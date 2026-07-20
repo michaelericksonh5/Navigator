@@ -1,14 +1,18 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#54A6EC"/>
-      <stop offset="1" stop-color="#3B82CE"/>
+    <clipPath id="sq">
+      <path d="M285 100 H739 A185 185 0 0 1 924 285 V739 A185 185 0 0 1 739 924
+               H285 A185 185 0 0 1 100 739 V285 A185 185 0 0 1 285 100 Z"/>
+    </clipPath>
+    <linearGradient id="base" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4E9EE4"/>
+      <stop offset="1" stop-color="#3E86C8"/>
     </linearGradient>
-    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#7CC0F7"/>
+    <linearGradient id="pocket" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#82C3F8"/>
       <stop offset="1" stop-color="#4E9EE4"/>
     </linearGradient>
-    <radialGradient id="apple" cx="452" cy="640" r="260" gradientUnits="userSpaceOnUse">
+    <radialGradient id="apple" cx="452" cy="650" r="260" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#F76F60"/>
       <stop offset="0.5" stop-color="#E04137"/>
       <stop offset="1" stop-color="#A61E1B"/>
@@ -18,45 +22,39 @@
       <stop offset="1" stop-color="#563015"/>
     </linearGradient>
     <filter id="blur" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="14"/>
+      <feGaussianBlur stdDeviation="12"/>
     </filter>
     <mask id="bites">
       <rect x="0" y="0" width="1024" height="1024" fill="white"/>
-      <circle cx="672" cy="672" r="48" fill="black"/>
-      <circle cx="672" cy="768" r="48" fill="black"/>
+      <circle cx="672" cy="668" r="48" fill="black"/>
+      <circle cx="672" cy="762" r="48" fill="black"/>
     </mask>
   </defs>
 
-  <!-- soft ground shadow -->
-  <ellipse cx="512" cy="936" rx="386" ry="38" fill="#000000" opacity="0.16" filter="url(#blur)"/>
+  <g clip-path="url(#sq)">
+    <!-- base body fills the whole squircle to the top -->
+    <rect x="100" y="100" width="824" height="824" fill="url(#base)"/>
 
-  <!-- folder back with a subtle integrated tab (large, fills the canvas) -->
-  <path d="M64 372 C64 336 90 300 146 300 L286 300 C322 300 334 316 352 344
-           C368 366 388 372 414 372 L898 372 C930 372 960 402 960 448
-           L960 858 C960 900 930 922 894 922 L130 922 C94 922 64 900 64 858 Z"
-        fill="url(#back)"/>
+    <!-- three folder tabs across the top, lighter -> darker left to right -->
+    <path d="M150 214 A56 56 0 0 1 206 158 H352 A56 56 0 0 1 408 214 V470 H150 Z" fill="#8AC6F8"/>
+    <path d="M400 198 A56 56 0 0 1 456 142 H602 A56 56 0 0 1 658 198 V470 H400 Z" fill="#5AA6EC"/>
+    <path d="M650 214 A56 56 0 0 1 706 158 H852 A56 56 0 0 1 908 214 V470 H650 Z" fill="#3B7FC4"/>
 
-  <!-- front pocket -->
-  <path d="M124 390 H900 A60 60 0 0 1 960 450 V862 A60 60 0 0 1 900 922 H124
-           A60 60 0 0 1 64 862 V450 A60 60 0 0 1 124 390 Z" fill="url(#front)"/>
-  <path d="M128 394 H896" stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="4" stroke-linecap="round"/>
+    <!-- soft shadow cast by the front pocket over the tabs -->
+    <rect x="100" y="430" width="824" height="26" fill="#000000" opacity="0.12" filter="url(#blur)"/>
 
-  <!-- apple shadow -->
-  <ellipse cx="512" cy="726" rx="168" ry="156" fill="#000000" opacity="0.13" filter="url(#blur)"/>
+    <!-- front pocket fills to the bottom corners -->
+    <rect x="100" y="452" width="824" height="472" fill="url(#pocket)"/>
+    <rect x="118" y="456" width="788" height="5" rx="2.5" fill="#FFFFFF" opacity="0.45"/>
 
-  <!-- stem (no leaf) -->
-  <path d="M508 596 q2 -60 46 -86" fill="none" stroke="url(#stem)" stroke-width="20" stroke-linecap="round"/>
-
-  <!-- apple body: clean iconic silhouette, two bites cut -->
-  <g mask="url(#bites)">
-    <path d="M512 590
-             C548 556 616 558 648 610
-             C682 662 674 792 616 834
-             C574 866 450 866 408 834
-             C350 792 342 662 376 610
-             C408 558 476 556 512 590 Z" fill="url(#apple)"/>
+    <!-- apple -->
+    <ellipse cx="512" cy="726" rx="166" ry="150" fill="#000000" opacity="0.12" filter="url(#blur)"/>
+    <path d="M508 596 q2 -60 46 -86" fill="none" stroke="url(#stem)" stroke-width="20" stroke-linecap="round"/>
+    <g mask="url(#bites)">
+      <path d="M512 592 C548 558 616 560 648 612 C682 664 674 794 616 836
+               C574 868 450 868 408 836 C350 794 342 664 376 612
+               C408 560 476 558 512 592 Z" fill="url(#apple)"/>
+    </g>
+    <ellipse cx="452" cy="664" rx="40" ry="58" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 452 664)"/>
   </g>
-
-  <!-- gloss -->
-  <ellipse cx="450" cy="662" rx="40" ry="58" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 450 662)"/>
 </svg>
