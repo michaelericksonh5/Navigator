@@ -554,28 +554,37 @@ struct ControlBar: View {
     @ObservedObject var browser: Browser
     @FocusState private var addressFocused: Bool
     var body: some View {
-        HStack(spacing: 8) {
-            Button { browser.goBack() } label: { Image(systemName: "chevron.left") }
-                .disabled(!browser.canGoBack).keyboardShortcut("[", modifiers: .command).help("Back")
-            Button { browser.goForward() } label: { Image(systemName: "chevron.right") }
-                .disabled(!browser.canGoForward).keyboardShortcut("]", modifiers: .command).help("Forward")
-            Button { browser.goUp() } label: { Image(systemName: "chevron.up") }
-                .keyboardShortcut(.upArrow, modifiers: .command).help("Enclosing Folder")
-            HStack(spacing: 5) {
+        VStack(spacing: 7) {
+            // Row 1: navigation + tools
+            HStack(spacing: 8) {
+                Button { browser.goBack() } label: { Image(systemName: "chevron.left") }
+                    .disabled(!browser.canGoBack).keyboardShortcut("[", modifiers: .command).help("Back")
+                Button { browser.goForward() } label: { Image(systemName: "chevron.right") }
+                    .disabled(!browser.canGoForward).keyboardShortcut("]", modifiers: .command).help("Forward")
+                Button { browser.goUp() } label: { Image(systemName: "chevron.up") }
+                    .keyboardShortcut(.upArrow, modifiers: .command).help("Enclosing Folder")
+                Spacer()
+                TextField("Filter", text: $browser.filterText).textFieldStyle(.roundedBorder).frame(width: 170)
+                Button { browser.newFolder() } label: { Image(systemName: "folder.badge.plus") }.help("New Folder")
+                Button { browser.load() } label: { Image(systemName: "arrow.clockwise") }
+                    .keyboardShortcut("r", modifiers: .command).help("Refresh")
+                Picker("", selection: $browser.viewMode) {
+                    Image(systemName: "list.bullet").tag(ViewMode.list)
+                    Image(systemName: "square.grid.2x2").tag(ViewMode.icon)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 86).help("View")
+            }
+            // Row 2: full-width address bar on its own line
+            HStack(spacing: 6) {
                 Image(systemName: "folder").foregroundStyle(.secondary)
                 TextField("Type a path and press Return", text: $browser.pathText)
-                    .textFieldStyle(.roundedBorder).focused($addressFocused).onSubmit { browser.submitPath() }
-            }.frame(maxWidth: .infinity)
-            TextField("Filter", text: $browser.filterText).textFieldStyle(.roundedBorder).frame(width: 150)
-            Button { browser.newFolder() } label: { Image(systemName: "folder.badge.plus") }.help("New Folder")
-            Button { browser.load() } label: { Image(systemName: "arrow.clockwise") }
-                .keyboardShortcut("r", modifiers: .command).help("Refresh")
-            Picker("", selection: $browser.viewMode) {
-                Image(systemName: "list.bullet").tag(ViewMode.list)
-                Image(systemName: "square.grid.2x2").tag(ViewMode.icon)
-            }.pickerStyle(.segmented).labelsHidden().frame(width: 86).help("View")
-            Button("") { addressFocused = true }.keyboardShortcut("l", modifiers: .command)
-                .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13, design: .monospaced))
+                    .focused($addressFocused)
+                    .onSubmit { browser.submitPath() }
+                    .frame(maxWidth: .infinity)
+                Button("") { addressFocused = true }.keyboardShortcut("l", modifiers: .command)
+                    .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
+            }
         }.padding(.horizontal, 10).padding(.vertical, 8)
     }
 }
@@ -603,7 +612,6 @@ struct NameCell: View {
             Image(nsImage: browser.icon(for: item)).resizable().frame(width: 16, height: 16)
             Text(item.name).lineLimit(1)
         }
-        .draggable(item.url)
     }
 }
 
@@ -625,7 +633,7 @@ struct FileTableView: View {
     }
 
     var body: some View {
-        Table(visibleItems, selection: $browser.selection, sortOrder: $browser.sortOrder) {
+        Table(of: FileItem.self, selection: $browser.selection, sortOrder: $browser.sortOrder) {
             TableColumn("Name", value: \.name) { item in
                 NameCell(item: item, browser: browser)
             }
@@ -638,6 +646,17 @@ struct FileTableView: View {
             TableColumn("Kind", value: \.kind) { item in
                 Text(item.kind).foregroundStyle(.secondary).lineLimit(1)
             }.width(min: 90, ideal: 130)
+        } rows: {
+            // Native AppKit-backed row drag (doesn't interfere with double-click),
+            // plus drop-onto-folder-row support.
+            ForEach(visibleItems) { item in
+                TableRow(item)
+                    .itemProvider { NSItemProvider(object: item.url as NSURL) }
+                    .dropDestination(for: URL.self) { urls in
+                        guard item.isDirectory else { return }
+                        browser.importURLs(urls, into: item.url, move: true)
+                    }
+            }
         }
         .contextMenu(forSelectionType: FileItem.ID.self) { ids in
             if !ids.isEmpty {
@@ -716,8 +735,14 @@ struct IconGridView: View {
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(visibleItems) { item in
                     IconCell(item: item, browser: browser, selected: browser.selection.contains(item.id))
+                        // Double-click opens; single click selects (count:2 handler
+                        // must come first so SwiftUI gives it priority).
                         .onTapGesture(count: 2) { openItem(item, browser) }
-                        .onTapGesture { browser.selection = [item.id]; browser.updateStatus() }
+                        .onTapGesture(count: 1) { browser.selection = [item.id]; browser.updateStatus() }
+                        .dropDestination(for: URL.self) { urls, _ in
+                            guard item.isDirectory else { return false }
+                            browser.importURLs(urls, into: item.url, move: true); return true
+                        }
                         .contextMenu {
                             Button("Open") { openItem(item, browser) }
                             if item.isDirectory { Button("Open in New Tab") { model.newTab(at: item.url) } }
@@ -815,8 +840,8 @@ struct TabStrip: View {
 
 struct BrowserPane: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var browser: Browser   // observe the active browser so viewMode/path changes re-render this view
     var body: some View {
-        let browser = model.active
         HSplitView {
             SidebarView(browser: browser, favorites: defaultLocations())
                 .frame(minWidth: 190, idealWidth: 210, maxWidth: 340)
@@ -845,7 +870,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             TabStrip(model: model)
             Divider()
-            BrowserPane(model: model).id(model.selected)
+            BrowserPane(model: model, browser: model.active).id(model.selected)
         }.frame(minWidth: 880, minHeight: 560)
     }
 }
@@ -927,7 +952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.requestFilesAccessIfNeeded() }
+        // (No auto TCC prompt on launch — use the "Grant Full Disk Access…" menu command.)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
