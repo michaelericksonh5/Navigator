@@ -24,6 +24,10 @@ enum Prefs {
     }
     static var groupBy: String { get { d.string(forKey: "groupBy") ?? "none" } set { d.set(newValue, forKey: "groupBy") } }
     static var showPreview: Bool { get { d.bool(forKey: "showPreview") } set { d.set(newValue, forKey: "showPreview") } }
+    static var showSidebar: Bool {
+        get { d.object(forKey: "showSidebar") == nil ? true : d.bool(forKey: "showSidebar") }
+        set { d.set(newValue, forKey: "showSidebar") }
+    }
     static var columnData: Data? { get { d.data(forKey: "columnCustomization") } set { d.set(newValue, forKey: "columnCustomization") } }
     static var recentFolders: [String] { get { d.stringArray(forKey: "recentFolders") ?? [] } set { d.set(newValue, forKey: "recentFolders") } }
 }
@@ -837,6 +841,7 @@ final class AppModel: ObservableObject {
     @Published var tabs: [Browser]
     @Published var selected: Int = 0
     @Published var showPreview: Bool = Prefs.showPreview { didSet { Prefs.showPreview = showPreview } }
+    @Published var showSidebar: Bool = Prefs.showSidebar { didSet { Prefs.showSidebar = showSidebar } }
     @Published var columnCustomization: TableColumnCustomization<FileItem> = AppModel.loadColumns() {
         didSet { AppModel.saveColumns(columnCustomization) }
     }
@@ -948,6 +953,9 @@ struct ControlBar: View {
         VStack(spacing: 7) {
             // Row 1: navigation + search + tools
             HStack(spacing: 8) {
+                Button { model.showSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
+                    .help("Show/Hide Sidebar (⌥⌘S)")
+                    .foregroundStyle(model.showSidebar ? Color.accentColor : .secondary)
                 Button { browser.goBack() } label: { Image(systemName: "chevron.left") }
                     .disabled(!browser.canGoBack).keyboardShortcut("[", modifiers: .command).help("Back")
                 Button { browser.goForward() } label: { Image(systemName: "chevron.right") }
@@ -1394,38 +1402,113 @@ struct TabStrip: View {
     }
 }
 
-struct BrowserPane: View {
+// The middle pane: toolbar, breadcrumb/search banner, file view, status bar.
+struct BrowserContent: View {
     @ObservedObject var model: AppModel
-    @ObservedObject var browser: Browser   // observe the active browser so viewMode/path changes re-render this view
+    @ObservedObject var browser: Browser
     var body: some View {
-        HSplitView {
-            SidebarView(browser: browser, favorites: defaultLocations())
-                .frame(minWidth: 190, idealWidth: 210, maxWidth: 340)
-            VStack(spacing: 0) {
-                ControlBar(model: model, browser: browser)
+        VStack(spacing: 0) {
+            ControlBar(model: model, browser: browser)
+            Divider()
+            if browser.isSearching {
+                SearchBanner(browser: browser)
                 Divider()
-                if browser.isSearching {
-                    SearchBanner(browser: browser)
-                    Divider()
-                } else {
-                    BreadcrumbBar(browser: browser)
-                    Divider()
-                }
-                Group {
-                    if browser.viewMode == .icon { IconGridView(model: model, browser: browser) }
-                    else { FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization) }
-                }
-                .dropDestination(for: URL.self) { urls, _ in
-                    browser.copyURLs(urls, move: false); return true
-                }
+            } else {
+                BreadcrumbBar(browser: browser)
                 Divider()
-                StatusBar(browser: browser)
-            }.frame(minWidth: 560)
-            if model.showPreview {
-                PreviewPane(browser: browser)
-                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 420)
             }
+            Group {
+                if browser.viewMode == .icon { IconGridView(model: model, browser: browser) }
+                else { FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization) }
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                browser.copyURLs(urls, move: false); return true
+            }
+            Divider()
+            StatusBar(browser: browser)
         }
+    }
+}
+
+// A real AppKit NSSplitView gives Finder-quality resizing: per-pane min/max,
+// the file list absorbs window resizing while the sidebar/preview hold their
+// width, remembered divider positions, and animated collapse of the side panes.
+final class PaneSplitController: NSSplitViewController {
+    let sidebarHC = NSHostingController(rootView: AnyView(EmptyView()))
+    let contentHC = NSHostingController(rootView: AnyView(EmptyView()))
+    let previewHC = NSHostingController(rootView: AnyView(EmptyView()))
+    private var sidebarItem: NSSplitViewItem!
+    private var previewItem: NSSplitViewItem!
+    private let initialSidebarCollapsed: Bool
+    private let initialPreviewCollapsed: Bool
+
+    init(sidebarCollapsed: Bool, previewCollapsed: Bool) {
+        initialSidebarCollapsed = sidebarCollapsed
+        initialPreviewCollapsed = previewCollapsed
+        super.init(nibName: nil, bundle: nil)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.autosaveName = "NavigatorPanes"   // remembers divider positions across launches
+        splitView.identifier = NSUserInterfaceItemIdentifier("NavigatorPanes")
+
+        sidebarItem = NSSplitViewItem(viewController: sidebarHC)
+        sidebarItem.minimumThickness = 180
+        sidebarItem.maximumThickness = 360
+        sidebarItem.canCollapse = true
+        sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
+        sidebarItem.isCollapsed = initialSidebarCollapsed
+
+        let contentItem = NSSplitViewItem(viewController: contentHC)
+        contentItem.minimumThickness = 420
+        contentItem.canCollapse = false
+        contentItem.holdingPriority = NSLayoutConstraint.Priority(250) // lowest → absorbs window resize
+
+        previewItem = NSSplitViewItem(viewController: previewHC)
+        previewItem.minimumThickness = 220
+        previewItem.maximumThickness = 560
+        previewItem.canCollapse = true
+        previewItem.holdingPriority = NSLayoutConstraint.Priority(260)
+        previewItem.isCollapsed = initialPreviewCollapsed
+
+        addSplitViewItem(sidebarItem)
+        addSplitViewItem(contentItem)
+        addSplitViewItem(previewItem)
+    }
+
+    func setSidebar(collapsed: Bool) {
+        guard let sidebarItem, sidebarItem.isCollapsed != collapsed else { return }
+        sidebarItem.animator().isCollapsed = collapsed
+    }
+    func setPreview(collapsed: Bool) {
+        guard let previewItem, previewItem.isCollapsed != collapsed else { return }
+        previewItem.animator().isCollapsed = collapsed
+    }
+}
+
+struct BrowserPane: NSViewControllerRepresentable {
+    @ObservedObject var model: AppModel
+    var browser: Browser
+
+    func makeNSViewController(context: Context) -> PaneSplitController {
+        let vc = PaneSplitController(sidebarCollapsed: !model.showSidebar, previewCollapsed: !model.showPreview)
+        _ = vc.view // force viewDidLoad so items exist
+        applyRootViews(vc)
+        return vc
+    }
+    func updateNSViewController(_ vc: PaneSplitController, context: Context) {
+        applyRootViews(vc)
+        vc.setSidebar(collapsed: !model.showSidebar)
+        vc.setPreview(collapsed: !model.showPreview)
+    }
+    private func applyRootViews(_ vc: PaneSplitController) {
+        vc.sidebarHC.rootView = AnyView(SidebarView(browser: browser, favorites: defaultLocations()))
+        vc.contentHC.rootView = AnyView(BrowserContent(model: model, browser: browser).id(browser.id))
+        vc.previewHC.rootView = AnyView(PreviewPane(browser: browser))
     }
 }
 
@@ -1435,7 +1518,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             TabStrip(model: model)
             Divider()
-            BrowserPane(model: model, browser: model.active).id(model.selected)
+            BrowserPane(model: model, browser: model.active)
         }.frame(minWidth: 880, minHeight: 560)
     }
 }
@@ -1626,6 +1709,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let viewItem = NSMenuItem(); mainMenu.addItem(viewItem)
         let viewMenu = NSMenu(title: "View"); viewItem.submenu = viewMenu
+        let sb = viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(toggleSidebarAction(_:)), keyEquivalent: "s")
+        sb.keyEquivalentModifierMask = [.command, .option]; sb.target = self
         let pv = viewMenu.addItem(withTitle: "Toggle Preview Pane", action: #selector(togglePreviewAction(_:)), keyEquivalent: "p")
         pv.keyEquivalentModifierMask = [.command, .shift]; pv.target = self
         let sh = viewMenu.addItem(withTitle: "Toggle Hidden Files", action: #selector(toggleHiddenAction(_:)), keyEquivalent: ".")
@@ -1656,6 +1741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func compressAction(_ sender: Any?) { appModel.active.compress(appModel.active.selection) }
     @objc func emptyTrashAction(_ sender: Any?) { confirmEmptyTrash(appModel.active) }
     @objc func togglePreviewAction(_ sender: Any?) { appModel.showPreview.toggle() }
+    @objc func toggleSidebarAction(_ sender: Any?) { appModel.showSidebar.toggle() }
     @objc func toggleHiddenAction(_ sender: Any?) { appModel.active.showHidden.toggle() }
     @objc func undoAction(_ sender: Any?) {
         // When editing text, let the field's own undo run; otherwise undo file operations.

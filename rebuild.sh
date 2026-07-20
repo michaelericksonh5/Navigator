@@ -45,6 +45,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSLocalNetworkUsageDescription</key><string>Navigator discovers file servers on your local network so they appear in the sidebar.</string>
 <key>NSBonjourServices</key><array><string>_smb._tcp</string></array>
+<key>NSDesktopFolderUsageDescription</key><string>Navigator shows and manages the files in your Desktop folder.</string>
+<key>NSDocumentsFolderUsageDescription</key><string>Navigator shows and manages the files in your Documents folder.</string>
+<key>NSDownloadsFolderUsageDescription</key><string>Navigator shows and manages the files in your Downloads folder.</string>
+<key>NSRemovableVolumesUsageDescription</key><string>Navigator shows and manages files on USB and external drives you connect.</string>
+<key>NSNetworkVolumesUsageDescription</key><string>Navigator shows and manages files on network drives you connect to.</string>
+<key>NSFileProviderPresenceUsageDescription</key><string>Navigator shows files stored in cloud providers like iCloud Drive and Google Drive.</string>
 </dict></plist>
 PLIST
 # Sign with the stable "Navigator Dev" self-signed identity if it exists, so the
