@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build & Lint
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (swiftc)
+        run: |
+          swiftc -swift-version 5 -target arm64-apple-macos14.0 \
+            -o Navigator.bin main.swift \
+            -framework SwiftUI -framework AppKit \
+            -framework UniformTypeIdentifiers -framework Quartz
+          echo "Build succeeded."
+
+      - name: SwiftLint (code-quality scan)
+        continue-on-error: true
+        run: |
+          brew install swiftlint
+          swiftlint lint --quiet --reporter github-actions-logging || true
