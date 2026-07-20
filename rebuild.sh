@@ -43,6 +43,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
 <key>NSPrincipalClass</key><string>NSApplication</string>
+<key>NSLocalNetworkUsageDescription</key><string>Navigator discovers file servers on your local network so they appear in the sidebar.</string>
+<key>NSBonjourServices</key><array><string>_smb._tcp</string></array>
 </dict></plist>
 PLIST
 codesign --force --deep -s - "$APP"
