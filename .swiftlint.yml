@@ -1,0 +1,23 @@
+# SwiftLint config tuned for Navigator — a single-file SwiftUI app.
+# The defaults flag style choices (short local names, long file) that are
+# fine here; we relax those and keep the substantive rules.
+disabled_rules:
+  - comma               # cosmetic spacing in dense literals
+  - statement_position  # `} else {` placement preference
+  - trailing_comma
+
+identifier_name:
+  min_length: 1         # allow short locals (u, r, cx, ...)
+  max_length: 60
+
+line_length:
+  warning: 160
+  error: 320
+
+file_length:
+  warning: 1500
+  error: 3000
+
+type_body_length:
+  warning: 600
+  error: 1200
