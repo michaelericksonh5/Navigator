@@ -43,6 +43,62 @@ final class MetadataCache {
     }
 }
 
+// On-demand recursive folder sizing (opt-in, like Finder's "Calculate all sizes").
+// ObservableObject so Size cells refresh once a computed total lands.
+final class FolderSizeCache: ObservableObject {
+    static let shared = FolderSizeCache()
+    @Published private var version = 0
+    private var store: [String: Int64] = [:]
+    private var inFlight: Set<String> = []
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "navigator.foldersize", qos: .utility, attributes: .concurrent)
+
+    func cached(_ url: URL) -> Int64? { lock.lock(); defer { lock.unlock() }; return store[url.path] }
+
+    func compute(_ url: URL) {
+        let key = url.path
+        lock.lock()
+        if store[key] != nil || inFlight.contains(key) { lock.unlock(); return }
+        inFlight.insert(key); lock.unlock()
+        queue.async {
+            let total = FolderSizeCache.size(of: url)
+            self.lock.lock(); self.store[key] = total; self.inFlight.remove(key); self.lock.unlock()
+            DispatchQueue.main.async { self.version &+= 1 }
+        }
+    }
+
+    static func size(of url: URL) -> Int64 {
+        var total: Int64 = 0
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]
+        if let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys,
+                                                   options: [], errorHandler: { _, _ in true }) {
+            for case let f as URL in en {
+                let v = try? f.resourceValues(forKeys: Set(keys))
+                if v?.isRegularFile == true {
+                    total += Int64(v?.totalFileAllocatedSize ?? v?.fileAllocatedSize ?? 0)
+                }
+            }
+        }
+        return total
+    }
+}
+
+struct SizeCell: View {
+    let item: FileItem
+    @ObservedObject private var cache = FolderSizeCache.shared
+    var body: some View {
+        if item.isDirectory {
+            if let s = cache.cached(item.url) {
+                Text(ByteCountFormatter.string(fromByteCount: s, countStyle: .file)).foregroundStyle(.secondary)
+            } else {
+                Text("—").foregroundStyle(.secondary)
+            }
+        } else {
+            Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).foregroundStyle(.secondary)
+        }
+    }
+}
+
 func formatDuration(_ seconds: Double) -> String {
     guard seconds >= 1 else { return "" }
     let total = Int(seconds.rounded())
@@ -314,6 +370,27 @@ func shareItems(_ urls: [URL]) {
     let picker = NSSharingServicePicker(items: urls)
     picker.show(relativeTo: .zero, of: cv, preferredEdge: .minY)
 }
+
+// Open With / default-app helpers.
+func applicationsToOpen(_ url: URL) -> [URL] {
+    NSWorkspace.shared.urlsForApplications(toOpen: url)
+}
+func openWith(_ urls: [URL], app: URL) {
+    NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+}
+func chooseApplication() -> URL? {
+    let panel = NSOpenPanel()
+    panel.message = "Choose an application"
+    panel.directoryURL = URL(fileURLWithPath: "/Applications")
+    panel.allowedContentTypes = [.application]
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    return panel.runModal() == .OK ? panel.url : nil
+}
+func setDefaultApp(_ appURL: URL, for fileURL: URL) {
+    guard let type = try? fileURL.resourceValues(forKeys: [.contentTypeKey]).contentType else { NSSound.beep(); return }
+    Task { try? await NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: type) }
+}
 func openInTerminal(_ url: URL) {
     let dir = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
     let p = Process()
@@ -339,6 +416,9 @@ func defaultLocations() -> [SidebarLocation] {
 
 let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
 func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtension.lowercased()) }
+
+let archiveExtensions: Set<String> = ["zip","tar","tgz","gz","bz2","xz","tbz","txz"]
+func isArchive(_ url: URL) -> Bool { archiveExtensions.contains(url.pathExtension.lowercased()) }
 
 // Cloud providers mounted as folders under ~/Library/CloudStorage, plus iCloud Drive.
 func cloudLocations() -> [SidebarLocation] {
@@ -880,6 +960,25 @@ final class Browser: ObservableObject, Identifiable {
         load()
     }
 
+    func makeSymlink(_ ids: Set<String>) {
+        var created: [URL] = []
+        for it in items.filter({ ids.contains($0.id) }) {
+            let base = it.url.deletingPathExtension().lastPathComponent
+            let ext = it.url.pathExtension
+            let linkName = ext.isEmpty ? "\(base) symlink" : "\(base) symlink.\(ext)"
+            let linkURL = uniqueDest(currentURL, linkName)
+            do { try fm.createSymbolicLink(at: linkURL, withDestinationURL: it.url); created.append(linkURL) }
+            catch { NSSound.beep() }
+        }
+        if !created.isEmpty {
+            UndoStack.shared.push("Make Symbolic Link") { [weak self] in
+                for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
+                self?.load()
+            }
+        }
+        load()
+    }
+
     func rename(id: String, to newName: String) {
         guard let item = items.first(where: { $0.id == id }) else { return }
         let n = newName.trimmingCharacters(in: .whitespaces)
@@ -953,6 +1052,46 @@ final class Browser: ObservableObject, Identifiable {
                     try? FileManager.default.trashItem(at: dest, resultingItemURL: nil); self?.load()
                 }
                 self?.load()
+            }
+        }
+    }
+
+    func extract(_ ids: Set<String>) {
+        let sel = items.filter { ids.contains($0.id) && !$0.isDirectory && isArchive($0.url) }
+        guard !sel.isEmpty else { return }
+        let dir = currentURL
+        busy = true; busyText = "Extracting…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            var created: [URL] = []
+            for it in sel {
+                var base = it.url.deletingPathExtension().lastPathComponent
+                if (base as NSString).pathExtension.lowercased() == "tar" { base = (base as NSString).deletingPathExtension }
+                let dest = self.uniqueDest(dir, base)
+                try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+                let p = Process()
+                if it.url.pathExtension.lowercased() == "zip" {
+                    p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+                    p.arguments = ["-x", "-k", it.url.path, dest.path]
+                } else {
+                    p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+                    p.arguments = ["-xf", it.url.path, "-C", dest.path]
+                }
+                do {
+                    try p.run(); p.waitUntilExit()
+                    if p.terminationStatus == 0 { created.append(dest) }
+                    else { try? FileManager.default.removeItem(at: dest) }
+                } catch { try? FileManager.default.removeItem(at: dest) }
+            }
+            DispatchQueue.main.async {
+                self.busy = false; self.busyText = ""
+                if !created.isEmpty {
+                    UndoStack.shared.push("Extract") { [weak self] in
+                        for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
+                        self?.load()
+                    }
+                }
+                self.load()
             }
         }
     }
@@ -1212,6 +1351,26 @@ struct NameCell: View {
     }
 }
 
+struct OpenWithMenu: View {
+    let urls: [URL]
+    var body: some View {
+        Menu("Open With") {
+            if let first = urls.first {
+                ForEach(applicationsToOpen(first), id: \.self) { app in
+                    Button(app.deletingPathExtension().lastPathComponent) { openWith(urls, app: app) }
+                }
+                Divider()
+            }
+            Button("Other Application…") { if let app = chooseApplication() { openWith(urls, app: app) } }
+            if urls.count == 1, let f = urls.first {
+                Button("Always Open With…") {
+                    if let app = chooseApplication() { setDefaultApp(app, for: f); openWith([f], app: app) }
+                }
+            }
+        }
+    }
+}
+
 struct FileTableView: View {
     let model: AppModel
     @ObservedObject var browser: Browser
@@ -1235,7 +1394,7 @@ struct FileTableView: View {
                 Text(item.modified, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
             }.width(min: 150, ideal: 185).customizationID("modified")
             TableColumn("Size", value: \FileItem.size) { item in
-                Text(item.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).foregroundStyle(.secondary)
+                SizeCell(item: item)
             }.width(min: 70, ideal: 90).customizationID("size")
             TableColumn("Kind", value: \FileItem.kind) { item in
                 Text(item.kind).foregroundStyle(.secondary).lineLimit(1)
@@ -1310,14 +1469,25 @@ struct FileTableView: View {
             if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }), it.isDirectory {
                 Button("Open in New Tab") { model.newTab(at: it.url) }
             }
+            let selURLs = browser.items.filter { ids.contains($0.id) }.map { $0.url }
+            if selURLs.contains(where: { !$0.hasDirectoryPath }) { OpenWithMenu(urls: selURLs.filter { !$0.hasDirectoryPath }) }
             Button("Quick Look") { QuickLook.shared.show(browser.items.filter { ids.contains($0.id) }.map { $0.url }) }
             Button("Reveal in Finder") { browser.revealInFinder(ids) }
             Divider()
             if ids.count == 1 { Button("Rename…") { promptRename(browser, ids.first!) } }
             Button("Duplicate") { browser.duplicate(ids) }
             Button("Make Alias") { browser.makeAlias(ids) }
+            Button("Make Symbolic Link") { browser.makeSymlink(ids) }
+            if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
+                Button("Calculate Size") {
+                    for it in browser.items where ids.contains(it.id) && it.isDirectory { FolderSizeCache.shared.compute(it.url) }
+                }
+            }
             Button("Get Info") { showInfo(browser, ids) }
             Button("Compress") { browser.compress(ids) }
+            if browser.items.contains(where: { ids.contains($0.id) && isArchive($0.url) }) {
+                Button("Extract") { browser.extract(ids) }
+            }
             Divider()
             Button("Share…") { shareItems(browser.items.filter { ids.contains($0.id) }.map { $0.url }) }
             if let it = browser.items.first(where: { $0.id == ids.first }) {
@@ -1335,6 +1505,9 @@ struct FileTableView: View {
             Button("Paste") { browser.pasteFiles() }
             Button("New Folder") { browser.newFolder() }
             Button("New Text File") { browser.newTextFile() }
+            Button("Calculate All Sizes") {
+                for it in browser.items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
+            }
             Button("Reveal in Finder") { browser.revealInFinder([]) }
         }
     }
@@ -1420,12 +1593,15 @@ struct IconGridView: View {
             .contextMenu {
                 Button("Open") { openItem(item, browser) }
                 if item.isDirectory { Button("Open in New Tab") { model.newTab(at: item.url) } }
+                if !item.isDirectory { OpenWithMenu(urls: [item.url]) }
                 Button("Quick Look") { QuickLook.shared.show([item.url]) }
                 Button("Reveal in Finder") { browser.revealInFinder([item.id]) }
                 Divider()
                 Button("Rename…") { promptRename(browser, item.id) }
                 Button("Duplicate") { browser.duplicate([item.id]) }
                 Button("Make Alias") { browser.makeAlias([item.id]) }
+                Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
+                if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
                 Button("Get Info") { showInfo(browser, [item.id]) }
                 Divider()
                 Button("Share…") { shareItems([item.url]) }
@@ -1439,6 +1615,7 @@ struct IconGridView: View {
 
 struct PreviewPane: View {
     @ObservedObject var browser: Browser
+    @ObservedObject private var sizeCache = FolderSizeCache.shared
     @State private var thumb: NSImage?
     @State private var meta = FileMeta()
     private static let df: DateFormatter = { let d = DateFormatter(); d.dateStyle = .medium; d.timeStyle = .short; return d }()
@@ -1457,7 +1634,7 @@ struct PreviewPane: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 6) {
                     infoRow("Kind", it.kind)
-                    infoRow("Size", it.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: it.size, countStyle: .file))
+                    infoRow("Size", sizeText(it))
                     if let d = meta.duration, d >= 1 { infoRow("Duration", formatDuration(d)) }
                     if let w = meta.width, let h = meta.height, w > 0, h > 0 { infoRow("Dimensions", "\(w) × \(h)") }
                     infoRow("Created", Self.df.string(from: it.created))
@@ -1495,9 +1672,17 @@ struct PreviewPane: View {
             Text(v).textSelection(.enabled).lineLimit(3)
         }
     }
+    private func sizeText(_ it: FileItem) -> String {
+        if it.isDirectory {
+            if let s = sizeCache.cached(it.url) { return ByteCountFormatter.string(fromByteCount: s, countStyle: .file) }
+            return "Calculating…"
+        }
+        return ByteCountFormatter.string(fromByteCount: it.size, countStyle: .file)
+    }
     private func loadDetails() {
         guard let it = item else { thumb = nil; meta = FileMeta(); return }
         thumb = nil; meta = FileMeta()
+        if it.isDirectory { FolderSizeCache.shared.compute(it.url) }
         ThumbnailCache.shared.thumbnail(for: it.url) { img in
             if self.item?.url == it.url { self.thumb = img }
         }
