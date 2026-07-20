@@ -356,8 +356,12 @@ func promptComment(_ browser: Browser, _ id: String) {
 }
 func showInfo(_ browser: Browser, _ ids: Set<String>) {
     guard !ids.isEmpty else { return }
-    let a = NSAlert(); a.messageText = "Get Info"; a.informativeText = browser.infoText(ids)
-    a.addButton(withTitle: "OK"); a.runModal()
+    if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }) {
+        GetInfoController.shared.show(browser, it)
+    } else {
+        let a = NSAlert(); a.messageText = "Get Info"; a.informativeText = browser.infoText(ids)
+        a.addButton(withTitle: "OK"); a.runModal()
+    }
 }
 func confirmEmptyTrash(_ browser: Browser) {
     let a = NSAlert(); a.alertStyle = .warning
@@ -2106,6 +2110,125 @@ final class ImageViewerController {
         window?.contentView = NSHostingView(rootView: ImageViewerView(urls: urls, index: index))
         window?.center()
         window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// MARK: - Rich Get Info window
+
+struct GetInfoView: View {
+    @ObservedObject var browser: Browser
+    let item: FileItem
+    @ObservedObject private var sizeCache = FolderSizeCache.shared
+    @State private var name: String
+    @State private var comment: String = ""
+    @State private var tags: [String]
+    @State private var thumb: NSImage?
+    @State private var meta = FileMeta()
+    private static let df: DateFormatter = { let d = DateFormatter(); d.dateStyle = .long; d.timeStyle = .short; return d }()
+
+    init(browser: Browser, item: FileItem) {
+        self.browser = browser; self.item = item
+        _name = State(initialValue: item.name)
+        _tags = State(initialValue: item.tags)
+    }
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Spacer()
+                    Group {
+                        if let t = thumb { Image(nsImage: t).resizable().scaledToFit() }
+                        else { Image(nsImage: browser.icon(for: item)).resizable().scaledToFit() }
+                    }.frame(width: 120, height: 120)
+                    Spacer()
+                }
+                TextField("Name", text: $name).textFieldStyle(.roundedBorder).font(.headline)
+                    .onSubmit { if name != item.name { browser.rename(id: item.id, to: name) } }
+                Divider()
+                Group {
+                    row("Kind", item.kind)
+                    row("Size", sizeText())
+                    if let d = meta.duration, d >= 1 { row("Duration", formatDuration(d)) }
+                    if let w = meta.width, let h = meta.height, w > 0, h > 0 { row("Dimensions", "\(w) × \(h)") }
+                    row("Created", Self.df.string(from: item.created))
+                    row("Modified", Self.df.string(from: item.modified))
+                    row("Added", Self.df.string(from: item.dateAdded))
+                    row("Where", item.url.deletingLastPathComponent().path)
+                    row("Permissions", permString())
+                }.font(.callout)
+                Divider()
+                Text("Tags").font(.subheadline).bold()
+                HStack(spacing: 8) {
+                    ForEach(standardTags, id: \.self) { t in
+                        Button { toggle(t) } label: {
+                            Circle().fill(tagColor(t)).frame(width: 20, height: 20)
+                                .overlay(Circle().stroke(Color.primary, lineWidth: tags.contains(t) ? 2.5 : 0))
+                        }.buttonStyle(.plain).help(t)
+                    }
+                }
+                Divider()
+                Text("Comment").font(.subheadline).bold()
+                TextEditor(text: $comment).frame(height: 56)
+                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+                Button("Save Comment") { browser.setComment(id: item.id, comment) }
+                if !item.isDirectory {
+                    Divider()
+                    HStack {
+                        Text("Opens with").foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Change…") { if let app = chooseApplication() { setDefaultApp(app, for: item.url) } }
+                    }.font(.callout)
+                }
+            }.padding(16)
+        }
+        .frame(minWidth: 320, minHeight: 480)
+        .onAppear { load() }
+    }
+    @ViewBuilder private func row(_ k: String, _ v: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(k).foregroundStyle(.secondary).frame(width: 92, alignment: .trailing)
+            Text(v).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+    private func sizeText() -> String {
+        if item.isDirectory {
+            if let s = sizeCache.cached(item.url) { return ByteCountFormatter.string(fromByteCount: s, countStyle: .file) }
+            return "Calculating…"
+        }
+        return ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
+    }
+    private func permString() -> String {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: item.url.path),
+              let perm = attrs[.posixPermissions] as? NSNumber else { return "—" }
+        let p = perm.uint16Value
+        func rwx(_ v: UInt16) -> String { "\(v & 4 != 0 ? "r" : "-")\(v & 2 != 0 ? "w" : "-")\(v & 1 != 0 ? "x" : "-")" }
+        return "\(rwx((p >> 6) & 7))\(rwx((p >> 3) & 7))\(rwx(p & 7))"
+    }
+    private func toggle(_ t: String) {
+        if let i = tags.firstIndex(of: t) { tags.remove(at: i) } else { tags.append(t) }
+        browser.setTags([item.id], tags: tags)
+    }
+    private func load() {
+        ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }
+        MetadataCache.shared.meta(for: item.url) { m in meta = m; if let c = m.comment, comment.isEmpty { comment = c } }
+        if item.isDirectory { FolderSizeCache.shared.compute(item.url) }
+    }
+}
+
+final class GetInfoController {
+    static let shared = GetInfoController()
+    private var windows: [String: NSWindow] = [:]
+    func show(_ browser: Browser, _ item: FileItem) {
+        if let w = windows[item.id] { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 540),
+                         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        w.title = "\(item.name) Info"
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: GetInfoView(browser: browser, item: item))
+        w.center()
+        w.makeKeyAndOrderFront(nil)
+        windows[item.id] = w
         NSApp.activate(ignoringOtherApps: true)
     }
 }
