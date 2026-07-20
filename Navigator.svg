@@ -33,13 +33,15 @@
   <!-- ground shadow -->
   <ellipse cx="512" cy="962" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
 
-  <!-- three overlapping tabs: darkest (back, flush RIGHT) -> lightest (front, flush LEFT) -->
-  <path d="M556 406 C556 356 584 296 636 296 H908 A40 40 0 0 1 948 336 V406 Z"
+  <!-- back tab (darkest, flush RIGHT) -->
+  <path d="M660 406 C660 356 688 296 740 296 H908 A48 48 0 0 1 948 344 V406 Z"
         fill="#3B82CE" filter="url(#tabsh)"/>
-  <path d="M300 406 C300 356 328 296 380 296 H568 C620 296 648 356 648 406 Z"
+  <!-- middle tab (shifted right, overlaps to the right) -->
+  <path d="M380 406 C380 356 408 296 460 296 H640 C692 296 720 356 720 406 Z"
         fill="#4C97DE" filter="url(#tabsh)"/>
-  <path d="M76 406 V336 A40 40 0 0 1 116 296 H360 C412 296 440 356 440 406 Z"
-        fill="#63B0EF" filter="url(#tabsh)"/>
+  <!-- left tab: formed with the folder (same gradient), flush LEFT -->
+  <path d="M76 406 V344 A48 48 0 0 1 124 296 H360 C412 296 430 356 430 406 Z"
+        fill="url(#back)" filter="url(#tabsh)"/>
 
   <!-- folder back (fills sides + bottom) -->
   <path d="M76 388 H948 V858 A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858 Z" fill="url(#back)"/>
