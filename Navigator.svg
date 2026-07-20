@@ -34,17 +34,16 @@
   <ellipse cx="512" cy="962" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
 
   <!-- back tab (darkest, flush RIGHT) -->
-  <path d="M660 406 C660 356 688 296 740 296 H908 A48 48 0 0 1 948 344 V406 Z"
+  <path d="M672 408 C672 356 700 296 752 296 H908 A48 48 0 0 1 948 344 V408 Z"
         fill="#3B82CE" filter="url(#tabsh)"/>
-  <!-- middle tab (shifted right, overlaps to the right) -->
-  <path d="M380 406 C380 356 408 296 460 296 H640 C692 296 720 356 720 406 Z"
+  <!-- middle tab (shifted right) -->
+  <path d="M456 408 C456 356 484 296 536 296 H716 C768 296 796 356 796 408 Z"
         fill="#4C97DE" filter="url(#tabsh)"/>
-  <!-- left tab: formed with the folder (same gradient), flush LEFT -->
-  <path d="M76 406 V344 A48 48 0 0 1 124 296 H360 C412 296 430 356 430 406 Z"
-        fill="url(#back)" filter="url(#tabsh)"/>
 
-  <!-- folder back (fills sides + bottom) -->
-  <path d="M76 388 H948 V858 A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858 Z" fill="url(#back)"/>
+  <!-- FRONT folder: left tab + body as ONE continuous shape (seamless), flush LEFT -->
+  <path d="M116 296 H360 C412 296 430 388 486 388 H948 V858
+           A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858
+           V336 A40 40 0 0 1 116 296 Z" fill="url(#back)" filter="url(#tabsh)"/>
 
   <!-- shadow the pocket casts on the back -->
   <rect x="76" y="452" width="872" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
