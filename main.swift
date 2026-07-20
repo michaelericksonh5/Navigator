@@ -409,6 +409,7 @@ final class Browser: ObservableObject, Identifiable {
     }
     @Published var groupBy: GroupBy = .none { didSet { Prefs.groupBy = groupBy.rawValue } }
     @Published var status: String = ""
+    @Published var freeSpace: String = ""
     @Published var isRecents = false
     @Published var viewMode: ViewMode = .list { didSet { Prefs.viewModeIcon = (viewMode == .icon) } }
     @Published var iconSize: CGFloat = 76 { didSet { Prefs.iconSize = iconSize } }
@@ -619,7 +620,19 @@ final class Browser: ObservableObject, Identifiable {
         items = result
         pathText = currentURL.path
         selection = []
+        updateFreeSpace()
         updateStatus()
+    }
+
+    func updateFreeSpace() {
+        let vals = try? currentURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
+        if let avail = vals?.volumeAvailableCapacityForImportantUsage, avail > 0 {
+            freeSpace = "\(ByteCountFormatter.string(fromByteCount: avail, countStyle: .file)) available"
+        } else if let avail = vals?.volumeAvailableCapacity, let total = vals?.volumeTotalCapacity, total > 0 {
+            freeSpace = "\(ByteCountFormatter.string(fromByteCount: Int64(avail), countStyle: .file)) available"
+        } else {
+            freeSpace = ""
+        }
     }
 
     func updateStatus() {
@@ -1503,6 +1516,10 @@ struct StatusBar: View {
                 Text(browser.busyText).font(.caption).foregroundStyle(.secondary)
             } else {
                 Text(browser.status).font(.caption).foregroundStyle(.secondary)
+                if !browser.freeSpace.isEmpty {
+                    Text("·").font(.caption).foregroundStyle(.tertiary)
+                    Text(browser.freeSpace).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer()
             if browser.viewMode == .icon {
