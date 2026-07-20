@@ -1456,6 +1456,13 @@ final class PaneSplitController: NSSplitViewController {
         splitView.autosaveName = "NavigatorPanes"   // remembers divider positions across launches
         splitView.identifier = NSUserInterfaceItemIdentifier("NavigatorPanes")
 
+        // Critical: stop each SwiftUI host from pushing its intrinsic size back into
+        // AppKit. Otherwise dragging a divider makes the split view (and the window)
+        // resize to fit content instead of just trading width between two panes.
+        // With this cleared, the split view's min/max + holding priorities are the
+        // sole authority — a divider drag only redistributes its two neighbours.
+        for hc in [sidebarHC, contentHC, previewHC] { hc.sizingOptions = [] }
+
         sidebarItem = NSSplitViewItem(viewController: sidebarHC)
         sidebarItem.minimumThickness = 180
         sidebarItem.maximumThickness = 360
