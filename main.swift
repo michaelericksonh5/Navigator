@@ -344,6 +344,16 @@ func promptRename(_ browser: Browser, _ id: String) {
     a.accessoryView = f; a.addButton(withTitle: "Rename"); a.addButton(withTitle: "Cancel")
     if a.runModal() == .alertFirstButtonReturn { browser.rename(id: id, to: f.stringValue) }
 }
+func promptComment(_ browser: Browser, _ id: String) {
+    guard let item = browser.items.first(where: { $0.id == id }) else { return }
+    var existing = ""
+    if let md = MDItemCreate(nil, item.url.path as CFString),
+       let c = MDItemCopyAttribute(md, kMDItemFinderComment) as? String { existing = c }
+    let a = NSAlert(); a.messageText = "Comment"; a.informativeText = "Finder comment for “\(item.name)”:"
+    let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24)); f.stringValue = existing
+    a.accessoryView = f; a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
+    if a.runModal() == .alertFirstButtonReturn { browser.setComment(id: id, f.stringValue) }
+}
 func showInfo(_ browser: Browser, _ ids: Set<String>) {
     guard !ids.isEmpty else { return }
     let a = NSAlert(); a.messageText = "Get Info"; a.informativeText = browser.infoText(ids)
@@ -960,6 +970,63 @@ final class Browser: ObservableObject, Identifiable {
         load()
     }
 
+    // Writes Finder tags via the com.apple.metadata:_kMDItemUserTags xattr (the
+    // URLResourceValues.tagNames setter is macOS 26+, so we set the store directly).
+    // Standard color names get their color index ("Red\n6"); custom tags stay plain.
+    static func writeTags(_ url: URL, _ names: [String]) {
+        let colorIndex: [String: Int] = ["gray": 1, "grey": 1, "green": 2, "purple": 3,
+                                         "blue": 4, "yellow": 5, "red": 6, "orange": 7]
+        let attr = "com.apple.metadata:_kMDItemUserTags"
+        if names.isEmpty {
+            _ = url.withUnsafeFileSystemRepresentation { removexattr($0, attr, 0) }
+            return
+        }
+        let entries = names.map { n -> String in colorIndex[n.lowercased()].map { "\(n)\n\($0)" } ?? n }
+        guard let data = try? PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0) else { return }
+        _ = data.withUnsafeBytes { raw in
+            url.withUnsafeFileSystemRepresentation { path in
+                setxattr(path, attr, raw.baseAddress, data.count, 0, 0)
+            }
+        }
+    }
+    func toggleTag(_ ids: Set<String>, _ tag: String) {
+        let affected = items.filter { ids.contains($0.id) }
+        guard !affected.isEmpty else { return }
+        let undoData: [(URL, [String])] = affected.map { ($0.url, $0.tags) }
+        for it in affected {
+            var t = it.tags
+            if let idx = t.firstIndex(of: tag) { t.remove(at: idx) } else { t.append(tag) }
+            Browser.writeTags(it.url, t)
+        }
+        UndoStack.shared.push("Tag") { [weak self] in
+            for (u, old) in undoData { Browser.writeTags(u, old) }
+            self?.load()
+        }
+        load()
+    }
+    func setTags(_ ids: Set<String>, tags: [String]) {
+        let affected = items.filter { ids.contains($0.id) }
+        guard !affected.isEmpty else { return }
+        let undoData: [(URL, [String])] = affected.map { ($0.url, $0.tags) }
+        for it in affected { Browser.writeTags(it.url, tags) }
+        UndoStack.shared.push("Tag") { [weak self] in
+            for (u, old) in undoData { Browser.writeTags(u, old) }
+            self?.load()
+        }
+        load()
+    }
+    func setComment(id: String, _ comment: String) {
+        guard let it = items.first(where: { $0.id == id }) else { return }
+        let path = it.url.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let c = comment.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let src = "tell application \"Finder\" to set comment of (POSIX file \"\(path)\" as alias) to \"\(c)\""
+        DispatchQueue.global(qos: .userInitiated).async {
+            var err: NSDictionary?
+            NSAppleScript(source: src)?.executeAndReturnError(&err)
+            if let err { NSLog("setComment error: \(err)") }
+        }
+    }
+
     func makeSymlink(_ ids: Set<String>) {
         var created: [URL] = []
         for it in items.filter({ ids.contains($0.id) }) {
@@ -1351,6 +1418,28 @@ struct NameCell: View {
     }
 }
 
+let standardTags = ["Red", "Orange", "Yellow", "Green", "Blue", "Purple", "Gray"]
+
+struct TagsMenu: View {
+    @ObservedObject var browser: Browser
+    let ids: Set<String>
+    var body: some View {
+        Menu("Tags") {
+            ForEach(standardTags, id: \.self) { t in
+                Button { browser.toggleTag(ids, t) } label: {
+                    Label(t, systemImage: appliedToAll(t) ? "checkmark.circle.fill" : "circle")
+                }
+            }
+            Divider()
+            Button("Clear Tags") { browser.setTags(ids, tags: []) }
+        }
+    }
+    private func appliedToAll(_ t: String) -> Bool {
+        let sel = browser.items.filter { ids.contains($0.id) }
+        return !sel.isEmpty && sel.allSatisfy { $0.tags.contains(t) }
+    }
+}
+
 struct OpenWithMenu: View {
     let urls: [URL]
     var body: some View {
@@ -1475,6 +1564,8 @@ struct FileTableView: View {
             Button("Reveal in Finder") { browser.revealInFinder(ids) }
             Divider()
             if ids.count == 1 { Button("Rename…") { promptRename(browser, ids.first!) } }
+            TagsMenu(browser: browser, ids: ids)
+            if ids.count == 1 { Button("Edit Comment…") { promptComment(browser, ids.first!) } }
             Button("Duplicate") { browser.duplicate(ids) }
             Button("Make Alias") { browser.makeAlias(ids) }
             Button("Make Symbolic Link") { browser.makeSymlink(ids) }
@@ -1598,6 +1689,8 @@ struct IconGridView: View {
                 Button("Reveal in Finder") { browser.revealInFinder([item.id]) }
                 Divider()
                 Button("Rename…") { promptRename(browser, item.id) }
+                TagsMenu(browser: browser, ids: [item.id])
+                Button("Edit Comment…") { promptComment(browser, item.id) }
                 Button("Duplicate") { browser.duplicate([item.id]) }
                 Button("Make Alias") { browser.makeAlias([item.id]) }
                 Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
