@@ -30,30 +30,27 @@
     </mask>
   </defs>
 
-  <!-- ground shadow -->
-  <ellipse cx="512" cy="962" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
-
-  <!-- back tab (darkest, flush RIGHT) -->
-  <path d="M488 408 C488 356 516 296 570 296 H908 A40 40 0 0 1 948 336 V408 Z"
+  <!-- back tab (darkest, flush RIGHT edge) -->
+  <path d="M520 408 C520 356 548 296 602 296 H940 A40 40 0 0 1 980 336 V408 Z"
         fill="#3B82CE" filter="url(#tabsh)"/>
-  <!-- middle tab (same shape, stepped back uniformly) -->
+  <!-- middle tab (UNCHANGED) -->
   <path d="M282 408 C282 356 310 296 364 296 H662 C716 296 742 356 742 408 Z"
         fill="#4C97DE" filter="url(#tabsh)"/>
 
-  <!-- FRONT folder: left tab merged into body (one seamless shape), flush LEFT -->
-  <path d="M116 296 H416 C470 296 486 408 536 408 H948 V858
-           A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858
-           V336 A40 40 0 0 1 116 296 Z" fill="url(#back)" filter="url(#tabsh)"/>
+  <!-- FRONT folder: left tab merged, body stretched to sides + bottom -->
+  <path d="M84 296 H384 C438 296 454 408 504 408 H980 V860
+           A140 140 0 0 1 840 1000 H184 A140 140 0 0 1 44 860
+           V336 A40 40 0 0 1 84 296 Z" fill="url(#back)" filter="url(#tabsh)"/>
 
   <!-- shadow the pocket casts on the back -->
-  <rect x="76" y="452" width="872" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
+  <rect x="44" y="452" width="936" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
 
-  <!-- front pocket -->
-  <path d="M76 476 Q512 462 948 476 V858 A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858 Z"
+  <!-- front pocket: stretched to sides + bottom -->
+  <path d="M44 476 Q512 462 980 476 V860 A140 140 0 0 1 840 1000 H184 A140 140 0 0 1 44 860 Z"
         fill="url(#pocket)"/>
-  <path d="M104 474 Q512 461 920 474" fill="none" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="4"/>
+  <path d="M72 474 Q512 461 952 474" fill="none" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="4"/>
 
-  <!-- apple -->
+  <!-- apple (unchanged) -->
   <ellipse cx="512" cy="772" rx="176" ry="158" fill="#000000" opacity="0.12" filter="url(#blur)"/>
   <path d="M508 636 q2 -62 46 -88" fill="none" stroke="url(#stem)" stroke-width="21" stroke-linecap="round"/>
   <g mask="url(#bites)">
