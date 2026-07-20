@@ -34,14 +34,14 @@
   <ellipse cx="512" cy="962" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
 
   <!-- back tab (darkest, flush RIGHT) -->
-  <path d="M672 408 C672 356 700 296 752 296 H908 A48 48 0 0 1 948 344 V408 Z"
+  <path d="M488 408 C488 356 516 296 570 296 H908 A40 40 0 0 1 948 336 V408 Z"
         fill="#3B82CE" filter="url(#tabsh)"/>
-  <!-- middle tab (shifted right) -->
-  <path d="M456 408 C456 356 484 296 536 296 H716 C768 296 796 356 796 408 Z"
+  <!-- middle tab (same shape, stepped back uniformly) -->
+  <path d="M282 408 C282 356 310 296 364 296 H662 C716 296 742 356 742 408 Z"
         fill="#4C97DE" filter="url(#tabsh)"/>
 
-  <!-- FRONT folder: left tab + body as ONE continuous shape (seamless), flush LEFT -->
-  <path d="M116 296 H360 C412 296 430 388 486 388 H948 V858
+  <!-- FRONT folder: left tab merged into body (one seamless shape), flush LEFT -->
+  <path d="M116 296 H416 C470 296 486 408 536 408 H948 V858
            A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858
            V336 A40 40 0 0 1 116 296 Z" fill="url(#back)" filter="url(#tabsh)"/>
 
