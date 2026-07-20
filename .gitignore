@@ -7,3 +7,8 @@ run.log
 run.pid
 *.o
 .DS_Store
+
+# Never commit signing keys
+*.p12
+*.key
+navcert.*

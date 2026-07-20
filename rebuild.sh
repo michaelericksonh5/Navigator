@@ -47,6 +47,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSBonjourServices</key><array><string>_smb._tcp</string></array>
 </dict></plist>
 PLIST
-codesign --force --deep -s - "$APP"
+# Sign with the stable "Navigator Dev" self-signed identity if it exists, so the
+# app's designated requirement stays constant across rebuilds and macOS keeps
+# your Full Disk Access / Local Network grants. Falls back to ad-hoc if absent.
+SIGN_ID="Navigator Dev"
+if security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
+  codesign --force --deep -s "$SIGN_ID" "$APP"
+  echo "Signed with '$SIGN_ID' (stable identity)."
+else
+  codesign --force --deep -s - "$APP"
+  echo "Signed ad-hoc (no '$SIGN_ID' identity found)."
+fi
 touch "$APP"
 echo "Installed $APP"
