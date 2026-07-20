@@ -28,6 +28,14 @@ enum Prefs {
         get { d.object(forKey: "showSidebar") == nil ? true : d.bool(forKey: "showSidebar") }
         set { d.set(newValue, forKey: "showSidebar") }
     }
+    static var sidebarWidth: CGFloat {
+        get { let v = d.double(forKey: "sidebarWidth"); return v < 120 ? 210 : CGFloat(v) }
+        set { d.set(Double(newValue), forKey: "sidebarWidth") }
+    }
+    static var previewWidth: CGFloat {
+        get { let v = d.double(forKey: "previewWidth"); return v < 120 ? 280 : CGFloat(v) }
+        set { d.set(Double(newValue), forKey: "previewWidth") }
+    }
     static var columnData: Data? { get { d.data(forKey: "columnCustomization") } set { d.set(newValue, forKey: "columnCustomization") } }
     static var recentFolders: [String] { get { d.stringArray(forKey: "recentFolders") ?? [] } set { d.set(newValue, forKey: "recentFolders") } }
 }
@@ -1430,70 +1438,133 @@ struct BrowserContent: View {
     }
 }
 
-// A real AppKit NSSplitView gives Finder-quality resizing: per-pane min/max,
-// the file list absorbs window resizing while the sidebar/preview hold their
-// width, remembered divider positions, and animated collapse of the side panes.
-final class PaneSplitController: NSSplitViewController {
+// Frame-based NSSplitView with an explicit delegate. Divider positions are
+// changed ONLY by a user drag or a collapse toggle — never by a relayout — so
+// SwiftUI re-renders (which happen constantly) can't make a divider snap back.
+// This is the classic, predictable model:
+//   • drag a divider  → its two neighbours trade width (min/max enforced)
+//   • resize the window → only the middle (content) pane flexes
+//   • side panes keep their width and are remembered across launches
+final class PaneController: NSViewController, NSSplitViewDelegate {
     let sidebarHC = NSHostingController(rootView: AnyView(EmptyView()))
     let contentHC = NSHostingController(rootView: AnyView(EmptyView()))
     let previewHC = NSHostingController(rootView: AnyView(EmptyView()))
-    private var sidebarItem: NSSplitViewItem!
-    private var previewItem: NSSplitViewItem!
-    private let initialSidebarCollapsed: Bool
-    private let initialPreviewCollapsed: Bool
+
+    private let splitView = NSSplitView()
+    private let sidebarPane = NSView()
+    private let contentPane = NSView()
+    private let previewPane = NSView()
+
+    private let sidebarMin: CGFloat = 180, sidebarMax: CGFloat = 380
+    private let contentMin: CGFloat = 400
+    private let previewMin: CGFloat = 200, previewMax: CGFloat = 620
+
+    private var sidebarWidth = Prefs.sidebarWidth
+    private var previewWidth = Prefs.previewWidth
+    private var sidebarCollapsed: Bool
+    private var previewCollapsed: Bool
+    private var didInitialLayout = false
+    private var applyingLayout = false
 
     init(sidebarCollapsed: Bool, previewCollapsed: Bool) {
-        initialSidebarCollapsed = sidebarCollapsed
-        initialPreviewCollapsed = previewCollapsed
+        self.sidebarCollapsed = sidebarCollapsed
+        self.previewCollapsed = previewCollapsed
         super.init(nibName: nil, bundle: nil)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
+    override func loadView() {
         splitView.isVertical = true
         splitView.dividerStyle = .thin
-        splitView.autosaveName = "NavigatorPanes"   // remembers divider positions across launches
-        splitView.identifier = NSUserInterfaceItemIdentifier("NavigatorPanes")
+        splitView.delegate = self
+        for (pane, hc) in [(sidebarPane, sidebarHC), (contentPane, contentHC), (previewPane, previewHC)] {
+            hc.sizingOptions = []                       // never push SwiftUI's size back into AppKit
+            addChild(hc)
+            hc.view.translatesAutoresizingMaskIntoConstraints = false
+            pane.addSubview(hc.view)
+            NSLayoutConstraint.activate([
+                hc.view.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+                hc.view.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+                hc.view.topAnchor.constraint(equalTo: pane.topAnchor),
+                hc.view.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+            ])
+            splitView.addSubview(pane)
+        }
+        view = splitView
+        NotificationCenter.default.addObserver(self, selector: #selector(didResize(_:)),
+                                               name: NSSplitView.didResizeSubviewsNotification, object: splitView)
+    }
 
-        // Critical: stop each SwiftUI host from pushing its intrinsic size back into
-        // AppKit. Otherwise dragging a divider makes the split view (and the window)
-        // resize to fit content instead of just trading width between two panes.
-        // With this cleared, the split view's min/max + holding priorities are the
-        // sole authority — a divider drag only redistributes its two neighbours.
-        for hc in [sidebarHC, contentHC, previewHC] { hc.sizingOptions = [] }
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        if !didInitialLayout, splitView.bounds.width > 0 {
+            didInitialLayout = true
+            applyLayout()
+        }
+    }
 
-        sidebarItem = NSSplitViewItem(viewController: sidebarHC)
-        sidebarItem.minimumThickness = 180
-        sidebarItem.maximumThickness = 360
-        sidebarItem.canCollapse = true
-        sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
-        sidebarItem.isCollapsed = initialSidebarCollapsed
+    private var total: CGFloat { splitView.bounds.width }
+    private var thickness: CGFloat { splitView.dividerThickness }
 
-        let contentItem = NSSplitViewItem(viewController: contentHC)
-        contentItem.minimumThickness = 420
-        contentItem.canCollapse = false
-        contentItem.holdingPriority = NSLayoutConstraint.Priority(250) // lowest → absorbs window resize
+    // Set divider positions from the stored widths. Called only initially and on
+    // an explicit collapse/expand — NOT on every relayout.
+    private func applyLayout() {
+        guard total > 0 else { return }
+        applyingLayout = true
+        let sw = sidebarCollapsed ? 0 : sidebarWidth
+        let pw = previewCollapsed ? 0 : previewWidth
+        splitView.setPosition(sw, ofDividerAt: 0)
+        splitView.setPosition(total - pw, ofDividerAt: 1)
+        applyingLayout = false
+    }
 
-        previewItem = NSSplitViewItem(viewController: previewHC)
-        previewItem.minimumThickness = 220
-        previewItem.maximumThickness = 560
-        previewItem.canCollapse = true
-        previewItem.holdingPriority = NSLayoutConstraint.Priority(260)
-        previewItem.isCollapsed = initialPreviewCollapsed
+    // Window resize: hold the side panes, let only the content pane flex.
+    func splitView(_ sv: NSSplitView, shouldAdjustSizeOfSubview subview: NSView) -> Bool {
+        subview === contentPane
+    }
+    func splitView(_ sv: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
+        subview === sidebarPane || subview === previewPane
+    }
+    // Drag limits.
+    func splitView(_ sv: NSSplitView, constrainMinCoordinate proposedMin: CGFloat, ofSubviewAt i: Int) -> CGFloat {
+        if i == 0 { return sidebarMin }
+        // divider 1: keep content ≥ contentMin and preview ≤ previewMax
+        return max(sidebarPane.frame.maxX + thickness + contentMin, total - previewMax)
+    }
+    func splitView(_ sv: NSSplitView, constrainMaxCoordinate proposedMax: CGFloat, ofSubviewAt i: Int) -> CGFloat {
+        if i == 0 { return min(sidebarMax, previewPane.frame.minX - thickness - contentMin) }
+        // divider 1: keep preview ≥ previewMin
+        return total - previewMin
+    }
 
-        addSplitViewItem(sidebarItem)
-        addSplitViewItem(contentItem)
-        addSplitViewItem(previewItem)
+    // After any resize (drag or window), remember the side-pane widths and sync
+    // collapse state (in case the user dragged a divider all the way to the edge).
+    @objc private func didResize(_ n: Notification) {
+        guard !applyingLayout else { return }
+        sidebarCollapsed = splitView.isSubviewCollapsed(sidebarPane)
+        previewCollapsed = splitView.isSubviewCollapsed(previewPane)
+        if !sidebarCollapsed, sidebarPane.frame.width > 1 {
+            sidebarWidth = sidebarPane.frame.width; Prefs.sidebarWidth = sidebarWidth
+        }
+        if !previewCollapsed, previewPane.frame.width > 1 {
+            previewWidth = previewPane.frame.width; Prefs.previewWidth = previewWidth
+        }
     }
 
     func setSidebar(collapsed: Bool) {
-        guard let sidebarItem, sidebarItem.isCollapsed != collapsed else { return }
-        sidebarItem.animator().isCollapsed = collapsed
+        guard collapsed != sidebarCollapsed else { return }
+        sidebarCollapsed = collapsed
+        applyLayout()
     }
     func setPreview(collapsed: Bool) {
-        guard let previewItem, previewItem.isCollapsed != collapsed else { return }
-        previewItem.animator().isCollapsed = collapsed
+        guard collapsed != previewCollapsed else { return }
+        previewCollapsed = collapsed
+        applyLayout()
+    }
+    func apply(sidebar: AnyView, content: AnyView, preview: AnyView) {
+        sidebarHC.rootView = sidebar
+        contentHC.rootView = content
+        previewHC.rootView = preview
     }
 }
 
@@ -1501,21 +1572,21 @@ struct BrowserPane: NSViewControllerRepresentable {
     @ObservedObject var model: AppModel
     var browser: Browser
 
-    func makeNSViewController(context: Context) -> PaneSplitController {
-        let vc = PaneSplitController(sidebarCollapsed: !model.showSidebar, previewCollapsed: !model.showPreview)
-        _ = vc.view // force viewDidLoad so items exist
-        applyRootViews(vc)
+    func makeNSViewController(context: Context) -> PaneController {
+        let vc = PaneController(sidebarCollapsed: !model.showSidebar, previewCollapsed: !model.showPreview)
+        _ = vc.view
+        apply(vc)
         return vc
     }
-    func updateNSViewController(_ vc: PaneSplitController, context: Context) {
-        applyRootViews(vc)
+    func updateNSViewController(_ vc: PaneController, context: Context) {
+        apply(vc)
         vc.setSidebar(collapsed: !model.showSidebar)
         vc.setPreview(collapsed: !model.showPreview)
     }
-    private func applyRootViews(_ vc: PaneSplitController) {
-        vc.sidebarHC.rootView = AnyView(SidebarView(browser: browser, favorites: defaultLocations()))
-        vc.contentHC.rootView = AnyView(BrowserContent(model: model, browser: browser).id(browser.id))
-        vc.previewHC.rootView = AnyView(PreviewPane(browser: browser))
+    private func apply(_ vc: PaneController) {
+        vc.apply(sidebar: AnyView(SidebarView(browser: browser, favorites: defaultLocations())),
+                 content: AnyView(BrowserContent(model: model, browser: browser).id(browser.id)),
+                 preview: AnyView(PreviewPane(browser: browser)))
     }
 }
 
