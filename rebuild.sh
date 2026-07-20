@@ -8,8 +8,16 @@ echo "Compiling..."
   -o "$DIR/Navigator.bin" "$DIR/main.swift" \
   -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers
 
-# (Re)generate the icon if the generator is present
-if [ -f "$DIR/makeicon.swift" ]; then
+# (Re)generate the icon: prefer the SVG via rsvg-convert, else the Swift generator
+if command -v rsvg-convert >/dev/null 2>&1 && [ -f "$DIR/Navigator.svg" ]; then
+  rm -rf "$DIR/Navigator.iconset"; mkdir "$DIR/Navigator.iconset"
+  for spec in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" "128 128x128" \
+              "256 128x128@2x" "256 256x256" "512 256x256@2x" "512 512x512" "1024 512x512@2x"; do
+    set -- $spec
+    rsvg-convert -w "$1" -h "$1" "$DIR/Navigator.svg" -o "$DIR/Navigator.iconset/icon_$2.png"
+  done
+  iconutil -c icns -o "$DIR/Navigator.icns" "$DIR/Navigator.iconset"
+elif [ -f "$DIR/makeicon.swift" ]; then
   /usr/bin/swiftc -o "$DIR/makeicon" "$DIR/makeicon.swift" -framework AppKit
   rm -rf "$DIR/Navigator.iconset"
   "$DIR/makeicon" "$DIR/Navigator.iconset"
