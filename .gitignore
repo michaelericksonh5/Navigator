@@ -1,0 +1,9 @@
+# Build artifacts
+Navigator.bin
+makeicon
+Navigator.iconset/
+build.log
+run.log
+run.pid
+*.o
+.DS_Store
