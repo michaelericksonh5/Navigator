@@ -8,7 +8,7 @@
       <stop offset="0" stop-color="#7CC0F7"/>
       <stop offset="1" stop-color="#4E9EE4"/>
     </linearGradient>
-    <radialGradient id="apple" cx="466" cy="620" r="250" gradientUnits="userSpaceOnUse">
+    <radialGradient id="apple" cx="452" cy="640" r="240" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#F76F60"/>
       <stop offset="0.5" stop-color="#E04137"/>
       <stop offset="1" stop-color="#A61E1B"/>
@@ -26,40 +26,43 @@
     </filter>
     <mask id="bites">
       <rect x="0" y="0" width="1024" height="1024" fill="white"/>
-      <circle cx="674" cy="650" r="52" fill="black"/>
-      <circle cx="674" cy="742" r="52" fill="black"/>
+      <circle cx="650" cy="662" r="46" fill="black"/>
+      <circle cx="650" cy="752" r="46" fill="black"/>
     </mask>
   </defs>
 
   <!-- soft ground shadow -->
-  <ellipse cx="512" cy="906" rx="360" ry="42" fill="#000000" opacity="0.18" filter="url(#blur)"/>
+  <ellipse cx="512" cy="906" rx="356" ry="40" fill="#000000" opacity="0.18" filter="url(#blur)"/>
 
-  <!-- folder back with integrated tab (one shape, one color) -->
-  <path d="M96 356 C96 296 132 240 196 240 L344 240 C392 240 404 262 430 320
-           C452 356 474 360 506 360 L832 360 C888 360 928 396 928 452
-           L928 796 C928 852 888 892 832 892 L192 892 C136 892 96 852 96 796 Z"
+  <!-- folder back with a subtle integrated tab -->
+  <path d="M96 384 C96 336 126 300 172 300 L300 300 C332 300 344 316 362 348
+           C378 372 398 376 424 376 L832 376 C888 376 928 412 928 464
+           L928 800 C928 852 888 892 832 892 L192 892 C136 892 96 852 96 800 Z"
         fill="url(#back)"/>
 
   <!-- front pocket -->
-  <path d="M150 410 H874 A54 54 0 0 1 928 464 V838 A54 54 0 0 1 874 892 H150
-           A54 54 0 0 1 96 838 V464 A54 54 0 0 1 150 410 Z" fill="url(#front)"/>
-  <path d="M154 414 H870" stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="4" stroke-linecap="round"/>
+  <path d="M150 422 H874 A54 54 0 0 1 928 476 V838 A54 54 0 0 1 874 892 H150
+           A54 54 0 0 1 96 838 V476 A54 54 0 0 1 150 422 Z" fill="url(#front)"/>
+  <path d="M154 426 H870" stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="4" stroke-linecap="round"/>
 
   <!-- apple shadow -->
-  <ellipse cx="512" cy="716" rx="150" ry="150" fill="#000000" opacity="0.14" filter="url(#blur)"/>
+  <ellipse cx="512" cy="720" rx="150" ry="140" fill="#000000" opacity="0.13" filter="url(#blur)"/>
 
   <!-- stem + leaf -->
-  <path d="M508 610 q0 -58 44 -84" fill="none" stroke="url(#stem)" stroke-width="19" stroke-linecap="round"/>
-  <path d="M556 528 q66 -40 112 4 q-60 44 -112 -4 z" fill="url(#leaf)"/>
-  <path d="M570 528 q42 -2 86 4" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="4"/>
+  <path d="M508 606 q2 -56 42 -80" fill="none" stroke="url(#stem)" stroke-width="18" stroke-linecap="round"/>
+  <path d="M554 532 q64 -38 108 4 q-58 42 -108 -4 z" fill="url(#leaf)"/>
+  <path d="M568 532 q42 -2 84 4" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="4"/>
 
-  <!-- apple body: two lobes (top dip) with bites cut, shared gradient -->
+  <!-- apple body: clean single silhouette, heart-top, with two bites cut -->
   <g mask="url(#bites)">
-    <circle cx="456" cy="700" r="112" fill="url(#apple)"/>
-    <circle cx="568" cy="700" r="112" fill="url(#apple)"/>
-    <ellipse cx="512" cy="770" rx="112" ry="86" fill="url(#apple)"/>
+    <path d="M512 604
+             C544 574 604 576 632 622
+             C662 670 656 784 604 822
+             C566 850 458 850 420 822
+             C368 784 362 670 392 622
+             C420 576 480 574 512 604 Z" fill="url(#apple)"/>
   </g>
 
   <!-- gloss -->
-  <ellipse cx="452" cy="642" rx="40" ry="58" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 452 642)"/>
+  <ellipse cx="452" cy="660" rx="36" ry="54" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 452 660)"/>
 </svg>
