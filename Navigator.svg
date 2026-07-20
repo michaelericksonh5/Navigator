@@ -1,5 +1,8 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
+    <clipPath id="tile">
+      <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224"/>
+    </clipPath>
     <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#5AAAEE"/>
       <stop offset="1" stop-color="#3B82CE"/>
@@ -30,33 +33,33 @@
     </mask>
   </defs>
 
-  <!-- back tab (darkest, flush RIGHT edge) -->
-  <path d="M520 408 C520 356 548 296 602 296 H940 A40 40 0 0 1 980 336 V408 Z"
-        fill="#3B82CE" filter="url(#tabsh)"/>
-  <!-- middle tab (UNCHANGED) -->
-  <path d="M282 408 C282 356 310 296 364 296 H662 C716 296 742 356 742 408 Z"
-        fill="#4C97DE" filter="url(#tabsh)"/>
+  <!-- Everything clipped to the tile; NO base fill above the tabs, so the top stays
+       transparent (off-white plate shows there). Blue runs to the tile edges below. -->
+  <g clip-path="url(#tile)">
+    <!-- back tab (darkest, flush RIGHT edge) -->
+    <path d="M560 408 C560 356 588 296 642 296 H1024 V408 Z" fill="#3B82CE" filter="url(#tabsh)"/>
+    <!-- middle tab -->
+    <path d="M300 408 C300 356 328 296 382 296 H700 C756 296 784 356 784 408 Z"
+          fill="#4C97DE" filter="url(#tabsh)"/>
+    <!-- front folder: left tab flush LEFT edge, body to sides + bottom -->
+    <path d="M0 296 H360 C440 296 460 408 540 408 H1024 V1024 H0 Z"
+          fill="url(#back)" filter="url(#tabsh)"/>
 
-  <!-- FRONT folder: left tab merged, body stretched to sides + bottom -->
-  <path d="M84 296 H384 C438 296 454 408 504 408 H980 V860
-           A140 140 0 0 1 840 1000 H184 A140 140 0 0 1 44 860
-           V336 A40 40 0 0 1 84 296 Z" fill="url(#back)" filter="url(#tabsh)"/>
+    <!-- shadow the pocket casts on the back -->
+    <rect x="0" y="452" width="1024" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
 
-  <!-- shadow the pocket casts on the back -->
-  <rect x="44" y="452" width="936" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
+    <!-- front pocket to sides + bottom -->
+    <path d="M0 476 Q512 462 1024 476 V1024 H0 Z" fill="url(#pocket)"/>
+    <path d="M40 474 Q512 461 984 474" fill="none" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="4"/>
 
-  <!-- front pocket: stretched to sides + bottom -->
-  <path d="M44 476 Q512 462 980 476 V860 A140 140 0 0 1 840 1000 H184 A140 140 0 0 1 44 860 Z"
-        fill="url(#pocket)"/>
-  <path d="M72 474 Q512 461 952 474" fill="none" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="4"/>
-
-  <!-- apple (unchanged) -->
-  <ellipse cx="512" cy="772" rx="176" ry="158" fill="#000000" opacity="0.12" filter="url(#blur)"/>
-  <path d="M508 636 q2 -62 46 -88" fill="none" stroke="url(#stem)" stroke-width="21" stroke-linecap="round"/>
-  <g mask="url(#bites)">
-    <path d="M512 632 C550 596 622 598 656 652 C692 706 684 842 624 886
-             C580 918 452 918 410 886 C350 842 342 706 378 652
-             C412 598 484 596 512 632 Z" fill="url(#apple)"/>
+    <!-- apple -->
+    <ellipse cx="512" cy="772" rx="176" ry="158" fill="#000000" opacity="0.12" filter="url(#blur)"/>
+    <path d="M508 636 q2 -62 46 -88" fill="none" stroke="url(#stem)" stroke-width="21" stroke-linecap="round"/>
+    <g mask="url(#bites)">
+      <path d="M512 632 C550 596 622 598 656 652 C692 706 684 842 624 886
+               C580 918 452 918 410 886 C350 842 342 706 378 652
+               C412 598 484 596 512 632 Z" fill="url(#apple)"/>
+    </g>
+    <ellipse cx="450" cy="708" rx="42" ry="60" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 450 708)"/>
   </g>
-  <ellipse cx="450" cy="708" rx="42" ry="60" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 450 708)"/>
 </svg>
