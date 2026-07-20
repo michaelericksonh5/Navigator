@@ -1,14 +1,14 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#54A6EC"/>
+      <stop offset="0" stop-color="#57A9EE"/>
       <stop offset="1" stop-color="#3B82CE"/>
     </linearGradient>
     <linearGradient id="pocket" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#7EC1F7"/>
+      <stop offset="0" stop-color="#82C4F8"/>
       <stop offset="1" stop-color="#4E9EE4"/>
     </linearGradient>
-    <radialGradient id="apple" cx="452" cy="690" r="270" gradientUnits="userSpaceOnUse">
+    <radialGradient id="apple" cx="452" cy="700" r="270" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#F76F60"/>
       <stop offset="0.5" stop-color="#E04137"/>
       <stop offset="1" stop-color="#A61E1B"/>
@@ -22,36 +22,34 @@
     </filter>
     <mask id="bites">
       <rect x="0" y="0" width="1024" height="1024" fill="white"/>
-      <circle cx="676" cy="706" r="50" fill="black"/>
-      <circle cx="676" cy="806" r="50" fill="black"/>
+      <circle cx="676" cy="716" r="50" fill="black"/>
+      <circle cx="676" cy="816" r="50" fill="black"/>
     </mask>
   </defs>
 
   <!-- ground shadow -->
-  <ellipse cx="512" cy="960" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
+  <ellipse cx="512" cy="962" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
 
-  <!-- three short folder tabs on top, all the same folder color -->
-  <path d="M100 330 A60 60 0 0 1 160 270 H290 A60 60 0 0 1 350 330 V470 H100 Z" fill="url(#back)"/>
-  <path d="M386 330 A60 60 0 0 1 446 270 H578 A60 60 0 0 1 638 330 V470 H386 Z" fill="url(#back)"/>
-  <path d="M674 330 A60 60 0 0 1 734 270 H864 A60 60 0 0 1 924 330 V470 H674 Z" fill="url(#back)"/>
-
-  <!-- folder back (fills sides + bottom) -->
-  <path d="M76 360 H948 V858 A90 90 0 0 1 858 948 H166 A90 90 0 0 1 76 858 Z" fill="url(#back)"/>
+  <!-- folder back: one smooth integrated tab (macOS style), fills sides + bottom -->
+  <path d="M116 300 H404 C462 300 480 388 536 388 H872 A76 76 0 0 1 948 464
+           V858 A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858
+           V340 A40 40 0 0 1 116 300 Z" fill="url(#back)"/>
 
   <!-- shadow the pocket casts on the back -->
-  <rect x="76" y="430" width="872" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
+  <rect x="76" y="452" width="872" height="24" fill="#000000" opacity="0.10" filter="url(#blur)"/>
 
-  <!-- front pocket (fills sides + bottom) -->
-  <path d="M76 452 H948 V858 A90 90 0 0 1 858 948 H166 A90 90 0 0 1 76 858 Z" fill="url(#pocket)"/>
-  <path d="M96 456 H928" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="4" stroke-linecap="round"/>
+  <!-- front pocket: gentle curved top, fills sides + bottom -->
+  <path d="M76 476 Q512 462 948 476 V858 A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858 Z"
+        fill="url(#pocket)"/>
+  <path d="M104 474 Q512 461 920 474" fill="none" stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="4"/>
 
   <!-- apple -->
-  <ellipse cx="512" cy="762" rx="176" ry="158" fill="#000000" opacity="0.12" filter="url(#blur)"/>
-  <path d="M508 626 q2 -62 46 -88" fill="none" stroke="url(#stem)" stroke-width="21" stroke-linecap="round"/>
+  <ellipse cx="512" cy="772" rx="176" ry="158" fill="#000000" opacity="0.12" filter="url(#blur)"/>
+  <path d="M508 636 q2 -62 46 -88" fill="none" stroke="url(#stem)" stroke-width="21" stroke-linecap="round"/>
   <g mask="url(#bites)">
-    <path d="M512 622 C550 586 622 588 656 642 C692 696 684 832 624 876
-             C580 908 452 908 410 876 C350 832 342 696 378 642
-             C412 588 484 586 512 622 Z" fill="url(#apple)"/>
+    <path d="M512 632 C550 596 622 598 656 652 C692 706 684 842 624 886
+             C580 918 452 918 410 886 C350 842 342 706 378 652
+             C412 598 484 596 512 632 Z" fill="url(#apple)"/>
   </g>
-  <ellipse cx="450" cy="698" rx="42" ry="60" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 450 698)"/>
+  <ellipse cx="450" cy="708" rx="42" ry="60" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 450 708)"/>
 </svg>
