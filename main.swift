@@ -2,10 +2,108 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import Quartz
+import CoreServices
 
 enum ViewMode { case list, icon }
 enum SortField: String, CaseIterable { case name, modified, size, kind }
 enum GroupBy: String, CaseIterable { case none, kind, date, size }
+
+// Rich per-file metadata read lazily from Spotlight (the same index Finder uses):
+// media duration, pixel dimensions, and Finder comment. Loaded off the main
+// thread and cached, so scrolling a folder of media never blocks.
+struct FileMeta {
+    var duration: Double?          // seconds (audio/video)
+    var width: Int?
+    var height: Int?
+    var comment: String?
+    var loaded = false
+}
+
+final class MetadataCache {
+    static let shared = MetadataCache()
+    private var store: [String: FileMeta] = [:]
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "navigator.metadata", qos: .utility, attributes: .concurrent)
+
+    func meta(for url: URL, completion: @escaping (FileMeta) -> Void) {
+        let key = url.path
+        lock.lock(); let cached = store[key]; lock.unlock()
+        if let cached { completion(cached); return }
+        queue.async {
+            var m = FileMeta(loaded: true)
+            if let md = MDItemCreate(nil, url.path as CFString) {
+                if let d = MDItemCopyAttribute(md, kMDItemDurationSeconds) as? Double { m.duration = d }
+                if let w = MDItemCopyAttribute(md, kMDItemPixelWidth) as? Int { m.width = w }
+                if let h = MDItemCopyAttribute(md, kMDItemPixelHeight) as? Int { m.height = h }
+                if let c = MDItemCopyAttribute(md, kMDItemFinderComment) as? String, !c.isEmpty { m.comment = c }
+            }
+            self.lock.lock(); self.store[key] = m; self.lock.unlock()
+            DispatchQueue.main.async { completion(m) }
+        }
+    }
+}
+
+func formatDuration(_ seconds: Double) -> String {
+    guard seconds >= 1 else { return "" }
+    let total = Int(seconds.rounded())
+    let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+}
+
+// Maps Finder's standard tag names to their dot colors; unknown tags show gray.
+func tagColor(_ name: String) -> Color {
+    switch name.lowercased() {
+    case "red": return .red
+    case "orange": return .orange
+    case "yellow": return .yellow
+    case "green": return .green
+    case "blue": return .blue
+    case "purple": return .purple
+    case "gray", "grey": return .gray
+    default: return .secondary
+    }
+}
+
+// A table cell that lazily loads Spotlight metadata for one file (like the
+// thumbnail cells): shows "—" until the value arrives, then updates in place.
+struct MetadataCell: View {
+    enum Field { case duration, dimensions }
+    let url: URL
+    let field: Field
+    @State private var text = "—"
+    var body: some View {
+        Text(text).foregroundStyle(.secondary).lineLimit(1)
+            .onAppear { load() }
+            .onChange(of: url) { text = "—"; load() }
+    }
+    private func load() {
+        MetadataCache.shared.meta(for: url) { m in
+            switch field {
+            case .duration:
+                let d = m.duration.map(formatDuration) ?? ""
+                text = d.isEmpty ? "—" : d
+            case .dimensions:
+                if let w = m.width, let h = m.height, w > 0, h > 0 { text = "\(w) × \(h)" } else { text = "—" }
+            }
+        }
+    }
+}
+
+struct TagsCell: View {
+    let tags: [String]
+    var body: some View {
+        if tags.isEmpty {
+            Text("—").foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 4) {
+                ForEach(tags.prefix(5), id: \.self) { tag in
+                    Circle().fill(tagColor(tag)).frame(width: 8, height: 8)
+                }
+                Text(tags.joined(separator: ", ")).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+    }
+}
 
 // MARK: - Persistence (UserDefaults-backed view settings)
 
@@ -165,6 +263,7 @@ struct FileItem: Identifiable, Hashable {
     let accessed: Date
     let dateAdded: Date
     let kind: String
+    let tags: [String]
 
     var ext: String { isDirectory ? "" : url.pathExtension.lowercased() }
     var baseName: String { (name as NSString).deletingPathExtension }
@@ -359,7 +458,7 @@ final class Browser: ObservableObject, Identifiable {
 
     static let itemKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
                                              .creationDateKey, .contentAccessDateKey, .addedToDirectoryDateKey,
-                                             .localizedTypeDescriptionKey]
+                                             .localizedTypeDescriptionKey, .tagNamesKey]
 
     static func item(from u: URL, _ rv: URLResourceValues?) -> FileItem {
         let isDir = rv?.isDirectory ?? false
@@ -370,7 +469,8 @@ final class Browser: ObservableObject, Identifiable {
                         created: rv?.creationDate ?? modified,
                         accessed: (rv?.allValues[.contentAccessDateKey] as? Date) ?? modified,
                         dateAdded: (rv?.allValues[.addedToDirectoryDateKey] as? Date) ?? modified,
-                        kind: rv?.localizedTypeDescription ?? (isDir ? "Folder" : "File"))
+                        kind: rv?.localizedTypeDescription ?? (isDir ? "Folder" : "File"),
+                        tags: (rv?.allValues[.tagNamesKey] as? [String]) ?? [])
     }
 
     private func makeItem(_ u: URL) -> FileItem {
@@ -1110,33 +1210,57 @@ struct FileTableView: View {
         for it in chosen { NSWorkspace.shared.open(it.url) }
     }
 
+    // Columns live in their own builder with an explicit type so the compiler
+    // doesn't choke inferring the (large) Table generic signature.
+    @TableColumnBuilder<FileItem, KeyPathComparator<FileItem>>
+    private var columns: some TableColumnContent<FileItem, KeyPathComparator<FileItem>> {
+        Group {
+            TableColumn("Name", value: \FileItem.name) { item in
+                NameCell(item: item, browser: browser)
+            }.customizationID("name")
+            TableColumn("Date Modified", value: \FileItem.modified) { item in
+                Text(item.modified, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("modified")
+            TableColumn("Size", value: \FileItem.size) { item in
+                Text(item.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).foregroundStyle(.secondary)
+            }.width(min: 70, ideal: 90).customizationID("size")
+            TableColumn("Kind", value: \FileItem.kind) { item in
+                Text(item.kind).foregroundStyle(.secondary).lineLimit(1)
+            }.width(min: 90, ideal: 130).customizationID("kind")
+        }
+        Group {
+            TableColumn("Date Created", value: \FileItem.created) { item in
+                Text(item.created, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("created").defaultVisibility(.hidden)
+            TableColumn("Date Last Opened", value: \FileItem.accessed) { item in
+                Text(item.accessed, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("accessed").defaultVisibility(.hidden)
+            TableColumn("Date Added", value: \FileItem.dateAdded) { item in
+                Text(item.dateAdded, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("dateAdded").defaultVisibility(.hidden)
+            TableColumn("Extension", value: \FileItem.ext) { item in
+                Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary)
+            }.width(min: 60, ideal: 80).customizationID("extension").defaultVisibility(.hidden)
+        }
+        Group {
+            TableColumn("Duration") { (item: FileItem) in
+                if item.isDirectory { Text("—").foregroundStyle(.secondary) }
+                else { MetadataCell(url: item.url, field: .duration) }
+            }.width(min: 70, ideal: 90).customizationID("duration").defaultVisibility(.hidden)
+            TableColumn("Dimensions") { (item: FileItem) in
+                if item.isDirectory { Text("—").foregroundStyle(.secondary) }
+                else { MetadataCell(url: item.url, field: .dimensions) }
+            }.width(min: 90, ideal: 110).customizationID("dimensions").defaultVisibility(.hidden)
+            TableColumn("Tags") { (item: FileItem) in
+                TagsCell(tags: item.tags)
+            }.width(min: 90, ideal: 140).customizationID("tags").defaultVisibility(.hidden)
+        }
+    }
+
     var body: some View {
         Table(of: FileItem.self, selection: $browser.selection, sortOrder: $browser.sortOrder,
               columnCustomization: $columnCustomization) {
-            TableColumn("Name", value: \.name) { item in
-                NameCell(item: item, browser: browser)
-            }.customizationID("name")
-            TableColumn("Date Modified", value: \.modified) { item in
-                Text(item.modified, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
-            }.width(min: 150, ideal: 185).customizationID("modified")
-            TableColumn("Size", value: \.size) { item in
-                Text(item.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).foregroundStyle(.secondary)
-            }.width(min: 70, ideal: 90).customizationID("size")
-            TableColumn("Kind", value: \.kind) { item in
-                Text(item.kind).foregroundStyle(.secondary).lineLimit(1)
-            }.width(min: 90, ideal: 130).customizationID("kind")
-            TableColumn("Date Created", value: \.created) { item in
-                Text(item.created, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
-            }.width(min: 150, ideal: 185).customizationID("created").defaultVisibility(.hidden)
-            TableColumn("Date Last Opened", value: \.accessed) { item in
-                Text(item.accessed, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
-            }.width(min: 150, ideal: 185).customizationID("accessed").defaultVisibility(.hidden)
-            TableColumn("Date Added", value: \.dateAdded) { item in
-                Text(item.dateAdded, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
-            }.width(min: 150, ideal: 185).customizationID("dateAdded").defaultVisibility(.hidden)
-            TableColumn("Extension", value: \.ext) { item in
-                Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary)
-            }.width(min: 60, ideal: 80).customizationID("extension").defaultVisibility(.hidden)
+            columns
         } rows: {
             if browser.groupBy == .none {
                 ForEach(browser.visibleItems()) { item in tableRow(item) }
@@ -1303,6 +1427,7 @@ struct IconGridView: View {
 struct PreviewPane: View {
     @ObservedObject var browser: Browser
     @State private var thumb: NSImage?
+    @State private var meta = FileMeta()
     private static let df: DateFormatter = { let d = DateFormatter(); d.dateStyle = .medium; d.timeStyle = .short; return d }()
     private var item: FileItem? {
         let sel = browser.items.filter { browser.selection.contains($0.id) }
@@ -1320,11 +1445,18 @@ struct PreviewPane: View {
                 VStack(alignment: .leading, spacing: 6) {
                     infoRow("Kind", it.kind)
                     infoRow("Size", it.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: it.size, countStyle: .file))
+                    if let d = meta.duration, d >= 1 { infoRow("Duration", formatDuration(d)) }
+                    if let w = meta.width, let h = meta.height, w > 0, h > 0 { infoRow("Dimensions", "\(w) × \(h)") }
+                    infoRow("Created", Self.df.string(from: it.created))
                     infoRow("Modified", Self.df.string(from: it.modified))
-                    if let c = (try? it.url.resourceValues(forKeys: [.creationDateKey]))?.creationDate {
-                        infoRow("Created", Self.df.string(from: c))
+                    infoRow("Added", Self.df.string(from: it.dateAdded))
+                    if !it.tags.isEmpty {
+                        HStack(alignment: .top, spacing: 6) {
+                            Text("Tags").foregroundStyle(.secondary).frame(width: 72, alignment: .leading)
+                            TagsCell(tags: it.tags)
+                        }
                     }
-                    if let t = thumb { infoRow("Dimensions", "\(Int(t.size.width)) × \(Int(t.size.height))") }
+                    if let c = meta.comment { infoRow("Comment", c) }
                     infoRow("Where", it.url.deletingLastPathComponent().path)
                 }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                 Spacer()
@@ -1341,8 +1473,8 @@ struct PreviewPane: View {
         }
         .padding(14).frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.4))
-        .onChange(of: browser.selection) { loadThumb() }
-        .onAppear { loadThumb() }
+        .onChange(of: browser.selection) { loadDetails() }
+        .onAppear { loadDetails() }
     }
     @ViewBuilder private func infoRow(_ k: String, _ v: String) -> some View {
         HStack(alignment: .top, spacing: 6) {
@@ -1350,11 +1482,14 @@ struct PreviewPane: View {
             Text(v).textSelection(.enabled).lineLimit(3)
         }
     }
-    private func loadThumb() {
-        guard let it = item else { thumb = nil; return }
-        thumb = nil
+    private func loadDetails() {
+        guard let it = item else { thumb = nil; meta = FileMeta(); return }
+        thumb = nil; meta = FileMeta()
         ThumbnailCache.shared.thumbnail(for: it.url) { img in
             if self.item?.url == it.url { self.thumb = img }
+        }
+        MetadataCache.shared.meta(for: it.url) { m in
+            if self.item?.url == it.url { self.meta = m }
         }
     }
 }
