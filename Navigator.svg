@@ -21,7 +21,7 @@
       <feGaussianBlur stdDeviation="13"/>
     </filter>
     <filter id="tabsh" x="-40%" y="-40%" width="180%" height="180%">
-      <feDropShadow dx="7" dy="6" stdDeviation="7" flood-color="#173F71" flood-opacity="0.35"/>
+      <feDropShadow dx="8" dy="5" stdDeviation="7" flood-color="#123863" flood-opacity="0.30"/>
     </filter>
     <mask id="bites">
       <rect x="0" y="0" width="1024" height="1024" fill="white"/>
@@ -33,16 +33,13 @@
   <!-- ground shadow -->
   <ellipse cx="512" cy="962" rx="404" ry="34" fill="#000000" opacity="0.16" filter="url(#blur)"/>
 
-  <!-- three OVERLAPPING tabs (same color; overlap shown by soft seam shadows) -->
-  <g filter="url(#tabsh)">
-    <path d="M470 404 C470 348 500 292 552 292 H710 C762 292 792 348 792 404 Z" fill="#57A9EE"/>
-  </g>
-  <g filter="url(#tabsh)">
-    <path d="M300 404 C300 348 330 292 382 292 H540 C592 292 622 348 622 404 Z" fill="#57A9EE"/>
-  </g>
-  <g filter="url(#tabsh)">
-    <path d="M116 404 C116 348 146 292 198 292 H356 C408 292 438 348 438 404 Z" fill="#57A9EE"/>
-  </g>
+  <!-- three overlapping tabs: darkest (back, flush RIGHT) -> lightest (front, flush LEFT) -->
+  <path d="M556 406 C556 356 584 296 636 296 H908 A40 40 0 0 1 948 336 V406 Z"
+        fill="#3B82CE" filter="url(#tabsh)"/>
+  <path d="M300 406 C300 356 328 296 380 296 H568 C620 296 648 356 648 406 Z"
+        fill="#4C97DE" filter="url(#tabsh)"/>
+  <path d="M76 406 V336 A40 40 0 0 1 116 296 H360 C412 296 440 356 440 406 Z"
+        fill="#63B0EF" filter="url(#tabsh)"/>
 
   <!-- folder back (fills sides + bottom) -->
   <path d="M76 388 H948 V858 A92 92 0 0 1 856 950 H168 A92 92 0 0 1 76 858 Z" fill="url(#back)"/>
