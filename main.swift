@@ -161,7 +161,13 @@ struct FileItem: Identifiable, Hashable {
     let isDirectory: Bool
     let size: Int64
     let modified: Date
+    let created: Date
+    let accessed: Date
+    let dateAdded: Date
     let kind: String
+
+    var ext: String { isDirectory ? "" : url.pathExtension.lowercased() }
+    var baseName: String { (name as NSString).deletingPathExtension }
 
     static func == (l: FileItem, r: FileItem) -> Bool { l.id == r.id }
     func hash(into h: inout Hasher) { h.combine(id) }
@@ -351,14 +357,24 @@ final class Browser: ObservableObject, Identifiable {
 
     func icon(for item: FileItem) -> NSImage { NSWorkspace.shared.icon(forFile: item.url.path) }
 
-    private func makeItem(_ u: URL) -> FileItem {
-        let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .localizedTypeDescriptionKey]
-        let rv = try? u.resourceValues(forKeys: keys)
+    static let itemKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
+                                             .creationDateKey, .contentAccessDateKey, .addedToDirectoryDateKey,
+                                             .localizedTypeDescriptionKey]
+
+    static func item(from u: URL, _ rv: URLResourceValues?) -> FileItem {
         let isDir = rv?.isDirectory ?? false
+        let modified = rv?.contentModificationDate ?? Date.distantPast
         return FileItem(id: u.path, url: u, name: u.lastPathComponent,
                         isDirectory: isDir, size: Int64(rv?.fileSize ?? 0),
-                        modified: rv?.contentModificationDate ?? Date.distantPast,
+                        modified: modified,
+                        created: rv?.creationDate ?? modified,
+                        accessed: (rv?.allValues[.contentAccessDateKey] as? Date) ?? modified,
+                        dateAdded: (rv?.allValues[.addedToDirectoryDateKey] as? Date) ?? modified,
                         kind: rv?.localizedTypeDescription ?? (isDir ? "Folder" : "File"))
+    }
+
+    private func makeItem(_ u: URL) -> FileItem {
+        Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))
     }
 
     // The view order: sort, folders-first, then name filter.
@@ -491,20 +507,13 @@ final class Browser: ObservableObject, Identifiable {
     func load() {
         isRecents = false
         isSearching = false
-        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey,
-                                      .contentModificationDateKey, .localizedTypeDescriptionKey]
+        let keys = Browser.itemKeys
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         var result: [FileItem] = []
         if let urls = try? fm.contentsOfDirectory(at: currentURL, includingPropertiesForKeys: keys, options: opts) {
             for u in urls {
-                let rv = try? u.resourceValues(forKeys: Set(keys))
-                let isDir = rv?.isDirectory ?? false
-                let size = Int64(rv?.fileSize ?? 0)
-                let mod = rv?.contentModificationDate ?? Date.distantPast
-                let kind = rv?.localizedTypeDescription ?? (isDir ? "Folder" : "File")
-                result.append(FileItem(id: u.path, url: u, name: u.lastPathComponent,
-                                       isDirectory: isDir, size: size, modified: mod, kind: kind))
+                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
             }
         }
         items = result
@@ -1116,6 +1125,18 @@ struct FileTableView: View {
             TableColumn("Kind", value: \.kind) { item in
                 Text(item.kind).foregroundStyle(.secondary).lineLimit(1)
             }.width(min: 90, ideal: 130).customizationID("kind")
+            TableColumn("Date Created", value: \.created) { item in
+                Text(item.created, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("created").defaultVisibility(.hidden)
+            TableColumn("Date Last Opened", value: \.accessed) { item in
+                Text(item.accessed, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("accessed").defaultVisibility(.hidden)
+            TableColumn("Date Added", value: \.dateAdded) { item in
+                Text(item.dateAdded, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+            }.width(min: 150, ideal: 185).customizationID("dateAdded").defaultVisibility(.hidden)
+            TableColumn("Extension", value: \.ext) { item in
+                Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary)
+            }.width(min: 60, ideal: 80).customizationID("extension").defaultVisibility(.hidden)
         } rows: {
             if browser.groupBy == .none {
                 ForEach(browser.visibleItems()) { item in tableRow(item) }
