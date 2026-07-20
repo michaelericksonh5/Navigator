@@ -386,8 +386,12 @@ final class Browser: ObservableObject, Identifiable {
 
     // Background copy/move with a busy indicator (keeps the UI responsive on big transfers).
     func copyURLs(_ urls: [URL], move: Bool) {
-        let sources = urls.filter { $0.path != currentURL.path }
-        guard !sources.isEmpty else { NSSound.beep(); return }
+        // Skip items that already live in this folder — dropping into the same
+        // folder is a no-op (cancel), not a self-copy.
+        let sources = urls.filter {
+            $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path
+        }
+        guard !sources.isEmpty else { return }
         let dir = currentURL
         busy = true; busyText = move ? "Moving…" : "Copying…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -500,7 +504,18 @@ final class Browser: ObservableObject, Identifiable {
 final class AppModel: ObservableObject {
     @Published var tabs: [Browser]
     @Published var selected: Int = 0
-    init() { tabs = [Browser(start: FileManager.default.homeDirectoryForCurrentUser)] }
+    init() {
+        tabs = [Browser(start: FileManager.default.homeDirectoryForCurrentUser)]
+        // Refresh the sidebar the instant a disk/USB/network share mounts or ejects,
+        // so new volumes appear (and stale ones disappear) automatically.
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification,
+                     NSWorkspace.didRenameVolumeNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+        }
+    }
     var active: Browser { tabs[max(0, min(selected, tabs.count - 1))] }
     func newTab(at url: URL? = nil) {
         tabs.append(Browser(start: url ?? FileManager.default.homeDirectoryForCurrentUser))
