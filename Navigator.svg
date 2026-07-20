@@ -1,63 +1,65 @@
 <svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="tab" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#EBB047"/>
-      <stop offset="1" stop-color="#D2942A"/>
-    </linearGradient>
     <linearGradient id="back" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#F4C556"/>
-      <stop offset="1" stop-color="#E0A836"/>
+      <stop offset="0" stop-color="#54A6EC"/>
+      <stop offset="1" stop-color="#3B82CE"/>
     </linearGradient>
     <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#FDDC81"/>
-      <stop offset="1" stop-color="#F0BB4C"/>
+      <stop offset="0" stop-color="#7CC0F7"/>
+      <stop offset="1" stop-color="#4E9EE4"/>
     </linearGradient>
-    <radialGradient id="apple" cx="0.36" cy="0.28" r="0.9">
-      <stop offset="0" stop-color="#F46A5E"/>
-      <stop offset="0.5" stop-color="#DE3E35"/>
-      <stop offset="1" stop-color="#A81E1B"/>
+    <radialGradient id="apple" cx="466" cy="620" r="250" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F76F60"/>
+      <stop offset="0.5" stop-color="#E04137"/>
+      <stop offset="1" stop-color="#A61E1B"/>
     </radialGradient>
     <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#63C457"/>
+      <stop offset="0" stop-color="#66C95A"/>
       <stop offset="1" stop-color="#2C8A3B"/>
     </linearGradient>
     <linearGradient id="stem" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#814E27"/>
-      <stop offset="1" stop-color="#573015"/>
+      <stop offset="0" stop-color="#83502A"/>
+      <stop offset="1" stop-color="#563015"/>
     </linearGradient>
     <filter id="blur" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="16"/>
+      <feGaussianBlur stdDeviation="15"/>
     </filter>
     <mask id="bites">
-      <rect x="0" y="0" width="1024" height="1024" fill="black"/>
-      <circle cx="512" cy="632" r="148" fill="white"/>
-      <circle cx="650" cy="585" r="58" fill="black"/>
-      <circle cx="650" cy="688" r="58" fill="black"/>
+      <rect x="0" y="0" width="1024" height="1024" fill="white"/>
+      <circle cx="674" cy="650" r="52" fill="black"/>
+      <circle cx="674" cy="742" r="52" fill="black"/>
     </mask>
   </defs>
 
   <!-- soft ground shadow -->
-  <ellipse cx="512" cy="838" rx="360" ry="46" fill="#000000" opacity="0.20" filter="url(#blur)"/>
+  <ellipse cx="512" cy="906" rx="360" ry="42" fill="#000000" opacity="0.18" filter="url(#blur)"/>
 
-  <!-- folder -->
-  <rect x="150" y="344" width="300" height="132" rx="34" fill="url(#tab)"/>
-  <rect x="112" y="396" width="800" height="426" rx="52" fill="url(#back)"/>
-  <path d="M112 474 h800 v296 a52 52 0 0 1 -52 52 h-696 a52 52 0 0 1 -52 -52 z" fill="url(#front)"/>
-  <rect x="112" y="474" width="800" height="5" rx="2.5" fill="#FFFFFF" opacity="0.45"/>
+  <!-- folder back with integrated tab (one shape, one color) -->
+  <path d="M96 356 C96 296 132 240 196 240 L344 240 C392 240 404 262 430 320
+           C452 356 474 360 506 360 L832 360 C888 360 928 396 928 452
+           L928 796 C928 852 888 892 832 892 L192 892 C136 892 96 852 96 796 Z"
+        fill="url(#back)"/>
 
-  <!-- apple soft shadow -->
-  <ellipse cx="512" cy="656" rx="150" ry="150" fill="#000000" opacity="0.15" filter="url(#blur)"/>
+  <!-- front pocket -->
+  <path d="M150 410 H874 A54 54 0 0 1 928 464 V838 A54 54 0 0 1 874 892 H150
+           A54 54 0 0 1 96 838 V464 A54 54 0 0 1 150 410 Z" fill="url(#front)"/>
+  <path d="M154 414 H870" stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- apple shadow -->
+  <ellipse cx="512" cy="716" rx="150" ry="150" fill="#000000" opacity="0.14" filter="url(#blur)"/>
 
   <!-- stem + leaf -->
-  <path d="M506 512 q4 -52 44 -70" fill="none" stroke="url(#stem)" stroke-width="19" stroke-linecap="round"/>
-  <path d="M552 452 q64 -40 108 2 q-58 44 -108 -2 z" fill="url(#leaf)"/>
-  <path d="M566 452 q40 -2 82 4" fill="none" stroke="#FFFFFF" stroke-opacity="0.30" stroke-width="4"/>
+  <path d="M508 610 q0 -58 44 -84" fill="none" stroke="url(#stem)" stroke-width="19" stroke-linecap="round"/>
+  <path d="M556 528 q66 -40 112 4 q-60 44 -112 -4 z" fill="url(#leaf)"/>
+  <path d="M570 528 q42 -2 86 4" fill="none" stroke="#FFFFFF" stroke-opacity="0.28" stroke-width="4"/>
 
-  <!-- apple body with two bites cut out -->
+  <!-- apple body: two lobes (top dip) with bites cut, shared gradient -->
   <g mask="url(#bites)">
-    <circle cx="512" cy="632" r="148" fill="url(#apple)"/>
+    <circle cx="456" cy="700" r="112" fill="url(#apple)"/>
+    <circle cx="568" cy="700" r="112" fill="url(#apple)"/>
+    <ellipse cx="512" cy="770" rx="112" ry="86" fill="url(#apple)"/>
   </g>
 
-  <!-- specular gloss -->
-  <ellipse cx="466" cy="582" rx="40" ry="58" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 466 582)"/>
+  <!-- gloss -->
+  <ellipse cx="452" cy="642" rx="40" ry="58" fill="#FFFFFF" opacity="0.22" transform="rotate(-20 452 642)"/>
 </svg>
