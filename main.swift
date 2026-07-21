@@ -6,7 +6,7 @@ import CoreServices
 
 extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
 
-enum ViewMode: String { case list, tree, icon, gallery, column }
+enum ViewMode: String { case list, icon, gallery, column }
 enum ConflictPolicy { case keepBoth, replace, skip }
 
 final class TransferProgress: ObservableObject {
@@ -1376,6 +1376,8 @@ struct SidebarView: View {
     @ObservedObject var recents = RecentFolders.shared
     @ObservedObject var network = NetworkBrowser.shared
     @ObservedObject var favStore = FavoritesStore.shared
+    @State private var favNodes: [SidebarNode] = []
+    @State private var cloudNodes: [SidebarNode] = []
 
     @ViewBuilder private func row(_ loc: SidebarLocation) -> some View {
         HStack(spacing: 2) {
@@ -1390,21 +1392,27 @@ struct SidebarView: View {
         }
     }
 
+    // An expandable folder entry (Windows-11-style): disclosure triangle drills
+    // into subfolders inline; clicking any node navigates the main view there.
+    @ViewBuilder private func tree(_ node: SidebarNode, removable: Bool) -> some View {
+        OutlineGroup(node, children: \.children) { n in
+            Button { browser.navigate(to: n.url) } label: {
+                Label(n.name, systemImage: n.symbol).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
+            }.buttonStyle(.plain).help(n.url.path)
+                .contextMenu {
+                    if removable && n.id == node.id { Button("Remove from Sidebar") { favStore.remove(n.url) } }
+                }
+        }
+    }
+
     var body: some View {
-        let clouds = cloudLocations()
         let volumes = volumeLocations()
         List {
             Section("Favorites") {
                 Button { browser.loadRecents() } label: {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
-                ForEach(favStore.urls, id: \.self) { u in
-                    Button { browser.navigate(to: u) } label: {
-                        Label(favoriteName(u), systemImage: favoriteSymbol(u)).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
-                    }.buttonStyle(.plain).help(u.path)
-                        .contextMenu { Button("Remove from Sidebar") { favStore.remove(u) } }
-                }
-                .onMove { favStore.move(from: $0, to: $1) }
+                ForEach(favNodes) { tree($0, removable: true) }
             }
             .dropDestination(for: URL.self) { urls, _ in
                 for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }
@@ -1426,8 +1434,8 @@ struct SidebarView: View {
                     }
                 }
             }
-            if !clouds.isEmpty {
-                Section("Cloud") { ForEach(clouds) { row($0) } }
+            if !cloudNodes.isEmpty {
+                Section("Cloud") { ForEach(cloudNodes) { tree($0, removable: false) } }
             }
             Section("Locations") { ForEach(volumes) { row($0) } }
             if !network.servers.isEmpty {
@@ -1439,7 +1447,18 @@ struct SidebarView: View {
                     }
                 }
             }
-        }.listStyle(.sidebar)
+        }
+        .listStyle(.sidebar)
+        .onAppear { rebuildNodes() }
+        .onChange(of: favStore.urls) { rebuildFav() }
+    }
+
+    private func rebuildFav() {
+        favNodes = favStore.urls.map { SidebarNode(url: $0, name: favoriteName($0), symbol: favoriteSymbol($0)) }
+    }
+    private func rebuildNodes() {
+        rebuildFav()
+        cloudNodes = cloudLocations().map { SidebarNode(url: $0.url, name: $0.name, symbol: $0.symbol) }
     }
 }
 
@@ -1530,11 +1549,10 @@ struct ControlBar: View {
                 }.help("Toggle Preview Pane").foregroundStyle(model.showPreview ? Color.accentColor : .secondary)
                 Picker("", selection: $browser.viewMode) {
                     Image(systemName: "list.bullet").tag(ViewMode.list)
-                    Image(systemName: "list.bullet.indent").tag(ViewMode.tree)
                     Image(systemName: "square.grid.2x2").tag(ViewMode.icon)
                     Image(systemName: "rectangle.split.3x1").tag(ViewMode.column)
                     Image(systemName: "photo.on.rectangle").tag(ViewMode.gallery)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 185).help("View")
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 150).help("View")
             }
             // Row 2: full-width address bar on its own line
             HStack(spacing: 6) {
@@ -1975,101 +1993,29 @@ struct PreviewPane: View {
 }
 
 // Miller-column (Finder column) view: a horizontal chain of folder listings.
-// A lazily-loaded node for the expandable tree (Finder-style disclosure list).
-// `children` loads one level on first access (nil for files / empty / unreadable
-// folders, so those show no disclosure triangle).
-final class TreeNode: Identifiable {
-    let item: FileItem
-    let showHidden: Bool
-    var id: String { item.id }
+// A lazily-loaded folder node for the sidebar's expandable tree (Windows-11-style
+// navigation pane). Shows sub-FOLDERS only; `children` loads one level on first
+// access (nil when a folder has no subfolders, so no disclosure triangle shows).
+final class SidebarNode: Identifiable {
+    let url: URL
+    let name: String
+    let symbol: String
+    var id: String { url.path }
     private var loaded = false
-    private var cache: [TreeNode] = []
-    init(item: FileItem, showHidden: Bool) { self.item = item; self.showHidden = showHidden }
+    private var cache: [SidebarNode] = []
+    init(url: URL, name: String, symbol: String) { self.url = url; self.name = name; self.symbol = symbol }
 
-    var children: [TreeNode]? {
-        guard item.isDirectory else { return nil }
-        if !loaded { loaded = true; cache = TreeNode.load(item.url, showHidden: showHidden) }
+    var children: [SidebarNode]? {
+        if !loaded { loaded = true; cache = SidebarNode.subfolders(url) }
         return cache.isEmpty ? nil : cache
     }
-    static func load(_ dir: URL, showHidden: Bool) -> [TreeNode] {
-        let keys = Browser.itemKeys
-        var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
-        if !showHidden { opts.insert(.skipsHiddenFiles) }
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: opts) else { return [] }
-        let items = urls.map { Browser.item(from: $0, try? $0.resourceValues(forKeys: Set(keys))) }
-        return items
-            .sorted { ($0.isDirectory ? 0 : 1, $0.name.localizedLowercase) < ($1.isDirectory ? 0 : 1, $1.name.localizedLowercase) }
-            .map { TreeNode(item: $0, showHidden: showHidden) }
-    }
-}
-
-struct TreeTableView: View {
-    let model: AppModel
-    @ObservedObject var browser: Browser
-    @State private var roots: [TreeNode] = []
-    private static let df: DateFormatter = { let d = DateFormatter(); d.dateStyle = .medium; d.timeStyle = .short; return d }()
-
-    var body: some View {
-        Table(roots, children: \.children, selection: $browser.selection) {
-            TableColumn("Name") { (node: TreeNode) in
-                HStack(spacing: 6) {
-                    Image(nsImage: browser.icon(for: node.item)).resizable().frame(width: 16, height: 16)
-                    Text(node.item.name).lineLimit(1)
-                }
-            }
-            TableColumn("Date Modified") { (node: TreeNode) in
-                Text(node.item.modified, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
-            }.width(min: 140, ideal: 175)
-            TableColumn("Size") { (node: TreeNode) in
-                Text(node.item.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: node.item.size, countStyle: .file)).foregroundStyle(.secondary)
-            }.width(min: 70, ideal: 90)
-            TableColumn("Kind") { (node: TreeNode) in
-                Text(node.item.kind).foregroundStyle(.secondary).lineLimit(1)
-            }.width(min: 90, ideal: 130)
-        }
-        .contextMenu(forSelectionType: String.self) { ids in
-            treeMenu(ids)
-        } primaryAction: { ids in
-            open(ids)
-        }
-        .onChange(of: browser.selection) { browser.updateStatus() }
-        .onAppear { rebuild() }
-        .onChange(of: browser.currentURL) { rebuild() }
-        .onChange(of: browser.showHidden) { rebuild() }
-    }
-
-    private func rebuild() { roots = TreeNode.load(browser.currentURL, showHidden: browser.showHidden) }
-
-    private func open(_ ids: Set<String>) {
-        for id in ids {
-            let url = URL(fileURLWithPath: id)
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: id, isDirectory: &isDir) else { continue }
-            if isDir.boolValue { browser.navigate(to: url) }
-            else if isImageFile(url) { ImageViewerController.shared.show(urls: [url], index: 0) }
-            else { NSWorkspace.shared.open(url) }
-        }
-    }
-
-    @ViewBuilder private func treeMenu(_ ids: Set<String>) -> some View {
-        if ids.isEmpty {
-            Button("New Folder") { browser.newFolder() }
-            Button("New Text File") { browser.newTextFile() }
-        } else {
-            let urls = ids.map { URL(fileURLWithPath: $0) }
-            Button("Open") { open(ids) }
-            if ids.count == 1, let u = urls.first, u.hasDirectoryPath { Button("Open in New Tab") { model.newTab(at: u) } }
-            Button("Quick Look") { QuickLook.shared.show(urls) }
-            Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting(urls) }
-            if urls.allSatisfy({ $0.hasDirectoryPath }) {
-                Button("Add to Sidebar") { urls.forEach { FavoritesStore.shared.add($0) } }
-            }
-            Divider()
-            Button("Move to Trash") {
-                for u in urls { try? FileManager.default.trashItem(at: u, resultingItemURL: nil) }
-                rebuild()
-            }
-        }
+    static func subfolders(_ dir: URL) -> [SidebarNode] {
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
+        return urls
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+            .map { SidebarNode(url: $0, name: $0.lastPathComponent, symbol: "folder") }
     }
 }
 
@@ -2301,7 +2247,6 @@ struct BrowserContent: View {
                 case .icon: IconGridView(model: model, browser: browser)
                 case .gallery: GalleryView(model: model, browser: browser)
                 case .column: ColumnView(model: model, browser: browser)
-                case .tree: TreeTableView(model: model, browser: browser)
                 case .list: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
                 }
             }
