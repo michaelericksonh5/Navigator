@@ -2093,9 +2093,8 @@ struct ColumnView: View {
 
     @ViewBuilder private func colList(_ dir: URL, level: Int) -> some View {
         ColumnList(dir: dir, browser: browser,
-                   selectedChild: level < path.count ? path[level] : nil,
                    onPickFolder: { folder in path = Array(path.prefix(level)) + [folder] },
-                   onPickFile: { level == path.count ? (path = Array(path.prefix(level))) : () },
+                   onPickFile: { path = Array(path.prefix(level)) },
                    onOpen: { openItem($0, browser) })
             .frame(width: 250)
     }
@@ -2104,42 +2103,37 @@ struct ColumnView: View {
 struct ColumnList: View {
     let dir: URL
     @ObservedObject var browser: Browser
-    let selectedChild: URL?
     let onPickFolder: (URL) -> Void
     let onPickFile: () -> Void
     let onOpen: (FileItem) -> Void
     @State private var items: [FileItem] = []
-    @State private var selectedID: String?
+    @State private var sel: String?
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(items) { item in
-                    HStack(spacing: 6) {
-                        Image(nsImage: browser.icon(for: item)).resizable().frame(width: 16, height: 16)
-                        Text(item.name).lineLimit(1)
-                        Spacer(minLength: 0)
-                        if item.isDirectory { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary) }
-                    }
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(rowSelected(item) ? Color.accentColor.opacity(0.25) : Color.clear)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { onOpen(item) }
-                    .onTapGesture(count: 1) {
-                        selectedID = item.id
-                        browser.selection = [item.id]; browser.updateStatus()
-                        if item.isDirectory { onPickFolder(item.url) } else { onPickFile() }
-                    }
+        // Native List → robust click handling, real selection highlight, and
+        // keyboard arrows within the column. Single-select drills; double-click opens.
+        List(selection: $sel) {
+            ForEach(items) { item in
+                HStack(spacing: 6) {
+                    Image(nsImage: browser.icon(for: item)).resizable().frame(width: 16, height: 16)
+                    Text(item.name).lineLimit(1)
+                    Spacer(minLength: 0)
+                    if item.isDirectory { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary) }
                 }
-            }.padding(.vertical, 4)
+                .tag(item.id)
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(item) })
+            }
         }
-        .background(Color(nsColor: .textBackgroundColor).opacity(0.15))
-        .onAppear(perform: load)
-        .onChange(of: dir) { load() }
+        .listStyle(.plain)
+        .onChange(of: sel) { handleSelection() }
+        .onAppear { load() }
+        .onChange(of: dir) { sel = nil; load() }
     }
-    private func rowSelected(_ item: FileItem) -> Bool {
-        if let c = selectedChild, c.path == item.url.path { return true }
-        return selectedID == item.id
+    private func handleSelection() {
+        guard let id = sel, let item = items.first(where: { $0.id == id }) else { onPickFile(); return }
+        browser.selection = [id]; browser.updateStatus()
+        if item.isDirectory { onPickFolder(item.url) } else { onPickFile() }
     }
     private func load() {
         let keys: [URLResourceKey] = [.isDirectoryKey, .localizedTypeDescriptionKey]
