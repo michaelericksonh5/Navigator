@@ -823,6 +823,18 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     private var loadGeneration = 0
+    // Client-side directory cache (Windows-style): last-known listing per folder,
+    // so revisits / back-forward are instant while a fresh copy loads in the
+    // background. Main-thread only.
+    private static var dirCache: [String: [FileItem]] = [:]
+    static func invalidateCache(_ path: String) { dirCache[path] = nil; dirCache[path + "\u{1}h"] = nil }
+
+    // Explicit user Refresh (⌘R): drop the cached listing for this folder so we
+    // re-read from disk/network and show a clean "Loading…" instead of stale cache.
+    func refresh() {
+        Browser.invalidateCache(currentURL.path)
+        if isSearching { runSearch() } else { load() }
+    }
 
     // Directory enumeration (and its per-file attribute fetches) runs on a
     // background queue — over SMB/VPN it can take a while, and doing it on the
@@ -843,31 +855,63 @@ final class Browser: ObservableObject, Identifiable {
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         loadGeneration += 1
         let gen = loadGeneration
-        busy = true; busyText = "Loading…"
+        let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
+        // Show cached contents instantly on revisit; still refresh in the background.
+        let cached = Browser.dirCache[cacheKey]
+        if let cached {
+            items = cached
+            busy = false; busyText = ""
+            updateFreeSpace(); updateStatus()
+        } else {
+            items = []            // clear stale previous-folder contents; progressive load fills it in
+            busy = true; busyText = "Loading…"
+            updateStatus()
+        }
+        let hadCache = cached != nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // Stream items in as they're read (Finder-style progressive fill) so a
-            // huge/slow network folder shows contents immediately instead of a long
-            // blank wait. Publish in batches; discard if a newer load superseded us.
+            // On a first (uncached) visit, stream items in as they're read
+            // (Finder-style progressive fill). On a cached revisit, just refresh
+            // silently and swap in the fresh list at the end.
             let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
             var result: [FileItem] = []
             var sinceFlush = 0
-            func flush(done: Bool) {
-                let snapshot = result
-                DispatchQueue.main.async {
-                    guard let self, gen == self.loadGeneration else { return }
-                    self.items = snapshot
-                    if done { self.busy = false; self.busyText = ""; self.updateFreeSpace() }
-                    else { self.busyText = "Loading… (\(snapshot.count))" }
-                    self.updateStatus()
-                }
-            }
             while let u = en?.nextObject() as? URL {
                 guard let self, gen == self.loadGeneration else { return }   // superseded → stop
                 result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
                 sinceFlush += 1
-                if sinceFlush >= 50 { sinceFlush = 0; flush(done: false) }
+                if !hadCache, sinceFlush >= 50 {
+                    sinceFlush = 0
+                    let snapshot = result
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, gen == self.loadGeneration else { return }
+                        self.items = snapshot; self.busyText = "Loading… (\(snapshot.count))"; self.updateStatus()
+                    }
+                }
             }
-            flush(done: true)
+            // DFS junctions (e.g. //server/Games/Tools) auto-mount on first access;
+            // the enumerator can return before the mount settles, yielding an empty
+            // listing. If a network dir comes back empty, wait briefly and retry once
+            // so we don't display a spurious "0 items" for a folder that isn't empty.
+            var final = result
+            if isNetwork, final.isEmpty {
+                Thread.sleep(forTimeInterval: 1.5)
+                guard let self, gen == self.loadGeneration else { return }
+                let en2 = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
+                var retry: [FileItem] = []
+                while let u = en2?.nextObject() as? URL {
+                    guard gen == self.loadGeneration else { return }
+                    retry.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                }
+                final = retry
+            }
+            let committed = final
+            DispatchQueue.main.async {
+                guard let self, gen == self.loadGeneration else { return }
+                Browser.dirCache[cacheKey] = committed
+                self.items = committed
+                self.busy = false; self.busyText = ""
+                self.updateFreeSpace(); self.updateStatus()
+            }
         }
     }
 
@@ -1632,7 +1676,7 @@ struct ControlBar: View {
                     .menuStyle(.borderlessButton).frame(width: 40).help("Sort, Group & View Options")
 
                 Button { browser.newFolder() } label: { Image(systemName: "folder.badge.plus") }.help("New Folder")
-                Button { browser.isSearching ? browser.runSearch() : browser.load() } label: { Image(systemName: "arrow.clockwise") }
+                Button { browser.refresh() } label: { Image(systemName: "arrow.clockwise") }
                     .keyboardShortcut("r", modifiers: .command).help("Refresh")
                 Button { model.dualPane.toggle() } label: { Image(systemName: "rectangle.split.2x1") }
                     .help("Dual Pane (⌥⌘2)").foregroundStyle(model.dualPane ? Color.accentColor : .secondary)
