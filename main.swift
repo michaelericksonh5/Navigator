@@ -6,7 +6,7 @@ import CoreServices
 
 extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
 
-enum ViewMode { case list, icon }
+enum ViewMode: String { case list, icon, gallery }
 enum ConflictPolicy { case keepBoth, replace, skip }
 
 final class TransferProgress: ObservableObject {
@@ -192,7 +192,7 @@ struct TagsCell: View {
 enum Prefs {
     static let d = UserDefaults.standard
     static var showHidden: Bool { get { d.bool(forKey: "showHidden") } set { d.set(newValue, forKey: "showHidden") } }
-    static var viewModeIcon: Bool { get { d.bool(forKey: "viewModeIcon") } set { d.set(newValue, forKey: "viewModeIcon") } }
+    static var viewMode: String { get { d.string(forKey: "viewMode") ?? "list" } set { d.set(newValue, forKey: "viewMode") } }
     static var iconSize: CGFloat {
         get { let v = d.double(forKey: "iconSize"); return v < 32 ? 76 : CGFloat(v) }
         set { d.set(Double(newValue), forKey: "iconSize") }
@@ -578,7 +578,7 @@ final class Browser: ObservableObject, Identifiable {
     @Published var status: String = ""
     @Published var freeSpace: String = ""
     @Published var isRecents = false
-    @Published var viewMode: ViewMode = .list { didSet { Prefs.viewModeIcon = (viewMode == .icon) } }
+    @Published var viewMode: ViewMode = .list { didSet { Prefs.viewMode = viewMode.rawValue } }
     @Published var iconSize: CGFloat = 76 { didSet { Prefs.iconSize = iconSize } }
     @Published var gridColumns = 1
     @Published var keyboardScrollID: String?
@@ -597,7 +597,7 @@ final class Browser: ObservableObject, Identifiable {
         currentURL = start
         pathText = start.path
         showHidden = Prefs.showHidden
-        viewMode = Prefs.viewModeIcon ? .icon : .list
+        viewMode = ViewMode(rawValue: Prefs.viewMode) ?? .list
         iconSize = Prefs.iconSize
         groupBy = GroupBy(rawValue: Prefs.groupBy) ?? .none
         sortOrder = [Browser.comparator(for: SortField(rawValue: Prefs.sortKey) ?? .name, ascending: Prefs.sortAscending)]
@@ -1526,7 +1526,8 @@ struct ControlBar: View {
                 Picker("", selection: $browser.viewMode) {
                     Image(systemName: "list.bullet").tag(ViewMode.list)
                     Image(systemName: "square.grid.2x2").tag(ViewMode.icon)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 86).help("View")
+                    Image(systemName: "photo.on.rectangle").tag(ViewMode.gallery)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 116).help("View")
             }
             // Row 2: full-width address bar on its own line
             HStack(spacing: 6) {
@@ -1966,6 +1967,64 @@ struct PreviewPane: View {
     }
 }
 
+// Shared image/thumbnail view with icon fallback, used by Gallery view.
+struct ThumbImage: View {
+    let item: FileItem
+    @ObservedObject var browser: Browser
+    @State private var thumb: NSImage?
+    var body: some View {
+        Group {
+            if let t = thumb { Image(nsImage: t).resizable().scaledToFit() }
+            else { Image(nsImage: browser.icon(for: item)).resizable().scaledToFit() }
+        }
+        .onAppear { ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 } }
+        .onChange(of: item.url) { thumb = nil; ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 } }
+    }
+}
+
+struct GalleryView: View {
+    let model: AppModel
+    @ObservedObject var browser: Browser
+    private var items: [FileItem] { browser.orderedVisibleItems() }
+    private var selected: FileItem? { items.first { browser.selection.contains($0.id) } ?? items.first }
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Color(nsColor: .textBackgroundColor).opacity(0.25)
+                if let it = selected {
+                    VStack(spacing: 8) {
+                        ThumbImage(item: it, browser: browser).padding(24)
+                        Text(it.name).font(.callout).lineLimit(1).padding(.bottom, 6)
+                    }
+                } else {
+                    Text("No items").foregroundStyle(.secondary)
+                }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(items) { it in
+                            ThumbImage(item: it, browser: browser)
+                                .frame(width: 66, height: 66)
+                                .padding(3)
+                                .background(browser.selection.contains(it.id) ? Color.accentColor.opacity(0.3) : Color.clear)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .id(it.id)
+                                .onTapGesture(count: 2) { openItem(it, browser) }
+                                .onTapGesture(count: 1) { browser.selection = [it.id]; browser.updateStatus() }
+                        }
+                    }.padding(8)
+                }
+                .frame(height: 92)
+                .onChange(of: browser.keyboardScrollID) {
+                    if let id = browser.keyboardScrollID { withAnimation { proxy.scrollTo(id) } }
+                }
+            }
+        }
+    }
+}
+
 struct StatusBar: View {
     @ObservedObject var browser: Browser
     var body: some View {
@@ -2058,8 +2117,11 @@ struct BrowserContent: View {
                 Divider()
             }
             Group {
-                if browser.viewMode == .icon { IconGridView(model: model, browser: browser) }
-                else { FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization) }
+                switch browser.viewMode {
+                case .icon: IconGridView(model: model, browser: browser)
+                case .gallery: GalleryView(model: model, browser: browser)
+                case .list: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
+                }
             }
             .dropDestination(for: URL.self) { urls, _ in
                 browser.copyURLs(urls, move: false); return true
@@ -2595,10 +2657,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if b.viewMode == .icon, flags.isEmpty { b.moveSelection(dy: -1); return nil }
             return event
         case 123: // Left
-            if b.viewMode == .icon, flags.isEmpty { b.moveSelection(dx: -1); return nil }
+            if b.viewMode == .icon || b.viewMode == .gallery, flags.isEmpty { b.moveSelection(dx: -1); return nil }
             return event
         case 124: // Right
-            if b.viewMode == .icon, flags.isEmpty { b.moveSelection(dx: 1); return nil }
+            if b.viewMode == .icon || b.viewMode == .gallery, flags.isEmpty { b.moveSelection(dx: 1); return nil }
             return event
         default:
             // Type-to-select (printable key, no command/control/option)
