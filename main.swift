@@ -2516,6 +2516,24 @@ struct ItemFramesKey: PreferenceKey {
     }
 }
 
+// The rubber-band selection rectangle: a translucent fill with an animated
+// dashed "marching ants" outline (TimelineView drives the dash phase each frame).
+struct MarqueeRect: View {
+    let rect: CGRect
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let phase = -timeline.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1) * 8
+            Rectangle()
+                .fill(Color.accentColor.opacity(0.12))
+                .overlay(Rectangle().stroke(Color.accentColor,
+                                            style: StrokeStyle(lineWidth: 1.2, dash: [5, 3], dashPhase: phase)))
+                .frame(width: rect.width, height: rect.height)
+                .offset(x: rect.minX, y: rect.minY)
+                .allowsHitTesting(false)
+        }
+    }
+}
+
 struct IconGridView: View {
     let model: AppModel
     @ObservedObject var browser: Browser
@@ -2567,12 +2585,7 @@ struct IconGridView: View {
                     .coordinateSpace(name: "iconGrid")
                     .onPreferenceChange(ItemFramesKey.self) { itemFrames = $0 }
                     .overlay(alignment: .topLeading) {
-                        if let m = marquee {
-                            Rectangle().fill(Color.accentColor.opacity(0.15))
-                                .overlay(Rectangle().stroke(Color.accentColor.opacity(0.7), lineWidth: 1))
-                                .frame(width: m.width, height: m.height).offset(x: m.minX, y: m.minY)
-                                .allowsHitTesting(false)
-                        }
+                        if let m = marquee { MarqueeRect(rect: m) }
                     }
                 }
                 .onChange(of: browser.keyboardScrollID) {
