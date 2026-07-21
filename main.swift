@@ -688,6 +688,7 @@ final class Browser: ObservableObject, Identifiable {
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
+    private var recentsQuery: NSMetadataQuery?
     private var searchQuery: NSMetadataQuery?
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
@@ -702,7 +703,6 @@ final class Browser: ObservableObject, Identifiable {
         groupBy = GroupBy(rawValue: Prefs.groupBy) ?? .none
         sortOrder = [Browser.comparator(for: SortField(rawValue: Prefs.sortKey) ?? .name, ascending: Prefs.sortAscending)]
         load()
-        RecentFolders.shared.record(start)
     }
 
     static func comparator(for f: SortField, ascending: Bool) -> KeyPathComparator<FileItem> {
@@ -917,25 +917,47 @@ final class Browser: ObservableObject, Identifiable {
     // navigated to, plus every folder you've created/saved/pasted/renamed a file
     // in (see RecentFolders.shared.record calls in the file operations). Shown
     // most-recent first — no Spotlight flood of every touched file.
+    // "Recents" in Favorites works like Finder's: recently used / changed FILES
+    // across your home folder, newest first. (The separate "Recent Folders" list
+    // is the folders you've worked in — see RecentFolders.)
     func loadRecents() {
         isRecents = true
         isSearching = false
         dirWatcher.stop()
         selection = []
         pathText = "Recents"
-        sortOrder = [KeyPathComparator(\FileItem.modified, order: .reverse)]
-        let folders = RecentFolders.shared.urls
         items = []
-        busy = true; busyText = "Loading recents…"
-        updateStatus()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
-            let built = folders.compactMap { self.fm.fileExists(atPath: $0.path) ? self.makeItem($0) : nil }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isRecents else { return }
-                self.items = built; self.busy = false; self.busyText = ""; self.updateStatus()
-            }
+        status = "Finding recent files…"
+        sortOrder = [KeyPathComparator(\FileItem.modified, order: .reverse)]
+        recentsQuery?.stop()
+        let q = NSMetadataQuery()
+        q.searchScopes = [NSMetadataQueryUserHomeScope]
+        let since = Date().addingTimeInterval(-60 * 60 * 24 * 45) as NSDate
+        q.predicate = NSPredicate(format: "kMDItemLastUsedDate >= %@ OR kMDItemFSContentChangeDate >= %@", since, since)
+        q.sortDescriptors = [NSSortDescriptor(key: "kMDItemFSContentChangeDate", ascending: false)]
+        NotificationCenter.default.addObserver(self, selector: #selector(recentsGathered(_:)),
+                                               name: .NSMetadataQueryDidFinishGathering, object: q)
+        recentsQuery = q
+        q.start()
+    }
+
+    @objc private func recentsGathered(_ note: Notification) {
+        guard let q = recentsQuery else { return }
+        q.disableUpdates()
+        var result: [FileItem] = []
+        let n = min(q.resultCount, 200)
+        for i in 0..<n {
+            guard let mi = q.result(at: i) as? NSMetadataItem,
+                  let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
+            result.append(makeItem(URL(fileURLWithPath: path)))
         }
+        items = result
+        updateStatus()
+        q.stop()
+        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
+        recentsQuery = nil
     }
 
     // Spotlight search within the current folder subtree (name + content).
@@ -1215,7 +1237,8 @@ final class Browser: ObservableObject, Identifiable {
         searchText = ""; isSearching = false; searchQuery?.stop(); searchQuery = nil
         currentURL = url
         load()
-        RecentFolders.shared.record(url)
+        // NOTE: navigating does NOT record a recent folder — "Recent Folders" is
+        // only folders you've worked in (created/saved/moved/renamed files).
         NotificationCenter.default.post(name: .navigatorDidNavigate, object: nil)
     }
 
@@ -1303,6 +1326,7 @@ final class Browser: ObservableObject, Identifiable {
             catch { failures.append((u, error.localizedDescription)) }
         }
         if !restores.isEmpty {
+            RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Move to Trash") { [weak self] in
                 for r in restores { try? FileManager.default.moveItem(at: r.trash, to: r.original) }
                 self?.load()
@@ -1527,6 +1551,7 @@ final class Browser: ObservableObject, Identifiable {
         }
         if let failure { reportFileError("Couldn't make an alias", failure) }
         if !created.isEmpty {
+            RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Make Alias") { [weak self] in
                 for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
                 self?.load()
@@ -1604,6 +1629,7 @@ final class Browser: ObservableObject, Identifiable {
             catch { failure = failure ?? error.localizedDescription }
         }
         if let failure { reportFileError("Some items couldn't be renamed", failure) }
+        if !undo.isEmpty { RecentFolders.shared.record(currentURL) }
         if !undo.isEmpty {
             UndoStack.shared.push("Batch Rename") { [weak self] in
                 for (newURL, oldURL) in undo { try? FileManager.default.moveItem(at: newURL, to: oldURL) }
@@ -1624,6 +1650,7 @@ final class Browser: ObservableObject, Identifiable {
             catch { reportFileError("Couldn't create the symbolic link", error.localizedDescription) }
         }
         if !created.isEmpty {
+            RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Make Symbolic Link") { [weak self] in
                 for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
                 self?.load()
@@ -1640,6 +1667,7 @@ final class Browser: ObservableObject, Identifiable {
         let dest = oldURL.deletingLastPathComponent().appendingPathComponent(n)
         do {
             try fm.moveItem(at: oldURL, to: dest)
+            RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Rename") { [weak self] in
                 try? FileManager.default.moveItem(at: dest, to: oldURL); self?.load()
             }
@@ -1708,6 +1736,7 @@ final class Browser: ObservableObject, Identifiable {
             DispatchQueue.main.async {
                 self?.busy = false; self?.busyText = ""
                 if ok {
+                    RecentFolders.shared.record(dir)
                     UndoStack.shared.push("Compress") { [weak self] in
                         try? FileManager.default.trashItem(at: dest, resultingItemURL: nil); self?.load()
                     }
@@ -1752,6 +1781,7 @@ final class Browser: ObservableObject, Identifiable {
             DispatchQueue.main.async {
                 self.busy = false; self.busyText = ""
                 if !created.isEmpty {
+                    RecentFolders.shared.record(dir)
                     UndoStack.shared.push("Extract") { [weak self] in
                         for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
                         self?.load()
