@@ -2440,23 +2440,23 @@ final class BatchRenameController {
 
 // MARK: - AppKit entry point
 
+final class NavWindow: NSWindow {
+    let model = AppModel()
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow!
-    let appModel = AppModel()
+    var window: NavWindow!
+    private var extraWindows: [NavWindow] = []
     private var keyMonitor: Any?
+
+    // Menu commands and keyboard nav target whichever Navigator window is key.
+    var appModel: AppModel { (NSApp.keyWindow as? NavWindow)?.model ?? window.model }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         setupMenu()
-        let hosting = NSHostingView(rootView: ContentView(model: appModel))
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                          backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.title = "Navigator"
-        window.contentView = hosting
+        window = makeWindow(restoreState: true)
         window.setFrameAutosaveName("NavigatorMainWindow")
-        window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
@@ -2464,8 +2464,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // (No auto TCC prompt on launch — use the "Grant Full Disk Access…" menu command.)
     }
 
+    @discardableResult
+    private func makeWindow(restoreState: Bool) -> NavWindow {
+        let w = NavWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                          backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.title = "Navigator"
+        w.contentView = NSHostingView(rootView: ContentView(model: w.model))
+        w.center()
+        return w
+    }
+
+    @objc func newWindowAction(_ sender: Any?) {
+        let w = makeWindow(restoreState: false)
+        var f = w.frame; f.origin.x += 28; f.origin.y -= 28; w.setFrame(f, display: false)
+        extraWindows.append(w)
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func applicationWillTerminate(_ notification: Notification) { appModel.saveState() }
+    func applicationWillTerminate(_ notification: Notification) { window.model.saveState() }
 
     // Keyboard navigation for the file list/grid. Runs only when our window is key
     // and a text field isn't being edited, so typing in the address/search/filter
@@ -2476,9 +2496,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     private func handleKey(_ event: NSEvent) -> NSEvent? {
-        guard NSApp.keyWindow == window else { return event }
-        if let r = window.firstResponder, r is NSText || r is NSTextView { return event }
-        let b = appModel.active
+        guard let keyWin = NSApp.keyWindow as? NavWindow else { return event }
+        if let r = keyWin.firstResponder, r is NSText || r is NSTextView { return event }
+        let b = keyWin.model.active
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
         switch event.keyCode {
         case 36, 76: // Return / Enter → open
@@ -2531,6 +2551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fileItem = NSMenuItem(); mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "File"); fileItem.submenu = fileMenu
+        let nw = fileMenu.addItem(withTitle: "New Window", action: #selector(newWindowAction(_:)), keyEquivalent: "n"); nw.target = self
         let nt = fileMenu.addItem(withTitle: "New Tab", action: #selector(newTabAction(_:)), keyEquivalent: "t"); nt.target = self
         let ct = fileMenu.addItem(withTitle: "Close Tab", action: #selector(closeTabAction(_:)), keyEquivalent: "w"); ct.target = self
         fileMenu.addItem(.separator())
@@ -2584,7 +2605,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func paste(_ sender: Any?) { appModel.active.pasteFiles() }
     @objc func newTabAction(_ sender: Any?) { appModel.newTab() }
     @objc func closeTabAction(_ sender: Any?) {
-        if appModel.tabs.count > 1 { appModel.closeTab(appModel.selected) } else { window.performClose(nil) }
+        if appModel.tabs.count > 1 { appModel.closeTab(appModel.selected) } else { NSApp.keyWindow?.performClose(nil) }
     }
     @objc func newFolderAction(_ sender: Any?) { appModel.active.newFolder() }
     @objc func newTextFileAction(_ sender: Any?) { appModel.active.newTextFile() }
