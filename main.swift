@@ -2263,8 +2263,10 @@ struct IconGridView: View {
     @ViewBuilder private func cell(_ item: FileItem) -> some View {
         IconCell(item: item, browser: browser, selected: browser.selection.contains(item.id))
             .id(item.id)
-            .onTapGesture(count: 2) { openItem(item, browser) }
-            .onTapGesture(count: 1) { browser.selection = [item.id]; browser.updateStatus() }
+            // Single-tap selects INSTANTLY; double-tap opens via a simultaneous
+            // gesture so the single tap never waits out the double-click timeout.
+            .onTapGesture { browser.selection = [item.id]; browser.updateStatus() }
+            .simultaneousGesture(TapGesture(count: 2).onEnded { openItem(item, browser) })
             .dropDestination(for: URL.self) { urls, _ in
                 guard item.isDirectory else { return false }
                 browser.importURLs(urls, into: item.url, move: true); return true
@@ -2526,8 +2528,8 @@ struct GalleryView: View {
                                 .background(browser.selection.contains(it.id) ? Color.accentColor.opacity(0.3) : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .id(it.id)
-                                .onTapGesture(count: 2) { openItem(it, browser) }
-                                .onTapGesture(count: 1) { browser.selection = [it.id]; browser.updateStatus() }
+                                .onTapGesture { browser.selection = [it.id]; browser.updateStatus() }
+                                .simultaneousGesture(TapGesture(count: 2).onEnded { openItem(it, browser) })
                         }
                     }.padding(8)
                 }
