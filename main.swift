@@ -2287,8 +2287,6 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
     private var didInitialLayout = false
     private var applyingLayout = false
     private var bypassConstraints = false
-    var onSidebarCollapse: ((Bool) -> Void)?
-    var onPreviewCollapse: ((Bool) -> Void)?
 
     init(sidebarCollapsed: Bool, previewCollapsed: Bool) {
         self.sidebarCollapsed = sidebarCollapsed
@@ -2365,14 +2363,12 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
         return total - previewMin
     }
 
-    // After any resize (drag or window), remember the side-pane widths and sync
-    // collapse state (in case the user dragged a divider all the way to the edge).
+    // Remember the side-pane widths while they're open (ignore transient 0-widths).
+    // Open/closed state is owned solely by the toggle buttons (setSidebar/setPreview),
+    // so we never infer it from layout here — that used to spuriously flip the
+    // persisted showPreview/showSidebar during initial layout.
     @objc private func didResize(_ n: Notification) {
         guard !applyingLayout else { return }
-        let sc = splitView.isSubviewCollapsed(sidebarPane)
-        let pc = splitView.isSubviewCollapsed(previewPane)
-        if sc != sidebarCollapsed { sidebarCollapsed = sc; onSidebarCollapse?(sc) }
-        if pc != previewCollapsed { previewCollapsed = pc; onPreviewCollapse?(pc) }
         if !sidebarCollapsed, sidebarPane.frame.width > 1 {
             sidebarWidth = sidebarPane.frame.width; Prefs.sidebarWidth = sidebarWidth
         }
@@ -2405,9 +2401,6 @@ struct BrowserPane: NSViewControllerRepresentable {
     func makeNSViewController(context: Context) -> PaneController {
         let vc = PaneController(sidebarCollapsed: !model.showSidebar, previewCollapsed: !model.showPreview)
         _ = vc.view
-        let m = model
-        vc.onSidebarCollapse = { [weak m] collapsed in m?.showSidebar = !collapsed }
-        vc.onPreviewCollapse = { [weak m] collapsed in m?.showPreview = !collapsed }
         apply(vc)
         return vc
     }
@@ -2749,9 +2742,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
         NetworkBrowser.shared.start()
+        NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
+        NSUpdateDynamicServices()
         // Any folders passed at launch (opened via the system) open as new tabs.
         if !pendingFolders.isEmpty { pendingFolders.forEach { window.model.newTab(at: $0) }; pendingFolders = [] }
         // (No auto TCC prompt on launch — use the "Grant Full Disk Access…" menu command.)
+    }
+
+    // Finder Services entry: right-click a folder/file in Finder → Services →
+    // "Open in Navigator". Folders open as tabs; a file opens its enclosing folder.
+    @objc func openInNavigator(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        let urls = (pboard.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []
+        let folders = urls.map { u -> URL in
+            ((try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true) ? u : u.deletingLastPathComponent()
+        }
+        guard !folders.isEmpty else { return }
+        if let win = (NSApp.keyWindow as? NavWindow) ?? window {
+            folders.forEach { win.model.newTab(at: $0) }
+            win.makeKeyAndOrderFront(nil)
+        } else {
+            pendingFolders += folders
+        }
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // Receives folders/files the system routes to us (e.g. when Navigator is the

@@ -60,6 +60,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSItemContentTypes</key><array><string>public.folder</string></array>
   </dict>
 </array>
+<key>NSServices</key>
+<array>
+  <dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Open in Navigator</string></dict>
+    <key>NSMessage</key><string>openInNavigator</string>
+    <key>NSPortName</key><string>Navigator</string>
+    <key>NSSendFileTypes</key><array><string>public.item</string></array>
+  </dict>
+</array>
 </dict></plist>
 PLIST
 # Sign with the stable "Navigator Dev" self-signed identity if it exists, so the
