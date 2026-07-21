@@ -542,6 +542,8 @@ func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtensio
 
 let videoExtensions: Set<String> = ["mp4","mov","m4v","avi","mkv","webm","wmv","flv","mpg","mpeg","3gp","m2ts","mts","m2v","ts"]
 func isVideoFile(_ url: URL) -> Bool { videoExtensions.contains(url.pathExtension.lowercased()) }
+// Formats that should play (not just show a frame) in the viewer/preview.
+func isAnimatedImage(_ url: URL) -> Bool { url.pathExtension.lowercased() == "gif" }
 
 // Types worth asking QuickLook for a thumbnail of: images, video (poster frame),
 // plus design/raw formats it can render — notably PSD. Everything else shows its
@@ -2231,7 +2233,8 @@ struct PreviewPane: View {
         VStack(spacing: 12) {
             if let it = item {
                 Group {
-                    if let t = thumb { Image(nsImage: t).resizable().scaledToFit() }
+                    if isAnimatedImage(it.url) { AnimatedImage(url: it.url).id(it.url) }
+                    else if let t = thumb { Image(nsImage: t).resizable().scaledToFit() }
                     else { Image(nsImage: browser.icon(for: it)).resizable().scaledToFit() }
                 }.frame(maxWidth: 200, maxHeight: 200)
                 Text(it.name).font(.headline).multilineTextAlignment(.center).lineLimit(3)
@@ -2748,6 +2751,24 @@ struct ContentView: View {
 
 // MARK: - Image viewer (left/right scroll through folder images)
 
+// NSImageView plays animated GIFs natively; SwiftUI's Image renders only a
+// single frame. Used by the image viewer and preview pane for GIFs.
+struct AnimatedImage: NSViewRepresentable {
+    let url: URL
+    func makeNSView(context: Context) -> NSImageView {
+        let v = NSImageView()
+        v.imageScaling = .scaleProportionallyUpOrDown
+        v.animates = true
+        v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        v.image = NSImage(contentsOf: url)
+        return v
+    }
+    func updateNSView(_ v: NSImageView, context: Context) {
+        v.image = NSImage(contentsOf: url); v.animates = true
+    }
+}
+
 struct ImageViewerView: View {
     let urls: [URL]
     @State private var index: Int
@@ -2759,7 +2780,9 @@ struct ImageViewerView: View {
     var body: some View {
         ZStack {
             Color.black
-            if urls.indices.contains(index), let img = NSImage(contentsOf: urls[index]) {
+            if urls.indices.contains(index), isAnimatedImage(urls[index]) {
+                AnimatedImage(url: urls[index]).padding(44).id(urls[index])
+            } else if urls.indices.contains(index), let img = NSImage(contentsOf: urls[index]) {
                 Image(nsImage: img).resizable().scaledToFit().padding(44)
             } else {
                 Text("Can't load image").foregroundStyle(.white)
