@@ -259,40 +259,49 @@ final class RecentFolders: ObservableObject {
     func clear() { urls = []; Prefs.recentFolders = [] }
 }
 
-// Watches a single directory (non-recursively) and fires onChange when its
-// contents change — so a file appearing, disappearing, or being renamed by
-// another app refreshes the current view automatically. Local volumes only;
-// SMB doesn't push change notifications, so network folders use ⌘R / revisit.
+// Watches the current directory and fires onChange when its contents change —
+// so a file appearing, disappearing, or being renamed refreshes the view
+// automatically. Uses FSEvents (what Finder uses) rather than a raw kqueue fd,
+// because FSEvents also catches File Provider / cloud-storage changes (e.g.
+// Google Drive syncing a file down) that a kqueue on the directory misses.
+// Local volumes only; SMB doesn't emit these, so network folders use ⌘R.
 final class DirectoryWatcher {
-    private var source: DispatchSourceFileSystemObject?
-    private var fd: Int32 = -1
+    private var stream: FSEventStreamRef?
     private var watchedPath: String?
     private var pending = false
     private let onChange: () -> Void
     init(onChange: @escaping () -> Void) { self.onChange = onChange }
     func watch(_ url: URL) {
-        if watchedPath == url.path, source != nil { return }   // already watching this folder
+        if watchedPath == url.path, stream != nil { return }   // already watching this folder
         stop()
-        let f = open(url.path, O_EVTONLY)
-        guard f >= 0 else { return }
-        fd = f; watchedPath = url.path
-        let src = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: f, eventMask: [.write, .extend, .rename, .delete], queue: .main)
-        src.setEventHandler { [weak self] in self?.fire() }
-        src.setCancelHandler { [weak self] in if let d = self?.fd, d >= 0 { close(d) }; self?.fd = -1 }
-        source = src
-        src.resume()
+        let path = url.path
+        watchedPath = path
+        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                       retain: nil, release: nil, copyDescription: nil)
+        let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<DirectoryWatcher>.fromOpaque(info).takeUnretainedValue().fire()
+        }
+        guard let s = FSEventStreamCreate(nil, callback, &ctx, [path] as CFArray,
+                                          FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.3, flags) else { return }
+        stream = s
+        FSEventStreamSetDispatchQueue(s, .main)
+        FSEventStreamStart(s)
     }
-    // Coalesce bursts of events (a copy fires many) into one refresh.
+    // Coalesce bursts of events (a copy/sync fires many) into one refresh.
     private func fire() {
         guard !pending else { return }
         pending = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.pending = false; self?.onChange()
         }
     }
-    func stop() { source?.cancel(); source = nil; watchedPath = nil }
-    deinit { source?.cancel() }
+    func stop() {
+        if let s = stream { FSEventStreamStop(s); FSEventStreamInvalidate(s); FSEventStreamRelease(s); stream = nil }
+        watchedPath = nil
+    }
+    deinit { if let s = stream { FSEventStreamStop(s); FSEventStreamInvalidate(s); FSEventStreamRelease(s) } }
 }
 
 // MARK: - Undo stack (file operations)
@@ -1899,16 +1908,24 @@ struct SidebarView: View {
     // into subfolders inline; clicking any node navigates the main view there.
     @ViewBuilder private func tree(_ node: SidebarNode, removable: Bool) -> some View {
         OutlineGroup(node, children: \.children) { n in
-            Button { browser.openFavorite(n.url.path, mountURL: n.mountURL) } label: {
-                Label(n.name, systemImage: n.symbol).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
-            }.buttonStyle(.plain).help(n.mountURL ?? n.url.path)
-                .contextMenu {
-                    // Home stays as a fixed anchor; everything else can be unpinned.
-                    if removable, n.id == node.id,
-                       n.url.standardizedFileURL.path != FileManager.default.homeDirectoryForCurrentUser.path {
-                        Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
-                    }
+            // Show a pushpin on top-level pinned favorites (Windows 11 Quick Access
+            // style). Home stays a fixed anchor with no pin. Click the pin to unpin.
+            let isTop = n.id == node.id
+            let isHome = n.url.standardizedFileURL.path == FileManager.default.homeDirectoryForCurrentUser.path
+            let pinned = removable && isTop && !isHome
+            HStack(spacing: 4) {
+                Button { browser.openFavorite(n.url.path, mountURL: n.mountURL) } label: {
+                    Label(n.name, systemImage: n.symbol).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
+                }.buttonStyle(.plain).help(n.mountURL ?? n.url.path)
+                if pinned {
+                    Button { favStore.remove(label: n.name, path: n.url.path) } label: {
+                        Image(systemName: "pin.fill").font(.caption2).rotationEffect(.degrees(45))
+                    }.buttonStyle(.plain).foregroundStyle(.tertiary).help("Unpin from Sidebar")
                 }
+            }
+            .contextMenu {
+                if pinned { Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) } }
+            }
         }
     }
 
