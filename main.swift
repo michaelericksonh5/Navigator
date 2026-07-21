@@ -2805,16 +2805,130 @@ struct AnimatedImage: NSViewRepresentable {
     }
 }
 
+// Pannable, zoomable image view. zoom is the display scale relative to the
+// image's actual pixels (1.0 = 100%). Scroll wheel zooms toward the cursor,
+// drag pans when zoomed in; the SwiftUI bar drives it via ZoomController.
+final class ZoomView: NSView {
+    var onZoomChange: ((Double, Double) -> Void)?     // (current, fit)
+    private var _image: NSImage?
+    private var _zoom: Double = 1
+    private var offset = CGPoint.zero
+    private var didFit = false
+    override var isFlipped: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
+    func setImage(_ img: NSImage?) {
+        _image = img; offset = .zero; didFit = false
+        if bounds.width > 0, bounds.height > 0 { fit() } else { needsDisplay = true }
+    }
+    private var pixelSize: CGSize {
+        guard let rep = _image?.representations.first else { return _image?.size ?? .zero }
+        return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
+    }
+    var fitZoom: Double {
+        let s = pixelSize
+        guard s.width > 0, s.height > 0, bounds.width > 0, bounds.height > 0 else { return 1 }
+        return Double(min(bounds.width / s.width, bounds.height / s.height))
+    }
+    var zoom: Double { _zoom }
+    func fit() {
+        offset = .zero; _zoom = fitZoom; didFit = true
+        needsDisplay = true; report()
+    }
+    func setZoom(_ z: Double) { zoomAt(CGPoint(x: bounds.midX, y: bounds.midY), factor: z / max(_zoom, 0.0001)) }
+    func zoomBy(_ factor: Double) { zoomAt(CGPoint(x: bounds.midX, y: bounds.midY), factor: factor) }
+    func zoomAt(_ p: CGPoint, factor: Double) {
+        let old = _zoom
+        let newZoom = max(0.05, min(old * factor, 16))
+        guard abs(newZoom - old) > 0.0001 else { return }
+        let cx = bounds.midX + offset.x, cy = bounds.midY + offset.y
+        let rel = CGPoint(x: p.x - cx, y: p.y - cy)
+        let ratio = CGFloat(newZoom / old)
+        offset.x -= rel.x * (ratio - 1); offset.y -= rel.y * (ratio - 1)
+        _zoom = newZoom; clampOffset(); needsDisplay = true; report()
+    }
+    private func report() { onZoomChange?(_zoom, fitZoom) }
+    private func clampOffset() {
+        let s = pixelSize
+        let w = CGFloat(s.width) * CGFloat(_zoom), h = CGFloat(s.height) * CGFloat(_zoom)
+        let maxX = max(0, (w - bounds.width) / 2), maxY = max(0, (h - bounds.height) / 2)
+        offset.x = min(maxX, max(-maxX, offset.x)); offset.y = min(maxY, max(-maxY, offset.y))
+    }
+    override func layout() {
+        super.layout()
+        if !didFit, _image != nil, bounds.width > 0, bounds.height > 0 { fit() } else { clampOffset() }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.setFill(); bounds.fill()
+        guard let img = _image else { return }
+        let s = pixelSize
+        let w = CGFloat(s.width) * CGFloat(_zoom), h = CGFloat(s.height) * CGFloat(_zoom)
+        let x = (bounds.width - w) / 2 + offset.x, y = (bounds.height - h) / 2 + offset.y
+        img.draw(in: NSRect(x: x, y: y, width: w, height: h), from: .zero, operation: .sourceOver,
+                 fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high.rawValue])
+    }
+    override func scrollWheel(with event: NSEvent) {
+        let d = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
+        guard d != 0 else { return }
+        zoomAt(convert(event.locationInWindow, from: nil), factor: 1 + Double(d) * 0.01)
+    }
+    private var lastDrag: CGPoint?
+    override func mouseDown(with event: NSEvent) { lastDrag = convert(event.locationInWindow, from: nil) }
+    override func mouseDragged(with event: NSEvent) {
+        guard let l = lastDrag else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        offset.x += p.x - l.x; offset.y += p.y - l.y
+        lastDrag = p; clampOffset(); needsDisplay = true
+    }
+    override func mouseUp(with event: NSEvent) { lastDrag = nil }
+}
+
+final class ZoomController: ObservableObject {
+    @Published var zoom: Double = 1
+    @Published var fitZoom: Double = 1
+    weak var view: ZoomView?
+    var percent: Int { Int((zoom * 100).rounded()) }
+    func setZoom(_ z: Double) { view?.setZoom(z) }
+    func zoomBy(_ f: Double) { view?.zoomBy(f) }
+    func fit() { view?.fit() }
+}
+
+struct ZoomableImageView: NSViewRepresentable {
+    let url: URL
+    let controller: ZoomController
+    func makeNSView(context: Context) -> ZoomView {
+        let v = ZoomView()
+        v.onZoomChange = { z, fit in DispatchQueue.main.async { controller.zoom = z; controller.fitZoom = fit } }
+        v.setImage(NSImage(contentsOf: url))
+        controller.view = v
+        context.coordinator.url = url
+        return v
+    }
+    func updateNSView(_ v: ZoomView, context: Context) {
+        controller.view = v
+        if context.coordinator.url != url {
+            context.coordinator.url = url
+            v.setImage(NSImage(contentsOf: url))
+        }
+    }
+    func makeCoordinator() -> Coord { Coord() }
+    final class Coord { var url: URL? }
+}
+
 struct ImageViewerView: View {
     let urls: [URL]
     @State private var index: Int
     @State private var dims: String = ""
     @State private var sizeStr: String = ""
     @State private var kindStr: String = ""
+    @StateObject private var zoomCtl = ZoomController()
     init(urls: [URL], index: Int) { self.urls = urls; _index = State(initialValue: index) }
     private func step(_ d: Int) {
         guard !urls.isEmpty else { return }
         index = (index + d + urls.count) % urls.count
+    }
+    private var zoomBinding: Binding<Double> {
+        Binding(get: { zoomCtl.zoom }, set: { zoomCtl.setZoom($0) })
     }
     // Read dimensions / size / kind for the bottom detail bar (Windows Photos-style).
     private func loadInfo() {
@@ -2829,13 +2943,14 @@ struct ImageViewerView: View {
             if let w = m.width, let h = m.height, w > 0, h > 0 { dims = "\(w) × \(h)" }
         }
     }
+    private var isAnimated: Bool { urls.indices.contains(index) && isAnimatedImage(urls[index]) }
     var body: some View {
         ZStack {
             Color.black
-            if urls.indices.contains(index), isAnimatedImage(urls[index]) {
+            if urls.indices.contains(index), isAnimated {
                 AnimatedImage(url: urls[index]).padding(44).id(urls[index])
-            } else if urls.indices.contains(index), let img = NSImage(contentsOf: urls[index]) {
-                Image(nsImage: img).resizable().scaledToFit().padding(44)
+            } else if urls.indices.contains(index) {
+                ZoomableImageView(url: urls[index], controller: zoomCtl).id(urls[index])
             } else {
                 Text("Can't load image").foregroundStyle(.white)
             }
@@ -2848,25 +2963,45 @@ struct ImageViewerView: View {
             }.foregroundStyle(.white.opacity(0.8)).padding(.horizontal, 14)
             VStack {
                 Spacer()
-                if urls.indices.contains(index) {
-                    HStack(spacing: 10) {
-                        Text(urls[index].lastPathComponent).fontWeight(.medium).lineLimit(1)
-                        detail("photo", dims)
-                        detail("internaldrive", sizeStr)
-                        detail("doc", kindStr)
-                        Text("·").foregroundStyle(.white.opacity(0.5))
-                        Text("\(index + 1) of \(urls.count)").foregroundStyle(.white.opacity(0.85))
-                    }
-                    .font(.callout).foregroundStyle(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 8)
-                    .background(.black.opacity(0.6)).clipShape(Capsule())
-                    .padding(.bottom, 16)
-                }
+                bottomBar
             }
+            // ⌘+ / ⌘= zoom in, ⌘- zoom out, ⌘0 fit (hidden shortcut buttons)
+            Group {
+                Button("") { zoomCtl.zoomBy(1.25) }.keyboardShortcut("+", modifiers: .command)
+                Button("") { zoomCtl.zoomBy(1.25) }.keyboardShortcut("=", modifiers: .command)
+                Button("") { zoomCtl.zoomBy(0.8) }.keyboardShortcut("-", modifiers: .command)
+                Button("") { zoomCtl.fit() }.keyboardShortcut("0", modifiers: .command)
+            }.frame(width: 0, height: 0).opacity(0)
         }
         .frame(minWidth: 520, minHeight: 420)
         .onAppear { loadInfo() }
         .onChange(of: index) { loadInfo() }
+    }
+    // Windows Photos-style bottom bar: details on the left, zoom controls on the right.
+    private var bottomBar: some View {
+        HStack(spacing: 12) {
+            if urls.indices.contains(index) {
+                Text(urls[index].lastPathComponent).fontWeight(.medium).lineLimit(1)
+                detail("photo", dims)
+                detail("internaldrive", sizeStr)
+                Text("·").foregroundStyle(.white.opacity(0.4))
+                Text("\(index + 1) of \(urls.count)").foregroundStyle(.white.opacity(0.85))
+            }
+            Spacer(minLength: 12)
+            if !isAnimated {
+                Button { zoomCtl.fit() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
+                    .buttonStyle(.plain).help("Fit to Window (⌘0)")
+                Button { zoomCtl.zoomBy(0.8) } label: { Image(systemName: "minus.magnifyingglass") }
+                    .buttonStyle(.plain).help("Zoom Out (⌘−)")
+                Slider(value: zoomBinding, in: 0.05...8).frame(width: 130)
+                Button { zoomCtl.zoomBy(1.25) } label: { Image(systemName: "plus.magnifyingglass") }
+                    .buttonStyle(.plain).help("Zoom In (⌘+)")
+                Text("\(zoomCtl.percent)%").monospacedDigit().frame(width: 46, alignment: .trailing)
+            }
+        }
+        .font(.callout).foregroundStyle(.white)
+        .padding(.horizontal, 16).padding(.vertical, 9)
+        .background(.black.opacity(0.6))
     }
     @ViewBuilder private func detail(_ symbol: String, _ text: String) -> some View {
         if !text.isEmpty {
@@ -3256,6 +3391,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 QuickLook.shared.show(b.items.filter { b.selection.contains($0.id) }.map { $0.url }); return nil
             }
             return event
+        case 8 where flags == .command: // ⌘C → copy files (text fields handled above)
+            if !b.selection.isEmpty { b.copyFiles() }
+            return nil
+        case 7 where flags == .command: // ⌘X → cut files
+            if !b.selection.isEmpty { b.cutFiles() }
+            return nil
+        case 9 where flags == .command: // ⌘V → paste files into the current folder
+            b.pasteFiles(); return nil
         case 125: // Down
             if b.viewMode == .icon, flags.isEmpty { b.moveSelection(dy: 1); return nil }
             return event
