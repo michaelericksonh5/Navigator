@@ -467,7 +467,7 @@ func favoriteSymbol(_ url: URL) -> String {
     case "\(home)/Music": return "music.note"
     case "\(home)/Movies": return "film"
     case "/Applications": return "square.grid.2x2"
-    default: return "folder"
+    default: return url.path.hasPrefix("/Volumes/") ? "externaldrive.connected.to.line.below" : "folder"
     }
 }
 func favoriteName(_ url: URL) -> String {
@@ -476,28 +476,43 @@ func favoriteName(_ url: URL) -> String {
     return n.isEmpty ? url.path : n
 }
 
+// A sidebar favorite: a labeled shortcut to a path, optionally backed by a
+// network URL to (re)mount when the path isn't currently available.
+struct Favorite: Codable, Identifiable, Hashable {
+    var label: String
+    var path: String
+    var mountURL: String?
+    var id: String { "\(label)\u{1}\(path)" }
+    var url: URL { URL(fileURLWithPath: path) }
+}
+
 // User-customizable sidebar favorites (add / remove / reorder), persisted.
+// Supports custom labels + optional network mount URLs (mapped-drive style).
 final class FavoritesStore: ObservableObject {
     static let shared = FavoritesStore()
-    @Published var urls: [URL]
+    @Published var items: [Favorite]
     init() {
-        if let saved = UserDefaults.standard.stringArray(forKey: "favorites"), !saved.isEmpty {
-            urls = saved.map { URL(fileURLWithPath: $0) }
+        if let data = UserDefaults.standard.data(forKey: "favoritesV2"),
+           let decoded = try? JSONDecoder().decode([Favorite].self, from: data), !decoded.isEmpty {
+            items = decoded
+        } else if let saved = UserDefaults.standard.stringArray(forKey: "favorites"), !saved.isEmpty {
+            items = saved.map { Favorite(label: favoriteName(URL(fileURLWithPath: $0)), path: $0, mountURL: nil) }
+            persist()
         } else {
-            urls = defaultLocations().map { $0.url }
+            items = defaultLocations().map { Favorite(label: $0.name, path: $0.url.path, mountURL: nil) }
             persist()
         }
     }
-    func contains(_ url: URL) -> Bool { urls.contains { $0.path == url.standardizedFileURL.path } }
-    func add(_ url: URL) {
+    func contains(_ url: URL) -> Bool { items.contains { $0.path == url.standardizedFileURL.path } }
+    func add(_ url: URL, label: String? = nil, mountURL: String? = nil) {
         let s = url.standardizedFileURL
-        guard !contains(s) else { return }
-        urls.append(s); persist()
+        if label == nil, contains(s) { return }   // dedupe plain drag-adds; named drives may share a path
+        items.append(Favorite(label: label ?? favoriteName(s), path: s.path, mountURL: mountURL)); persist()
     }
-    func remove(_ url: URL) { urls.removeAll { $0.path == url.path }; persist() }
-    func move(from: IndexSet, to: Int) { urls.move(fromOffsets: from, toOffset: to); persist() }
-    func reset() { urls = defaultLocations().map { $0.url }; persist() }
-    private func persist() { UserDefaults.standard.set(urls.map { $0.path }, forKey: "favorites") }
+    func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
+    func move(from: IndexSet, to: Int) { items.move(fromOffsets: from, toOffset: to); persist() }
+    func reset() { items = defaultLocations().map { Favorite(label: $0.name, path: $0.url.path, mountURL: nil) }; persist() }
+    private func persist() { if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: "favoritesV2") } }
 }
 
 let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
@@ -854,6 +869,21 @@ final class Browser: ObservableObject, Identifiable {
         load()
         RecentFolders.shared.record(url)
         NotificationCenter.default.post(name: .navigatorDidNavigate, object: nil)
+    }
+
+    // Navigate to a sidebar favorite. For a network drive whose volume isn't
+    // mounted (e.g. after a reboot or VPN reconnect), (re)mount it first, then go.
+    func openFavorite(_ path: String, mountURL: String?) {
+        let url = URL(fileURLWithPath: path)
+        if fm.fileExists(atPath: path) { navigate(to: url); return }
+        guard let m = mountURL, let smb = URL(string: m) else { NSSound.beep(); return }
+        busy = true; busyText = "Connecting to \(smb.host ?? "server")…"
+        NSWorkspace.shared.open(smb)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self else { return }
+            self.busy = false; self.busyText = ""
+            if self.fm.fileExists(atPath: path) { self.navigate(to: url) } else { NSSound.beep() }
+        }
     }
 
     func goUp() {
@@ -1396,11 +1426,11 @@ struct SidebarView: View {
     // into subfolders inline; clicking any node navigates the main view there.
     @ViewBuilder private func tree(_ node: SidebarNode, removable: Bool) -> some View {
         OutlineGroup(node, children: \.children) { n in
-            Button { browser.navigate(to: n.url) } label: {
+            Button { browser.openFavorite(n.url.path, mountURL: n.mountURL) } label: {
                 Label(n.name, systemImage: n.symbol).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
-            }.buttonStyle(.plain).help(n.url.path)
+            }.buttonStyle(.plain).help(n.mountURL ?? n.url.path)
                 .contextMenu {
-                    if removable && n.id == node.id { Button("Remove from Sidebar") { favStore.remove(n.url) } }
+                    if removable && n.id == node.id { Button("Remove from Sidebar") { favStore.remove(label: n.name, path: n.url.path) } }
                 }
         }
     }
@@ -1450,11 +1480,11 @@ struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .onAppear { rebuildNodes() }
-        .onChange(of: favStore.urls) { rebuildFav() }
+        .onChange(of: favStore.items) { rebuildFav() }
     }
 
     private func rebuildFav() {
-        favNodes = favStore.urls.map { SidebarNode(url: $0, name: favoriteName($0), symbol: favoriteSymbol($0)) }
+        favNodes = favStore.items.map { SidebarNode(url: $0.url, name: $0.label, symbol: favoriteSymbol($0.url), mountURL: $0.mountURL) }
     }
     private func rebuildNodes() {
         rebuildFav()
@@ -2000,10 +2030,13 @@ final class SidebarNode: Identifiable {
     let url: URL
     let name: String
     let symbol: String
-    var id: String { url.path }
+    let mountURL: String?    // for a network-drive favorite: (re)mount when the path is gone
+    var id: String { "\(name)\u{1}\(url.path)" }   // name-scoped so two labels can share a path
     private var loaded = false
     private var cache: [SidebarNode] = []
-    init(url: URL, name: String, symbol: String) { self.url = url; self.name = name; self.symbol = symbol }
+    init(url: URL, name: String, symbol: String, mountURL: String? = nil) {
+        self.url = url; self.name = name; self.symbol = symbol; self.mountURL = mountURL
+    }
 
     var children: [SidebarNode]? {
         if !loaded { loaded = true; cache = SidebarNode.subfolders(url) }
