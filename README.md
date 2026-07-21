@@ -8,53 +8,77 @@ A premium, Finder-style file manager for macOS — built for a Windows → Mac s
 - **Apple Silicon or Intel Mac** — the release is a **universal** binary
 - **macOS 14 (Sonoma) or newer**
 
-## Download (no build required)
-Grab the latest **Navigator.zip** from the [**Releases**](../../releases/latest) page:
-1. Unzip it and drag **Navigator.app** into **Applications**.
-2. **First launch (one-time):** right-click (Control-click) **Navigator.app → Open → Open**.
+## Install (no build required)
 
-> Navigator isn't notarized by Apple, so a plain double-click shows a security warning the first time. Right-click → Open gets past it once; afterward it opens normally. (Alternatives: **System Settings → Privacy & Security → Open Anyway**, or `xattr -dr com.apple.quarantine /Applications/Navigator.app`.)
+1. Download the latest **Navigator.zip** from the [**Releases**](../../releases/latest) page.
+2. Unzip it and drag **Navigator.app** into your **Applications** folder.
+3. Do the one-time first-launch step below, then grant permissions.
 
-## Build from source
-Needs the **Xcode Command Line Tools** (`xcode-select --install`). One command builds, signs, and installs to `/Applications`:
+---
 
-```bash
-git clone <your-repo-url> NavigatorApp
-cd NavigatorApp
-bash rebuild.sh
-open /Applications/Navigator.app
-```
+## First launch & permissions
 
-- `rebuild.sh` compiles `main.swift`, generates the icon from `AppIcon.png`, assembles the `.app` bundle, and code-signs it.
-- `quickbuild.sh` is a faster variant for iterating (skips icon regeneration).
+Navigator is signed with a **self-signed** certificate (not an Apple Developer ID), so macOS treats it as an app "from an unidentified developer." A few one-time steps get it fully working. None of this recurs after the first time.
 
-### Stable code signing (recommended, optional)
-If a self-signed **“Navigator Dev”** certificate exists in your login keychain, `rebuild.sh` signs with it so the app's identity stays constant across rebuilds — which means macOS **remembers** its Full Disk Access / folder-access grants instead of re-prompting every build. Without it, the build falls back to ad-hoc signing (still runs; permissions just reset per build). A backup of the cert lives in `~/.navigator-signing/` (password in its README).
+### 1. Open it the first time (get past Gatekeeper)
+A plain double-click will be blocked the first time. Instead, do **one** of:
+- **Right-click (Control-click) Navigator.app → Open → Open.** ← easiest
+- **System Settings → Privacy & Security**, scroll to *"Navigator was blocked…"* → **Open Anyway**.
+- Terminal: `xattr -dr com.apple.quarantine /Applications/Navigator.app`
 
-### Sharing with someone else
-Send them the [Releases](../../releases/latest) download (universal, runs on Apple Silicon and Intel, macOS 14+). Because it isn't notarized, the first launch needs a one-time **right-click → Open**. Truly zero-warning distribution would require Apple Developer ID signing + notarization ($99/yr Apple Developer Program).
+After this once, it launches normally every time.
+
+### 2. Allow folder-access prompts (Desktop / Documents / Downloads)
+The first time Navigator opens your **Desktop**, **Documents**, or **Downloads**, macOS asks *"Navigator would like to access files in your … folder."* Click **OK / Allow**.
+- Clicked *Don't Allow* by mistake? Re-enable it in **System Settings → Privacy & Security → Files and Folders → Navigator**.
+
+### 3. Grant Full Disk Access (recommended)
+For **full** functionality — moving items in protected folders (Pictures, Documents, Desktop, Downloads) to the Trash, copying/renaming there, and browsing system locations without repeated prompts — give Navigator **Full Disk Access**:
+
+- **From Navigator:** menu bar → **Navigator → "Grant Full Disk Access…"** (opens the correct settings pane), **or**
+- **Manually:** System Settings → **Privacy & Security → Full Disk Access** → click **+** → select **Navigator** from Applications → toggle it **on** → **relaunch Navigator**.
+
+Without this, operations on protected folders may fail — Navigator will tell you exactly what failed and why (it no longer fails silently), and point you here.
+
+### 4. Local Network (for discovering servers)
+To auto-discover SMB file servers on your LAN (the **Network** section of the sidebar, via Bonjour), allow the **Local Network** prompt on first launch — or enable it later in **System Settings → Privacy & Security → Local Network → Navigator**.
+
+### 5. Connecting to network drives / servers
+Use **Connect to Server (⌘K)** or the Dock-icon menu to mount an SMB/AFP share (e.g. `smb://server/share`). You must be on the same network (or VPN) as the server. Mounted shares appear under **Locations**. Navigator applies a safe per-user SMB tuning automatically on launch for smoother network browsing.
+
+> **Why the grants stick:** macOS ties these permissions to the app's code signature. The release build has a **stable** signature, so your grants persist across updates — you won't have to re-grant them each time you install a new version.
+
+---
 
 ## Features
 
-**Views** — List, Icon, Gallery (big preview + filmstrip), and Column (Miller) views. The left **sidebar is an expandable tree** (Windows-11-style): click a folder's disclosure triangle to drill into subfolders inline.
+**Windows 11-style command bar** — A full-width top bar: **New ▾ · Cut · Copy · Paste · Rename · Share · Delete · Sort ▾ · View ▾ · ⋯ · Details**, above the navigation / file / details panes. **⌘ + scroll wheel** resizes and cycles the view (Details → Columns → Icons, with smooth icon sizing), just like Explorer's Ctrl+scroll.
 
-**Navigation** — Editable address bar (⌘L), clickable breadcrumb, tabs (⌘T/⌘W), multiple windows (⌘N), back/forward/up, full keyboard navigation (arrows, Return to open, Backspace for enclosing folder), and type-to-select. Reopens your tabs and window position on launch.
+**Views** — List (Details), Icon (small→extra-large), Gallery (big preview + filmstrip), and Column (Miller) views. The **sidebar is an expandable tree**: click a folder's disclosure triangle to drill in inline.
 
-**Dual pane** — Split the content into two independent panes (⌥⌘2) to drag files between them, ForkLift-style.
+**Thumbnails** — Real thumbnails in every view for images, **video** (poster frame), **PSD/PSB**, **PDF**, and **RAW** — via QuickLook. **Animated GIFs play** in the viewer and preview pane.
 
-**File operations** — Copy / Cut / Paste / Duplicate / Rename / Move to Trash / Empty Trash / Compress / **Extract** (zip + tar family) / **Batch rename** (find-replace, prefix/suffix, numbering) / New Folder / New Text File / Make Alias / **Make Symbolic Link**. Copy/move show a **progress window** and a **conflict dialog** (Keep Both / Replace / Skip). Most operations are **undoable** (⌘Z).
+**Image viewer** — Built-in viewer with **zoom** (scroll wheel, ⌘+/−/0, and a zoom slider), drag-to-pan, ←/→ through the folder, and a bottom bar showing **dimensions, file size, and position**.
 
-**Metadata & columns** — Toggle columns from the header menu: Name, Date Modified/Created/Added, Size (with on-demand **folder size** calculation), Kind, Extension, and — read lazily from Spotlight — media **Duration**, image/video **Dimensions**, and **Tags**. Column widths and choices persist.
+**Pin folders (Quick Access)** — Right-click any folder → **Pin to Sidebar**; pinned favorites show a **pushpin** you can click to unpin. Home stays a fixed anchor.
 
-**Preview & Get Info** — A toggleable preview pane (⇧⌘P) and a rich **Get Info** window with editable name, tags, comments, permissions, and Open With. **Set/edit Finder tags** (colored) and comments.
+**Navigation** — Editable address bar (⌘L), clickable breadcrumb, tabs (⌘T/⌘W), multiple windows (⌘N), back/forward/up, full keyboard nav, and type-to-select. Reopens your tabs and window position on launch. **Auto-refresh**: the current folder updates automatically when files change on disk (local & cloud folders, via FSEvents).
 
-**Search** — Instant name **filter** for the current folder, plus a recursive **Spotlight search** with scope (This Folder / This Mac) and kind filters (Images / Documents / PDFs / Movies / Audio / Folders).
+**File operations** — Copy / Cut / Paste (**⌘C/⌘X/⌘V**, with numbered-copy paste-in-place) / Duplicate / Rename / Move to Trash / Empty Trash / Compress / **Extract** (zip + tar) / **Batch rename** / New Folder / New Text File / Make Alias / **Make Symbolic Link**. Copy/move show a **progress window** and **conflict dialog** (Keep Both / Replace / Skip). Most operations are **undoable** (⌘Z), and failures are always reported — never silent.
 
-**Sidebar** — Customizable **Favorites** (drag a folder in, or “Add to Sidebar”), **Recents** and **Recent Folders**, **Cloud** (iCloud / Google Drive / OneDrive / Dropbox), **Locations** (disks — USB/external drives auto-appear on plug-in, with eject), **Network** (Bonjour-discovered SMB servers), and **Connect to Server** (⌘K).
+**Dual pane** — Split into two independent panes (⌥⌘2) to drag files between them.
 
-**System integration** — Appears in Finder's **Open With** for folders; an **“Open in Navigator”** entry in Finder's Services menu; **Open With / set default app** for files; **Open in Terminal**; **Quick Look** (Space / ⌘Y); **Share…**; built-in **image viewer** (←/→ through a folder). Status bar shows item count and free space.
+**Metadata & columns** — Toggle columns: Name, Date Modified/Created/Added, Size (with on-demand **folder size**), Kind, Extension, and — lazily from Spotlight — **Duration**, **Dimensions**, and **Tags**. Widths and choices persist.
 
-**Extras** — Grant Full Disk Access helper, Set as Default File Browser helper (with an honest explanation of macOS's Finder restriction), and light/dark theme following the system.
+**Preview & Get Info** — Toggleable preview pane (⇧⌘P / the **Details** button) and a rich **Get Info** window with editable name, tags, comments, permissions, and Open With. Set/edit colored **Finder tags** and comments.
+
+**Search** — Instant name filter, plus recursive **Spotlight search** with scope (This Folder / This Mac) and kind filters.
+
+**Sidebar** — **Recents** (recent files, like Finder), **Recent Folders** (folders you've actually worked in), customizable **Favorites**, **Cloud** (iCloud / Google Drive / OneDrive / Dropbox), **Locations** (disks, with eject), and **Network** (Bonjour SMB servers).
+
+**Dock menu** — Right-click Navigator in the Dock for New Window, New Tab, Find…, Go to Folder…, Connect to Server…, Applications, Volumes, Home.
+
+**System integration** — Finder **Open With** + **"Open in Navigator"** Services entry, **Open in Terminal**, **Quick Look** (Space / ⌘Y), **Share…**, and folders open faster on network drives than Finder.
 
 ## Keyboard shortcuts
 | Shortcut | Action |
@@ -62,18 +86,40 @@ Send them the [Releases](../../releases/latest) download (universal, runs on App
 | ⌘L / ⌘F | Focus address bar / search |
 | ⌘T / ⌘W / ⌘N | New tab / close tab / new window |
 | ⇧⌘N / ⌥⌘N | New folder / new text file |
+| ⌘C / ⌘X / ⌘V | Copy / cut / paste files |
 | ⌘I / ⌘D / ⌘Y or Space | Get Info / Duplicate / Quick Look |
 | ⌘⌫ / ⇧⌘⌫ | Move to Trash / Empty Trash |
 | ⌘[ / ⌘] / ⌘↑ | Back / Forward / Enclosing folder |
 | ⇧⌘P / ⌥⌘S / ⌥⌘2 | Toggle preview / sidebar / dual pane |
 | ⇧⌘. / ⌘R / ⌘Z / ⌘K | Show hidden / Refresh / Undo / Connect to Server |
+| ⌘ + scroll | Resize / cycle the view (Details ↔ Columns ↔ Icons) |
+| ⌘+ / ⌘− / ⌘0 | Zoom in / out / fit *(image viewer)* |
+
+## Build from source
+Needs the **Xcode Command Line Tools** (`xcode-select --install`). One command builds, signs, and installs to `/Applications`:
+
+```bash
+git clone https://github.com/michaelericksonh5/Navigator.git NavigatorApp
+cd NavigatorApp
+bash rebuild.sh
+open /Applications/Navigator.app
+```
+
+- `rebuild.sh` compiles `main.swift`, generates the icon from `AppIcon.png`, assembles the universal `.app` bundle (arm64 + x86_64), and code-signs it.
+- `quickbuild.sh` is a faster arm64-only variant for iterating.
+
+### Stable code signing (recommended, optional)
+If a self-signed **"Navigator Dev"** certificate exists in your login keychain, `rebuild.sh` signs with it so the app's identity stays constant across rebuilds — which means macOS **remembers** its Full Disk Access / folder-access grants instead of re-prompting every build. Without it, the build falls back to ad-hoc signing (still runs; permissions just reset per build). A backup of the cert lives in `~/.navigator-signing/`.
+
+### Sharing with someone else
+Send them the [Releases](../../releases/latest) download (universal, macOS 14+). Because it isn't notarized, their first launch needs the one-time **right-click → Open** and the permission steps above. Truly zero-warning distribution would require Apple Developer ID signing + notarization ($99/yr Apple Developer Program).
 
 ## Known limitations
+- **Auto-refresh** covers local and cloud (File Provider) folders. **SMB network shares** don't push change notifications, so use **⌘R** (or revisit) to refresh those. Files added on a cloud service's *other* devices appear only once that service syncs them down to this Mac.
 - **Cannot fully replace Finder** as the system folder handler — macOS locks that to Finder. Navigator registers as a folder app instead (Open With, the Services entry, and `open -b com.merickson.navigator <folder>` all work).
 - **Empty Trash** clears only the home volume's `~/.Trash`, not per-volume trashes.
-- **Bonjour** network discovery needs macOS's Local Network permission; unmounted servers may not appear until it's granted.
-- Favorites are added/removed via drag and context menu (drag-to-reorder was removed when the sidebar became an expandable tree).
-- The app-icon source is 616×616, so the largest (1024) icon size is slightly upscaled.
+- Some protected-folder operations require **Full Disk Access** (see permissions above).
+- Not notarized — hence the one-time first-launch step.
 
 ## License
 Personal project. No warranty.
