@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import Quartz
+import QuickLookThumbnailing
 import CoreServices
 
 extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
@@ -313,17 +314,25 @@ final class NetworkBrowser: NSObject, ObservableObject, NetServiceBrowserDelegat
     }
 }
 
-// Async image-thumbnail cache (falls back to file-type icons for non-images).
+// Async thumbnail cache backed by QuickLook. Unlike loading the full NSImage,
+// QLThumbnailGenerator produces a right-sized preview cheaply and supports many
+// formats beyond plain images — PSD, PDF, AI, RAW — via the system's thumbnail
+// generators (and its own on-disk cache). Non-thumbnailable files return nil so
+// callers fall back to the file-type icon. Cache is keyed by path+size so the
+// small list-view thumbnail and the large preview don't clobber each other.
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
     private let cache = NSCache<NSString, NSImage>()
-    func thumbnail(for url: URL, completion: @escaping (NSImage?) -> Void) {
-        let key = url.path as NSString
+    func thumbnail(for url: URL, size: CGFloat = 256, completion: @escaping (NSImage?) -> Void) {
+        let key = "\(url.path)@\(Int(size))" as NSString
         if let c = cache.object(forKey: key) { completion(c); return }
-        DispatchQueue.global(qos: .utility).async {
-            var img: NSImage?
-            if isImageFile(url), let src = NSImage(contentsOf: url) { img = src }
-            if let i = img { self.cache.setObject(i, forKey: key) }
+        guard isThumbnailable(url) else { completion(nil); return }
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+        let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
+                                               scale: scale, representationTypes: .thumbnail)
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { [weak self] rep, _ in
+            let img = rep?.nsImage
+            if let img { self?.cache.setObject(img, forKey: key) }
             DispatchQueue.main.async { completion(img) }
         }
     }
@@ -530,6 +539,16 @@ final class FavoritesStore: ObservableObject {
 
 let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
 func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtension.lowercased()) }
+
+let videoExtensions: Set<String> = ["mp4","mov","m4v","avi","mkv","webm","wmv","flv","mpg","mpeg","3gp","m2ts","mts","m2v","ts"]
+func isVideoFile(_ url: URL) -> Bool { videoExtensions.contains(url.pathExtension.lowercased()) }
+
+// Types worth asking QuickLook for a thumbnail of: images, video (poster frame),
+// plus design/raw formats it can render — notably PSD. Everything else shows its
+// file-type icon.
+let thumbnailExtensions: Set<String> = imageExtensions.union(videoExtensions).union(
+    ["psd","psb","pdf","ai","eps","svg","tga","exr","dds","cr2","nef","arw","dng","raw","orf","rw2","raf"])
+func isThumbnailable(_ url: URL) -> Bool { thumbnailExtensions.contains(url.pathExtension.lowercased()) }
 
 let archiveExtensions: Set<String> = ["zip","tar","tgz","gz","bz2","xz","tbz","txz"]
 func isArchive(_ url: URL) -> Bool { archiveExtensions.contains(url.pathExtension.lowercased()) }
@@ -1207,6 +1226,19 @@ final class Browser: ObservableObject, Identifiable {
         return dest
     }
 
+    // Name for pasting a file into its own folder: "photo.jpg" -> "photo (1).jpg",
+    // then "(2)", "(3)"… (Windows/Explorer-style in-place copy).
+    private func numberedCopyDest(_ dir: URL, _ name: String) -> URL {
+        let fm = FileManager.default
+        let ext = (name as NSString).pathExtension, base = (name as NSString).deletingPathExtension
+        func make(_ n: Int) -> URL {
+            dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
+        }
+        var i = 1, dest = make(1)
+        while fm.fileExists(atPath: dest.path) { i += 1; dest = make(i) }
+        return dest
+    }
+
     func pasteFiles() { copyURLs(pasteboardURLs(), move: cutMode) }
 
     private func pasteboardURLs() -> [URL] {
@@ -1215,10 +1247,16 @@ final class Browser: ObservableObject, Identifiable {
 
     // Background copy/move with a busy indicator (keeps the UI responsive on big transfers).
     func copyURLs(_ urls: [URL], move: Bool) {
-        // Skip items that already live in this folder — dropping into the same
-        // folder is a no-op (cancel), not a self-copy.
-        let sources = urls.filter {
-            $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path
+        let sources: [URL]
+        if move {
+            // Moving items into the folder they already live in is a no-op.
+            sources = urls.filter {
+                $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path
+            }
+        } else {
+            // Paste (copy): items already in this folder become numbered duplicates
+            // ("photo.jpg" -> "photo (1).jpg"); everything else copies in normally.
+            sources = urls.filter { $0.path != currentURL.path }
         }
         guard !sources.isEmpty else { return }
         performTransfer(sources, into: currentURL, move: move, resetCut: true)
@@ -1233,9 +1271,13 @@ final class Browser: ObservableObject, Identifiable {
 
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
         let fm = FileManager.default
+        // A copy whose source already lives in the destination is an in-place
+        // duplicate ("paste into same folder") — it gets a numbered name silently,
+        // so it's never treated as a conflict.
+        func isSelfDup(_ src: URL) -> Bool { !move && src.deletingLastPathComponent().path == dir.path }
         // Resolve name conflicts up front with one prompt (applied to all).
         var policy: ConflictPolicy = .keepBoth
-        let conflicts = sources.filter { fm.fileExists(atPath: dir.appendingPathComponent($0.lastPathComponent).path) }
+        let conflicts = sources.filter { !isSelfDup($0) && fm.fileExists(atPath: dir.appendingPathComponent($0.lastPathComponent).path) }
         if !conflicts.isEmpty {
             let a = NSAlert()
             a.messageText = conflicts.count == 1
@@ -1269,7 +1311,9 @@ final class Browser: ObservableObject, Identifiable {
                 }
                 let target = dir.appendingPathComponent(src.lastPathComponent)
                 var dest = target
-                if fm.fileExists(atPath: target.path) {
+                if isSelfDup(src) {
+                    dest = self.numberedCopyDest(dir, src.lastPathComponent)
+                } else if fm.fileExists(atPath: target.path) {
                     switch policy {
                     case .skip: continue
                     case .replace: try? fm.removeItem(at: target)
@@ -1847,12 +1891,34 @@ struct BreadcrumbBar: View {
     }
 }
 
+// Small leading icon for list/column rows that upgrades to a real thumbnail
+// (images, video poster frames, PSD, PDF…) once QuickLook produces one. Lazy
+// per row via .onAppear, so only rows scrolled into view do any work; folders
+// and non-visual files just keep their type icon.
+struct ThumbIcon: View {
+    let item: FileItem
+    @ObservedObject var browser: Browser
+    var size: CGFloat = 16
+    @State private var thumb: NSImage?
+    var body: some View {
+        Group {
+            if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fit) }
+            else { Image(nsImage: browser.icon(for: item)).resizable() }
+        }
+        .frame(width: size, height: size)
+        .onAppear {
+            guard thumb == nil, !item.isDirectory, isThumbnailable(item.url) else { return }
+            ThumbnailCache.shared.thumbnail(for: item.url, size: max(40, size * 2)) { if let t = $0 { thumb = t } }
+        }
+    }
+}
+
 struct NameCell: View {
     let item: FileItem
     @ObservedObject var browser: Browser
     var body: some View {
         HStack(spacing: 6) {
-            Image(nsImage: browser.icon(for: item)).resizable().frame(width: 16, height: 16)
+            ThumbIcon(item: item, browser: browser)
             Text(item.name).lineLimit(1)
         }
     }
@@ -2221,7 +2287,7 @@ struct PreviewPane: View {
         guard let it = item else { thumb = nil; meta = FileMeta(); return }
         thumb = nil; meta = FileMeta()
         if it.isDirectory { FolderSizeCache.shared.compute(it.url) }
-        ThumbnailCache.shared.thumbnail(for: it.url) { img in
+        ThumbnailCache.shared.thumbnail(for: it.url, size: 512) { img in
             if self.item?.url == it.url { self.thumb = img }
         }
         MetadataCache.shared.meta(for: it.url) { m in
@@ -2305,7 +2371,7 @@ struct ColumnList: View {
         List(selection: $sel) {
             ForEach(items) { item in
                 HStack(spacing: 6) {
-                    Image(nsImage: browser.icon(for: item)).resizable().frame(width: 16, height: 16)
+                    ThumbIcon(item: item, browser: browser)
                     Text(item.name).lineLimit(1)
                     Spacer(minLength: 0)
                     if item.isDirectory { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary) }
@@ -2834,7 +2900,7 @@ struct GetInfoView: View {
         browser.setTags([item.id], tags: tags)
     }
     private func load() {
-        ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }
+        ThumbnailCache.shared.thumbnail(for: item.url, size: 512) { thumb = $0 }
         MetadataCache.shared.meta(for: item.url) { m in meta = m; if let c = m.comment, comment.isEmpty { comment = c } }
         if item.isDirectory { FolderSizeCache.shared.compute(item.url) }
     }
