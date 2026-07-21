@@ -638,22 +638,54 @@ final class Browser: ObservableObject, Identifiable {
     var currentAscending: Bool { sortOrder.first?.order == .forward }
     func setSort(_ f: SortField, ascending: Bool) { sortOrder = [Browser.comparator(for: f, ascending: ascending)] }
 
-    func icon(for item: FileItem) -> NSImage { NSWorkspace.shared.icon(forFile: item.url.path) }
+    var currentIsNetwork = false
+    private static var typeIconCache: [String: NSImage] = [:]
+    func icon(for item: FileItem) -> NSImage {
+        // On network volumes, use cached icons keyed by type (no per-file I/O over
+        // SMB). Locally, use the real per-file icon (custom folder/app icons).
+        guard currentIsNetwork else { return NSWorkspace.shared.icon(forFile: item.url.path) }
+        let key = item.isDirectory ? "/dir" : (item.ext.isEmpty ? "/file" : item.ext)
+        if let c = Browser.typeIconCache[key] { return c }
+        let type: UTType = item.isDirectory ? .folder : (UTType(filenameExtension: item.ext) ?? .data)
+        let img = NSWorkspace.shared.icon(for: type)
+        Browser.typeIconCache[key] = img
+        return img
+    }
 
+    // Full metadata (used on fast/local volumes and for single-item detail views).
     static let itemKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
                                              .creationDateKey, .contentAccessDateKey, .addedToDirectoryDateKey,
                                              .localizedTypeDescriptionKey, .tagNamesKey]
+    // Minimal metadata for slow (network/SMB) volumes — just what the default
+    // columns need. Everything else is derived locally or falls back, so a
+    // 600-item network folder loads in a couple of round-trips, not hundreds.
+    static let fastItemKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+
+    // Localized "Kind" derived from the extension with no disk/network I/O.
+    private static var kindCache: [String: String] = [:]
+    private static let kindLock = NSLock()
+    static func localKind(_ url: URL, isDir: Bool) -> String {
+        if isDir { return "Folder" }
+        let ext = url.pathExtension.lowercased()
+        if ext.isEmpty { return "Document" }
+        kindLock.lock(); defer { kindLock.unlock() }
+        if let c = kindCache[ext] { return c }
+        let kind = UTType(filenameExtension: ext)?.localizedDescription ?? "\(ext.uppercased()) file"
+        kindCache[ext] = kind
+        return kind
+    }
 
     static func item(from u: URL, _ rv: URLResourceValues?) -> FileItem {
         let isDir = rv?.isDirectory ?? false
         let modified = rv?.contentModificationDate ?? Date.distantPast
+        let kind = (rv?.allValues[.localizedTypeDescriptionKey] as? String) ?? localKind(u, isDir: isDir)
         return FileItem(id: u.path, url: u, name: u.lastPathComponent,
                         isDirectory: isDir, size: Int64(rv?.fileSize ?? 0),
                         modified: modified,
                         created: rv?.creationDate ?? modified,
                         accessed: (rv?.allValues[.contentAccessDateKey] as? Date) ?? modified,
                         dateAdded: (rv?.allValues[.addedToDirectoryDateKey] as? Date) ?? modified,
-                        kind: rv?.localizedTypeDescription ?? (isDir ? "Folder" : "File"),
+                        kind: kind,
                         tags: (rv?.allValues[.tagNamesKey] as? [String]) ?? [])
     }
 
@@ -802,26 +834,40 @@ final class Browser: ObservableObject, Identifiable {
         pathText = currentURL.path
         selection = []
         let dir = currentURL
-        let keys = Browser.itemKeys
+        // On slow (network/SMB) volumes, fetch only the essential attributes to
+        // avoid hundreds of per-file round-trips over the VPN.
+        let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
+        currentIsNetwork = isNetwork
+        let keys = isNetwork ? Browser.fastItemKeys : Browser.itemKeys
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         loadGeneration += 1
         let gen = loadGeneration
         busy = true; busyText = "Loading…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Stream items in as they're read (Finder-style progressive fill) so a
+            // huge/slow network folder shows contents immediately instead of a long
+            // blank wait. Publish in batches; discard if a newer load superseded us.
+            let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
             var result: [FileItem] = []
-            if let urls = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: opts) {
-                for u in urls {
-                    result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+            var sinceFlush = 0
+            func flush(done: Bool) {
+                let snapshot = result
+                DispatchQueue.main.async {
+                    guard let self, gen == self.loadGeneration else { return }
+                    self.items = snapshot
+                    if done { self.busy = false; self.busyText = ""; self.updateFreeSpace() }
+                    else { self.busyText = "Loading… (\(snapshot.count))" }
+                    self.updateStatus()
                 }
             }
-            DispatchQueue.main.async {
-                guard let self, gen == self.loadGeneration else { return }   // ignore superseded loads
-                self.items = result
-                self.busy = false; self.busyText = ""
-                self.updateFreeSpace()
-                self.updateStatus()
+            while let u = en?.nextObject() as? URL {
+                guard let self, gen == self.loadGeneration else { return }   // superseded → stop
+                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                sinceFlush += 1
+                if sinceFlush >= 50 { sinceFlush = 0; flush(done: false) }
             }
+            flush(done: true)
         }
     }
 
