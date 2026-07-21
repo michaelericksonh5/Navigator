@@ -8,6 +8,22 @@ enum ViewMode { case list, icon }
 enum SortField: String, CaseIterable { case name, modified, size, kind }
 enum GroupBy: String, CaseIterable { case none, kind, date, size }
 
+enum SearchKind: String, CaseIterable {
+    case any = "Any", images = "Images", documents = "Documents", pdf = "PDFs"
+    case movies = "Movies", audio = "Audio", folders = "Folders"
+    var typeTree: String? {
+        switch self {
+        case .any: return nil
+        case .images: return "public.image"
+        case .documents: return "public.content"
+        case .pdf: return "com.adobe.pdf"
+        case .movies: return "public.movie"
+        case .audio: return "public.audio"
+        case .folders: return "public.folder"
+        }
+    }
+}
+
 // Rich per-file metadata read lazily from Spotlight (the same index Finder uses):
 // media duration, pixel dimensions, and Finder comment. Loaded off the main
 // thread and cached, so scrolling a folder of media never blocks.
@@ -491,6 +507,8 @@ final class Browser: ObservableObject, Identifiable {
     @Published var filterText: String = ""
     @Published var searchText: String = ""
     @Published var isSearching = false
+    @Published var searchThisMac = false
+    @Published var searchKind: SearchKind = .any
     @Published var showHidden = false { didSet { Prefs.showHidden = showHidden; load() } }
     @Published var sortOrder: [KeyPathComparator<FileItem>] = [KeyPathComparator(\FileItem.name, order: .forward)] {
         didSet {
@@ -669,8 +687,10 @@ final class Browser: ObservableObject, Identifiable {
         status = "Searching…"
         searchQuery?.stop()
         let q = NSMetadataQuery()
-        q.searchScopes = [currentURL]
-        q.predicate = NSPredicate(format: "kMDItemDisplayName LIKE[cd] %@ OR kMDItemTextContent CONTAINS[cd] %@", "*\(query)*", query)
+        q.searchScopes = searchThisMac ? [NSMetadataQueryLocalComputerScope] : [currentURL]
+        var subs = [NSPredicate(format: "kMDItemDisplayName LIKE[cd] %@ OR kMDItemTextContent CONTAINS[cd] %@", "*\(query)*", query)]
+        if let tree = searchKind.typeTree { subs.append(NSPredicate(format: "kMDItemContentTypeTree == %@", tree)) }
+        q.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: subs)
         q.sortDescriptors = [NSSortDescriptor(key: "kMDItemFSName", ascending: true)]
         NotificationCenter.default.addObserver(self, selector: #selector(searchGathered(_:)),
                                                name: .NSMetadataQueryDidFinishGathering, object: q)
@@ -1334,6 +1354,18 @@ struct ControlBar: View {
                         Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
                             .buttonStyle(.plain)
                     }
+                    Menu {
+                        Picker("Scope", selection: $browser.searchThisMac) {
+                            Text("This Folder").tag(false)
+                            Text("This Mac").tag(true)
+                        }
+                        Picker("Kind", selection: $browser.searchKind) {
+                            ForEach(SearchKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                        }
+                    } label: { Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary) }
+                        .menuStyle(.borderlessButton).frame(width: 22)
+                        .onChange(of: browser.searchThisMac) { if browser.isSearching { browser.runSearch() } }
+                        .onChange(of: browser.searchKind) { if browser.isSearching { browser.runSearch() } }
                 }
                 .padding(.horizontal, 7).padding(.vertical, 4)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
