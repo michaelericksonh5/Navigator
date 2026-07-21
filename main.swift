@@ -583,6 +583,9 @@ final class FavoritesStore: ObservableObject {
         items.append(Favorite(label: label ?? favoriteName(s), path: s.path, mountURL: mountURL)); persist()
     }
     func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
+    func remove(url: URL) { let p = url.standardizedFileURL.path; items.removeAll { $0.path == p }; persist() }
+    // Pin/unpin a folder from anywhere (file view, etc.).
+    func togglePin(_ url: URL) { contains(url) ? remove(url: url) : add(url) }
     func move(from: IndexSet, to: Int) { items.move(fromOffsets: from, toOffset: to); persist() }
     func reset() { items = defaultLocations().map { Favorite(label: $0.name, path: $0.url.path, mountURL: nil) }; persist() }
     private func persist() { if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: "favoritesV2") } }
@@ -1900,7 +1903,11 @@ struct SidebarView: View {
                 Label(n.name, systemImage: n.symbol).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
             }.buttonStyle(.plain).help(n.mountURL ?? n.url.path)
                 .contextMenu {
-                    if removable && n.id == node.id { Button("Remove from Sidebar") { favStore.remove(label: n.name, path: n.url.path) } }
+                    // Home stays as a fixed anchor; everything else can be unpinned.
+                    if removable, n.id == node.id,
+                       n.url.standardizedFileURL.path != FileManager.default.homeDirectoryForCurrentUser.path {
+                        Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
+                    }
                 }
         }
     }
@@ -2333,8 +2340,11 @@ struct FileTableView: View {
                 Button("Calculate Size") {
                     for it in browser.items where ids.contains(it.id) && it.isDirectory { FolderSizeCache.shared.compute(it.url) }
                 }
-                Button("Add to Sidebar") {
-                    for it in browser.items where ids.contains(it.id) && it.isDirectory { FavoritesStore.shared.add(it.url) }
+                let dirs = browser.items.filter { ids.contains($0.id) && $0.isDirectory }
+                if dirs.count == 1, FavoritesStore.shared.contains(dirs[0].url) {
+                    Button("Unpin from Sidebar") { FavoritesStore.shared.remove(url: dirs[0].url) }
+                } else {
+                    Button("Pin to Sidebar") { for it in dirs { FavoritesStore.shared.add(it.url) } }
                 }
             }
             Button("Get Info") { showInfo(browser, ids) }
@@ -2460,7 +2470,13 @@ struct IconGridView: View {
                 Button("Make Alias") { browser.makeAlias([item.id]) }
                 Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
-                if item.isDirectory { Button("Add to Sidebar") { FavoritesStore.shared.add(item.url) } }
+                if item.isDirectory {
+                    if FavoritesStore.shared.contains(item.url) {
+                        Button("Unpin from Sidebar") { FavoritesStore.shared.remove(url: item.url) }
+                    } else {
+                        Button("Pin to Sidebar") { FavoritesStore.shared.add(item.url) }
+                    }
+                }
                 Button("Get Info") { showInfo(browser, [item.id]) }
                 Divider()
                 Button("Share…") { shareItems([item.url]) }
