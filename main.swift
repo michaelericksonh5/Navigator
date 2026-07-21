@@ -444,6 +444,51 @@ func defaultLocations() -> [SidebarLocation] {
     ]
 }
 
+// SF Symbol / display name for a favorite path (well-known folders get their icon).
+func favoriteSymbol(_ url: URL) -> String {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    switch url.path {
+    case home: return "house"
+    case "\(home)/Desktop": return "menubar.dock.rectangle"
+    case "\(home)/Documents": return "doc"
+    case "\(home)/Downloads": return "arrow.down.circle"
+    case "\(home)/Pictures": return "photo"
+    case "\(home)/Music": return "music.note"
+    case "\(home)/Movies": return "film"
+    case "/Applications": return "square.grid.2x2"
+    default: return "folder"
+    }
+}
+func favoriteName(_ url: URL) -> String {
+    if url.path == FileManager.default.homeDirectoryForCurrentUser.path { return "Home" }
+    let n = url.lastPathComponent
+    return n.isEmpty ? url.path : n
+}
+
+// User-customizable sidebar favorites (add / remove / reorder), persisted.
+final class FavoritesStore: ObservableObject {
+    static let shared = FavoritesStore()
+    @Published var urls: [URL]
+    init() {
+        if let saved = UserDefaults.standard.stringArray(forKey: "favorites"), !saved.isEmpty {
+            urls = saved.map { URL(fileURLWithPath: $0) }
+        } else {
+            urls = defaultLocations().map { $0.url }
+            persist()
+        }
+    }
+    func contains(_ url: URL) -> Bool { urls.contains { $0.path == url.standardizedFileURL.path } }
+    func add(_ url: URL) {
+        let s = url.standardizedFileURL
+        guard !contains(s) else { return }
+        urls.append(s); persist()
+    }
+    func remove(_ url: URL) { urls.removeAll { $0.path == url.path }; persist() }
+    func move(from: IndexSet, to: Int) { urls.move(fromOffsets: from, toOffset: to); persist() }
+    func reset() { urls = defaultLocations().map { $0.url }; persist() }
+    private func persist() { UserDefaults.standard.set(urls.map { $0.path }, forKey: "favorites") }
+}
+
 let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
 func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtension.lowercased()) }
 
@@ -1260,7 +1305,7 @@ struct SidebarView: View {
     @ObservedObject var browser: Browser
     @ObservedObject var recents = RecentFolders.shared
     @ObservedObject var network = NetworkBrowser.shared
-    let favorites: [SidebarLocation]
+    @ObservedObject var favStore = FavoritesStore.shared
 
     @ViewBuilder private func row(_ loc: SidebarLocation) -> some View {
         HStack(spacing: 2) {
@@ -1283,7 +1328,17 @@ struct SidebarView: View {
                 Button { browser.loadRecents() } label: {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
-                ForEach(favorites) { row($0) }
+                ForEach(favStore.urls, id: \.self) { u in
+                    Button { browser.navigate(to: u) } label: {
+                        Label(favoriteName(u), systemImage: favoriteSymbol(u)).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
+                    }.buttonStyle(.plain).help(u.path)
+                        .contextMenu { Button("Remove from Sidebar") { favStore.remove(u) } }
+                }
+                .onMove { favStore.move(from: $0, to: $1) }
+            }
+            .dropDestination(for: URL.self) { urls, _ in
+                for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }
+                return true
             }
             if !recents.urls.isEmpty {
                 Section {
@@ -1628,6 +1683,9 @@ struct FileTableView: View {
                 Button("Calculate Size") {
                     for it in browser.items where ids.contains(it.id) && it.isDirectory { FolderSizeCache.shared.compute(it.url) }
                 }
+                Button("Add to Sidebar") {
+                    for it in browser.items where ids.contains(it.id) && it.isDirectory { FavoritesStore.shared.add(it.url) }
+                }
             }
             Button("Get Info") { showInfo(browser, ids) }
             Button("Compress") { browser.compress(ids) }
@@ -1750,6 +1808,7 @@ struct IconGridView: View {
                 Button("Make Alias") { browser.makeAlias([item.id]) }
                 Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
+                if item.isDirectory { Button("Add to Sidebar") { FavoritesStore.shared.add(item.url) } }
                 Button("Get Info") { showInfo(browser, [item.id]) }
                 Divider()
                 Button("Share…") { shareItems([item.url]) }
@@ -2090,7 +2149,7 @@ struct BrowserPane: NSViewControllerRepresentable {
         vc.setPreview(collapsed: !model.showPreview)
     }
     private func apply(_ vc: PaneController) {
-        vc.apply(sidebar: AnyView(SidebarView(browser: browser, favorites: defaultLocations())),
+        vc.apply(sidebar: AnyView(SidebarView(browser: browser)),
                  content: AnyView(BrowserContent(model: model, browser: browser).id(browser.id)),
                  preview: AnyView(PreviewPane(browser: browser)))
     }
