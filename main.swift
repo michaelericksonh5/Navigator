@@ -208,6 +208,7 @@ enum Prefs {
         get { d.object(forKey: "showSidebar") == nil ? true : d.bool(forKey: "showSidebar") }
         set { d.set(newValue, forKey: "showSidebar") }
     }
+    static var dualPane: Bool { get { d.bool(forKey: "dualPane") } set { d.set(newValue, forKey: "dualPane") } }
     static var sidebarWidth: CGFloat {
         get { let v = d.double(forKey: "sidebarWidth"); return v < 120 ? 210 : CGFloat(v) }
         set { d.set(Double(newValue), forKey: "sidebarWidth") }
@@ -1313,6 +1314,8 @@ final class AppModel: ObservableObject {
     @Published var selected: Int = 0 { didSet { saveState() } }
     @Published var showPreview: Bool = Prefs.showPreview { didSet { Prefs.showPreview = showPreview } }
     @Published var showSidebar: Bool = Prefs.showSidebar { didSet { Prefs.showSidebar = showSidebar } }
+    @Published var dualPane: Bool = Prefs.dualPane { didSet { Prefs.dualPane = dualPane } }
+    lazy var secondary = Browser(start: FileManager.default.homeDirectoryForCurrentUser)
     @Published var columnCustomization: TableColumnCustomization<FileItem> = AppModel.loadColumns() {
         didSet { AppModel.saveColumns(columnCustomization) }
     }
@@ -1520,6 +1523,8 @@ struct ControlBar: View {
                 Button { browser.newFolder() } label: { Image(systemName: "folder.badge.plus") }.help("New Folder")
                 Button { browser.isSearching ? browser.runSearch() : browser.load() } label: { Image(systemName: "arrow.clockwise") }
                     .keyboardShortcut("r", modifiers: .command).help("Refresh")
+                Button { model.dualPane.toggle() } label: { Image(systemName: "rectangle.split.2x1") }
+                    .help("Dual Pane (⌥⌘2)").foregroundStyle(model.dualPane ? Color.accentColor : .secondary)
                 Button { model.showPreview.toggle() } label: {
                     Image(systemName: model.showPreview ? "sidebar.right" : "sidebar.squares.right")
                 }.help("Toggle Preview Pane").foregroundStyle(model.showPreview ? Color.accentColor : .secondary)
@@ -2290,8 +2295,17 @@ struct BrowserPane: NSViewControllerRepresentable {
         vc.setPreview(collapsed: !model.showPreview)
     }
     private func apply(_ vc: PaneController) {
+        let content: AnyView
+        if model.dualPane {
+            content = AnyView(HSplitView {
+                BrowserContent(model: model, browser: browser).id(browser.id).frame(minWidth: 260)
+                BrowserContent(model: model, browser: model.secondary).id(model.secondary.id).frame(minWidth: 260)
+            })
+        } else {
+            content = AnyView(BrowserContent(model: model, browser: browser).id(browser.id))
+        }
         vc.apply(sidebar: AnyView(SidebarView(browser: browser)),
-                 content: AnyView(BrowserContent(model: model, browser: browser).id(browser.id)),
+                 content: content,
                  preview: AnyView(PreviewPane(browser: browser)))
     }
 }
@@ -2742,6 +2756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sb.keyEquivalentModifierMask = [.command, .option]; sb.target = self
         let pv = viewMenu.addItem(withTitle: "Toggle Preview Pane", action: #selector(togglePreviewAction(_:)), keyEquivalent: "p")
         pv.keyEquivalentModifierMask = [.command, .shift]; pv.target = self
+        let dp = viewMenu.addItem(withTitle: "Toggle Dual Pane", action: #selector(toggleDualPaneAction(_:)), keyEquivalent: "2")
+        dp.keyEquivalentModifierMask = [.command, .option]; dp.target = self
         let sh = viewMenu.addItem(withTitle: "Toggle Hidden Files", action: #selector(toggleHiddenAction(_:)), keyEquivalent: ".")
         sh.keyEquivalentModifierMask = [.command, .shift]; sh.target = self
 
@@ -2776,6 +2792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func emptyTrashAction(_ sender: Any?) { confirmEmptyTrash(appModel.active) }
     @objc func togglePreviewAction(_ sender: Any?) { appModel.showPreview.toggle() }
     @objc func toggleSidebarAction(_ sender: Any?) { appModel.showSidebar.toggle() }
+    @objc func toggleDualPaneAction(_ sender: Any?) { appModel.dualPane.toggle() }
     @objc func toggleHiddenAction(_ sender: Any?) { appModel.active.showHidden.toggle() }
     @objc func undoAction(_ sender: Any?) {
         // When editing text, let the field's own undo run; otherwise undo file operations.
