@@ -51,6 +51,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSRemovableVolumesUsageDescription</key><string>Navigator shows and manages files on USB and external drives you connect.</string>
 <key>NSNetworkVolumesUsageDescription</key><string>Navigator shows and manages files on network drives you connect to.</string>
 <key>NSFileProviderPresenceUsageDescription</key><string>Navigator shows files stored in cloud providers like iCloud Drive and Google Drive.</string>
+<key>CFBundleDocumentTypes</key>
+<array>
+  <dict>
+    <key>CFBundleTypeName</key><string>Folder</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+  </dict>
+</array>
 </dict></plist>
 PLIST
 # Sign with the stable "Navigator Dev" self-signed identity if it exists, so the

@@ -2738,6 +2738,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Menu commands and keyboard nav target whichever Navigator window is key.
     var appModel: AppModel { (NSApp.keyWindow as? NavWindow)?.model ?? window.model }
 
+    private var pendingFolders: [URL] = []
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         setupMenu()
@@ -2747,7 +2749,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
         NetworkBrowser.shared.start()
+        // Any folders passed at launch (opened via the system) open as new tabs.
+        if !pendingFolders.isEmpty { pendingFolders.forEach { window.model.newTab(at: $0) }; pendingFolders = [] }
         // (No auto TCC prompt on launch — use the "Grant Full Disk Access…" menu command.)
+    }
+
+    // Receives folders/files the system routes to us (e.g. when Navigator is the
+    // default folder handler). Folders open as new tabs; other files open normally.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let folders = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let others = urls.filter { !folders.contains($0) }
+        for u in others { NSWorkspace.shared.open(u) }
+        guard !folders.isEmpty else { return }
+        guard let win = (NSApp.keyWindow as? NavWindow) ?? window else { pendingFolders += folders; return }
+        folders.forEach { win.model.newTab(at: $0) }
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @discardableResult
@@ -2828,6 +2845,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu(); appItem.submenu = appMenu
         appMenu.addItem(withTitle: "About Navigator", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
+        let dfb = appMenu.addItem(withTitle: "Set as Default File Browser…", action: #selector(setDefaultBrowserAction(_:)), keyEquivalent: "")
+        dfb.target = self
         let fda = appMenu.addItem(withTitle: "Grant Full Disk Access…", action: #selector(openFullDiskAccessAction(_:)), keyEquivalent: "")
         fda.target = self
         appMenu.addItem(.separator())
@@ -2921,6 +2940,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let r = window.firstResponder, r is NSText || r is NSTextView,
            let um = window.undoManager, um.canUndo { um.undo(); return }
         UndoStack.shared.undo()
+    }
+    @objc func setDefaultBrowserAction(_ sender: Any?) {
+        let appURL = Bundle.main.bundleURL
+        Task { @MainActor in
+            // Attempt the real takeover (works only if the OS permits it for folders).
+            try? await NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: .folder)
+            let def = NSWorkspace.shared.urlForApplication(toOpen: UTType.folder)
+            let isDefault = def?.standardizedFileURL.path == appURL.standardizedFileURL.path
+            let a = NSAlert()
+            if isDefault {
+                a.messageText = "Navigator is now your default folder handler"
+                a.informativeText = "Folders opened through the system will now open in Navigator."
+                a.addButton(withTitle: "OK")
+                a.runModal()
+            } else {
+                a.messageText = "macOS reserves folders for Finder"
+                a.informativeText = """
+                macOS doesn't let any third-party app fully replace Finder as the system-wide handler for folders — Apple locks that to Finder.
+
+                What does work — Navigator is registered as a folder app, so you can:
+                •  Right-click a folder in Finder → Open With → Navigator
+                •  Open With → Other…, pick Navigator, and tick “Always Open With” to make that folder always open in Navigator
+                •  From Terminal:  open -b com.merickson.navigator <folder>
+                •  Keep Navigator in your Dock as your everyday browser
+
+                Folders opened this way open as tabs in Navigator.
+                """
+                a.addButton(withTitle: "Reveal Navigator in Finder")
+                a.addButton(withTitle: "OK")
+                if a.runModal() == .alertFirstButtonReturn {
+                    NSWorkspace.shared.activateFileViewerSelecting([appURL])
+                }
+            }
+        }
     }
     @objc func openFullDiskAccessAction(_ sender: Any?) {
         let a = NSAlert()
