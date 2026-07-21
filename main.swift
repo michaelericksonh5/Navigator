@@ -259,6 +259,42 @@ final class RecentFolders: ObservableObject {
     func clear() { urls = []; Prefs.recentFolders = [] }
 }
 
+// Watches a single directory (non-recursively) and fires onChange when its
+// contents change — so a file appearing, disappearing, or being renamed by
+// another app refreshes the current view automatically. Local volumes only;
+// SMB doesn't push change notifications, so network folders use ⌘R / revisit.
+final class DirectoryWatcher {
+    private var source: DispatchSourceFileSystemObject?
+    private var fd: Int32 = -1
+    private var watchedPath: String?
+    private var pending = false
+    private let onChange: () -> Void
+    init(onChange: @escaping () -> Void) { self.onChange = onChange }
+    func watch(_ url: URL) {
+        if watchedPath == url.path, source != nil { return }   // already watching this folder
+        stop()
+        let f = open(url.path, O_EVTONLY)
+        guard f >= 0 else { return }
+        fd = f; watchedPath = url.path
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: f, eventMask: [.write, .extend, .rename, .delete], queue: .main)
+        src.setEventHandler { [weak self] in self?.fire() }
+        src.setCancelHandler { [weak self] in if let d = self?.fd, d >= 0 { close(d) }; self?.fd = -1 }
+        source = src
+        src.resume()
+    }
+    // Coalesce bursts of events (a copy fires many) into one refresh.
+    private func fire() {
+        guard !pending else { return }
+        pending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.pending = false; self?.onChange()
+        }
+    }
+    func stop() { source?.cancel(); source = nil; watchedPath = nil }
+    deinit { source?.cancel() }
+}
+
 // MARK: - Undo stack (file operations)
 
 final class UndoStack {
@@ -386,6 +422,18 @@ struct SidebarLocation: Identifiable, Hashable {
     let url: URL
     let symbol: String
     var ejectable: Bool = false
+}
+
+// Surfaces a file-operation failure instead of failing silently. Must be called
+// on the main thread.
+func reportFileError(_ summary: String, _ detail: String = "") {
+    let a = NSAlert(); a.alertStyle = .warning
+    a.messageText = summary
+    var msg = detail
+    if !msg.isEmpty { msg += "\n\n" }
+    msg += "Items in protected folders (Desktop, Documents, Pictures, Downloads) or on read-only volumes can need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
+    a.informativeText = msg
+    a.addButton(withTitle: "OK"); a.runModal()
 }
 
 // Shared dialogs / actions usable from menus and context menus.
@@ -872,6 +920,7 @@ final class Browser: ObservableObject, Identifiable {
     func loadRecents() {
         isRecents = true
         isSearching = false
+        dirWatcher.stop()
         selection = []
         pathText = "Recents"
         sortOrder = [KeyPathComparator(\FileItem.modified, order: .reverse)]
@@ -894,6 +943,7 @@ final class Browser: ObservableObject, Identifiable {
         let query = searchText.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { clearSearch(); return }
         isSearching = true
+        dirWatcher.stop()
         selection = []
         items = []
         status = "Searching…"
@@ -938,6 +988,37 @@ final class Browser: ObservableObject, Identifiable {
     private static var dirCache: [String: [FileItem]] = [:]
     static func invalidateCache(_ path: String) { dirCache[path] = nil; dirCache[path + "\u{1}h"] = nil }
 
+    // Auto-refresh: watches the current (local) folder and silently re-reads it
+    // when its contents change on disk (e.g. a download finishes, another app
+    // adds a file). Preserves selection; no "Loading…" flash.
+    private lazy var dirWatcher = DirectoryWatcher { [weak self] in self?.silentRefresh() }
+    func silentRefresh() {
+        guard !isSearching, !isRecents, !currentIsNetwork else { return }
+        let dir = currentURL, sh = showHidden
+        let cacheKey = dir.path + (sh ? "\u{1}h" : "")
+        loadGeneration += 1
+        let gen = loadGeneration
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let keys = Browser.itemKeys
+            var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
+            if !sh { opts.insert(.skipsHiddenFiles) }
+            let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
+            var result: [FileItem] = []
+            while let u = en?.nextObject() as? URL {
+                guard let self, gen == self.loadGeneration else { return }
+                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+            }
+            let final = result
+            DispatchQueue.main.async { [weak self] in
+                guard let self, gen == self.loadGeneration else { return }
+                Browser.dirCache[cacheKey] = final
+                self.items = final
+                self.selection = self.selection.filter { sel in final.contains { $0.id == sel } }
+                self.updateStatus()
+            }
+        }
+    }
+
     // Explicit user Refresh (⌘R): drop the cached listing for this folder so we
     // re-read from disk/network and show a clean "Loading…" instead of stale cache.
     func refresh() {
@@ -957,6 +1038,7 @@ final class Browser: ObservableObject, Identifiable {
         let dir = currentURL
         let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
         currentIsNetwork = isNetwork
+        if isNetwork { dirWatcher.stop() } else { dirWatcher.watch(dir) }   // auto-refresh local folders
         loadGeneration += 1
         let gen = loadGeneration
         let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
@@ -1244,7 +1326,8 @@ final class Browser: ObservableObject, Identifiable {
     }
     func newFolder() {
         let target = uniqueDest(currentURL, "New Folder")
-        try? fm.createDirectory(at: target, withIntermediateDirectories: false)
+        do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
+        catch { reportFileError("Couldn't create the folder", error.localizedDescription); return }
         RecentFolders.shared.record(currentURL)
         UndoStack.shared.push("New Folder") { [weak self] in
             try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
@@ -1253,7 +1336,10 @@ final class Browser: ObservableObject, Identifiable {
     }
     func newTextFile() {
         let target = uniqueDest(currentURL, "New Text File.txt")
-        fm.createFile(atPath: target.path, contents: Data())
+        guard fm.createFile(atPath: target.path, contents: Data()) else {
+            reportFileError("Couldn't create the text file",
+                            "Navigator couldn't write to “\(currentURL.lastPathComponent)”."); return
+        }
         RecentFolders.shared.record(currentURL)
         UndoStack.shared.push("New Text File") { [weak self] in
             try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
@@ -1367,6 +1453,7 @@ final class Browser: ObservableObject, Identifiable {
             guard let self else { return }
             var moved: [(from: URL, to: URL)] = []
             var copied: [URL] = []
+            var failures: [(name: String, reason: String)] = []
             let total = sources.count
             for (i, src) in sources.enumerated() {
                 if progress.cancelled { break }
@@ -1389,11 +1476,14 @@ final class Browser: ObservableObject, Identifiable {
                     if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
                     else { try fm.copyItem(at: src, to: dest); copied.append(dest) }
                 } catch {
+                    // Move across volumes fails as a rename → fall back to copy(+delete).
                     do {
                         try fm.copyItem(at: src, to: dest)
                         if move { try? fm.removeItem(at: src); moved.append((src, dest)) }
                         else { copied.append(dest) }
-                    } catch {}
+                    } catch let e {
+                        failures.append((src.lastPathComponent, e.localizedDescription))
+                    }
                 }
             }
             DispatchQueue.main.async {
@@ -1412,21 +1502,30 @@ final class Browser: ObservableObject, Identifiable {
                         self?.load()
                     }
                 }
+                Browser.invalidateCache(dir.path)
                 self.load()
+                if !failures.isEmpty {
+                    let verb = move ? "moved" : "copied"
+                    let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
+                    reportFileError(failures.count == 1 ? "“\(failures[0].name)” couldn't be \(verb)"
+                                                        : "\(failures.count) items couldn't be \(verb)", detail)
+                }
             }
         }
     }
 
     func makeAlias(_ ids: Set<String>) {
         var created: [URL] = []
+        var failure: String?
         for it in items.filter({ ids.contains($0.id) }) {
             let aliasURL = uniqueDest(currentURL, it.url.deletingPathExtension().lastPathComponent + " alias")
             do {
                 let data = try it.url.bookmarkData(options: .suitableForBookmarkFile, includingResourceValuesForKeys: nil, relativeTo: nil)
                 try URL.writeBookmarkData(data, to: aliasURL)
                 created.append(aliasURL)
-            } catch { NSSound.beep() }
+            } catch { failure = failure ?? error.localizedDescription }
         }
+        if let failure { reportFileError("Couldn't make an alias", failure) }
         if !created.isEmpty {
             UndoStack.shared.push("Make Alias") { [weak self] in
                 for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
@@ -1495,13 +1594,16 @@ final class Browser: ObservableObject, Identifiable {
 
     func applyRenames(_ pairs: [(url: URL, newName: String)]) {
         var undo: [(URL, URL)] = []
+        var failure: String?
         for (url, newName) in pairs {
             let n = newName.trimmingCharacters(in: .whitespaces)
             guard !n.isEmpty, n != url.lastPathComponent else { continue }
             let dest = url.deletingLastPathComponent().appendingPathComponent(n)
             guard !fm.fileExists(atPath: dest.path) else { continue }
-            do { try fm.moveItem(at: url, to: dest); undo.append((dest, url)) } catch {}
+            do { try fm.moveItem(at: url, to: dest); undo.append((dest, url)) }
+            catch { failure = failure ?? error.localizedDescription }
         }
+        if let failure { reportFileError("Some items couldn't be renamed", failure) }
         if !undo.isEmpty {
             UndoStack.shared.push("Batch Rename") { [weak self] in
                 for (newURL, oldURL) in undo { try? FileManager.default.moveItem(at: newURL, to: oldURL) }
@@ -1519,7 +1621,7 @@ final class Browser: ObservableObject, Identifiable {
             let linkName = ext.isEmpty ? "\(base) symlink" : "\(base) symlink.\(ext)"
             let linkURL = uniqueDest(currentURL, linkName)
             do { try fm.createSymbolicLink(at: linkURL, withDestinationURL: it.url); created.append(linkURL) }
-            catch { NSSound.beep() }
+            catch { reportFileError("Couldn't create the symbolic link", error.localizedDescription) }
         }
         if !created.isEmpty {
             UndoStack.shared.push("Make Symbolic Link") { [weak self] in
@@ -1542,18 +1644,21 @@ final class Browser: ObservableObject, Identifiable {
                 try? FileManager.default.moveItem(at: dest, to: oldURL); self?.load()
             }
             load()
-        } catch { NSSound.beep() }
+        } catch { reportFileError("Couldn't rename “\(item.name)”", error.localizedDescription) }
     }
 
     func duplicate(_ ids: Set<String>) {
         var created: [URL] = []
+        var failure: String?
         for it in items.filter({ ids.contains($0.id) }) {
             let ext = it.url.pathExtension
             let base = it.url.deletingPathExtension().lastPathComponent
             let name = ext.isEmpty ? "\(base) copy" : "\(base) copy.\(ext)"
             let dest = uniqueDest(currentURL, name)
-            do { try fm.copyItem(at: it.url, to: dest); created.append(dest) } catch {}
+            do { try fm.copyItem(at: it.url, to: dest); created.append(dest) }
+            catch { failure = failure ?? error.localizedDescription }
         }
+        if let failure { reportFileError("Couldn't duplicate", failure) }
         if !created.isEmpty {
             RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Duplicate") { [weak self] in
@@ -1597,11 +1702,19 @@ final class Browser: ObservableObject, Identifiable {
             p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
             p.arguments = ["-r", "-q", dest.lastPathComponent] + names
             p.currentDirectoryURL = dir
-            try? p.run(); p.waitUntilExit()
+            var runError: String?
+            do { try p.run(); p.waitUntilExit() } catch { runError = error.localizedDescription }
+            let ok = runError == nil && p.terminationStatus == 0
             DispatchQueue.main.async {
                 self?.busy = false; self?.busyText = ""
-                UndoStack.shared.push("Compress") { [weak self] in
-                    try? FileManager.default.trashItem(at: dest, resultingItemURL: nil); self?.load()
+                if ok {
+                    UndoStack.shared.push("Compress") { [weak self] in
+                        try? FileManager.default.trashItem(at: dest, resultingItemURL: nil); self?.load()
+                    }
+                } else {
+                    try? FileManager.default.removeItem(at: dest)   // clean up partial archive
+                    reportFileError("Couldn't create the archive",
+                                    runError ?? "zip exited with code \(p.terminationStatus).")
                 }
                 self?.load()
             }
@@ -1616,6 +1729,7 @@ final class Browser: ObservableObject, Identifiable {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var created: [URL] = []
+            var failures: [(name: String, reason: String)] = []
             for it in sel {
                 var base = it.url.deletingPathExtension().lastPathComponent
                 if (base as NSString).pathExtension.lowercased() == "tar" { base = (base as NSString).deletingPathExtension }
@@ -1632,8 +1746,8 @@ final class Browser: ObservableObject, Identifiable {
                 do {
                     try p.run(); p.waitUntilExit()
                     if p.terminationStatus == 0 { created.append(dest) }
-                    else { try? FileManager.default.removeItem(at: dest) }
-                } catch { try? FileManager.default.removeItem(at: dest) }
+                    else { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, "The archive couldn't be expanded (code \(p.terminationStatus)).")) }
+                } catch { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, error.localizedDescription)) }
             }
             DispatchQueue.main.async {
                 self.busy = false; self.busyText = ""
@@ -1644,15 +1758,22 @@ final class Browser: ObservableObject, Identifiable {
                     }
                 }
                 self.load()
+                if !failures.isEmpty {
+                    let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
+                    reportFileError(failures.count == 1 ? "Couldn't extract “\(failures[0].name)”" : "\(failures.count) archives couldn't be extracted", detail)
+                }
             }
         }
     }
 
     func emptyTrash() {
         let trash = fm.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
-        if let entries = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) {
-            for e in entries { try? fm.removeItem(at: e) }
+        guard let entries = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
+        var failure: String?
+        for e in entries {
+            do { try fm.removeItem(at: e) } catch { failure = failure ?? error.localizedDescription }
         }
+        if let failure { reportFileError("Some items couldn't be removed from the Trash", failure) }
     }
 }
 
