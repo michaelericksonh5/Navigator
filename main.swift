@@ -672,6 +672,43 @@ final class Browser: ObservableObject, Identifiable {
     var currentAscending: Bool { sortOrder.first?.order == .forward }
     func setSort(_ f: SortField, ascending: Bool) { sortOrder = [Browser.comparator(for: f, ascending: ascending)] }
 
+    // ⌘ + scroll wheel changes the view size, Windows 11-style: a continuum from
+    // Details → Columns → Icons, and within Icons a smooth resize (small → extra
+    // large). Icon sizing is continuous (real-time micro-adjustments); crossing a
+    // view boundary needs a bit of accumulated scroll so one flick doesn't skip
+    // through everything. dy > 0 = larger. minIcon 44 ≈ "small", 256 ≈ "extra large".
+    static let minIconSize: CGFloat = 44
+    static let maxIconSize: CGFloat = 256
+    private var scrollAccum: CGFloat = 0
+    func adjustViewScale(_ dy: CGFloat) {
+        if viewMode == .icon {
+            let proposed = iconSize + dy * 1.4
+            if proposed < Browser.minIconSize {          // shrinking past the smallest icons
+                scrollAccum += dy
+                if scrollAccum <= -6 { viewMode = .column; scrollAccum = 0 }
+            } else {
+                iconSize = min(Browser.maxIconSize, proposed); scrollAccum = 0
+            }
+        } else {
+            scrollAccum += dy
+            if scrollAccum >= 6 {                          // grow
+                scrollAccum = 0
+                switch viewMode {
+                case .list: viewMode = .column
+                case .column: viewMode = .icon; iconSize = Browser.minIconSize
+                default: break
+                }
+            } else if scrollAccum <= -6 {                  // shrink
+                scrollAccum = 0
+                switch viewMode {
+                case .gallery: viewMode = .icon; iconSize = Browser.maxIconSize
+                case .column: viewMode = .list
+                default: break
+                }
+            }
+        }
+    }
+
     var currentIsNetwork = false
     private static var typeIconCache: [String: NSImage] = [:]
     func icon(for item: FileItem) -> NSImage {
@@ -3264,6 +3301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NavWindow!
     private var extraWindows: [NavWindow] = []
     private var keyMonitor: Any?
+    private var scrollMonitor: Any?
 
     // Menu commands and keyboard nav target whichever Navigator window is key.
     var appModel: AppModel { (NSApp.keyWindow as? NavWindow)?.model ?? window.model }
@@ -3373,6 +3411,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handleKey(event) ?? event
         }
+        // ⌘ + scroll wheel resizes/cycles the view (Windows 11 Ctrl+scroll).
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            self?.handleScroll(event) ?? event
+        }
+    }
+    private func handleScroll(_ event: NSEvent) -> NSEvent? {
+        guard event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command,
+              let keyWin = NSApp.keyWindow as? NavWindow else { return event }
+        let dy = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
+        guard dy != 0 else { return nil }
+        keyWin.model.active.adjustViewScale(dy)
+        return nil   // consume so the list doesn't scroll while resizing
     }
     private func handleKey(_ event: NSEvent) -> NSEvent? {
         guard let keyWin = NSApp.keyWindow as? NavWindow else { return event }
