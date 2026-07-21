@@ -8,8 +8,16 @@ echo "Compiling..."
   -o "$DIR/Navigator.bin" "$DIR/main.swift" \
   -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers
 
-# (Re)generate the icon: prefer the SVG via rsvg-convert, else the Swift generator
-if command -v rsvg-convert >/dev/null 2>&1 && [ -f "$DIR/Navigator.svg" ]; then
+# (Re)generate the icon: prefer AppIcon.png (sips), then the SVG, then the Swift generator
+if [ -f "$DIR/AppIcon.png" ]; then
+  rm -rf "$DIR/Navigator.iconset"; mkdir "$DIR/Navigator.iconset"
+  for spec in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" "128 128x128" \
+              "256 128x128@2x" "256 256x256" "512 256x256@2x" "512 512x512" "1024 512x512@2x"; do
+    set -- $spec
+    sips -z "$1" "$1" "$DIR/AppIcon.png" --out "$DIR/Navigator.iconset/icon_$2.png" >/dev/null 2>&1
+  done
+  iconutil -c icns -o "$DIR/Navigator.icns" "$DIR/Navigator.iconset"
+elif command -v rsvg-convert >/dev/null 2>&1 && [ -f "$DIR/Navigator.svg" ]; then
   rm -rf "$DIR/Navigator.iconset"; mkdir "$DIR/Navigator.iconset"
   for spec in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" "128 128x128" \
               "256 128x128@2x" "256 256x256" "512 256x256@2x" "512 512x512" "1024 512x512@2x"; do
