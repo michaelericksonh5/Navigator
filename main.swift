@@ -7,6 +7,14 @@ import CoreServices
 extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
 
 enum ViewMode { case list, icon }
+enum ConflictPolicy { case keepBoth, replace, skip }
+
+final class TransferProgress: ObservableObject {
+    @Published var fraction: Double = 0
+    @Published var current: String = ""
+    @Published var cancelled = false
+}
+
 enum SortField: String, CaseIterable { case name, modified, size, kind }
 enum GroupBy: String, CaseIterable { case none, kind, date, size }
 
@@ -985,26 +993,63 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
+        let fm = FileManager.default
+        // Resolve name conflicts up front with one prompt (applied to all).
+        var policy: ConflictPolicy = .keepBoth
+        let conflicts = sources.filter { fm.fileExists(atPath: dir.appendingPathComponent($0.lastPathComponent).path) }
+        if !conflicts.isEmpty {
+            let a = NSAlert()
+            a.messageText = conflicts.count == 1
+                ? "“\(conflicts[0].lastPathComponent)” already exists in “\(dir.lastPathComponent)”"
+                : "\(conflicts.count) items already exist in “\(dir.lastPathComponent)”"
+            a.informativeText = "Choose how to handle items with the same name."
+            a.addButton(withTitle: "Keep Both")
+            a.addButton(withTitle: "Replace")
+            a.addButton(withTitle: "Skip")
+            a.addButton(withTitle: "Cancel")
+            switch a.runModal() {
+            case .alertFirstButtonReturn: policy = .keepBoth
+            case .alertSecondButtonReturn: policy = .replace
+            case .alertThirdButtonReturn: policy = .skip
+            default: return
+            }
+        }
+        let progress = TransferProgress()
+        TransferProgressController.shared.show(progress, title: move ? "Moving…" : "Copying…")
         busy = true; busyText = move ? "Moving…" : "Copying…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var moved: [(from: URL, to: URL)] = []
             var copied: [URL] = []
-            for src in sources {
-                let dest = self.uniqueDest(dir, src.lastPathComponent)
+            let total = sources.count
+            for (i, src) in sources.enumerated() {
+                if progress.cancelled { break }
+                DispatchQueue.main.async {
+                    progress.current = src.lastPathComponent
+                    progress.fraction = total > 0 ? Double(i) / Double(total) : 0
+                }
+                let target = dir.appendingPathComponent(src.lastPathComponent)
+                var dest = target
+                if fm.fileExists(atPath: target.path) {
+                    switch policy {
+                    case .skip: continue
+                    case .replace: try? fm.removeItem(at: target)
+                    case .keepBoth: dest = self.uniqueDest(dir, src.lastPathComponent)
+                    }
+                }
                 do {
-                    if move { try FileManager.default.moveItem(at: src, to: dest); moved.append((src, dest)) }
-                    else { try FileManager.default.copyItem(at: src, to: dest); copied.append(dest) }
+                    if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
+                    else { try fm.copyItem(at: src, to: dest); copied.append(dest) }
                 } catch {
-                    // Cross-volume fallback: copy, then remove source if this was a move.
                     do {
-                        try FileManager.default.copyItem(at: src, to: dest)
-                        if move { try? FileManager.default.removeItem(at: src); moved.append((src, dest)) }
+                        try fm.copyItem(at: src, to: dest)
+                        if move { try? fm.removeItem(at: src); moved.append((src, dest)) }
                         else { copied.append(dest) }
                     } catch {}
                 }
             }
             DispatchQueue.main.async {
+                TransferProgressController.shared.hide()
                 if resetCut { self.cutMode = false }
                 self.busy = false; self.busyText = ""
                 if move, !moved.isEmpty {
@@ -2363,6 +2408,37 @@ final class GetInfoController {
         windows[item.id] = w
         NSApp.activate(ignoringOtherApps: true)
     }
+}
+
+// MARK: - Transfer progress window
+
+struct TransferProgressView: View {
+    @ObservedObject var progress: TransferProgress
+    let title: String
+    let onCancel: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            ProgressView(value: progress.fraction)
+            Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            HStack { Spacer(); Button("Cancel") { progress.cancelled = true; onCancel() } }
+        }.padding(18).frame(width: 380)
+    }
+}
+
+final class TransferProgressController {
+    static let shared = TransferProgressController()
+    private var window: NSWindow?
+    func show(_ progress: TransferProgress, title: String) {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 130),
+                         styleMask: [.titled], backing: .buffered, defer: false)
+        w.title = title
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: TransferProgressView(progress: progress, title: title) { [weak w] in w?.close() })
+        w.center(); w.makeKeyAndOrderFront(nil)
+        window = w
+    }
+    func hide() { window?.close(); window = nil }
 }
 
 // MARK: - Batch rename
