@@ -1232,6 +1232,27 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
 
+    // Click selection with modifiers, like Finder/Explorer:
+    //  • plain click → select just this item (and set the range anchor)
+    //  • ⌘-click → toggle this item in/out of the selection
+    //  • ⇧-click → select the range from the anchor to this item
+    var selectionAnchor: String?
+    func click(_ id: String, modifiers: NSEvent.ModifierFlags) {
+        if modifiers.contains(.command) {
+            if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
+            selectionAnchor = id
+        } else if modifiers.contains(.shift), let anchor = selectionAnchor {
+            let vis = orderedVisibleItems()
+            if let a = vis.firstIndex(where: { $0.id == anchor }),
+               let b = vis.firstIndex(where: { $0.id == id }) {
+                selection = Set(vis[min(a, b)...max(a, b)].map { $0.id })
+            } else { selection = [id]; selectionAnchor = id }
+        } else {
+            selection = [id]; selectionAnchor = id
+        }
+        updateStatus()
+    }
+
     func updateStatus() {
         let count = items.count
         if selection.isEmpty {
@@ -2486,32 +2507,73 @@ struct IconCell: View {
     }
 }
 
+// Collects each icon cell's frame (in the grid's coordinate space) so a
+// rubber-band drag can hit-test which items it covers.
+struct ItemFramesKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
 struct IconGridView: View {
     let model: AppModel
     @ObservedObject var browser: Browser
+    @State private var itemFrames: [String: CGRect] = [:]
+    @State private var marquee: CGRect?
     private var columns: [GridItem] { [GridItem(.adaptive(minimum: browser.iconSize + 44), spacing: 12)] }
 
     var body: some View {
         GeometryReader { geo in
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 12) {
-                        if browser.groupBy == .none {
-                            ForEach(browser.visibleItems()) { item in cell(item) }
-                        } else {
-                            ForEach(browser.groups(), id: \.title) { group in
-                                Section {
-                                    ForEach(group.items) { item in cell(item) }
-                                } header: {
-                                    HStack {
-                                        Text(group.title).font(.headline).foregroundStyle(.secondary)
-                                        Spacer()
-                                    }.padding(.top, 8).padding(.horizontal, 4)
+                    ZStack(alignment: .topLeading) {
+                        // Empty-space catcher: a rubber-band drag begins here. Drags
+                        // that start on a cell hit the cell's own .draggable (move),
+                        // so attaching the gesture ONLY here keeps the two separate.
+                        Color.clear.frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .topLeading)
+                            .contentShape(Rectangle())
+                            .gesture(
+                                DragGesture(minimumDistance: 6, coordinateSpace: .named("iconGrid"))
+                                    .onChanged { v in
+                                        let r = CGRect(x: min(v.startLocation.x, v.location.x),
+                                                       y: min(v.startLocation.y, v.location.y),
+                                                       width: abs(v.location.x - v.startLocation.x),
+                                                       height: abs(v.location.y - v.startLocation.y))
+                                        marquee = r
+                                        browser.selection = Set(itemFrames.filter { $0.value.intersects(r) }.map { $0.key })
+                                        browser.updateStatus()
+                                    }
+                                    .onEnded { _ in marquee = nil }
+                            )
+                        LazyVGrid(columns: columns, spacing: 12) {
+                            if browser.groupBy == .none {
+                                ForEach(browser.visibleItems()) { item in cell(item) }
+                            } else {
+                                ForEach(browser.groups(), id: \.title) { group in
+                                    Section {
+                                        ForEach(group.items) { item in cell(item) }
+                                    } header: {
+                                        HStack {
+                                            Text(group.title).font(.headline).foregroundStyle(.secondary)
+                                            Spacer()
+                                        }.padding(.top, 8).padding(.horizontal, 4)
+                                    }
                                 }
                             }
                         }
+                        .padding(14)
                     }
-                    .padding(14)
+                    .coordinateSpace(name: "iconGrid")
+                    .onPreferenceChange(ItemFramesKey.self) { itemFrames = $0 }
+                    .overlay(alignment: .topLeading) {
+                        if let m = marquee {
+                            Rectangle().fill(Color.accentColor.opacity(0.15))
+                                .overlay(Rectangle().stroke(Color.accentColor.opacity(0.7), lineWidth: 1))
+                                .frame(width: m.width, height: m.height).offset(x: m.minX, y: m.minY)
+                                .allowsHitTesting(false)
+                        }
+                    }
                 }
                 .onChange(of: browser.keyboardScrollID) {
                     if let id = browser.keyboardScrollID { withAnimation { proxy.scrollTo(id, anchor: .center) } }
@@ -2533,9 +2595,13 @@ struct IconGridView: View {
     @ViewBuilder private func cell(_ item: FileItem) -> some View {
         IconCell(item: item, browser: browser, selected: browser.selection.contains(item.id))
             .id(item.id)
-            // Single-tap selects INSTANTLY; double-tap opens via a simultaneous
-            // gesture so the single tap never waits out the double-click timeout.
-            .onTapGesture { browser.selection = [item.id]; browser.updateStatus() }
+            .background(GeometryReader { g in
+                Color.clear.preference(key: ItemFramesKey.self, value: [item.id: g.frame(in: .named("iconGrid"))])
+            })
+            // Single-tap selects INSTANTLY (with ⌘/⇧ modifiers, Finder-style);
+            // double-tap opens via a simultaneous gesture so the single tap never
+            // waits out the double-click timeout.
+            .onTapGesture { browser.click(item.id, modifiers: NSApp.currentEvent?.modifierFlags ?? []) }
             .simultaneousGesture(TapGesture(count: 2).onEnded { openItem(item, browser) })
             .dropDestination(for: URL.self) { urls, _ in
                 guard item.isDirectory else { return false }
@@ -2804,7 +2870,7 @@ struct GalleryView: View {
                                 .background(browser.selection.contains(it.id) ? Color.accentColor.opacity(0.3) : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .id(it.id)
-                                .onTapGesture { browser.selection = [it.id]; browser.updateStatus() }
+                                .onTapGesture { browser.click(it.id, modifiers: NSApp.currentEvent?.modifierFlags ?? []) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { openItem(it, browser) })
                         }
                     }.padding(8)

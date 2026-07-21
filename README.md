@@ -81,6 +81,8 @@ When you choose **Update Now**, it downloads the new `Navigator.zip`, replaces t
 
 **Navigation** — Editable address bar (⌘L), clickable breadcrumb, tabs (⌘T/⌘W), multiple windows (⌘N), back/forward/up, full keyboard nav, and type-to-select. Reopens your tabs and window position on launch. **Auto-refresh**: the current folder updates automatically when files change on disk (local & cloud folders, via FSEvents).
 
+**Selection** — Click to select, **⇧-click** for a range, **⌘-click** to toggle individual items, and **drag a rubber-band** over empty space to select many at once — in every view (List, Icon, Column, Gallery).
+
 **File operations** — Copy / Cut / Paste (**⌘C/⌘X/⌘V**, with numbered-copy paste-in-place) / Duplicate / Rename / Move to Trash / Empty Trash / Compress / **Extract** (zip + tar) / **Batch rename** / New Folder / New Text File / Make Alias / **Make Symbolic Link**. Copy/move show a **progress window** and **conflict dialog** (Keep Both / Replace / Skip). Most operations are **undoable** (⌘Z), and failures are always reported — never silent.
 
 **Dual pane** — Split into two independent panes (⌥⌘2) to drag files between them.
