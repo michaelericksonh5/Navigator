@@ -5,12 +5,18 @@ A premium, Finder-style file manager for macOS — built for a Windows → Mac s
 ![Navigator icon](AppIcon.png)
 
 ## Requirements
-- **Apple Silicon Mac** (arm64) — the build targets `arm64-apple-macos14.0`
+- **Apple Silicon or Intel Mac** — the release is a **universal** binary
 - **macOS 14 (Sonoma) or newer**
-- **Xcode Command Line Tools** (`xcode-select --install`) for `swiftc`
 
-## Install
-One command builds, signs, and installs to `/Applications`:
+## Download (no build required)
+Grab the latest **Navigator.zip** from the [**Releases**](../../releases/latest) page:
+1. Unzip it and drag **Navigator.app** into **Applications**.
+2. **First launch (one-time):** right-click (Control-click) **Navigator.app → Open → Open**.
+
+> Navigator isn't notarized by Apple, so a plain double-click shows a security warning the first time. Right-click → Open gets past it once; afterward it opens normally. (Alternatives: **System Settings → Privacy & Security → Open Anyway**, or `xattr -dr com.apple.quarantine /Applications/Navigator.app`.)
+
+## Build from source
+Needs the **Xcode Command Line Tools** (`xcode-select --install`). One command builds, signs, and installs to `/Applications`:
 
 ```bash
 git clone <your-repo-url> NavigatorApp
@@ -26,7 +32,7 @@ open /Applications/Navigator.app
 If a self-signed **“Navigator Dev”** certificate exists in your login keychain, `rebuild.sh` signs with it so the app's identity stays constant across rebuilds — which means macOS **remembers** its Full Disk Access / folder-access grants instead of re-prompting every build. Without it, the build falls back to ad-hoc signing (still runs; permissions just reset per build). A backup of the cert lives in `~/.navigator-signing/` (password in its README).
 
 ### Sharing with someone else
-The app is self-signed, not notarized, and Apple-Silicon-only. A coworker on an Apple Silicon Mac (macOS 14+) can run it, but on first launch they'll need to **right-click → Open** once to get past Gatekeeper.
+Send them the [Releases](../../releases/latest) download (universal, runs on Apple Silicon and Intel, macOS 14+). Because it isn't notarized, the first launch needs a one-time **right-click → Open**. Truly zero-warning distribution would require Apple Developer ID signing + notarization ($99/yr Apple Developer Program).
 
 ## Features
 
