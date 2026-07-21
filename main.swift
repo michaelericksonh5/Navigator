@@ -2159,6 +2159,9 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
     private var previewCollapsed: Bool
     private var didInitialLayout = false
     private var applyingLayout = false
+    private var bypassConstraints = false
+    var onSidebarCollapse: ((Bool) -> Void)?
+    var onPreviewCollapse: ((Bool) -> Void)?
 
     init(sidebarCollapsed: Bool, previewCollapsed: Bool) {
         self.sidebarCollapsed = sidebarCollapsed
@@ -2205,10 +2208,12 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
     private func applyLayout() {
         guard total > 0 else { return }
         applyingLayout = true
+        bypassConstraints = true      // let setPosition reach 0 / full width to truly collapse
         let sw = sidebarCollapsed ? 0 : sidebarWidth
         let pw = previewCollapsed ? 0 : previewWidth
         splitView.setPosition(sw, ofDividerAt: 0)
         splitView.setPosition(total - pw, ofDividerAt: 1)
+        bypassConstraints = false
         applyingLayout = false
     }
 
@@ -2219,13 +2224,15 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
     func splitView(_ sv: NSSplitView, canCollapseSubview subview: NSView) -> Bool {
         subview === sidebarPane || subview === previewPane
     }
-    // Drag limits.
+    // Drag limits. Bypassed during programmatic collapse/expand so panes can hit 0.
     func splitView(_ sv: NSSplitView, constrainMinCoordinate proposedMin: CGFloat, ofSubviewAt i: Int) -> CGFloat {
+        if bypassConstraints { return 0 }
         if i == 0 { return sidebarMin }
         // divider 1: keep content ≥ contentMin and preview ≤ previewMax
         return max(sidebarPane.frame.maxX + thickness + contentMin, total - previewMax)
     }
     func splitView(_ sv: NSSplitView, constrainMaxCoordinate proposedMax: CGFloat, ofSubviewAt i: Int) -> CGFloat {
+        if bypassConstraints { return total }
         if i == 0 { return min(sidebarMax, previewPane.frame.minX - thickness - contentMin) }
         // divider 1: keep preview ≥ previewMin
         return total - previewMin
@@ -2235,8 +2242,10 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
     // collapse state (in case the user dragged a divider all the way to the edge).
     @objc private func didResize(_ n: Notification) {
         guard !applyingLayout else { return }
-        sidebarCollapsed = splitView.isSubviewCollapsed(sidebarPane)
-        previewCollapsed = splitView.isSubviewCollapsed(previewPane)
+        let sc = splitView.isSubviewCollapsed(sidebarPane)
+        let pc = splitView.isSubviewCollapsed(previewPane)
+        if sc != sidebarCollapsed { sidebarCollapsed = sc; onSidebarCollapse?(sc) }
+        if pc != previewCollapsed { previewCollapsed = pc; onPreviewCollapse?(pc) }
         if !sidebarCollapsed, sidebarPane.frame.width > 1 {
             sidebarWidth = sidebarPane.frame.width; Prefs.sidebarWidth = sidebarWidth
         }
@@ -2269,6 +2278,9 @@ struct BrowserPane: NSViewControllerRepresentable {
     func makeNSViewController(context: Context) -> PaneController {
         let vc = PaneController(sidebarCollapsed: !model.showSidebar, previewCollapsed: !model.showPreview)
         _ = vc.view
+        let m = model
+        vc.onSidebarCollapse = { [weak m] collapsed in m?.showSidebar = !collapsed }
+        vc.onPreviewCollapse = { [weak m] collapsed in m?.showPreview = !collapsed }
         apply(vc)
         return vc
     }
