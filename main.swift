@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 import Quartz
 import CoreServices
 
+extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
+
 enum ViewMode { case list, icon }
 enum SortField: String, CaseIterable { case name, modified, size, kind }
 enum GroupBy: String, CaseIterable { case none, kind, date, size }
@@ -842,6 +844,7 @@ final class Browser: ObservableObject, Identifiable {
         currentURL = url
         load()
         RecentFolders.shared.record(url)
+        NotificationCenter.default.post(name: .navigatorDidNavigate, object: nil)
     }
 
     func goUp() {
@@ -1262,14 +1265,23 @@ final class Browser: ObservableObject, Identifiable {
 
 final class AppModel: ObservableObject {
     @Published var tabs: [Browser]
-    @Published var selected: Int = 0
+    @Published var selected: Int = 0 { didSet { saveState() } }
     @Published var showPreview: Bool = Prefs.showPreview { didSet { Prefs.showPreview = showPreview } }
     @Published var showSidebar: Bool = Prefs.showSidebar { didSet { Prefs.showSidebar = showSidebar } }
     @Published var columnCustomization: TableColumnCustomization<FileItem> = AppModel.loadColumns() {
         didSet { AppModel.saveColumns(columnCustomization) }
     }
     init() {
-        tabs = [Browser(start: FileManager.default.homeDirectoryForCurrentUser)]
+        // Restore previously open tabs (falling back to Home).
+        let fm = FileManager.default
+        let saved = (UserDefaults.standard.stringArray(forKey: "openTabs") ?? []).filter { fm.fileExists(atPath: $0) }
+        if saved.isEmpty {
+            tabs = [Browser(start: fm.homeDirectoryForCurrentUser)]
+        } else {
+            tabs = saved.map { Browser(start: URL(fileURLWithPath: $0)) }
+            let savedSel = UserDefaults.standard.integer(forKey: "selectedTab")
+            selected = max(0, min(savedSel, tabs.count - 1))
+        }
         // Refresh the sidebar the instant a disk/USB/network share mounts or ejects,
         // so new volumes appear (and stale ones disappear) automatically.
         let nc = NSWorkspace.shared.notificationCenter
@@ -1279,6 +1291,14 @@ final class AppModel: ObservableObject {
                 self?.objectWillChange.send()
             }
         }
+        // Persist open tabs whenever any tab navigates.
+        NotificationCenter.default.addObserver(forName: .navigatorDidNavigate, object: nil, queue: .main) { [weak self] _ in
+            self?.saveState()
+        }
+    }
+    func saveState() {
+        UserDefaults.standard.set(tabs.map { $0.currentURL.path }, forKey: "openTabs")
+        UserDefaults.standard.set(selected, forKey: "selectedTab")
     }
     static func loadColumns() -> TableColumnCustomization<FileItem> {
         if let data = Prefs.columnData,
@@ -1291,11 +1311,13 @@ final class AppModel: ObservableObject {
     func newTab(at url: URL? = nil) {
         tabs.append(Browser(start: url ?? FileManager.default.homeDirectoryForCurrentUser))
         selected = tabs.count - 1
+        saveState()
     }
     func closeTab(_ index: Int) {
         guard tabs.indices.contains(index), tabs.count > 1 else { return }
         tabs.remove(at: index)
         if selected >= tabs.count { selected = tabs.count - 1 }
+        saveState()
     }
 }
 
@@ -2443,6 +2465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) { appModel.saveState() }
 
     // Keyboard navigation for the file list/grid. Runs only when our window is key
     // and a text field isn't being edited, so typing in the address/search/filter
