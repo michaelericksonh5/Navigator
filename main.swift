@@ -3447,7 +3447,7 @@ final class ImageViewerController {
             w.isReleasedWhenClosed = false
             window = w
         }
-        window?.title = "Preview"
+        window?.title = urls.indices.contains(index) ? urls[index].lastPathComponent : "Image"
         window?.contentView = NSHostingView(rootView: ImageViewerView(urls: urls, index: index))
         window?.center()
         window?.makeKeyAndOrderFront(nil)
@@ -3900,9 +3900,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Receives folders/files the system routes to us (e.g. when Navigator is the
     // default folder handler). Folders open as new tabs; other files open normally.
     func application(_ application: NSApplication, open urls: [URL]) {
-        let folders = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
-        let others = urls.filter { !folders.contains($0) }
-        for u in others { NSWorkspace.shared.open(u) }
+        // Images → our built-in viewer (when Navigator is the default image app,
+        // opening one from Finder lands here). Do NOT NSWorkspace.open them, or it
+        // would bounce right back to us. Arrow through the folder like Preview.
+        let images = urls.filter { isImageFile($0) }
+        if let first = images.first {
+            let folder = first.deletingLastPathComponent()
+            let siblings = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+                .filter { isImageFile($0) }
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            let list = siblings.isEmpty ? images : siblings
+            ImageViewerController.shared.show(urls: list, index: list.firstIndex(of: first) ?? 0)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        let rest = urls.filter { !isImageFile($0) }
+        let folders = rest.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let others = rest.filter { !folders.contains($0) }
+        for u in others { NSWorkspace.shared.open(u) }   // non-images → their own default app
         guard !folders.isEmpty else { return }
         guard let win = (NSApp.keyWindow as? NavWindow) ?? window else { pendingFolders += folders; return }
         folders.forEach { win.model.newTab(at: $0) }
@@ -4000,6 +4014,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(.separator())
         let dfb = appMenu.addItem(withTitle: "Set as Default File Browser…", action: #selector(setDefaultBrowserAction(_:)), keyEquivalent: "")
         dfb.target = self
+        let div = appMenu.addItem(withTitle: "Set as Default Image Viewer…", action: #selector(setDefaultImageViewerAction(_:)), keyEquivalent: "")
+        div.target = self
         let fda = appMenu.addItem(withTitle: "Grant Full Disk Access…", action: #selector(openFullDiskAccessAction(_:)), keyEquivalent: "")
         fda.target = self
         appMenu.addItem(.separator())
@@ -4097,6 +4113,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            let um = window.undoManager, um.canUndo { um.undo(); return }
         UndoStack.shared.undo()
     }
+    @objc func setDefaultImageViewerAction(_ sender: Any?) {
+        // Common image types Navigator's viewer handles well. (We register for
+        // public.image, but defaults are set per concrete type.)
+        let types = ["public.png", "public.jpeg", "com.compuserve.gif", "public.tiff",
+                     "public.heic", "public.heif", "org.webmproject.webp",
+                     "com.microsoft.bmp", "com.microsoft.ico", "public.jpeg-2000"]
+        let appURL = Bundle.main.bundleURL
+        let group = DispatchGroup()
+        var failures = 0
+        for t in types {
+            guard let ut = UTType(t) else { continue }
+            group.enter()
+            NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: ut) { err in
+                if err != nil { failures += 1 }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            let a = NSAlert()
+            if failures == 0 {
+                a.messageText = "Navigator is now your default image viewer"
+                a.informativeText = "Opening an image anywhere — Finder, Mail, Messages — now opens it in Navigator's viewer.\n\nTo undo later: in Finder select an image → Get Info → “Open with” → choose another app → “Change All…”."
+            } else {
+                a.alertStyle = .warning
+                a.messageText = "Set as default image viewer (mostly)"
+                a.informativeText = "\(failures) image type(s) couldn't be set automatically. You can finish manually: Finder → select an image → Get Info → “Open with” → Navigator → “Change All…”."
+            }
+            a.addButton(withTitle: "OK"); a.runModal()
+        }
+    }
+
     @objc func setDefaultBrowserAction(_ sender: Any?) {
         let appURL = Bundle.main.bundleURL
         Task { @MainActor in
