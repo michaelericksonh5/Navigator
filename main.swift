@@ -1757,103 +1757,137 @@ struct ControlBar: View {
     }
     var body: some View {
         VStack(spacing: 7) {
-            // Row 1: navigation + search + tools
+            // Row 1: navigation + address bar + search (Windows 11 layout)
             HStack(spacing: 8) {
                 Button { model.showSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
-                    .help("Show/Hide Sidebar (⌥⌘S)")
-                    .foregroundStyle(model.showSidebar ? Color.accentColor : .secondary)
+                    .help("Navigation Pane (⌥⌘S)").foregroundStyle(model.showSidebar ? Color.accentColor : .secondary)
                 Button { browser.goBack() } label: { Image(systemName: "chevron.left") }
                     .disabled(!browser.canGoBack).keyboardShortcut("[", modifiers: .command).help("Back")
                 Button { browser.goForward() } label: { Image(systemName: "chevron.right") }
                     .disabled(!browser.canGoForward).keyboardShortcut("]", modifiers: .command).help("Forward")
                 Button { browser.goUp() } label: { Image(systemName: "chevron.up") }
-                    .keyboardShortcut(.upArrow, modifiers: .command).help("Enclosing Folder")
+                    .keyboardShortcut(.upArrow, modifiers: .command).help("Up")
+                Button { browser.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    .keyboardShortcut("r", modifiers: .command).help("Refresh")
+
+                HStack(spacing: 6) {
+                    Image(systemName: "folder").foregroundStyle(.secondary).font(.caption)
+                    TextField("Type a path and press Return", text: $browser.pathText)
+                        .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
+                        .focused($addressFocused).onSubmit { browser.submitPath() }
+                }
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+                .frame(maxWidth: .infinity)
 
                 HStack(spacing: 4) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.caption)
                     TextField("Search “\(folderName)”", text: $browser.searchText)
-                        .textFieldStyle(.plain)
-                        .focused($searchFocused)
+                        .textFieldStyle(.plain).focused($searchFocused)
                         .onSubmit { browser.runSearch() }
                         .onChange(of: browser.searchText) {
                             if browser.searchText.isEmpty && browser.isSearching { browser.clearSearch() }
                         }
                     if !browser.searchText.isEmpty {
-                        Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
-                            .buttonStyle(.plain)
+                        Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain)
                     }
                     Menu {
                         Picker("Scope", selection: $browser.searchThisMac) {
-                            Text("This Folder").tag(false)
-                            Text("This Mac").tag(true)
+                            Text("This Folder").tag(false); Text("This Mac").tag(true)
                         }
                         Picker("Kind", selection: $browser.searchKind) {
                             ForEach(SearchKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                         }
                     } label: { Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary) }
-                        .menuStyle(.borderlessButton).frame(width: 22)
+                        .menuStyle(.borderlessButton).frame(width: 20)
                         .onChange(of: browser.searchThisMac) { if browser.isSearching { browser.runSearch() } }
                         .onChange(of: browser.searchKind) { if browser.isSearching { browser.runSearch() } }
                 }
-                .padding(.horizontal, 7).padding(.vertical, 4)
+                .padding(.horizontal, 7).padding(.vertical, 5)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
-                .frame(maxWidth: .infinity)
+                .frame(width: 240)
 
-                TextField("Filter", text: $browser.filterText).textFieldStyle(.roundedBorder).frame(width: 130)
-
-                Menu {
-                    Picker("Sort By", selection: sortFieldBinding) {
-                        Text("Name").tag(SortField.name)
-                        Text("Date Modified").tag(SortField.modified)
-                        Text("Size").tag(SortField.size)
-                        Text("Kind").tag(SortField.kind)
-                    }
-                    Toggle("Ascending", isOn: ascendingBinding)
-                    Divider()
-                    Picker("Group By", selection: $browser.groupBy) {
-                        Text("None").tag(GroupBy.none)
-                        Text("Kind").tag(GroupBy.kind)
-                        Text("Date Modified").tag(GroupBy.date)
-                        Text("Size").tag(GroupBy.size)
-                    }
-                    Divider()
-                    Toggle("Show Hidden Files", isOn: $browser.showHidden)
-                    Toggle("Show Preview Pane", isOn: $model.showPreview)
-                } label: { Image(systemName: "slider.horizontal.3") }
-                    .menuStyle(.borderlessButton).frame(width: 40).help("Sort, Group & View Options")
-
-                Button { browser.newFolder() } label: { Image(systemName: "folder.badge.plus") }.help("New Folder")
-                Button { browser.refresh() } label: { Image(systemName: "arrow.clockwise") }
-                    .keyboardShortcut("r", modifiers: .command).help("Refresh")
-                Button { model.dualPane.toggle() } label: { Image(systemName: "rectangle.split.2x1") }
-                    .help("Dual Pane (⌥⌘2)").foregroundStyle(model.dualPane ? Color.accentColor : .secondary)
-                Button { model.showPreview.toggle() } label: {
-                    Image(systemName: model.showPreview ? "sidebar.right" : "sidebar.squares.right")
-                }.help("Toggle Preview Pane").foregroundStyle(model.showPreview ? Color.accentColor : .secondary)
-                Picker("", selection: $browser.viewMode) {
-                    Image(systemName: "list.bullet").tag(ViewMode.list)
-                    Image(systemName: "square.grid.2x2").tag(ViewMode.icon)
-                    Image(systemName: "rectangle.split.3x1").tag(ViewMode.column)
-                    Image(systemName: "photo.on.rectangle").tag(ViewMode.gallery)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 150).help("View")
-            }
-            // Row 2: full-width address bar on its own line
-            HStack(spacing: 6) {
-                Image(systemName: "folder").foregroundStyle(.secondary)
-                TextField("Type a path and press Return", text: $browser.pathText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 13, design: .monospaced))
-                    .focused($addressFocused)
-                    .onSubmit { browser.submitPath() }
-                    .frame(maxWidth: .infinity)
                 Button("") { addressFocused = true }.keyboardShortcut("l", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
                 Button("") { searchFocused = true }.keyboardShortcut("f", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
             }
+
+            // Row 2: Windows 11-style command bar
+            HStack(spacing: 6) {
+                Menu {
+                    Button { browser.newFolder() } label: { Label("Folder", systemImage: "folder.badge.plus") }
+                    Button { browser.newTextFile() } label: { Label("Text File", systemImage: "doc.badge.plus") }
+                } label: { Label("New", systemImage: "plus") }
+                    .menuStyle(.borderlessButton).fixedSize().help("New")
+
+                sep()
+                Button { browser.cutFiles() } label: { Image(systemName: "scissors") }.help("Cut").disabled(!hasSel)
+                Button { browser.copyFiles() } label: { Image(systemName: "doc.on.doc") }.help("Copy").disabled(!hasSel)
+                Button { browser.pasteFiles() } label: { Image(systemName: "doc.on.clipboard") }.help("Paste")
+                Button { if let id = browser.selection.first { promptRename(browser, id) } } label: { Image(systemName: "pencil") }.help("Rename").disabled(!oneSel)
+                Button { shareItems(selURLs) } label: { Image(systemName: "square.and.arrow.up") }.help("Share").disabled(!hasSel)
+                Button { browser.moveToTrash(browser.selection) } label: { Image(systemName: "trash") }.help("Delete (⌘⌫)").disabled(!hasSel)
+
+                sep()
+                Menu {
+                    Picker("Sort by", selection: sortFieldBinding) {
+                        Text("Name").tag(SortField.name)
+                        Text("Date Modified").tag(SortField.modified)
+                        Text("Type").tag(SortField.kind)
+                        Text("Size").tag(SortField.size)
+                    }
+                    Divider()
+                    Picker("Order", selection: ascendingBinding) {
+                        Text("Ascending").tag(true); Text("Descending").tag(false)
+                    }
+                    Divider()
+                    Picker("Group by", selection: $browser.groupBy) {
+                        Text("(None)").tag(GroupBy.none)
+                        Text("Kind").tag(GroupBy.kind)
+                        Text("Date Modified").tag(GroupBy.date)
+                        Text("Size").tag(GroupBy.size)
+                    }
+                } label: { Label("Sort", systemImage: "arrow.up.arrow.down") }.menuStyle(.borderlessButton).fixedSize().help("Sort")
+
+                Menu {
+                    Button { browser.viewMode = .icon; browser.iconSize = 128 } label: { Label("Large icons", systemImage: "square.grid.2x2") }
+                    Button { browser.viewMode = .icon; browser.iconSize = 90 } label: { Label("Medium icons", systemImage: "square.grid.3x3") }
+                    Button { browser.viewMode = .icon; browser.iconSize = 56 } label: { Label("Small icons", systemImage: "square.grid.4x3.fill") }
+                    Divider()
+                    Button { browser.viewMode = .list } label: { Label("Details", systemImage: "list.bullet") }
+                    Button { browser.viewMode = .column } label: { Label("Columns", systemImage: "rectangle.split.3x1") }
+                    Button { browser.viewMode = .gallery } label: { Label("Gallery", systemImage: "photo.on.rectangle") }
+                    Divider()
+                    Toggle("Preview pane", isOn: $model.showPreview)
+                    Menu("Show") {
+                        Toggle("Navigation pane", isOn: $model.showSidebar)
+                        Toggle("Hidden items", isOn: $browser.showHidden)
+                    }
+                } label: { Label("View", systemImage: "square.grid.2x2") }.menuStyle(.borderlessButton).fixedSize().help("View")
+
+                Menu {
+                    Toggle("Dual Pane (⌥⌘2)", isOn: $model.dualPane)
+                    Button { openInTerminal(browser.currentURL) } label: { Label("Open in Terminal", systemImage: "terminal") }
+                    Divider()
+                    Button { showInfo(browser, browser.selection) } label: { Label("Get Info", systemImage: "info.circle") }.disabled(!hasSel)
+                    Button { browser.compress(browser.selection) } label: { Label("Compress", systemImage: "archivebox") }.disabled(!hasSel)
+                    Button { browser.makeAlias(browser.selection) } label: { Label("Make Alias", systemImage: "arrow.up.right") }.disabled(!hasSel)
+                } label: { Image(systemName: "ellipsis") }.menuStyle(.borderlessButton).fixedSize().frame(width: 34).help("More")
+
+                Spacer()
+                Button { model.showPreview.toggle() } label: { Label("Details", systemImage: "sidebar.right") }
+                    .foregroundStyle(model.showPreview ? Color.accentColor : .secondary).help("Details / Preview Pane (⇧⌘P)")
+            }
         }.padding(.horizontal, 10).padding(.vertical, 8)
     }
+
+    @ViewBuilder private func sep() -> some View { Divider().frame(height: 16).padding(.horizontal, 3) }
+    private var hasSel: Bool { !browser.selection.isEmpty }
+    private var oneSel: Bool { browser.selection.count == 1 }
+    private var selURLs: [URL] { browser.items.filter { browser.selection.contains($0.id) }.map(\.url) }
 
     private var sortFieldBinding: Binding<SortField> {
         Binding(get: { browser.currentSortField },
@@ -2546,8 +2580,6 @@ struct BrowserContent: View {
     @ObservedObject var browser: Browser
     var body: some View {
         VStack(spacing: 0) {
-            ControlBar(model: model, browser: browser)
-            Divider()
             if browser.isSearching {
                 SearchBanner(browser: browser)
                 Divider()
@@ -2744,6 +2776,10 @@ struct ContentView: View {
         VStack(spacing: 0) {
             TabStrip(model: model)
             Divider()
+            // Windows 11-style command bar spanning the full width, above the
+            // navigation / content / details panes.
+            ControlBar(model: model, browser: model.active)
+            Divider()
             BrowserPane(model: model, browser: model.active)
         }.frame(minWidth: 880, minHeight: 560)
     }
@@ -2772,10 +2808,26 @@ struct AnimatedImage: NSViewRepresentable {
 struct ImageViewerView: View {
     let urls: [URL]
     @State private var index: Int
+    @State private var dims: String = ""
+    @State private var sizeStr: String = ""
+    @State private var kindStr: String = ""
     init(urls: [URL], index: Int) { self.urls = urls; _index = State(initialValue: index) }
     private func step(_ d: Int) {
         guard !urls.isEmpty else { return }
         index = (index + d + urls.count) % urls.count
+    }
+    // Read dimensions / size / kind for the bottom detail bar (Windows Photos-style).
+    private func loadInfo() {
+        guard urls.indices.contains(index) else { dims = ""; sizeStr = ""; kindStr = ""; return }
+        let u = urls[index]
+        let vals = try? u.resourceValues(forKeys: [.fileSizeKey, .localizedTypeDescriptionKey])
+        sizeStr = (vals?.fileSize).map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? ""
+        kindStr = vals?.allValues[.localizedTypeDescriptionKey] as? String ?? u.pathExtension.uppercased()
+        dims = ""
+        MetadataCache.shared.meta(for: u) { m in
+            guard urls.indices.contains(index), urls[index] == u else { return }
+            if let w = m.width, let h = m.height, w > 0, h > 0 { dims = "\(w) × \(h)" }
+        }
     }
     var body: some View {
         ZStack {
@@ -2797,13 +2849,30 @@ struct ImageViewerView: View {
             VStack {
                 Spacer()
                 if urls.indices.contains(index) {
-                    Text("\(urls[index].lastPathComponent)    ·    \(index + 1) of \(urls.count)")
-                        .font(.callout).foregroundStyle(.white)
-                        .padding(.horizontal, 14).padding(.vertical, 7)
-                        .background(.black.opacity(0.55)).clipShape(Capsule()).padding(.bottom, 16)
+                    HStack(spacing: 10) {
+                        Text(urls[index].lastPathComponent).fontWeight(.medium).lineLimit(1)
+                        detail("photo", dims)
+                        detail("internaldrive", sizeStr)
+                        detail("doc", kindStr)
+                        Text("·").foregroundStyle(.white.opacity(0.5))
+                        Text("\(index + 1) of \(urls.count)").foregroundStyle(.white.opacity(0.85))
+                    }
+                    .font(.callout).foregroundStyle(.white)
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .background(.black.opacity(0.6)).clipShape(Capsule())
+                    .padding(.bottom, 16)
                 }
             }
-        }.frame(minWidth: 520, minHeight: 420)
+        }
+        .frame(minWidth: 520, minHeight: 420)
+        .onAppear { loadInfo() }
+        .onChange(of: index) { loadInfo() }
+    }
+    @ViewBuilder private func detail(_ symbol: String, _ text: String) -> some View {
+        if !text.isEmpty {
+            Label { Text(text) } icon: { Image(systemName: symbol).font(.caption) }
+                .foregroundStyle(.white.opacity(0.85))
+        }
     }
 }
 
