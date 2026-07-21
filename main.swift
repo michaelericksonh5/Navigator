@@ -119,9 +119,22 @@ struct SizeCell: View {
             } else {
                 Text("—").foregroundStyle(.secondary)
             }
+        } else if item.modified == .distantPast {
+            // Network item whose size hasn't been fetched yet (see Browser.lightItem).
+            Text("—").foregroundStyle(.tertiary)
         } else {
             Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).foregroundStyle(.secondary)
         }
+    }
+}
+
+// Renders a date column, showing a placeholder while a network item's metadata
+// is still being fetched in the background (sentinel = .distantPast).
+struct DateCell: View {
+    let date: Date
+    var body: some View {
+        if date == .distantPast { Text("—").foregroundStyle(.tertiary) }
+        else { Text(date, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary) }
     }
 }
 
@@ -693,6 +706,44 @@ final class Browser: ObservableObject, Identifiable {
         Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))
     }
 
+    // Fast directory read for slow (network/SMB) volumes. POSIX readdir returns
+    // names AND the directory bit (d_type) from a single batched server response
+    // — ~0.7s for hundreds of entries. Foundation's enumerator, by contrast,
+    // stats every entry up front (~1 round-trip/file ≈ 86ms each over VPN),
+    // which is why a 600-item network folder "hangs" for a minute in Finder.
+    // Size/dates are filled in lazily afterward (see loadNetwork).
+    static func fastNames(_ dir: URL, showHidden: Bool) -> [(url: URL, isDir: Bool)] {
+        guard let dp = opendir(dir.path) else { return [] }
+        defer { closedir(dp) }
+        var out: [(URL, Bool)] = []
+        while let ep = readdir(dp) {
+            var e = ep.pointee
+            let name = withUnsafeBytes(of: &e.d_name) { raw -> String in
+                raw.baseAddress.map { String(cString: $0.assumingMemoryBound(to: CChar.self)) } ?? ""
+            }
+            if name.isEmpty || name == "." || name == ".." { continue }
+            if !showHidden && name.hasPrefix(".") { continue }
+            var isDir = Int32(e.d_type) == Int32(DT_DIR)
+            if Int32(e.d_type) == Int32(DT_UNKNOWN) {   // rare: server didn't return a type → one stat
+                var st = stat()
+                if lstat(dir.path + "/" + name, &st) == 0 { isDir = (st.st_mode & S_IFMT) == S_IFDIR }
+            }
+            out.append((dir.appendingPathComponent(name, isDirectory: isDir), isDir))
+        }
+        return out
+    }
+
+    // A FileItem with just name + directory bit (no size/date I/O). The
+    // .distantPast dates are a sentinel meaning "not fetched yet"; the Size/Date
+    // cells render a placeholder for it until loadNetwork's enrich pass fills in.
+    static func lightItem(url u: URL, isDir: Bool) -> FileItem {
+        FileItem(id: u.path, url: u, name: u.lastPathComponent,
+                 isDirectory: isDir, size: 0,
+                 modified: .distantPast, created: .distantPast,
+                 accessed: .distantPast, dateAdded: .distantPast,
+                 kind: localKind(u, isDir: isDir), tags: [])
+    }
+
     // The view order: sort, folders-first, then name filter.
     func visibleItems() -> [FileItem] {
         let sorted = items.sorted(using: sortOrder)
@@ -846,13 +897,8 @@ final class Browser: ObservableObject, Identifiable {
         pathText = currentURL.path
         selection = []
         let dir = currentURL
-        // On slow (network/SMB) volumes, fetch only the essential attributes to
-        // avoid hundreds of per-file round-trips over the VPN.
         let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
         currentIsNetwork = isNetwork
-        let keys = isNetwork ? Browser.fastItemKeys : Browser.itemKeys
-        var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
-        if !showHidden { opts.insert(.skipsHiddenFiles) }
         loadGeneration += 1
         let gen = loadGeneration
         let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
@@ -863,54 +909,110 @@ final class Browser: ObservableObject, Identifiable {
             busy = false; busyText = ""
             updateFreeSpace(); updateStatus()
         } else {
-            items = []            // clear stale previous-folder contents; progressive load fills it in
+            items = []            // clear stale previous-folder contents; the load fills it in
             busy = true; busyText = "Loading…"
             updateStatus()
         }
         let hadCache = cached != nil
+        if isNetwork { loadNetwork(dir, gen: gen, cacheKey: cacheKey) }
+        else { loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: hadCache) }
+    }
+
+    // Local volumes: stat is cheap, so read everything (incl. tags/kind) up front
+    // via Foundation's enumerator, streaming in batches for very large folders.
+    private func loadLocal(_ dir: URL, gen: Int, cacheKey: String, hadCache: Bool) {
+        let keys = Browser.itemKeys
+        var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
+        if !showHidden { opts.insert(.skipsHiddenFiles) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // On a first (uncached) visit, stream items in as they're read
-            // (Finder-style progressive fill). On a cached revisit, just refresh
-            // silently and swap in the fresh list at the end.
             let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
             var result: [FileItem] = []
             var sinceFlush = 0
             while let u = en?.nextObject() as? URL {
-                guard let self, gen == self.loadGeneration else { return }   // superseded → stop
+                guard let self, gen == self.loadGeneration else { return }
                 result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
                 sinceFlush += 1
-                if !hadCache, sinceFlush >= 50 {
+                if !hadCache, sinceFlush >= 200 {
                     sinceFlush = 0
                     let snapshot = result
                     DispatchQueue.main.async { [weak self] in
                         guard let self, gen == self.loadGeneration else { return }
-                        self.items = snapshot; self.busyText = "Loading… (\(snapshot.count))"; self.updateStatus()
+                        self.items = snapshot; self.updateStatus()
                     }
                 }
             }
-            // DFS junctions (e.g. //server/Games/Tools) auto-mount on first access;
-            // the enumerator can return before the mount settles, yielding an empty
-            // listing. If a network dir comes back empty, wait briefly and retry once
-            // so we don't display a spurious "0 items" for a folder that isn't empty.
-            var final = result
-            if isNetwork, final.isEmpty {
-                Thread.sleep(forTimeInterval: 1.5)
-                guard let self, gen == self.loadGeneration else { return }
-                let en2 = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
-                var retry: [FileItem] = []
-                while let u = en2?.nextObject() as? URL {
-                    guard gen == self.loadGeneration else { return }
-                    retry.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
-                }
-                final = retry
-            }
-            let committed = final
+            let committed = result
             DispatchQueue.main.async {
                 guard let self, gen == self.loadGeneration else { return }
                 Browser.dirCache[cacheKey] = committed
                 self.items = committed
                 self.busy = false; self.busyText = ""
                 self.updateFreeSpace(); self.updateStatus()
+            }
+        }
+    }
+
+    // Network volumes: two-phase load that beats Finder. Phase 1 shows names +
+    // folder icons instantly (POSIX readdir, ~0.7s for hundreds of entries).
+    // Phase 2 fills in size/date in the background (one stat each, ~86ms over
+    // VPN), updating the UI in chunks. Both phases honor the generation token so
+    // navigating away cancels them, and the final result is cached for instant
+    // revisits. Finder blocks on phase 2 for the whole folder — hence the hang.
+    private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String) {
+        let showHidden = self.showHidden
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var names = Browser.fastNames(dir, showHidden: showHidden)
+            // DFS junctions auto-mount on first access and can read empty; retry once.
+            if names.isEmpty {
+                Thread.sleep(forTimeInterval: 1.5)
+                guard let self, gen == self.loadGeneration else { return }
+                names = Browser.fastNames(dir, showHidden: showHidden)
+            }
+            // Folders first, then by name, so the top of the list — what the user
+            // sees and what we enrich first — is stable and Finder-like.
+            names.sort { a, b in
+                if a.isDir != b.isDir { return a.isDir }
+                return a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
+            }
+            var enriched = names.map { Browser.lightItem(url: $0.url, isDir: $0.isDir) }
+            guard let self, gen == self.loadGeneration else { return }
+            let light = enriched
+            DispatchQueue.main.async { [weak self] in
+                guard let self, gen == self.loadGeneration else { return }
+                self.items = light                       // instant: names + folder icons
+                self.busy = false; self.busyText = ""
+                self.updateFreeSpace(); self.updateStatus()
+            }
+            // Phase 2 — lazily fetch size + dates, publishing every 40 items.
+            let enrichKeys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey]
+            var sinceFlush = 0
+            for i in enriched.indices {
+                guard gen == self.loadGeneration else { return }
+                let u = enriched[i].url
+                if let rv = try? u.resourceValues(forKeys: enrichKeys) {
+                    let m = rv.contentModificationDate ?? Date()
+                    enriched[i] = FileItem(id: u.path, url: u, name: u.lastPathComponent,
+                                           isDirectory: enriched[i].isDirectory,
+                                           size: Int64(rv.fileSize ?? 0),
+                                           modified: m, created: rv.creationDate ?? m,
+                                           accessed: m, dateAdded: m,
+                                           kind: enriched[i].kind, tags: [])
+                }
+                sinceFlush += 1
+                if sinceFlush >= 40 {
+                    sinceFlush = 0
+                    let snapshot = enriched
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, gen == self.loadGeneration else { return }
+                        self.items = snapshot; self.updateStatus()
+                    }
+                }
+            }
+            let committed = enriched
+            DispatchQueue.main.async { [weak self] in
+                guard let self, gen == self.loadGeneration else { return }
+                Browser.dirCache[cacheKey] = committed
+                self.items = committed; self.updateStatus()
             }
         }
     }
@@ -1818,7 +1920,7 @@ struct FileTableView: View {
                 NameCell(item: item, browser: browser)
             }.customizationID("name")
             TableColumn("Date Modified", value: \FileItem.modified) { item in
-                Text(item.modified, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+                DateCell(date: item.modified)
             }.width(min: 150, ideal: 185).customizationID("modified")
             TableColumn("Size", value: \FileItem.size) { item in
                 SizeCell(item: item)
@@ -1829,13 +1931,13 @@ struct FileTableView: View {
         }
         Group {
             TableColumn("Date Created", value: \FileItem.created) { item in
-                Text(item.created, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+                DateCell(date: item.created)
             }.width(min: 150, ideal: 185).customizationID("created").defaultVisibility(.hidden)
             TableColumn("Date Last Opened", value: \FileItem.accessed) { item in
-                Text(item.accessed, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+                DateCell(date: item.accessed)
             }.width(min: 150, ideal: 185).customizationID("accessed").defaultVisibility(.hidden)
             TableColumn("Date Added", value: \FileItem.dateAdded) { item in
-                Text(item.dateAdded, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary)
+                DateCell(date: item.dateAdded)
             }.width(min: 150, ideal: 185).customizationID("dateAdded").defaultVisibility(.hidden)
             TableColumn("Extension", value: \FileItem.ext) { item in
                 Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary)
