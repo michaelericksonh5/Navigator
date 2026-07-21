@@ -790,23 +790,39 @@ final class Browser: ObservableObject, Identifiable {
         load()
     }
 
+    private var loadGeneration = 0
+
+    // Directory enumeration (and its per-file attribute fetches) runs on a
+    // background queue — over SMB/VPN it can take a while, and doing it on the
+    // main thread would freeze the UI. Results are applied on the main thread,
+    // and stale loads (superseded by a newer navigation) are discarded.
     func load() {
         isRecents = false
         isSearching = false
+        pathText = currentURL.path
+        selection = []
+        let dir = currentURL
         let keys = Browser.itemKeys
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
         if !showHidden { opts.insert(.skipsHiddenFiles) }
-        var result: [FileItem] = []
-        if let urls = try? fm.contentsOfDirectory(at: currentURL, includingPropertiesForKeys: keys, options: opts) {
-            for u in urls {
-                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+        loadGeneration += 1
+        let gen = loadGeneration
+        busy = true; busyText = "Loading…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var result: [FileItem] = []
+            if let urls = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: opts) {
+                for u in urls {
+                    result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self, gen == self.loadGeneration else { return }   // ignore superseded loads
+                self.items = result
+                self.busy = false; self.busyText = ""
+                self.updateFreeSpace()
+                self.updateStatus()
             }
         }
-        items = result
-        pathText = currentURL.path
-        selection = []
-        updateFreeSpace()
-        updateStatus()
     }
 
     func updateFreeSpace() {
@@ -2039,6 +2055,9 @@ final class SidebarNode: Identifiable {
     }
 
     var children: [SidebarNode]? {
+        // Network-drive favorites: never enumerate synchronously — SMB/VPN listing
+        // on the main thread freezes the UI. They open in the main pane on click.
+        if mountURL != nil { return nil }
         if !loaded { loaded = true; cache = SidebarNode.subfolders(url) }
         return cache.isEmpty ? nil : cache
     }
