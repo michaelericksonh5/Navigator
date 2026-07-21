@@ -3,10 +3,13 @@
 set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 APP="/Applications/Navigator.app"
-echo "Compiling..."
-/usr/bin/swiftc -swift-version 5 -target arm64-apple-macos14.0 \
-  -o "$DIR/Navigator.bin" "$DIR/main.swift" \
-  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers
+echo "Compiling (universal: arm64 + x86_64)..."
+SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" \
+  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers)
+/usr/bin/swiftc "${SWIFT_ARGS[@]}" -target arm64-apple-macos14.0  -o "$DIR/Navigator-arm64"
+/usr/bin/swiftc "${SWIFT_ARGS[@]}" -target x86_64-apple-macos14.0 -o "$DIR/Navigator-x86_64"
+lipo -create "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64" -output "$DIR/Navigator.bin"
+rm -f "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64"
 
 # (Re)generate the icon: prefer AppIcon.png (sips), then the SVG, then the Swift generator
 if [ -f "$DIR/AppIcon.png" ]; then
