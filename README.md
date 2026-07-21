@@ -53,6 +53,16 @@ The app ships with **no** preconfigured network drives — a fresh install is a 
 
 No company server names are baked into the app, so the same public build works for everyone; the shared `.json` lives wherever your team shares files (Slack/Drive).
 
+---
+
+## Updating
+Navigator updates itself from this repo's Releases — **your settings and permissions are never touched** (they live in `~/Library`, not in the app bundle, and the signing identity stays stable).
+
+- **Automatic:** on launch (at most once a day) Navigator quietly checks for a newer release and, if there is one, asks whether to update.
+- **Manual:** **Navigator menu → "Check for Updates…"**.
+
+When you choose **Update Now**, it downloads the new `Navigator.zip`, replaces the app in `/Applications`, and relaunches — favorites, view settings, pinned drives, and Full Disk Access all carry over. (If `/Applications` isn't writable, it points you to the Releases page to update manually.)
+
 > **Why the grants stick:** macOS ties these permissions to the app's code signature. The release build has a **stable** signature, so your grants persist across updates — you won't have to re-grant them each time you install a new version.
 
 ---

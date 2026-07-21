@@ -236,6 +236,8 @@ enum Prefs {
     }
     static var columnData: Data? { get { d.data(forKey: "columnCustomization") } set { d.set(newValue, forKey: "columnCustomization") } }
     static var recentFolders: [String] { get { d.stringArray(forKey: "recentFolders") ?? [] } set { d.set(newValue, forKey: "recentFolders") } }
+    static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
+    static var skipUpdateVersion: String { get { d.string(forKey: "skipUpdateVersion") ?? "" } set { d.set(newValue, forKey: "skipUpdateVersion") } }
 }
 
 // MARK: - Recent folders (Windows Quick Access-style MRU list)
@@ -1285,16 +1287,54 @@ final class Browser: ObservableObject, Identifiable {
     // Navigate to a sidebar favorite. For a network drive whose volume isn't
     // mounted (e.g. after a reboot or VPN reconnect), (re)mount it first, then go.
     func openFavorite(_ path: String, mountURL: String?) {
-        let url = URL(fileURLWithPath: path)
-        if fm.fileExists(atPath: path) { navigate(to: url); return }
+        if fm.fileExists(atPath: path) { navigate(to: URL(fileURLWithPath: path)); return }
         guard let m = mountURL, let smb = URL(string: m) else { NSSound.beep(); return }
         busy = true; busyText = "Connecting to \(smb.host ?? "server")…"
         NSWorkspace.shared.open(smb)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        pollForMount(path: path, smb: smb, tries: 0)
+    }
+    // A network share doesn't always mount where the favorite's stored path
+    // expects (e.g. smb://host/data/Dept lands at /Volumes/Dept, not
+    // /Volumes/data/Dept). After triggering the mount, poll for the stored path
+    // OR the share's actual mount point and navigate to whichever appears.
+    private func pollForMount(path: String, smb: URL, tries: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self else { return }
-            self.busy = false; self.busyText = ""
-            if self.fm.fileExists(atPath: path) { self.navigate(to: url) } else { NSSound.beep() }
+            if self.fm.fileExists(atPath: path) {
+                self.busy = false; self.busyText = ""; self.navigate(to: URL(fileURLWithPath: path)); return
+            }
+            if let actual = Browser.mountPoint(for: smb) {
+                self.busy = false; self.busyText = ""; self.navigate(to: actual); return
+            }
+            if tries < 7 { self.pollForMount(path: path, smb: smb, tries: tries + 1) }
+            else { self.busy = false; self.busyText = ""; NSSound.beep() }
         }
+    }
+    // Where an SMB URL actually mounted. macOS names the volume after the last
+    // path component (smb://host/a/b → /Volumes/b, or /Volumes/b-N on a clash),
+    // so check those; also match the live mount table by remote path.
+    static func mountPoint(for smb: URL) -> URL? {
+        let fm = FileManager.default
+        let comps = smb.pathComponents.filter { $0 != "/" }
+        if let last = comps.last {
+            let candidates = ["/Volumes/\(last)"] + (1...3).map({ "/Volumes/\(last)-\($0)" })
+            for cand in candidates where fm.fileExists(atPath: cand) {
+                return URL(fileURLWithPath: cand)
+            }
+        }
+        // Fall back to scanning mounted volumes for one whose remote path matches.
+        let share = "/" + comps.joined(separator: "/")
+        if let vols = fm.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) {
+            for v in vols {
+                var st = statfs(); if statfs(v.path, &st) == 0 {
+                    let from = withUnsafeBytes(of: &st.f_mntfromname) { raw -> String in
+                        raw.baseAddress.map { String(cString: $0.assumingMemoryBound(to: CChar.self)) } ?? ""
+                    }
+                    if from.hasSuffix(share) || from.contains(share) { return v }
+                }
+            }
+        }
+        return nil
     }
 
     func goUp() {
@@ -3536,6 +3576,134 @@ final class BatchRenameController {
 
 // MARK: - AppKit entry point
 
+// Self-update from GitHub Releases. Checks the latest release, and (if newer)
+// downloads Navigator.zip and swaps the app bundle in place, then relaunches.
+// Your settings live in UserDefaults / ~/Library — replacing the .app bundle
+// doesn't touch them, and the stable signing identity keeps macOS permission
+// grants intact — so updating never wipes your personalization.
+enum Updater {
+    static let repo = "michaelericksonh5/Navigator"
+    static var currentVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
+    static var releasesPage: URL { URL(string: "https://github.com/\(repo)/releases/latest")! }
+
+    static func isNewer(_ remote: String, than local: String) -> Bool {
+        func parts(_ s: String) -> [Int] { s.split(separator: ".").map { Int($0.filter(\.isNumber)) ?? 0 } }
+        let r = parts(remote), l = parts(local)
+        for i in 0..<max(r.count, l.count) where (i < r.count ? r[i] : 0) != (i < l.count ? l[i] : 0) {
+            return (i < r.count ? r[i] : 0) > (i < l.count ? l[i] : 0)
+        }
+        return false
+    }
+
+    // userInitiated: show "you're up to date" / errors. Automatic launch checks
+    // are silent unless there's an update, and throttled to once/day.
+    static func check(userInitiated: Bool) {
+        if !userInitiated {
+            let dayAgo = Date().timeIntervalSince1970 - 86_400
+            if Prefs.lastUpdateCheck > dayAgo { return }
+        }
+        var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("Navigator", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            DispatchQueue.main.async {
+                Prefs.lastUpdateCheck = Date().timeIntervalSince1970
+                guard let json, let tag = json["tag_name"] as? String else {
+                    if userInitiated { alert("Couldn't check for updates", "Please try again later, or visit the Releases page.", link: releasesPage) }
+                    return
+                }
+                let remote = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+                let notes = (json["body"] as? String) ?? ""
+                let page = (json["html_url"] as? String).flatMap(URL.init) ?? releasesPage
+                var zip: URL?
+                if let assets = json["assets"] as? [[String: Any]] {
+                    zip = assets.first { ($0["name"] as? String) == "Navigator.zip" }
+                        .flatMap { ($0["browser_download_url"] as? String) }.flatMap(URL.init)
+                }
+                if isNewer(remote, than: currentVersion) {
+                    if !userInitiated, Prefs.skipUpdateVersion == remote { return }
+                    presentUpdate(version: remote, notes: notes, page: page, zip: zip, userInitiated: userInitiated)
+                } else if userInitiated {
+                    alert("You're up to date", "Navigator \(currentVersion) is the latest version.")
+                }
+            }
+        }.resume()
+    }
+
+    private static func presentUpdate(version: String, notes: String, page: URL, zip: URL?, userInitiated: Bool) {
+        let a = NSAlert()
+        a.messageText = "Navigator \(version) is available"
+        var info = "You have \(currentVersion). Updating keeps all your settings and permissions."
+        if !notes.isEmpty { info += "\n\n" + String(notes.prefix(600)) }
+        a.informativeText = info
+        a.addButton(withTitle: "Update Now")
+        a.addButton(withTitle: "Release Notes")
+        a.addButton(withTitle: userInitiated ? "Later" : "Skip This Version")
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            if let zip { download(zip) } else { NSWorkspace.shared.open(page) }
+        case .alertSecondButtonReturn:
+            NSWorkspace.shared.open(page)
+        default:
+            if !userInitiated { Prefs.skipUpdateVersion = version }
+        }
+    }
+
+    private static func download(_ zip: URL) {
+        guard access("/Applications", W_OK) == 0 else {
+            alert("Can't update automatically", "Navigator can't write to /Applications. Download the update manually from the Releases page.", link: releasesPage)
+            return
+        }
+        NSApp.dockTile.badgeLabel = "↓"   // brief hint while the (small) zip downloads
+        URLSession.shared.downloadTask(with: zip) { tmp, _, err in
+            DispatchQueue.main.async {
+                NSApp.dockTile.badgeLabel = nil
+                guard let tmp, err == nil else { alert("Download failed", err?.localizedDescription ?? "Please try again."); return }
+                install(zipAt: tmp)
+            }
+        }.resume()
+    }
+
+    private static func install(zipAt zip: URL) {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("NavigatorUpdate-\(UUID().uuidString)")
+        try? fm.createDirectory(at: work, withIntermediateDirectories: true)
+        let expand = Process(); expand.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        expand.arguments = ["-x", "-k", zip.path, work.path]
+        do { try expand.run(); expand.waitUntilExit() } catch { alert("Update failed", error.localizedDescription); return }
+        guard expand.terminationStatus == 0,
+              let newApp = (try? fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil))?
+                  .first(where: { $0.pathExtension == "app" }) else {
+            alert("Update failed", "The downloaded update couldn't be expanded."); return
+        }
+        let dest = "/Applications/Navigator.app"
+        // A helper that waits for us to quit, swaps the bundle, and relaunches —
+        // you can't overwrite a running app bundle from within itself.
+        let script = """
+        #!/bin/bash
+        for i in $(seq 1 60); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done
+        /bin/rm -rf "\(dest)"
+        /usr/bin/ditto "\(newApp.path)" "\(dest)"
+        /usr/bin/xattr -dr com.apple.quarantine "\(dest)" 2>/dev/null
+        /usr/bin/open "\(dest)"
+        /bin/rm -rf "\(work.path)"
+        """
+        let scriptURL = work.appendingPathComponent("update.sh")
+        do { try script.write(to: scriptURL, atomically: true, encoding: .utf8) } catch { alert("Update failed", error.localizedDescription); return }
+        let runner = Process(); runner.executableURL = URL(fileURLWithPath: "/bin/bash"); runner.arguments = [scriptURL.path]
+        do { try runner.run() } catch { alert("Update failed", error.localizedDescription); return }
+        NSApp.terminate(nil)   // quit so the helper can replace the bundle
+    }
+
+    private static func alert(_ title: String, _ msg: String, link: URL? = nil) {
+        let a = NSAlert(); a.messageText = title; a.informativeText = msg
+        if link != nil { a.addButton(withTitle: "Open Releases Page") }
+        a.addButton(withTitle: "OK")
+        if a.runModal() == .alertFirstButtonReturn, let link { NSWorkspace.shared.open(link) }
+    }
+}
+
 final class NavWindow: NSWindow {
     let model = AppModel()
 
@@ -3573,6 +3741,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
         ensureSMBTuning()
+        Updater.check(userInitiated: false)   // silent, throttled to once/day; prompts only if an update exists
         NetworkBrowser.shared.start()
         NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
         NSUpdateDynamicServices()
@@ -3723,6 +3892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appItem = NSMenuItem(); mainMenu.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
         appMenu.addItem(withTitle: "About Navigator", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let cfu = appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdatesAction(_:)), keyEquivalent: ""); cfu.target = self
         appMenu.addItem(.separator())
         let dfb = appMenu.addItem(withTitle: "Set as Default File Browser…", action: #selector(setDefaultBrowserAction(_:)), keyEquivalent: "")
         dfb.target = self
@@ -3884,6 +4054,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             break
         }
     }
+
+    @objc func checkForUpdatesAction(_ sender: Any?) { Updater.check(userInitiated: true) }
 
     @objc func exportFavoritesAction(_ sender: Any?) {
         guard let data = FavoritesStore.shared.exportData() else { NSSound.beep(); return }
