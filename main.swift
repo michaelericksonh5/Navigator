@@ -714,6 +714,11 @@ final class Browser: ObservableObject, Identifiable {
     var currentIsNetwork = false
     private static var typeIconCache: [String: NSImage] = [:]
     func icon(for item: FileItem) -> NSImage {
+        // The Trash gets its proper can icon (icon(forFile:) returns a blank
+        // document for ~/.Trash, and it's often unreadable without Full Disk Access).
+        if item.url.lastPathComponent == ".Trash" {
+            return NSImage(named: NSImage.trashEmptyName) ?? NSWorkspace.shared.icon(for: .folder)
+        }
         // On network volumes, use cached icons keyed by type (no per-file I/O over
         // SMB). Locally, use the real per-file icon (custom folder/app icons).
         guard currentIsNetwork else { return NSWorkspace.shared.icon(forFile: item.url.path) }
@@ -728,7 +733,8 @@ final class Browser: ObservableObject, Identifiable {
     // Full metadata (used on fast/local volumes and for single-item detail views).
     static let itemKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
                                              .creationDateKey, .contentAccessDateKey, .addedToDirectoryDateKey,
-                                             .localizedTypeDescriptionKey, .tagNamesKey]
+                                             .localizedTypeDescriptionKey, .tagNamesKey,
+                                             .isSymbolicLinkKey, .isAliasFileKey]
     // Minimal metadata for slow (network/SMB) volumes — just what the default
     // columns need. Everything else is derived locally or falls back, so a
     // 600-item network folder loads in a couple of round-trips, not hundreds.
@@ -749,7 +755,13 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     static func item(from u: URL, _ rv: URLResourceValues?) -> FileItem {
-        let isDir = rv?.isDirectory ?? false
+        var isDir = rv?.isDirectory ?? false
+        // A symlink/alias to a folder (e.g. the "Google Drive" cloud link) should
+        // behave and sort like a folder — open into it, keep it up top with folders.
+        if !isDir, rv?.isSymbolicLink == true || rv?.isAliasFile == true {
+            var d: ObjCBool = false
+            if FileManager.default.fileExists(atPath: u.path, isDirectory: &d), d.boolValue { isDir = true }
+        }
         let modified = rv?.contentModificationDate ?? Date.distantPast
         let kind = (rv?.allValues[.localizedTypeDescriptionKey] as? String) ?? localKind(u, isDir: isDir)
         return FileItem(id: u.path, url: u, name: u.lastPathComponent,
