@@ -1212,10 +1212,13 @@ final class Browser: ObservableObject, Identifiable {
     }
     func moveToTrash(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
         var restores: [(trash: URL, original: URL)] = []
+        var failures: [(url: URL, reason: String)] = []
         for u in urls {
             var out: NSURL?
-            do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((t, u)) } } catch {}
+            do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((t, u)) } }
+            catch { failures.append((u, error.localizedDescription)) }
         }
         if !restores.isEmpty {
             UndoStack.shared.push("Move to Trash") { [weak self] in
@@ -1223,6 +1226,20 @@ final class Browser: ObservableObject, Identifiable {
                 self?.load()
             }
         }
+        // Surface failures instead of silently doing nothing (e.g. protected
+        // folders like ~/Pictures need Full Disk Access to trash).
+        if !failures.isEmpty {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = failures.count == 1
+                ? "“\(failures[0].url.lastPathComponent)” couldn't be moved to the Trash"
+                : "\(failures.count) items couldn't be moved to the Trash"
+            a.informativeText = (failures.first?.reason ?? "")
+                + "\n\nItems in protected folders (like Pictures, Documents, or Desktop) may need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
+            a.addButton(withTitle: "OK")
+            a.runModal()
+        }
+        Browser.invalidateCache(currentURL.path)
         load()
     }
     func newFolder() {
@@ -1280,25 +1297,32 @@ final class Browser: ObservableObject, Identifiable {
         return dest
     }
 
-    func pasteFiles() { copyURLs(pasteboardURLs(), move: cutMode) }
+    // Explicit paste (⌘V / context menu). Pasting a copied item into its own
+    // folder makes a numbered duplicate ("photo.jpg" -> "photo (1).jpg"); a cut
+    // item pasted into its own folder is a no-op.
+    func pasteFiles() {
+        let urls = pasteboardURLs()
+        guard !urls.isEmpty else { return }
+        if cutMode {
+            let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
+            guard !sources.isEmpty else { return }
+            performTransfer(sources, into: currentURL, move: true, resetCut: true)
+        } else {
+            let sources = urls.filter { $0.path != currentURL.path }   // keep same-folder → duplicated by isSelfDup
+            guard !sources.isEmpty else { return }
+            performTransfer(sources, into: currentURL, move: false, resetCut: true)
+        }
+    }
 
     private func pasteboardURLs() -> [URL] {
         (NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: nil) as? [URL]) ?? []
     }
 
-    // Background copy/move with a busy indicator (keeps the UI responsive on big transfers).
+    // Background copy/move with a busy indicator (keeps the UI responsive on big
+    // transfers). Used by drag-and-drop: dropping items into the folder they
+    // already live in is a no-op (cancel), NOT a self-copy.
     func copyURLs(_ urls: [URL], move: Bool) {
-        let sources: [URL]
-        if move {
-            // Moving items into the folder they already live in is a no-op.
-            sources = urls.filter {
-                $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path
-            }
-        } else {
-            // Paste (copy): items already in this folder become numbered duplicates
-            // ("photo.jpg" -> "photo (1).jpg"); everything else copies in normally.
-            sources = urls.filter { $0.path != currentURL.path }
-        }
+        let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
         guard !sources.isEmpty else { return }
         performTransfer(sources, into: currentURL, move: move, resetCut: true)
     }
