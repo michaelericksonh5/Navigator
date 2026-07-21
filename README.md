@@ -46,6 +46,13 @@ To auto-discover SMB file servers on your LAN (the **Network** section of the si
 ### 5. Connecting to network drives / servers
 Use **Connect to Server (⌘K)** or the Dock-icon menu to mount an SMB/AFP share (e.g. `smb://server/share`). You must be on the same network (or VPN) as the server. Mounted shares appear under **Locations**. Navigator applies a safe per-user SMB tuning automatically on launch for smoother network browsing.
 
+### Sharing a set of drives with a team
+The app ships with **no** preconfigured network drives — a fresh install is a clean local file explorer. To hand a team the same shortcuts:
+- On a configured Mac: **File → Export Favorites…** → save the `.json` (personal home folders are left out; network drives are included).
+- Each coworker: **File → Import Favorites…** → pick that file. The drives appear in their sidebar, and they connect through **their own** VPN and login the first time they click one.
+
+No company server names are baked into the app, so the same public build works for everyone; the shared `.json` lives wherever your team shares files (Slack/Drive).
+
 > **Why the grants stick:** macOS ties these permissions to the app's code signature. The release build has a **stable** signature, so your grants persist across updates — you won't have to re-grant them each time you install a new version.
 
 ---

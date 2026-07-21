@@ -598,6 +598,34 @@ final class FavoritesStore: ObservableObject {
     func move(from: IndexSet, to: Int) { items.move(fromOffsets: from, toOffset: to); persist() }
     func reset() { items = defaultLocations().map { Favorite(label: $0.name, path: $0.url.path, mountURL: nil) }; persist() }
     private func persist() { if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: "favoritesV2") } }
+
+    // Export/import favorites as JSON — so a shared set (e.g. team network
+    // drives) can be handed to a coworker who imports it. Each person still
+    // connects through their own VPN/credentials; only the shortcuts are shared.
+    func exportData() -> Data? {
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? enc.encode(items)
+    }
+    @discardableResult
+    func importData(_ data: Data) -> Int {
+        guard let incoming = try? JSONDecoder().decode([Favorite].self, from: data) else { return -1 }
+        let existing = Set(items.map { $0.id })
+        let homeName = FileManager.default.homeDirectoryForCurrentUser.lastPathComponent
+        // A favorite is portable if it's a network drive (mountURL) or not under
+        // some OTHER user's home. This skips a sharer's personal ~/Desktop etc.,
+        // which would be a broken path for the importer, while keeping shared
+        // network drives, /Applications, /Volumes, etc.
+        func portable(_ f: Favorite) -> Bool {
+            if f.mountURL != nil { return true }
+            let parts = f.path.split(separator: "/")
+            if parts.count >= 2, parts[0] == "Users", parts[1] != Substring(homeName) { return false }
+            return true
+        }
+        let fresh = incoming.filter { !existing.contains($0.id) && portable($0) }
+        guard !fresh.isEmpty else { return 0 }
+        items.append(contentsOf: fresh); persist()
+        return fresh.count
+    }
 }
 
 let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
@@ -3729,6 +3757,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileMenu.addItem(.separator())
         let cs = fileMenu.addItem(withTitle: "Connect to Server…", action: #selector(connectServerAction(_:)), keyEquivalent: "k")
         cs.target = self
+        fileMenu.addItem(.separator())
+        let expF = fileMenu.addItem(withTitle: "Export Favorites…", action: #selector(exportFavoritesAction(_:)), keyEquivalent: ""); expF.target = self
+        let impF = fileMenu.addItem(withTitle: "Import Favorites…", action: #selector(importFavoritesAction(_:)), keyEquivalent: ""); impF.target = self
 
         // Edit menu uses the STANDARD selectors + titles, so the user's System Settings
         // keyboard-shortcut overrides for Copy/Cut/Paste are applied automatically.
@@ -3852,6 +3883,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             break
         }
+    }
+
+    @objc func exportFavoritesAction(_ sender: Any?) {
+        guard let data = FavoritesStore.shared.exportData() else { NSSound.beep(); return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Navigator Favorites.json"
+        panel.allowedContentTypes = [.json]
+        panel.message = "Share this file with a coworker; they can import it to get the same sidebar shortcuts (they still connect through their own VPN/login)."
+        if panel.runModal() == .OK, let url = panel.url { try? data.write(to: url) }
+    }
+    @objc func importFavoritesAction(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a Navigator favorites (.json) file to add its shortcuts to your sidebar."
+        guard panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) else { return }
+        let n = FavoritesStore.shared.importData(data)
+        let a = NSAlert()
+        if n > 0 {
+            a.messageText = "Imported \(n) favorite\(n == 1 ? "" : "s")"
+            a.informativeText = "They've been added to your sidebar. Network drives connect through your own VPN and login when you first click them."
+        } else if n == 0 {
+            a.alertStyle = .informational
+            a.messageText = "Nothing new to import"
+            a.informativeText = "Those favorites are already in your sidebar."
+        } else {
+            a.alertStyle = .warning
+            a.messageText = "Couldn't read that file"
+            a.informativeText = "It doesn't look like a Navigator favorites export."
+        }
+        a.addButton(withTitle: "OK"); a.runModal()
     }
 
     @objc func connectServerAction(_ sender: Any?) {
