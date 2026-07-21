@@ -2516,6 +2516,36 @@ struct ItemFramesKey: PreferenceKey {
     }
 }
 
+// AppKit-level drag catcher for rubber-band selection. A SwiftUI DragGesture
+// inside a ScrollView is unreliable (the scroll view eats the drag), so we use a
+// real NSView that receives mouseDragged directly. It sits behind the cells, so
+// only drags/clicks on empty space reach it. Coordinates are top-left (flipped)
+// to match SwiftUI's grid space.
+struct MarqueeCatcher: NSViewRepresentable {
+    var onRect: (CGRect?) -> Void      // drag rect in grid space; nil when the drag ends
+    var onEmptyClick: () -> Void        // a click on empty space (no drag) → deselect
+    func makeNSView(context: Context) -> CatcherView { let v = CatcherView(); v.onRect = onRect; v.onEmptyClick = onEmptyClick; return v }
+    func updateNSView(_ v: CatcherView, context: Context) { v.onRect = onRect; v.onEmptyClick = onEmptyClick }
+    final class CatcherView: NSView {
+        var onRect: ((CGRect?) -> Void)?
+        var onEmptyClick: (() -> Void)?
+        private var start: NSPoint?
+        private var dragged = false
+        override var isFlipped: Bool { true }
+        override func mouseDown(with e: NSEvent) { start = convert(e.locationInWindow, from: nil); dragged = false }
+        override func mouseDragged(with e: NSEvent) {
+            guard let s = start else { return }
+            dragged = true
+            let p = convert(e.locationInWindow, from: nil)
+            onRect?(CGRect(x: min(s.x, p.x), y: min(s.y, p.y), width: abs(p.x - s.x), height: abs(p.y - s.y)))
+        }
+        override func mouseUp(with e: NSEvent) {
+            if !dragged { onEmptyClick?() }
+            start = nil; onRect?(nil)
+        }
+    }
+}
+
 // The rubber-band selection rectangle: a translucent fill with an animated
 // dashed "marching ants" outline (TimelineView drives the dash phase each frame).
 struct MarqueeRect: View {
@@ -2546,24 +2576,19 @@ struct IconGridView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     ZStack(alignment: .topLeading) {
-                        // Empty-space catcher: a rubber-band drag begins here. Drags
-                        // that start on a cell hit the cell's own .draggable (move),
-                        // so attaching the gesture ONLY here keeps the two separate.
-                        Color.clear.frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .topLeading)
-                            .contentShape(Rectangle())
-                            .gesture(
-                                DragGesture(minimumDistance: 6, coordinateSpace: .named("iconGrid"))
-                                    .onChanged { v in
-                                        let r = CGRect(x: min(v.startLocation.x, v.location.x),
-                                                       y: min(v.startLocation.y, v.location.y),
-                                                       width: abs(v.location.x - v.startLocation.x),
-                                                       height: abs(v.location.y - v.startLocation.y))
-                                        marquee = r
-                                        browser.selection = Set(itemFrames.filter { $0.value.intersects(r) }.map { $0.key })
-                                        browser.updateStatus()
-                                    }
-                                    .onEnded { _ in marquee = nil }
-                            )
+                        // Rubber-band catcher (behind the cells): an AppKit NSView that
+                        // receives the drag directly, so ScrollView doesn't eat it.
+                        MarqueeCatcher(
+                            onRect: { r in
+                                marquee = r
+                                if let r {
+                                    browser.selection = Set(itemFrames.filter { $0.value.intersects(r) }.map { $0.key })
+                                    browser.updateStatus()
+                                }
+                            },
+                            onEmptyClick: { browser.selection = []; browser.updateStatus() }
+                        )
+                        .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .topLeading)
                         LazyVGrid(columns: columns, spacing: 12) {
                             if browser.groupBy == .none {
                                 ForEach(browser.visibleItems()) { item in cell(item) }
