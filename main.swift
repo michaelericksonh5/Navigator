@@ -3295,13 +3295,26 @@ final class BatchRenameController {
 
 final class NavWindow: NSWindow {
     let model = AppModel()
+
+    // ⌘ + scroll wheel resizes/cycles the view (Windows 11 Ctrl+scroll). Handled
+    // here in sendEvent so the event is fully consumed — a local event monitor
+    // isn't reliable because AppKit's responsive scrolling can still deliver the
+    // wheel event to the list, making it scroll while zooming.
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .scrollWheel,
+           event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command {
+            let dy = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
+            if dy != 0 { model.active.adjustViewScale(dy) }
+            return   // consume — do not forward to the content/scroll view
+        }
+        super.sendEvent(event)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NavWindow!
     private var extraWindows: [NavWindow] = []
     private var keyMonitor: Any?
-    private var scrollMonitor: Any?
 
     // Menu commands and keyboard nav target whichever Navigator window is key.
     var appModel: AppModel { (NSApp.keyWindow as? NavWindow)?.model ?? window.model }
@@ -3411,18 +3424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handleKey(event) ?? event
         }
-        // ⌘ + scroll wheel resizes/cycles the view (Windows 11 Ctrl+scroll).
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-            self?.handleScroll(event) ?? event
-        }
-    }
-    private func handleScroll(_ event: NSEvent) -> NSEvent? {
-        guard event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command,
-              let keyWin = NSApp.keyWindow as? NavWindow else { return event }
-        let dy = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
-        guard dy != 0 else { return nil }
-        keyWin.model.active.adjustViewScale(dy)
-        return nil   // consume so the list doesn't scroll while resizing
+        // ⌘ + scroll wheel view resizing is handled in NavWindow.sendEvent.
     }
     private func handleKey(_ event: NSEvent) -> NSEvent? {
         guard let keyWin = NSApp.keyWindow as? NavWindow else { return event }
