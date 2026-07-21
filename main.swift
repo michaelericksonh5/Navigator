@@ -6,7 +6,7 @@ import CoreServices
 
 extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
 
-enum ViewMode: String { case list, icon, gallery }
+enum ViewMode: String { case list, icon, gallery, column }
 enum ConflictPolicy { case keepBoth, replace, skip }
 
 final class TransferProgress: ObservableObject {
@@ -1531,8 +1531,9 @@ struct ControlBar: View {
                 Picker("", selection: $browser.viewMode) {
                     Image(systemName: "list.bullet").tag(ViewMode.list)
                     Image(systemName: "square.grid.2x2").tag(ViewMode.icon)
+                    Image(systemName: "rectangle.split.3x1").tag(ViewMode.column)
                     Image(systemName: "photo.on.rectangle").tag(ViewMode.gallery)
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 116).help("View")
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 150).help("View")
             }
             // Row 2: full-width address bar on its own line
             HStack(spacing: 6) {
@@ -1972,6 +1973,87 @@ struct PreviewPane: View {
     }
 }
 
+// Miller-column (Finder column) view: a horizontal chain of folder listings.
+struct ColumnView: View {
+    let model: AppModel
+    @ObservedObject var browser: Browser
+    @State private var path: [URL] = []   // selected sub-folder chain below the root
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: true) {
+            HStack(spacing: 0) {
+                colList(browser.currentURL, level: 0)
+                ForEach(Array(path.enumerated()), id: \.offset) { idx, url in
+                    Divider()
+                    colList(url, level: idx + 1)
+                }
+            }
+        }
+        .onChange(of: browser.currentURL) { path = [] }
+    }
+
+    @ViewBuilder private func colList(_ dir: URL, level: Int) -> some View {
+        ColumnList(dir: dir, browser: browser,
+                   selectedChild: level < path.count ? path[level] : nil,
+                   onPickFolder: { folder in path = Array(path.prefix(level)) + [folder] },
+                   onPickFile: { level == path.count ? (path = Array(path.prefix(level))) : () },
+                   onOpen: { openItem($0, browser) })
+            .frame(width: 250)
+    }
+}
+
+struct ColumnList: View {
+    let dir: URL
+    @ObservedObject var browser: Browser
+    let selectedChild: URL?
+    let onPickFolder: (URL) -> Void
+    let onPickFile: () -> Void
+    let onOpen: (FileItem) -> Void
+    @State private var items: [FileItem] = []
+    @State private var selectedID: String?
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(items) { item in
+                    HStack(spacing: 6) {
+                        Image(nsImage: browser.icon(for: item)).resizable().frame(width: 16, height: 16)
+                        Text(item.name).lineLimit(1)
+                        Spacer(minLength: 0)
+                        if item.isDirectory { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary) }
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(rowSelected(item) ? Color.accentColor.opacity(0.25) : Color.clear)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { onOpen(item) }
+                    .onTapGesture(count: 1) {
+                        selectedID = item.id
+                        browser.selection = [item.id]; browser.updateStatus()
+                        if item.isDirectory { onPickFolder(item.url) } else { onPickFile() }
+                    }
+                }
+            }.padding(.vertical, 4)
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.15))
+        .onAppear(perform: load)
+        .onChange(of: dir) { load() }
+    }
+    private func rowSelected(_ item: FileItem) -> Bool {
+        if let c = selectedChild, c.path == item.url.path { return true }
+        return selectedID == item.id
+    }
+    private func load() {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .localizedTypeDescriptionKey]
+        var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
+        if !browser.showHidden { opts.insert(.skipsHiddenFiles) }
+        var result: [FileItem] = []
+        if let urls = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: opts) {
+            for u in urls { result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))) }
+        }
+        items = result.sorted { ($0.isDirectory ? 0 : 1, $0.name.localizedLowercase) < ($1.isDirectory ? 0 : 1, $1.name.localizedLowercase) }
+    }
+}
+
 // Shared image/thumbnail view with icon fallback, used by Gallery view.
 struct ThumbImage: View {
     let item: FileItem
@@ -2125,6 +2207,7 @@ struct BrowserContent: View {
                 switch browser.viewMode {
                 case .icon: IconGridView(model: model, browser: browser)
                 case .gallery: GalleryView(model: model, browser: browser)
+                case .column: ColumnView(model: model, browser: browser)
                 case .list: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
                 }
             }
