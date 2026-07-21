@@ -1031,6 +1031,24 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
 
+    func applyRenames(_ pairs: [(url: URL, newName: String)]) {
+        var undo: [(URL, URL)] = []
+        for (url, newName) in pairs {
+            let n = newName.trimmingCharacters(in: .whitespaces)
+            guard !n.isEmpty, n != url.lastPathComponent else { continue }
+            let dest = url.deletingLastPathComponent().appendingPathComponent(n)
+            guard !fm.fileExists(atPath: dest.path) else { continue }
+            do { try fm.moveItem(at: url, to: dest); undo.append((dest, url)) } catch {}
+        }
+        if !undo.isEmpty {
+            UndoStack.shared.push("Batch Rename") { [weak self] in
+                for (newURL, oldURL) in undo { try? FileManager.default.moveItem(at: newURL, to: oldURL) }
+                self?.load()
+            }
+        }
+        load()
+    }
+
     func makeSymlink(_ ids: Set<String>) {
         var created: [URL] = []
         for it in items.filter({ ids.contains($0.id) }) {
@@ -1568,6 +1586,7 @@ struct FileTableView: View {
             Button("Reveal in Finder") { browser.revealInFinder(ids) }
             Divider()
             if ids.count == 1 { Button("Rename…") { promptRename(browser, ids.first!) } }
+            else { Button("Batch Rename…") { BatchRenameController.shared.show(browser, browser.items.filter { ids.contains($0.id) }) } }
             TagsMenu(browser: browser, ids: ids)
             if ids.count == 1 { Button("Edit Comment…") { promptComment(browser, ids.first!) } }
             Button("Duplicate") { browser.duplicate(ids) }
@@ -2233,6 +2252,79 @@ final class GetInfoController {
     }
 }
 
+// MARK: - Batch rename
+
+struct BatchRenameView: View {
+    @ObservedObject var browser: Browser
+    let items: [FileItem]
+    let onClose: () -> Void
+    @State private var find = ""
+    @State private var replace = ""
+    @State private var prefix = ""
+    @State private var suffix = ""
+    @State private var numbered = false
+    @State private var startAt = 1
+
+    private func newName(_ item: FileItem, _ index: Int) -> String {
+        let ext = item.url.pathExtension
+        var base = item.url.deletingPathExtension().lastPathComponent
+        if !find.isEmpty { base = base.replacingOccurrences(of: find, with: replace) }
+        base = prefix + base + suffix
+        if numbered { base += " \(startAt + index)" }
+        return ext.isEmpty ? base : "\(base).\(ext)"
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Rename \(items.count) Items").font(.headline)
+            HStack { Text("Find").frame(width: 70, alignment: .trailing); TextField("text to find", text: $find).textFieldStyle(.roundedBorder) }
+            HStack { Text("Replace").frame(width: 70, alignment: .trailing); TextField("replacement", text: $replace).textFieldStyle(.roundedBorder) }
+            HStack { Text("Prefix").frame(width: 70, alignment: .trailing); TextField("prepend", text: $prefix).textFieldStyle(.roundedBorder) }
+            HStack { Text("Suffix").frame(width: 70, alignment: .trailing); TextField("append (before extension)", text: $suffix).textFieldStyle(.roundedBorder) }
+            HStack {
+                Toggle("Append number, starting at", isOn: $numbered)
+                TextField("", value: $startAt, format: .number).frame(width: 50).textFieldStyle(.roundedBorder).disabled(!numbered)
+            }
+            Divider()
+            Text("Preview").font(.subheadline).bold()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(items.prefix(200).enumerated()), id: \.element.id) { i, it in
+                        HStack(spacing: 6) {
+                            Text(it.name).foregroundStyle(.secondary).lineLimit(1)
+                            Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.tertiary)
+                            Text(newName(it, i)).lineLimit(1)
+                        }.font(.callout)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(height: 170)
+            HStack {
+                Spacer()
+                Button("Cancel") { onClose() }.keyboardShortcut(.cancelAction)
+                Button("Rename All") {
+                    browser.applyRenames(items.enumerated().map { (i, it) in (it.url, newName(it, i)) })
+                    onClose()
+                }.keyboardShortcut(.defaultAction)
+            }
+        }.padding(16).frame(width: 480)
+    }
+}
+
+final class BatchRenameController {
+    static let shared = BatchRenameController()
+    private var window: NSWindow?
+    func show(_ browser: Browser, _ items: [FileItem]) {
+        guard !items.isEmpty else { return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 480),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.title = "Batch Rename"
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: BatchRenameView(browser: browser, items: items) { [weak w] in w?.close() })
+        w.center(); w.makeKeyAndOrderFront(nil)
+        window = w
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 // MARK: - AppKit entry point
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -2385,7 +2477,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func moveToTrashAction(_ sender: Any?) { appModel.active.moveToTrash(appModel.active.selection) }
     @objc func getInfoAction(_ sender: Any?) { showInfo(appModel.active, appModel.active.selection) }
     @objc func duplicateAction(_ sender: Any?) { appModel.active.duplicate(appModel.active.selection) }
-    @objc func renameAction(_ sender: Any?) { if let id = appModel.active.selection.first { promptRename(appModel.active, id) } }
+    @objc func renameAction(_ sender: Any?) {
+        let b = appModel.active
+        let sel = b.items.filter { b.selection.contains($0.id) }
+        if sel.count > 1 { BatchRenameController.shared.show(b, sel) }
+        else if let id = b.selection.first { promptRename(b, id) }
+    }
     @objc func quickLookAction(_ sender: Any?) {
         let b = appModel.active
         QuickLook.shared.show(b.items.filter { b.selection.contains($0.id) }.map { $0.url })
