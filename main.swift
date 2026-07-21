@@ -2883,12 +2883,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
+        ensureSMBTuning()
         NetworkBrowser.shared.start()
         NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
         NSUpdateDynamicServices()
         // Any folders passed at launch (opened via the system) open as new tabs.
         if !pendingFolders.isEmpty { pendingFolders.forEach { window.model.newTab(at: $0) }; pendingFolders = [] }
         // (No auto TCC prompt on launch — use the "Grant Full Disk Access…" menu command.)
+    }
+
+    // Make network-drive browsing steadier out of the box by disabling SMB
+    // change-notifications (needless chatter over the VPN). macOS reads a
+    // per-user config at ~/Library/Preferences/nsmb.conf — no sudo, no /etc.
+    // We only ADD our setting; we never remove or overwrite existing config,
+    // and skip if the user/IT already tuned it. Takes effect on the next mount.
+    func ensureSMBTuning() {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Preferences/nsmb.conf")
+        if let existing = try? String(contentsOfFile: path, encoding: .utf8) {
+            if existing.contains("notify_off") { return }   // already configured — leave it alone
+            // Only append if there's no [default] section to disturb (avoid duplicate sections).
+            if existing.range(of: #"(?m)^\s*\[default\]"#, options: .regularExpression) == nil {
+                let updated = existing + "\n[default]\nnotify_off=yes\n"
+                try? updated.write(toFile: path, atomically: true, encoding: .utf8)
+            }
+            return
+        }
+        let content = """
+        # Written by Navigator — steadier, faster SMB/network-drive browsing.
+        # Disables SMB directory change-notifications (needless chatter over VPN).
+        # Per-user, safe, no sudo. Takes effect on the next mount.
+        [default]
+        notify_off=yes
+        """
+        try? content.write(toFile: path, atomically: true, encoding: .utf8)
     }
 
     // Finder Services entry: right-click a folder/file in Finder → Services →
