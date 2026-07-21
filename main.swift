@@ -5,7 +5,10 @@ import Quartz
 import QuickLookThumbnailing
 import CoreServices
 
-extension Notification.Name { static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate") }
+extension Notification.Name {
+    static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate")
+    static let navigatorFocusSearch = Notification.Name("navigatorFocusSearch")
+}
 
 enum ViewMode: String { case list, icon, gallery, column }
 enum ConflictPolicy { case keepBoth, replace, skip }
@@ -240,7 +243,7 @@ enum Prefs {
 final class RecentFolders: ObservableObject {
     static let shared = RecentFolders()
     @Published var urls: [URL]
-    private let cap = 12
+    private let cap = 30
     private let fm = FileManager.default
     init() { urls = Prefs.recentFolders.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) } }
     func record(_ url: URL) {
@@ -637,7 +640,6 @@ final class Browser: ObservableObject, Identifiable {
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
-    private var recentsQuery: NSMetadataQuery?
     private var searchQuery: NSMetadataQuery?
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
@@ -851,42 +853,28 @@ final class Browser: ObservableObject, Identifiable {
     func orderedVisibleItems() -> [FileItem] { groupBy == .none ? visibleItems() : groups().flatMap { $0.items } }
 
     // Spotlight-backed Recents (recently used/modified files), like Finder's Recents.
+    // Recents = the folders you've actually worked in: every folder you've
+    // navigated to, plus every folder you've created/saved/pasted/renamed a file
+    // in (see RecentFolders.shared.record calls in the file operations). Shown
+    // most-recent first — no Spotlight flood of every touched file.
     func loadRecents() {
         isRecents = true
+        isSearching = false
         selection = []
         pathText = "Recents"
-        items = []
-        status = "Finding recent files…"
         sortOrder = [KeyPathComparator(\FileItem.modified, order: .reverse)]
-        recentsQuery?.stop()
-        let q = NSMetadataQuery()
-        q.searchScopes = [NSMetadataQueryUserHomeScope]
-        let since = Date().addingTimeInterval(-60 * 60 * 24 * 45) as NSDate
-        q.predicate = NSPredicate(format: "kMDItemLastUsedDate >= %@ OR kMDItemFSContentChangeDate >= %@", since, since)
-        q.sortDescriptors = [NSSortDescriptor(key: "kMDItemFSContentChangeDate", ascending: false)]
-        NotificationCenter.default.addObserver(self, selector: #selector(recentsGathered(_:)),
-                                               name: .NSMetadataQueryDidFinishGathering, object: q)
-        recentsQuery = q
-        q.start()
-    }
-
-    @objc private func recentsGathered(_ note: Notification) {
-        guard let q = recentsQuery else { return }
-        q.disableUpdates()
-        var result: [FileItem] = []
-        let n = min(q.resultCount, 200)
-        for i in 0..<n {
-            guard let mi = q.result(at: i) as? NSMetadataItem,
-                  let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
-            result.append(makeItem(URL(fileURLWithPath: path)))
-        }
-        items = result
+        let folders = RecentFolders.shared.urls
+        items = []
+        busy = true; busyText = "Loading recents…"
         updateStatus()
-        q.stop()
-        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
-        recentsQuery = nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let built = folders.compactMap { self.fm.fileExists(atPath: $0.path) ? self.makeItem($0) : nil }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isRecents else { return }
+                self.items = built; self.busy = false; self.busyText = ""; self.updateStatus()
+            }
+        }
     }
 
     // Spotlight search within the current folder subtree (name + content).
@@ -1228,6 +1216,7 @@ final class Browser: ObservableObject, Identifiable {
     func newFolder() {
         let target = uniqueDest(currentURL, "New Folder")
         try? fm.createDirectory(at: target, withIntermediateDirectories: false)
+        RecentFolders.shared.record(currentURL)
         UndoStack.shared.push("New Folder") { [weak self] in
             try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
         }
@@ -1236,6 +1225,7 @@ final class Browser: ObservableObject, Identifiable {
     func newTextFile() {
         let target = uniqueDest(currentURL, "New Text File.txt")
         fm.createFile(atPath: target.path, contents: Data())
+        RecentFolders.shared.record(currentURL)
         UndoStack.shared.push("New Text File") { [weak self] in
             try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
         }
@@ -1374,6 +1364,7 @@ final class Browser: ObservableObject, Identifiable {
                 TransferProgressController.shared.hide()
                 if resetCut { self.cutMode = false }
                 self.busy = false; self.busyText = ""
+                RecentFolders.shared.record(dir)   // you worked in the destination folder
                 if move, !moved.isEmpty {
                     UndoStack.shared.push("Move") { [weak self] in
                         for m in moved { try? FileManager.default.moveItem(at: m.to, to: m.from) }
@@ -1528,6 +1519,7 @@ final class Browser: ObservableObject, Identifiable {
             do { try fm.copyItem(at: it.url, to: dest); created.append(dest) } catch {}
         }
         if !created.isEmpty {
+            RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Duplicate") { [weak self] in
                 for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
                 self?.load()
@@ -1919,6 +1911,7 @@ struct ControlBar: View {
                     .foregroundStyle(model.showPreview ? Color.accentColor : .secondary).help("Details / Preview Pane (⇧⌘P)")
             }
         }.padding(.horizontal, 10).padding(.vertical, 8)
+        .onReceive(NotificationCenter.default.publisher(for: .navigatorFocusSearch)) { _ in searchFocused = true }
     }
 
     @ViewBuilder private func sep() -> some View { Divider().frame(height: 16).padding(.horizontal, 3) }
@@ -3651,6 +3644,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             let s = field.stringValue.trimmingCharacters(in: .whitespaces)
             if !s.isEmpty, let url = URL(string: s) { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    // Right-click (or Control-click) the Dock icon → Finder-style shortcuts.
+    // macOS appends its own "Options / Show All Windows / Quit" below these.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let m = NSMenu()
+        func add(_ title: String, _ sel: Selector) {
+            m.addItem(withTitle: title, action: sel, keyEquivalent: "").target = self
+        }
+        add("New Window", #selector(newWindowAction(_:)))
+        add("New Tab", #selector(dockNewTabAction(_:)))
+        add("Find…", #selector(dockFindAction(_:)))
+        m.addItem(.separator())
+        add("Go to Folder…", #selector(goToFolderAction(_:)))
+        add("Connect to Server…", #selector(connectServerAction(_:)))
+        m.addItem(.separator())
+        add("Applications", #selector(dockApplicationsAction(_:)))
+        add("Volumes", #selector(dockVolumesAction(_:)))
+        add("Home", #selector(dockHomeAction(_:)))
+        return m
+    }
+
+    private func openFolderTab(_ url: URL) {
+        let win = (NSApp.keyWindow as? NavWindow) ?? window!
+        win.model.newTab(at: url)
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc func dockNewTabAction(_ sender: Any?) {
+        let win = (NSApp.keyWindow as? NavWindow) ?? window!
+        win.model.newTab()
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc func dockApplicationsAction(_ sender: Any?) { openFolderTab(URL(fileURLWithPath: "/Applications")) }
+    @objc func dockVolumesAction(_ sender: Any?) { openFolderTab(URL(fileURLWithPath: "/Volumes")) }
+    @objc func dockHomeAction(_ sender: Any?) { openFolderTab(FileManager.default.homeDirectoryForCurrentUser) }
+    @objc func dockFindAction(_ sender: Any?) {
+        let win = (NSApp.keyWindow as? NavWindow) ?? window!
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(name: .navigatorFocusSearch, object: nil)
+    }
+    @objc func goToFolderAction(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Go to Folder"
+        alert.informativeText = "Enter a path, e.g. /Users/you/Documents or ~/Desktop"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Go"); alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            var p = field.stringValue.trimmingCharacters(in: .whitespaces)
+            if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
+            guard !p.isEmpty else { return }
+            let url = URL(fileURLWithPath: p)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                openFolderTab(url)
+            } else { NSSound.beep() }
         }
     }
 }
