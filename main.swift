@@ -3830,6 +3830,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NavWindow!
     private var extraWindows: [NavWindow] = []
     private var keyMonitor: Any?
+    private var mainWindowShown = false
+    // Set when we're launched purely to view an image (open handler runs before
+    // didFinishLaunching) — then we DON'T pop the browser window behind the viewer.
+    private var suppressMainWindow = false
 
     // Menu commands and keyboard nav target whichever Navigator window is key.
     var appModel: AppModel { (NSApp.keyWindow as? NavWindow)?.model ?? window.model }
@@ -3839,19 +3843,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         setupMenu()
-        window = makeWindow(restoreState: true)
+        window = makeWindow(restoreState: true)   // created, but not shown yet
         window.setFrameAutosaveName("NavigatorMainWindow")
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         installKeyMonitor()
         ensureSMBTuning()
         Updater.check(userInitiated: false)   // silent, throttled to once/day; prompts only if an update exists
         NetworkBrowser.shared.start()
         NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
         NSUpdateDynamicServices()
-        // Any folders passed at launch (opened via the system) open as new tabs.
+        // Show the browser shortly — unless we were launched only to view an image
+        // (the open handler sets suppressMainWindow first). The tiny delay also lets
+        // a folder-open event arrive so it opens as a tab in the same window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, !self.suppressMainWindow else { return }
+            self.showMainWindow()
+        }
+    }
+
+    // Bring up the browser window (idempotent) and flush any queued folder opens.
+    func showMainWindow() {
+        if !mainWindowShown {
+            mainWindowShown = true
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            window.makeKeyAndOrderFront(nil)
+        }
         if !pendingFolders.isEmpty { pendingFolders.forEach { window.model.newTab(at: $0) }; pendingFolders = [] }
-        // (No auto TCC prompt on launch — use the "Grant Full Disk Access…" menu command.)
     }
 
     // Make network-drive browsing steadier out of the box by disabling SMB
@@ -3904,7 +3922,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // opening one from Finder lands here). Do NOT NSWorkspace.open them, or it
         // would bounce right back to us. Arrow through the folder like Preview.
         let images = urls.filter { isImageFile($0) }
+        let rest = urls.filter { !isImageFile($0) }
+        let folders = rest.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let others = rest.filter { !folders.contains($0) }
+
         if let first = images.first {
+            // If we're only being asked to view image(s) and the browser hasn't
+            // shown yet (launched to view), keep the browser hidden — just the viewer.
+            if folders.isEmpty && others.isEmpty && !mainWindowShown { suppressMainWindow = true }
             let folder = first.deletingLastPathComponent()
             let siblings = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
                 .filter { isImageFile($0) }
@@ -3913,15 +3938,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ImageViewerController.shared.show(urls: list, index: list.firstIndex(of: first) ?? 0)
             NSApp.activate(ignoringOtherApps: true)
         }
-        let rest = urls.filter { !isImageFile($0) }
-        let folders = rest.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
-        let others = rest.filter { !folders.contains($0) }
         for u in others { NSWorkspace.shared.open(u) }   // non-images → their own default app
         guard !folders.isEmpty else { return }
-        guard let win = (NSApp.keyWindow as? NavWindow) ?? window else { pendingFolders += folders; return }
-        folders.forEach { win.model.newTab(at: $0) }
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        // Folders always need the browser window.
+        if window == nil { pendingFolders += folders; return }   // opened before launch finished
+        showMainWindow()
+        folders.forEach { window.model.newTab(at: $0) }
     }
 
     @discardableResult
@@ -3945,6 +3967,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // Clicking the Dock icon (or reopening) with no window visible brings the
+    // browser up — important since an image-only launch keeps it hidden.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showMainWindow() }
+        return true
+    }
     func applicationWillTerminate(_ notification: Notification) { window.model.saveState() }
 
     // Keyboard navigation for the file list/grid. Runs only when our window is key
