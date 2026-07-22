@@ -1844,9 +1844,14 @@ final class Browser: ObservableObject, Identifiable {
                     }
                 }
                 Browser.invalidateCache(dir.path)
-                // Local folders refresh without the "Loading…" flash (and FSEvents
-                // would fire anyway); network folders need an explicit reload.
-                if self.currentIsNetwork { self.load() } else { self.silentRefresh() }
+                // Only re-read the current folder if it actually changed: files
+                // landed here, or a move may have removed them from here. A copy
+                // into a DIFFERENT folder leaves the current listing untouched —
+                // skip the reload, which over SMB re-stats the whole folder and
+                // reads like a hang after copying just a few files.
+                if move || dir.path == self.currentURL.path {
+                    if self.currentIsNetwork { self.load() } else { self.silentRefresh() }
+                }
                 if !failures.isEmpty {
                     let verb = move ? "moved" : "copied"
                     let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
