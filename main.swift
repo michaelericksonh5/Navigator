@@ -454,7 +454,11 @@ struct FileItem: Identifiable, Hashable, Codable {
 // background). Local folders enumerate fast enough to skip. Capped, evicts
 // oldest. Main-thread access only; disk writes are async-snapshotted.
 enum DiskCache {
-    private struct Entry: Codable { let items: [FileItem]; let savedAt: Date }
+    // dirModified = the folder's own mtime when we cached it. On revisit we stat
+    // just the folder (one round-trip) and compare: if it matches, no files were
+    // added or removed, so the cached listing is still valid and we skip the full
+    // re-enumeration. (Optional so old cache files decode as nil.)
+    private struct Entry: Codable { let items: [FileItem]; let savedAt: Date; let dirModified: Date? }
     private static let maxFolders = 60
     private static let maxItemsPerFolder = 5000
     private static let fileURL: URL = {
@@ -470,9 +474,10 @@ enum DiskCache {
     }()
     static func get(_ key: String) -> [FileItem]? { store[key]?.items }
     static func age(_ key: String) -> TimeInterval? { store[key].map { Date().timeIntervalSince($0.savedAt) } }
-    static func put(_ key: String, _ items: [FileItem]) {
+    static func dirModified(_ key: String) -> Date? { store[key]?.dirModified }
+    static func put(_ key: String, _ items: [FileItem], dirModified: Date? = nil) {
         guard items.count <= maxItemsPerFolder else { return }
-        store[key] = Entry(items: items, savedAt: Date())
+        store[key] = Entry(items: items, savedAt: Date(), dirModified: dirModified)
         if store.count > maxFolders {
             for v in store.sorted(by: { $0.value.savedAt < $1.value.savedAt }).prefix(store.count - maxFolders) {
                 store[v.key] = nil
@@ -1238,10 +1243,8 @@ final class Browser: ObservableObject, Identifiable {
         // network folders, so a local path's key simply isn't present).
         let seed = Browser.dirCache[cacheKey] ?? DiskCache.get(cacheKey)
         let hadSeed = seed != nil
-        // How recently we cached this folder. SMB enumeration of a big/DFS folder
-        // can take tens of seconds, so if we already have a recent listing we skip
-        // the re-scan entirely on a network folder (⌘R forces a refresh).
-        let cacheFresh = (DiskCache.age(cacheKey) ?? .infinity) < Browser.networkCacheTTL
+        let cachedDirMtime = DiskCache.dirModified(cacheKey)
+        let withinBackstop = (DiskCache.age(cacheKey) ?? .infinity) < Browser.networkCacheTTL
         if let seed {
             items = seed
             busy = false; busyText = ""
@@ -1251,29 +1254,40 @@ final class Browser: ObservableObject, Identifiable {
             busy = true; busyText = "Loading…"
             updateStatus()
         }
-        // Determine network-ness OFF the main thread — volumeIsLocalKey is a stat
-        // that can block on a hiccuping SMB mount — then run the matching loader.
+        // OFF the main thread, stat just the folder: its mtime (one round-trip) and
+        // whether it's a network volume. Both are stats that can block on a slow SMB
+        // mount, so never on the main thread.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self, gen == self.loadGeneration else { return }
-            let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
+            let rv = try? dir.resourceValues(forKeys: [.volumeIsLocalKey, .contentModificationDateKey])
+            let isNetwork = rv?.volumeIsLocal == false
+            let dirMtime = rv?.contentModificationDate
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
                 self.currentIsNetwork = isNetwork
                 if isNetwork { self.dirWatcher.stop() } else { self.dirWatcher.watch(dir) }
                 self.updateFreeSpace()
                 if isNetwork {
-                    // Fresh cached listing → don't pay the slow SMB re-enumeration again.
-                    if hadSeed && cacheFresh { self.slowNetwork = false; return }
-                    self.loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed)
+                    // Conditional revalidation: if the folder's mtime is unchanged, no
+                    // files were added or removed since we cached it — serve the cache
+                    // and skip the slow re-enumeration. A changed mtime → refresh now
+                    // (new files show immediately). The TTL backstop catches the cases
+                    // dir-mtime misses (in-place edits / some servers' renames). ⌘R
+                    // always forces a refresh.
+                    let unchanged = hadSeed && dirMtime != nil && dirMtime == cachedDirMtime && withinBackstop
+                    if unchanged { self.slowNetwork = false; return }
+                    self.loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed, dirMtime: dirMtime)
                 } else {
                     self.loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: Browser.dirCache[cacheKey] != nil)
                 }
             }
         }
     }
-    // How long a cached network listing is trusted before we re-scan on navigation.
-    // Long enough that clicking around a big share stays instant; ⌘R always refreshes.
-    static let networkCacheTTL: TimeInterval = 300
+    // Backstop for the conditional-revalidation cache: even if the folder's mtime
+    // looks unchanged, re-scan after this long to catch in-place edits/renames that
+    // don't bump the directory mtime. Generous because the mtime check is accurate
+    // for the common case (files added/removed).
+    static let networkCacheTTL: TimeInterval = 900
 
     // Local volumes: stat is cheap, so read everything (incl. tags/kind) up front
     // via Foundation's enumerator, streaming in batches for very large folders.
@@ -1315,7 +1329,7 @@ final class Browser: ObservableObject, Identifiable {
     // VPN), updating the UI in chunks. Both phases honor the generation token so
     // navigating away cancels them, and the final result is cached for instant
     // revisits. Finder blocks on phase 2 for the whole folder — hence the hang.
-    private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String, hadSeed: Bool = false) {
+    private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String, hadSeed: Bool = false, dirMtime: Date? = nil) {
         let showHidden = self.showHidden
         // Non-blocking hint if the enumeration stalls (slow/hiccuping SMB mount):
         // a quiet note in the breadcrumb bar, not a popup. Fires only if we're
@@ -1373,7 +1387,7 @@ final class Browser: ObservableObject, Identifiable {
                 // seed we're already showing, nor overwrite the persisted cache.
                 if committed.isEmpty && hadSeed { return }
                 Browser.dirCache[cacheKey] = committed
-                if !committed.isEmpty { DiskCache.put(cacheKey, committed) }   // persist for instant first-open next session
+                if !committed.isEmpty { DiskCache.put(cacheKey, committed, dirModified: dirMtime) }   // store folder mtime for conditional revalidation
                 self.items = committed
                 self.busy = false; self.busyText = ""; self.slowNetwork = false
                 self.updateFreeSpace(); self.updateStatus()
