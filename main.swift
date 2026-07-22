@@ -1371,15 +1371,33 @@ final class Browser: ObservableObject, Identifiable {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.busy = false; self.busyText = ""
-                // Prefer the stored favorite path (usually a subfolder of the share)
-                // if the mount made it appear; else land at the share's mountpoint.
+                // 1) Stored path present (share mounted where we expected)? Go there.
                 if self.fm.fileExists(atPath: path) {
                     self.navigate(to: URL(fileURLWithPath: path))
                 } else if let mp = mounted {
-                    self.navigate(to: URL(fileURLWithPath: mp))
+                    // 2) The share mounted somewhere else than the stored path — a
+                    // clash (…-1), or the coworker had it mounted under a different
+                    // name. Re-anchor the favorite's sub-path onto the ACTUAL
+                    // mountpoint so we still land inside the target folder.
+                    let rel = Browser.shareRelativePath(path)
+                    let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
+                    if self.fm.fileExists(atPath: target) {
+                        self.navigate(to: URL(fileURLWithPath: target))
+                    } else {
+                        self.navigate(to: URL(fileURLWithPath: mp))   // last resort: share root
+                    }
                 } else { NSSound.beep() }
             }
         }
+    }
+    // The favorite path's location beneath its volume root:
+    // "/Volumes/cifs-games/Games/ArtSource" -> "Games/ArtSource". Used to
+    // re-anchor onto the actual mountpoint when a share mounts somewhere
+    // unexpected. Empty if the favorite IS the volume root.
+    static func shareRelativePath(_ path: String) -> String {
+        let parts = path.split(separator: "/").map(String.init)
+        guard parts.count > 2, parts[0] == "Volumes" else { return "" }
+        return parts.dropFirst(2).joined(separator: "/")
     }
     // Mount an SMB/AFP URL directly, without Finder. Blocking — call off the main
     // thread. Returns the real mountpoint path (nil on failure). NetFS uses stored
