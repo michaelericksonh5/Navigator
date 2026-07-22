@@ -528,6 +528,25 @@ func showInfo(_ browser: Browser, _ ids: Set<String>) {
         a.addButton(withTitle: "OK"); a.runModal()
     }
 }
+// Google Drive for desktop stamps every synced item with its Drive item ID in
+// this extended attribute. That ID maps to a universal drive.google.com link
+// that resolves for anyone with access — regardless of OS, username, or mount
+// path — which is the correct way to share a Drive location across users.
+func googleDriveItemID(_ url: URL) -> String? {
+    let name = "com.google.drivefs.item-id#S"
+    let n = getxattr(url.path, name, nil, 0, 0, 0)
+    guard n > 0 else { return nil }
+    var buf = [UInt8](repeating: 0, count: n)
+    guard getxattr(url.path, name, &buf, n, 0, 0) == n else { return nil }
+    return String(decoding: buf, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+func googleDriveURL(for url: URL, isDirectory: Bool) -> URL? {
+    guard let id = googleDriveItemID(url), !id.isEmpty else { return nil }
+    return URL(string: isDirectory
+        ? "https://drive.google.com/drive/folders/\(id)"
+        : "https://drive.google.com/file/d/\(id)/view")
+}
+
 func confirmEmptyTrash(_ browser: Browser) {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = "Empty the Trash?"
@@ -1455,6 +1474,9 @@ final class Browser: ObservableObject, Identifiable {
         var p = pathText.trimmingCharacters(in: .whitespaces)
         if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
         guard !p.isEmpty else { pathText = currentURL.path; return }
+        // A Google Drive path pasted from another user won't exist here (their
+        // home + account email); re-anchor it onto this Mac's Drive account.
+        if !fm.fileExists(atPath: p), let remapped = Browser.remapGoogleDrivePath(p) { p = remapped }
         let url = URL(fileURLWithPath: p)
         var isDir: ObjCBool = false
         if fm.fileExists(atPath: url.path, isDirectory: &isDir) {
@@ -1488,6 +1510,40 @@ final class Browser: ObservableObject, Identifiable {
         let paths = items.filter { ids.contains($0.id) }.map { $0.url.path }
         let text = paths.isEmpty ? currentURL.path : paths.joined(separator: "\n")
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+    }
+    // True when the selection lives inside Google Drive (has a Drive item ID).
+    func isGoogleDriveSelection(_ ids: Set<String>) -> Bool {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }) else { return false }
+        return googleDriveItemID(it.url) != nil
+    }
+    // Copy a shareable drive.google.com link (resolves for anyone with access,
+    // no username/mount in it) instead of a machine-specific local path.
+    func copyGoogleDriveLink(_ ids: Set<String>) {
+        let links = items.filter { ids.contains($0.id) }
+            .compactMap { googleDriveURL(for: $0.url, isDirectory: $0.isDirectory)?.absoluteString }
+        guard !links.isEmpty else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(links.joined(separator: "\n"), forType: .string)
+    }
+    func openGoogleDriveLink(_ ids: Set<String>) {
+        let urls = items.filter { ids.contains($0.id) }
+            .compactMap { googleDriveURL(for: $0.url, isDirectory: $0.isDirectory) }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        for u in urls { NSWorkspace.shared.open(u) }
+    }
+    // A Google Drive path copied from another Mac carries that user's home and
+    // account email (…/GoogleDrive-<their email>/Shared drives/…). Re-anchor the
+    // part from the shared/My-Drive root onto THIS Mac's Drive account so a
+    // pasted shared-drive path resolves locally. Returns nil if not a Drive path.
+    static func remapGoogleDrivePath(_ path: String) -> String? {
+        guard let r = path.range(of: "/CloudStorage/GoogleDrive-") else { return nil }
+        let afterAccount = path[r.upperBound...]                     // "<email>/Shared drives/…"
+        guard let slash = afterAccount.firstIndex(of: "/") else { return nil }
+        let rel = String(afterAccount[afterAccount.index(after: slash)...])   // "Shared drives/…"
+        let cs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")
+        guard let accounts = try? FileManager.default.contentsOfDirectory(atPath: cs.path),
+              let local = accounts.first(where: { $0.hasPrefix("GoogleDrive-") }) else { return nil }
+        return cs.appendingPathComponent(local).appendingPathComponent(rel).path
     }
     func copyName(_ ids: Set<String>) {
         let names = items.filter { ids.contains($0.id) }.map { $0.name }
@@ -2565,6 +2621,10 @@ struct FileTableView: View {
             Button("Paste") { browser.pasteFiles() }
             Button("Copy Path") { browser.copyPath(ids) }
             Button("Copy Name") { browser.copyName(ids) }
+            if browser.isGoogleDriveSelection(ids) {
+                Button("Copy Google Drive Link") { browser.copyGoogleDriveLink(ids) }
+                Button("Open in Google Drive") { browser.openGoogleDriveLink(ids) }
+            }
             Divider()
             Button("Move to Trash") { browser.moveToTrash(ids) }
         } else {
@@ -2768,6 +2828,10 @@ struct IconGridView: View {
                 Button("Open in Terminal") { openInTerminal(item.isDirectory ? item.url : browser.currentURL) }
                 Button("Copy Path") { browser.copyPath([item.id]) }
                 Button("Copy Name") { browser.copyName([item.id]) }
+                if browser.isGoogleDriveSelection([item.id]) {
+                    Button("Copy Google Drive Link") { browser.copyGoogleDriveLink([item.id]) }
+                    Button("Open in Google Drive") { browser.openGoogleDriveLink([item.id]) }
+                }
                 Button("Move to Trash") { browser.moveToTrash([item.id]) }
             }
     }
