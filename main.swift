@@ -15,6 +15,7 @@ let navLog = Logger(subsystem: "com.merickson.navigator", category: "perf")
 extension Notification.Name {
     static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate")
     static let navigatorFocusSearch = Notification.Name("navigatorFocusSearch")
+    static let navigatorResignFields = Notification.Name("navigatorResignFields")   // drop address/search focus so typing → type-to-select
 }
 
 enum ViewMode: String { case list, icon, gallery, column }
@@ -1469,6 +1470,9 @@ final class Browser: ObservableObject, Identifiable {
     //  • ⇧-click → select the range from the anchor to this item
     var selectionAnchor: String?
     func click(_ id: String, modifiers: NSEvent.ModifierFlags) {
+        // Clicking in the file view drops keyboard focus from the address/search
+        // fields, so typing next goes to type-to-select instead of the address bar.
+        NotificationCenter.default.post(name: .navigatorResignFields, object: nil)
         if modifiers.contains(.command) {
             if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
             selectionAnchor = id
@@ -2626,6 +2630,7 @@ struct ControlBar: View {
             }
         }.padding(.horizontal, 10).padding(.vertical, 8)
         .onReceive(NotificationCenter.default.publisher(for: .navigatorFocusSearch)) { _ in searchFocused = true }
+        .onReceive(NotificationCenter.default.publisher(for: .navigatorResignFields)) { _ in addressFocused = false; searchFocused = false }
     }
 
     @ViewBuilder private func sep() -> some View { Divider().frame(height: 16).padding(.horizontal, 3) }
@@ -4624,6 +4629,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.makeKeyAndOrderFront(nil)
         }
         if !pendingFolders.isEmpty { pendingFolders.forEach { window.model.newTab(at: $0) }; pendingFolders = [] }
+        // Clear any initial keyboard focus off the address bar so typing goes to
+        // type-to-select, not the address field.
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .navigatorResignFields, object: nil) }
     }
 
     // Make network-drive browsing steadier out of the box by disabling SMB
