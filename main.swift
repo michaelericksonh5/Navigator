@@ -242,6 +242,7 @@ enum Prefs {
         set { d.set(newValue, forKey: "confirmTrash") }
     }
     static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
+    static var didOfferDefaults: Bool { get { d.bool(forKey: "didOfferDefaults") } set { d.set(newValue, forKey: "didOfferDefaults") } }
     static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
     static var skipUpdateVersion: String { get { d.string(forKey: "skipUpdateVersion") ?? "" } set { d.set(newValue, forKey: "skipUpdateVersion") } }
 }
@@ -3991,6 +3992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self, !self.suppressMainWindow else { return }
             self.showMainWindow()
+            self.offerDefaultsIfNeeded()   // one-time; only on a normal (visible) launch
         }
     }
 
@@ -4281,9 +4283,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            let um = window.undoManager, um.canUndo { um.undo(); return }
         UndoStack.shared.undo()
     }
-    @objc func setDefaultImageViewerAction(_ sender: Any?) {
-        // Common image types Navigator's viewer handles well. (We register for
-        // public.image, but defaults are set per concrete type.)
+    @objc func setDefaultImageViewerAction(_ sender: Any?) { applyImageDefaults(announce: true) }
+
+    // Set Navigator as the default app for the image types its viewer handles.
+    // (We register for public.image, but Launch Services defaults are set per
+    // concrete type.) `announce` shows a result alert; the first-launch prompt
+    // passes false since it already asked.
+    private func applyImageDefaults(announce: Bool) {
         let types = ["public.png", "public.jpeg", "com.compuserve.gif", "public.tiff",
                      "public.heic", "public.heif", "org.webmproject.webp",
                      "com.microsoft.bmp", "com.microsoft.ico", "public.jpeg-2000"]
@@ -4299,6 +4305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         group.notify(queue: .main) {
+            guard announce else { return }
             let a = NSAlert()
             if failures == 0 {
                 a.messageText = "Navigator is now your default image viewer"
@@ -4310,6 +4317,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             a.addButton(withTitle: "OK"); a.runModal()
         }
+    }
+
+    // One-time, on first normal launch: offer to become the default for the only
+    // type Navigator genuinely owns — images. Folders are deliberately excluded
+    // (macOS reserves them for Finder), and other types would just bounce back
+    // out to their own apps, so we don't pretend to own them.
+    private func offerDefaultsIfNeeded() {
+        guard !Prefs.didOfferDefaults else { return }
+        Prefs.didOfferDefaults = true
+        let appURL = Bundle.main.bundleURL
+        // Skip if already the default (e.g. set earlier via the menu).
+        if NSWorkspace.shared.urlForApplication(toOpen: UTType.png)?.standardizedFileURL == appURL.standardizedFileURL { return }
+        let a = NSAlert()
+        a.messageText = "Make Navigator your default image viewer?"
+        a.informativeText = "Images opened anywhere — Finder, Mail, Messages — would open in Navigator's fast built-in viewer instead of Preview.\n\nFinder stays your file manager; macOS reserves folders for it. You can change this anytime in the Navigator menu."
+        a.addButton(withTitle: "Use Navigator")
+        a.addButton(withTitle: "Not Now")
+        if a.runModal() == .alertFirstButtonReturn { applyImageDefaults(announce: false) }
     }
 
     @objc func setDefaultBrowserAction(_ sender: Any?) {
