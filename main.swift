@@ -581,7 +581,9 @@ func confirmEmptyTrash(_ browser: Browser) {
 func openItem(_ item: FileItem, _ browser: Browser) {
     if item.isDirectory { browser.navigate(to: item.url); return }
     if isImageFile(item.url) {
-        let imgs = browser.items.filter { !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        // Use the on-screen order (current sort/filter), so ←/→ in the viewer
+        // matches what the user sees in the folder — not the raw load order.
+        let imgs = browser.orderedVisibleItems().filter { !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
         ImageViewerController.shared.show(urls: imgs, index: imgs.firstIndex(of: item.url) ?? 0)
         return
     }
@@ -3571,12 +3573,15 @@ struct ZoomableImageView: NSViewRepresentable {
 
 struct ImageViewerView: View {
     let urls: [URL]
+    var onTitle: (String) -> Void = { _ in }
     @State private var index: Int
     @State private var dims: String = ""
     @State private var sizeStr: String = ""
     @State private var kindStr: String = ""
     @StateObject private var zoomCtl = ZoomController()
-    init(urls: [URL], index: Int) { self.urls = urls; _index = State(initialValue: index) }
+    init(urls: [URL], index: Int, onTitle: @escaping (String) -> Void = { _ in }) {
+        self.urls = urls; self.onTitle = onTitle; _index = State(initialValue: index)
+    }
     private func step(_ d: Int) {
         guard !urls.isEmpty else { return }
         index = (index + d + urls.count) % urls.count
@@ -3588,6 +3593,7 @@ struct ImageViewerView: View {
     private func loadInfo() {
         guard urls.indices.contains(index) else { dims = ""; sizeStr = ""; kindStr = ""; return }
         let u = urls[index]
+        onTitle(u.lastPathComponent)   // keep the window title in sync with ←/→ navigation
         let vals = try? u.resourceValues(forKeys: [.fileSizeKey, .localizedTypeDescriptionKey])
         sizeStr = (vals?.fileSize).map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? ""
         kindStr = vals?.allValues[.localizedTypeDescriptionKey] as? String ?? u.pathExtension.uppercased()
@@ -3678,7 +3684,9 @@ final class ImageViewerController {
             window = w
         }
         window?.title = urls.indices.contains(index) ? urls[index].lastPathComponent : "Image"
-        window?.contentView = NSHostingView(rootView: ImageViewerView(urls: urls, index: index))
+        window?.contentView = NSHostingView(rootView: ImageViewerView(urls: urls, index: index) { [weak self] name in
+            self?.window?.title = name
+        })
         window?.center()
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
