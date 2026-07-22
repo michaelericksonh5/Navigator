@@ -2678,7 +2678,7 @@ struct FileTableView: View {
             Button("Copy") { browser.copyFiles() }
             Button("Cut") { browser.cutFiles() }
             Button("Paste") { browser.pasteFiles() }
-            Button("Copy Path") { browser.copyPath(ids) }
+            if !browser.isGoogleDriveSelection(ids) { Button("Copy Path") { browser.copyPath(ids) } }
             Button("Copy Name") { browser.copyName(ids) }
             if browser.isGoogleDriveSelection(ids) {
                 Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Web Link") }
@@ -2892,7 +2892,7 @@ struct IconGridView: View {
                 Divider()
                 Button("Share…") { shareItems([item.url]) }
                 Button("Open in Terminal") { openInTerminal(item.isDirectory ? item.url : browser.currentURL) }
-                Button("Copy Path") { browser.copyPath([item.id]) }
+                if !browser.isGoogleDriveSelection([item.id]) { Button("Copy Path") { browser.copyPath([item.id]) } }
                 Button("Copy Name") { browser.copyName([item.id]) }
                 if browser.isGoogleDriveSelection([item.id]) {
                     Button { browser.copyGoogleDriveLink([item.id]) } label: { gdLabel("Copy Web Link") }
