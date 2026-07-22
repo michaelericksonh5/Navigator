@@ -2660,9 +2660,6 @@ struct FileTableView: View {
                 Button("Open in New Tab") { model.newTab(at: it.url) }
                 Button("Open in Second Pane") { model.openInSecondPane(it.url) }
             }
-            if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }), isImageFile(it.url) {
-                Button("Open in New Window") { if let (u, i) = imageContext(it, browser) { ImageViewerController.openDetached(urls: u, index: i) } }
-            }
             if let pair = browser.imagePair(ids) {
                 Button("Swipe Compare") { CompareController.show(left: pair.0, right: pair.1) }
             }
@@ -2894,9 +2891,6 @@ struct IconGridView: View {
                 if item.isDirectory {
                     Button("Open in New Tab") { model.newTab(at: item.url) }
                     Button("Open in Second Pane") { model.openInSecondPane(item.url) }
-                }
-                if isImageFile(item.url) {
-                    Button("Open in New Window") { if let (u, i) = imageContext(item, browser) { ImageViewerController.openDetached(urls: u, index: i) } }
                 }
                 if let pair = browser.imagePair(browser.selection) {
                     Button("Swipe Compare") { CompareController.show(left: pair.0, right: pair.1) }
@@ -3765,32 +3759,22 @@ struct ImageViewerView: View {
 
 final class ImageViewerController {
     static let shared = ImageViewerController()
-    private var window: NSWindow?
-    private static var detached: [NSWindow] = []   // retains extra side-by-side windows
+    private static var windows: [NSWindow] = []   // every open viewer (retained)
 
-    // The primary viewer: reuses one window so ←/→ browse in place.
-    func show(urls: [URL], index: Int) {
-        guard !urls.isEmpty else { NSSound.beep(); return }
-        // If a viewer is already on screen, open a NEW window so images stack
-        // side by side (unlimited) instead of replacing the current one. ←/→
-        // still browses within each window; closing all reuses the primary.
-        if let w = window, w.isVisible {
-            ImageViewerController.openDetached(urls: urls, index: index)
-            return
-        }
-        if window == nil { window = ImageViewerController.makeWindow() }
-        ImageViewerController.install(urls: urls, index: index, in: window!)
-        window!.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-    }
-    // A second, independent viewer window — for looking at images side by side.
-    static func openDetached(urls: [URL], index: Int) {
+    // Every image open gets its OWN window, so images stack side by side —
+    // including when earlier ones are minimized (a minimized window reports
+    // isVisible == false, so reuse-based logic wrongly replaced it). ←/→ browses
+    // within each window.
+    func show(urls: [URL], index: Int) { ImageViewerController.open(urls: urls, index: index) }
+    static func open(urls: [URL], index: Int) {
         guard !urls.isEmpty else { NSSound.beep(); return }
         let w = makeWindow()
         install(urls: urls, index: index, in: w)
-        if let key = NSApp.keyWindow { w.setFrameOrigin(NSPoint(x: key.frame.minX + 44, y: max(40, key.frame.minY - 44))) }
-        detached.append(w)
+        // Cascade off the most recent viewer so stacked windows don't perfectly overlap.
+        if let last = windows.last { w.setFrameOrigin(NSPoint(x: last.frame.minX + 32, y: max(40, last.frame.minY - 32))) }
+        windows.append(w)
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
-            detached.removeAll { $0 === w }
+            windows.removeAll { $0 === w }
         }
         w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
