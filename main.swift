@@ -5,6 +5,12 @@ import Quartz
 import QuickLookThumbnailing
 import CoreServices
 import NetFS
+import os
+
+// Perf logging — view in Console.app (or `log stream`) filtered by
+// subsystem "com.merickson.navigator". Records how long SMB enumeration and
+// metadata enrichment actually take, so slow folders are diagnosable.
+let navLog = Logger(subsystem: "com.merickson.navigator", category: "perf")
 
 extension Notification.Name {
     static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate")
@@ -463,6 +469,7 @@ enum DiskCache {
         return s
     }()
     static func get(_ key: String) -> [FileItem]? { store[key]?.items }
+    static func age(_ key: String) -> TimeInterval? { store[key].map { Date().timeIntervalSince($0.savedAt) } }
     static func put(_ key: String, _ items: [FileItem]) {
         guard items.count <= maxItemsPerFolder else { return }
         store[key] = Entry(items: items, savedAt: Date())
@@ -1269,6 +1276,10 @@ final class Browser: ObservableObject, Identifiable {
         // network folders, so a local path's key simply isn't present).
         let seed = Browser.dirCache[cacheKey] ?? DiskCache.get(cacheKey)
         let hadSeed = seed != nil
+        // How recently we cached this folder. SMB enumeration of a big/DFS folder
+        // can take tens of seconds, so if we already have a recent listing we skip
+        // the re-scan entirely on a network folder (⌘R forces a refresh).
+        let cacheFresh = (DiskCache.age(cacheKey) ?? .infinity) < Browser.networkCacheTTL
         if let seed {
             items = seed
             busy = false; busyText = ""
@@ -1288,11 +1299,19 @@ final class Browser: ObservableObject, Identifiable {
                 self.currentIsNetwork = isNetwork
                 if isNetwork { self.dirWatcher.stop() } else { self.dirWatcher.watch(dir) }
                 self.updateFreeSpace()
-                if isNetwork { self.loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed) }
-                else { self.loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: Browser.dirCache[cacheKey] != nil) }
+                if isNetwork {
+                    // Fresh cached listing → don't pay the slow SMB re-enumeration again.
+                    if hadSeed && cacheFresh { self.slowNetwork = false; return }
+                    self.loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed)
+                } else {
+                    self.loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: Browser.dirCache[cacheKey] != nil)
+                }
             }
         }
     }
+    // How long a cached network listing is trusted before we re-scan on navigation.
+    // Long enough that clicking around a big share stays instant; ⌘R always refreshes.
+    static let networkCacheTTL: TimeInterval = 300
 
     // Local volumes: stat is cheap, so read everything (incl. tags/kind) up front
     // via Foundation's enumerator, streaming in batches for very large folders.
@@ -1346,6 +1365,7 @@ final class Browser: ObservableObject, Identifiable {
             }
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let t0 = DispatchTime.now()
             var names = Browser.fastNames(dir, showHidden: showHidden)
             // DFS junctions auto-mount on first access and can read empty; retry once.
             if names.isEmpty {
@@ -1353,6 +1373,8 @@ final class Browser: ObservableObject, Identifiable {
                 guard let self, gen == self.loadGeneration else { return }
                 names = Browser.fastNames(dir, showHidden: showHidden)
             }
+            let readMs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000
+            navLog.log("readdir \(names.count, privacy: .public) items in \(Int(readMs), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
             // Folders first, then by name, so the top of the list — what the user
             // sees and what we enrich first — is stable and Finder-like.
             names.sort { a, b in
@@ -1379,6 +1401,7 @@ final class Browser: ObservableObject, Identifiable {
             // index, so no locking. (ponytail: GCD pool ~= cores+blocked; widen with
             // an explicit semaphore pool only if this still isn't fast enough.)
             let enrichKeys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey]
+            let tEnrich = DispatchTime.now()
             enriched.withUnsafeMutableBufferPointer { buf in
                 DispatchQueue.concurrentPerform(iterations: buf.count) { i in
                     guard gen == self.loadGeneration,
@@ -1390,6 +1413,8 @@ final class Browser: ObservableObject, Identifiable {
                                       accessed: m, dateAdded: m, kind: buf[i].kind, tags: [])
                 }
             }
+            let enrichMs = Double(DispatchTime.now().uptimeNanoseconds - tEnrich.uptimeNanoseconds) / 1_000_000
+            navLog.log("enrich \(enriched.count, privacy: .public) items in \(Int(enrichMs), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
             guard gen == self.loadGeneration else { return }
             let committed = enriched
             DispatchQueue.main.async { [weak self] in
