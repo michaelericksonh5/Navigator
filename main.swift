@@ -2262,6 +2262,9 @@ struct ControlBar: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
                 .frame(maxWidth: .infinity)
 
+                Button { browser.copyPath([]) } label: { Image(systemName: "doc.on.doc") }
+                    .help("Copy Full Path")
+
                 HStack(spacing: 4) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.caption)
                     TextField("Search “\(folderName)”", text: $browser.searchText)
@@ -2271,7 +2274,7 @@ struct ControlBar: View {
                             if browser.searchText.isEmpty && browser.isSearching { browser.clearSearch() }
                         }
                     if !browser.searchText.isEmpty {
-                        Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain)
+                        Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("Clear Search")
                     }
                     Menu {
                         Picker("Scope", selection: $browser.searchThisMac) {
@@ -2281,14 +2284,14 @@ struct ControlBar: View {
                             ForEach(SearchKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                         }
                     } label: { Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary) }
-                        .menuStyle(.borderlessButton).frame(width: 20)
+                        .menuStyle(.borderlessButton).frame(width: 20).help("Search Scope & Kind")
                         .onChange(of: browser.searchThisMac) { if browser.isSearching { browser.runSearch() } }
                         .onChange(of: browser.searchKind) { if browser.isSearching { browser.runSearch() } }
                 }
                 .padding(.horizontal, 7).padding(.vertical, 5)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
-                .frame(width: 240)
+                .frame(width: 200)
 
                 Button("") { addressFocused = true }.keyboardShortcut("l", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
@@ -2523,15 +2526,15 @@ struct FileTableView: View {
             TableColumn("Date Added", value: \FileItem.dateAdded) { item in
                 DateCell(date: item.dateAdded)
             }.width(min: 150, ideal: 185).customizationID("dateAdded").defaultVisibility(.hidden)
-            TableColumn("Extension", value: \FileItem.ext) { item in
+            TableColumn("Ext", value: \FileItem.ext) { item in
                 Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary)
-            }.width(min: 60, ideal: 80).customizationID("extension").defaultVisibility(.hidden)
+            }.width(min: 44, ideal: 56).customizationID("extension").defaultVisibility(.hidden)
         }
         Group {
-            TableColumn("Duration") { (item: FileItem) in
+            TableColumn("Time") { (item: FileItem) in
                 if item.isDirectory { Text("—").foregroundStyle(.secondary) }
                 else { MetadataCell(url: item.url, field: .duration) }
-            }.width(min: 70, ideal: 90).customizationID("duration").defaultVisibility(.hidden)
+            }.width(min: 50, ideal: 64).customizationID("duration").defaultVisibility(.hidden)
             TableColumn("Dimensions") { (item: FileItem) in
                 if item.isDirectory { Text("—").foregroundStyle(.secondary) }
                 else { MetadataCell(url: item.url, field: .dimensions) }
