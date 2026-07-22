@@ -1450,6 +1450,10 @@ final class Browser: ObservableObject, Identifiable {
 
     // File clipboard
     var cutMode = false
+    // The pasteboard changeCount captured when we cut. A paste is a MOVE only if
+    // the pasteboard hasn't changed since — otherwise another app (or a later
+    // copy) replaced the contents and we must not move files we didn't cut.
+    var cutChangeCount = -1
     private func selectedURLs() -> [URL] { items.filter { selection.contains($0.id) }.map { $0.url } }
     func copyFiles() {
         let urls = selectedURLs(); guard !urls.isEmpty else { NSSound.beep(); return }
@@ -1457,7 +1461,8 @@ final class Browser: ObservableObject, Identifiable {
     }
     func cutFiles() {
         let urls = selectedURLs(); guard !urls.isEmpty else { NSSound.beep(); return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL]); cutMode = true
+        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL])
+        cutMode = true; cutChangeCount = NSPasteboard.general.changeCount
     }
     private func uniqueDest(_ dir: URL, _ name: String) -> URL {
         let fm = FileManager.default
@@ -1490,7 +1495,8 @@ final class Browser: ObservableObject, Identifiable {
     func pasteFiles() {
         let urls = pasteboardURLs()
         guard !urls.isEmpty else { return }
-        if cutMode {
+        let isMove = cutMode && NSPasteboard.general.changeCount == cutChangeCount
+        if isMove {
             let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
             guard !sources.isEmpty else { return }
             performTransfer(sources, into: currentURL, move: true, resetCut: true)
@@ -3972,6 +3978,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return event
         case 51: // Delete/Backspace (no modifier) → enclosing folder
             if flags.isEmpty { b.goUp(); return nil }
+            return event
+        case 120: // F2 → rename selected (Windows parity)
+            if !b.selection.isEmpty { renameAction(nil); return nil }
             return event
         case 49: // Space → Quick Look
             if !b.selection.isEmpty {
