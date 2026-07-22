@@ -101,6 +101,8 @@ When you choose **Update Now**, it downloads the new `Navigator.zip`, replaces t
 
 **System integration** — Finder **Open With** + **"Open in Navigator"** Services entry, **Open in Terminal**, **Quick Look** (Space / ⌘Y), **Share…**, and folders open faster on network drives than Finder.
 
+**Google Drive** — Right-click an item inside Google Drive for **Copy Google Drive Link** and **Open in Google Drive** — a real `drive.google.com` link (read from Drive's own item ID) that resolves for anyone with access, so you can share a location without pasting a local path full of your username. And a Google Drive path **pasted from another user** (their home + account email) is auto-remapped to your own Drive account in the address bar, so shared-drive paths just resolve.
+
 ## Keyboard shortcuts
 | Shortcut | Action |
 |---|---|
