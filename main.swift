@@ -1789,11 +1789,14 @@ final class Browser: ObservableObject, Identifiable {
             var copied: [URL] = []
             var failures: [(name: String, reason: String)] = []
             let total = sources.count
+            let step = max(1, total / 50)   // update the progress bar ~50× max, not once per file
             for (i, src) in sources.enumerated() {
                 if progress.cancelled { break }
-                DispatchQueue.main.async {
-                    progress.current = src.lastPathComponent
-                    progress.fraction = total > 0 ? Double(i) / Double(total) : 0
+                if i % step == 0 {
+                    DispatchQueue.main.async {
+                        progress.current = src.lastPathComponent
+                        progress.fraction = total > 0 ? Double(i) / Double(total) : 0
+                    }
                 }
                 let target = dir.appendingPathComponent(src.lastPathComponent)
                 var dest = target
@@ -1807,6 +1810,9 @@ final class Browser: ObservableObject, Identifiable {
                     }
                 }
                 do {
+                    // On APFS, copyItem already does a copy-on-write clone (instant,
+                    // no extra space) for same-volume copies; across volumes / SMB /
+                    // File Provider it's a real byte copy (bandwidth-bound).
                     if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
                     else { try fm.copyItem(at: src, to: dest); copied.append(dest) }
                 } catch {
@@ -1837,7 +1843,9 @@ final class Browser: ObservableObject, Identifiable {
                     }
                 }
                 Browser.invalidateCache(dir.path)
-                self.load()
+                // Local folders refresh without the "Loading…" flash (and FSEvents
+                // would fire anyway); network folders need an explicit reload.
+                if self.currentIsNetwork { self.load() } else { self.silentRefresh() }
                 if !failures.isEmpty {
                     let verb = move ? "moved" : "copied"
                     let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
@@ -3763,6 +3771,13 @@ final class ImageViewerController {
     // The primary viewer: reuses one window so ←/→ browse in place.
     func show(urls: [URL], index: Int) {
         guard !urls.isEmpty else { NSSound.beep(); return }
+        // If a viewer is already on screen, open a NEW window so images stack
+        // side by side (unlimited) instead of replacing the current one. ←/→
+        // still browses within each window; closing all reuses the primary.
+        if let w = window, w.isVisible {
+            ImageViewerController.openDetached(urls: urls, index: index)
+            return
+        }
         if window == nil { window = ImageViewerController.makeWindow() }
         ImageViewerController.install(urls: urls, index: index, in: window!)
         window!.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
