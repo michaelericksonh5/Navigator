@@ -1763,6 +1763,7 @@ final class Browser: ObservableObject, Identifiable {
         // Resolve name conflicts up front with one prompt (applied to all).
         var policy: ConflictPolicy = .keepBoth
         let conflicts = sources.filter { !isSelfDup($0) && fm.fileExists(atPath: dir.appendingPathComponent($0.lastPathComponent).path) }
+        let conflictNames = Set(conflicts.map { $0.lastPathComponent })   // reuse below; no second stat over the network
         if !conflicts.isEmpty {
             let a = NSAlert()
             a.messageText = conflicts.count == 1
@@ -1802,7 +1803,7 @@ final class Browser: ObservableObject, Identifiable {
                 var dest = target
                 if isSelfDup(src) {
                     dest = self.numberedCopyDest(dir, src.lastPathComponent)
-                } else if fm.fileExists(atPath: target.path) {
+                } else if conflictNames.contains(src.lastPathComponent) {
                     switch policy {
                     case .skip: continue
                     case .replace: try? fm.removeItem(at: target)
