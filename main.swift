@@ -620,10 +620,19 @@ final class FavoritesStore: ObservableObject {
             if parts.count >= 2, parts[0] == "Users", parts[1] != Substring(homeName) { return false }
             return true
         }
-        let fresh = incoming.filter { !existing.contains($0.id) && portable($0) }
-        guard !fresh.isEmpty else { return 0 }
-        items.append(contentsOf: fresh); persist()
-        return fresh.count
+        // Upsert by label: a re-imported team file with corrected paths updates the
+        // existing drive in place instead of adding a duplicate. New labels append.
+        var changed = 0
+        for f in incoming where portable(f) {
+            if let idx = items.firstIndex(where: { $0.label == f.label }) {
+                if items[idx].path != f.path || items[idx].mountURL != f.mountURL { items[idx] = f; changed += 1 }
+            } else if !existing.contains(f.id) {
+                items.append(f); changed += 1
+            }
+        }
+        guard changed > 0 else { return 0 }
+        persist()
+        return changed
     }
 }
 
