@@ -237,6 +237,11 @@ enum Prefs {
     }
     static var columnData: Data? { get { d.data(forKey: "columnCustomization") } set { d.set(newValue, forKey: "columnCustomization") } }
     static var recentFolders: [String] { get { d.stringArray(forKey: "recentFolders") ?? [] } set { d.set(newValue, forKey: "recentFolders") } }
+    static var confirmTrash: Bool {
+        get { d.object(forKey: "confirmTrash") == nil ? true : d.bool(forKey: "confirmTrash") }
+        set { d.set(newValue, forKey: "confirmTrash") }
+    }
+    static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
     static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
     static var skipUpdateVersion: String { get { d.string(forKey: "skipUpdateVersion") ?? "" } set { d.set(newValue, forKey: "skipUpdateVersion") } }
 }
@@ -377,6 +382,14 @@ final class ThumbnailCache {
     func thumbnail(for url: URL, size: CGFloat = 256, completion: @escaping (NSImage?) -> Void) {
         let key = "\(url.path)@\(Int(size))" as NSString
         if let c = cache.object(forKey: key) { completion(c); return }
+        // Settings → Thumbnails: off = type icons only (fastest on slow shares);
+        // images = skip the pricey PSD/PDF/RAW/video generators. The image viewer
+        // loads full images directly, so it's unaffected either way.
+        switch Prefs.thumbnailMode {
+        case "off": completion(nil); return
+        case "images" where !isImageFile(url): completion(nil); return
+        default: break
+        }
         guard isThumbnailable(url) else { completion(nil); return }
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
@@ -632,6 +645,16 @@ final class FavoritesStore: ObservableObject {
         let s = url.standardizedFileURL
         if label == nil, contains(s) { return }   // dedupe plain drag-adds; named drives may share a path
         items.append(Favorite(label: label ?? favoriteName(s), path: s.path, mountURL: mountURL)); persist()
+    }
+    // Drag-to-reorder from the sidebar. Home always snaps back to the top so it
+    // stays the fixed anchor, regardless of where it's dropped.
+    func move(fromOffsets: IndexSet, toOffset: Int) {
+        items.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if let hi = items.firstIndex(where: { $0.path == home }), hi != 0 {
+            items.insert(items.remove(at: hi), at: 0)
+        }
+        persist()
     }
     func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
     func remove(url: URL) { let p = url.standardizedFileURL.path; items.removeAll { $0.path == p }; persist() }
@@ -1473,6 +1496,14 @@ final class Browser: ObservableObject, Identifiable {
     func moveToTrash(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
+        if Prefs.confirmTrash {
+            let a = NSAlert(); a.alertStyle = .warning
+            a.messageText = urls.count == 1
+                ? "Move “\(urls[0].lastPathComponent)” to the Trash?"
+                : "Move \(urls.count) items to the Trash?"
+            a.addButton(withTitle: "Move to Trash"); a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
         var restores: [(trash: URL, original: URL)] = []
         var failures: [(url: URL, reason: String)] = []
         for u in urls {
@@ -2086,6 +2117,10 @@ struct SidebarView: View {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
                 ForEach(favNodes) { tree($0, removable: true) }
+                    .onMove { from, to in
+                        favNodes.move(fromOffsets: from, toOffset: to)   // immediate, smooth
+                        favStore.move(fromOffsets: from, toOffset: to)   // persist + anchor Home
+                    }
             }
             .dropDestination(for: URL.self) { urls, _ in
                 for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }
@@ -3886,6 +3921,45 @@ final class NavWindow: NSWindow {
     }
 }
 
+// Settings window (⌘,). Bound directly to the same UserDefaults keys the app
+// reads via Prefs, so changes take effect with no plumbing: the behavioral ones
+// (Trash confirm, thumbnails) are read live at point-of-use; view/sort/hidden
+// apply to newly opened windows and tabs.
+struct SettingsView: View {
+    @AppStorage("viewMode") private var viewMode = "list"
+    @AppStorage("sortKey") private var sortKey = "name"
+    @AppStorage("sortAscending") private var sortAscending = true
+    @AppStorage("showHidden") private var showHidden = false
+    @AppStorage("confirmTrash") private var confirmTrash = true
+    @AppStorage("thumbnailMode") private var thumbnailMode = "all"
+    var body: some View {
+        Form {
+            Section("Defaults for new windows & tabs") {
+                Picker("View", selection: $viewMode) {
+                    Text("Details").tag("list"); Text("Icons").tag("icon")
+                    Text("Gallery").tag("gallery"); Text("Columns").tag("column")
+                }
+                Picker("Sort by", selection: $sortKey) {
+                    Text("Name").tag("name"); Text("Date Modified").tag("modified")
+                    Text("Size").tag("size"); Text("Kind").tag("kind")
+                }
+                Toggle("Ascending order", isOn: $sortAscending)
+                Toggle("Show hidden files", isOn: $showHidden)
+            }
+            Section("Behavior") {
+                Toggle("Confirm before moving to Trash", isOn: $confirmTrash)
+                Picker("Thumbnails", selection: $thumbnailMode) {
+                    Text("All files").tag("all")
+                    Text("Images only").tag("images")
+                    Text("Off (fastest on slow drives)").tag("off")
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 440, height: 360)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NavWindow!
     private var extraWindows: [NavWindow] = []
@@ -4104,6 +4178,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "About Navigator", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         let cfu = appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdatesAction(_:)), keyEquivalent: ""); cfu.target = self
         appMenu.addItem(.separator())
+        let set = appMenu.addItem(withTitle: "Settings…", action: #selector(showSettingsAction(_:)), keyEquivalent: ","); set.target = self
+        appMenu.addItem(.separator())
         let dfb = appMenu.addItem(withTitle: "Set as Default File Browser…", action: #selector(setDefaultBrowserAction(_:)), keyEquivalent: "")
         dfb.target = self
         let div = appMenu.addItem(withTitle: "Set as Default Image Viewer…", action: #selector(setDefaultImageViewerAction(_:)), keyEquivalent: "")
@@ -4299,6 +4375,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func checkForUpdatesAction(_ sender: Any?) { Updater.check(userInitiated: true) }
+    private var settingsWindow: NSWindow?
+    @objc func showSettingsAction(_ sender: Any?) {
+        if settingsWindow == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 360),
+                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            w.title = "Settings"
+            w.contentView = NSHostingView(rootView: SettingsView())
+            w.isReleasedWhenClosed = false
+            w.center()
+            settingsWindow = w
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     @objc func exportFavoritesAction(_ sender: Any?) {
         guard let data = FavoritesStore.shared.exportData() else { NSSound.beep(); return }
