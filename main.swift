@@ -1027,44 +1027,6 @@ final class Browser: ObservableObject, Identifiable {
         Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))
     }
 
-    // Fast directory read for slow (network/SMB) volumes. POSIX readdir returns
-    // names AND the directory bit (d_type) from a single batched server response
-    // — ~0.7s for hundreds of entries. Foundation's enumerator, by contrast,
-    // stats every entry up front (~1 round-trip/file ≈ 86ms each over VPN),
-    // which is why a 600-item network folder "hangs" for a minute in Finder.
-    // Size/dates are filled in lazily afterward (see loadNetwork).
-    static func fastNames(_ dir: URL, showHidden: Bool) -> [(url: URL, isDir: Bool)] {
-        guard let dp = opendir(dir.path) else { return [] }
-        defer { closedir(dp) }
-        var out: [(URL, Bool)] = []
-        while let ep = readdir(dp) {
-            var e = ep.pointee
-            let name = withUnsafeBytes(of: &e.d_name) { raw -> String in
-                raw.baseAddress.map { String(cString: $0.assumingMemoryBound(to: CChar.self)) } ?? ""
-            }
-            if name.isEmpty || name == "." || name == ".." { continue }
-            if !showHidden && name.hasPrefix(".") { continue }
-            var isDir = Int32(e.d_type) == Int32(DT_DIR)
-            if Int32(e.d_type) == Int32(DT_UNKNOWN) {   // rare: server didn't return a type → one stat
-                var st = stat()
-                if lstat(dir.path + "/" + name, &st) == 0 { isDir = (st.st_mode & S_IFMT) == S_IFDIR }
-            }
-            out.append((dir.appendingPathComponent(name, isDirectory: isDir), isDir))
-        }
-        return out
-    }
-
-    // A FileItem with just name + directory bit (no size/date I/O). The
-    // .distantPast dates are a sentinel meaning "not fetched yet"; the Size/Date
-    // cells render a placeholder for it until loadNetwork's enrich pass fills in.
-    static func lightItem(url u: URL, isDir: Bool) -> FileItem {
-        FileItem(id: u.path, url: u, name: u.lastPathComponent,
-                 isDirectory: isDir, size: 0,
-                 modified: .distantPast, created: .distantPast,
-                 accessed: .distantPast, dateAdded: .distantPast,
-                 kind: localKind(u, isDir: isDir), tags: [])
-    }
-
     // The view order: sort, folders-first, then name filter.
     // Memoized: sorting + filtering 669 items is O(n log n), and this is called
     // from `body`, which SwiftUI re-evaluates on every scroll tick — so without a
@@ -1364,59 +1326,47 @@ final class Browser: ObservableObject, Identifiable {
                 self.slowNetwork = true
             }
         }
+        let keys = Browser.itemKeys
+        var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
+        if !showHidden { opts.insert(.skipsHiddenFiles) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // ONE bulk enumeration that fetches names AND metadata together
+            // (includingPropertiesForKeys → getattrlistbulk under the hood). On SMB
+            // this batches attributes into the directory read — far fewer round
+            // trips than readdir + a stat per file, which is the slowest possible
+            // method on a network volume. Stream in batches so rows appear as they
+            // arrive (unless a full-detail seed is already on screen).
+            func enumerate() -> [FileItem] {
+                guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts) else { return [] }
+                var out: [FileItem] = []
+                var sinceFlush = 0
+                while let u = en.nextObject() as? URL {
+                    guard let self, gen == self.loadGeneration else { return out }
+                    out.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                    sinceFlush += 1
+                    if !hadSeed, sinceFlush >= 100 {
+                        sinceFlush = 0
+                        let snap = out
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, gen == self.loadGeneration else { return }
+                            self.items = snap; self.busy = false; self.busyText = ""; self.slowNetwork = false; self.updateStatus()
+                        }
+                    }
+                }
+                return out
+            }
             let t0 = DispatchTime.now()
-            var names = Browser.fastNames(dir, showHidden: showHidden)
+            var result = enumerate()
             // DFS junctions auto-mount on first access and can read empty; retry once.
-            if names.isEmpty {
+            if result.isEmpty {
                 Thread.sleep(forTimeInterval: 1.5)
                 guard let self, gen == self.loadGeneration else { return }
-                names = Browser.fastNames(dir, showHidden: showHidden)
+                result = enumerate()
             }
-            let readMs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000
-            navLog.log("readdir \(names.count, privacy: .public) items in \(Int(readMs), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
-            // Folders first, then by name, so the top of the list — what the user
-            // sees and what we enrich first — is stable and Finder-like.
-            names.sort { a, b in
-                if a.isDir != b.isDir { return a.isDir }
-                return a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
-            }
-            var enriched = names.map { Browser.lightItem(url: $0.url, isDir: $0.isDir) }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000
+            navLog.log("network bulk enumerate \(result.count, privacy: .public) items in \(Int(ms), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
             guard let self, gen == self.loadGeneration else { return }
-            let light = enriched
-            // Skip the names-only repaint if a full-detail seed is already on screen
-            // — it would blank out sizes/dates until Phase 2 refills them.
-            if !hadSeed {
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, gen == self.loadGeneration else { return }
-                    self.items = light                   // instant: names + folder icons
-                    self.busy = false; self.busyText = ""; self.slowNetwork = false
-                    self.updateFreeSpace(); self.updateStatus()
-                }
-            }
-            // Phase 2 — fetch size + dates. Each is a separate SMB round-trip
-            // (~90ms over VPN); done serially a 600-item folder stalls ~a minute.
-            // Run them IN PARALLEL — they're I/O-bound, so GCD keeps many in flight
-            // and the wall-clock drops ~10x. Each iteration writes only its own
-            // index, so no locking. (ponytail: GCD pool ~= cores+blocked; widen with
-            // an explicit semaphore pool only if this still isn't fast enough.)
-            let enrichKeys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey]
-            let tEnrich = DispatchTime.now()
-            enriched.withUnsafeMutableBufferPointer { buf in
-                DispatchQueue.concurrentPerform(iterations: buf.count) { i in
-                    guard gen == self.loadGeneration,
-                          let rv = try? buf[i].url.resourceValues(forKeys: enrichKeys) else { return }
-                    let u = buf[i].url, m = rv.contentModificationDate ?? Date()
-                    buf[i] = FileItem(id: u.path, url: u, name: u.lastPathComponent,
-                                      isDirectory: buf[i].isDirectory, size: Int64(rv.fileSize ?? 0),
-                                      modified: m, created: rv.creationDate ?? m,
-                                      accessed: m, dateAdded: m, kind: buf[i].kind, tags: [])
-                }
-            }
-            let enrichMs = Double(DispatchTime.now().uptimeNanoseconds - tEnrich.uptimeNanoseconds) / 1_000_000
-            navLog.log("enrich \(enriched.count, privacy: .public) items in \(Int(enrichMs), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
-            guard gen == self.loadGeneration else { return }
-            let committed = enriched
+            let committed = result
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
                 // A transient empty read (folder briefly unreachable) must not wipe a
@@ -1424,7 +1374,9 @@ final class Browser: ObservableObject, Identifiable {
                 if committed.isEmpty && hadSeed { return }
                 Browser.dirCache[cacheKey] = committed
                 if !committed.isEmpty { DiskCache.put(cacheKey, committed) }   // persist for instant first-open next session
-                self.items = committed; self.updateStatus()
+                self.items = committed
+                self.busy = false; self.busyText = ""; self.slowNetwork = false
+                self.updateFreeSpace(); self.updateStatus()
             }
         }
     }
