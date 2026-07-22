@@ -77,7 +77,9 @@ When you choose **Update Now**, it downloads the new `Navigator.zip`, replaces t
 
 **Image viewer** — Built-in viewer with **zoom** (scroll wheel, ⌘+/−/0, and a zoom slider), drag-to-pan, ←/→ through the folder, and a bottom bar showing **dimensions, file size, and position**.
 
-**Pin folders (Quick Access)** — Right-click any folder → **Pin to Sidebar**; pinned favorites show a **pushpin** you can click to unpin. Home stays a fixed anchor.
+**Pin folders (Quick Access)** — Right-click any folder → **Pin to Sidebar**; pinned favorites show a **pushpin** you can click to unpin. **Drag to reorder** favorites; Home stays a fixed anchor at the top.
+
+**Settings (⌘,)** — **Navigator → Settings…**: default view and sort for new windows, show hidden files by default, confirm-before-Trash, and a **Thumbnails** control (All / Images only / Off) — turn thumbnails down or off for maximum speed on slow network drives.
 
 **Navigation** — Editable address bar (⌘L), clickable breadcrumb, tabs (⌘T/⌘W), multiple windows (⌘N), back/forward/up, full keyboard nav, and type-to-select. Reopens your tabs and window position on launch. **Auto-refresh**: the current folder updates automatically when files change on disk (local & cloud folders, via FSEvents).
 
@@ -111,6 +113,7 @@ When you choose **Update Now**, it downloads the new `Navigator.zip`, replaces t
 | ⌘[ / ⌘] / ⌘↑ | Back / Forward / Enclosing folder |
 | ⇧⌘P / ⌥⌘S / ⌥⌘2 | Toggle preview / sidebar / dual pane |
 | ⇧⌘. / ⌘R / ⌘Z / ⌘K | Show hidden / Refresh / Undo / Connect to Server |
+| ⌘, / F2 | Settings / Rename selected |
 | ⌘ + scroll | Resize / cycle the view (Details ↔ Columns ↔ Icons) |
 | ⌘+ / ⌘− / ⌘0 | Zoom in / out / fit *(image viewer)* |
 
