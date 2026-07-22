@@ -896,6 +896,7 @@ final class Browser: ObservableObject, Identifiable {
     private var forwardStack: [URL] = []
     private var recentsQuery: NSMetadataQuery?
     private var searchQuery: NSMetadataQuery?
+    private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
     private let fm = FileManager.default
@@ -1144,7 +1145,18 @@ final class Browser: ObservableObject, Identifiable {
         selection = []
         items = []
         status = "Searching…"
-        searchQuery?.stop()
+        searchQuery?.stop(); searchQuery = nil
+        searchGen += 1
+        // Spotlight only for a true-local "This Mac" search — it doesn't index SMB
+        // shares or Google Drive (File Provider), so those need a real recursive
+        // walk. "This Folder" always walks (works everywhere, incl. cloud/SMB).
+        if searchThisMac && !currentIsNetwork && !isCloudProviderPath(currentURL) {
+            runSpotlight(query)
+        } else {
+            walkSearch(query, root: currentURL, gen: searchGen)
+        }
+    }
+    private func runSpotlight(_ query: String) {
         let q = NSMetadataQuery()
         q.searchScopes = searchThisMac ? [NSMetadataQueryLocalComputerScope] : [currentURL]
         var subs = [NSPredicate(format: "kMDItemDisplayName LIKE[cd] %@ OR kMDItemTextContent CONTAINS[cd] %@", "*\(query)*", query)]
@@ -1155,6 +1167,46 @@ final class Browser: ObservableObject, Identifiable {
                                                name: .NSMetadataQueryDidFinishGathering, object: q)
         searchQuery = q
         q.start()
+    }
+    // Recursive filesystem search — the only reliable way on SMB / Google Drive
+    // (Spotlight can't index them). Matches a name substring OR a file extension
+    // (so "png", ".png", or "logo" all work). Streams matches in as they're found,
+    // on a background thread, cancellable via searchGen.
+    private func walkSearch(_ raw: String, root: URL, gen: Int) {
+        let q = raw.lowercased()
+        let extQ = q.trimmingCharacters(in: CharacterSet(charactersIn: "*."))
+        let kindTree = searchKind.typeTree   // optional kind constraint (Images, etc.)
+        let showHidden = self.showHidden
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let keys = Browser.itemKeys
+            var opts: FileManager.DirectoryEnumerationOptions = []
+            if !showHidden { opts.insert(.skipsHiddenFiles) }
+            let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: opts)
+            var batch: [FileItem] = []
+            var total = 0
+            func flush(final: Bool) {
+                let snap = batch; batch.removeAll()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, gen == self.searchGen else { return }
+                    if !snap.isEmpty { self.items.append(contentsOf: snap) }
+                    self.status = final ? "\(self.items.count) found" : "Searching… \(self.items.count) found"
+                }
+            }
+            while let u = en?.nextObject() as? URL {
+                guard let self, gen == self.searchGen else { return }   // cancelled
+                let name = u.lastPathComponent.lowercased()
+                let ext = u.pathExtension.lowercased()
+                if kindTree != nil {   // kind filter set → require a matching content type
+                    if !(UTType(filenameExtension: ext)?.conforms(to: UTType(kindTree!) ?? .data) ?? false) { continue }
+                }
+                guard name.contains(q) || (!extQ.isEmpty && ext == extQ) else { continue }
+                batch.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                total += 1
+                if batch.count >= 40 { flush(final: false) }
+                if total >= 10_000 { break }   // sanity cap on huge trees
+            }
+            flush(final: true)
+        }
     }
     @objc private func searchGathered(_ note: Notification) {
         guard let q = searchQuery else { return }
@@ -1174,6 +1226,7 @@ final class Browser: ObservableObject, Identifiable {
     }
     func clearSearch() {
         searchQuery?.stop(); searchQuery = nil
+        searchGen += 1   // cancel any in-flight recursive walk
         searchText = ""; isSearching = false
         load()
     }
@@ -2755,26 +2808,32 @@ struct FileTableView: View {
     }
 
     var body: some View {
-        Table(of: FileItem.self, selection: $browser.selection, sortOrder: $browser.sortOrder,
-              columnCustomization: $columnCustomization) {
-            columns
-        } rows: {
-            if browser.groupBy == .none {
-                ForEach(browser.visibleItems()) { item in tableRow(item) }
-            } else {
-                ForEach(browser.groups(), id: \.title) { group in
-                    Section(group.title) {
-                        ForEach(group.items) { item in tableRow(item) }
+        ScrollViewReader { proxy in
+            Table(of: FileItem.self, selection: $browser.selection, sortOrder: $browser.sortOrder,
+                  columnCustomization: $columnCustomization) {
+                columns
+            } rows: {
+                if browser.groupBy == .none {
+                    ForEach(browser.visibleItems()) { item in tableRow(item) }
+                } else {
+                    ForEach(browser.groups(), id: \.title) { group in
+                        Section(group.title) {
+                            ForEach(group.items) { item in tableRow(item) }
+                        }
                     }
                 }
             }
+            .contextMenu(forSelectionType: FileItem.ID.self) { ids in
+                contextMenu(ids)
+            } primaryAction: { ids in
+                open(ids)
+            }
+            .onChange(of: browser.selection) { browser.updateStatus() }
+            // Type-to-select (and keyboard nav) scrolls the chosen row into view.
+            .onChange(of: browser.keyboardScrollID) {
+                if let id = browser.keyboardScrollID { proxy.scrollTo(id) }
+            }
         }
-        .contextMenu(forSelectionType: FileItem.ID.self) { ids in
-            contextMenu(ids)
-        } primaryAction: { ids in
-            open(ids)
-        }
-        .onChange(of: browser.selection) { browser.updateStatus() }
     }
 
     @TableRowBuilder<FileItem>
