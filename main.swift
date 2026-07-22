@@ -3488,14 +3488,19 @@ struct AnimatedImage: NSViewRepresentable {
 final class ZoomView: NSView {
     var onZoomChange: ((Double, Double) -> Void)?     // (current, fit)
     private var _image: NSImage?
+    private var _cgImage: CGImage?
     private var _zoom: Double = 1
     private var offset = CGPoint.zero
     private var didFit = false
+    private var rotation = 0     // degrees, multiples of 90
+    private var flipH = false
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
     func setImage(_ img: NSImage?) {
-        _image = img; offset = .zero; didFit = false
+        _image = img
+        _cgImage = img?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        offset = .zero; didFit = false; rotation = 0; flipH = false
         if bounds.width > 0, bounds.height > 0 { fit() } else { needsDisplay = true }
     }
     private var pixelSize: CGSize {
@@ -3504,10 +3509,15 @@ final class ZoomView: NSView {
     }
     var fitZoom: Double {
         let s = pixelSize
-        guard s.width > 0, s.height > 0, bounds.width > 0, bounds.height > 0 else { return 1 }
-        return Double(min(bounds.width / s.width, bounds.height / s.height))
+        let swap = (rotation % 180) != 0                 // 90°/270° swaps the fit box
+        let iw = swap ? s.height : s.width, ih = swap ? s.width : s.height
+        guard iw > 0, ih > 0, bounds.width > 0, bounds.height > 0 else { return 1 }
+        return Double(min(bounds.width / iw, bounds.height / ih))
     }
     var zoom: Double { _zoom }
+    func rotate() { rotation = (rotation + 90) % 360; fit() }
+    func flipHorizontal() { flipH.toggle(); needsDisplay = true }
+    func actualSize() { setZoom(1) }
     func fit() {
         offset = .zero; _zoom = fitZoom; didFit = true
         needsDisplay = true; report()
@@ -3540,9 +3550,19 @@ final class ZoomView: NSView {
         guard let img = _image else { return }
         let s = pixelSize
         let w = CGFloat(s.width) * CGFloat(_zoom), h = CGFloat(s.height) * CGFloat(_zoom)
-        let x = (bounds.width - w) / 2 + offset.x, y = (bounds.height - h) / 2 + offset.y
-        img.draw(in: NSRect(x: x, y: y, width: w, height: h), from: .zero, operation: .sourceOver,
-                 fraction: 1, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high.rawValue])
+        let cx = bounds.midX + offset.x, cy = bounds.midY + offset.y
+        guard let cg = _cgImage, let ctx = NSGraphicsContext.current?.cgContext else {
+            // Fallback: no CGImage (rare) — draw upright without transform.
+            img.draw(in: NSRect(x: cx - w/2, y: cy - h/2, width: w, height: h))
+            return
+        }
+        ctx.saveGState()
+        ctx.translateBy(x: cx, y: cy)
+        ctx.rotate(by: CGFloat(Double(rotation) * .pi / 180))
+        if flipH { ctx.scaleBy(x: -1, y: 1) }
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: -w/2, y: -h/2, width: w, height: h))
+        ctx.restoreGState()
     }
     override func scrollWheel(with event: NSEvent) {
         let d = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
@@ -3568,6 +3588,9 @@ final class ZoomController: ObservableObject {
     func setZoom(_ z: Double) { view?.setZoom(z) }
     func zoomBy(_ f: Double) { view?.zoomBy(f) }
     func fit() { view?.fit() }
+    func rotate() { view?.rotate() }
+    func flipHorizontal() { view?.flipHorizontal() }
+    func actualSize() { view?.actualSize() }
 }
 
 struct ZoomableImageView: NSViewRepresentable {
@@ -3704,6 +3727,12 @@ struct ImageViewerView: View {
             }
             Spacer(minLength: 12)
             if !isAnimated {
+                Button { zoomCtl.rotate() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.plain).help("Rotate 90°")
+                Button { zoomCtl.flipHorizontal() } label: { Image(systemName: "arrow.left.and.right") }
+                    .buttonStyle(.plain).help("Flip Horizontal")
+                Button { zoomCtl.actualSize() } label: { Text("1:1").font(.callout.monospacedDigit()) }
+                    .buttonStyle(.plain).help("Actual Size (100%)")
                 Button { zoomCtl.fit() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                     .buttonStyle(.plain).help("Fit to Window (⌘0)")
                 Button { zoomCtl.zoomBy(0.8) } label: { Image(systemName: "minus.magnifyingglass") }
@@ -3793,7 +3822,12 @@ final class CompareView: NSView {
         return NSRect(x: (bounds.width - w)/2 + offset.x, y: (bounds.height - h)/2 + offset.y, width: w, height: h)
     }
     func fit() { _zoom = 1; offset = .zero; didFit = true; needsDisplay = true }
-    override func layout() { super.layout(); if !didFit, bounds.width > 0 { fit() } }
+    override func layout() {
+        super.layout()
+        if !didFit, bounds.width > 0 { fit(); return }
+        if abs(_zoom - 1) < 0.001 { offset = .zero }   // at fit: stay centered when the window resizes
+        needsDisplay = true
+    }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.black.setFill(); bounds.fill()
         let r = destRect()
@@ -3860,6 +3894,7 @@ struct SwipeCompareView: View {
         ZStack {
             Color.black
             SwipeCompare(left: leftImg, right: rightImg)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             VStack {
                 HStack { tag(leftURL.lastPathComponent); Spacer(); tag(rightURL.lastPathComponent) }.padding(12)
                 Spacer()
