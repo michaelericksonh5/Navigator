@@ -243,6 +243,7 @@ enum Prefs {
     }
     static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
     static var didOfferDefaults: Bool { get { d.bool(forKey: "didOfferDefaults") } set { d.set(newValue, forKey: "didOfferDefaults") } }
+    static var warnImageDelete: Bool { get { d.object(forKey: "warnImageDelete") == nil ? true : d.bool(forKey: "warnImageDelete") } set { d.set(newValue, forKey: "warnImageDelete") } }
     static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
     static var skipUpdateVersion: String { get { d.string(forKey: "skipUpdateVersion") ?? "" } set { d.set(newValue, forKey: "skipUpdateVersion") } }
 }
@@ -3526,7 +3527,7 @@ final class ZoomView: NSView {
     override func scrollWheel(with event: NSEvent) {
         let d = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
         guard d != 0 else { return }
-        zoomAt(convert(event.locationInWindow, from: nil), factor: 1 + Double(d) * 0.01)
+        zoomAt(convert(event.locationInWindow, from: nil), factor: 1 + Double(d) * 0.012)
     }
     private var lastDrag: CGPoint?
     override func mouseDown(with event: NSEvent) { lastDrag = convert(event.locationInWindow, from: nil) }
@@ -3572,7 +3573,7 @@ struct ZoomableImageView: NSViewRepresentable {
 }
 
 struct ImageViewerView: View {
-    let urls: [URL]
+    @State private var urls: [URL]
     var onTitle: (String) -> Void = { _ in }
     @State private var index: Int
     @State private var dims: String = ""
@@ -3580,7 +3581,38 @@ struct ImageViewerView: View {
     @State private var kindStr: String = ""
     @StateObject private var zoomCtl = ZoomController()
     init(urls: [URL], index: Int, onTitle: @escaping (String) -> Void = { _ in }) {
-        self.urls = urls; self.onTitle = onTitle; _index = State(initialValue: index)
+        _urls = State(initialValue: urls); self.onTitle = onTitle; _index = State(initialValue: index)
+    }
+    // Move the current image to the Trash (with an optional, suppressible warning),
+    // then advance to the next. Undo (⌘Z) restores it from the Trash.
+    private func deleteCurrent() {
+        guard urls.indices.contains(index) else { return }
+        let target = urls[index]
+        let perform = {
+            var out: NSURL?
+            do { try FileManager.default.trashItem(at: target, resultingItemURL: &out) }
+            catch { reportFileError("Couldn't move “\(target.lastPathComponent)” to the Trash.", error.localizedDescription); return }
+            let trashed = out as URL?
+            UndoStack.shared.push("Delete “\(target.lastPathComponent)”") {
+                if let t = trashed { try? FileManager.default.moveItem(at: t, to: target) }
+            }
+            urls.remove(at: index)
+            if urls.isEmpty { NSApp.keyWindow?.close(); return }
+            if index >= urls.count { index = urls.count - 1 }
+            loadInfo()
+        }
+        guard Prefs.warnImageDelete else { perform(); return }
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Move “\(target.lastPathComponent)” to the Trash?"
+        a.informativeText = "You can bring it back with Undo (⌘Z)."
+        a.showsSuppressionButton = true
+        a.suppressionButton?.title = "Don't ask again"
+        a.addButton(withTitle: "Move to Trash")
+        a.addButton(withTitle: "Cancel")
+        let resp = a.runModal()
+        if a.suppressionButton?.state == .on { Prefs.warnImageDelete = false }
+        if resp == .alertFirstButtonReturn { perform() }
     }
     private func step(_ d: Int) {
         guard !urls.isEmpty else { return }
@@ -3631,6 +3663,9 @@ struct ImageViewerView: View {
                 Button("") { zoomCtl.zoomBy(1.25) }.keyboardShortcut("=", modifiers: .command)
                 Button("") { zoomCtl.zoomBy(0.8) }.keyboardShortcut("-", modifiers: .command)
                 Button("") { zoomCtl.fit() }.keyboardShortcut("0", modifiers: .command)
+                Button("") { deleteCurrent() }.keyboardShortcut(.delete, modifiers: [])
+                Button("") { UndoStack.shared.undo() }.keyboardShortcut("z", modifiers: .command)
+                Button("") { NSApp.keyWindow?.close() }.keyboardShortcut(.escape, modifiers: [])
             }.frame(width: 0, height: 0).opacity(0)
         }
         .frame(minWidth: 520, minHeight: 420)
