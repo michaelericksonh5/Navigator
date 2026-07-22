@@ -2801,11 +2801,14 @@ struct IconGridView: View {
             .background(GeometryReader { g in
                 Color.clear.preference(key: ItemFramesKey.self, value: [item.id: g.frame(in: .named("iconGrid"))])
             })
-            // Single-tap selects INSTANTLY (with ⌘/⇧ modifiers, Finder-style);
-            // double-tap opens via a simultaneous gesture so the single tap never
-            // waits out the double-click timeout.
-            .onTapGesture { browser.click(item.id, modifiers: NSApp.currentEvent?.modifierFlags ?? []) }
-            .simultaneousGesture(TapGesture(count: 2).onEnded { openItem(item, browser) })
+            // ONE tap recognizer — no count:2 gesture to disambiguate against, so
+            // the select fires on mouse-up with zero double-click delay. A
+            // double-click still opens: macOS reports clickCount==2 on the 2nd press.
+            .onTapGesture {
+                let e = NSApp.currentEvent
+                if (e?.clickCount ?? 1) >= 2 { openItem(item, browser) }
+                else { browser.click(item.id, modifiers: e?.modifierFlags ?? []) }
+            }
             .dropDestination(for: URL.self) { urls, _ in
                 guard item.isDirectory else { return false }
                 browser.importURLs(urls, into: item.url, move: true); return true
@@ -3080,8 +3083,11 @@ struct GalleryView: View {
                                 .background(browser.selection.contains(it.id) ? Color.accentColor.opacity(0.3) : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .id(it.id)
-                                .onTapGesture { browser.click(it.id, modifiers: NSApp.currentEvent?.modifierFlags ?? []) }
-                                .simultaneousGesture(TapGesture(count: 2).onEnded { openItem(it, browser) })
+                                .onTapGesture {
+                                    let e = NSApp.currentEvent
+                                    if (e?.clickCount ?? 1) >= 2 { openItem(it, browser) }
+                                    else { browser.click(it.id, modifiers: e?.modifierFlags ?? []) }
+                                }
                         }
                     }.padding(8)
                 }
