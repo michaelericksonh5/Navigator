@@ -755,8 +755,18 @@ func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtensio
 // from standard URL resource keys (local, no network). Matches Finder: a badge
 // only for online-only or actively-downloading items; downloaded items show none.
 enum CloudBadge { case onlineOnly, downloading }
+// Only File Provider locations (Google Drive & other CloudStorage providers,
+// iCloud Drive) can be online-only. Gate on the PATH first — a cheap string
+// check — so we never stat SMB / local files per cell. Reading the ubiquitous
+// keys on an SMB file is a NETWORK round-trip; doing it per visible row made
+// scrolling network folders (e.g. artSource) lag. This restores that speed.
+func isCloudProviderPath(_ url: URL) -> Bool {
+    let p = url.path
+    return p.contains("/Library/CloudStorage/") || p.contains("/Library/Mobile Documents/")
+}
 func cloudBadge(for url: URL) -> CloudBadge? {
-    guard let v = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey]),
+    guard isCloudProviderPath(url),
+          let v = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey]),
           v.isUbiquitousItem == true else { return nil }
     if v.ubiquitousItemIsDownloading == true { return .downloading }
     if v.ubiquitousItemDownloadingStatus == .notDownloaded { return .onlineOnly }
@@ -3353,7 +3363,12 @@ struct TabItemView: View {
     }
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "folder").font(.caption2).foregroundStyle(.secondary)
+            if browser.busy {
+                ProgressView().controlSize(.mini).scaleEffect(0.55).frame(width: 12, height: 12)
+            } else {
+                Image(systemName: browser.slowNetwork ? "wifi.exclamationmark" : "folder")
+                    .font(.caption2).foregroundStyle(browser.slowNetwork ? .orange : .secondary)
+            }
             Text(title).font(.callout).lineLimit(1)
             if showClose {
                 Button(action: onClose) { Image(systemName: "xmark").font(.system(size: 9, weight: .bold)) }
