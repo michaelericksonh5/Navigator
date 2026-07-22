@@ -1244,28 +1244,36 @@ final class Browser: ObservableObject, Identifiable {
         pathText = addressString(for: currentURL)
         selection = []
         let dir = currentURL
-        let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
-        currentIsNetwork = isNetwork
-        if isNetwork { dirWatcher.stop() } else { dirWatcher.watch(dir) }   // auto-refresh local folders
         loadGeneration += 1
         let gen = loadGeneration
         let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
-        // Show cached contents instantly on revisit; still refresh in the background.
-        let cached = Browser.dirCache[cacheKey]
-        // Disk cache seeds only network folders (local is already instant).
-        let seed = cached ?? (isNetwork ? DiskCache.get(cacheKey) : nil)
+        // Seed instantly from cache — no stat needed (DiskCache only ever holds
+        // network folders, so a local path's key simply isn't present).
+        let seed = Browser.dirCache[cacheKey] ?? DiskCache.get(cacheKey)
+        let hadSeed = seed != nil
         if let seed {
             items = seed
             busy = false; busyText = ""
-            updateFreeSpace(); updateStatus()
+            updateStatus()
         } else {
             items = []            // clear stale previous-folder contents; the load fills it in
             busy = true; busyText = "Loading…"
             updateStatus()
         }
-        let hadSeed = seed != nil
-        if isNetwork { loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed) }
-        else { loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: cached != nil) }
+        // Determine network-ness OFF the main thread — volumeIsLocalKey is a stat
+        // that can block on a hiccuping SMB mount — then run the matching loader.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, gen == self.loadGeneration else { return }
+            let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, gen == self.loadGeneration else { return }
+                self.currentIsNetwork = isNetwork
+                if isNetwork { self.dirWatcher.stop() } else { self.dirWatcher.watch(dir) }
+                self.updateFreeSpace()
+                if isNetwork { self.loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed) }
+                else { self.loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: Browser.dirCache[cacheKey] != nil) }
+            }
+        }
     }
 
     // Local volumes: stat is cheap, so read everything (incl. tags/kind) up front
@@ -1379,13 +1387,17 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     func updateFreeSpace() {
-        let vals = try? currentURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
-        if let avail = vals?.volumeAvailableCapacityForImportantUsage, avail > 0 {
-            freeSpace = "\(ByteCountFormatter.string(fromByteCount: avail, countStyle: .file)) available"
-        } else if let avail = vals?.volumeAvailableCapacity, let total = vals?.volumeTotalCapacity, total > 0 {
-            freeSpace = "\(ByteCountFormatter.string(fromByteCount: Int64(avail), countStyle: .file)) available"
-        } else {
-            freeSpace = ""
+        // Volume-capacity read is a stat that can block over SMB — do it off-main.
+        let url = currentURL
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let vals = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey])
+            let text: String
+            if let avail = vals?.volumeAvailableCapacityForImportantUsage, avail > 0 {
+                text = "\(ByteCountFormatter.string(fromByteCount: avail, countStyle: .file)) available"
+            } else if let avail = vals?.volumeAvailableCapacity, let total = vals?.volumeTotalCapacity, total > 0 {
+                text = "\(ByteCountFormatter.string(fromByteCount: Int64(avail), countStyle: .file)) available"
+            } else { text = "" }
+            DispatchQueue.main.async { guard let self, self.currentURL == url else { return }; self.freeSpace = text }
         }
     }
 
@@ -1451,8 +1463,11 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     func navigate(to url: URL, recordHistory: Bool = true) {
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else { NSSound.beep(); return }
+        // No main-thread fileExists here: callers pass validated directories
+        // (sidebar/breadcrumb/openItem all check), and submitPath validates its
+        // own input off-main. load() enumerates on a background thread and simply
+        // shows an empty folder if the path is gone — so navigation never blocks
+        // on a stat over a slow SMB mount.
         if recordHistory { backStack.append(currentURL); forwardStack.removeAll() }
         searchText = ""; isSearching = false; searchQuery?.stop(); searchQuery = nil
         currentURL = url
@@ -1537,14 +1552,20 @@ final class Browser: ObservableObject, Identifiable {
         var p = pathText.trimmingCharacters(in: .whitespaces)
         if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
         guard !p.isEmpty else { pathText = addressString(for: currentURL); return }
-        // Resolve any Google Drive path form (a coworker's full path, the portable
-        // "Google Drive/…", or a bare "Shared drives/…") onto this Mac's account.
-        if !fm.fileExists(atPath: p), let resolved = Browser.resolveGoogleDrivePath(p) { p = resolved }
-        let url = URL(fileURLWithPath: p)
-        var isDir: ObjCBool = false
-        if fm.fileExists(atPath: url.path, isDirectory: &isDir) {
-            if isDir.boolValue { navigate(to: url) } else { NSWorkspace.shared.open(url); pathText = addressString(for: currentURL) }
-        } else { NSSound.beep(); pathText = addressString(for: currentURL) }
+        // Validate the typed path off the main thread — a fileExists over SMB can
+        // block. Resolve Google Drive path forms, then act on the result on main.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var path = p
+            if !FileManager.default.fileExists(atPath: path), let resolved = Browser.resolveGoogleDrivePath(path) { path = resolved }
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if exists, isDir.boolValue { self.navigate(to: URL(fileURLWithPath: path)) }
+                else if exists { NSWorkspace.shared.open(URL(fileURLWithPath: path)); self.pathText = self.addressString(for: self.currentURL) }
+                else { NSSound.beep(); self.pathText = self.addressString(for: self.currentURL) }
+            }
+        }
     }
 
     func breadcrumbs() -> [(name: String, url: URL)] {
@@ -4074,6 +4095,7 @@ struct GetInfoView: View {
     @State private var tags: [String]
     @State private var thumb: NSImage?
     @State private var meta = FileMeta()
+    @State private var perms = "—"
     private static let df: DateFormatter = { let d = DateFormatter(); d.dateStyle = .long; d.timeStyle = .short; return d }()
 
     init(browser: Browser, item: FileItem) {
@@ -4104,7 +4126,7 @@ struct GetInfoView: View {
                     row("Modified", Self.df.string(from: item.modified))
                     row("Added", Self.df.string(from: item.dateAdded))
                     row("Where", item.url.deletingLastPathComponent().path)
-                    row("Permissions", permString())
+                    row("Permissions", perms)
                 }.font(.callout)
                 Divider()
                 Text("Tags").font(.subheadline).bold()
@@ -4147,8 +4169,8 @@ struct GetInfoView: View {
         }
         return ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
     }
-    private func permString() -> String {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: item.url.path),
+    static func permString(_ url: URL) -> String {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let perm = attrs[.posixPermissions] as? NSNumber else { return "—" }
         let p = perm.uint16Value
         func rwx(_ v: UInt16) -> String { "\(v & 4 != 0 ? "r" : "-")\(v & 2 != 0 ? "w" : "-")\(v & 1 != 0 ? "x" : "-")" }
@@ -4162,6 +4184,13 @@ struct GetInfoView: View {
         ThumbnailCache.shared.thumbnail(for: item.url, size: 512) { thumb = $0 }
         MetadataCache.shared.meta(for: item.url) { m in meta = m; if let c = m.comment, comment.isEmpty { comment = c } }
         if item.isDirectory { FolderSizeCache.shared.compute(item.url) }
+        // Permissions read is a stat — off-main so opening Get Info on a network
+        // file doesn't hitch.
+        let url = item.url
+        DispatchQueue.global(qos: .utility).async {
+            let p = GetInfoView.permString(url)
+            DispatchQueue.main.async { perms = p }
+        }
     }
 }
 
@@ -4583,12 +4612,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // shown yet (launched to view), keep the browser hidden — just the viewer.
             if folders.isEmpty && others.isEmpty && !mainWindowShown { suppressMainWindow = true }
             let folder = first.deletingLastPathComponent()
-            let siblings = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
-                .filter { isImageFile($0) }
-                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-            let list = siblings.isEmpty ? images : siblings
-            ImageViewerController.shared.show(urls: list, index: list.firstIndex(of: first) ?? 0)
-            NSApp.activate(ignoringOtherApps: true)
+            // Enumerate the sibling images off the main thread — over a network /
+            // Drive folder this scan can block. Open the viewer once the list is
+            // ready (near-instant for local folders); no main-thread stall.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let siblings = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+                    .filter { isImageFile($0) }
+                    .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+                let list = siblings.isEmpty ? images : siblings
+                DispatchQueue.main.async {
+                    ImageViewerController.shared.show(urls: list, index: list.firstIndex(of: first) ?? 0)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
         }
         for u in others { NSWorkspace.shared.open(u) }   // non-images → their own default app
         guard !folders.isEmpty else { return }
