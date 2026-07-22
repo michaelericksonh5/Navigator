@@ -849,10 +849,10 @@ func volumeLocations() -> [SidebarLocation] {
 final class Browser: ObservableObject, Identifiable {
     let id = UUID()
     @Published var currentURL: URL
-    @Published var items: [FileItem] = []
+    @Published var items: [FileItem] = [] { didSet { visibleCache = nil } }
     @Published var selection: Set<String> = []
     @Published var pathText: String = ""
-    @Published var filterText: String = ""
+    @Published var filterText: String = "" { didSet { visibleCache = nil } }
     @Published var searchText: String = ""
     @Published var isSearching = false
     @Published var searchThisMac = false
@@ -860,6 +860,7 @@ final class Browser: ObservableObject, Identifiable {
     @Published var showHidden = false { didSet { Prefs.showHidden = showHidden; load() } }
     @Published var sortOrder: [KeyPathComparator<FileItem>] = [KeyPathComparator(\FileItem.name, order: .forward)] {
         didSet {
+            visibleCache = nil
             for f in SortField.allCases {
                 for asc in [true, false] where sortOrder.first == Browser.comparator(for: f, ascending: asc) {
                     Prefs.sortKey = f.rawValue; Prefs.sortAscending = asc; return
@@ -1058,11 +1059,18 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     // The view order: sort, folders-first, then name filter.
+    // Memoized: sorting + filtering 669 items is O(n log n), and this is called
+    // from `body`, which SwiftUI re-evaluates on every scroll tick — so without a
+    // cache a large network folder re-sorts every frame and scrolling stutters.
+    // Invalidated (visibleCache = nil) whenever items / sortOrder / filterText change.
+    private var visibleCache: [FileItem]?
     func visibleItems() -> [FileItem] {
+        if let c = visibleCache { return c }
         let sorted = items.sorted(using: sortOrder)
         let combined = sorted.filter { $0.isDirectory } + sorted.filter { !$0.isDirectory }
-        if filterText.isEmpty { return combined }
-        return combined.filter { $0.name.localizedCaseInsensitiveContains(filterText) }
+        let result = filterText.isEmpty ? combined : combined.filter { $0.name.localizedCaseInsensitiveContains(filterText) }
+        visibleCache = result
+        return result
     }
 
     // Grouped sections for the current groupBy setting.
