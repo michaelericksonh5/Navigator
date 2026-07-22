@@ -18,6 +18,7 @@ final class TransferProgress: ObservableObject {
     @Published var fraction: Double = 0
     @Published var current: String = ""
     @Published var cancelled = false
+    @Published var slow = false      // set if the transfer stalls (slow/hiccuping mount)
 }
 
 enum SortField: String, CaseIterable { case name, modified, size, kind }
@@ -1308,6 +1309,14 @@ final class Browser: ObservableObject, Identifiable {
     // revisits. Finder blocks on phase 2 for the whole folder — hence the hang.
     private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String, hadSeed: Bool = false) {
         let showHidden = self.showHidden
+        // Non-blocking hint if the enumeration stalls (slow/hiccuping SMB mount).
+        // Fires only if we're still on this same load after a few seconds.
+        if !hadSeed {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, gen == self.loadGeneration, self.busy else { return }
+                self.busyText = "Still loading — the network drive is responding slowly…"
+            }
+        }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var names = Browser.fastNames(dir, showHidden: showHidden)
             // DFS junctions auto-mount on first access and can read empty; retry once.
@@ -1782,32 +1791,52 @@ final class Browser: ObservableObject, Identifiable {
         // duplicate ("paste into same folder") — it gets a numbered name silently,
         // so it's never treated as a conflict.
         func isSelfDup(_ src: URL) -> Bool { !move && src.deletingLastPathComponent().path == dir.path }
-        // Resolve name conflicts up front with one prompt (applied to all).
-        var policy: ConflictPolicy = .keepBoth
-        let conflicts = sources.filter { !isSelfDup($0) && fm.fileExists(atPath: dir.appendingPathComponent($0.lastPathComponent).path) }
-        let conflictNames = Set(conflicts.map { $0.lastPathComponent })   // reuse below; no second stat over the network
-        if !conflicts.isEmpty {
-            let a = NSAlert()
-            a.messageText = conflicts.count == 1
-                ? "“\(conflicts[0].lastPathComponent)” already exists in “\(dir.lastPathComponent)”"
-                : "\(conflicts.count) items already exist in “\(dir.lastPathComponent)”"
-            a.informativeText = "Choose how to handle items with the same name."
-            a.addButton(withTitle: "Keep Both")
-            a.addButton(withTitle: "Replace")
-            a.addButton(withTitle: "Skip")
-            a.addButton(withTitle: "Cancel")
-            switch a.runModal() {
-            case .alertFirstButtonReturn: policy = .keepBoth
-            case .alertSecondButtonReturn: policy = .replace
-            case .alertThirdButtonReturn: policy = .skip
-            default: return
-            }
-        }
         let progress = TransferProgress()
         TransferProgressController.shared.show(progress, title: move ? "Moving…" : "Copying…")
         busy = true; busyText = move ? "Moving…" : "Copying…"
+        // Non-blocking "responding slowly" hint if a network op stalls (e.g. a
+        // hiccuping SMB mount). Cancelled the moment the transfer finishes.
+        let slowHint = DispatchWorkItem { progress.slow = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: slowHint)
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            // Conflict scan runs HERE, on the background thread — fileExists over
+            // SMB is a round-trip and must never block the main thread. The prompt
+            // (which must be on the main thread) hops over and back via a semaphore.
+            let conflicts = sources.filter { !isSelfDup($0) && fm.fileExists(atPath: dir.appendingPathComponent($0.lastPathComponent).path) }
+            let conflictNames = Set(conflicts.map { $0.lastPathComponent })
+            var policy: ConflictPolicy = .keepBoth
+            if !conflicts.isEmpty {
+                var cancel = false
+                let sem = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async {
+                    let a = NSAlert()
+                    a.messageText = conflicts.count == 1
+                        ? "“\(conflicts[0].lastPathComponent)” already exists in “\(dir.lastPathComponent)”"
+                        : "\(conflicts.count) items already exist in “\(dir.lastPathComponent)”"
+                    a.informativeText = "Choose how to handle items with the same name."
+                    a.addButton(withTitle: "Keep Both")
+                    a.addButton(withTitle: "Replace")
+                    a.addButton(withTitle: "Skip")
+                    a.addButton(withTitle: "Cancel")
+                    switch a.runModal() {
+                    case .alertFirstButtonReturn: policy = .keepBoth
+                    case .alertSecondButtonReturn: policy = .replace
+                    case .alertThirdButtonReturn: policy = .skip
+                    default: cancel = true
+                    }
+                    sem.signal()
+                }
+                sem.wait()
+                if cancel {
+                    DispatchQueue.main.async {
+                        slowHint.cancel(); TransferProgressController.shared.hide()
+                        self.busy = false; self.busyText = ""
+                    }
+                    return
+                }
+            }
             var moved: [(from: URL, to: URL)] = []
             var copied: [URL] = []
             var failures: [(name: String, reason: String)] = []
@@ -1850,6 +1879,7 @@ final class Browser: ObservableObject, Identifiable {
                 }
             }
             DispatchQueue.main.async {
+                slowHint.cancel()
                 TransferProgressController.shared.hide()
                 if resetCut { self.cutMode = false }
                 self.busy = false; self.busyText = ""
@@ -4095,6 +4125,10 @@ struct TransferProgressView: View {
             Text(title).font(.headline)
             ProgressView(value: progress.fraction)
             Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            if progress.slow {
+                Label("The network drive is responding slowly — still working…", systemImage: "wifi.exclamationmark")
+                    .font(.caption).foregroundStyle(.orange).lineLimit(2)
+            }
             HStack { Spacer(); Button("Cancel") { progress.cancelled = true; onCancel() } }
         }.padding(18).frame(width: 380)
     }
