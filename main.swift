@@ -2116,6 +2116,11 @@ final class AppModel: ObservableObject {
         if selected >= tabs.count { selected = tabs.count - 1 }
         saveState()
     }
+    // Open a folder in the right-hand pane, turning on dual-pane view if needed.
+    func openInSecondPane(_ url: URL) {
+        dualPane = true
+        secondary.navigate(to: url)
+    }
 }
 
 // MARK: - Components
@@ -2584,6 +2589,7 @@ struct FileTableView: View {
             Button("Open") { open(ids) }
             if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }), it.isDirectory {
                 Button("Open in New Tab") { model.newTab(at: it.url) }
+                Button("Open in Second Pane") { model.openInSecondPane(it.url) }
             }
             let selURLs = browser.items.filter { ids.contains($0.id) }.map { $0.url }
             if selURLs.contains(where: { !$0.hasDirectoryPath }) { OpenWithMenu(urls: selURLs.filter { !$0.hasDirectoryPath }) }
@@ -2806,7 +2812,10 @@ struct IconGridView: View {
             }
             .contextMenu {
                 Button("Open") { openItem(item, browser) }
-                if item.isDirectory { Button("Open in New Tab") { model.newTab(at: item.url) } }
+                if item.isDirectory {
+                    Button("Open in New Tab") { model.newTab(at: item.url) }
+                    Button("Open in Second Pane") { model.openInSecondPane(item.url) }
+                }
                 if !item.isDirectory { OpenWithMenu(urls: [item.url]) }
                 Button("Quick Look") { QuickLook.shared.show([item.url]) }
                 Button("Reveal in Finder") { browser.revealInFinder([item.id]) }
