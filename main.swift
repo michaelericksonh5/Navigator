@@ -595,10 +595,6 @@ final class FavoritesStore: ObservableObject {
     }
     func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
     func remove(url: URL) { let p = url.standardizedFileURL.path; items.removeAll { $0.path == p }; persist() }
-    // Pin/unpin a folder from anywhere (file view, etc.).
-    func togglePin(_ url: URL) { contains(url) ? remove(url: url) : add(url) }
-    func move(from: IndexSet, to: Int) { items.move(fromOffsets: from, toOffset: to); persist() }
-    func reset() { items = defaultLocations().map { Favorite(label: $0.name, path: $0.url.path, mountURL: nil) }; persist() }
     private func persist() { if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: "favoritesV2") } }
 
     // Export/import favorites as JSON — so a shared set (e.g. team network
@@ -1187,31 +1183,25 @@ final class Browser: ObservableObject, Identifiable {
                 self.busy = false; self.busyText = ""
                 self.updateFreeSpace(); self.updateStatus()
             }
-            // Phase 2 — lazily fetch size + dates, publishing every 40 items.
+            // Phase 2 — fetch size + dates. Each is a separate SMB round-trip
+            // (~90ms over VPN); done serially a 600-item folder stalls ~a minute.
+            // Run them IN PARALLEL — they're I/O-bound, so GCD keeps many in flight
+            // and the wall-clock drops ~10x. Each iteration writes only its own
+            // index, so no locking. (ponytail: GCD pool ~= cores+blocked; widen with
+            // an explicit semaphore pool only if this still isn't fast enough.)
             let enrichKeys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey, .creationDateKey]
-            var sinceFlush = 0
-            for i in enriched.indices {
-                guard gen == self.loadGeneration else { return }
-                let u = enriched[i].url
-                if let rv = try? u.resourceValues(forKeys: enrichKeys) {
-                    let m = rv.contentModificationDate ?? Date()
-                    enriched[i] = FileItem(id: u.path, url: u, name: u.lastPathComponent,
-                                           isDirectory: enriched[i].isDirectory,
-                                           size: Int64(rv.fileSize ?? 0),
-                                           modified: m, created: rv.creationDate ?? m,
-                                           accessed: m, dateAdded: m,
-                                           kind: enriched[i].kind, tags: [])
-                }
-                sinceFlush += 1
-                if sinceFlush >= 40 {
-                    sinceFlush = 0
-                    let snapshot = enriched
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, gen == self.loadGeneration else { return }
-                        self.items = snapshot; self.updateStatus()
-                    }
+            enriched.withUnsafeMutableBufferPointer { buf in
+                DispatchQueue.concurrentPerform(iterations: buf.count) { i in
+                    guard gen == self.loadGeneration,
+                          let rv = try? buf[i].url.resourceValues(forKeys: enrichKeys) else { return }
+                    let u = buf[i].url, m = rv.contentModificationDate ?? Date()
+                    buf[i] = FileItem(id: u.path, url: u, name: u.lastPathComponent,
+                                      isDirectory: buf[i].isDirectory, size: Int64(rv.fileSize ?? 0),
+                                      modified: m, created: rv.creationDate ?? m,
+                                      accessed: m, dateAdded: m, kind: buf[i].kind, tags: [])
                 }
             }
+            guard gen == self.loadGeneration else { return }
             let committed = enriched
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
