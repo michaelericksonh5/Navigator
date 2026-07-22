@@ -18,7 +18,6 @@ final class TransferProgress: ObservableObject {
     @Published var fraction: Double = 0
     @Published var current: String = ""
     @Published var cancelled = false
-    @Published var slow = false      // set if the transfer stalls (slow/hiccuping mount)
 }
 
 enum SortField: String, CaseIterable { case name, modified, size, kind }
@@ -868,6 +867,7 @@ final class Browser: ObservableObject, Identifiable {
     @Published var keyboardScrollID: String?
     @Published var busy = false
     @Published var busyText = ""
+    @Published var slowNetwork = false   // a network op is taking a while — shown quietly in the breadcrumb bar
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
@@ -1240,6 +1240,7 @@ final class Browser: ObservableObject, Identifiable {
     func load() {
         isRecents = false
         isSearching = false
+        slowNetwork = false
         pathText = addressString(for: currentURL)
         selection = []
         let dir = currentURL
@@ -1309,12 +1310,13 @@ final class Browser: ObservableObject, Identifiable {
     // revisits. Finder blocks on phase 2 for the whole folder — hence the hang.
     private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String, hadSeed: Bool = false) {
         let showHidden = self.showHidden
-        // Non-blocking hint if the enumeration stalls (slow/hiccuping SMB mount).
-        // Fires only if we're still on this same load after a few seconds.
+        // Non-blocking hint if the enumeration stalls (slow/hiccuping SMB mount):
+        // a quiet note in the breadcrumb bar, not a popup. Fires only if we're
+        // still on this same load after a few seconds.
         if !hadSeed {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
                 guard let self, gen == self.loadGeneration, self.busy else { return }
-                self.busyText = "Still loading — the network drive is responding slowly…"
+                self.slowNetwork = true
             }
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1340,7 +1342,7 @@ final class Browser: ObservableObject, Identifiable {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, gen == self.loadGeneration else { return }
                     self.items = light                   // instant: names + folder icons
-                    self.busy = false; self.busyText = ""
+                    self.busy = false; self.busyText = ""; self.slowNetwork = false
                     self.updateFreeSpace(); self.updateStatus()
                 }
             }
@@ -1794,9 +1796,11 @@ final class Browser: ObservableObject, Identifiable {
         let progress = TransferProgress()
         TransferProgressController.shared.show(progress, title: move ? "Moving…" : "Copying…")
         busy = true; busyText = move ? "Moving…" : "Copying…"
+        slowNetwork = false
         // Non-blocking "responding slowly" hint if a network op stalls (e.g. a
-        // hiccuping SMB mount). Cancelled the moment the transfer finishes.
-        let slowHint = DispatchWorkItem { progress.slow = true }
+        // hiccuping SMB mount) — shown quietly in the breadcrumb bar, not a popup.
+        // Cancelled the moment the transfer finishes.
+        let slowHint = DispatchWorkItem { [weak self] in self?.slowNetwork = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: slowHint)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -1832,7 +1836,7 @@ final class Browser: ObservableObject, Identifiable {
                 if cancel {
                     DispatchQueue.main.async {
                         slowHint.cancel(); TransferProgressController.shared.hide()
-                        self.busy = false; self.busyText = ""
+                        self.busy = false; self.busyText = ""; self.slowNetwork = false
                     }
                     return
                 }
@@ -1882,7 +1886,7 @@ final class Browser: ObservableObject, Identifiable {
                 slowHint.cancel()
                 TransferProgressController.shared.hide()
                 if resetCut { self.cutMode = false }
-                self.busy = false; self.busyText = ""
+                self.busy = false; self.busyText = ""; self.slowNetwork = false
                 RecentFolders.shared.record(dir)   // you worked in the destination folder
                 if move, !moved.isEmpty {
                     UndoStack.shared.push("Move") { [weak self] in
@@ -2539,8 +2543,14 @@ struct BreadcrumbBar: View {
                 Button { browser.navigate(to: crumb.url) } label: { Text(crumb.name).font(.callout).lineLimit(1).fixedSize() }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            if browser.slowNetwork {
+                Label("Network drive responding slowly…", systemImage: "wifi.exclamationmark")
+                    .font(.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
+                    .transition(.opacity)
+            }
         }.padding(.horizontal, 10).padding(.vertical, 4).frame(maxWidth: .infinity, alignment: .leading).clipped()
+        .animation(.easeInOut(duration: 0.2), value: browser.slowNetwork)
     }
 }
 
@@ -4125,10 +4135,6 @@ struct TransferProgressView: View {
             Text(title).font(.headline)
             ProgressView(value: progress.fraction)
             Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            if progress.slow {
-                Label("The network drive is responding slowly — still working…", systemImage: "wifi.exclamationmark")
-                    .font(.caption).foregroundStyle(.orange).lineLimit(2)
-            }
             HStack { Spacer(); Button("Cancel") { progress.cancelled = true; onCancel() } }
         }.padding(18).frame(width: 380)
     }
