@@ -546,6 +546,30 @@ func googleDriveURL(for url: URL, isDirectory: Bool) -> URL? {
         ? "https://drive.google.com/drive/folders/\(id)"
         : "https://drive.google.com/file/d/\(id)/view")
 }
+// A portable, username-free path for a Drive item, matching the breadcrumb:
+// /Users/x/Library/CloudStorage/GoogleDrive-x@…/Shared drives/A/B
+//   → "Google Drive/Shared drives/A/B"
+func googleDrivePortablePath(_ url: URL) -> String? {
+    let p = url.path
+    guard let r = p.range(of: "/CloudStorage/GoogleDrive-") else { return nil }
+    let after = p[r.upperBound...]
+    guard let slash = after.firstIndex(of: "/") else { return nil }
+    let rel = after[after.index(after: slash)...]
+    return rel.isEmpty ? "Google Drive" : "Google Drive/\(rel)"
+}
+// The installed Google Drive app's own icon, for the Drive context-menu items
+// (mirrors how Finder badges its Quick Actions). Loaded once.
+enum GoogleDriveIcon {
+    static let image: NSImage = NSWorkspace.shared.icon(forFile: "/Applications/Google Drive.app")
+}
+// A context-menu label badged with the Google Drive app icon.
+@ViewBuilder func gdLabel(_ title: String) -> some View {
+    Label {
+        Text(title)
+    } icon: {
+        Image(nsImage: GoogleDriveIcon.image).resizable().frame(width: 16, height: 16)
+    }.labelStyle(.titleAndIcon)
+}
 
 func confirmEmptyTrash(_ browser: Browser) {
     let a = NSAlert(); a.alertStyle = .warning
@@ -1474,9 +1498,9 @@ final class Browser: ObservableObject, Identifiable {
         var p = pathText.trimmingCharacters(in: .whitespaces)
         if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
         guard !p.isEmpty else { pathText = currentURL.path; return }
-        // A Google Drive path pasted from another user won't exist here (their
-        // home + account email); re-anchor it onto this Mac's Drive account.
-        if !fm.fileExists(atPath: p), let remapped = Browser.remapGoogleDrivePath(p) { p = remapped }
+        // Resolve any Google Drive path form (a coworker's full path, the portable
+        // "Google Drive/…", or a bare "Shared drives/…") onto this Mac's account.
+        if !fm.fileExists(atPath: p), let resolved = Browser.resolveGoogleDrivePath(p) { p = resolved }
         let url = URL(fileURLWithPath: p)
         var isDir: ObjCBool = false
         if fm.fileExists(atPath: url.path, isDirectory: &isDir) {
@@ -1531,18 +1555,35 @@ final class Browser: ObservableObject, Identifiable {
         guard !urls.isEmpty else { NSSound.beep(); return }
         for u in urls { NSWorkspace.shared.open(u) }
     }
-    // A Google Drive path copied from another Mac carries that user's home and
-    // account email (…/GoogleDrive-<their email>/Shared drives/…). Re-anchor the
-    // part from the shared/My-Drive root onto THIS Mac's Drive account so a
-    // pasted shared-drive path resolves locally. Returns nil if not a Drive path.
-    static func remapGoogleDrivePath(_ path: String) -> String? {
-        guard let r = path.range(of: "/CloudStorage/GoogleDrive-") else { return nil }
-        let afterAccount = path[r.upperBound...]                     // "<email>/Shared drives/…"
-        guard let slash = afterAccount.firstIndex(of: "/") else { return nil }
-        let rel = String(afterAccount[afterAccount.index(after: slash)...])   // "Shared drives/…"
+    // Copy a clean, username-free path like "Google Drive/Shared drives/…/NB2 pass"
+    // (matches the breadcrumb). It carries no home folder or account email, and
+    // Navigator's address bar resolves it against the local Drive account — so a
+    // coworker can paste it and land in the same shared-drive location.
+    func copyGoogleDrivePath(_ ids: Set<String>) {
+        let paths = items.filter { ids.contains($0.id) }.compactMap { googleDrivePortablePath($0.url) }
+        let text = paths.isEmpty ? (googleDrivePortablePath(currentURL) ?? "") : paths.joined(separator: "\n")
+        guard !text.isEmpty else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+    }
+    // Resolve any Google Drive path form typed/pasted into the address bar onto
+    // THIS Mac's Drive account: a full cross-user path from another Mac
+    // (/Users/them/…/GoogleDrive-them@…/Shared drives/…), the portable
+    // "Google Drive/…" form, or a bare "Shared drives/…" / "My Drive/…".
+    // Returns nil if it isn't a Drive path.
+    static func resolveGoogleDrivePath(_ input: String) -> String? {
         let cs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")
         guard let accounts = try? FileManager.default.contentsOfDirectory(atPath: cs.path),
               let local = accounts.first(where: { $0.hasPrefix("GoogleDrive-") }) else { return nil }
+        var rel: String?
+        if let r = input.range(of: "/CloudStorage/GoogleDrive-") {          // full path from another Mac
+            let after = input[r.upperBound...]
+            if let slash = after.firstIndex(of: "/") { rel = String(after[after.index(after: slash)...]) }
+        } else if input.hasPrefix("Google Drive/") {                        // portable form
+            rel = String(input.dropFirst("Google Drive/".count))
+        } else if input.hasPrefix("Shared drives") || input.hasPrefix("My Drive") {   // drive-relative
+            rel = input
+        }
+        guard let rel, !rel.isEmpty else { return nil }
         return cs.appendingPathComponent(local).appendingPathComponent(rel).path
     }
     func copyName(_ ids: Set<String>) {
@@ -2631,8 +2672,9 @@ struct FileTableView: View {
             Button("Copy Path") { browser.copyPath(ids) }
             Button("Copy Name") { browser.copyName(ids) }
             if browser.isGoogleDriveSelection(ids) {
-                Button("Copy Google Drive Link") { browser.copyGoogleDriveLink(ids) }
-                Button("Open in Google Drive") { browser.openGoogleDriveLink(ids) }
+                Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Google Drive Link") }
+                Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Google Drive Path") }
+                Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Google Drive") }
             }
             Divider()
             Button("Move to Trash") { browser.moveToTrash(ids) }
@@ -2844,8 +2886,9 @@ struct IconGridView: View {
                 Button("Copy Path") { browser.copyPath([item.id]) }
                 Button("Copy Name") { browser.copyName([item.id]) }
                 if browser.isGoogleDriveSelection([item.id]) {
-                    Button("Copy Google Drive Link") { browser.copyGoogleDriveLink([item.id]) }
-                    Button("Open in Google Drive") { browser.openGoogleDriveLink([item.id]) }
+                    Button { browser.copyGoogleDriveLink([item.id]) } label: { gdLabel("Copy Google Drive Link") }
+                    Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Google Drive Path") }
+                    Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Google Drive") }
                 }
                 Button("Move to Trash") { browser.moveToTrash([item.id]) }
             }
