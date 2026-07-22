@@ -5,7 +5,7 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 APP="/Applications/Navigator.app"
 echo "Compiling (universal: arm64 + x86_64)..."
 SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" \
-  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers)
+  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers -framework NetFS)
 /usr/bin/swiftc "${SWIFT_ARGS[@]}" -target arm64-apple-macos14.0  -o "$DIR/Navigator-arm64"
 /usr/bin/swiftc "${SWIFT_ARGS[@]}" -target x86_64-apple-macos14.0 -o "$DIR/Navigator-x86_64"
 lipo -create "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64" -output "$DIR/Navigator.bin"
@@ -48,8 +48,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.2</string>
-<key>CFBundleVersion</key><string>18</string>
+<key>CFBundleShortVersionString</key><string>1.4.3</string>
+<key>CFBundleVersion</key><string>19</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>

@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import Quartz
 import QuickLookThumbnailing
 import CoreServices
+import NetFS
 
 extension Notification.Name {
     static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate")
@@ -1296,56 +1297,41 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     // Navigate to a sidebar favorite. For a network drive whose volume isn't
-    // mounted (e.g. after a reboot or VPN reconnect), (re)mount it first, then go.
+    // mounted (e.g. after a reboot or VPN reconnect), mount it directly via
+    // NetFS — NOT NSWorkspace.open(smb://…), which hands the mount to Finder and
+    // pops Finder's "Connecting to…" window. NetFSMountURLSync mounts silently to
+    // /Volumes using keychain creds (its own auth sheet only if none are stored)
+    // and returns the real mountpoint, so no polling/guessing is needed.
     func openFavorite(_ path: String, mountURL: String?) {
         if fm.fileExists(atPath: path) { navigate(to: URL(fileURLWithPath: path)); return }
         guard let m = mountURL, let smb = URL(string: m) else { NSSound.beep(); return }
         busy = true; busyText = "Connecting to \(smb.host ?? "server")…"
-        NSWorkspace.shared.open(smb)
-        pollForMount(path: path, smb: smb, tries: 0)
-    }
-    // A network share doesn't always mount where the favorite's stored path
-    // expects (e.g. smb://host/data/Dept lands at /Volumes/Dept, not
-    // /Volumes/data/Dept). After triggering the mount, poll for the stored path
-    // OR the share's actual mount point and navigate to whichever appears.
-    private func pollForMount(path: String, smb: URL, tries: Int) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self else { return }
-            if self.fm.fileExists(atPath: path) {
-                self.busy = false; self.busyText = ""; self.navigate(to: URL(fileURLWithPath: path)); return
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let mounted = Browser.mountShare(smb)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.busy = false; self.busyText = ""
+                // Prefer the stored favorite path (usually a subfolder of the share)
+                // if the mount made it appear; else land at the share's mountpoint.
+                if self.fm.fileExists(atPath: path) {
+                    self.navigate(to: URL(fileURLWithPath: path))
+                } else if let mp = mounted {
+                    self.navigate(to: URL(fileURLWithPath: mp))
+                } else { NSSound.beep() }
             }
-            if let actual = Browser.mountPoint(for: smb) {
-                self.busy = false; self.busyText = ""; self.navigate(to: actual); return
-            }
-            if tries < 7 { self.pollForMount(path: path, smb: smb, tries: tries + 1) }
-            else { self.busy = false; self.busyText = ""; NSSound.beep() }
         }
     }
-    // Where an SMB URL actually mounted. macOS names the volume after the last
-    // path component (smb://host/a/b → /Volumes/b, or /Volumes/b-N on a clash),
-    // so check those; also match the live mount table by remote path.
-    static func mountPoint(for smb: URL) -> URL? {
-        let fm = FileManager.default
-        let comps = smb.pathComponents.filter { $0 != "/" }
-        if let last = comps.last {
-            let candidates = ["/Volumes/\(last)"] + (1...3).map({ "/Volumes/\(last)-\($0)" })
-            for cand in candidates where fm.fileExists(atPath: cand) {
-                return URL(fileURLWithPath: cand)
-            }
-        }
-        // Fall back to scanning mounted volumes for one whose remote path matches.
-        let share = "/" + comps.joined(separator: "/")
-        if let vols = fm.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) {
-            for v in vols {
-                var st = statfs(); if statfs(v.path, &st) == 0 {
-                    let from = withUnsafeBytes(of: &st.f_mntfromname) { raw -> String in
-                        raw.baseAddress.map { String(cString: $0.assumingMemoryBound(to: CChar.self)) } ?? ""
-                    }
-                    if from.hasSuffix(share) || from.contains(share) { return v }
-                }
-            }
-        }
-        return nil
+    // Mount an SMB/AFP URL directly, without Finder. Blocking — call off the main
+    // thread. Returns the real mountpoint path (nil on failure). NetFS uses stored
+    // keychain creds and shows its own auth sheet only when none exist.
+    static func mountShare(_ url: URL) -> String? {
+        let openOpts = NSMutableDictionary()
+        openOpts[kNAUIOptionKey] = kNAUIOptionAllowUI
+        var pts: Unmanaged<CFArray>?
+        let rc = NetFSMountURLSync(url as CFURL, nil, nil, nil,
+                                   openOpts as CFMutableDictionary, nil, &pts)
+        guard rc == 0 else { return nil }
+        return (pts?.takeRetainedValue() as? [String])?.first
     }
 
     func goUp() {
@@ -4269,7 +4255,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
             let s = field.stringValue.trimmingCharacters(in: .whitespaces)
-            if !s.isEmpty, let url = URL(string: s) { NSWorkspace.shared.open(url) }
+            if !s.isEmpty, let url = URL(string: s) {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let mp = Browser.mountShare(url)   // direct mount, no Finder
+                    DispatchQueue.main.async {
+                        if let mp { self.openFolderTab(URL(fileURLWithPath: mp)) } else { NSSound.beep() }
+                    }
+                }
+            }
         }
     }
 
