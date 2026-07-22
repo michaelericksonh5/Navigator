@@ -850,7 +850,7 @@ final class Browser: ObservableObject, Identifiable {
 
     init(start: URL) {
         currentURL = start
-        pathText = start.path
+        pathText = googleDrivePortablePath(start) ?? start.path
         showHidden = Prefs.showHidden
         viewMode = ViewMode(rawValue: Prefs.viewMode) ?? .list
         iconSize = Prefs.iconSize
@@ -1211,7 +1211,7 @@ final class Browser: ObservableObject, Identifiable {
     func load() {
         isRecents = false
         isSearching = false
-        pathText = currentURL.path
+        pathText = addressString(for: currentURL)
         selection = []
         let dir = currentURL
         let isNetwork = ((try? dir.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false)
@@ -1497,15 +1497,15 @@ final class Browser: ObservableObject, Identifiable {
     func submitPath() {
         var p = pathText.trimmingCharacters(in: .whitespaces)
         if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
-        guard !p.isEmpty else { pathText = currentURL.path; return }
+        guard !p.isEmpty else { pathText = addressString(for: currentURL); return }
         // Resolve any Google Drive path form (a coworker's full path, the portable
         // "Google Drive/…", or a bare "Shared drives/…") onto this Mac's account.
         if !fm.fileExists(atPath: p), let resolved = Browser.resolveGoogleDrivePath(p) { p = resolved }
         let url = URL(fileURLWithPath: p)
         var isDir: ObjCBool = false
         if fm.fileExists(atPath: url.path, isDirectory: &isDir) {
-            if isDir.boolValue { navigate(to: url) } else { NSWorkspace.shared.open(url); pathText = currentURL.path }
-        } else { NSSound.beep(); pathText = currentURL.path }
+            if isDir.boolValue { navigate(to: url) } else { NSWorkspace.shared.open(url); pathText = addressString(for: currentURL) }
+        } else { NSSound.beep(); pathText = addressString(for: currentURL) }
     }
 
     func breadcrumbs() -> [(name: String, url: URL)] {
@@ -1534,6 +1534,15 @@ final class Browser: ObservableObject, Identifiable {
         let paths = items.filter { ids.contains($0.id) }.map { $0.url.path }
         let text = paths.isEmpty ? currentURL.path : paths.joined(separator: "\n")
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+    }
+    // What the address bar shows: inside Google Drive, the clean username-free
+    // "Google Drive/Shared drives/…" form (directly shareable — a coworker pastes
+    // it into their address bar and it resolves to their own account). Elsewhere,
+    // the real local path.
+    func addressString(for url: URL) -> String { googleDrivePortablePath(url) ?? url.path }
+    func copyDisplayedPath() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(addressString(for: currentURL), forType: .string)
     }
     // True when the selection lives inside Google Drive (has a Drive item ID).
     func isGoogleDriveSelection(_ ids: Set<String>) -> Bool {
@@ -2308,8 +2317,8 @@ struct ControlBar: View {
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
                 .frame(maxWidth: .infinity)
 
-                Button { browser.copyPath([]) } label: { Image(systemName: "doc.on.doc") }
-                    .help("Copy Full Path")
+                Button { browser.copyDisplayedPath() } label: { Image(systemName: "doc.on.doc") }
+                    .help("Copy Path Shown in Address Bar")
 
                 HStack(spacing: 4) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.caption)
