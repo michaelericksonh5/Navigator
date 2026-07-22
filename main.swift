@@ -567,7 +567,7 @@ enum GoogleDriveIcon {
     Label {
         Text(title)
     } icon: {
-        Image(nsImage: GoogleDriveIcon.image).resizable().frame(width: 16, height: 16)
+        Image(nsImage: GoogleDriveIcon.image).resizable().frame(width: 13, height: 13)
     }.labelStyle(.titleAndIcon)
 }
 
@@ -2681,9 +2681,9 @@ struct FileTableView: View {
             Button("Copy Path") { browser.copyPath(ids) }
             Button("Copy Name") { browser.copyName(ids) }
             if browser.isGoogleDriveSelection(ids) {
-                Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Google Drive Link") }
-                Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Google Drive Path") }
-                Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Google Drive") }
+                Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Web Link") }
+                Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Local Path") }
+                Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Web") }
             }
             Divider()
             Button("Move to Trash") { browser.moveToTrash(ids) }
@@ -2895,9 +2895,9 @@ struct IconGridView: View {
                 Button("Copy Path") { browser.copyPath([item.id]) }
                 Button("Copy Name") { browser.copyName([item.id]) }
                 if browser.isGoogleDriveSelection([item.id]) {
-                    Button { browser.copyGoogleDriveLink([item.id]) } label: { gdLabel("Copy Google Drive Link") }
-                    Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Google Drive Path") }
-                    Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Google Drive") }
+                    Button { browser.copyGoogleDriveLink([item.id]) } label: { gdLabel("Copy Web Link") }
+                    Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Local Path") }
+                    Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Web") }
                 }
                 Button("Move to Trash") { browser.moveToTrash([item.id]) }
             }
