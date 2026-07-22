@@ -751,6 +751,28 @@ final class FavoritesStore: ObservableObject {
 let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
 func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtension.lowercased()) }
 
+// Cloud (File Provider) download state for a Google Drive / iCloud item, read
+// from standard URL resource keys (local, no network). Matches Finder: a badge
+// only for online-only or actively-downloading items; downloaded items show none.
+enum CloudBadge { case onlineOnly, downloading }
+func cloudBadge(for url: URL) -> CloudBadge? {
+    guard let v = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey]),
+          v.isUbiquitousItem == true else { return nil }
+    if v.ubiquitousItemIsDownloading == true { return .downloading }
+    if v.ubiquitousItemDownloadingStatus == .notDownloaded { return .onlineOnly }
+    return nil   // .current / .downloaded → present locally, no badge
+}
+@ViewBuilder func cloudBadgeView(_ badge: CloudBadge?) -> some View {
+    if let badge {
+        Image(systemName: badge == .downloading ? "arrow.clockwise" : "icloud.and.arrow.down")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.white)
+            .padding(3)
+            .background(Circle().fill(Color.black.opacity(0.55)))
+            .help(badge == .downloading ? "Downloading from the cloud…" : "Online only — will download when opened")
+    }
+}
+
 let videoExtensions: Set<String> = ["mp4","mov","m4v","avi","mkv","webm","wmv","flv","mpg","mpeg","3gp","m2ts","mts","m2v","ts"]
 func isVideoFile(_ url: URL) -> Bool { videoExtensions.contains(url.pathExtension.lowercased()) }
 // Formats that should play (not just show a frame) in the viewer/preview.
@@ -2517,11 +2539,14 @@ struct ThumbIcon: View {
 struct NameCell: View {
     let item: FileItem
     @ObservedObject var browser: Browser
+    @State private var cloud: CloudBadge?
     var body: some View {
         HStack(spacing: 6) {
             ThumbIcon(item: item, browser: browser)
             Text(item.name).lineLimit(1)
+            cloudBadgeView(cloud)
         }
+        .onAppear { cloud = cloudBadge(for: item.url) }
     }
 }
 
@@ -2732,6 +2757,7 @@ struct IconCell: View {
     @ObservedObject var browser: Browser
     let selected: Bool
     @State private var thumb: NSImage?
+    @State private var cloud: CloudBadge?
     var body: some View {
         VStack(spacing: 6) {
             Group {
@@ -2739,6 +2765,7 @@ struct IconCell: View {
                 else { Image(nsImage: browser.icon(for: item)).resizable().scaledToFit() }
             }
             .frame(width: browser.iconSize, height: browser.iconSize)
+            .overlay(alignment: .bottomTrailing) { cloudBadgeView(cloud) }
             Text(item.name).font(.caption).lineLimit(2).multilineTextAlignment(.center)
         }
         .frame(width: browser.iconSize + 40, height: browser.iconSize + 46)
@@ -2747,7 +2774,10 @@ struct IconCell: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
         .draggable(item.url)
-        .onAppear { ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 } }
+        .onAppear {
+            ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }
+            cloud = cloudBadge(for: item.url)
+        }
     }
 }
 
@@ -3127,13 +3157,15 @@ struct ThumbImage: View {
     let item: FileItem
     @ObservedObject var browser: Browser
     @State private var thumb: NSImage?
+    @State private var cloud: CloudBadge?
     var body: some View {
         Group {
             if let t = thumb { Image(nsImage: t).resizable().scaledToFit() }
             else { Image(nsImage: browser.icon(for: item)).resizable().scaledToFit() }
         }
-        .onAppear { ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 } }
-        .onChange(of: item.url) { thumb = nil; ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 } }
+        .overlay(alignment: .bottomTrailing) { cloudBadgeView(cloud).padding(4) }
+        .onAppear { ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }; cloud = cloudBadge(for: item.url) }
+        .onChange(of: item.url) { thumb = nil; ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }; cloud = cloudBadge(for: item.url) }
     }
 }
 
