@@ -579,14 +579,17 @@ func confirmEmptyTrash(_ browser: Browser) {
     a.addButton(withTitle: "Empty Trash"); a.addButton(withTitle: "Cancel")
     if a.runModal() == .alertFirstButtonReturn { browser.emptyTrash() }
 }
+// All visible images in on-screen order + the index of `item` — so the viewer
+// browses in the order the user sees. nil if the item isn't an image.
+func imageContext(_ item: FileItem, _ browser: Browser) -> ([URL], Int)? {
+    guard isImageFile(item.url) else { return nil }
+    let imgs = browser.orderedVisibleItems().filter { !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+    return (imgs, imgs.firstIndex(of: item.url) ?? 0)
+}
 func openItem(_ item: FileItem, _ browser: Browser) {
     if item.isDirectory { browser.navigate(to: item.url); return }
-    if isImageFile(item.url) {
-        // Use the on-screen order (current sort/filter), so ←/→ in the viewer
-        // matches what the user sees in the folder — not the raw load order.
-        let imgs = browser.orderedVisibleItems().filter { !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
-        ImageViewerController.shared.show(urls: imgs, index: imgs.firstIndex(of: item.url) ?? 0)
-        return
+    if let (imgs, idx) = imageContext(item, browser) {
+        ImageViewerController.shared.show(urls: imgs, index: idx); return
     }
     NSWorkspace.shared.open(item.url)
 }
@@ -1546,6 +1549,11 @@ final class Browser: ObservableObject, Identifiable {
     func copyDisplayedPath() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(addressString(for: currentURL), forType: .string)
+    }
+    // The two selected images (in on-screen order) for Swipe Compare, else nil.
+    func imagePair(_ ids: Set<String>) -> (URL, URL)? {
+        let imgs = orderedVisibleItems().filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        return imgs.count == 2 ? (imgs[0], imgs[1]) : nil
     }
     // True when the selection lives inside Google Drive (has a Drive item ID).
     func isGoogleDriveSelection(_ ids: Set<String>) -> Bool {
@@ -2644,6 +2652,12 @@ struct FileTableView: View {
                 Button("Open in New Tab") { model.newTab(at: it.url) }
                 Button("Open in Second Pane") { model.openInSecondPane(it.url) }
             }
+            if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }), isImageFile(it.url) {
+                Button("Open in New Window") { if let (u, i) = imageContext(it, browser) { ImageViewerController.openDetached(urls: u, index: i) } }
+            }
+            if let pair = browser.imagePair(ids) {
+                Button("Swipe Compare") { CompareController.show(left: pair.0, right: pair.1) }
+            }
             let selURLs = browser.items.filter { ids.contains($0.id) }.map { $0.url }
             if selURLs.contains(where: { !$0.hasDirectoryPath }) { OpenWithMenu(urls: selURLs.filter { !$0.hasDirectoryPath }) }
             Button("Quick Look") { QuickLook.shared.show(browser.items.filter { ids.contains($0.id) }.map { $0.url }) }
@@ -2872,6 +2886,12 @@ struct IconGridView: View {
                 if item.isDirectory {
                     Button("Open in New Tab") { model.newTab(at: item.url) }
                     Button("Open in Second Pane") { model.openInSecondPane(item.url) }
+                }
+                if isImageFile(item.url) {
+                    Button("Open in New Window") { if let (u, i) = imageContext(item, browser) { ImageViewerController.openDetached(urls: u, index: i) } }
+                }
+                if let pair = browser.imagePair(browser.selection) {
+                    Button("Swipe Compare") { CompareController.show(left: pair.0, right: pair.1) }
                 }
                 if !item.isDirectory { OpenWithMenu(urls: [item.url]) }
                 Button("Quick Look") { QuickLook.shared.show([item.url]) }
@@ -3709,22 +3729,167 @@ struct ImageViewerView: View {
 final class ImageViewerController {
     static let shared = ImageViewerController()
     private var window: NSWindow?
+    private static var detached: [NSWindow] = []   // retains extra side-by-side windows
+
+    // The primary viewer: reuses one window so ←/→ browse in place.
     func show(urls: [URL], index: Int) {
         guard !urls.isEmpty else { NSSound.beep(); return }
-        if window == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 680),
-                             styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                             backing: .buffered, defer: false)
-            w.isReleasedWhenClosed = false
-            window = w
+        if window == nil { window = ImageViewerController.makeWindow() }
+        ImageViewerController.install(urls: urls, index: index, in: window!)
+        window!.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    // A second, independent viewer window — for looking at images side by side.
+    static func openDetached(urls: [URL], index: Int) {
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        let w = makeWindow()
+        install(urls: urls, index: index, in: w)
+        if let key = NSApp.keyWindow { w.setFrameOrigin(NSPoint(x: key.frame.minX + 44, y: max(40, key.frame.minY - 44))) }
+        detached.append(w)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+            detached.removeAll { $0 === w }
         }
-        window?.title = urls.indices.contains(index) ? urls[index].lastPathComponent : "Image"
-        window?.contentView = NSHostingView(rootView: ImageViewerView(urls: urls, index: index) { [weak self] name in
-            self?.window?.title = name
-        })
-        window?.center()
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    private static func makeWindow() -> NSWindow {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 680),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                         backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false; w.center(); return w
+    }
+    private static func install(urls: [URL], index: Int, in w: NSWindow) {
+        w.title = urls.indices.contains(index) ? urls[index].lastPathComponent : "Image"
+        w.contentView = NSHostingView(rootView: ImageViewerView(urls: urls, index: index) { [weak w] name in w?.title = name })
+    }
+}
+
+// MARK: - Swipe compare (two images, aspect-aligned)
+
+// Draws two images into the SAME box (each aspect-fit, so different resolutions
+// line up aspect-to-aspect), with a draggable divider revealing the right image
+// over the left. Shared zoom (scroll) + pan (drag); double-click resets.
+final class CompareView: NSView {
+    var leftImage: NSImage?
+    var rightImage: NSImage?
+    private var _zoom: Double = 1
+    private var offset = CGPoint.zero
+    private var dividerFrac: CGFloat = 0.5
+    private var didFit = false
+    private var draggingDivider = false
+    private var lastDrag: CGPoint?
+    override var isFlipped: Bool { false }
+    override var acceptsFirstResponder: Bool { true }
+
+    private func pixels(_ img: NSImage?) -> CGSize {
+        guard let rep = img?.representations.first else { return img?.size ?? .zero }
+        return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
+    }
+    // Both images draw into this rect (fit from the left image), so a point at
+    // aspect-fraction (u,v) matches between them regardless of pixel resolution.
+    private func destRect() -> NSRect {
+        let s = pixels(leftImage)
+        guard s.width > 0, s.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
+        let scale = min(bounds.width / s.width, bounds.height / s.height)
+        let w = s.width * scale * CGFloat(_zoom), h = s.height * scale * CGFloat(_zoom)
+        return NSRect(x: (bounds.width - w)/2 + offset.x, y: (bounds.height - h)/2 + offset.y, width: w, height: h)
+    }
+    func fit() { _zoom = 1; offset = .zero; didFit = true; needsDisplay = true }
+    override func layout() { super.layout(); if !didFit, bounds.width > 0 { fit() } }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.black.setFill(); bounds.fill()
+        let r = destRect()
+        let hints: [NSImageRep.HintKey: Any] = [.interpolation: NSImageInterpolation.high.rawValue]
+        leftImage?.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
+        let dx = bounds.minX + dividerFrac * bounds.width
+        if let right = rightImage {
+            NSGraphicsContext.current?.saveGraphicsState()
+            NSBezierPath(rect: NSRect(x: dx, y: 0, width: bounds.maxX - dx, height: bounds.height)).addClip()
+            right.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
+            NSGraphicsContext.current?.restoreGraphicsState()
+        }
+        NSColor.white.withAlphaComponent(0.9).setStroke()
+        let line = NSBezierPath(); line.lineWidth = 2
+        line.move(to: CGPoint(x: dx, y: 0)); line.line(to: CGPoint(x: dx, y: bounds.height)); line.stroke()
+        let handle = NSBezierPath(ovalIn: NSRect(x: dx-11, y: bounds.midY-11, width: 22, height: 22))
+        NSColor.white.setFill(); handle.fill()
+        NSColor.black.withAlphaComponent(0.55).setStroke(); handle.stroke()
+    }
+    override func scrollWheel(with event: NSEvent) {
+        let d = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
+        guard d != 0 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        let old = _zoom, nz = max(0.1, min(old * (1 + Double(d) * 0.012), 16))
+        guard abs(nz - old) > 0.0001 else { return }
+        let cx = bounds.midX + offset.x, cy = bounds.midY + offset.y
+        let rel = CGPoint(x: p.x - cx, y: p.y - cy), ratio = CGFloat(nz/old)
+        offset.x -= rel.x * (ratio - 1); offset.y -= rel.y * (ratio - 1)
+        _zoom = nz; needsDisplay = true
+    }
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 { fit(); return }
+        let p = convert(event.locationInWindow, from: nil)
+        draggingDivider = abs(p.x - (bounds.minX + dividerFrac * bounds.width)) < 16
+        lastDrag = p
+    }
+    override func mouseDragged(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        if draggingDivider {
+            dividerFrac = max(0, min(1, (p.x - bounds.minX) / max(1, bounds.width)))
+        } else if let l = lastDrag {
+            offset.x += p.x - l.x; offset.y += p.y - l.y
+        }
+        lastDrag = p; needsDisplay = true
+    }
+    override func mouseUp(with event: NSEvent) { lastDrag = nil; draggingDivider = false }
+}
+
+struct SwipeCompare: NSViewRepresentable {
+    let left: NSImage?
+    let right: NSImage?
+    func makeNSView(context: Context) -> CompareView { let v = CompareView(); v.leftImage = left; v.rightImage = right; return v }
+    func updateNSView(_ v: CompareView, context: Context) { v.leftImage = left; v.rightImage = right; v.needsDisplay = true }
+}
+
+struct SwipeCompareView: View {
+    let leftURL: URL, rightURL: URL
+    private let leftImg: NSImage?, rightImg: NSImage?
+    init(leftURL: URL, rightURL: URL) {
+        self.leftURL = leftURL; self.rightURL = rightURL
+        leftImg = NSImage(contentsOf: leftURL); rightImg = NSImage(contentsOf: rightURL)
+    }
+    var body: some View {
+        ZStack {
+            Color.black
+            SwipeCompare(left: leftImg, right: rightImg)
+            VStack {
+                HStack { tag(leftURL.lastPathComponent); Spacer(); tag(rightURL.lastPathComponent) }.padding(12)
+                Spacer()
+                Text("Drag the divider to swipe  ·  scroll to zoom  ·  drag to pan  ·  double-click to reset")
+                    .font(.caption).foregroundStyle(.white.opacity(0.75))
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.black.opacity(0.5)).clipShape(Capsule()).padding(.bottom, 12)
+            }
+        }.frame(minWidth: 560, minHeight: 440)
+    }
+    private func tag(_ t: String) -> some View {
+        Text(t).font(.callout).foregroundStyle(.white).lineLimit(1)
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(.black.opacity(0.55)).clipShape(Capsule())
+    }
+}
+
+final class CompareController {
+    private static var windows: [NSWindow] = []
+    static func show(left: URL, right: URL) {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 740),
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.title = "Compare — \(left.lastPathComponent)  ↔  \(right.lastPathComponent)"
+        w.contentView = NSHostingView(rootView: SwipeCompareView(leftURL: left, rightURL: right))
+        w.center(); windows.append(w)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+            windows.removeAll { $0 === w }
+        }
+        w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }
 }
 
