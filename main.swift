@@ -1787,6 +1787,31 @@ final class Browser: ObservableObject, Identifiable {
         performTransfer(sources, into: dir, move: move, resetCut: false)
     }
 
+    // The platform copy engine (copyfile) with byte-level progress: clones on
+    // APFS (instant), byte-copies across volumes / SMB / File Provider while
+    // reporting bytes, and preserves metadata — the same engine FileManager uses.
+    // Used for regular files so a large copy shows a real, moving bar.
+    static func copyWithProgress(_ src: URL, _ dst: URL, onBytes: @escaping (Int64) -> Void) throws {
+        final class Box { let cb: (Int64) -> Void; init(_ c: @escaping (Int64) -> Void) { cb = c } }
+        let boxPtr = Unmanaged.passRetained(Box(onBytes)).toOpaque()
+        defer { Unmanaged<Box>.fromOpaque(boxPtr).release() }
+        let state = copyfile_state_alloc(); defer { copyfile_state_free(state) }
+        let cb: copyfile_callback_t = { what, stage, st, _, _, ctx in
+            if what == COPYFILE_COPY_DATA, stage == COPYFILE_PROGRESS, let ctx {
+                var copied: off_t = 0
+                _ = copyfile_state_get(st, UInt32(COPYFILE_STATE_COPIED), &copied)
+                Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue().cb(Int64(copied))
+            }
+            return COPYFILE_CONTINUE
+        }
+        _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CTX), boxPtr)
+        _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CB), unsafeBitCast(cb, to: UnsafeMutableRawPointer.self))
+        if copyfile(src.path, dst.path, state, copyfile_flags_t(COPYFILE_ALL | COPYFILE_CLONE)) != 0 {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                          userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+        }
+    }
+
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
         let fm = FileManager.default
         // A copy whose source already lives in the destination is an in-place
@@ -1845,34 +1870,44 @@ final class Browser: ObservableObject, Identifiable {
             var copied: [URL] = []
             var failures: [(name: String, reason: String)] = []
             let total = sources.count
-            let step = max(1, total / 50)   // update the progress bar ~50× max, not once per file
+            let step = max(1, total / 50)
+            // Byte-level progress so a single large file shows a real, moving bar
+            // (not a stuck 0%). Used only for plain file copies; folders and moves
+            // fall back to per-file (count) progress.
+            let sizes: [Int64] = sources.map { Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) }
+            let anyDir = sources.contains { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            let totalBytes = sizes.reduce(0, +)
+            let useBytes = !move && !anyDir && totalBytes > 0
+            var base: Int64 = 0
+            var lastFrac = -1.0
             for (i, src) in sources.enumerated() {
                 if progress.cancelled { break }
-                if i % step == 0 {
-                    DispatchQueue.main.async {
-                        progress.current = src.lastPathComponent
-                        progress.fraction = total > 0 ? Double(i) / Double(total) : 0
-                    }
-                }
+                if useBytes { let n = src.lastPathComponent; DispatchQueue.main.async { progress.current = n } }
                 let target = dir.appendingPathComponent(src.lastPathComponent)
                 var dest = target
                 if isSelfDup(src) {
                     dest = self.numberedCopyDest(dir, src.lastPathComponent)
                 } else if conflictNames.contains(src.lastPathComponent) {
                     switch policy {
-                    case .skip: continue
+                    case .skip: base += sizes[i]; continue
                     case .replace: try? fm.removeItem(at: target)
                     case .keepBoth: dest = self.uniqueDest(dir, src.lastPathComponent)
                     }
                 }
+                let fileBase = base
+                let onBytes: (Int64) -> Void = { copiedBytes in
+                    let frac = Double(fileBase + copiedBytes) / Double(totalBytes)
+                    if frac - lastFrac >= 0.004 {            // ~250 UI updates max, even for a 2 GB file
+                        lastFrac = frac
+                        DispatchQueue.main.async { progress.fraction = min(1, frac) }
+                    }
+                }
                 do {
-                    // On APFS, copyItem already does a copy-on-write clone (instant,
-                    // no extra space) for same-volume copies; across volumes / SMB /
-                    // File Provider it's a real byte copy (bandwidth-bound).
                     if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
-                    else { try fm.copyItem(at: src, to: dest); copied.append(dest) }
+                    else if useBytes { try Browser.copyWithProgress(src, dest, onBytes: onBytes); copied.append(dest) }
+                    else { try fm.copyItem(at: src, to: dest); copied.append(dest) }   // APFS clones this too
                 } catch {
-                    // Move across volumes fails as a rename → fall back to copy(+delete).
+                    // Cross-volume move (rename fails) or a copyfile hiccup → plain copy.
                     do {
                         try fm.copyItem(at: src, to: dest)
                         if move { try? fm.removeItem(at: src); moved.append((src, dest)) }
@@ -1880,6 +1915,11 @@ final class Browser: ObservableObject, Identifiable {
                     } catch let e {
                         failures.append((src.lastPathComponent, e.localizedDescription))
                     }
+                }
+                base += sizes[i]
+                if !useBytes, i % step == 0 || i == total - 1 {
+                    let n = src.lastPathComponent, frac = total > 0 ? Double(i + 1) / Double(total) : 0
+                    DispatchQueue.main.async { progress.current = n; progress.fraction = frac }
                 }
             }
             DispatchQueue.main.async {
@@ -4152,7 +4192,11 @@ struct TransferProgressView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.headline)
             ProgressView(value: progress.fraction)
-            Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            HStack {
+                Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 8)
+                Text("\(Int((progress.fraction * 100).rounded()))%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+            }
             HStack { Spacer(); Button("Cancel") { progress.cancelled = true; onCancel() } }
         }.padding(18).frame(width: 380)
     }
