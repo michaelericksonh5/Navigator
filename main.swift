@@ -2543,14 +2543,8 @@ struct BreadcrumbBar: View {
                 Button { browser.navigate(to: crumb.url) } label: { Text(crumb.name).font(.callout).lineLimit(1).fixedSize() }
                     .buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 8)
-            if browser.slowNetwork {
-                Label("Network drive responding slowly…", systemImage: "wifi.exclamationmark")
-                    .font(.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
-                    .transition(.opacity)
-            }
+            Spacer(minLength: 0)
         }.padding(.horizontal, 10).padding(.vertical, 4).frame(maxWidth: .infinity, alignment: .leading).clipped()
-        .animation(.easeInOut(duration: 0.2), value: browser.slowNetwork)
     }
 }
 
@@ -3270,6 +3264,11 @@ struct StatusBar: View {
                 }
             }
             Spacer()
+            if browser.slowNetwork {
+                Label("Network drive responding slowly…", systemImage: "wifi.exclamationmark")
+                    .font(.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
+                    .padding(.trailing, 8).transition(.opacity)
+            }
             if browser.viewMode == .icon {
                 Image(systemName: "photo").font(.caption2).foregroundStyle(.secondary)
                 Slider(value: $browser.iconSize, in: 48...192).frame(width: 110).controlSize(.mini)
@@ -3554,11 +3553,16 @@ struct AnimatedImage: NSViewRepresentable {
         v.animates = true
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        v.image = NSImage(contentsOf: url)
+        loadAsync(into: v)
         return v
     }
-    func updateNSView(_ v: NSImageView, context: Context) {
-        v.image = NSImage(contentsOf: url); v.animates = true
+    func updateNSView(_ v: NSImageView, context: Context) { loadAsync(into: v) }
+    private func loadAsync(into v: NSImageView) {
+        let target = url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let img = NSImage(contentsOf: target)
+            DispatchQueue.main.async { v.image = img; v.animates = true }
+        }
     }
 }
 
@@ -3679,16 +3683,25 @@ struct ZoomableImageView: NSViewRepresentable {
     func makeNSView(context: Context) -> ZoomView {
         let v = ZoomView()
         v.onZoomChange = { z, fit in DispatchQueue.main.async { controller.zoom = z; controller.fitZoom = fit } }
-        v.setImage(NSImage(contentsOf: url))
         controller.view = v
         context.coordinator.url = url
+        loadAsync(into: v, coord: context.coordinator)
         return v
     }
     func updateNSView(_ v: ZoomView, context: Context) {
         controller.view = v
         if context.coordinator.url != url {
             context.coordinator.url = url
-            v.setImage(NSImage(contentsOf: url))
+            loadAsync(into: v, coord: context.coordinator)
+        }
+    }
+    // Decode off the main thread — a large PSD / online-only file would freeze
+    // the UI if read on the main thread. Ignore a stale load if the view moved on.
+    private func loadAsync(into v: ZoomView, coord: Coord) {
+        let target = url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let img = NSImage(contentsOf: target)
+            DispatchQueue.main.async { if coord.url == target { v.setImage(img) } }
         }
     }
     func makeCoordinator() -> Coord { Coord() }
@@ -3962,16 +3975,21 @@ struct SwipeCompare: NSViewRepresentable {
 
 struct SwipeCompareView: View {
     let leftURL: URL, rightURL: URL
-    private let leftImg: NSImage?, rightImg: NSImage?
-    init(leftURL: URL, rightURL: URL) {
-        self.leftURL = leftURL; self.rightURL = rightURL
-        leftImg = NSImage(contentsOf: leftURL); rightImg = NSImage(contentsOf: rightURL)
-    }
+    @State private var leftImg: NSImage?
+    @State private var rightImg: NSImage?
     var body: some View {
         ZStack {
             Color.black
             SwipeCompare(left: leftImg, right: rightImg)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onAppear {
+                    // Decode off the main thread so opening compare on large
+                    // images doesn't freeze the UI.
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let l = NSImage(contentsOf: leftURL), r = NSImage(contentsOf: rightURL)
+                        DispatchQueue.main.async { leftImg = l; rightImg = r }
+                    }
+                }
             VStack {
                 HStack { tag(leftURL.lastPathComponent); Spacer(); tag(rightURL.lastPathComponent) }.padding(12)
                 Spacer()
