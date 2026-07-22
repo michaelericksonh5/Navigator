@@ -408,7 +408,7 @@ final class QuickLook: NSObject, QLPreviewPanelDataSource {
 
 // MARK: - Model
 
-struct FileItem: Identifiable, Hashable {
+struct FileItem: Identifiable, Hashable, Codable {
     let id: String
     let url: URL
     let name: String
@@ -426,6 +426,45 @@ struct FileItem: Identifiable, Hashable {
 
     static func == (l: FileItem, r: FileItem) -> Bool { l.id == r.id }
     func hash(into h: inout Hasher) { h.combine(id) }
+}
+
+// Persists network directory listings across launches so the FIRST open of a
+// network folder in a new session paints instantly (then refreshes in the
+// background). Local folders enumerate fast enough to skip. Capped, evicts
+// oldest. Main-thread access only; disk writes are async-snapshotted.
+enum DiskCache {
+    private struct Entry: Codable { let items: [FileItem]; let savedAt: Date }
+    private static let maxFolders = 60
+    private static let maxItemsPerFolder = 5000
+    private static let fileURL: URL = {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Navigator", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("dircache.json")
+    }()
+    private static var store: [String: Entry] = {
+        guard let d = try? Data(contentsOf: fileURL),
+              let s = try? JSONDecoder().decode([String: Entry].self, from: d) else { return [:] }
+        return s
+    }()
+    static func get(_ key: String) -> [FileItem]? { store[key]?.items }
+    static func put(_ key: String, _ items: [FileItem]) {
+        guard items.count <= maxItemsPerFolder else { return }
+        store[key] = Entry(items: items, savedAt: Date())
+        if store.count > maxFolders {
+            for v in store.sorted(by: { $0.value.savedAt < $1.value.savedAt }).prefix(store.count - maxFolders) {
+                store[v.key] = nil
+            }
+        }
+        persist()
+    }
+    static func remove(_ key: String) { if store.removeValue(forKey: key) != nil { persist() } }
+    private static func persist() {
+        let snap = store
+        DispatchQueue.global(qos: .utility).async {
+            if let d = try? JSONEncoder().encode(snap) { try? d.write(to: fileURL) }
+        }
+    }
 }
 
 struct SidebarLocation: Identifiable, Hashable {
@@ -1056,7 +1095,9 @@ final class Browser: ObservableObject, Identifiable {
     // so revisits / back-forward are instant while a fresh copy loads in the
     // background. Main-thread only.
     private static var dirCache: [String: [FileItem]] = [:]
-    static func invalidateCache(_ path: String) { dirCache[path] = nil; dirCache[path + "\u{1}h"] = nil }
+    static func invalidateCache(_ path: String) {
+        for k in [path, path + "\u{1}h"] { dirCache[k] = nil; DiskCache.remove(k) }
+    }
 
     // Auto-refresh: watches the current (local) folder and silently re-reads it
     // when its contents change on disk (e.g. a download finishes, another app
@@ -1114,8 +1155,10 @@ final class Browser: ObservableObject, Identifiable {
         let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
         // Show cached contents instantly on revisit; still refresh in the background.
         let cached = Browser.dirCache[cacheKey]
-        if let cached {
-            items = cached
+        // Disk cache seeds only network folders (local is already instant).
+        let seed = cached ?? (isNetwork ? DiskCache.get(cacheKey) : nil)
+        if let seed {
+            items = seed
             busy = false; busyText = ""
             updateFreeSpace(); updateStatus()
         } else {
@@ -1123,9 +1166,9 @@ final class Browser: ObservableObject, Identifiable {
             busy = true; busyText = "Loading…"
             updateStatus()
         }
-        let hadCache = cached != nil
-        if isNetwork { loadNetwork(dir, gen: gen, cacheKey: cacheKey) }
-        else { loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: hadCache) }
+        let hadSeed = seed != nil
+        if isNetwork { loadNetwork(dir, gen: gen, cacheKey: cacheKey, hadSeed: hadSeed) }
+        else { loadLocal(dir, gen: gen, cacheKey: cacheKey, hadCache: cached != nil) }
     }
 
     // Local volumes: stat is cheap, so read everything (incl. tags/kind) up front
@@ -1168,7 +1211,7 @@ final class Browser: ObservableObject, Identifiable {
     // VPN), updating the UI in chunks. Both phases honor the generation token so
     // navigating away cancels them, and the final result is cached for instant
     // revisits. Finder blocks on phase 2 for the whole folder — hence the hang.
-    private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String) {
+    private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String, hadSeed: Bool = false) {
         let showHidden = self.showHidden
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var names = Browser.fastNames(dir, showHidden: showHidden)
@@ -1187,11 +1230,15 @@ final class Browser: ObservableObject, Identifiable {
             var enriched = names.map { Browser.lightItem(url: $0.url, isDir: $0.isDir) }
             guard let self, gen == self.loadGeneration else { return }
             let light = enriched
-            DispatchQueue.main.async { [weak self] in
-                guard let self, gen == self.loadGeneration else { return }
-                self.items = light                       // instant: names + folder icons
-                self.busy = false; self.busyText = ""
-                self.updateFreeSpace(); self.updateStatus()
+            // Skip the names-only repaint if a full-detail seed is already on screen
+            // — it would blank out sizes/dates until Phase 2 refills them.
+            if !hadSeed {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, gen == self.loadGeneration else { return }
+                    self.items = light                   // instant: names + folder icons
+                    self.busy = false; self.busyText = ""
+                    self.updateFreeSpace(); self.updateStatus()
+                }
             }
             // Phase 2 — fetch size + dates. Each is a separate SMB round-trip
             // (~90ms over VPN); done serially a 600-item folder stalls ~a minute.
@@ -1215,7 +1262,11 @@ final class Browser: ObservableObject, Identifiable {
             let committed = enriched
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
+                // A transient empty read (folder briefly unreachable) must not wipe a
+                // seed we're already showing, nor overwrite the persisted cache.
+                if committed.isEmpty && hadSeed { return }
                 Browser.dirCache[cacheKey] = committed
+                if !committed.isEmpty { DiskCache.put(cacheKey, committed) }   // persist for instant first-open next session
                 self.items = committed; self.updateStatus()
             }
         }
