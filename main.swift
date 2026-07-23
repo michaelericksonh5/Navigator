@@ -3577,14 +3577,13 @@ struct FileTableView: View {
 
     @TableRowBuilder<FileItem>
     private func tableRow(_ item: FileItem) -> some TableRowContent<FileItem> {
+        // EXPERIMENT: no row-level .dropDestination — that registers the whole
+        // NSTableView as a drag destination and makes it swallow empty-area drops.
+        // With it gone, the table is drag-transparent and the container-level
+        // .dropDestination should catch drops anywhere. (itemProvider = drag-OUT,
+        // a source, is kept.)
         TableRow(item)
             .itemProvider { NSItemProvider(object: item.url as NSURL) }
-            .dropDestination(for: URL.self) { urls in
-                // Onto a folder row → into that folder; onto a file row → into the
-                // current folder (so a drop anywhere on the list lands somewhere).
-                if item.isDirectory { browser.importURLs(urls, into: item.url, move: true) }
-                else { browser.dropIntoCurrentFolder(urls) }
-            }
     }
 
     @ViewBuilder
