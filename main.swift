@@ -1009,6 +1009,22 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
 
 struct H5GResult { let out: String; let err: String; let code: Int32 }
 
+// Append-only dev log at ~/Library/Logs/Navigator.log — while we bring the
+// Vertex/Imagen path up, so failures are diagnosable instead of guesswork.
+// ponytail: plain FileHandle append, no rotation; trim manually if it grows.
+let navLogURL = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/Navigator.log"))
+func navLog(_ msg: String) {
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    guard let data = "[\(stamp)] \(msg)\n".data(using: .utf8) else { return }
+    if let fh = try? FileHandle(forWritingTo: navLogURL) {
+        defer { try? fh.close() }
+        _ = try? fh.seekToEnd(); try? fh.write(contentsOf: data)
+    } else {
+        try? FileManager.default.createDirectory(at: navLogURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: navLogURL)
+    }
+}
+
 // GUI apps launched from Finder/Dock have a minimal PATH (no nvm/homebrew), so
 // resolve node by absolute path: nvm versions, then homebrew, then system.
 func resolveNode() -> String? {
@@ -1056,11 +1072,17 @@ func runH5GClient(_ args: [String]) -> H5GResult {
     p.environment = env
     let o = Pipe(); let e = Pipe()
     p.standardOutput = o; p.standardError = e
-    do { try p.run() } catch { return H5GResult(out: "", err: error.localizedDescription, code: 127) }
+    navLog("run: node \(client) \(args.joined(separator: " "))")
+    do { try p.run() } catch {
+        navLog("run FAILED to launch: \(error.localizedDescription)")
+        return H5GResult(out: "", err: error.localizedDescription, code: 127)
+    }
     let od = o.fileHandleForReading.readDataToEndOfFile()
     let ed = e.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return H5GResult(out: String(data: od, encoding: .utf8) ?? "", err: String(data: ed, encoding: .utf8) ?? "", code: p.terminationStatus)
+    let out = String(data: od, encoding: .utf8) ?? "", err = String(data: ed, encoding: .utf8) ?? ""
+    navLog("exit \(p.terminationStatus)\n  out: \(out.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1500))\n  err: \(err.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1500))")
+    return H5GResult(out: out, err: err, code: p.terminationStatus)
 }
 
 // client.mjs prints "✅ Saved <path>" on success.
@@ -1104,6 +1126,7 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
     guard !imgs.isEmpty else { NSSound.beep(); return }
     guard resolveNode() != nil, resolveH5GClient() != nil else { DispatchQueue.main.async { promptVertexSetup() }; return }
     guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
+    navLog("Imagen upscale ×\(factor): \(imgs.count) image(s)  node=\(resolveNode() ?? "?")  client=\(resolveH5GClient() ?? "?")")
     DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling", total: 0) }
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []; var errors: [String] = []
@@ -1114,20 +1137,24 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
                     : "Upscaling \(idx + 1) of \(imgs.count) — Imagen ×\(factor)"
             }
             let transparent = imageHasTransparency(src)
+            navLog("[\(idx + 1)/\(imgs.count)] \(src.lastPathComponent) transparent=\(transparent)")
             var inputPath = src.path
             var tmpInput: URL? = nil
             if transparent, let cg = loadCGImage(src), let g = compositeOnGreen(cg), let png = encodePNG(g) {
                 let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
                 if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
+                else { navLog("  green-composite temp write FAILED — sending original transparent PNG") }
             }
             let args = ["imagen-upscale", inputPath, "--factor", "x\(factor)", "--out", FileManager.default.temporaryDirectory.path]
             var r = runH5GClient(args)
             // Imagen's diffusion upscaler blips transiently ("no image returned"),
             // which doesn't bill — one retry kills most spurious failures.
-            if r.code != 0 || parseSavedPath(r.out) == nil { r = runH5GClient(args) }
+            if r.code != 0 || parseSavedPath(r.out) == nil { navLog("  attempt 1 failed — retrying once"); r = runH5GClient(args) }
             if let t = tmpInput { try? FileManager.default.removeItem(at: t) }
             guard r.code == 0, let saved = parseSavedPath(r.out) else {
-                errors.append("\(src.lastPathComponent): \(cleanH5GError(r))"); continue
+                let msg = cleanH5GError(r)
+                navLog("  RESULT: error — \(msg)")
+                errors.append("\(src.lastPathComponent): \(msg)"); continue
             }
             let savedURL = URL(fileURLWithPath: saved)
             let dst = upscaleOutputURL(src)
@@ -1137,8 +1164,13 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
                 try finalData.write(to: dst)
                 try? FileManager.default.removeItem(at: savedURL)
                 outs.append(dst)
-            } catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
+                navLog("  RESULT: ok → \(dst.lastPathComponent)")
+            } catch {
+                navLog("  RESULT: save failed — \(error.localizedDescription)")
+                errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)")
+            }
         }
+        navLog("Imagen upscale done: \(outs.count) ok, \(errors.count) error(s)")
         DispatchQueue.main.async {
             BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
             if !errors.isEmpty { showBGSummary(app: "Upscale (Imagen 4)", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
@@ -6357,6 +6389,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vSignIn.target = self
         let vStatus = aiMenu.addItem(withTitle: "Vertex Status…", action: #selector(vertexStatusAction(_:)), keyEquivalent: "")
         vStatus.target = self
+        let vLog = aiMenu.addItem(withTitle: "Open AI Log…", action: #selector(openAILogAction(_:)), keyEquivalent: "")
+        vLog.target = self
 
         NSApp.mainMenu = mainMenu
     }
@@ -6389,6 +6423,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
         try? p.run()
+    }
+
+    // AI → Open AI Log — reveal the dev log so failures are easy to inspect.
+    @objc func openAILogAction(_ sender: Any?) {
+        if !FileManager.default.fileExists(atPath: navLogURL.path) { navLog("(log opened — no activity yet)") }
+        NSWorkspace.shared.open(navLogURL)
     }
 
     // AI → Vertex Status — `whoami` against the metered service.
