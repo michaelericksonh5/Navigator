@@ -637,6 +637,57 @@ func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     }
 }
 
+// Remove BG for several images in one hidden Photoshop session (reuses the
+// proven single script per file). Photoshop is launched hidden on the first
+// call and stays open/hidden between files. `onDone` gets the outputs that
+// succeeded. Failures are surfaced per file by runPhotoshopScript.
+func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []
+        for src in imgs {
+            let out = rmbgOutputURL(src)
+            if runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path]) { outs.append(out) }
+        }
+        DispatchQueue.main.async {
+            guard !outs.isEmpty else { return }
+            hideApp(bundleID: "com.adobe.Photoshop")
+            onDone?(outs)
+        }
+    }
+}
+
+// Chroma Key for several PNGs in one hidden After Effects session (single still
+// script per file).
+func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    let pngs = srcs.filter { $0.pathExtension.lowercased() == "png" }
+    guard !pngs.isEmpty else { NSSound.beep(); return }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []
+        for src in pngs {
+            let folder = src.deletingLastPathComponent()
+            let base = src.deletingPathExtension().lastPathComponent
+            let out = folder.appendingPathComponent("\(base)_rmbg.png")
+            let cfg: [String: Any] = [
+                "sourceFile": src.path, "outputFolder": folder.path, "outputName": "\(base)_rmbg",
+                "automationMode": true, "showUi": false, "appendFrameToken": false,
+                "renderImmediately": true, "finalOutputFormat": "png",
+                "deleteIntermediateRender": true, "keyMode": "auto"
+            ]
+            guard let cfgPath = writeChromaConfig(cfg) else { continue }
+            let ok = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
+            try? FileManager.default.removeItem(atPath: cfgPath)
+            if ok { outs.append(out) }
+        }
+        DispatchQueue.main.async {
+            guard !outs.isEmpty else { return }
+            hideApp(bundleID: "com.adobe.AfterEffects")
+            onDone?(outs)
+        }
+    }
+}
+
 // Hide a finished helper app (Photoshop / After Effects) and bring Navigator
 // back to the front, so it isn't left sitting in front of the user.
 func hideApp(bundleID: String) {
@@ -1145,17 +1196,20 @@ final class Browser: ObservableObject, Identifiable {
     @Published var items: [FileItem] = [] {
         didSet {
             visibleCache = nil
-            // A background op (e.g. Remove BG) asked to reveal a file once the
-            // listing reloads and contains it — select + scroll to it now.
-            if let p = pendingRevealPath, items.contains(where: { $0.id == p }) {
-                pendingRevealPath = nil
-                selection = [p]; keyboardScrollID = p; updateStatus()
+            // A background op (e.g. Remove BG) asked to reveal file(s) once the
+            // listing reloads and contains them — select + scroll to them now.
+            if !pendingRevealPaths.isEmpty {
+                let present = pendingRevealPaths.filter { p in items.contains { $0.id == p } }
+                if !present.isEmpty {
+                    pendingRevealPaths = []
+                    selection = Set(present); keyboardScrollID = present.first; updateStatus()
+                }
             }
         }
     }
     @Published var selection: Set<String> = []
-    // Path to select + scroll to as soon as the next listing load includes it.
-    var pendingRevealPath: String?
+    // Paths to select + scroll to as soon as the next listing load includes them.
+    var pendingRevealPaths: [String] = []
     @Published var pathText: String = ""
     @Published var filterText: String = "" { didSet { visibleCache = nil } }
     @Published var searchText: String = ""
@@ -1954,25 +2008,36 @@ final class Browser: ObservableObject, Identifiable {
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
     }
 
-    // Refresh the listing and, once it reloads with the file present, select +
-    // scroll to it (used to highlight a just-produced "_rmbg" result).
-    func refreshAndReveal(_ url: URL) {
-        pendingRevealPath = url.path
+    // Refresh the listing and, once it reloads with the file(s) present, select +
+    // scroll to them (used to highlight just-produced "_rmbg" results).
+    func refreshAndReveal(_ url: URL) { refreshAndReveal([url]) }
+    func refreshAndReveal(_ urls: [URL]) {
+        pendingRevealPaths = urls.map { $0.path }
         refresh()
     }
 
-    // Remove BG (single image): Photoshop keys the original and writes
-    // "<name>_rmbg.png" alongside; then we refresh and highlight the new file.
+    // Remove BG: Photoshop keys the selected image(s) and writes "<name>_rmbg.png"
+    // alongside each; then we refresh and highlight the new file(s). Works for one
+    // selected image or many (e.g. 20 of 300).
     func removeBackground(_ ids: Set<String>) {
-        guard let id = ids.first, let it = items.first(where: { $0.id == id }),
-              !it.isDirectory, isImageFile(it.url) else { NSSound.beep(); return }
-        removeBackgroundForImage(it.url) { [weak self] out in self?.refreshAndReveal(out) }
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        if urls.count == 1 {
+            removeBackgroundForImage(urls[0]) { [weak self] out in self?.refreshAndReveal(out) }
+        } else {
+            removeBackgroundForImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+        }
     }
 
-    // Chroma Key BG (single PNG) via After Effects — writes "<base>_rmbg.png" next to it.
+    // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
-        guard let id = ids.first, let it = items.first(where: { $0.id == id }), !it.isDirectory else { NSSound.beep(); return }
-        chromaKeyForImage(it.url) { [weak self] out in self?.refreshAndReveal(out) }
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        if urls.count == 1 {
+            chromaKeyForImage(urls[0]) { [weak self] out in self?.refreshAndReveal(out) }
+        } else {
+            chromaKeyForImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+        }
     }
 
     // Batch Chroma Key BG (folder): AE keys every PNG in the folder, writing
@@ -3262,17 +3327,23 @@ struct FileTableView: View {
             Button("Duplicate") { browser.duplicate(ids) }
             Button("Make Alias") { browser.makeAlias(ids) }
             Button("Make Symbolic Link") { browser.makeSymlink(ids) }
-            if PhotoshopIcon.image != nil, ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }) {
-                if !it.isDirectory, isImageFile(it.url) {
-                    Button { browser.removeBackground(ids) } label: { psLabel("Remove BG") }
-                } else if it.isDirectory {
+            if PhotoshopIcon.image != nil {
+                let sel = browser.items.filter { ids.contains($0.id) }
+                let imgCount = sel.filter { !$0.isDirectory && isImageFile($0.url) }.count
+                let dirs = sel.filter { $0.isDirectory }
+                if imgCount >= 1 {
+                    Button { browser.removeBackground(ids) } label: { psLabel(imgCount == 1 ? "Remove BG" : "Remove BG (\(imgCount) images)") }
+                } else if dirs.count == 1, sel.count == 1 {
                     Button { browser.batchRemoveBackground(ids) } label: { psLabel("Batch Remove BG") }
                 }
             }
-            if AfterEffectsIcon.image != nil, ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }) {
-                if !it.isDirectory, it.url.pathExtension.lowercased() == "png" {
-                    Button { browser.chromaKeyBackground(ids) } label: { aeLabel("Chroma Key BG") }
-                } else if it.isDirectory {
+            if AfterEffectsIcon.image != nil {
+                let sel = browser.items.filter { ids.contains($0.id) }
+                let pngCount = sel.filter { !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.count
+                let dirs = sel.filter { $0.isDirectory }
+                if pngCount >= 1 {
+                    Button { browser.chromaKeyBackground(ids) } label: { aeLabel(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)") }
+                } else if dirs.count == 1, sel.count == 1 {
                     Button { browser.batchChromaKeyBackground(ids) } label: { aeLabel("Batch Chroma Key BG") }
                 }
             }
@@ -3521,17 +3592,23 @@ struct IconGridView: View {
                 Button("Duplicate") { browser.duplicate([item.id]) }
                 Button("Make Alias") { browser.makeAlias([item.id]) }
                 Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
+                // If the right-clicked cell is part of a multi-selection, act on
+                // the whole selection; otherwise just this item.
+                let bgIDs: Set<String> = (browser.selection.contains(item.id) && browser.selection.count > 1) ? browser.selection : [item.id]
+                let bgSel = browser.items.filter { bgIDs.contains($0.id) }
                 if PhotoshopIcon.image != nil {
-                    if !item.isDirectory, isImageFile(item.url) {
-                        Button { browser.removeBackground([item.id]) } label: { psLabel("Remove BG") }
-                    } else if item.isDirectory {
+                    let imgCount = bgSel.filter { !$0.isDirectory && isImageFile($0.url) }.count
+                    if imgCount >= 1 {
+                        Button { browser.removeBackground(bgIDs) } label: { psLabel(imgCount == 1 ? "Remove BG" : "Remove BG (\(imgCount) images)") }
+                    } else if item.isDirectory, bgSel.count == 1 {
                         Button { browser.batchRemoveBackground([item.id]) } label: { psLabel("Batch Remove BG") }
                     }
                 }
                 if AfterEffectsIcon.image != nil {
-                    if !item.isDirectory, item.url.pathExtension.lowercased() == "png" {
-                        Button { browser.chromaKeyBackground([item.id]) } label: { aeLabel("Chroma Key BG") }
-                    } else if item.isDirectory {
+                    let pngCount = bgSel.filter { !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.count
+                    if pngCount >= 1 {
+                        Button { browser.chromaKeyBackground(bgIDs) } label: { aeLabel(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)") }
+                    } else if item.isDirectory, bgSel.count == 1 {
                         Button { browser.batchChromaKeyBackground([item.id]) } label: { aeLabel("Batch Chroma Key BG") }
                     }
                 }
