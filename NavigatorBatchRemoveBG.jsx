@@ -15,7 +15,8 @@ app.bringToFront();
 
 var SKIP_FOLDERS = ["EN", "en"];
 var IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".psd", ".tif", ".tiff", ".bmp"];
-var TARGET = (typeof arguments !== "undefined" && arguments.length > 0) ? String(arguments[0]) : null;
+var TARGET = (typeof arguments !== "undefined" && arguments.length > 0) ? String(arguments[0])
+    : (($.global && $.global.NAV_ARG) ? String($.global.NAV_ARG) : null);
 
 // ============================================
 // FILE PROCESSING
