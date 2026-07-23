@@ -159,7 +159,9 @@ This file is intended to be launched by run.bat.
         var sourceFolder = makeFolder(config.sourceFolder);
         var outputFolder = ensureFolder(makeFolder(config.outputFolder));
         var singleScript = config.singleScript ? makeFile(config.singleScript) : File(scriptFolder().fsName + "/chroma_key_still.jsx");
-        var logFile = makeFile(config.logFile || (outputFolder.fsName + "/chroma_key_folder.log"));
+        // Logging to a file is disabled (keeps the output folder clean) unless a
+        // logFile is explicitly requested. appendLog still echoes to the console.
+        var logFile = config.logFile ? makeFile(config.logFile) : null;
 
         appendLog(logFile, "Batch config: " + cfgFile.fsName);
         appendLog(logFile, "Source folder: " + sourceFolder.fsName);
@@ -206,8 +208,7 @@ This file is intended to be launched by run.bat.
                     autoSampleStrategy: config.autoSampleStrategy || "corners",
                     renderImmediately: false,
                     finalOutputFormat: "png",
-                    deleteIntermediateRender: config.deleteIntermediateRender !== false,
-                    logFile: outputFolder.fsName + "/" + outputName + ".log"
+                    deleteIntermediateRender: config.deleteIntermediateRender !== false
                 };
                 $.evalFile(singleScript);
                 queued.push({ sourceName: source.name, outputName: outputName });
@@ -251,14 +252,18 @@ This file is intended to be launched by run.bat.
         var succeeded = queued.length - outputFailed;
         appendLog(logFile, "Complete. Succeeded=" + succeeded + " Failed=" + failed);
         if (failed > 0) {
-            throw new Error("Batch completed with failures. See " + logFile.fsName);
+            throw new Error("Batch completed with failures: " + failed + " of " + files.length + " (succeeded " + succeeded + ").");
         }
+        return "processed " + succeeded + " of " + files.length;
     }
 
+    var RESULT;
     try {
-        main();
+        RESULT = "OK: " + main();
     } catch (e) {
+        // Return the error as a status string so Navigator can surface it.
+        RESULT = "ERROR: " + e.toString();
         $.writeln("[chroma_key_folder] ERROR: " + e.toString());
-        throw e;
     }
+    RESULT;  // returned to osascript stdout
 })();

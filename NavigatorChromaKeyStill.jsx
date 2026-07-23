@@ -113,14 +113,14 @@ Notes:
     var DID_BEGIN_UNDO = false;
 
     function log(message) {
-        var line = "[chroma_key_still] " + message;
-        $.writeln(line);
+        // Console only — no log FILE is written (keeps the output folder clean).
+        $.writeln("[chroma_key_still] " + message);
         if (!LOG_FILE) {
             return;
         }
         try {
             LOG_FILE.open(LOG_INITIALIZED ? "a" : "w");
-            LOG_FILE.write(line + "\n");
+            LOG_FILE.write("[chroma_key_still] " + message + "\n");
             LOG_FILE.close();
             LOG_INITIALIZED = true;
         } catch (e) {
@@ -208,23 +208,13 @@ Notes:
     }
 
     function initLogFile(config) {
-        var logPath = config.logFile;
-        if (!logPath) {
-            if (config.outputFolder) {
-                logPath = makeFolder(config.outputFolder).fsName + "/chroma_key_still.log";
-            } else {
-                logPath = scriptFolder().fsName + "/chroma_key_still.log";
-            }
-        }
-        LOG_FILE = makeFile(logPath);
-        var parent = LOG_FILE.parent;
-        if (parent && !parent.exists) {
-            ensureFolder(parent);
-        }
-        LOG_INITIALIZED = false;
-        log("Log file: " + LOG_FILE.fsName);
-        if (config.configFile) {
-            log("Config file: " + makeFile(config.configFile).fsName);
+        // Logging to a file is disabled — only write a file if a logFile is
+        // explicitly requested in the config (Navigator never sets one).
+        if (config.logFile) {
+            LOG_FILE = makeFile(config.logFile);
+            var parent = LOG_FILE.parent;
+            if (parent && !parent.exists) { ensureFolder(parent); }
+            LOG_INITIALIZED = false;
         }
     }
 
@@ -1009,16 +999,16 @@ Notes:
         var renderInfo = queueRender(made.comp, outputFolder, outputName, CONFIG);
         var finalOutputs = CONFIG.renderImmediately ? convertRenderedOutputs(renderInfo, CONFIG) : [renderInfo.outputPath];
         log("Done. Final output: " + finalOutputs.join(", "));
+        return finalOutputs.join(", ");
     }
 
+    var RESULT;
     try {
-        main();
+        RESULT = "OK: " + main();
     } catch (e) {
-        log("ERROR: " + e.toString());
-        if (!isAutomation(ACTIVE_CONFIG)) {
-            alert("Chroma key export failed:\n" + e.toString());
-        }
-        throw e;
+        // Return the error as a status string (osascript stdout) so Navigator can
+        // surface it — no blocking alert (invisible when the user is in Navigator).
+        RESULT = "ERROR: " + e.toString();
     } finally {
         try {
             if (DID_BEGIN_UNDO) {
@@ -1030,4 +1020,5 @@ Notes:
             app.quit();
         }
     }
+    RESULT;  // returned to osascript stdout
 })();

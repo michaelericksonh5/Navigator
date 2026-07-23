@@ -760,9 +760,11 @@ func runAfterEffectsScript(resource: String, globals: [String: String]) {
         let outData = out.fileHandleForReading.readDataToEndOfFile()
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        _ = outData
+        let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if p.terminationStatus != 0 {
             DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", String(data: errData, encoding: .utf8) ?? "") }
+        } else if stdout.contains("ERROR") {
+            DispatchQueue.main.async { reportFileError("After Effects couldn’t finish Chroma Key", stdout) }
         }
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) }
