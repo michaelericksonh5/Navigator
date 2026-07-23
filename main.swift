@@ -4641,23 +4641,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // and skip if the user/IT already tuned it. Takes effect on the next mount.
     func ensureSMBTuning() {
         let path = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Preferences/nsmb.conf")
-        if let existing = try? String(contentsOfFile: path, encoding: .utf8) {
-            if existing.contains("notify_off") { return }   // already configured — leave it alone
-            // Only append if there's no [default] section to disturb (avoid duplicate sections).
-            if existing.range(of: #"(?m)^\s*\[default\]"#, options: .regularExpression) == nil {
-                let updated = existing + "\n[default]\nnotify_off=yes\n"
-                try? updated.write(toFile: path, atomically: true, encoding: .utf8)
-            }
-            return
-        }
-        let content = """
-        # Written by Navigator — steadier, faster SMB/network-drive browsing.
-        # Disables SMB directory change-notifications (needless chatter over VPN).
-        # Per-user, safe, no sudo. Takes effect on the next mount.
+        // Research-backed client tuning for high-latency SMB over VPN. Per-user,
+        // no sudo; takes effect on the NEXT mount. Values target the two things
+        // we CAN influence against a slow/non-batching server:
+        //   dir_cache_async_cnt  10→100 : many parallel directory queries in flight
+        //                                 to hide per-round-trip VPN latency while
+        //                                 the listing is fetched.
+        //   dir_cache_max/min           : keep a fetched directory cached longer so
+        //                                 repeat browsing isn't re-listed (default
+        //                                 60s is shorter than a big folder takes).
+        //   max_cached_per_dir  =10000  : cache even large (600+ item) folders fully.
+        //   notify_off                  : skip change-notify chatter over the VPN.
+        let ours = """
+        # Written by Navigator — faster, steadier SMB browsing over VPN (per-user, no sudo).
+        # Takes effect on the next mount. See `man nsmb.conf`.
         [default]
         notify_off=yes
+        dir_cache_async_cnt=100
+        dir_cache_max=180s
+        dir_cache_min=60s
+        max_cached_per_dir=10000
         """
-        try? content.write(toFile: path, atomically: true, encoding: .utf8)
+        let existing = try? String(contentsOfFile: path, encoding: .utf8)
+        // Our file (or none) → safe to (re)write with the full tuned block.
+        if existing == nil || existing!.contains("Written by Navigator") {
+            if existing != ours { try? ours.write(toFile: path, atomically: true, encoding: .utf8) }
+            return
+        }
+        // A file we didn't create → be conservative: only add notify_off if there's
+        // no [default] section yet, never disturbing existing user/IT config.
+        if !existing!.contains("notify_off"),
+           existing!.range(of: #"(?m)^\s*\[default\]"#, options: .regularExpression) == nil {
+            try? (existing! + "\n[default]\nnotify_off=yes\n").write(toFile: path, atomically: true, encoding: .utf8)
+        }
     }
 
     // Finder Services entry: right-click a folder/file in Finder → Services →
