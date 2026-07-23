@@ -3511,20 +3511,40 @@ struct FileTableView: View {
             .onChange(of: browser.keyboardScrollID) {
                 if let id = browser.keyboardScrollID { proxy.scrollTo(id) }
             }
-            // Drop external files onto the table (empty area included) → import
-            // into the current folder. Folder-row drops (tableRow) take
-            // precedence when the drop lands on a folder. Without this, the Table
-            // swallows drops over its empty area and nothing lands.
+            // Drop onto the table's row area → current folder (folder rows take
+            // precedence). SwiftUI's Table only exposes row drops, so the empty
+            // area / empty folders are handled by the overlay below.
             .dropDestination(for: URL.self) { urls, _ in
                 browser.dropIntoCurrentFolder(urls); return true
             } isTargeted: { dropInCurrent = $0 }
             .overlay {
-                if dropInCurrent {
+                if browser.visibleItems().isEmpty {
+                    emptyFolderDropZone
+                } else if dropInCurrent {
                     RoundedRectangle(cornerRadius: 6)
                         .strokeBorder(Color.accentColor, lineWidth: 2).padding(2).allowsHitTesting(false)
                 }
             }
         }
+    }
+
+    // Shown when the folder has no items: a full-pane drop target (the Table has
+    // no rows to accept a drop, so this covers "drag into an empty folder").
+    private var emptyFolderDropZone: some View {
+        ZStack {
+            (dropInCurrent ? Color.accentColor.opacity(0.08) : Color.clear)
+            VStack(spacing: 6) {
+                Image(systemName: "tray.and.arrow.down")
+                    .font(.system(size: 34)).foregroundStyle(dropInCurrent ? Color.accentColor : Color.secondary.opacity(0.6))
+                Text("This folder is empty").font(.title3).foregroundStyle(.secondary)
+                Text("Drag files here to add them").font(.callout).foregroundStyle(.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .dropDestination(for: URL.self) { urls, _ in
+            browser.dropIntoCurrentFolder(urls); return true
+        } isTargeted: { dropInCurrent = $0 }
     }
     @State private var dropInCurrent = false
 
