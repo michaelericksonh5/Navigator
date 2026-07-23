@@ -2492,6 +2492,21 @@ final class Browser: ObservableObject, Identifiable {
         performTransfer(sources, into: currentURL, move: move, resetCut: true)
     }
 
+    // A drag-drop of external files onto the current folder. Finder-style: move
+    // when the sources are on the same volume as this folder, copy across
+    // volumes. (This is what a plain drag into a window does.)
+    func dropIntoCurrentFolder(_ urls: [URL]) {
+        func volID(_ u: URL) -> NSObject? {
+            (try? u.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? NSObject
+        }
+        let destVol = volID(currentURL)
+        let sameVolume = urls.allSatisfy { u in
+            guard let a = volID(u), let b = destVol else { return false }
+            return a.isEqual(b)
+        }
+        copyURLs(urls, move: sameVolume)
+    }
+
     // Import (move or copy) dropped items into a target directory (a folder row or another tab).
     func importURLs(_ urls: [URL], into dir: URL, move: Bool) {
         let sources = urls.filter { $0.deletingLastPathComponent().path != dir.path && $0.path != dir.path }
@@ -3492,8 +3507,22 @@ struct FileTableView: View {
             .onChange(of: browser.keyboardScrollID) {
                 if let id = browser.keyboardScrollID { proxy.scrollTo(id) }
             }
+            // Drop external files onto the table (empty area included) → import
+            // into the current folder. Folder-row drops (tableRow) take
+            // precedence when the drop lands on a folder. Without this, the Table
+            // swallows drops over its empty area and nothing lands.
+            .dropDestination(for: URL.self) { urls, _ in
+                browser.dropIntoCurrentFolder(urls); return true
+            } isTargeted: { dropInCurrent = $0 }
+            .overlay {
+                if dropInCurrent {
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color.accentColor, lineWidth: 2).padding(2).allowsHitTesting(false)
+                }
+            }
         }
     }
+    @State private var dropInCurrent = false
 
     @TableRowBuilder<FileItem>
     private func tableRow(_ item: FileItem) -> some TableRowContent<FileItem> {
@@ -4214,7 +4243,7 @@ struct BrowserContent: View {
                 }
             }
             .dropDestination(for: URL.self) { urls, _ in
-                browser.copyURLs(urls, move: false); return true
+                browser.dropIntoCurrentFolder(urls); return true
             }
             Divider()
             StatusBar(browser: browser)
