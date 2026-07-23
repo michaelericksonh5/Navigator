@@ -2951,12 +2951,12 @@ struct IconCell: View {
 
 // Collects each icon cell's frame (in the grid's coordinate space) so a
 // rubber-band drag can hit-test which items it covers.
-struct ItemFramesKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue()) { $1 }
-    }
-}
+// Holds each visible cell's frame for rubber-band hit-testing. A plain reference
+// (not @Published / not a PreferenceKey) on purpose: cells write their frame into
+// it WITHOUT feeding layout-derived values back into the view graph. The old
+// PreferenceKey approach reduced 600+ frames during layout and, with a large
+// cached folder present at launch, spun in a layout loop that hung the window.
+final class FrameStore { var frames: [String: CGRect] = [:] }
 
 // AppKit-level drag catcher for rubber-band selection. A SwiftUI DragGesture
 // inside a ScrollView is unreliable (the scroll view eats the drag), so we use a
@@ -3009,7 +3009,7 @@ struct MarqueeRect: View {
 struct IconGridView: View {
     let model: AppModel
     @ObservedObject var browser: Browser
-    @State private var itemFrames: [String: CGRect] = [:]
+    @State private var frameStore = FrameStore()
     @State private var marquee: CGRect?
     private var columns: [GridItem] { [GridItem(.adaptive(minimum: browser.iconSize + 44), spacing: 12)] }
 
@@ -3024,7 +3024,7 @@ struct IconGridView: View {
                             onRect: { r in
                                 marquee = r
                                 if let r {
-                                    browser.selection = Set(itemFrames.filter { $0.value.intersects(r) }.map { $0.key })
+                                    browser.selection = Set(frameStore.frames.filter { $0.value.intersects(r) }.map { $0.key })
                                     browser.updateStatus()
                                 }
                             },
@@ -3050,7 +3050,6 @@ struct IconGridView: View {
                         .padding(14)
                     }
                     .coordinateSpace(name: "iconGrid")
-                    .onPreferenceChange(ItemFramesKey.self) { itemFrames = $0 }
                     .overlay(alignment: .topLeading) {
                         if let m = marquee { MarqueeRect(rect: m) }
                     }
@@ -3076,7 +3075,12 @@ struct IconGridView: View {
         IconCell(item: item, browser: browser, selected: browser.selection.contains(item.id))
             .id(item.id)
             .background(GeometryReader { g in
-                Color.clear.preference(key: ItemFramesKey.self, value: [item.id: g.frame(in: .named("iconGrid"))])
+                // Record this cell's frame for marquee hit-testing — writing to a
+                // plain store (not a PreferenceKey), so it never feeds back into
+                // layout. Updated as cells appear/scroll into view.
+                Color.clear
+                    .onAppear { frameStore.frames[item.id] = g.frame(in: .named("iconGrid")) }
+                    .onChange(of: g.frame(in: .named("iconGrid"))) { _, f in frameStore.frames[item.id] = f }
             })
             // ONE tap recognizer — no count:2 gesture to disambiguate against, so
             // the select fires on mouse-up with zero double-click delay. A
