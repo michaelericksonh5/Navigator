@@ -998,6 +998,46 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
     }
 }
 
+// Batch Remove BG on a FOLDER (Photoshop) — shared by Navigator's menu and Finder.
+func batchRemoveBackgroundFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
+    DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds in \(folder.lastPathComponent)", total: 0) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let r = runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path], reportError: false)
+        DispatchQueue.main.async {
+            if r.ok { hideApp(bundleID: "com.adobe.Photoshop") }
+            BGJobProgress.shared.finish(batchSummaryLine("Remove BG", r))
+            if !r.ok { reportFileError("Photoshop couldn’t finish Batch Remove BG", r.message) }
+            onDone?()
+        }
+    }
+}
+
+// Batch Chroma Key on a FOLDER (After Effects) — shared by Navigator and Finder.
+func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
+    guard let still = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
+        reportFileError("After Effects script missing", "NavigatorChromaKeyStill.jsx isn’t bundled in Navigator.app."); return
+    }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying \(folder.lastPathComponent)", total: 0) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let cfg: [String: Any] = [
+            "sourceFolder": folder.path, "outputFolder": folder.path,
+            "singleScript": still.path, "outputSuffix": "_rmbg",
+            "keyMode": "auto", "finalOutputFormat": "png", "deleteIntermediateRender": true,
+        ]
+        guard let cfgPath = writeChromaConfig(cfg) else {
+            DispatchQueue.main.async { BGJobProgress.shared.finish("Chroma key failed"); reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
+        }
+        let r = runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath], reportError: false)
+        try? FileManager.default.removeItem(atPath: cfgPath)
+        DispatchQueue.main.async {
+            if r.ok { hideApp(bundleID: "com.adobe.AfterEffects") }
+            BGJobProgress.shared.finish(batchSummaryLine("Chroma key", r))
+            if !r.ok { reportFileError("After Effects couldn’t finish Batch Chroma Key", r.message) }
+            onDone?()
+        }
+    }
+}
+
 // Single-image Remove BG usable from anywhere (browser or image viewer): Photoshop
 // opens the ORIGINAL and saves the keyed result as "<name>_rmbg.png" — no redundant
 // pre-copy (faster, especially on network/Drive), and the original is never
@@ -2472,30 +2512,7 @@ final class Browser: ObservableObject, Identifiable {
     // transparent "<name>_rmbg" PNGs into a "_rmbg" subfolder. Originals untouched.
     func batchChromaKeyBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
-        guard let still = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
-            reportFileError("After Effects script missing", "NavigatorChromaKeyStill.jsx isn’t bundled in Navigator.app."); return
-        }
-        let folder = it.url
-        DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying \(folder.lastPathComponent)", total: 0) }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let cfg: [String: Any] = [
-                "sourceFolder": folder.path,
-                "outputFolder": folder.path,   // "<name>_rmbg.png" alongside each original
-                "singleScript": still.path, "outputSuffix": "_rmbg",
-                "keyMode": "auto", "finalOutputFormat": "png", "deleteIntermediateRender": true
-            ]
-            guard let cfgPath = writeChromaConfig(cfg) else {
-                DispatchQueue.main.async { BGJobProgress.shared.finish("Chroma key failed"); reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
-            }
-            let r = runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath], reportError: false)
-            try? FileManager.default.removeItem(atPath: cfgPath)
-            DispatchQueue.main.async {
-                if r.ok { hideApp(bundleID: "com.adobe.AfterEffects") }
-                BGJobProgress.shared.finish(batchSummaryLine("Chroma key", r))
-                if !r.ok { reportFileError("After Effects couldn’t finish Batch Chroma Key", r.message) }
-                self.refresh()
-            }
-        }
+        batchChromaKeyFolder(it.url) { [weak self] in self?.refresh() }
     }
 
     // Batch Remove BG (folder): Photoshop opens each ORIGINAL image (recursively,
@@ -2504,17 +2521,7 @@ final class Browser: ObservableObject, Identifiable {
     // written.
     func batchRemoveBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
-        let folder = it.url
-        DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds in \(folder.lastPathComponent)", total: 0) }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let r = runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path], reportError: false)
-            DispatchQueue.main.async {
-                if r.ok { hideApp(bundleID: "com.adobe.Photoshop") }
-                BGJobProgress.shared.finish(batchSummaryLine("Remove BG", r))
-                if !r.ok { reportFileError("Photoshop couldn’t finish Batch Remove BG", r.message) }
-                self.refresh()
-            }
-        }
+        batchRemoveBackgroundFolder(it.url) { [weak self] in self?.refresh() }
     }
     // What the address bar shows: inside Google Drive, the clean username-free
     // "Google Drive/Shared drives/…" form (directly shareable — a coworker pastes
@@ -5695,9 +5702,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSUpdateDynamicServices()
         // Install the Finder Quick Actions once per version (cheap; skips the pbs
         // flush on subsequent launches). Bump the marker when the workflows change.
-        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 1 {
+        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 2 {
             installFinderQuickActions(nil)
-            Prefs.d.set(1, forKey: "finderQuickActionsVersion")
+            Prefs.d.set(2, forKey: "finderQuickActionsVersion")
         }
         // Show the browser shortly — unless we were launched only to view an image
         // (the open handler sets suppressMainWindow first). The tiny delay also lets
@@ -5804,51 +5811,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let paths = (String(bytes: bytes, encoding: .utf8) ?? "")
             .split(separator: "\n").map(String.init)
-        let urls = paths.map { URL(fileURLWithPath: $0) }.filter { isImageFile($0) }
-        guard !urls.isEmpty else { return }
+        // Same routing as Navigator's own menu: folders → batch; image(s) → single/multi.
+        let all = paths.map { URL(fileURLWithPath: $0) }
+        let folders = all.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let images = all.filter { !folders.contains($0) && isImageFile($0) }
+        guard !folders.isEmpty || !images.isEmpty else { return }
         NSApp.activate(ignoringOtherApps: true)
         switch url.host {
-        case "removebg":       removeBackgroundForImages(urls)
-        case "chromakey":      chromaKeyForImages(urls)
-        case "upscale-art":    upscaleImagesViaFal(urls, option: upscalePreset("CGI"))
-        case "upscale-photo":  upscaleImagesViaFal(urls, option: upscalePreset("High Fidelity V2"))
-        case "upscale-lowq":   upscaleImagesViaFal(urls, option: upscalePreset("Wonder 3"))
+        case "removebg":
+            folders.forEach { batchRemoveBackgroundFolder($0) }
+            if !images.isEmpty { removeBackgroundForImages(images) }
+        case "chromakey":
+            folders.forEach { batchChromaKeyFolder($0) }
+            if !images.isEmpty { chromaKeyForImages(images) }
+        case "upscale-art":    if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("CGI")) }
+        case "upscale-photo":  if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("High Fidelity V2")) }
+        case "upscale-lowq":   if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("Wonder 3")) }
         default: break
         }
     }
 
-    // Finder Quick Actions to install (title → navigatoraction:// action).
-    private static let finderQuickActions: [(title: String, action: String)] = [
-        ("Navigator — Remove Background", "removebg"),
-        ("Navigator — Chroma Key (Green Screen)", "chromakey"),
-        ("Navigator — Upscale (Art)", "upscale-art"),
-        ("Navigator — Upscale (Photoreal)", "upscale-photo"),
-        ("Navigator — Upscale (Low Quality ×4)", "upscale-lowq"),
+    // Finder Quick Actions. Names + logic MATCH Navigator's own menu. `requires`
+    // = only installed when that app is present (PS/AE). `acceptsFolders` = also
+    // offered on folders (batch), like Navigator's Batch Remove BG / Chroma Key.
+    private struct FinderQA { let title: String; let action: String; let requires: String?; let acceptsFolders: Bool }
+    private static let finderQuickActions: [FinderQA] = [
+        .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
+        .init(title: "Chroma Key BG",          action: "chromakey",    requires: "com.adobe.AfterEffects", acceptsFolders: true),
+        .init(title: "Upscale Low Quality ×4", action: "upscale-lowq", requires: nil,                      acceptsFolders: false),
+        .init(title: "Upscale Art",            action: "upscale-art",  requires: nil,                      acceptsFolders: false),
+        .init(title: "Upscale Photoreal",      action: "upscale-photo", requires: nil,                     acceptsFolders: false),
+    ]
+    // Older names to clean up so we don't leave stale duplicates behind.
+    private static let legacyQuickActionNames = [
+        "Navigator — Remove Background", "Navigator — Chroma Key (Green Screen)",
+        "Navigator — Upscale (Art)", "Navigator — Upscale (Photoreal)", "Navigator — Upscale (Low Quality ×4)",
     ]
 
-    // Install/refresh the Quick Actions in ~/Library/Services so they appear in
-    // Finder's right-click for images. Each is a "Run Shell Script" workflow that
-    // hex-encodes the selected paths and opens navigatoraction://<action>.
+    // Install/refresh the Quick Actions in ~/Library/Services. Photoshop/After
+    // Effects actions install only when that app is present; upscales always.
     @objc func installFinderQuickActions(_ sender: Any? = nil) {
         let fm = FileManager.default
         let svc = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Services")
+        for name in Self.legacyQuickActionNames {
+            try? fm.removeItem(at: svc.appendingPathComponent("\(name).workflow"))
+        }
         for qa in Self.finderQuickActions {
-            let contents = svc.appendingPathComponent("\(qa.title).workflow/Contents")
+            let bundle = svc.appendingPathComponent("\(qa.title).workflow")
+            if let req = qa.requires, NSWorkspace.shared.urlForApplication(withBundleIdentifier: req) == nil {
+                try? fm.removeItem(at: bundle)   // app not installed → don't offer it
+                continue
+            }
+            let contents = bundle.appendingPathComponent("Contents")
             try? fm.createDirectory(at: contents, withIntermediateDirectories: true)
             let cmd = "h=$(printf '%s\\n' \"$@\" | xxd -p | tr -d '\\n'); open \"navigatoraction://\(qa.action)?hex=$h\""
-            try? Self.quickActionInfoPlist(title: qa.title).write(to: contents.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
-            try? Self.quickActionWorkflow(command: cmd).write(to: contents.appendingPathComponent("document.wflow"), atomically: true, encoding: .utf8)
+            try? Self.quickActionInfoPlist(title: qa.title, acceptsFolders: qa.acceptsFolders).write(to: contents.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
+            try? Self.quickActionWorkflow(command: cmd, acceptsFolders: qa.acceptsFolders).write(to: contents.appendingPathComponent("document.wflow"), atomically: true, encoding: .utf8)
         }
         let flush = Process(); flush.executableURL = URL(fileURLWithPath: "/System/Library/CoreServices/pbs"); flush.arguments = ["-flush"]
         try? flush.run()
         if sender != nil {
             let a = NSAlert(); a.messageText = "Finder Quick Actions installed"
-            a.informativeText = "Right-click an image in Finder to find Navigator’s Remove Background, Chroma Key, and Upscale actions. If they don’t show right away, toggle them on in System Settings → Keyboard → Keyboard Shortcuts → Services (or log out and back in)."
+            a.informativeText = "Right-click an image (or a folder) in Finder to find Navigator’s Remove BG, Chroma Key BG, and Upscale actions — the same as Navigator’s own menu. If they don’t show right away, enable them in System Settings → Keyboard → Keyboard Shortcuts → Services (or log out and back in)."
             a.addButton(withTitle: "OK"); a.runModal()
         }
     }
-    private static func quickActionInfoPlist(title: String) -> String {
-        """
+    private static func quickActionInfoPlist(title: String, acceptsFolders: Bool) -> String {
+        let types = acceptsFolders ? "<string>public.image</string><string>public.folder</string>" : "<string>public.image</string>"
+        return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
@@ -5857,13 +5887,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             <key>NSMenuItem</key><dict><key>default</key><string>\(title)</string></dict>
             <key>NSMessage</key><string>runWorkflowAsService</string>
             <key>NSRequiredContext</key><dict><key>NSApplicationIdentifier</key><string>com.apple.finder</string></dict>
-            <key>NSSendFileTypes</key><array><string>public.image</string></array>
+            <key>NSSendFileTypes</key><array>\(types)</array>
           </dict></array>
         </dict></plist>
         """
     }
-    private static func quickActionWorkflow(command: String) -> String {
-        """
+    private static func quickActionWorkflow(command: String, acceptsFolders: Bool) -> String {
+        let inputType = acceptsFolders ? "com.apple.Automator.fileSystemObject" : "com.apple.Automator.fileSystemObject.image"
+        return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
@@ -5931,13 +5962,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
           <key>workflowMetaData</key><dict>
             <key>applicationBundleIDsByPath</key><dict/>
             <key>applicationPaths</key><array/>
-            <key>inputTypeIdentifier</key><string>com.apple.Automator.fileSystemObject.image</string>
+            <key>inputTypeIdentifier</key><string>\(inputType)</string>
             <key>outputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
             <key>presentationMode</key><integer>11</integer>
             <key>processesInput</key><integer>0</integer>
             <key>serviceApplicationBundleID</key><string>com.apple.finder</string>
             <key>serviceApplicationPath</key><string>/System/Library/CoreServices/Finder.app</string>
-            <key>serviceInputTypeIdentifier</key><string>com.apple.Automator.fileSystemObject.image</string>
+            <key>serviceInputTypeIdentifier</key><string>\(inputType)</string>
             <key>serviceOutputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
             <key>serviceProcessesInput</key><integer>0</integer>
             <key>systemImageName</key><string>NSActionTemplate</string>
