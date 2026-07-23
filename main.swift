@@ -2427,12 +2427,16 @@ final class Browser: ObservableObject, Identifiable {
     // copy) replaced the contents and we must not move files we didn't cut.
     var cutChangeCount = -1
     private func selectedURLs() -> [URL] { items.filter { selection.contains($0.id) }.map { $0.url } }
-    func copyFiles() {
-        let urls = selectedURLs(); guard !urls.isEmpty else { NSSound.beep(); return }
+    // Copy/Cut act on an explicit id set when given (the right-clicked row from a
+    // context menu, which may not be in `selection`), else the current selection.
+    func copyFiles(_ ids: Set<String>? = nil) {
+        let urls = items.filter { (ids ?? selection).contains($0.id) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL]); cutMode = false
     }
-    func cutFiles() {
-        let urls = selectedURLs(); guard !urls.isEmpty else { NSSound.beep(); return }
+    func cutFiles(_ ids: Set<String>? = nil) {
+        let urls = items.filter { (ids ?? selection).contains($0.id) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL])
         cutMode = true; cutChangeCount = NSPasteboard.general.changeCount
     }
@@ -3529,8 +3533,10 @@ struct FileTableView: View {
         TableRow(item)
             .itemProvider { NSItemProvider(object: item.url as NSURL) }
             .dropDestination(for: URL.self) { urls in
-                guard item.isDirectory else { return }
-                browser.importURLs(urls, into: item.url, move: true)
+                // Onto a folder row → into that folder; onto a file row → into the
+                // current folder (so a drop anywhere on the list lands somewhere).
+                if item.isDirectory { browser.importURLs(urls, into: item.url, move: true) }
+                else { browser.dropIntoCurrentFolder(urls) }
             }
     }
 
@@ -3602,8 +3608,8 @@ struct FileTableView: View {
                 Button("Open in Terminal") { openInTerminal(it.isDirectory ? it.url : browser.currentURL) }
             }
             Divider()
-            Button("Copy") { browser.copyFiles() }
-            Button("Cut") { browser.cutFiles() }
+            Button("Copy") { browser.copyFiles(ids) }
+            Button("Cut") { browser.cutFiles(ids) }
             Button("Paste") { browser.pasteFiles() }
             if !browser.isGoogleDriveSelection(ids) { Button("Copy Path") { browser.copyPath(ids) } }
             Button("Copy Name") { browser.copyName(ids) }
@@ -3803,8 +3809,9 @@ struct IconGridView: View {
                 else { browser.click(item.id, modifiers: e?.modifierFlags ?? []) }
             }
             .dropDestination(for: URL.self) { urls, _ in
-                guard item.isDirectory else { return false }
-                browser.importURLs(urls, into: item.url, move: true); return true
+                if item.isDirectory { browser.importURLs(urls, into: item.url, move: true) }
+                else { browser.dropIntoCurrentFolder(urls) }
+                return true
             }
             .contextMenu {
                 Button("Open") { openItem(item, browser) }
