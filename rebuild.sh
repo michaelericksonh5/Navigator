@@ -39,6 +39,11 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
 [ -f "$DIR/Navigator.icns" ] && cp "$DIR/Navigator.icns" "$APP/Contents/Resources/Navigator.icns"
+# Bundle the Photoshop Remove-BG scripts so they ship inside the app — no one
+# needs a copy saved anywhere; Navigator points Photoshop at these.
+for jsx in NavigatorRemoveBG NavigatorBatchRemoveBG; do
+  [ -f "$DIR/$jsx.jsx" ] && cp "$DIR/$jsx.jsx" "$APP/Contents/Resources/$jsx.jsx"
+done
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -48,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.48</string>
-<key>CFBundleVersion</key><string>64</string>
+<key>CFBundleShortVersionString</key><string>1.4.49</string>
+<key>CFBundleVersion</key><string>65</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>

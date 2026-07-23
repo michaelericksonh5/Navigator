@@ -585,6 +585,53 @@ enum GoogleDriveIcon {
     }.labelStyle(.titleAndIcon)
 }
 
+// Photoshop's own icon + location, for the Remove-BG menu items. Resolved once;
+// `image` is nil (and the menu items are hidden) when Photoshop isn't installed.
+enum PhotoshopIcon {
+    static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.Photoshop")
+    static let image: NSImage? = url.map { NSWorkspace.shared.icon(forFile: $0.path) }
+}
+@ViewBuilder func psLabel(_ title: String) -> some View {
+    Label {
+        Text(title)
+    } icon: {
+        if let img = PhotoshopIcon.image { Image(nsImage: img).resizable().frame(width: 14, height: 14) }
+    }.labelStyle(.titleAndIcon)
+}
+
+// Runs a bundled Photoshop .jsx (by resource name, no extension) against one
+// path argument, launching Photoshop if needed. `do javascript` blocks until the
+// script finishes, so callers run this off the main thread and refresh after.
+func runPhotoshopScript(resource: String, argument: String) {
+    guard let script = Bundle.main.url(forResource: resource, withExtension: "jsx") else {
+        DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
+        return
+    }
+    func esc(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    }
+    let osa = """
+    tell application id "com.adobe.Photoshop"
+        activate
+        set jsx to (POSIX file "\(esc(script.path))") as alias
+        do javascript jsx with arguments {"\(esc(argument))"}
+    end tell
+    """
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", osa]
+    let err = Pipe(); p.standardError = err
+    do {
+        try p.run(); p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            DispatchQueue.main.async { reportFileError("Photoshop couldn’t run the script", msg) }
+        }
+    } catch {
+        DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) }
+    }
+}
+
 func confirmEmptyTrash(_ browser: Browser) {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = "Empty the Trash?"
@@ -1660,6 +1707,73 @@ final class Browser: ObservableObject, Identifiable {
         let paths = items.filter { ids.contains($0.id) }.map { $0.url.path }
         let text = paths.isEmpty ? currentURL.path : paths.joined(separator: "\n")
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // Extensions the batch/single scripts handle (matches IMAGE_EXTENSIONS in the JSX).
+    static let rmbgExtensions: Set<String> = ["jpg", "jpeg", "png", "psd", "tif", "tiff", "bmp"]
+
+    // "foo.png" → "foo_rmbg.png" in the same folder, uniquified if it already exists.
+    private func rmbgCopyURL(_ src: URL) -> URL {
+        let dir = src.deletingLastPathComponent()
+        let ext = src.pathExtension
+        let base = src.deletingPathExtension().lastPathComponent
+        func make(_ name: String) -> URL { dir.appendingPathComponent(ext.isEmpty ? name : "\(name).\(ext)") }
+        var candidate = make("\(base)_rmbg")
+        var n = 2
+        while FileManager.default.fileExists(atPath: candidate.path) { candidate = make("\(base)_rmbg \(n)"); n += 1 }
+        return candidate
+    }
+
+    // Remove BG (single image): copy to "<name>_rmbg", then have Photoshop remove
+    // the background + trim on the copy. Original is never touched.
+    func removeBackground(_ ids: Set<String>) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }),
+              !it.isDirectory, isImageFile(it.url) else { NSSound.beep(); return }
+        let src = it.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let copy = self.rmbgCopyURL(src)
+            do { try FileManager.default.copyItem(at: src, to: copy) }
+            catch { DispatchQueue.main.async { reportFileError("Couldn’t create the _rmbg copy", error.localizedDescription) }; return }
+            DispatchQueue.main.async { self.refresh() }          // show the copy right away
+            runPhotoshopScript(resource: "NavigatorRemoveBG", argument: copy.path)
+            DispatchQueue.main.async { self.refresh() }          // pick up the processed result
+        }
+    }
+
+    // Batch Remove BG (folder): recursively duplicate every image to "<name>_rmbg"
+    // alongside it (skipping EN folders and existing copies), then have Photoshop
+    // process only those copies in place. Originals are never touched.
+    func batchRemoveBackground(_ ids: Set<String>) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
+        let folder = it.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let n = self.duplicateImagesForRmbg(folder)
+            guard n > 0 else {
+                DispatchQueue.main.async { reportFileError("No images to process", "No image files were found in “\(folder.lastPathComponent)” (or copies already exist).") }
+                return
+            }
+            DispatchQueue.main.async { self.refresh() }
+            runPhotoshopScript(resource: "NavigatorBatchRemoveBG", argument: folder.path)
+            DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    // Recursively copy each image (not already a _rmbg copy) to "<name>_rmbg" next
+    // to it. Skips EN folders and existing copies. Returns how many it created.
+    private func duplicateImagesForRmbg(_ root: URL) -> Int {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return 0 }
+        var count = 0
+        for case let url as URL in en {
+            if url.pathComponents.contains(where: { $0 == "EN" || $0 == "en" }) { continue }
+            guard Browser.rmbgExtensions.contains(url.pathExtension.lowercased()) else { continue }
+            let base = url.deletingPathExtension().lastPathComponent
+            if base.hasSuffix("_rmbg") { continue }
+            let dst = url.deletingLastPathComponent().appendingPathComponent("\(base)_rmbg.\(url.pathExtension)")
+            if fm.fileExists(atPath: dst.path) { continue }
+            do { try fm.copyItem(at: url, to: dst); count += 1 } catch {}
+        }
+        return count
     }
     // What the address bar shows: inside Google Drive, the clean username-free
     // "Google Drive/Shared drives/…" form (directly shareable — a coworker pastes
@@ -2906,6 +3020,13 @@ struct FileTableView: View {
             Button("Duplicate") { browser.duplicate(ids) }
             Button("Make Alias") { browser.makeAlias(ids) }
             Button("Make Symbolic Link") { browser.makeSymlink(ids) }
+            if PhotoshopIcon.image != nil, ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }) {
+                if !it.isDirectory, isImageFile(it.url) {
+                    Button { browser.removeBackground(ids) } label: { psLabel("Remove BG") }
+                } else if it.isDirectory {
+                    Button { browser.batchRemoveBackground(ids) } label: { psLabel("Batch Remove BG") }
+                }
+            }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
                     for it in browser.items where ids.contains(it.id) && it.isDirectory { FolderSizeCache.shared.compute(it.url) }
@@ -3151,6 +3272,13 @@ struct IconGridView: View {
                 Button("Duplicate") { browser.duplicate([item.id]) }
                 Button("Make Alias") { browser.makeAlias([item.id]) }
                 Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
+                if PhotoshopIcon.image != nil {
+                    if !item.isDirectory, isImageFile(item.url) {
+                        Button { browser.removeBackground([item.id]) } label: { psLabel("Remove BG") }
+                    } else if item.isDirectory {
+                        Button { browser.batchRemoveBackground([item.id]) } label: { psLabel("Batch Remove BG") }
+                    }
+                }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
                 if item.isDirectory {
                     if FavoritesStore.shared.contains(item.url) {
