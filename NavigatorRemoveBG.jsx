@@ -17,8 +17,13 @@
 #target photoshop
 app.bringToFront();
 
-var TARGET = (typeof arguments !== "undefined" && arguments.length > 0) ? String(arguments[0])
+// SOURCE = original image to open; OUTPUT = where to save the keyed PNG. Passed
+// via `with arguments` (arguments[0]/[1]) with a $.global fallback. The original
+// is opened read-only and never written — we saveAs a new "<name>_rmbg.png".
+var SOURCE = (typeof arguments !== "undefined" && arguments.length > 0) ? String(arguments[0])
     : (($.global && $.global.NAV_ARG) ? String($.global.NAV_ARG) : null);
+var OUTPUT = (typeof arguments !== "undefined" && arguments.length > 1) ? String(arguments[1])
+    : (($.global && $.global.NAV_ARG2) ? String($.global.NAV_ARG2) : (SOURCE ? pngPathFor(SOURCE) : null));
 
 function logTo(path, msg) {
     try { var f = File(path); f.open("a"); f.write(msg + "\n"); f.close(); } catch (e) {}
@@ -32,14 +37,14 @@ function pngPathFor(p) {
 }
 
 function doWork() {
-    var logPath = TARGET ? (TARGET + ".rmbg.log") : (Folder.desktop.fsName + "/rmbg.log");
+    var logPath = (OUTPUT || SOURCE || (Folder.desktop.fsName + "/rmbg")) + ".rmbg.log";
     var priorDialogs = app.displayDialogs;
     app.displayDialogs = DialogModes.NO;  // never let PS pop a modal that would hang us
-    logTo(logPath, "=== Remove BG start: " + (TARGET || "(active doc)") + " ===");
+    logTo(logPath, "=== Remove BG start: src=" + (SOURCE || "(active doc)") + " out=" + (OUTPUT || "(n/a)") + " ===");
 
     var doc;
-    if (TARGET) {
-        doc = app.open(new File(TARGET));
+    if (SOURCE) {
+        doc = app.open(new File(SOURCE));
     } else if (app.documents.length) {
         doc = app.activeDocument;
     } else {
@@ -69,17 +74,16 @@ function doWork() {
             logTo(logPath, "trim skipped: " + tErr.message);
         }
 
-        var saved = TARGET;
-        if (TARGET) {
-            // Explicit PNG save (bare doc.save() on a PNG is unreliable and was
-            // the original failure). Flatten first so alpha bakes in cleanly.
-            saved = pngPathFor(TARGET);
-            var opts = new PNGSaveOptions();
-            try { opts.compression = 6; } catch (oErr) {}
-            doc.saveAs(new File(saved), opts, true, Extension.LOWERCASE);
-            logTo(logPath, "saved PNG: " + saved);
-            doc.close(SaveOptions.DONOTSAVECHANGES);
-        }
+        // saveAs a NEW "<name>_rmbg.png" — the source is opened read-only and
+        // never written (no redundant pre-copy). Explicit PNG (bare doc.save()
+        // on a PNG is unreliable).
+        var saved = OUTPUT || pngPathFor(SOURCE);
+        var opts = new PNGSaveOptions();
+        try { opts.compression = 6; } catch (oErr) {}
+        doc.saveAs(new File(saved), opts, true, Extension.LOWERCASE);
+        logTo(logPath, "saved PNG: " + saved);
+        doc.close(SaveOptions.DONOTSAVECHANGES);  // discard changes to SOURCE
+
         app.displayDialogs = priorDialogs;
         return "OK: " + saved;
     } catch (e) {
