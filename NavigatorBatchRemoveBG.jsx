@@ -1,13 +1,15 @@
 /**
  * Navigator — Batch Remove Background.
- * Driven by Navigator: processes every image whose name ends in "_rmbg" inside
- * the folder passed as arguments[0] (and its subfolders), in place. Navigator
- * has already duplicated each original to a "<name>_rmbg" copy, so originals are
- * never touched — only the copies. Skips "EN" folders. Trim defaults OFF (keeps
- * the original canvas size), matching the original batch script.
+ * Driven by Navigator: opens every ORIGINAL image in the folder passed as
+ * arguments[0] (and its subfolders) and saves a keyed "<name>_rmbg.png" next to
+ * it. Originals are opened read-only and never written; images already ending in
+ * "_rmbg" are skipped, so re-running is safe and there's no pre-duplication.
+ * Skips "EN" folders. Trim defaults OFF (keeps the original canvas size).
  *
- * Falls back to the interactive folder-picker GUI if run manually with no
- * argument. Bundled inside Navigator.app so no one has to keep it on disk.
+ * In automation (Navigator) it RETURNS a status string ("OK: …" / "ERROR: …")
+ * that osascript prints to stdout — no blocking, invisible alerts. The manual
+ * folder-picker GUI (run with no argument) still shows a summary alert.
+ * Bundled inside Navigator.app.
  */
 
 #target photoshop
@@ -21,21 +23,16 @@ var TARGET = (typeof arguments !== "undefined" && arguments.length > 0) ? String
 // ============================================
 // FILE PROCESSING
 // ============================================
-function processFolder(rootFolder, shouldTrim, onlyRmbg) {
-    var imageFiles = collectImageFiles(rootFolder, onlyRmbg);
-
+// Returns { message, total, processed, errors }.
+function processFolder(rootFolder, shouldTrim) {
+    var imageFiles = collectImageFiles(rootFolder);
     if (imageFiles.length === 0) {
-        alert("No image files found to process in:\n" + rootFolder.fsName);
-        return;
+        return { message: "No images to process in:\n" + rootFolder.fsName, total: 0, processed: 0, errors: 0 };
     }
 
     var startTime = new Date();
-    var processed = 0;
-    var errors = 0;
-    var errorLog = [];
-    var criticalStop = false;
-    var criticalReason = "";
-    var stoppedAt = "";
+    var processed = 0, errors = 0, errorLog = [];
+    var criticalStop = false, criticalReason = "", stoppedAt = "";
     var originalDialogMode = app.displayDialogs;
 
     app.displayDialogs = DialogModes.NO;
@@ -43,29 +40,19 @@ function processFolder(rootFolder, shouldTrim, onlyRmbg) {
         for (var i = 0; i < imageFiles.length; i++) {
             var file = imageFiles[i];
             var doc = null;
-
             try {
                 doc = openDocumentWithRetry(file);
                 removeBackground(doc, shouldTrim);
-                saveKeyed(doc, file);
-                doc.close(SaveOptions.DONOTSAVECHANGES);
+                saveKeyedAs(doc, rmbgOutputFor(file));      // "<name>_rmbg.png" alongside
+                doc.close(SaveOptions.DONOTSAVECHANGES);     // discard changes to the original
                 purgeCachesSafely();
                 processed++;
             } catch (e) {
                 errors++;
                 errorLog.push(file.name + ": " + e.message);
-
-                try {
-                    if (doc !== null) {
-                        doc.close(SaveOptions.DONOTSAVECHANGES);
-                    }
-                } catch (closeErr) {}
-
+                try { if (doc !== null) { doc.close(SaveOptions.DONOTSAVECHANGES); } } catch (closeErr) {}
                 if (isCriticalBatchError(e)) {
-                    criticalStop = true;
-                    criticalReason = e.message;
-                    stoppedAt = file.name;
-                    break;
+                    criticalStop = true; criticalReason = e.message; stoppedAt = file.name; break;
                 }
             }
         }
@@ -73,97 +60,69 @@ function processFolder(rootFolder, shouldTrim, onlyRmbg) {
         app.displayDialogs = originalDialogMode;
     }
 
-    var endTime = new Date();
-    var duration = (endTime - startTime) / 1000;
-
+    var duration = ((new Date()) - startTime) / 1000;
     var message = "Remove Background Complete!\n\n";
     message += "Trim enabled: " + (shouldTrim ? "Yes" : "No (default)") + "\n";
     message += "Total images: " + imageFiles.length + "\n";
     message += "Successfully processed: " + processed + "\n";
     message += "Errors: " + errors + "\n";
     message += "Time: " + duration.toFixed(1) + " seconds";
-
     if (criticalStop) {
-        message += "\n\nStopped early at: " + stoppedAt;
-        message += "\nReason: " + criticalReason;
-        message += "\n\nAction required: free scratch disk space (or resolve cancellation),";
-        message += "\nthen rerun the batch from this folder.";
+        message += "\n\nStopped early at: " + stoppedAt + "\nReason: " + criticalReason;
+        message += "\n\nAction required: free scratch disk space (or resolve cancellation), then rerun.";
     }
-
-    if (errors > 0) {
-        message += "\n\nErrors:\n" + errorLog.join("\n");
-    }
-
-    alert(message);
+    if (errors > 0) { message += "\n\nErrors:\n" + errorLog.join("\n"); }
+    return { message: message, total: imageFiles.length, processed: processed, errors: errors };
 }
 
-// Save the keyed result. For PNG (the common case) use an explicit PNG saveAs
-// so transparency persists — a bare doc.save() on a PNG is unreliable. Other
-// formats fall back to doc.save() in their own format.
-function saveKeyed(doc, file) {
-    if (/\.png$/i.test(file.name)) {
-        var opts = new PNGSaveOptions();
-        try { opts.compression = 6; } catch (e) {}
-        doc.saveAs(file, opts, true, Extension.LOWERCASE);
-    } else {
-        doc.save();
-    }
+// "foo.png" → File(".../foo_rmbg.png") in the same folder.
+function rmbgOutputFor(file) {
+    var name = file.name;
+    var dot = name.lastIndexOf(".");
+    var base = (dot > 0) ? name.substring(0, dot) : name;
+    return new File(file.parent.fsName + "/" + base + "_rmbg.png");
+}
+
+// Explicit PNG saveAs so transparency persists (bare doc.save() on a PNG is unreliable).
+function saveKeyedAs(doc, outFile) {
+    var opts = new PNGSaveOptions();
+    try { opts.compression = 6; } catch (e) {}
+    doc.saveAs(outFile, opts, true, Extension.LOWERCASE);
 }
 
 function removeBackground(doc, shouldTrim) {
     var layer = doc.activeLayer;
-
     if (!(layer && layer.typename === "ArtLayer")) {
-        try {
-            doc.flatten();
-            layer = doc.activeLayer;
-        } catch (e) {
-            throw new Error("Cannot process layer type");
-        }
+        try { doc.flatten(); layer = doc.activeLayer; }
+        catch (e) { throw new Error("Cannot process layer type"); }
     }
-
     try { layer.isBackgroundLayer = false; } catch (e) {}
-
     var id = stringIDToTypeID("removeBackground");
     executeAction(id, new ActionDescriptor(), DialogModes.NO);
-
-    if (shouldTrim) {
-        doc.trim(TrimType.TRANSPARENT, true, true, true, true);
-    }
+    if (shouldTrim) { doc.trim(TrimType.TRANSPARENT, true, true, true, true); }
 }
 
 // ============================================
-// FILE COLLECTION
+// FILE COLLECTION — originals only (skip our own "_rmbg" outputs)
 // ============================================
-function collectImageFiles(folder, onlyRmbg) {
+function collectImageFiles(folder) {
     var imageFiles = [];
-
     function scanFolder(currentFolder, isRoot) {
-        if (!isRoot && shouldSkipFolder(currentFolder.name)) {
-            return;
-        }
-
+        if (!isRoot && shouldSkipFolder(currentFolder.name)) { return; }
         var files = currentFolder.getFiles();
         for (var i = 0; i < files.length; i++) {
             var item = files[i];
-
             if (item instanceof Folder) {
                 scanFolder(item, false);
             } else if (item instanceof File) {
-                if (isImageFile(item.name) && (!onlyRmbg || isRmbgFile(item.name))) {
-                    imageFiles.push(item);
-                }
+                if (isImageFile(item.name) && !isRmbgFile(item.name)) { imageFiles.push(item); }
             }
         }
     }
-
     scanFolder(folder, true);
     imageFiles.sort(function (a, b) {
-        var aName = a.fsName.toLowerCase();
-        var bName = b.fsName.toLowerCase();
-        if (aName < bName) return -1;
-        if (aName > bName) return 1;
-        return 0;
+        var aName = a.fsName.toLowerCase(), bName = b.fsName.toLowerCase();
+        return aName < bName ? -1 : (aName > bName ? 1 : 0);
     });
     return imageFiles;
 }
@@ -172,10 +131,7 @@ function openDocumentWithRetry(file) {
     try {
         return app.open(file);
     } catch (e) {
-        if (isOpenOptionsError(e)) {
-            $.sleep(200);
-            return app.open(file);
-        }
+        if (isOpenOptionsError(e)) { $.sleep(200); return app.open(file); }
         throw e;
     }
 }
@@ -215,8 +171,8 @@ function isImageFile(filename) {
     return false;
 }
 
-// True when the base name (before the extension) ends in "_rmbg" — the copies
-// Navigator made. Keeps the batch from touching originals sitting alongside them.
+// True when the base name (before the extension) ends in "_rmbg" — our own
+// outputs. Keeps the batch from re-processing results sitting alongside originals.
 function isRmbgFile(filename) {
     var dot = filename.lastIndexOf(".");
     var base = (dot > 0) ? filename.substring(0, dot) : filename;
@@ -229,7 +185,6 @@ function isRmbgFile(filename) {
 function showGUI() {
     var dialog = new Window("dialog", "Batch Remove Background");
     dialog.alignChildren = "fill";
-
     dialog.add("statictext", undefined, "Select a folder to process all images in subfolders.").alignment = "left";
 
     var folderGroup = dialog.add("group");
@@ -245,8 +200,7 @@ function showGUI() {
     optionsPanel.alignChildren = "left";
     var trimCheckbox = optionsPanel.add("checkbox", undefined, "Trim transparent pixels after remove background");
     trimCheckbox.value = false;
-    optionsPanel.add("statictext", undefined, "Default: OFF (keeps original canvas size).");
-    optionsPanel.add("statictext", undefined, "Processes images in selected folder + subfolders (skips EN folder).");
+    optionsPanel.add("statictext", undefined, "Writes '<name>_rmbg.png' next to each original (skips EN folder).");
 
     var buttonGroup = dialog.add("group");
     buttonGroup.orientation = "row";
@@ -256,7 +210,7 @@ function showGUI() {
     processBtn.enabled = false;
 
     browseBtn.onClick = function () {
-        var folder = Folder.selectDialog("Select folder containing image subfolders:");
+        var folder = Folder.selectDialog("Select folder containing images:");
         if (folder) { folderPath.text = folder.fsName; processBtn.enabled = true; }
     };
     folderPath.onChanging = function () { processBtn.enabled = folderPath.text !== ""; };
@@ -264,7 +218,7 @@ function showGUI() {
         var selectedFolder = new Folder(folderPath.text);
         if (!selectedFolder.exists) { alert("Selected folder does not exist."); return; }
         dialog.close(1);
-        processFolder(selectedFolder, trimCheckbox.value, false);
+        alert(processFolder(selectedFolder, trimCheckbox.value).message);
     };
     dialog.show();
 }
@@ -272,10 +226,18 @@ function showGUI() {
 // ============================================
 // RUN
 // ============================================
+var RESULT;
 if (TARGET) {
-    var f = new Folder(TARGET);
-    if (f.exists) processFolder(f, false, true); // only the _rmbg copies, no trim
-    else alert("Folder does not exist:\n" + TARGET);
+    try {
+        var f = new Folder(TARGET);
+        if (!f.exists) throw new Error("Folder does not exist: " + TARGET);
+        var r = processFolder(f, false);                 // originals → "<name>_rmbg.png", no trim
+        RESULT = (r.errors > 0) ? ("ERROR: " + r.message) : ("OK: processed " + r.processed + " of " + r.total);
+    } catch (e) {
+        RESULT = "ERROR: " + e.toString();
+    }
 } else {
     showGUI();
+    RESULT = "OK";
 }
+RESULT;  // returned to osascript stdout

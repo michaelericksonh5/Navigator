@@ -1880,9 +1880,6 @@ final class Browser: ObservableObject, Identifiable {
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
     }
 
-    // Extensions the batch/single scripts handle (matches IMAGE_EXTENSIONS in the JSX).
-    static let rmbgExtensions: Set<String> = ["jpg", "jpeg", "png", "psd", "tif", "tiff", "bmp"]
-
     // Remove BG (single image): copy to "<name>_rmbg", then have Photoshop remove
     // the background + trim on the copy. Original is never touched. Refreshes so
     // the copy (then the processed result) shows up.
@@ -1909,7 +1906,7 @@ final class Browser: ObservableObject, Identifiable {
         DispatchQueue.global(qos: .userInitiated).async {
             let cfg: [String: Any] = [
                 "sourceFolder": folder.path,
-                "outputFolder": folder.appendingPathComponent("_rmbg").path,
+                "outputFolder": folder.path,   // "<name>_rmbg.png" alongside each original
                 "singleScript": still.path, "outputSuffix": "_rmbg",
                 "keyMode": "auto", "finalOutputFormat": "png", "deleteIntermediateRender": true
             ]
@@ -1922,40 +1919,17 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
 
-    // Batch Remove BG (folder): recursively duplicate every image to "<name>_rmbg"
-    // alongside it (skipping EN folders and existing copies), then have Photoshop
-    // process only those copies in place. Originals are never touched.
+    // Batch Remove BG (folder): Photoshop opens each ORIGINAL image (recursively,
+    // skipping EN folders and existing "_rmbg" outputs) and writes a keyed
+    // "<name>_rmbg.png" next to it. No pre-duplication — originals are never
+    // written.
     func batchRemoveBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
         let folder = it.url
         DispatchQueue.global(qos: .userInitiated).async {
-            let n = self.duplicateImagesForRmbg(folder)
-            guard n > 0 else {
-                DispatchQueue.main.async { reportFileError("No images to process", "No image files were found in “\(folder.lastPathComponent)” (or copies already exist).") }
-                return
-            }
-            DispatchQueue.main.async { self.refresh() }
             runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path])
             DispatchQueue.main.async { self.refresh() }
         }
-    }
-
-    // Recursively copy each image (not already a _rmbg copy) to "<name>_rmbg" next
-    // to it. Skips EN folders and existing copies. Returns how many it created.
-    private func duplicateImagesForRmbg(_ root: URL) -> Int {
-        let fm = FileManager.default
-        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { return 0 }
-        var count = 0
-        for case let url as URL in en {
-            if url.pathComponents.contains(where: { $0 == "EN" || $0 == "en" }) { continue }
-            guard Browser.rmbgExtensions.contains(url.pathExtension.lowercased()) else { continue }
-            let base = url.deletingPathExtension().lastPathComponent
-            if base.hasSuffix("_rmbg") { continue }
-            let dst = url.deletingLastPathComponent().appendingPathComponent("\(base)_rmbg.\(url.pathExtension)")
-            if fm.fileExists(atPath: dst.path) { continue }
-            do { try fm.copyItem(at: url, to: dst); count += 1 } catch {}
-        }
-        return count
     }
     // What the address bar shows: inside Google Drive, the clean username-free
     // "Google Drive/Shared drives/…" form (directly shareable — a coworker pastes
