@@ -2904,6 +2904,7 @@ struct FileTableView: View {
             if browser.isGoogleDriveSelection(ids) {
                 Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Web Link") }
                 Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Local Path") }
+                Button { browser.copyPath(ids) } label: { gdLabel("Copy Path for Claude") }
                 Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Web") }
             }
             Divider()
@@ -3130,6 +3131,7 @@ struct IconGridView: View {
                 if browser.isGoogleDriveSelection([item.id]) {
                     Button { browser.copyGoogleDriveLink([item.id]) } label: { gdLabel("Copy Web Link") }
                     Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Local Path") }
+                    Button { browser.copyPath([item.id]) } label: { gdLabel("Copy Path for Claude") }
                     Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Web") }
                 }
                 Button("Move to Trash") { browser.moveToTrash([item.id]) }
