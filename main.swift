@@ -644,6 +644,37 @@ func hideApp(bundleID: String) {
     NSApp.activate(ignoringOtherApps: true)
 }
 
+// Make sure `bundleID` is running and HIDDEN before we drive it — launching it
+// hidden (never activated) if it isn't running — so the whole Remove BG /
+// Chroma Key run happens in the background without stealing focus. Blocks
+// briefly; call off the main thread.
+func launchHidden(bundleID: String, appURL: URL) {
+    if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
+        if !app.isHidden { app.hide() }
+        return
+    }
+    let cfg = NSWorkspace.OpenConfiguration()
+    cfg.activates = false
+    cfg.hides = true
+    cfg.addsToRecentItems = false
+    let sem = DispatchSemaphore(value: 0)
+    NSWorkspace.shared.openApplication(at: appURL, configuration: cfg) { _, _ in sem.signal() }
+    _ = sem.wait(timeout: .now() + 90)
+    for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
+}
+
+// While `p` is running, keep `bundleID` hidden — opening a document can un-hide
+// an app, so we re-hide it (only if it actually became visible, so no flicker
+// when it's already hidden). Runs on a background queue; returns immediately.
+func keepHidden(while p: Process, bundleID: String) {
+    DispatchQueue.global(qos: .utility).async {
+        while p.isRunning {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+    }
+}
+
 // Runs a bundled Photoshop .jsx (by resource name, no extension) against one
 // path argument, launching Photoshop if needed. `do javascript` blocks until the
 // script finishes, so callers run this off the main thread and refresh after.
@@ -673,12 +704,14 @@ func runPhotoshopScript(resource: String, arguments: [String]) -> Bool {
     source += fileSource
     // Build the AppleScript `with arguments {…}` list from argv items 2…n.
     let argRefs = (0..<arguments.count).map { "item \($0 + 2) of argv" }.joined(separator: ", ")
+    // No `activate` — we launch Photoshop hidden and keep it hidden, so the whole
+    // run stays in the background (do javascript works whether or not it's front).
+    if let psURL = PhotoshopIcon.url { launchHidden(bundleID: "com.adobe.Photoshop", appURL: psURL) }
     let appleScript = """
     on run argv
         set jsxSource to item 1 of argv
         with timeout of 3600 seconds
             tell application id "com.adobe.Photoshop"
-                activate
                 do javascript jsxSource with arguments {\(argRefs)}
             end tell
         end timeout
@@ -691,6 +724,7 @@ func runPhotoshopScript(resource: String, arguments: [String]) -> Bool {
     let out = Pipe(); p.standardOutput = out
     do {
         try p.run()
+        keepHidden(while: p, bundleID: "com.adobe.Photoshop")
         // Read pipes before waiting so a chatty script can't deadlock on a full pipe.
         let outData = out.fileHandleForReading.readDataToEndOfFile()
         let errData = err.fileHandleForReading.readDataToEndOfFile()
@@ -756,12 +790,13 @@ func runAfterEffectsScript(resource: String, globals: [String: String]) -> Bool 
     var source = ""
     for (k, v) in globals { source += "$.global.\(k) = \"\(jsEsc(v))\";\n" }
     source += fileSource
+    // No `activate` — launch After Effects hidden and keep it hidden.
+    if let aeURL = AfterEffectsIcon.url { launchHidden(bundleID: "com.adobe.AfterEffects", appURL: aeURL) }
     let appleScript = """
     on run argv
         set jsxSource to item 1 of argv
         with timeout of 3600 seconds
             tell application id "com.adobe.AfterEffects"
-                activate
                 DoScript jsxSource
             end tell
         end timeout
@@ -774,6 +809,7 @@ func runAfterEffectsScript(resource: String, globals: [String: String]) -> Bool 
     let out = Pipe(); p.standardOutput = out
     do {
         try p.run()
+        keepHidden(while: p, bundleID: "com.adobe.AfterEffects")
         let outData = out.fileHandleForReading.readDataToEndOfFile()
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()

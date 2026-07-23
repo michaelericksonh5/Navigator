@@ -13,7 +13,7 @@
  */
 
 #target photoshop
-app.bringToFront();
+// NOTE: no app.bringToFront() — Navigator runs Photoshop hidden.
 
 var SKIP_FOLDERS = ["EN", "en"];
 var IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".psd", ".tif", ".tiff", ".bmp"];
