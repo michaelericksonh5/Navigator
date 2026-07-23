@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import ImageIO
+import Security
 import Quartz
 import QuickLookThumbnailing
 import CoreServices
@@ -249,6 +250,39 @@ struct TagsCell: View {
             }
         }
     }
+}
+
+// MARK: - API keys (macOS Keychain — never plaintext)
+
+enum APIKeys {
+    private static let service = "com.merickson.navigator.apikeys"
+    static func get(_ account: String) -> String? {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let d = out as? Data, let s = String(data: d, encoding: .utf8) else { return nil }
+        return s.isEmpty ? nil : s
+    }
+    static func set(_ value: String, _ account: String) {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        SecItemDelete(base as CFDictionary)
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var add = base; add[kSecValueData as String] = Data(trimmed.utf8)
+        SecItemAdd(add as CFDictionary, nil)
+    }
+    // The fal.ai API key (used for AI upscaling).
+    static var fal: String? { get { get("fal.ai") } set { set(newValue ?? "", "fal.ai") } }
 }
 
 // MARK: - Persistence (UserDefaults-backed view settings)
@@ -671,6 +705,12 @@ enum AfterEffectsIcon {
         Label("Prep for AI", systemImage: "wand.and.stars")
     }
 }
+// "Upscale (AI)" submenu — the three fal/Topaz presets.
+@ViewBuilder func upscaleMenu(_ action: @escaping (UpscaleOption) -> Void) -> some View {
+    Menu {
+        ForEach(upscaleOptions) { o in Button(o.label) { action(o) } }
+    } label: { Label("Upscale (AI)", systemImage: "arrow.up.backward.and.arrow.down.forward") }
+}
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {
     ForEach(aiPrepColors) { c in
         Button { action(c, ratio) } label: {
@@ -794,6 +834,165 @@ func fillBackgroundForImages(_ srcs: [URL], color: NSColor, suffix: String, rati
         DispatchQueue.main.async {
             if showProgress { BGJobProgress.shared.finish("Filled \(outs.count) of \(imgs.count) background\(imgs.count == 1 ? "" : "s")") }
             if !errors.isEmpty { showBGSummary(app: "Prep for AI", done: outs.count, total: imgs.count, errors: errors) }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
+// ===== AI Upscale (fal.ai / Topaz Gigapixel) =====
+
+struct UpscaleOption: Identifiable { let label: String; let model: String; let factor: Int; var id: String { label } }
+let upscaleOptions: [UpscaleOption] = [
+    .init(label: "Upscale Low Quality ×4", model: "Wonder 3",        factor: 4),
+    .init(label: "Upscale Art",            model: "CGI",             factor: 2),
+    .init(label: "Upscale Photoreal",      model: "High Fidelity V2", factor: 2),
+]
+
+func upscaleOutputURL(_ src: URL) -> URL {
+    let base = src.deletingPathExtension().lastPathComponent
+    return src.deletingLastPathComponent().appendingPathComponent("\(base)_upscaled.png")
+}
+
+private func loadCGImage(_ url: URL) -> CGImage? {
+    guard let s = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    return CGImageSourceCreateImageAtIndex(s, 0, nil)
+}
+private func loadCGImage(data: Data) -> CGImage? {
+    guard let s = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    return CGImageSourceCreateImageAtIndex(s, 0, nil)
+}
+private func encodePNG(_ cg: CGImage) -> Data? {
+    let out = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(out, "public.png" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(dest, cg, nil)
+    guard CGImageDestinationFinalize(dest) else { return nil }
+    return out as Data
+}
+
+// True if the image has an alpha channel AND any actually-transparent pixel
+// (downsampled scan so it's cheap).
+func imageHasTransparency(_ url: URL) -> Bool {
+    guard let cg = loadCGImage(url) else { return false }
+    switch cg.alphaInfo {
+    case .none, .noneSkipFirst, .noneSkipLast: return false
+    default: break
+    }
+    let w = min(cg.width, 128), h = min(cg.height, 128)
+    guard w > 0, h > 0, let ptr = calloc(w * h * 4, 1) else { return false }
+    defer { free(ptr) }
+    guard let ctx = CGContext(data: ptr, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    let px = ptr.bindMemory(to: UInt8.self, capacity: w * h * 4)
+    var i = 3
+    while i < w * h * 4 { if px[i] < 250 { return true }; i += 4 }
+    return false
+}
+
+// Composite the image over opaque green (#00FF00) at native size.
+private func compositeOnGreen(_ cg: CGImage) -> CGImage? {
+    let w = cg.width, h = cg.height
+    guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.setFillColor(CGColor(red: 0, green: 1, blue: 0, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return ctx.makeImage()
+}
+
+// After upscaling a green-backed image, key the green (#00FF00) back to
+// transparent. ponytail: threshold chroma key, no edge despill — fine for clean
+// flat art; a fal matting model would give crisper edges if needed.
+private func stripGreen(_ data: Data) -> Data? {
+    guard let cg = loadCGImage(data: data) else { return nil }
+    let w = cg.width, h = cg.height
+    guard w > 0, h > 0, let ptr = calloc(w * h * 4, 1) else { return nil }
+    defer { free(ptr) }
+    guard let ctx = CGContext(data: ptr, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    let px = ptr.bindMemory(to: UInt8.self, capacity: w * h * 4)
+    var i = 0
+    while i < w * h * 4 {
+        if px[i + 1] > 150, px[i] < 120, px[i + 2] < 120 { px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 0 }
+        i += 4
+    }
+    guard let outCG = ctx.makeImage() else { return nil }
+    return encodePNG(outCG)
+}
+
+// One synchronous fal Topaz upscale call → (result PNG bytes, error message).
+private func falUpscale(pngData input: Data, model: String, factor: Int, key: String) -> (data: Data?, error: String?) {
+    let dataURI = "data:image/png;base64," + input.base64EncodedString()
+    guard let url = URL(string: "https://fal.run/fal-ai/topaz/upscale/image") else { return (nil, "bad URL") }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 600
+    req.httpBody = try? JSONSerialization.data(withJSONObject: ["image_url": dataURI, "model": model, "upscale_factor": factor, "output_format": "png"])
+    var out: (Data?, String?) = (nil, "no response")
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, err in
+        defer { sem.signal() }
+        if let err { out = (nil, err.localizedDescription); return }
+        guard let data, let http = resp as? HTTPURLResponse else { out = (nil, "no data"); return }
+        guard http.statusCode == 200 else {
+            out = (nil, "fal HTTP \(http.statusCode): \(String(data: data, encoding: .utf8)?.prefix(300) ?? "")"); return
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let img = json["image"] as? [String: Any], let outStr = img["url"] as? String,
+              let outURL = URL(string: outStr) else { out = (nil, "unexpected fal response"); return }
+        if let outData = try? Data(contentsOf: outURL) { out = (outData, nil) }
+        else { out = (nil, "couldn’t download the upscaled result") }
+    }.resume()
+    sem.wait()
+    return out
+}
+
+func promptAddFalKey() {
+    let a = NSAlert(); a.alertStyle = .warning
+    a.messageText = "Add your fal.ai API key first"
+    a.informativeText = "AI upscaling runs through fal.ai. Add your key from the menu bar: AI → API Keys…"
+    a.addButton(withTitle: "OK"); a.runModal()
+}
+
+// Upscale one or many images via fal. Transparent images get a green backing,
+// are upscaled, then keyed back to transparent. Non-blocking progress + summary.
+func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    guard let key = APIKeys.fal else { DispatchQueue.main.async { promptAddFalKey() }; return }
+    // total:0 → an animated INDETERMINATE bar (an upscale is one long opaque
+    // network call with no sub-progress, so a static "0 of 1" looked frozen).
+    // The label names the current file/model; the whole thing is off the main
+    // thread so Navigator stays fully usable.
+    DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling", total: 0) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []; var errors: [String] = []
+        for (idx, src) in imgs.enumerated() {
+            DispatchQueue.main.async {
+                BGJobProgress.shared.label = imgs.count == 1
+                    ? "Upscaling \(src.lastPathComponent) — \(option.model)"
+                    : "Upscaling \(idx + 1) of \(imgs.count) — \(option.model)"
+            }
+            guard let cg = loadCGImage(src) else { errors.append("\(src.lastPathComponent): can’t read"); continue }
+            let transparent = imageHasTransparency(src)
+            let inputCG = transparent ? (compositeOnGreen(cg) ?? cg) : cg
+            guard let inputPNG = encodePNG(inputCG) else { errors.append("\(src.lastPathComponent): encode failed"); continue }
+            let (outData, err) = falUpscale(pngData: inputPNG, model: option.model, factor: option.factor, key: key)
+            if let outData {
+                let finalData = transparent ? (stripGreen(outData) ?? outData) : outData
+                let dst = upscaleOutputURL(src)
+                do { try finalData.write(to: dst); outs.append(dst) }
+                catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
+            } else {
+                errors.append("\(src.lastPathComponent): \(err ?? "upscale failed")")
+            }
+        }
+        DispatchQueue.main.async {
+            BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
+            if !errors.isEmpty { showBGSummary(app: "Upscale", done: outs.count, total: imgs.count, errors: errors) }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
@@ -2251,6 +2450,13 @@ final class Browser: ObservableObject, Identifiable {
         fillBackgroundForImages(urls, color: c.color, suffix: c.suffix, ratio: ratio) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
+    // Upscale the selected image(s) via fal.ai (Topaz) → "<name>_upscaled.png".
+    func upscale(_ ids: Set<String>, _ option: UpscaleOption) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        upscaleImagesViaFal(urls, option: option) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
     // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
@@ -3631,6 +3837,7 @@ struct FileTableView: View {
             }
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
+                upscaleMenu { opt in browser.upscale(ids, opt) }
             }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
@@ -3900,6 +4107,7 @@ struct IconGridView: View {
                 }
                 if bgSel.contains(where: { !$0.isDirectory && isImageFile($0.url) }) {
                     prepForAIMenu { c, ratio in browser.fillBackground(bgIDs, c, ratio: ratio) }
+                    upscaleMenu { opt in browser.upscale(bgIDs, opt) }
                 }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
                 if item.isDirectory {
@@ -4795,6 +5003,9 @@ struct ImageViewerView: View {
                 prepForAIMenu { c, ratio in
                     fillBackgroundForImages([u], color: c.color, suffix: c.suffix, ratio: ratio) { outs in if let o = outs.first { revealNewImage(o) } }
                 }
+                upscaleMenu { opt in
+                    upscaleImagesViaFal([u], option: opt) { outs in if let o = outs.first { revealNewImage(o) } }
+                }
             }
             if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
@@ -5559,6 +5770,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // Finder right-click → Services / Quick Actions. Each hands the selected
+    // image(s) to the same engine Navigator's own menu uses, so Finder users get
+    // Remove BG / Chroma Key / Upscale without opening Navigator. Navigator comes
+    // forward so its status-bar progress is visible if a window is open.
+    private func serviceURLs(_ p: NSPasteboard) -> [URL] {
+        NSApp.activate(ignoringOtherApps: true)
+        return ((p.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? [])
+            .filter { isImageFile($0) }
+    }
+    private func upscalePreset(_ model: String) -> UpscaleOption {
+        upscaleOptions.first { $0.model == model } ?? upscaleOptions[0]
+    }
+    @objc func svcRemoveBG(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
+        removeBackgroundForImages(urls)
+    }
+    @objc func svcChromaKey(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
+        chromaKeyForImages(urls)
+    }
+    @objc func svcUpscaleArt(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
+        upscaleImagesViaFal(urls, option: upscalePreset("CGI"))
+    }
+    @objc func svcUpscalePhoto(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
+        upscaleImagesViaFal(urls, option: upscalePreset("High Fidelity V2"))
+    }
+    @objc func svcUpscaleLowQ(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
+        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
+        upscaleImagesViaFal(urls, option: upscalePreset("Wonder 3"))
+    }
+
     // Receives folders/files the system routes to us (e.g. when Navigator is the
     // default folder handler). Folders open as new tabs; other files open normally.
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -5761,7 +6005,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sh = viewMenu.addItem(withTitle: "Toggle Hidden Files", action: #selector(toggleHiddenAction(_:)), keyEquivalent: ".")
         sh.keyEquivalentModifierMask = [.command, .shift]; sh.target = self
 
+        let aiItem = NSMenuItem(); mainMenu.addItem(aiItem)
+        let aiMenu = NSMenu(title: "AI"); aiItem.submenu = aiMenu
+        let keysItem = aiMenu.addItem(withTitle: "API Keys…", action: #selector(apiKeysAction(_:)), keyEquivalent: "")
+        keysItem.target = self
+
         NSApp.mainMenu = mainMenu
+    }
+
+    // AI → API Keys… — paste/store the fal.ai key (Keychain-backed).
+    @objc func apiKeysAction(_ sender: Any?) {
+        let a = NSAlert()
+        a.messageText = "AI API Keys"
+        a.informativeText = "Paste your fal.ai API key (used for AI upscaling). It’s stored securely in your macOS Keychain, not in a file."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        field.placeholderString = "fal.ai key (e.g. 1234abcd-…:…)"
+        field.stringValue = APIKeys.fal ?? ""
+        a.accessoryView = field
+        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        if a.runModal() == .alertFirstButtonReturn {
+            APIKeys.fal = field.stringValue
+        }
     }
 
     // Fallback handlers: reached only when a text field is NOT the first responder,
