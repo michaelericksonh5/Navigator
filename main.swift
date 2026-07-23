@@ -624,13 +624,24 @@ func rmbgOutputURL(_ src: URL) -> URL {
 // pre-copy (faster, especially on network/Drive), and the original is never
 // written. `onProgress` (main thread) fires after Photoshop finishes so callers
 // can refresh.
-func removeBackgroundForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
+func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
     let out = rmbgOutputURL(src)
     DispatchQueue.global(qos: .userInitiated).async {
-        runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path])
-        DispatchQueue.main.async { onProgress?() }
+        let ok = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path])
+        DispatchQueue.main.async {
+            guard ok else { return }        // failure already surfaced; leave PS visible
+            hideApp(bundleID: "com.adobe.Photoshop")
+            onDone?(out)
+        }
     }
+}
+
+// Hide a finished helper app (Photoshop / After Effects) and bring Navigator
+// back to the front, so it isn't left sitting in front of the user.
+func hideApp(bundleID: String) {
+    for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) { app.hide() }
+    NSApp.activate(ignoringOtherApps: true)
 }
 
 // Runs a bundled Photoshop .jsx (by resource name, no extension) against one
@@ -638,15 +649,16 @@ func removeBackgroundForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
 // script finishes, so callers run this off the main thread and refresh after.
 // Never fails silently: a permission denial (Automation not allowed) or any
 // other error is surfaced with a clear next step.
-func runPhotoshopScript(resource: String, arguments: [String]) {
+@discardableResult
+func runPhotoshopScript(resource: String, arguments: [String]) -> Bool {
     guard PhotoshopIcon.url != nil else {
         DispatchQueue.main.async { reportFileError("Photoshop isn’t installed", "Install Adobe Photoshop to use Remove BG.") }
-        return
+        return false
     }
     guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
           let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
         DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
-        return
+        return false
     }
     // Pass the ExtendScript SOURCE and the args via osascript argv. This avoids
     // AppleScript file coercion (a `POSIX file … as alias` reference fails with
@@ -686,12 +698,16 @@ func runPhotoshopScript(resource: String, arguments: [String]) {
         let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if p.terminationStatus != 0 {
             DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", String(data: errData, encoding: .utf8) ?? "") }
+            return false
         } else if stdout.hasPrefix("ERROR") {
             // The script ran but reported a failure (e.g. save/removeBackground).
             DispatchQueue.main.async { reportFileError("Photoshop couldn’t finish Remove BG", stdout) }
+            return false
         }
+        return true
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) }
+        return false
     }
 }
 
@@ -722,15 +738,16 @@ func reportAdobeAutomationFailure(_ appName: String, _ raw: String) {
 // given ExtendScript string globals (e.g. a config-file path the script reads).
 // DoScript blocks until AE finishes (render included), so callers run this off
 // the main thread. Never fails silently.
-func runAfterEffectsScript(resource: String, globals: [String: String]) {
+@discardableResult
+func runAfterEffectsScript(resource: String, globals: [String: String]) -> Bool {
     guard AfterEffectsIcon.url != nil else {
         DispatchQueue.main.async { reportFileError("After Effects isn’t installed", "Install Adobe After Effects to use Chroma Key BG.") }
-        return
+        return false
     }
     guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
           let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
         DispatchQueue.main.async { reportFileError("After Effects script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
-        return
+        return false
     }
     func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
     // Prepend the string globals (e.g. the config-file path), then the script's
@@ -763,11 +780,15 @@ func runAfterEffectsScript(resource: String, globals: [String: String]) {
         let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if p.terminationStatus != 0 {
             DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", String(data: errData, encoding: .utf8) ?? "") }
+            return false
         } else if stdout.contains("ERROR") {
             DispatchQueue.main.async { reportFileError("After Effects couldn’t finish Chroma Key", stdout) }
+            return false
         }
+        return true
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) }
+        return false
     }
 }
 
@@ -780,13 +801,14 @@ func writeChromaConfig(_ dict: [String: Any]) -> String? {
 
 // Single-image chroma key (green/cyan/magenta screen → transparent PNG via AE
 // Keylight). Writes "<base>_rmbg.png" next to the source. Original is untouched.
-func chromaKeyForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
+func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard src.pathExtension.lowercased() == "png" else {
         DispatchQueue.main.async { reportFileError("Chroma Key needs a PNG", "The After Effects chroma-key workflow processes green/cyan/magenta-screen PNG images.") }
         return
     }
     let folder = src.deletingLastPathComponent()
     let base = src.deletingPathExtension().lastPathComponent
+    let out = folder.appendingPathComponent("\(base)_rmbg.png")
     DispatchQueue.global(qos: .userInitiated).async {
         let cfg: [String: Any] = [
             "sourceFile": src.path, "outputFolder": folder.path, "outputName": "\(base)_rmbg",
@@ -797,9 +819,13 @@ func chromaKeyForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
         guard let cfgPath = writeChromaConfig(cfg) else {
             DispatchQueue.main.async { reportFileError("Couldn’t start Chroma Key", "Failed to write the temporary config.") }; return
         }
-        runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
+        let ok = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
         try? FileManager.default.removeItem(atPath: cfgPath)
-        DispatchQueue.main.async { onProgress?() }
+        DispatchQueue.main.async {
+            guard ok else { return }        // failure already surfaced; leave AE visible
+            hideApp(bundleID: "com.adobe.AfterEffects")
+            onDone?(out)
+        }
     }
 }
 
@@ -1080,8 +1106,20 @@ func volumeLocations() -> [SidebarLocation] {
 final class Browser: ObservableObject, Identifiable {
     let id = UUID()
     @Published var currentURL: URL
-    @Published var items: [FileItem] = [] { didSet { visibleCache = nil } }
+    @Published var items: [FileItem] = [] {
+        didSet {
+            visibleCache = nil
+            // A background op (e.g. Remove BG) asked to reveal a file once the
+            // listing reloads and contains it — select + scroll to it now.
+            if let p = pendingRevealPath, items.contains(where: { $0.id == p }) {
+                pendingRevealPath = nil
+                selection = [p]; keyboardScrollID = p; updateStatus()
+            }
+        }
+    }
     @Published var selection: Set<String> = []
+    // Path to select + scroll to as soon as the next listing load includes it.
+    var pendingRevealPath: String?
     @Published var pathText: String = ""
     @Published var filterText: String = "" { didSet { visibleCache = nil } }
     @Published var searchText: String = ""
@@ -1880,19 +1918,25 @@ final class Browser: ObservableObject, Identifiable {
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
     }
 
-    // Remove BG (single image): copy to "<name>_rmbg", then have Photoshop remove
-    // the background + trim on the copy. Original is never touched. Refreshes so
-    // the copy (then the processed result) shows up.
+    // Refresh the listing and, once it reloads with the file present, select +
+    // scroll to it (used to highlight a just-produced "_rmbg" result).
+    func refreshAndReveal(_ url: URL) {
+        pendingRevealPath = url.path
+        refresh()
+    }
+
+    // Remove BG (single image): Photoshop keys the original and writes
+    // "<name>_rmbg.png" alongside; then we refresh and highlight the new file.
     func removeBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }),
               !it.isDirectory, isImageFile(it.url) else { NSSound.beep(); return }
-        removeBackgroundForImage(it.url) { [weak self] in self?.refresh() }
+        removeBackgroundForImage(it.url) { [weak self] out in self?.refreshAndReveal(out) }
     }
 
     // Chroma Key BG (single PNG) via After Effects — writes "<base>_rmbg.png" next to it.
     func chromaKeyBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), !it.isDirectory else { NSSound.beep(); return }
-        chromaKeyForImage(it.url) { [weak self] in self?.refresh() }
+        chromaKeyForImage(it.url) { [weak self] out in self?.refreshAndReveal(out) }
     }
 
     // Batch Chroma Key BG (folder): AE keys every PNG in the folder, writing
@@ -1913,9 +1957,12 @@ final class Browser: ObservableObject, Identifiable {
             guard let cfgPath = writeChromaConfig(cfg) else {
                 DispatchQueue.main.async { reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
             }
-            runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath])
+            let ok = runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath])
             try? FileManager.default.removeItem(atPath: cfgPath)
-            DispatchQueue.main.async { self.refresh() }
+            DispatchQueue.main.async {
+                if ok { hideApp(bundleID: "com.adobe.AfterEffects") }
+                self.refresh()
+            }
         }
     }
 
@@ -1927,8 +1974,11 @@ final class Browser: ObservableObject, Identifiable {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
         let folder = it.url
         DispatchQueue.global(qos: .userInitiated).async {
-            runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path])
-            DispatchQueue.main.async { self.refresh() }
+            let ok = runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path])
+            DispatchQueue.main.async {
+                if ok { hideApp(bundleID: "com.adobe.Photoshop") }
+                self.refresh()
+            }
         }
     }
     // What the address bar shows: inside Google Drive, the clean username-free
@@ -4254,6 +4304,19 @@ struct ImageViewerView: View {
         guard let u = currentURL else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(u.lastPathComponent, forType: .string)
     }
+    // After a background-removal finishes, move the viewer to the new "_rmbg"
+    // image: jump to it if already in the list, otherwise insert it after the
+    // current image and show it.
+    private func revealNewImage(_ out: URL) {
+        if let existing = urls.firstIndex(of: out) {
+            index = existing
+        } else {
+            let insertAt = min(index + 1, urls.count)
+            urls.insert(out, at: insertAt)
+            index = insertAt
+        }
+        loadInfo()
+    }
     private var zoomBinding: Binding<Double> {
         Binding(get: { zoomCtl.zoom }, set: { zoomCtl.setZoom($0) })
     }
@@ -4315,10 +4378,10 @@ struct ImageViewerView: View {
             if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
                 if PhotoshopIcon.image != nil {
-                    Button { removeBackgroundForImage(u) } label: { psLabel("Remove BG") }
+                    Button { removeBackgroundForImage(u) { out in revealNewImage(out) } } label: { psLabel("Remove BG") }
                 }
                 if AfterEffectsIcon.image != nil, u.pathExtension.lowercased() == "png" {
-                    Button { chromaKeyForImage(u) } label: { aeLabel("Chroma Key BG") }
+                    Button { chromaKeyForImage(u) { out in revealNewImage(out) } } label: { aeLabel("Chroma Key BG") }
                 }
             }
         }
