@@ -5,7 +5,7 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 APP="/Applications/Navigator.app"
 echo "Compiling (universal: arm64 + x86_64)..."
 SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" \
-  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers -framework NetFS)
+  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers -framework NetFS -framework Security)
 /usr/bin/swiftc "${SWIFT_ARGS[@]}" -target arm64-apple-macos14.0  -o "$DIR/Navigator-arm64"
 /usr/bin/swiftc "${SWIFT_ARGS[@]}" -target x86_64-apple-macos14.0 -o "$DIR/Navigator-x86_64"
 lipo -create "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64" -output "$DIR/Navigator.bin"
@@ -53,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.68</string>
-<key>CFBundleVersion</key><string>84</string>
+<key>CFBundleShortVersionString</key><string>1.4.69</string>
+<key>CFBundleVersion</key><string>85</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -91,6 +91,36 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSMessage</key><string>openInNavigator</string>
     <key>NSPortName</key><string>Navigator</string>
     <key>NSSendFileTypes</key><array><string>public.item</string></array>
+  </dict>
+  <dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Remove Background</string></dict>
+    <key>NSMessage</key><string>svcRemoveBG</string>
+    <key>NSPortName</key><string>Navigator</string>
+    <key>NSSendFileTypes</key><array><string>public.image</string></array>
+  </dict>
+  <dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Chroma Key (Green Screen)</string></dict>
+    <key>NSMessage</key><string>svcChromaKey</string>
+    <key>NSPortName</key><string>Navigator</string>
+    <key>NSSendFileTypes</key><array><string>public.image</string></array>
+  </dict>
+  <dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Upscale — Art</string></dict>
+    <key>NSMessage</key><string>svcUpscaleArt</string>
+    <key>NSPortName</key><string>Navigator</string>
+    <key>NSSendFileTypes</key><array><string>public.image</string></array>
+  </dict>
+  <dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Upscale — Photoreal</string></dict>
+    <key>NSMessage</key><string>svcUpscalePhoto</string>
+    <key>NSPortName</key><string>Navigator</string>
+    <key>NSSendFileTypes</key><array><string>public.image</string></array>
+  </dict>
+  <dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Upscale — Low Quality ×4</string></dict>
+    <key>NSMessage</key><string>svcUpscaleLowQ</string>
+    <key>NSPortName</key><string>Navigator</string>
+    <key>NSSendFileTypes</key><array><string>public.image</string></array>
   </dict>
 </array>
 </dict></plist>
