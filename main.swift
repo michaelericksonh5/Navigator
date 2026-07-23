@@ -4211,7 +4211,9 @@ struct ImageViewerView: View {
                 Slider(value: zoomBinding, in: 0.05...8).frame(width: 130)
                 Button { zoomCtl.zoomBy(1.25) } label: { Image(systemName: "plus.magnifyingglass") }
                     .buttonStyle(.plain).help("Zoom In (⌘+)")
-                Text("\(zoomCtl.percent)%").monospacedDigit().frame(width: 46, alignment: .trailing)
+                Button { zoomCtl.actualSize() } label: {
+                    Text("\(zoomCtl.percent)%").monospacedDigit().frame(width: 46, alignment: .trailing)
+                }.buttonStyle(.plain).help("Reset to 100%")
             }
         }
         .font(.callout).foregroundStyle(.white)
