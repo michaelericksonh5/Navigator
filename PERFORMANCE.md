@@ -40,10 +40,11 @@ on exactly the drives people search most.
    (one round-trip) and compare its modification date to the cached one. Unchanged
    → serve the cache, **no re-listing**. Changed (files added/removed bump the dir
    mtime) → refresh **immediately**. A 15-minute backstop + ⌘R cover the rest.
-4. **Background index.** Pinned network drives are quietly enumerated in the
-   background (low priority, one at a time, `mtime`-skipping, and it **backs off if
-   the link is degraded**) so opening them is instant. This is the *Windows-index
-   equivalent that macOS lacks for SMB.* Toggle in Settings → Network.
+4. **No background crawling.** We deliberately do *not* pre-enumerate drives in the
+   background: on a degraded VPN that competes with the user's own navigation for
+   the one choked connection and makes browsing hang. The persistent cache + mtime
+   revalidation already make revisits instant with **zero** background traffic. (A
+   background indexer was tried and removed for this reason — see git history.)
 5. **Never blocks the UI.** All enumeration, metadata, mounting, copying, image
    decoding, and even the conflict/permissions stats run **off the main thread**.
    A stalled mount shows a quiet "responding slowly…" note instead of a beachball.
@@ -65,8 +66,6 @@ on exactly the drives people search most.
 - **mtime revalidation** — Finder's dir cache is time-based (expires, re-lists even
   when nothing changed); ours re-lists **only when the folder actually changed**,
   and refreshes instantly when it did. Fresher *and* faster.
-- **Background pre-indexing of network drives** — Finder never does this; it's the
-  single biggest win against a slow server.
 - **No beachball** — Finder blocks on stalled SMB mounts; Navigator's window stays
   live with a status note.
 - **Working search on SMB/cloud** — Finder search leans on Spotlight, which is blind
