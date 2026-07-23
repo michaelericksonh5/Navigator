@@ -251,6 +251,7 @@ enum Prefs {
     static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
     static var didOfferDefaults: Bool { get { d.bool(forKey: "didOfferDefaults") } set { d.set(newValue, forKey: "didOfferDefaults") } }
     static var warnImageDelete: Bool { get { d.object(forKey: "warnImageDelete") == nil ? true : d.bool(forKey: "warnImageDelete") } set { d.set(newValue, forKey: "warnImageDelete") } }
+    static var backgroundIndex: Bool { get { d.object(forKey: "backgroundIndex") == nil ? true : d.bool(forKey: "backgroundIndex") } set { d.set(newValue, forKey: "backgroundIndex") } }
     static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
     static var skipUpdateVersion: String { get { d.string(forKey: "skipUpdateVersion") ?? "" } set { d.set(newValue, forKey: "skipUpdateVersion") } }
 }
@@ -1239,6 +1240,39 @@ final class Browser: ObservableObject, Identifiable {
     private static var dirCache: [String: [FileItem]] = [:]
     static func invalidateCache(_ path: String) {
         for k in [path, path + "\u{1}h"] { dirCache[k] = nil; DiskCache.remove(k) }
+    }
+
+    // Background cache warming: enumerate a network folder and store it in the
+    // disk cache WITHOUT touching any UI, so opening it later is instant. Skips
+    // work if the cache is already fresh (folder mtime unchanged) — so a periodic
+    // re-warm costs just one folder stat. Returns how long the enumeration took,
+    // so the caller can back off when the link is degraded. Call OFF the main
+    // thread. Returns nil if skipped (fresh) or unreadable.
+    @discardableResult
+    static func warmCache(_ dir: URL) -> TimeInterval? {
+        let cacheKey = dir.path      // the non-hidden listing (the common case)
+        let mtime = (try? dir.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        // Fresh (unchanged + within backstop)? one stat, done — nothing to fetch.
+        var fresh = false
+        DispatchQueue.main.sync {
+            if let m = mtime, DiskCache.dirModified(cacheKey) == m,
+               (DiskCache.age(cacheKey) ?? .infinity) < Browser.networkCacheTTL { fresh = true }
+        }
+        if fresh { return nil }
+        let t0 = DispatchTime.now()
+        guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: itemKeys,
+                                                       options: [.skipsSubdirectoryDescendants, .skipsHiddenFiles]) else { return nil }
+        var out: [FileItem] = []
+        while let u = en.nextObject() as? URL { out.append(item(from: u, try? u.resourceValues(forKeys: Set(itemKeys)))) }
+        let secs = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000_000
+        guard !out.isEmpty else { return secs }
+        let committed = out
+        DispatchQueue.main.async {
+            dirCache[cacheKey] = committed
+            DiskCache.put(cacheKey, committed, dirModified: mtime)
+        }
+        navLog.log("warm \(committed.count, privacy: .public) items in \(Int(secs * 1000), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
+        return secs
     }
 
     // Auto-refresh: watches the current (local) folder and silently re-reads it
@@ -4556,6 +4590,7 @@ struct SettingsView: View {
     @AppStorage("showHidden") private var showHidden = false
     @AppStorage("confirmTrash") private var confirmTrash = true
     @AppStorage("thumbnailMode") private var thumbnailMode = "all"
+    @AppStorage("backgroundIndex") private var backgroundIndex = true
     var body: some View {
         Form {
             Section("Defaults for new windows & tabs") {
@@ -4578,9 +4613,14 @@ struct SettingsView: View {
                     Text("Off (fastest on slow drives)").tag("off")
                 }
             }
+            Section("Network") {
+                Toggle("Keep pinned network drives indexed in the background", isOn: $backgroundIndex)
+                Text("Quietly pre-loads your pinned network folders so opening them is instant. Turn off if a slow VPN feels busier.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 360)
+        .frame(width: 460, height: 430)
     }
 }
 
@@ -4616,6 +4656,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, !self.suppressMainWindow else { return }
             self.showMainWindow()
             self.offerDefaultsIfNeeded()   // one-time; only on a normal (visible) launch
+        }
+        // Background index: warm the cache for pinned network drives so opening
+        // them is instant (the Windows-index equivalent macOS lacks for SMB).
+        // Delayed so it never competes with startup; re-run periodically.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.warmNetworkFavorites() }
+        indexTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.warmNetworkFavorites() }
+    }
+    private var indexTimer: Timer?
+    // Enumerate pinned network folders in the background (low priority, one at a
+    // time) and cache them, so navigating to them is instant. mtime revalidation
+    // makes a re-warm cost one stat when nothing changed. Backs off if the link is
+    // degraded (a single warm taking too long) so it never piles onto a slow VPN.
+    private func warmNetworkFavorites() {
+        guard Prefs.backgroundIndex else { return }
+        let paths = FavoritesStore.shared.items.filter { $0.mountURL != nil }.map { $0.path }
+        guard !paths.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async {
+            for path in paths {
+                let url = URL(fileURLWithPath: path)
+                guard FileManager.default.fileExists(atPath: url.path) else { continue }   // only if mounted
+                if let secs = Browser.warmCache(url), secs > 90 { break }                   // degraded → stop
+            }
         }
     }
 
