@@ -105,6 +105,13 @@ This file is intended to be launched by run.bat.
     }
 
     function renderedFilesForBase(outputFolder, outputName) {
+        // Clean single-frame name first (appendFrameToken:false → "<name>.png"),
+        // then the frame-tokened forms.
+        var exts = ["png", "tif", "tiff"];
+        for (var e = 0; e < exts.length; e++) {
+            var exact = File(outputFolder.fsName + "/" + outputName + "." + exts[e]);
+            if (exact.exists) { return [exact]; }
+        }
         var pngs = outputFolder.getFiles(outputName + "_*.png");
         if (pngs.length > 0) {
             return pngs;
@@ -143,9 +150,17 @@ This file is intended to be launched by run.bat.
         return idx > 0 ? name.substring(0, idx) : name;
     }
 
+    // Our own outputs end in "_rmbg" — skip them so we only key originals and
+    // re-running is safe (outputs sit alongside the sources now).
+    function isRmbgName(name) {
+        var dot = name.lastIndexOf(".");
+        var base = (dot > 0) ? name.substring(0, dot) : name;
+        return base.toLowerCase().indexOf("_rmbg") === base.length - 5;
+    }
+
     function pngFiles(folderObj) {
         return folderObj.getFiles(function (fileObj) {
-            return fileObj instanceof File && /\.png$/i.test(fileObj.name);
+            return fileObj instanceof File && /\.png$/i.test(fileObj.name) && !isRmbgName(fileObj.name);
         });
     }
 
@@ -207,6 +222,7 @@ This file is intended to be launched by run.bat.
                     sampleAutoInAutomation: config.sampleAutoInAutomation !== false,
                     autoSampleStrategy: config.autoSampleStrategy || "corners",
                     renderImmediately: false,
+                    appendFrameToken: false,   // clean "<name>_rmbg.png", no frame numbers
                     finalOutputFormat: "png",
                     deleteIntermediateRender: config.deleteIntermediateRender !== false
                 };
