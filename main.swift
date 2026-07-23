@@ -613,30 +613,22 @@ enum AfterEffectsIcon {
     }.labelStyle(.titleAndIcon)
 }
 
-// "foo.png" → "foo_rmbg.png" in the same folder, uniquified if it already exists.
-func rmbgCopyURL(_ src: URL) -> URL {
-    let dir = src.deletingLastPathComponent()
-    let ext = src.pathExtension
+// "foo.png" → "foo_rmbg.png" in the same folder (background removal needs PNG).
+func rmbgOutputURL(_ src: URL) -> URL {
     let base = src.deletingPathExtension().lastPathComponent
-    func make(_ name: String) -> URL { dir.appendingPathComponent(ext.isEmpty ? name : "\(name).\(ext)") }
-    var candidate = make("\(base)_rmbg")
-    var n = 2
-    while FileManager.default.fileExists(atPath: candidate.path) { candidate = make("\(base)_rmbg \(n)"); n += 1 }
-    return candidate
+    return src.deletingLastPathComponent().appendingPathComponent("\(base)_rmbg.png")
 }
 
-// Single-image Remove BG usable from anywhere (browser or image viewer): copy the
-// source to "<name>_rmbg", then run the bundled remove-background+trim script on
-// the copy. `onProgress` (main thread) fires after the copy and again after
-// Photoshop finishes, so callers can refresh. Original is never touched.
+// Single-image Remove BG usable from anywhere (browser or image viewer): Photoshop
+// opens the ORIGINAL and saves the keyed result as "<name>_rmbg.png" — no redundant
+// pre-copy (faster, especially on network/Drive), and the original is never
+// written. `onProgress` (main thread) fires after Photoshop finishes so callers
+// can refresh.
 func removeBackgroundForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
+    let out = rmbgOutputURL(src)
     DispatchQueue.global(qos: .userInitiated).async {
-        let copy = rmbgCopyURL(src)
-        do { try FileManager.default.copyItem(at: src, to: copy) }
-        catch { DispatchQueue.main.async { reportFileError("Couldn’t create the _rmbg copy", error.localizedDescription) }; return }
-        DispatchQueue.main.async { onProgress?() }
-        runPhotoshopScript(resource: "NavigatorRemoveBG", argument: copy.path)
+        runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path])
         DispatchQueue.main.async { onProgress?() }
     }
 }
@@ -646,7 +638,7 @@ func removeBackgroundForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
 // script finishes, so callers run this off the main thread and refresh after.
 // Never fails silently: a permission denial (Automation not allowed) or any
 // other error is surfaced with a clear next step.
-func runPhotoshopScript(resource: String, argument: String) {
+func runPhotoshopScript(resource: String, arguments: [String]) {
     guard PhotoshopIcon.url != nil else {
         DispatchQueue.main.async { reportFileError("Photoshop isn’t installed", "Install Adobe Photoshop to use Remove BG.") }
         return
@@ -656,30 +648,33 @@ func runPhotoshopScript(resource: String, argument: String) {
         DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
         return
     }
-    // Pass the ExtendScript SOURCE and the target as osascript argv. This avoids
+    // Pass the ExtendScript SOURCE and the args via osascript argv. This avoids
     // AppleScript file coercion (a `POSIX file … as alias` reference fails with
     // -1728 and the script never runs), and avoids escaping the multi-line source
     // into a string literal. `with timeout` lets long AI cutouts / big batches run
     // past osascript's default 2-minute AppleEvent limit (which shows as -1712).
-    // Also prepend the target as $.global.NAV_ARG so the script gets it even if
-    // `with arguments` doesn't populate arguments[] for a string source.
+    // Also prepend the args as $.global.NAV_ARG/NAV_ARG2 so the script gets them
+    // even if `with arguments` doesn't populate arguments[] for a string source.
     func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
-    let source = "$.global.NAV_ARG = \"\(jsEsc(argument))\";\n" + fileSource
+    var source = ""
+    for (i, a) in arguments.enumerated() { source += "$.global.NAV_ARG\(i == 0 ? "" : String(i + 1)) = \"\(jsEsc(a))\";\n" }
+    source += fileSource
+    // Build the AppleScript `with arguments {…}` list from argv items 2…n.
+    let argRefs = (0..<arguments.count).map { "item \($0 + 2) of argv" }.joined(separator: ", ")
     let appleScript = """
     on run argv
         set jsxSource to item 1 of argv
-        set targetPath to item 2 of argv
         with timeout of 3600 seconds
             tell application id "com.adobe.Photoshop"
                 activate
-                do javascript jsxSource with arguments {targetPath}
+                do javascript jsxSource with arguments {\(argRefs)}
             end tell
         end timeout
     end run
     """
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", appleScript, source, argument]
+    p.arguments = ["-e", appleScript, source] + arguments
     let err = Pipe(); p.standardError = err
     let out = Pipe(); p.standardOutput = out
     do {
@@ -1938,7 +1933,7 @@ final class Browser: ObservableObject, Identifiable {
                 return
             }
             DispatchQueue.main.async { self.refresh() }
-            runPhotoshopScript(resource: "NavigatorBatchRemoveBG", argument: folder.path)
+            runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path])
             DispatchQueue.main.async { self.refresh() }
         }
     }
