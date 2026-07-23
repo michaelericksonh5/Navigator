@@ -5682,6 +5682,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NetworkBrowser.shared.start()
         NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
         NSUpdateDynamicServices()
+        // Install the Finder Quick Actions once per version (cheap; skips the pbs
+        // flush on subsequent launches). Bump the marker when the workflows change.
+        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 1 {
+            installFinderQuickActions(nil)
+            Prefs.d.set(1, forKey: "finderQuickActionsVersion")
+        }
         // Show the browser shortly — unless we were launched only to view an image
         // (the open handler sets suppressMainWindow first). The tiny delay also lets
         // a folder-open event arrive so it opens as a tab in the same window.
@@ -5770,42 +5776,175 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    // Finder right-click → Services / Quick Actions. Each hands the selected
-    // image(s) to the same engine Navigator's own menu uses, so Finder users get
-    // Remove BG / Chroma Key / Upscale without opening Navigator. Navigator comes
-    // forward so its status-bar progress is visible if a window is open.
-    private func serviceURLs(_ p: NSPasteboard) -> [URL] {
-        NSApp.activate(ignoringOtherApps: true)
-        return ((p.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? [])
-            .filter { isImageFile($0) }
-    }
     private func upscalePreset(_ model: String) -> UpscaleOption {
         upscaleOptions.first { $0.model == model } ?? upscaleOptions[0]
     }
-    @objc func svcRemoveBG(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
-        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
-        removeBackgroundForImages(urls)
+
+    // A Finder Quick Action fired: navigatoraction://<action>?hex=<hex of newline-
+    // joined file paths>. Decode and run the matching action on the images.
+    private func handleActionURL(_ url: URL) {
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let hex = comps.queryItems?.first(where: { $0.name == "hex" })?.value else { return }
+        var bytes = [UInt8](); var idx = hex.startIndex
+        while let next = hex.index(idx, offsetBy: 2, limitedBy: hex.endIndex), next <= hex.endIndex {
+            if let b = UInt8(hex[idx..<next], radix: 16) { bytes.append(b) } else { break }
+            idx = next
+            if idx == hex.endIndex { break }
+        }
+        let paths = (String(bytes: bytes, encoding: .utf8) ?? "")
+            .split(separator: "\n").map(String.init)
+        let urls = paths.map { URL(fileURLWithPath: $0) }.filter { isImageFile($0) }
+        guard !urls.isEmpty else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        switch url.host {
+        case "removebg":       removeBackgroundForImages(urls)
+        case "chromakey":      chromaKeyForImages(urls)
+        case "upscale-art":    upscaleImagesViaFal(urls, option: upscalePreset("CGI"))
+        case "upscale-photo":  upscaleImagesViaFal(urls, option: upscalePreset("High Fidelity V2"))
+        case "upscale-lowq":   upscaleImagesViaFal(urls, option: upscalePreset("Wonder 3"))
+        default: break
+        }
     }
-    @objc func svcChromaKey(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
-        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
-        chromaKeyForImages(urls)
+
+    // Finder Quick Actions to install (title → navigatoraction:// action).
+    private static let finderQuickActions: [(title: String, action: String)] = [
+        ("Navigator — Remove Background", "removebg"),
+        ("Navigator — Chroma Key (Green Screen)", "chromakey"),
+        ("Navigator — Upscale (Art)", "upscale-art"),
+        ("Navigator — Upscale (Photoreal)", "upscale-photo"),
+        ("Navigator — Upscale (Low Quality ×4)", "upscale-lowq"),
+    ]
+
+    // Install/refresh the Quick Actions in ~/Library/Services so they appear in
+    // Finder's right-click for images. Each is a "Run Shell Script" workflow that
+    // hex-encodes the selected paths and opens navigatoraction://<action>.
+    @objc func installFinderQuickActions(_ sender: Any? = nil) {
+        let fm = FileManager.default
+        let svc = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Services")
+        for qa in Self.finderQuickActions {
+            let contents = svc.appendingPathComponent("\(qa.title).workflow/Contents")
+            try? fm.createDirectory(at: contents, withIntermediateDirectories: true)
+            let cmd = "h=$(printf '%s\\n' \"$@\" | xxd -p | tr -d '\\n'); open \"navigatoraction://\(qa.action)?hex=$h\""
+            try? Self.quickActionInfoPlist(title: qa.title).write(to: contents.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
+            try? Self.quickActionWorkflow(command: cmd).write(to: contents.appendingPathComponent("document.wflow"), atomically: true, encoding: .utf8)
+        }
+        let flush = Process(); flush.executableURL = URL(fileURLWithPath: "/System/Library/CoreServices/pbs"); flush.arguments = ["-flush"]
+        try? flush.run()
+        if sender != nil {
+            let a = NSAlert(); a.messageText = "Finder Quick Actions installed"
+            a.informativeText = "Right-click an image in Finder to find Navigator’s Remove Background, Chroma Key, and Upscale actions. If they don’t show right away, toggle them on in System Settings → Keyboard → Keyboard Shortcuts → Services (or log out and back in)."
+            a.addButton(withTitle: "OK"); a.runModal()
+        }
     }
-    @objc func svcUpscaleArt(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
-        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
-        upscaleImagesViaFal(urls, option: upscalePreset("CGI"))
+    private static func quickActionInfoPlist(title: String) -> String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+          <key>NSServices</key>
+          <array><dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>\(title)</string></dict>
+            <key>NSMessage</key><string>runWorkflowAsService</string>
+            <key>NSRequiredContext</key><dict><key>NSApplicationIdentifier</key><string>com.apple.finder</string></dict>
+            <key>NSSendFileTypes</key><array><string>public.image</string></array>
+          </dict></array>
+        </dict></plist>
+        """
     }
-    @objc func svcUpscalePhoto(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
-        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
-        upscaleImagesViaFal(urls, option: upscalePreset("High Fidelity V2"))
-    }
-    @objc func svcUpscaleLowQ(_ p: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>?) {
-        let urls = serviceURLs(p); guard !urls.isEmpty else { return }
-        upscaleImagesViaFal(urls, option: upscalePreset("Wonder 3"))
+    private static func quickActionWorkflow(command: String) -> String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+          <key>AMApplicationBuild</key><string>528</string>
+          <key>AMApplicationVersion</key><string>2.10</string>
+          <key>AMDocumentVersion</key><string>2</string>
+          <key>actions</key>
+          <array>
+            <dict>
+              <key>action</key>
+              <dict>
+                <key>AMAccepts</key><dict>
+                  <key>Container</key><string>List</string>
+                  <key>Optional</key><true/>
+                  <key>Types</key><array><string>com.apple.cocoa.string</string></array>
+                </dict>
+                <key>AMActionVersion</key><string>2.0.3</string>
+                <key>AMApplication</key><array><string>Automator</string></array>
+                <key>AMParameterProperties</key><dict>
+                  <key>COMMAND_STRING</key><dict/>
+                  <key>CheckedForUserDefaultShell</key><dict/>
+                  <key>inputMethod</key><dict/>
+                  <key>shell</key><dict/>
+                  <key>source</key><dict/>
+                </dict>
+                <key>AMProvides</key><dict>
+                  <key>Container</key><string>List</string>
+                  <key>Types</key><array><string>com.apple.cocoa.string</string></array>
+                </dict>
+                <key>ActionBundlePath</key><string>/System/Library/Automator/Run Shell Script.action</string>
+                <key>ActionName</key><string>Run Shell Script</string>
+                <key>ActionParameters</key><dict>
+                  <key>COMMAND_STRING</key><string>\(command)</string>
+                  <key>CheckedForUserDefaultShell</key><true/>
+                  <key>inputMethod</key><integer>1</integer>
+                  <key>shell</key><string>/bin/zsh</string>
+                  <key>source</key><string></string>
+                </dict>
+                <key>BundleIdentifier</key><string>com.apple.RunShellScript</string>
+                <key>CFBundleVersion</key><string>2.0.3</string>
+                <key>CanShowSelectedItemsWhenRun</key><false/>
+                <key>CanShowWhenRun</key><true/>
+                <key>Category</key><array><string>AMCategoryUtilities</string></array>
+                <key>Class Name</key><string>RunShellScriptAction</string>
+                <key>InputUUID</key><string>A1111111-1111-1111-1111-111111111111</string>
+                <key>Keywords</key><array><string>Shell</string><string>Script</string></array>
+                <key>OutputUUID</key><string>B2222222-2222-2222-2222-222222222222</string>
+                <key>UUID</key><string>C3333333-3333-3333-3333-333333333333</string>
+                <key>UnlocalizedApplications</key><array><string>Automator</string></array>
+                <key>arguments</key><dict>
+                  <key>0</key><dict><key>default value</key><integer>0</integer><key>name</key><string>inputMethod</string><key>required</key><string>0</string><key>type</key><string>0</string><key>uuid</key><string>0</string></dict>
+                  <key>1</key><dict><key>default value</key><false/><key>name</key><string>CheckedForUserDefaultShell</string><key>required</key><string>0</string><key>type</key><string>0</string><key>uuid</key><string>1</string></dict>
+                  <key>2</key><dict><key>default value</key><string></string><key>name</key><string>source</string><key>required</key><string>0</string><key>type</key><string>0</string><key>uuid</key><string>2</string></dict>
+                  <key>3</key><dict><key>default value</key><string>/bin/sh</string><key>name</key><string>shell</string><key>required</key><string>0</string><key>type</key><string>0</string><key>uuid</key><string>3</string></dict>
+                  <key>4</key><dict><key>default value</key><string></string><key>name</key><string>COMMAND_STRING</string><key>required</key><string>0</string><key>type</key><string>0</string><key>uuid</key><string>4</string></dict>
+                </dict>
+                <key>isViewVisible</key><integer>1</integer>
+                <key>location</key><string>309.000000:253.000000</string>
+                <key>nibPath</key><string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
+              </dict>
+              <key>isViewVisible</key><integer>1</integer>
+            </dict>
+          </array>
+          <key>connectors</key><dict/>
+          <key>workflowMetaData</key><dict>
+            <key>applicationBundleIDsByPath</key><dict/>
+            <key>applicationPaths</key><array/>
+            <key>inputTypeIdentifier</key><string>com.apple.Automator.fileSystemObject.image</string>
+            <key>outputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
+            <key>presentationMode</key><integer>11</integer>
+            <key>processesInput</key><integer>0</integer>
+            <key>serviceApplicationBundleID</key><string>com.apple.finder</string>
+            <key>serviceApplicationPath</key><string>/System/Library/CoreServices/Finder.app</string>
+            <key>serviceInputTypeIdentifier</key><string>com.apple.Automator.fileSystemObject.image</string>
+            <key>serviceOutputTypeIdentifier</key><string>com.apple.Automator.nothing</string>
+            <key>serviceProcessesInput</key><integer>0</integer>
+            <key>systemImageName</key><string>NSActionTemplate</string>
+            <key>useAutomaticInputType</key><integer>0</integer>
+            <key>workflowTypeIdentifier</key><string>com.apple.Automator.servicesMenu</string>
+          </dict>
+        </dict></plist>
+        """
     }
 
     // Receives folders/files the system routes to us (e.g. when Navigator is the
     // default folder handler). Folders open as new tabs; other files open normally.
     func application(_ application: NSApplication, open urls: [URL]) {
+        // Finder Quick Actions call back via our navigatoraction:// scheme.
+        let actionURLs = urls.filter { $0.scheme == "navigatoraction" }
+        if !actionURLs.isEmpty { actionURLs.forEach { handleActionURL($0) }; return }
+        let urls = urls.filter { $0.isFileURL }
+        guard !urls.isEmpty else { return }
         // Images → our built-in viewer (when Navigator is the default image app,
         // opening one from Finder lands here). Do NOT NSWorkspace.open them, or it
         // would bounce right back to us. Arrow through the folder like Preview.
@@ -6009,6 +6148,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let aiMenu = NSMenu(title: "AI"); aiItem.submenu = aiMenu
         let keysItem = aiMenu.addItem(withTitle: "API Keys…", action: #selector(apiKeysAction(_:)), keyEquivalent: "")
         keysItem.target = self
+        let qaItem = aiMenu.addItem(withTitle: "Install Finder Quick Actions", action: #selector(installFinderQuickActions(_:)), keyEquivalent: "")
+        qaItem.target = self
 
         NSApp.mainMenu = mainMenu
     }

@@ -53,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.69</string>
-<key>CFBundleVersion</key><string>85</string>
+<key>CFBundleShortVersionString</key><string>1.4.70</string>
+<key>CFBundleVersion</key><string>86</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -92,35 +92,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSPortName</key><string>Navigator</string>
     <key>NSSendFileTypes</key><array><string>public.item</string></array>
   </dict>
+</array>
+<key>CFBundleURLTypes</key>
+<array>
   <dict>
-    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Remove Background</string></dict>
-    <key>NSMessage</key><string>svcRemoveBG</string>
-    <key>NSPortName</key><string>Navigator</string>
-    <key>NSSendFileTypes</key><array><string>public.image</string></array>
-  </dict>
-  <dict>
-    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Chroma Key (Green Screen)</string></dict>
-    <key>NSMessage</key><string>svcChromaKey</string>
-    <key>NSPortName</key><string>Navigator</string>
-    <key>NSSendFileTypes</key><array><string>public.image</string></array>
-  </dict>
-  <dict>
-    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Upscale — Art</string></dict>
-    <key>NSMessage</key><string>svcUpscaleArt</string>
-    <key>NSPortName</key><string>Navigator</string>
-    <key>NSSendFileTypes</key><array><string>public.image</string></array>
-  </dict>
-  <dict>
-    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Upscale — Photoreal</string></dict>
-    <key>NSMessage</key><string>svcUpscalePhoto</string>
-    <key>NSPortName</key><string>Navigator</string>
-    <key>NSSendFileTypes</key><array><string>public.image</string></array>
-  </dict>
-  <dict>
-    <key>NSMenuItem</key><dict><key>default</key><string>Navigator: Upscale — Low Quality ×4</string></dict>
-    <key>NSMessage</key><string>svcUpscaleLowQ</string>
-    <key>NSPortName</key><string>Navigator</string>
-    <key>NSSendFileTypes</key><array><string>public.image</string></array>
+    <key>CFBundleURLName</key><string>Navigator Action</string>
+    <key>CFBundleURLSchemes</key><array><string>navigatoraction</string></array>
   </dict>
 </array>
 </dict></plist>
