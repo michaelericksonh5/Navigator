@@ -1678,7 +1678,10 @@ final class Browser: ObservableObject, Identifiable {
     // True when the selection lives inside Google Drive (has a Drive item ID).
     func isGoogleDriveSelection(_ ids: Set<String>) -> Bool {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }) else { return false }
-        return googleDriveItemID(it.url) != nil
+        // Must actually LIVE in Google Drive — not merely carry the drivefs xattr,
+        // which files copied OUT of Drive keep (that made the Drive menu appear on
+        // local copies). Path check first, then the item-id.
+        return it.url.path.contains("/Library/CloudStorage/GoogleDrive-") && googleDriveItemID(it.url) != nil
     }
     // Copy a shareable drive.google.com link (resolves for anyone with access,
     // no username/mount in it) instead of a machine-specific local path.
