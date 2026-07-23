@@ -705,10 +705,14 @@ enum AfterEffectsIcon {
         Label("Prep for AI", systemImage: "wand.and.stars")
     }
 }
-// "Upscale (AI)" submenu — the three fal/Topaz presets.
-@ViewBuilder func upscaleMenu(_ action: @escaping (UpscaleOption) -> Void) -> some View {
+// "Upscale (AI)" submenu — the three fal/Topaz presets plus Vertex/Imagen 4.
+@ViewBuilder func upscaleMenu(fal: @escaping (UpscaleOption) -> Void,
+                              imagen: @escaping (Int) -> Void) -> some View {
     Menu {
-        ForEach(upscaleOptions) { o in Button(o.label) { action(o) } }
+        ForEach(upscaleOptions) { o in Button(o.label) { fal(o) } }
+        Divider()
+        Button("Upscale (Imagen 4)") { imagen(2) }
+        Button("Upscale (Imagen 4) ×4") { imagen(4) }
     } label: { Label("Upscale (AI)", systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {
@@ -993,6 +997,140 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
         DispatchQueue.main.async {
             BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
             if !errors.isEmpty { showBGSummary(app: "Upscale", done: outs.count, total: imgs.count, errors: errors) }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
+// ===== AI Upscale (Vertex / Imagen 4) via the H5G ai-connect client =====
+// We don't re-implement Vertex OAuth in Swift — we drive the existing,
+// cost-tracked `client.mjs` (browser Google sign-in, company-metered). Navigator
+// just locates node + the client, then shells `imagen-upscale`.
+
+struct H5GResult { let out: String; let err: String; let code: Int32 }
+
+// GUI apps launched from Finder/Dock have a minimal PATH (no nvm/homebrew), so
+// resolve node by absolute path: nvm versions, then homebrew, then system.
+func resolveNode() -> String? {
+    let fm = FileManager.default
+    var candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+    let nvm = (NSHomeDirectory() as NSString).appendingPathComponent(".nvm/versions/node")
+    if let vers = try? fm.contentsOfDirectory(atPath: nvm).sorted(by: >) {
+        candidates.insert(contentsOf: vers.map { "\(nvm)/\($0)/bin/node" }, at: 0)
+    }
+    return candidates.first { fm.isExecutableFile(atPath: $0) }
+}
+
+// The h5g-ai-connect client, wherever the plugin/skill is installed.
+func resolveH5GClient() -> String? {
+    let home = NSHomeDirectory()
+    let fixed = [
+        "\(home)/.claude/skills/h5g-ai-connect/client.mjs",
+        "\(home)/Documents/h5g-ai-connect/skills/h5g-ai-connect/client.mjs",
+        "\(home)/Downloads/claude-plugins-main/plugins/h5g-ai-connect/skills/h5g-ai-connect/client.mjs",
+    ]
+    if let f = fixed.first(where: { FileManager.default.fileExists(atPath: $0) }) { return f }
+    let cache = "\(home)/.claude/plugins/cache"
+    if let e = FileManager.default.enumerator(atPath: cache) {
+        for case let p as String in e where p.hasSuffix("skills/h5g-ai-connect/client.mjs") { return "\(cache)/\(p)" }
+    }
+    return nil
+}
+
+func vertexSignedIn() -> Bool {
+    FileManager.default.fileExists(atPath: (NSHomeDirectory() as NSString).appendingPathComponent(".h5g-ai-gen/token.json"))
+}
+
+// Synchronous run of `node client.mjs <args>`. Reads pipes fully before waiting
+// (avoids a full-buffer deadlock). Node's own dir is put on PATH so the client's
+// child `open`/etc. resolve.
+func runH5GClient(_ args: [String]) -> H5GResult {
+    guard let node = resolveNode() else { return H5GResult(out: "", err: "Node.js not found", code: 127) }
+    guard let client = resolveH5GClient() else { return H5GResult(out: "", err: "h5g-ai-connect client not found", code: 127) }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: node)
+    p.arguments = [client] + args
+    var env = ProcessInfo.processInfo.environment
+    let nodeDir = (node as NSString).deletingLastPathComponent
+    env["PATH"] = "\(nodeDir):/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+    p.environment = env
+    let o = Pipe(); let e = Pipe()
+    p.standardOutput = o; p.standardError = e
+    do { try p.run() } catch { return H5GResult(out: "", err: error.localizedDescription, code: 127) }
+    let od = o.fileHandleForReading.readDataToEndOfFile()
+    let ed = e.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return H5GResult(out: String(data: od, encoding: .utf8) ?? "", err: String(data: ed, encoding: .utf8) ?? "", code: p.terminationStatus)
+}
+
+// client.mjs prints "✅ Saved <path>" on success.
+private func parseSavedPath(_ out: String) -> String? {
+    for line in out.split(separator: "\n") {
+        if let r = line.range(of: "Saved ") { return String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces) }
+    }
+    return nil
+}
+private func cleanH5GError(_ r: H5GResult) -> String {
+    let src = r.err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? r.out : r.err
+    return src.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        .last { !$0.isEmpty } ?? "upscale failed"
+}
+
+func promptVertexSetup() {
+    let a = NSAlert(); a.alertStyle = .warning
+    a.messageText = "Vertex (Imagen) isn’t set up on this Mac"
+    a.informativeText = "Imagen upscaling needs Node.js and the H5G ai-connect plugin installed. Ask Michael for the h5g-ai-connect setup, then try again."
+    a.addButton(withTitle: "OK"); a.runModal()
+}
+func promptVertexSignin() {
+    let a = NSAlert(); a.alertStyle = .warning
+    a.messageText = "Sign in to Vertex first"
+    a.informativeText = "Imagen upscaling runs through your High 5 Games Vertex account. Sign in from the menu bar: AI → Sign in to Vertex (Imagen)…"
+    a.addButton(withTitle: "OK"); a.runModal()
+}
+
+// Upscale one or many images via Vertex/Imagen 4. Transparent art is composited
+// on green, upscaled, then keyed back to transparent (Imagen upscales opaque
+// RGB) — same trick as the fal path. Non-blocking progress + summary.
+func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    guard resolveNode() != nil, resolveH5GClient() != nil else { DispatchQueue.main.async { promptVertexSetup() }; return }
+    guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling", total: 0) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []; var errors: [String] = []
+        for (idx, src) in imgs.enumerated() {
+            DispatchQueue.main.async {
+                BGJobProgress.shared.label = imgs.count == 1
+                    ? "Upscaling \(src.lastPathComponent) — Imagen ×\(factor)"
+                    : "Upscaling \(idx + 1) of \(imgs.count) — Imagen ×\(factor)"
+            }
+            let transparent = imageHasTransparency(src)
+            var inputPath = src.path
+            var tmpInput: URL? = nil
+            if transparent, let cg = loadCGImage(src), let g = compositeOnGreen(cg), let png = encodePNG(g) {
+                let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
+                if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
+            }
+            let r = runH5GClient(["imagen-upscale", inputPath, "--factor", "x\(factor)", "--out", FileManager.default.temporaryDirectory.path])
+            if let t = tmpInput { try? FileManager.default.removeItem(at: t) }
+            guard r.code == 0, let saved = parseSavedPath(r.out) else {
+                errors.append("\(src.lastPathComponent): \(cleanH5GError(r))"); continue
+            }
+            let savedURL = URL(fileURLWithPath: saved)
+            let dst = upscaleOutputURL(src)
+            do {
+                let data = try Data(contentsOf: savedURL)
+                let finalData = transparent ? (stripGreen(data) ?? data) : data
+                try finalData.write(to: dst)
+                try? FileManager.default.removeItem(at: savedURL)
+                outs.append(dst)
+            } catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
+        }
+        DispatchQueue.main.async {
+            BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
+            if !errors.isEmpty { showBGSummary(app: "Upscale (Imagen 4)", done: outs.count, total: imgs.count, errors: errors) }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
@@ -2497,6 +2635,13 @@ final class Browser: ObservableObject, Identifiable {
         upscaleImagesViaFal(urls, option: option) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
+    // Upscale the selected image(s) via Vertex/Imagen 4 → "<name>_upscaled.png".
+    func upscaleImagen(_ ids: Set<String>, factor: Int) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        upscaleImagesViaImagen(urls, factor: factor) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
     // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
@@ -3844,7 +3989,8 @@ struct FileTableView: View {
             }
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
-                upscaleMenu { opt in browser.upscale(ids, opt) }
+                upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
+                            imagen: { f in browser.upscaleImagen(ids, factor: f) })
             }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
@@ -4114,7 +4260,8 @@ struct IconGridView: View {
                 }
                 if bgSel.contains(where: { !$0.isDirectory && isImageFile($0.url) }) {
                     prepForAIMenu { c, ratio in browser.fillBackground(bgIDs, c, ratio: ratio) }
-                    upscaleMenu { opt in browser.upscale(bgIDs, opt) }
+                    upscaleMenu(fal: { opt in browser.upscale(bgIDs, opt) },
+                                imagen: { f in browser.upscaleImagen(bgIDs, factor: f) })
                 }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
                 if item.isDirectory {
@@ -5020,9 +5167,11 @@ struct ImageViewerView: View {
                 prepForAIMenu { c, ratio in
                     fillBackgroundForImages([u], color: c.color, suffix: c.suffix, ratio: ratio) { outs in if let o = outs.first { revealNewImage(o) } }
                 }
-                upscaleMenu { opt in
+                upscaleMenu(fal: { opt in
                     upscaleImagesViaFal([u], option: opt) { outs in if let o = outs.first { revealNewImage(o) } }
-                }
+                }, imagen: { f in
+                    upscaleImagesViaImagen([u], factor: f) { outs in if let o = outs.first { revealNewImage(o) } }
+                })
             }
             if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
@@ -6192,6 +6341,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keysItem.target = self
         let qaItem = aiMenu.addItem(withTitle: "Install Finder Quick Actions", action: #selector(installFinderQuickActions(_:)), keyEquivalent: "")
         qaItem.target = self
+        aiMenu.addItem(NSMenuItem.separator())
+        let vSignIn = aiMenu.addItem(withTitle: "Sign in to Vertex (Imagen)…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
+        vSignIn.target = self
+        let vStatus = aiMenu.addItem(withTitle: "Vertex Status…", action: #selector(vertexStatusAction(_:)), keyEquivalent: "")
+        vStatus.target = self
 
         NSApp.mainMenu = mainMenu
     }
@@ -6209,6 +6363,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.window.initialFirstResponder = field
         if a.runModal() == .alertFirstButtonReturn {
             APIKeys.fal = field.stringValue
+        }
+    }
+
+    // AI → Sign in to Vertex — runs the H5G client's browser Google sign-in in a
+    // visible Terminal window so the user sees the flow and the result. No key is
+    // typed; the token is stored by the client at ~/.h5g-ai-gen/token.json.
+    @objc func vertexSignInAction(_ sender: Any?) {
+        guard let node = resolveNode(), let client = resolveH5GClient() else { promptVertexSetup(); return }
+        func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let shell = "clear; \(q(node)) \(q(client)) login; echo; echo 'You can close this window.'"
+        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\"\nend tell"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        try? p.run()
+    }
+
+    // AI → Vertex Status — `whoami` against the metered service.
+    @objc func vertexStatusAction(_ sender: Any?) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = runH5GClient(["whoami"])
+            let email = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                let a = NSAlert()
+                if r.code == 0, !email.isEmpty, !email.lowercased().contains("not signed in") {
+                    a.messageText = "Signed in to Vertex"
+                    a.informativeText = "Account: \(email)\nImagen upscaling is ready."
+                } else {
+                    a.alertStyle = .warning
+                    a.messageText = "Not signed in to Vertex"
+                    a.informativeText = "Use AI → Sign in to Vertex (Imagen)… to sign in with your High 5 Games Google account."
+                }
+                a.addButton(withTitle: "OK"); a.runModal()
+            }
         }
     }
 
