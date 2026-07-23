@@ -996,7 +996,7 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
         }
         DispatchQueue.main.async {
             BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
-            if !errors.isEmpty { showBGSummary(app: "Upscale", done: outs.count, total: imgs.count, errors: errors) }
+            if !errors.isEmpty { showBGSummary(app: "Upscale", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
@@ -1070,10 +1070,17 @@ private func parseSavedPath(_ out: String) -> String? {
     }
     return nil
 }
+// Surface the whole "❌ …" block (the client prints the real reason there, often
+// multi-line JSON), not just the last line — that was only the request_id.
 private func cleanH5GError(_ r: H5GResult) -> String {
-    let src = r.err.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? r.out : r.err
-    return src.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        .last { !$0.isEmpty } ?? "upscale failed"
+    let combined = (r.out + "\n" + r.err)
+    let lines = combined.split(separator: "\n", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+    if let start = lines.firstIndex(where: { $0.contains("❌") }) {
+        let block = lines[start...].joined(separator: " ")
+            .replacingOccurrences(of: "❌", with: "").trimmingCharacters(in: .whitespaces)
+        if !block.isEmpty { return String(block.prefix(300)) }
+    }
+    return lines.last { !$0.isEmpty } ?? "upscale failed"
 }
 
 func promptVertexSetup() {
@@ -1113,7 +1120,11 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
                 let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
                 if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
             }
-            let r = runH5GClient(["imagen-upscale", inputPath, "--factor", "x\(factor)", "--out", FileManager.default.temporaryDirectory.path])
+            let args = ["imagen-upscale", inputPath, "--factor", "x\(factor)", "--out", FileManager.default.temporaryDirectory.path]
+            var r = runH5GClient(args)
+            // Imagen's diffusion upscaler blips transiently ("no image returned"),
+            // which doesn't bill — one retry kills most spurious failures.
+            if r.code != 0 || parseSavedPath(r.out) == nil { r = runH5GClient(args) }
             if let t = tmpInput { try? FileManager.default.removeItem(at: t) }
             guard r.code == 0, let saved = parseSavedPath(r.out) else {
                 errors.append("\(src.lastPathComponent): \(cleanH5GError(r))"); continue
@@ -1130,7 +1141,7 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
         }
         DispatchQueue.main.async {
             BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
-            if !errors.isEmpty { showBGSummary(app: "Upscale (Imagen 4)", done: outs.count, total: imgs.count, errors: errors) }
+            if !errors.isEmpty { showBGSummary(app: "Upscale (Imagen 4)", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
@@ -1256,10 +1267,10 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
 // One end-of-run dialog for a multi-image job with failures (collapses the
 // per-file errors). Success-only runs get no dialog — the progress bar's final
 // line + the highlighted results are the confirmation.
-func showBGSummary(app: String, done: Int, total: Int, errors: [String]) {
+func showBGSummary(app: String, done: Int, total: Int, errors: [String], verb: String = "removed") {
     let a = NSAlert()
     a.alertStyle = .warning
-    a.messageText = "\(app): removed \(done) of \(total)"
+    a.messageText = "\(app): \(verb) \(done) of \(total)"
     var msg = "\(errors.count) image\(errors.count == 1 ? "" : "s") could not be processed:\n\n"
     msg += errors.prefix(15).joined(separator: "\n")
     if errors.count > 15 { msg += "\n… and \(errors.count - 15) more." }
