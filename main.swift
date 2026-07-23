@@ -2446,6 +2446,19 @@ struct SidebarView: View {
                     Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
                 }
             }
+            // Drag a pinned favorite onto another to reorder. Uses a String payload
+            // (the path) — distinct from the URL file-drop type, so the two never
+            // collide. OutlineGroup rows don't support List's .onMove, so we do it
+            // explicitly. Dragging a non-favorite row is a harmless no-op.
+            .draggable(n.url.path)
+            .dropDestination(for: String.self) { items, _ in
+                guard let src = items.first,
+                      let from = favStore.items.firstIndex(where: { $0.path == src }),
+                      let target = favStore.items.firstIndex(where: { $0.path == n.url.path }),
+                      from != target else { return false }
+                favStore.move(fromOffsets: IndexSet(integer: from), toOffset: from < target ? target + 1 : target)
+                return true
+            }
         }
     }
 
@@ -2456,11 +2469,7 @@ struct SidebarView: View {
                 Button { browser.loadRecents() } label: {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
-                ForEach(favNodes) { tree($0, removable: true) }
-                    .onMove { from, to in
-                        favNodes.move(fromOffsets: from, toOffset: to)   // immediate, smooth
-                        favStore.move(fromOffsets: from, toOffset: to)   // persist + anchor Home
-                    }
+                ForEach(favNodes) { tree($0, removable: true) }   // reorder via drag (see tree)
             }
             .dropDestination(for: URL.self) { urls, _ in
                 for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }
