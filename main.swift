@@ -2434,6 +2434,13 @@ struct SidebarView: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(n.url.path, forType: .string)
                 }
+                if n.mountURL != nil {   // network drive favorite → offer Eject
+                    Button("Eject") {
+                        let c = n.url.pathComponents
+                        let vol = (c.count >= 3 && c[1] == "Volumes") ? URL(fileURLWithPath: "/Volumes/\(c[2])") : n.url
+                        try? NSWorkspace.shared.unmountAndEjectDevice(at: vol)
+                    }
+                }
                 if pinned {
                     Divider()
                     Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
@@ -2957,7 +2964,11 @@ struct IconCell: View {
         .contentShape(Rectangle())
         .draggable(item.url)
         .onAppear {
-            ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }
+            // Only fetch a thumbnail for files that can have one — folders keep
+            // their type icon (matches the list view; avoids per-cell churn).
+            if !item.isDirectory, isThumbnailable(item.url) {
+                ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }
+            }
             cloud = cloudBadge(for: item.url)
         }
     }
@@ -3092,9 +3103,10 @@ struct IconGridView: View {
                 // Record this cell's frame for marquee hit-testing — writing to a
                 // plain store (not a PreferenceKey), so it never feeds back into
                 // layout. Updated as cells appear/scroll into view.
-                Color.clear
-                    .onAppear { frameStore.frames[item.id] = g.frame(in: .named("iconGrid")) }
-                    .onChange(of: g.frame(in: .named("iconGrid"))) { _, f in frameStore.frames[item.id] = f }
+                // Capture the frame once when the cell appears (for marquee
+                // hit-testing). No .onChange — evaluating a named-coordinate-space
+                // frame per cell on every layout pass janks LazyVGrid scrolling.
+                Color.clear.onAppear { frameStore.frames[item.id] = g.frame(in: .named("iconGrid")) }
             })
             // ONE tap recognizer — no count:2 gesture to disambiguate against, so
             // the select fires on mouse-up with zero double-click delay. A
@@ -4889,6 +4901,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileMenu.addItem(.separator())
         let cs = fileMenu.addItem(withTitle: "Connect to Server…", action: #selector(connectServerAction(_:)), keyEquivalent: "k")
         cs.target = self
+        let and = fileMenu.addItem(withTitle: "Add Network Drive…", action: #selector(addNetworkDriveAction(_:)), keyEquivalent: "")
+        and.target = self
         fileMenu.addItem(.separator())
         let expF = fileMenu.addItem(withTitle: "Export Favorites…", action: #selector(exportFavoritesAction(_:)), keyEquivalent: ""); expF.target = self
         let impF = fileMenu.addItem(withTitle: "Import Favorites…", action: #selector(importFavoritesAction(_:)), keyEquivalent: ""); impF.target = self
@@ -5136,6 +5150,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         if let mp { self.openFolderTab(URL(fileURLWithPath: mp)) } else { NSSound.beep() }
                     }
                 }
+            }
+        }
+    }
+
+    // Add a network drive as a pinned favorite: prompt for a name + address,
+    // mount it, and add it to the sidebar with its mount URL so a click re-mounts
+    // it later (VPN reconnect, reboot). This is how a coworker sets up a new share
+    // without editing JSON.
+    @objc func addNetworkDriveAction(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Add Network Drive"
+        alert.informativeText = "Give it a name and the server address (e.g. smb://server/share). It mounts now and stays pinned in the sidebar — one click reconnects it later."
+        let name = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
+        name.placeholderString = "Name (e.g. G Drive)"
+        let addr = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        addr.stringValue = "smb://"
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 320, height: 58))
+        stack.orientation = .vertical; stack.spacing = 8
+        stack.addArrangedSubview(name); stack.addArrangedSubview(addr)
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Add"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let label = name.stringValue.trimmingCharacters(in: .whitespaces)
+        let s = addr.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty, let url = URL(string: s) else { NSSound.beep(); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let mp = Browser.mountShare(url) else {
+                DispatchQueue.main.async {
+                    let a = NSAlert(); a.messageText = "Couldn't connect to \(url.host ?? "the server")"
+                    a.informativeText = "Check the address and that you're on the VPN, then try again."
+                    a.runModal()
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                FavoritesStore.shared.add(URL(fileURLWithPath: mp), label: label.isEmpty ? nil : label, mountURL: s)
+                self.openFolderTab(URL(fileURLWithPath: mp))
             }
         }
     }
