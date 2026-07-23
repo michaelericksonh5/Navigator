@@ -14,7 +14,8 @@
  */
 
 #target photoshop
-app.bringToFront();
+// NOTE: no app.bringToFront() — Navigator runs Photoshop hidden, so we must not
+// pull it to the foreground.
 
 // Replace the file extension with .png (background removal needs an alpha format).
 function pngPathFor(p) {
