@@ -669,11 +669,19 @@ func runPhotoshopScript(resource: String, argument: String) {
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     p.arguments = ["-e", osa]
     let err = Pipe(); p.standardError = err
+    let out = Pipe(); p.standardOutput = out
     do {
-        try p.run(); p.waitUntilExit()
+        try p.run()
+        // Read pipes before waiting so a chatty script can't deadlock on a full pipe.
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if p.terminationStatus != 0 {
-            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", msg) }
+            DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", String(data: errData, encoding: .utf8) ?? "") }
+        } else if stdout.hasPrefix("ERROR") {
+            // The script ran but reported a failure (e.g. save/removeBackground).
+            DispatchQueue.main.async { reportFileError("Photoshop couldn’t finish Remove BG", stdout) }
         }
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) }
