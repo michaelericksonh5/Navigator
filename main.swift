@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import ImageIO
 import Quartz
 import QuickLookThumbnailing
 import CoreServices
@@ -651,10 +652,124 @@ enum AfterEffectsIcon {
     }.labelStyle(.titleAndIcon)
 }
 
+// "Prep for AI" submenu — fill the background with a chosen color (colored
+// circle swatches). `action` receives the picked color. Used by the file list
+// and the image viewer.
+@ViewBuilder func prepForAIMenu(_ action: @escaping (NSColor) -> Void) -> some View {
+    Menu {
+        Section("Fill Background") {
+            ForEach(aiPrepColors) { c in
+                Button { action(c.color) } label: {
+                    Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(c.color)) }
+                }
+            }
+        }
+    } label: {
+        Label("Prep for AI", systemImage: "wand.and.stars")
+    }
+}
+
 // "foo.png" → "foo_rmbg.png" in the same folder (background removal needs PNG).
 func rmbgOutputURL(_ src: URL) -> URL {
     let base = src.deletingPathExtension().lastPathComponent
     return src.deletingLastPathComponent().appendingPathComponent("\(base)_rmbg.png")
+}
+
+// ===== Prep for AI: background fill =====
+
+// The background-fill colors offered in the "Prep for AI" menu. The screen
+// colors match the chroma keyer's expected values for later Chroma Key use.
+struct AIPrepColor: Identifiable { let name: String; let color: NSColor; var id: String { name } }
+let aiPrepColors: [AIPrepColor] = [
+    .init(name: "White",         color: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)),
+    .init(name: "Black",         color: NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)),
+    .init(name: "Greenscreen",   color: NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)),
+    .init(name: "MagentaScreen", color: NSColor(srgbRed: 1, green: 0, blue: 1, alpha: 1)),
+    .init(name: "Bluescreen",    color: NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1)),
+    .init(name: "Yellow",        color: NSColor(srgbRed: 1, green: 1, blue: 0, alpha: 1)),
+    .init(name: "Orange",        color: NSColor(srgbRed: 1, green: 0.5, blue: 0, alpha: 1)),
+]
+
+// A small filled-circle swatch for the menu (kept in color — not a template
+// image — with a hairline border so white/black read against the menu).
+func circleSwatch(_ color: NSColor, size: CGFloat = 12) -> NSImage {
+    let img = NSImage(size: NSSize(width: size, height: size))
+    img.lockFocus()
+    let path = NSBezierPath(ovalIn: NSRect(x: 0.5, y: 0.5, width: size - 1, height: size - 1))
+    color.setFill(); path.fill()
+    NSColor.separatorColor.setStroke(); path.lineWidth = 0.5; path.stroke()
+    img.unlockFocus()
+    img.isTemplate = false
+    return img
+}
+
+// NB2's supported aspect ratios (width/height).
+let nb2Ratios: [(name: String, ratio: Double)] = [
+    ("16:9", 16.0/9), ("9:16", 9.0/16), ("4:3", 4.0/3), ("3:4", 3.0/4), ("1:1", 1),
+    ("3:2", 3.0/2), ("2:3", 2.0/3), ("21:9", 21.0/9), ("9:21", 9.0/21), ("5:4", 5.0/4), ("4:5", 4.0/5),
+]
+// Nearest supported ratio by log-distance (symmetric for ratios).
+func nearestNB2Ratio(w: Double, h: Double) -> Double {
+    let r = w / max(h, 1)
+    return nb2Ratios.min { abs(log($0.ratio) - log(r)) < abs(log($1.ratio) - log(r)) }!.ratio
+}
+
+func bgfillOutputURL(_ src: URL) -> URL {
+    let base = src.deletingPathExtension().lastPathComponent
+    return src.deletingLastPathComponent().appendingPathComponent("\(base)_bgfill.png")
+}
+
+// Fit the image into the nearest NB2 aspect ratio, pad by 20% (space on all
+// sides), fill the background with `color`, and write "<base>_bgfill.png". The
+// image is placed centered at its native size — never scaled or cropped, never
+// overwrites the original. Returns the output URL (nil on failure).
+func fillBackgroundForImage(_ src: URL, color: NSColor) -> URL? {
+    guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
+          let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+    let w = CGFloat(cg.width), h = CGFloat(cg.height)
+    guard w > 0, h > 0 else { return nil }
+    let rt = CGFloat(nearestNB2Ratio(w: Double(w), h: Double(h)))
+    // Smallest target-ratio box that contains the image, then +20% padding.
+    var tightW = w, tightH = h
+    if w / h > rt { tightW = w; tightH = w / rt } else { tightH = h; tightW = h * rt }
+    let canvasW = Int((tightW * 1.2).rounded())
+    let canvasH = Int((tightH * 1.2).rounded())
+    guard canvasW > 0, canvasH > 0,
+          let ctx = CGContext(data: nil, width: canvasW, height: canvasH, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.setFillColor((color.usingColorSpace(.deviceRGB) ?? color).cgColor)
+    ctx.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
+    let x = (CGFloat(canvasW) - w) / 2, y = (CGFloat(canvasH) - h) / 2
+    ctx.draw(cg, in: CGRect(x: x, y: y, width: w, height: h))   // native size, centered
+    guard let outImg = ctx.makeImage() else { return nil }
+    let dst = bgfillOutputURL(src)
+    guard let dest = CGImageDestinationCreateWithURL(dst as CFURL, "public.png" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(dest, outImg, nil)
+    guard CGImageDestinationFinalize(dest) else { return nil }
+    return dst
+}
+
+// Fill backgrounds for one or many images (native — no Adobe app). Shows the
+// non-blocking progress bar + end-of-run summary for multi-image runs.
+func fillBackgroundForImages(_ srcs: [URL], color: NSColor, onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    let showProgress = imgs.count > 1
+    if showProgress { DispatchQueue.main.async { BGJobProgress.shared.start("Filling backgrounds", total: imgs.count) } }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []; var errors: [String] = []
+        for src in imgs {
+            if let out = fillBackgroundForImage(src, color: color) { outs.append(out) }
+            else { errors.append("\(src.lastPathComponent): couldn’t create fill") }
+            if showProgress { DispatchQueue.main.async { BGJobProgress.shared.advance() } }
+        }
+        DispatchQueue.main.async {
+            if showProgress { BGJobProgress.shared.finish("Filled \(outs.count) of \(imgs.count) background\(imgs.count == 1 ? "" : "s")") }
+            if !errors.isEmpty { showBGSummary(app: "Prep for AI", done: outs.count, total: imgs.count, errors: errors) }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
 }
 
 // Single-image Remove BG usable from anywhere (browser or image viewer): Photoshop
@@ -2100,6 +2215,15 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
 
+    // Prep for AI — Fill Background: fit each selected image to the nearest NB2
+    // aspect ratio, pad 20%, fill with `color`, write "<name>_bgfill.png". Native
+    // (no Adobe app); originals untouched.
+    func fillBackground(_ ids: Set<String>, color: NSColor) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        fillBackgroundForImages(urls, color: color) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
     // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
@@ -3424,6 +3548,9 @@ struct FileTableView: View {
                     Button { browser.batchChromaKeyBackground(ids) } label: { aeLabel("Batch Chroma Key BG") }
                 }
             }
+            if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
+                prepForAIMenu { color in browser.fillBackground(ids, color: color) }
+            }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
                     for it in browser.items where ids.contains(it.id) && it.isDirectory { FolderSizeCache.shared.compute(it.url) }
@@ -3688,6 +3815,9 @@ struct IconGridView: View {
                     } else if item.isDirectory, bgSel.count == 1 {
                         Button { browser.batchChromaKeyBackground([item.id]) } label: { aeLabel("Batch Chroma Key BG") }
                     }
+                }
+                if bgSel.contains(where: { !$0.isDirectory && isImageFile($0.url) }) {
+                    prepForAIMenu { color in browser.fillBackground(bgIDs, color: color) }
                 }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
                 if item.isDirectory {
@@ -4577,6 +4707,13 @@ struct ImageViewerView: View {
             Button("Copy File") { copyFileToClipboard() }
             Button("Copy Location") { copyLocation() }
             Button("Copy File Name") { copyFileName() }
+            if let u = currentURL {
+                Divider()
+                OpenWithMenu(urls: [u])
+                prepForAIMenu { color in
+                    fillBackgroundForImages([u], color: color) { outs in if let o = outs.first { revealNewImage(o) } }
+                }
+            }
             if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
                 if PhotoshopIcon.image != nil {
