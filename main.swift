@@ -2385,6 +2385,7 @@ final class AppModel: ObservableObject {
 
 struct SidebarView: View {
     @ObservedObject var browser: Browser
+    @ObservedObject var model: AppModel
     @ObservedObject var recents = RecentFolders.shared
     @ObservedObject var network = NetworkBrowser.shared
     @ObservedObject var favStore = FavoritesStore.shared
@@ -2424,7 +2425,19 @@ struct SidebarView: View {
                 }
             }
             .contextMenu {
-                if pinned { Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) } }
+                Button("Open") { browser.openFavorite(n.url.path, mountURL: n.mountURL) }
+                Button("Open in New Tab") { model.newTab(at: n.url) }
+                Button("Open in Second Pane") { model.openInSecondPane(n.url) }
+                Divider()
+                Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([n.url]) }
+                Button("Copy Path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(n.url.path, forType: .string)
+                }
+                if pinned {
+                    Divider()
+                    Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
+                }
             }
         }
     }
@@ -3665,7 +3678,7 @@ struct BrowserPane: NSViewControllerRepresentable {
         } else {
             content = AnyView(BrowserContent(model: model, browser: browser).id(browser.id))
         }
-        vc.apply(sidebar: AnyView(SidebarView(browser: browser)),
+        vc.apply(sidebar: AnyView(SidebarView(browser: browser, model: model)),
                  content: content,
                  preview: AnyView(PreviewPane(browser: browser)))
     }
