@@ -651,23 +651,35 @@ func runPhotoshopScript(resource: String, argument: String) {
         DispatchQueue.main.async { reportFileError("Photoshop isn’t installed", "Install Adobe Photoshop to use Remove BG.") }
         return
     }
-    guard let script = Bundle.main.url(forResource: resource, withExtension: "jsx") else {
+    guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
+          let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
         DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
         return
     }
-    func esc(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-    }
-    let osa = """
-    tell application id "com.adobe.Photoshop"
-        activate
-        set jsx to (POSIX file "\(esc(script.path))") as alias
-        do javascript jsx with arguments {"\(esc(argument))"}
-    end tell
+    // Pass the ExtendScript SOURCE and the target as osascript argv. This avoids
+    // AppleScript file coercion (a `POSIX file … as alias` reference fails with
+    // -1728 and the script never runs), and avoids escaping the multi-line source
+    // into a string literal. `with timeout` lets long AI cutouts / big batches run
+    // past osascript's default 2-minute AppleEvent limit (which shows as -1712).
+    // Also prepend the target as $.global.NAV_ARG so the script gets it even if
+    // `with arguments` doesn't populate arguments[] for a string source.
+    func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+    let source = "$.global.NAV_ARG = \"\(jsEsc(argument))\";\n" + fileSource
+    let appleScript = """
+    on run argv
+        set jsxSource to item 1 of argv
+        set targetPath to item 2 of argv
+        with timeout of 3600 seconds
+            tell application id "com.adobe.Photoshop"
+                activate
+                do javascript jsxSource with arguments {targetPath}
+            end tell
+        end timeout
+    end run
     """
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", osa]
+    p.arguments = ["-e", appleScript, source, argument]
     let err = Pipe(); p.standardError = err
     let out = Pipe(); p.standardOutput = out
     do {
@@ -720,31 +732,42 @@ func runAfterEffectsScript(resource: String, globals: [String: String]) {
         DispatchQueue.main.async { reportFileError("After Effects isn’t installed", "Install Adobe After Effects to use Chroma Key BG.") }
         return
     }
-    guard let script = Bundle.main.url(forResource: resource, withExtension: "jsx") else {
+    guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
+          let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
         DispatchQueue.main.async { reportFileError("After Effects script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
         return
     }
     func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
-    func asEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
-    // ExtendScript one-liner: set each global to a string, then run the bundled script.
-    var js = ""
-    for (k, v) in globals { js += "$.global.\(k) = \"\(jsEsc(v))\"; " }
-    js += "$.evalFile(new File(\"\(jsEsc(script.path))\"));"
-    let osa = """
-    tell application id "com.adobe.AfterEffects"
-        activate
-        DoScript "\(asEsc(js))"
-    end tell
+    // Prepend the string globals (e.g. the config-file path), then the script's
+    // own source. The whole thing is passed to DoScript as an osascript argv item,
+    // so there's no AppleScript file coercion (-1728) and no literal escaping.
+    var source = ""
+    for (k, v) in globals { source += "$.global.\(k) = \"\(jsEsc(v))\";\n" }
+    source += fileSource
+    let appleScript = """
+    on run argv
+        set jsxSource to item 1 of argv
+        with timeout of 3600 seconds
+            tell application id "com.adobe.AfterEffects"
+                activate
+                DoScript jsxSource
+            end tell
+        end timeout
+    end run
     """
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", osa]
+    p.arguments = ["-e", appleScript, source]
     let err = Pipe(); p.standardError = err
+    let out = Pipe(); p.standardOutput = out
     do {
-        try p.run(); p.waitUntilExit()
+        try p.run()
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        _ = outData
         if p.terminationStatus != 0 {
-            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", msg) }
+            DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", String(data: errData, encoding: .utf8) ?? "") }
         }
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) }

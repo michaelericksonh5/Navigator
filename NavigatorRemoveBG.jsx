@@ -17,7 +17,8 @@
 #target photoshop
 app.bringToFront();
 
-var TARGET = (typeof arguments !== "undefined" && arguments.length > 0) ? String(arguments[0]) : null;
+var TARGET = (typeof arguments !== "undefined" && arguments.length > 0) ? String(arguments[0])
+    : (($.global && $.global.NAV_ARG) ? String($.global.NAV_ARG) : null);
 
 function logTo(path, msg) {
     try { var f = File(path); f.open("a"); f.write(msg + "\n"); f.close(); } catch (e) {}
