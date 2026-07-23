@@ -599,10 +599,44 @@ enum PhotoshopIcon {
     }.labelStyle(.titleAndIcon)
 }
 
+// "foo.png" → "foo_rmbg.png" in the same folder, uniquified if it already exists.
+func rmbgCopyURL(_ src: URL) -> URL {
+    let dir = src.deletingLastPathComponent()
+    let ext = src.pathExtension
+    let base = src.deletingPathExtension().lastPathComponent
+    func make(_ name: String) -> URL { dir.appendingPathComponent(ext.isEmpty ? name : "\(name).\(ext)") }
+    var candidate = make("\(base)_rmbg")
+    var n = 2
+    while FileManager.default.fileExists(atPath: candidate.path) { candidate = make("\(base)_rmbg \(n)"); n += 1 }
+    return candidate
+}
+
+// Single-image Remove BG usable from anywhere (browser or image viewer): copy the
+// source to "<name>_rmbg", then run the bundled remove-background+trim script on
+// the copy. `onProgress` (main thread) fires after the copy and again after
+// Photoshop finishes, so callers can refresh. Original is never touched.
+func removeBackgroundForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
+    guard isImageFile(src) else { NSSound.beep(); return }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let copy = rmbgCopyURL(src)
+        do { try FileManager.default.copyItem(at: src, to: copy) }
+        catch { DispatchQueue.main.async { reportFileError("Couldn’t create the _rmbg copy", error.localizedDescription) }; return }
+        DispatchQueue.main.async { onProgress?() }
+        runPhotoshopScript(resource: "NavigatorRemoveBG", argument: copy.path)
+        DispatchQueue.main.async { onProgress?() }
+    }
+}
+
 // Runs a bundled Photoshop .jsx (by resource name, no extension) against one
 // path argument, launching Photoshop if needed. `do javascript` blocks until the
 // script finishes, so callers run this off the main thread and refresh after.
+// Never fails silently: a permission denial (Automation not allowed) or any
+// other error is surfaced with a clear next step.
 func runPhotoshopScript(resource: String, argument: String) {
+    guard PhotoshopIcon.url != nil else {
+        DispatchQueue.main.async { reportFileError("Photoshop isn’t installed", "Install Adobe Photoshop to use Remove BG.") }
+        return
+    }
     guard let script = Bundle.main.url(forResource: resource, withExtension: "jsx") else {
         DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
         return
@@ -625,10 +659,33 @@ func runPhotoshopScript(resource: String, argument: String) {
         try p.run(); p.waitUntilExit()
         if p.terminationStatus != 0 {
             let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            DispatchQueue.main.async { reportFileError("Photoshop couldn’t run the script", msg) }
+            DispatchQueue.main.async { reportPhotoshopFailure(msg) }
         }
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) }
+    }
+}
+
+// Turn osascript's raw error into a clear message. The one users hit is the
+// Automation (Apple-events) permission being off — offer to open the right pane.
+func reportPhotoshopFailure(_ raw: String) {
+    let lower = raw.lowercased()
+    let isPermission = lower.contains("not authorized") || lower.contains("not allowed")
+        || lower.contains("-1743") || lower.contains("1743")
+    let a = NSAlert(); a.alertStyle = .warning
+    if isPermission {
+        a.messageText = "Navigator needs permission to control Photoshop"
+        a.informativeText = "macOS blocks apps from automating other apps until you allow it. Open Privacy & Security → Automation, turn on Adobe Photoshop under Navigator, then try Remove BG again."
+        a.addButton(withTitle: "Open Automation Settings")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!)
+        }
+    } else {
+        a.messageText = "Photoshop couldn’t run the script"
+        a.informativeText = raw.isEmpty ? "Photoshop reported an error." : raw
+        a.addButton(withTitle: "OK")
+        a.runModal()
     }
 }
 
@@ -1712,32 +1769,13 @@ final class Browser: ObservableObject, Identifiable {
     // Extensions the batch/single scripts handle (matches IMAGE_EXTENSIONS in the JSX).
     static let rmbgExtensions: Set<String> = ["jpg", "jpeg", "png", "psd", "tif", "tiff", "bmp"]
 
-    // "foo.png" → "foo_rmbg.png" in the same folder, uniquified if it already exists.
-    private func rmbgCopyURL(_ src: URL) -> URL {
-        let dir = src.deletingLastPathComponent()
-        let ext = src.pathExtension
-        let base = src.deletingPathExtension().lastPathComponent
-        func make(_ name: String) -> URL { dir.appendingPathComponent(ext.isEmpty ? name : "\(name).\(ext)") }
-        var candidate = make("\(base)_rmbg")
-        var n = 2
-        while FileManager.default.fileExists(atPath: candidate.path) { candidate = make("\(base)_rmbg \(n)"); n += 1 }
-        return candidate
-    }
-
     // Remove BG (single image): copy to "<name>_rmbg", then have Photoshop remove
-    // the background + trim on the copy. Original is never touched.
+    // the background + trim on the copy. Original is never touched. Refreshes so
+    // the copy (then the processed result) shows up.
     func removeBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }),
               !it.isDirectory, isImageFile(it.url) else { NSSound.beep(); return }
-        let src = it.url
-        DispatchQueue.global(qos: .userInitiated).async {
-            let copy = self.rmbgCopyURL(src)
-            do { try FileManager.default.copyItem(at: src, to: copy) }
-            catch { DispatchQueue.main.async { reportFileError("Couldn’t create the _rmbg copy", error.localizedDescription) }; return }
-            DispatchQueue.main.async { self.refresh() }          // show the copy right away
-            runPhotoshopScript(resource: "NavigatorRemoveBG", argument: copy.path)
-            DispatchQueue.main.async { self.refresh() }          // pick up the processed result
-        }
+        removeBackgroundForImage(it.url) { [weak self] in self?.refresh() }
     }
 
     // Batch Remove BG (folder): recursively duplicate every image to "<name>_rmbg"
@@ -4064,6 +4102,26 @@ struct ImageViewerView: View {
         guard !urls.isEmpty else { return }
         index = (index + d + urls.count) % urls.count
     }
+    private var currentURL: URL? { urls.indices.contains(index) ? urls[index] : nil }
+    // Put the decoded picture on the clipboard (paste into Photoshop, Slack, docs…).
+    private func copyImageToClipboard() {
+        guard let u = currentURL, let img = NSImage(contentsOf: u) else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([img])
+    }
+    // Put the file itself on the clipboard as a file reference, so ⌘V pastes the
+    // actual file into any Navigator (or Finder) folder. Matches copyFiles().
+    private func copyFileToClipboard() {
+        guard let u = currentURL else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([u as NSURL])
+    }
+    private func copyLocation() {
+        guard let u = currentURL else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(u.path, forType: .string)
+    }
+    private func copyFileName() {
+        guard let u = currentURL else { NSSound.beep(); return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(u.lastPathComponent, forType: .string)
+    }
     private var zoomBinding: Binding<Double> {
         Binding(get: { zoomCtl.zoom }, set: { zoomCtl.setZoom($0) })
     }
@@ -4117,6 +4175,16 @@ struct ImageViewerView: View {
         .frame(minWidth: 520, minHeight: 420)
         .onAppear { loadInfo() }
         .onChange(of: index) { loadInfo() }
+        .contextMenu {
+            Button("Copy to Clipboard") { copyImageToClipboard() }
+            Button("Copy File") { copyFileToClipboard() }
+            Button("Copy Location") { copyLocation() }
+            Button("Copy File Name") { copyFileName() }
+            if PhotoshopIcon.image != nil, let u = currentURL {
+                Divider()
+                Button { removeBackgroundForImage(u) } label: { psLabel("Remove BG") }
+            }
+        }
     }
     // Windows Photos-style bottom bar: details on the left, zoom controls on the right.
     private var bottomBar: some View {

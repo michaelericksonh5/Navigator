@@ -53,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.49</string>
-<key>CFBundleVersion</key><string>65</string>
+<key>CFBundleShortVersionString</key><string>1.4.50</string>
+<key>CFBundleVersion</key><string>66</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -68,6 +68,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSRemovableVolumesUsageDescription</key><string>Navigator shows and manages files on USB and external drives you connect.</string>
 <key>NSNetworkVolumesUsageDescription</key><string>Navigator shows and manages files on network drives you connect to.</string>
 <key>NSFileProviderPresenceUsageDescription</key><string>Navigator shows files stored in cloud providers like iCloud Drive and Google Drive.</string>
+<key>NSAppleEventsUsageDescription</key><string>Navigator asks Adobe Photoshop to remove image backgrounds for you.</string>
 <key>CFBundleDocumentTypes</key>
 <array>
   <dict>
