@@ -46,7 +46,7 @@ function processFolder(rootFolder, shouldTrim, onlyRmbg) {
             try {
                 doc = openDocumentWithRetry(file);
                 removeBackground(doc, shouldTrim);
-                doc.save();
+                saveKeyed(doc, file);
                 doc.close(SaveOptions.DONOTSAVECHANGES);
                 purgeCachesSafely();
                 processed++;
@@ -94,6 +94,19 @@ function processFolder(rootFolder, shouldTrim, onlyRmbg) {
     }
 
     alert(message);
+}
+
+// Save the keyed result. For PNG (the common case) use an explicit PNG saveAs
+// so transparency persists — a bare doc.save() on a PNG is unreliable. Other
+// formats fall back to doc.save() in their own format.
+function saveKeyed(doc, file) {
+    if (/\.png$/i.test(file.name)) {
+        var opts = new PNGSaveOptions();
+        try { opts.compression = 6; } catch (e) {}
+        doc.saveAs(file, opts, true, Extension.LOWERCASE);
+    } else {
+        doc.save();
+    }
 }
 
 function removeBackground(doc, shouldTrim) {
