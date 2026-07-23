@@ -27,6 +27,44 @@ final class TransferProgress: ObservableObject {
     @Published var cancelled = false
 }
 
+// App-wide, non-blocking progress for background-removal jobs (Photoshop /
+// After Effects). Shown in the status bar of every window; the user keeps
+// using Navigator while it runs. All mutations on the main thread.
+final class BGJobProgress: ObservableObject {
+    static let shared = BGJobProgress()
+    @Published var active = false
+    @Published var label = ""       // "Removing backgrounds" / "Chroma keying"
+    @Published var done = 0
+    @Published var total = 0        // 0 → indeterminate (folder batch)
+    @Published var finished = false // showing the final summary line
+    private var gen = 0
+
+    func start(_ label: String, total: Int) {
+        gen += 1; self.label = label; self.total = total; done = 0
+        finished = false; active = true
+    }
+    func advance() { done = min(done + 1, max(total, done + 1)) }
+    // Show a final one-line summary, then auto-dismiss after a few seconds
+    // (unless a new job started in the meantime).
+    func finish(_ summary: String) {
+        gen += 1; let g = gen
+        label = summary; finished = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.gen == g else { return }
+            self.active = false; self.finished = false
+        }
+    }
+    var text: String {
+        if finished { return label }
+        return total > 0 ? "\(label)… \(done) of \(total)" : "\(label)…"
+    }
+    var fraction: Double? { total > 0 && !finished ? Double(done) / Double(total) : nil }
+}
+
+// Result of driving an Adobe app: ok + a status/error message (script stdout on
+// success, or the failure reason).
+struct ScriptResult { let ok: Bool; let message: String }
+
 enum SortField: String, CaseIterable { case name, modified, size, kind }
 enum GroupBy: String, CaseIterable { case none, kind, date, size }
 
@@ -628,9 +666,9 @@ func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
     let out = rmbgOutputURL(src)
     DispatchQueue.global(qos: .userInitiated).async {
-        let ok = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path])
+        let r = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path])
         DispatchQueue.main.async {
-            guard ok else { return }        // failure already surfaced; leave PS visible
+            guard r.ok else { return }       // failure already surfaced; leave PS visible
             hideApp(bundleID: "com.adobe.Photoshop")
             onDone?(out)
         }
@@ -638,33 +676,39 @@ func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
 }
 
 // Remove BG for several images in one hidden Photoshop session (reuses the
-// proven single script per file). Photoshop is launched hidden on the first
-// call and stays open/hidden between files. `onDone` gets the outputs that
-// succeeded. Failures are surfaced per file by runPhotoshopScript.
+// proven single script per file). Shows non-blocking "N of M" progress and an
+// end-of-run summary (per-file errors collapsed into one dialog).
 func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); return }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds", total: imgs.count) }
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
+        var errors: [String] = []
         for src in imgs {
             let out = rmbgOutputURL(src)
-            if runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path]) { outs.append(out) }
+            let r = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path], reportError: false)
+            if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
+            DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
         DispatchQueue.main.async {
-            guard !outs.isEmpty else { return }
             hideApp(bundleID: "com.adobe.Photoshop")
-            onDone?(outs)
+            BGJobProgress.shared.finish("Removed \(outs.count) of \(imgs.count) background\(imgs.count == 1 ? "" : "s")")
+            if !errors.isEmpty { showBGSummary(app: "Photoshop", done: outs.count, total: imgs.count, errors: errors) }
+            if !outs.isEmpty { onDone?(outs) }
         }
     }
 }
 
 // Chroma Key for several PNGs in one hidden After Effects session (single still
-// script per file).
+// script per file). Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     let pngs = srcs.filter { $0.pathExtension.lowercased() == "png" }
     guard !pngs.isEmpty else { NSSound.beep(); return }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying", total: pngs.count) }
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
+        var errors: [String] = []
         for src in pngs {
             let folder = src.deletingLastPathComponent()
             let base = src.deletingPathExtension().lastPathComponent
@@ -675,17 +719,42 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 "renderImmediately": true, "finalOutputFormat": "png",
                 "deleteIntermediateRender": true, "keyMode": "auto"
             ]
-            guard let cfgPath = writeChromaConfig(cfg) else { continue }
-            let ok = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
+            guard let cfgPath = writeChromaConfig(cfg) else { errors.append("\(src.lastPathComponent): couldn’t write config"); continue }
+            let r = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath], reportError: false)
             try? FileManager.default.removeItem(atPath: cfgPath)
-            if ok { outs.append(out) }
+            if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
+            DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
         DispatchQueue.main.async {
-            guard !outs.isEmpty else { return }
             hideApp(bundleID: "com.adobe.AfterEffects")
-            onDone?(outs)
+            BGJobProgress.shared.finish("Keyed \(outs.count) of \(pngs.count) image\(pngs.count == 1 ? "" : "s")")
+            if !errors.isEmpty { showBGSummary(app: "After Effects", done: outs.count, total: pngs.count, errors: errors) }
+            if !outs.isEmpty { onDone?(outs) }
         }
     }
+}
+
+// One end-of-run dialog for a multi-image job with failures (collapses the
+// per-file errors). Success-only runs get no dialog — the progress bar's final
+// line + the highlighted results are the confirmation.
+func showBGSummary(app: String, done: Int, total: Int, errors: [String]) {
+    let a = NSAlert()
+    a.alertStyle = .warning
+    a.messageText = "\(app): removed \(done) of \(total)"
+    var msg = "\(errors.count) image\(errors.count == 1 ? "" : "s") could not be processed:\n\n"
+    msg += errors.prefix(15).joined(separator: "\n")
+    if errors.count > 15 { msg += "\n… and \(errors.count - 15) more." }
+    a.informativeText = msg
+    a.addButton(withTitle: "OK")
+    a.runModal()
+}
+
+// Short status-bar line from a folder-batch script's "OK: processed X of N" /
+// "ERROR: …" status.
+func batchSummaryLine(_ prefix: String, _ r: ScriptResult) -> String {
+    guard r.ok else { return "\(prefix): failed" }
+    let m = r.message.replacingOccurrences(of: "OK: ", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+    return m.isEmpty ? "\(prefix): done" : "\(prefix): \(m)"
 }
 
 // Hide a finished helper app (Photoshop / After Effects) and bring Navigator
@@ -732,15 +801,15 @@ func keepHidden(while p: Process, bundleID: String) {
 // Never fails silently: a permission denial (Automation not allowed) or any
 // other error is surfaced with a clear next step.
 @discardableResult
-func runPhotoshopScript(resource: String, arguments: [String]) -> Bool {
+func runPhotoshopScript(resource: String, arguments: [String], reportError: Bool = true) -> ScriptResult {
     guard PhotoshopIcon.url != nil else {
-        DispatchQueue.main.async { reportFileError("Photoshop isn’t installed", "Install Adobe Photoshop to use Remove BG.") }
-        return false
+        if reportError { DispatchQueue.main.async { reportFileError("Photoshop isn’t installed", "Install Adobe Photoshop to use Remove BG.") } }
+        return ScriptResult(ok: false, message: "Photoshop isn’t installed")
     }
     guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
           let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
-        DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
-        return false
+        if reportError { DispatchQueue.main.async { reportFileError("Photoshop script missing", "\(resource).jsx isn’t bundled in Navigator.app.") } }
+        return ScriptResult(ok: false, message: "\(resource).jsx isn’t bundled")
     }
     // Pass the ExtendScript SOURCE and the args via osascript argv. This avoids
     // AppleScript file coercion (a `POSIX file … as alias` reference fails with
@@ -781,18 +850,19 @@ func runPhotoshopScript(resource: String, arguments: [String]) -> Bool {
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let stderr = String(data: errData, encoding: .utf8) ?? ""
         if p.terminationStatus != 0 {
-            DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", String(data: errData, encoding: .utf8) ?? "") }
-            return false
+            if reportError { DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", stderr) } }
+            return ScriptResult(ok: false, message: stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         } else if stdout.hasPrefix("ERROR") {
             // The script ran but reported a failure (e.g. save/removeBackground).
-            DispatchQueue.main.async { reportFileError("Photoshop couldn’t finish Remove BG", stdout) }
-            return false
+            if reportError { DispatchQueue.main.async { reportFileError("Photoshop couldn’t finish Remove BG", stdout) } }
+            return ScriptResult(ok: false, message: stdout)
         }
-        return true
+        return ScriptResult(ok: true, message: stdout)
     } catch {
-        DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) }
-        return false
+        if reportError { DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) } }
+        return ScriptResult(ok: false, message: error.localizedDescription)
     }
 }
 
@@ -824,15 +894,15 @@ func reportAdobeAutomationFailure(_ appName: String, _ raw: String) {
 // DoScript blocks until AE finishes (render included), so callers run this off
 // the main thread. Never fails silently.
 @discardableResult
-func runAfterEffectsScript(resource: String, globals: [String: String]) -> Bool {
+func runAfterEffectsScript(resource: String, globals: [String: String], reportError: Bool = true) -> ScriptResult {
     guard AfterEffectsIcon.url != nil else {
-        DispatchQueue.main.async { reportFileError("After Effects isn’t installed", "Install Adobe After Effects to use Chroma Key BG.") }
-        return false
+        if reportError { DispatchQueue.main.async { reportFileError("After Effects isn’t installed", "Install Adobe After Effects to use Chroma Key BG.") } }
+        return ScriptResult(ok: false, message: "After Effects isn’t installed")
     }
     guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
           let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
-        DispatchQueue.main.async { reportFileError("After Effects script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
-        return false
+        if reportError { DispatchQueue.main.async { reportFileError("After Effects script missing", "\(resource).jsx isn’t bundled in Navigator.app.") } }
+        return ScriptResult(ok: false, message: "\(resource).jsx isn’t bundled")
     }
     func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
     // Prepend the string globals (e.g. the config-file path), then the script's
@@ -865,17 +935,18 @@ func runAfterEffectsScript(resource: String, globals: [String: String]) -> Bool 
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let stderr = String(data: errData, encoding: .utf8) ?? ""
         if p.terminationStatus != 0 {
-            DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", String(data: errData, encoding: .utf8) ?? "") }
-            return false
+            if reportError { DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", stderr) } }
+            return ScriptResult(ok: false, message: stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         } else if stdout.contains("ERROR") {
-            DispatchQueue.main.async { reportFileError("After Effects couldn’t finish Chroma Key", stdout) }
-            return false
+            if reportError { DispatchQueue.main.async { reportFileError("After Effects couldn’t finish Chroma Key", stdout) } }
+            return ScriptResult(ok: false, message: stdout)
         }
-        return true
+        return ScriptResult(ok: true, message: stdout)
     } catch {
-        DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) }
-        return false
+        if reportError { DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) } }
+        return ScriptResult(ok: false, message: error.localizedDescription)
     }
 }
 
@@ -906,10 +977,10 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
         guard let cfgPath = writeChromaConfig(cfg) else {
             DispatchQueue.main.async { reportFileError("Couldn’t start Chroma Key", "Failed to write the temporary config.") }; return
         }
-        let ok = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
+        let r = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
         try? FileManager.default.removeItem(atPath: cfgPath)
         DispatchQueue.main.async {
-            guard ok else { return }        // failure already surfaced; leave AE visible
+            guard r.ok else { return }       // failure already surfaced; leave AE visible
             hideApp(bundleID: "com.adobe.AfterEffects")
             onDone?(out)
         }
@@ -2048,6 +2119,7 @@ final class Browser: ObservableObject, Identifiable {
             reportFileError("After Effects script missing", "NavigatorChromaKeyStill.jsx isn’t bundled in Navigator.app."); return
         }
         let folder = it.url
+        DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying \(folder.lastPathComponent)", total: 0) }
         DispatchQueue.global(qos: .userInitiated).async {
             let cfg: [String: Any] = [
                 "sourceFolder": folder.path,
@@ -2056,12 +2128,14 @@ final class Browser: ObservableObject, Identifiable {
                 "keyMode": "auto", "finalOutputFormat": "png", "deleteIntermediateRender": true
             ]
             guard let cfgPath = writeChromaConfig(cfg) else {
-                DispatchQueue.main.async { reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
+                DispatchQueue.main.async { BGJobProgress.shared.finish("Chroma key failed"); reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
             }
-            let ok = runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath])
+            let r = runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath], reportError: false)
             try? FileManager.default.removeItem(atPath: cfgPath)
             DispatchQueue.main.async {
-                if ok { hideApp(bundleID: "com.adobe.AfterEffects") }
+                if r.ok { hideApp(bundleID: "com.adobe.AfterEffects") }
+                BGJobProgress.shared.finish(batchSummaryLine("Chroma key", r))
+                if !r.ok { reportFileError("After Effects couldn’t finish Batch Chroma Key", r.message) }
                 self.refresh()
             }
         }
@@ -2074,10 +2148,13 @@ final class Browser: ObservableObject, Identifiable {
     func batchRemoveBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
         let folder = it.url
+        DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds in \(folder.lastPathComponent)", total: 0) }
         DispatchQueue.global(qos: .userInitiated).async {
-            let ok = runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path])
+            let r = runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path], reportError: false)
             DispatchQueue.main.async {
-                if ok { hideApp(bundleID: "com.adobe.Photoshop") }
+                if r.ok { hideApp(bundleID: "com.adobe.Photoshop") }
+                BGJobProgress.shared.finish(batchSummaryLine("Remove BG", r))
+                if !r.ok { reportFileError("Photoshop couldn’t finish Batch Remove BG", r.message) }
                 self.refresh()
             }
         }
@@ -3889,8 +3966,20 @@ struct GalleryView: View {
 
 struct StatusBar: View {
     @ObservedObject var browser: Browser
+    @ObservedObject private var bgJob = BGJobProgress.shared
     var body: some View {
         HStack {
+            if bgJob.active {
+                // App-wide background-removal progress — non-blocking; the user
+                // keeps using Navigator while Photoshop / After Effects work.
+                if let f = bgJob.fraction {
+                    ProgressView(value: f).frame(width: 90).controlSize(.small)
+                } else {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                }
+                Text(bgJob.text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text("·").font(.caption).foregroundStyle(.tertiary)
+            }
             if browser.busy {
                 ProgressView().controlSize(.small).scaleEffect(0.7)
                 Text(browser.busyText).font(.caption).foregroundStyle(.secondary)
