@@ -4951,9 +4951,19 @@ struct ImageViewerView: View {
         sizeStr = (vals?.fileSize).map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) } ?? ""
         kindStr = vals?.allValues[.localizedTypeDescriptionKey] as? String ?? u.pathExtension.uppercased()
         dims = ""
-        MetadataCache.shared.meta(for: u) { m in
-            guard urls.indices.contains(index), urls[index] == u else { return }
-            if let w = m.width, let h = m.height, w > 0, h > 0 { dims = "\(w) × \(h)" }
+        // Read pixel dimensions straight from the image header (instant, works for
+        // just-created files that Spotlight hasn't indexed — unlike MetadataCache).
+        DispatchQueue.global(qos: .userInitiated).async {
+            var wh: (Int, Int)?
+            if let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+               let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+               let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int, w > 0, h > 0 {
+                wh = (w, h)
+            }
+            DispatchQueue.main.async {
+                guard urls.indices.contains(index), urls[index] == u, let wh else { return }
+                dims = "\(wh.0) × \(wh.1)"
+            }
         }
     }
     private var isAnimated: Bool { urls.indices.contains(index) && isAnimatedImage(urls[index]) }
@@ -5022,7 +5032,8 @@ struct ImageViewerView: View {
     private var bottomBar: some View {
         HStack(spacing: 12) {
             if urls.indices.contains(index) {
-                Text(urls[index].lastPathComponent).fontWeight(.medium).lineLimit(1)
+                // Filename is shown in the title bar, so keep the bottom bar to
+                // dimensions · size · position.
                 detail("photo", dims)
                 detail("internaldrive", sizeStr)
                 Text("·").foregroundStyle(.white.opacity(0.4))
