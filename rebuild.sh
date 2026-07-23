@@ -41,7 +41,7 @@ cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
 [ -f "$DIR/Navigator.icns" ] && cp "$DIR/Navigator.icns" "$APP/Contents/Resources/Navigator.icns"
 # Bundle the Photoshop Remove-BG scripts so they ship inside the app — no one
 # needs a copy saved anywhere; Navigator points Photoshop at these.
-for jsx in NavigatorRemoveBG NavigatorBatchRemoveBG; do
+for jsx in NavigatorRemoveBG NavigatorBatchRemoveBG NavigatorChromaKeyStill NavigatorChromaKeyFolder; do
   [ -f "$DIR/$jsx.jsx" ] && cp "$DIR/$jsx.jsx" "$APP/Contents/Resources/$jsx.jsx"
 done
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -53,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.51</string>
-<key>CFBundleVersion</key><string>67</string>
+<key>CFBundleShortVersionString</key><string>1.4.52</string>
+<key>CFBundleVersion</key><string>68</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -68,7 +68,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>NSRemovableVolumesUsageDescription</key><string>Navigator shows and manages files on USB and external drives you connect.</string>
 <key>NSNetworkVolumesUsageDescription</key><string>Navigator shows and manages files on network drives you connect to.</string>
 <key>NSFileProviderPresenceUsageDescription</key><string>Navigator shows files stored in cloud providers like iCloud Drive and Google Drive.</string>
-<key>NSAppleEventsUsageDescription</key><string>Navigator asks Adobe Photoshop to remove image backgrounds for you.</string>
+<key>NSAppleEventsUsageDescription</key><string>Navigator asks Adobe Photoshop and After Effects to remove image backgrounds for you.</string>
 <key>CFBundleDocumentTypes</key>
 <array>
   <dict>

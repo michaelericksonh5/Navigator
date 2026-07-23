@@ -599,6 +599,20 @@ enum PhotoshopIcon {
     }.labelStyle(.titleAndIcon)
 }
 
+// After Effects' own icon + location, for the Chroma Key menu items. Resolved
+// once; menu items are hidden when After Effects isn't installed.
+enum AfterEffectsIcon {
+    static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.AfterEffects")
+    static let image: NSImage? = url.map { NSWorkspace.shared.icon(forFile: $0.path) }
+}
+@ViewBuilder func aeLabel(_ title: String) -> some View {
+    Label {
+        Text(title)
+    } icon: {
+        if let img = AfterEffectsIcon.image { Image(nsImage: img).resizable().frame(width: 14, height: 14) }
+    }.labelStyle(.titleAndIcon)
+}
+
 // "foo.png" → "foo_rmbg.png" in the same folder, uniquified if it already exists.
 func rmbgCopyURL(_ src: URL) -> URL {
     let dir = src.deletingLastPathComponent()
@@ -659,7 +673,7 @@ func runPhotoshopScript(resource: String, argument: String) {
         try p.run(); p.waitUntilExit()
         if p.terminationStatus != 0 {
             let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            DispatchQueue.main.async { reportPhotoshopFailure(msg) }
+            DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", msg) }
         }
     } catch {
         DispatchQueue.main.async { reportFileError("Couldn’t launch Photoshop", error.localizedDescription) }
@@ -668,24 +682,96 @@ func runPhotoshopScript(resource: String, argument: String) {
 
 // Turn osascript's raw error into a clear message. The one users hit is the
 // Automation (Apple-events) permission being off — offer to open the right pane.
-func reportPhotoshopFailure(_ raw: String) {
+func reportAdobeAutomationFailure(_ appName: String, _ raw: String) {
     let lower = raw.lowercased()
     let isPermission = lower.contains("not authorized") || lower.contains("not allowed")
         || lower.contains("-1743") || lower.contains("1743")
     let a = NSAlert(); a.alertStyle = .warning
     if isPermission {
-        a.messageText = "Navigator needs permission to control Photoshop"
-        a.informativeText = "macOS blocks apps from automating other apps until you allow it. Open Privacy & Security → Automation, turn on Adobe Photoshop under Navigator, then try Remove BG again."
+        a.messageText = "Navigator needs permission to control \(appName)"
+        a.informativeText = "macOS blocks apps from automating other apps until you allow it. Open Privacy & Security → Automation, turn on Adobe \(appName) under Navigator, then try again."
         a.addButton(withTitle: "Open Automation Settings")
         a.addButton(withTitle: "Cancel")
         if a.runModal() == .alertFirstButtonReturn {
             NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!)
         }
     } else {
-        a.messageText = "Photoshop couldn’t run the script"
-        a.informativeText = raw.isEmpty ? "Photoshop reported an error." : raw
+        a.messageText = "\(appName) couldn’t run the script"
+        a.informativeText = raw.isEmpty ? "\(appName) reported an error." : raw
         a.addButton(withTitle: "OK")
         a.runModal()
+    }
+}
+
+// Runs a bundled After Effects .jsx via AppleScript DoScript, after setting the
+// given ExtendScript string globals (e.g. a config-file path the script reads).
+// DoScript blocks until AE finishes (render included), so callers run this off
+// the main thread. Never fails silently.
+func runAfterEffectsScript(resource: String, globals: [String: String]) {
+    guard AfterEffectsIcon.url != nil else {
+        DispatchQueue.main.async { reportFileError("After Effects isn’t installed", "Install Adobe After Effects to use Chroma Key BG.") }
+        return
+    }
+    guard let script = Bundle.main.url(forResource: resource, withExtension: "jsx") else {
+        DispatchQueue.main.async { reportFileError("After Effects script missing", "\(resource).jsx isn’t bundled in Navigator.app.") }
+        return
+    }
+    func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+    func asEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+    // ExtendScript one-liner: set each global to a string, then run the bundled script.
+    var js = ""
+    for (k, v) in globals { js += "$.global.\(k) = \"\(jsEsc(v))\"; " }
+    js += "$.evalFile(new File(\"\(jsEsc(script.path))\"));"
+    let osa = """
+    tell application id "com.adobe.AfterEffects"
+        activate
+        DoScript "\(asEsc(js))"
+    end tell
+    """
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", osa]
+    let err = Pipe(); p.standardError = err
+    do {
+        try p.run(); p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", msg) }
+        }
+    } catch {
+        DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) }
+    }
+}
+
+// Write a chroma-key config dict to a temp JSON file the AE scripts read. Path returned.
+func writeChromaConfig(_ dict: [String: Any]) -> String? {
+    guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("nav_chroma_\(UUID().uuidString).json")
+    do { try data.write(to: url); return url.path } catch { return nil }
+}
+
+// Single-image chroma key (green/cyan/magenta screen → transparent PNG via AE
+// Keylight). Writes "<base>_rmbg.png" next to the source. Original is untouched.
+func chromaKeyForImage(_ src: URL, onProgress: (() -> Void)? = nil) {
+    guard src.pathExtension.lowercased() == "png" else {
+        DispatchQueue.main.async { reportFileError("Chroma Key needs a PNG", "The After Effects chroma-key workflow processes green/cyan/magenta-screen PNG images.") }
+        return
+    }
+    let folder = src.deletingLastPathComponent()
+    let base = src.deletingPathExtension().lastPathComponent
+    DispatchQueue.global(qos: .userInitiated).async {
+        let cfg: [String: Any] = [
+            "sourceFile": src.path, "outputFolder": folder.path, "outputName": "\(base)_rmbg",
+            "automationMode": true, "showUi": false, "appendFrameToken": false,
+            "renderImmediately": true, "finalOutputFormat": "png",
+            "deleteIntermediateRender": true, "keyMode": "auto"
+        ]
+        guard let cfgPath = writeChromaConfig(cfg) else {
+            DispatchQueue.main.async { reportFileError("Couldn’t start Chroma Key", "Failed to write the temporary config.") }; return
+        }
+        runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
+        try? FileManager.default.removeItem(atPath: cfgPath)
+        DispatchQueue.main.async { onProgress?() }
     }
 }
 
@@ -1776,6 +1862,36 @@ final class Browser: ObservableObject, Identifiable {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }),
               !it.isDirectory, isImageFile(it.url) else { NSSound.beep(); return }
         removeBackgroundForImage(it.url) { [weak self] in self?.refresh() }
+    }
+
+    // Chroma Key BG (single PNG) via After Effects — writes "<base>_rmbg.png" next to it.
+    func chromaKeyBackground(_ ids: Set<String>) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }), !it.isDirectory else { NSSound.beep(); return }
+        chromaKeyForImage(it.url) { [weak self] in self?.refresh() }
+    }
+
+    // Batch Chroma Key BG (folder): AE keys every PNG in the folder, writing
+    // transparent "<name>_rmbg" PNGs into a "_rmbg" subfolder. Originals untouched.
+    func batchChromaKeyBackground(_ ids: Set<String>) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
+        guard let still = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
+            reportFileError("After Effects script missing", "NavigatorChromaKeyStill.jsx isn’t bundled in Navigator.app."); return
+        }
+        let folder = it.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cfg: [String: Any] = [
+                "sourceFolder": folder.path,
+                "outputFolder": folder.appendingPathComponent("_rmbg").path,
+                "singleScript": still.path, "outputSuffix": "_rmbg",
+                "keyMode": "auto", "finalOutputFormat": "png", "deleteIntermediateRender": true
+            ]
+            guard let cfgPath = writeChromaConfig(cfg) else {
+                DispatchQueue.main.async { reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
+            }
+            runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath])
+            try? FileManager.default.removeItem(atPath: cfgPath)
+            DispatchQueue.main.async { self.refresh() }
+        }
     }
 
     // Batch Remove BG (folder): recursively duplicate every image to "<name>_rmbg"
@@ -3065,6 +3181,13 @@ struct FileTableView: View {
                     Button { browser.batchRemoveBackground(ids) } label: { psLabel("Batch Remove BG") }
                 }
             }
+            if AfterEffectsIcon.image != nil, ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }) {
+                if !it.isDirectory, it.url.pathExtension.lowercased() == "png" {
+                    Button { browser.chromaKeyBackground(ids) } label: { aeLabel("Chroma Key BG") }
+                } else if it.isDirectory {
+                    Button { browser.batchChromaKeyBackground(ids) } label: { aeLabel("Batch Chroma Key BG") }
+                }
+            }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
                     for it in browser.items where ids.contains(it.id) && it.isDirectory { FolderSizeCache.shared.compute(it.url) }
@@ -3315,6 +3438,13 @@ struct IconGridView: View {
                         Button { browser.removeBackground([item.id]) } label: { psLabel("Remove BG") }
                     } else if item.isDirectory {
                         Button { browser.batchRemoveBackground([item.id]) } label: { psLabel("Batch Remove BG") }
+                    }
+                }
+                if AfterEffectsIcon.image != nil {
+                    if !item.isDirectory, item.url.pathExtension.lowercased() == "png" {
+                        Button { browser.chromaKeyBackground([item.id]) } label: { aeLabel("Chroma Key BG") }
+                    } else if item.isDirectory {
+                        Button { browser.batchChromaKeyBackground([item.id]) } label: { aeLabel("Batch Chroma Key BG") }
                     }
                 }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
@@ -4180,9 +4310,14 @@ struct ImageViewerView: View {
             Button("Copy File") { copyFileToClipboard() }
             Button("Copy Location") { copyLocation() }
             Button("Copy File Name") { copyFileName() }
-            if PhotoshopIcon.image != nil, let u = currentURL {
+            if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
-                Button { removeBackgroundForImage(u) } label: { psLabel("Remove BG") }
+                if PhotoshopIcon.image != nil {
+                    Button { removeBackgroundForImage(u) } label: { psLabel("Remove BG") }
+                }
+                if AfterEffectsIcon.image != nil, u.pathExtension.lowercased() == "png" {
+                    Button { chromaKeyForImage(u) } label: { aeLabel("Chroma Key BG") }
+                }
             }
         }
     }
