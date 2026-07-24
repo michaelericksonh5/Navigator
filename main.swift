@@ -1023,6 +1023,7 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); return }
     guard let key = APIKeys.fal else { DispatchQueue.main.async { promptAddFalKey() }; return }
+    guard confirmUpscale(count: imgs.count, label: option.label, perImage: nil) else { return }
     // total:0 → an animated INDETERMINATE bar (an upscale is one long opaque
     // network call with no sub-progress, so a static "0 of 1" looked frozen).
     // The label names the current file/model; the whole thing is off the main
@@ -1184,6 +1185,7 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
     guard !imgs.isEmpty else { NSSound.beep(); return }
     guard resolveNode() != nil, resolveH5GClient() != nil else { DispatchQueue.main.async { promptVertexSetup() }; return }
     guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
+    guard confirmUpscale(count: imgs.count, label: "Imagen 4 ×\(factor)", perImage: 0.06) else { return }
     let psAvail = PhotoshopIcon.url != nil
     navLog("Imagen upscale ×\(factor): \(imgs.count) image(s)  photoshop=\(psAvail)  node=\(resolveNode() ?? "?")  client=\(resolveH5GClient() ?? "?")")
     DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling", total: 0) }
@@ -1321,28 +1323,34 @@ func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
     chromaKeyForImages(pngs) { _ in onDone?() }
 }
 
-// Confirm a folder batch before spending — upscaling is one PAID AI call per
-// image, and a folder can hold hundreds. Returns true to proceed. `perImage` is
-// a known $/image (Imagen) or nil (fal — cost varies).
-func confirmBatchUpscale(count: Int, folder: URL, label: String, perImage: Double?) -> Bool {
+// Price warning shown before ANY upscale — it's one PAID AI call per image.
+// Returns true to proceed. `perImage` is a known $/image (Imagen) or nil (fal —
+// cost varies by image size). Runs modally; callers invoke on the main thread.
+func confirmUpscale(count: Int, label: String, perImage: Double?) -> Bool {
     let a = NSAlert()
     a.messageText = "Upscale \(count) image\(count == 1 ? "" : "s") with \(label)?"
-    var info = "Every image in “\(folder.lastPathComponent)” (and subfolders) will be upscaled — one paid AI upscale each."
-    if let p = perImage { info += String(format: "\n\nEstimated cost: ~$%.2f (about $%.2f each).", Double(count) * p, p) }
+    var info = "Each image is one paid AI upscale."
+    if let p = perImage {
+        info += count == 1
+            ? String(format: "\n\nEstimated cost: ~$%.2f.", p)
+            : String(format: "\n\nEstimated cost: ~$%.2f (about $%.2f each).", Double(count) * p, p)
+    } else {
+        info += " Cost depends on image size."
+    }
     a.informativeText = info
-    a.addButton(withTitle: "Upscale \(count)"); a.addButton(withTitle: "Cancel")
+    a.addButton(withTitle: "OK"); a.addButton(withTitle: "Cancel")
     return a.runModal() == .alertFirstButtonReturn
 }
 
 // Batch upscale a FOLDER — recurse (skip "EN" folders and existing "_upscaled"
-// outputs) and route through the same per-image upscalers used by multi-select.
+// outputs) and route through the per-image upscalers (which show the price
+// warning), same as multi-select.
 func batchUpscaleFolderViaFal(_ folder: URL, option: UpscaleOption, onDone: (() -> Void)? = nil) {
     let imgs = batchImageURLs(in: folder, skipSuffix: "_upscaled")
     guard !imgs.isEmpty else {
         DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
         onDone?(); return
     }
-    guard confirmBatchUpscale(count: imgs.count, folder: folder, label: option.label, perImage: nil) else { onDone?(); return }
     upscaleImagesViaFal(imgs, option: option) { _ in onDone?() }
 }
 func batchUpscaleFolderViaImagen(_ folder: URL, factor: Int, onDone: (() -> Void)? = nil) {
@@ -1351,7 +1359,6 @@ func batchUpscaleFolderViaImagen(_ folder: URL, factor: Int, onDone: (() -> Void
         DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
         onDone?(); return
     }
-    guard confirmBatchUpscale(count: imgs.count, folder: folder, label: "Imagen 4 ×\(factor)", perImage: 0.06) else { onDone?(); return }
     upscaleImagesViaImagen(imgs, factor: factor) { _ in onDone?() }
 }
 
