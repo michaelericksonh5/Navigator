@@ -901,16 +901,18 @@ func imageHasTransparency(_ url: URL) -> Bool {
     return false
 }
 
-// Composite the image over opaque green (#00FF00) at native size.
-private func compositeOnGreen(_ cg: CGImage) -> CGImage? {
+// Composite the image over an opaque solid color (a full backing layer) at
+// native size — gives the upscaler clean context and gradual edges.
+private func compositeOnColor(_ cg: CGImage, _ color: CGColor) -> CGImage? {
     let w = cg.width, h = cg.height
     guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                               space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-    ctx.setFillColor(CGColor(red: 0, green: 1, blue: 0, alpha: 1))
+    ctx.setFillColor(color)
     ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
     ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
     return ctx.makeImage()
 }
+private func compositeOnGreen(_ cg: CGImage) -> CGImage? { compositeOnColor(cg, CGColor(red: 0, green: 1, blue: 0, alpha: 1)) }
 
 // After upscaling a green-backed image, key the green (#00FF00) back to
 // transparent. ponytail: threshold chroma key, no edge despill — fine for clean
@@ -1168,18 +1170,21 @@ func promptVertexSignin() {
     a.addButton(withTitle: "OK"); a.runModal()
 }
 
-// Upscale one or many images via Vertex/Imagen 4. Transparent art is composited
-// on green, upscaled, then keyed back to transparent (Imagen upscales opaque
-// RGB) — same trick as the fal path. Non-blocking progress + summary.
+// Upscale one or many images via Vertex/Imagen 4. Imagen flattens alpha, so a
+// transparent cutout is composited onto a full solid backing layer first. With
+// Photoshop present we back it on WHITE, upscale, then re-cut with Photoshop's
+// Remove BG (best edges). Without Photoshop we back on GREEN and rebuild the
+// cutout from the original matte. Non-blocking progress + summary.
 func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); return }
     guard resolveNode() != nil, resolveH5GClient() != nil else { DispatchQueue.main.async { promptVertexSetup() }; return }
     guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
-    navLog("Imagen upscale ×\(factor): \(imgs.count) image(s)  node=\(resolveNode() ?? "?")  client=\(resolveH5GClient() ?? "?")")
+    let psAvail = PhotoshopIcon.url != nil
+    navLog("Imagen upscale ×\(factor): \(imgs.count) image(s)  photoshop=\(psAvail)  node=\(resolveNode() ?? "?")  client=\(resolveH5GClient() ?? "?")")
     DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling", total: 0) }
     DispatchQueue.global(qos: .userInitiated).async {
-        var outs: [URL] = []; var errors: [String] = []
+        var outs: [URL] = []; var errors: [String] = []; var usedPS = false
         for (idx, src) in imgs.enumerated() {
             DispatchQueue.main.async {
                 BGJobProgress.shared.label = imgs.count == 1
@@ -1202,10 +1207,15 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
             navLog("[\(idx + 1)/\(imgs.count)] \(src.lastPathComponent) \(w)×\(h) transparent=\(transparent) → \(String(format: "%.1f", outMP)) MP")
             var inputPath = src.path
             var tmpInput: URL? = nil
-            if transparent, let cg = loadCGImage(src), let g = compositeOnGreen(cg), let png = encodePNG(g) {
-                let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
-                if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
-                else { navLog("  green-composite temp write FAILED — sending original transparent PNG") }
+            // Transparent → composite on a full solid backing (white if we'll re-cut
+            // with Photoshop, green if we'll rebuild from the matte).
+            if transparent, let cg = loadCGImage(src) {
+                let backing: CGColor = psAvail ? CGColor(red: 1, green: 1, blue: 1, alpha: 1) : CGColor(red: 0, green: 1, blue: 0, alpha: 1)
+                if let g = compositeOnColor(cg, backing), let png = encodePNG(g) {
+                    let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
+                    if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
+                    else { navLog("  backing composite temp write FAILED — sending original transparent PNG") }
+                }
             }
             let inBytes = ((try? FileManager.default.attributesOfItem(atPath: inputPath))?[.size] as? Int) ?? 0
             if inBytes > 10 * 1024 * 1024 {
@@ -1224,24 +1234,39 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
                 navLog("  RESULT: error — \(msg)")
                 errors.append("\(src.lastPathComponent): \(msg)"); continue
             }
-            let savedURL = URL(fileURLWithPath: saved)
+            let savedURL = URL(fileURLWithPath: saved)   // opaque upscaled result
             let dst = upscaleOutputURL(src)
-            do {
-                let data = try Data(contentsOf: savedURL)
-                // Rebuild transparency from the original matte (Imagen flattens alpha);
-                // fall back to the green chroma key if recombine fails.
-                let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: data) ?? stripGreen(data) ?? data) : data
-                try finalData.write(to: dst)
+            if transparent && psAvail {
+                // Re-cut the white-backed upscale with Photoshop's Remove BG → clean
+                // high-res transparent PNG (the tool that's best at it).
+                usedPS = true
+                let r2 = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [savedURL.path, dst.path], reportError: false)
                 try? FileManager.default.removeItem(at: savedURL)
-                outs.append(dst)
-                navLog("  RESULT: ok → \(dst.lastPathComponent)")
-            } catch {
-                navLog("  RESULT: save failed — \(error.localizedDescription)")
-                errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)")
+                if r2.ok {
+                    outs.append(dst); navLog("  RESULT: ok (Photoshop re-cut) → \(dst.lastPathComponent)")
+                } else {
+                    navLog("  RESULT: Photoshop re-cut failed — \(r2.message)")
+                    errors.append("\(src.lastPathComponent): upscaled, but Photoshop Remove BG failed — \(r2.message)")
+                }
+            } else {
+                do {
+                    let data = try Data(contentsOf: savedURL)
+                    // No Photoshop: rebuild transparency from the original matte
+                    // (green backing); direct copy for opaque sources.
+                    let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: data) ?? stripGreen(data) ?? data) : data
+                    try finalData.write(to: dst)
+                    try? FileManager.default.removeItem(at: savedURL)
+                    outs.append(dst)
+                    navLog("  RESULT: ok\(transparent ? " (matte re-cut)" : "") → \(dst.lastPathComponent)")
+                } catch {
+                    navLog("  RESULT: save failed — \(error.localizedDescription)")
+                    errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)")
+                }
             }
         }
         navLog("Imagen upscale done: \(outs.count) ok, \(errors.count) error(s)")
         DispatchQueue.main.async {
+            if usedPS { hideApp(bundleID: "com.adobe.Photoshop") }
             BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
             if !errors.isEmpty { showBGSummary(app: "Upscale (Imagen 4)", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
             if !outs.isEmpty { onDone?(outs) }
