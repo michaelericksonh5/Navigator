@@ -41,7 +41,7 @@ cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
 [ -f "$DIR/Navigator.icns" ] && cp "$DIR/Navigator.icns" "$APP/Contents/Resources/Navigator.icns"
 # Bundle the Photoshop Remove-BG scripts so they ship inside the app — no one
 # needs a copy saved anywhere; Navigator points Photoshop at these.
-for jsx in NavigatorRemoveBG NavigatorBatchRemoveBG NavigatorChromaKeyStill NavigatorChromaKeyFolder; do
+for jsx in NavigatorRemoveBG NavigatorChromaKeyStill; do
   [ -f "$DIR/$jsx.jsx" ] && cp "$DIR/$jsx.jsx" "$APP/Contents/Resources/$jsx.jsx"
 done
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -53,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.79</string>
-<key>CFBundleVersion</key><string>95</string>
+<key>CFBundleShortVersionString</key><string>1.4.80</string>
+<key>CFBundleVersion</key><string>96</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>

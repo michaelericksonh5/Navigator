@@ -582,6 +582,9 @@ func reportFileError(_ summary: String, _ detail: String = "") {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = summary
     var msg = detail
+    // Cap the detail so a long message can't make the alert taller than the
+    // screen — that pushes the OK button off-screen and it can't be dismissed.
+    if msg.count > 1200 { msg = String(msg.prefix(1200)) + "\n… (truncated)" }
     if !msg.isEmpty { msg += "\n\n" }
     msg += "Items in protected folders (Desktop, Documents, Pictures, Downloads) or on read-only volumes can need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
     a.informativeText = msg
@@ -1275,43 +1278,45 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
 }
 
 // Batch Remove BG on a FOLDER (Photoshop) — shared by Navigator's menu and Finder.
-func batchRemoveBackgroundFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
-    DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds in \(folder.lastPathComponent)", total: 0) }
-    DispatchQueue.global(qos: .userInitiated).async {
-        let r = runPhotoshopScript(resource: "NavigatorBatchRemoveBG", arguments: [folder.path], reportError: false)
-        DispatchQueue.main.async {
-            if r.ok { hideApp(bundleID: "com.adobe.Photoshop") }
-            BGJobProgress.shared.finish(batchSummaryLine("Remove BG", r))
-            if !r.ok { reportFileError("Photoshop couldn’t finish Batch Remove BG", r.message) }
-            onDone?()
+// Images under a folder for a batch AI op: recurse, skip "EN"/"en" subfolders
+// and our own "_rmbg" outputs (so re-runs are safe). Sorted for stable order.
+func batchImageURLs(in folder: URL) -> [URL] {
+    let fm = FileManager.default
+    guard let en = fm.enumerator(at: folder, includingPropertiesForKeys: [.isDirectoryKey]) else { return [] }
+    var out: [URL] = []
+    for case let url as URL in en {
+        if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            if url.lastPathComponent.lowercased() == "en" { en.skipDescendants() }
+            continue
         }
+        guard isImageFile(url) else { continue }
+        if url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix("_rmbg") { continue }
+        out.append(url)
     }
+    return out.sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
 }
 
-// Batch Chroma Key on a FOLDER (After Effects) — shared by Navigator and Finder.
+// Batch Remove BG on a FOLDER (Photoshop). Routes through the proven per-file
+// path (same one multi-select uses) — the old in-Photoshop batch loop failed
+// with "command Get is not available" on every image. Non-blocking progress +
+// a capped end-of-run summary.
+func batchRemoveBackgroundFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
+    let imgs = batchImageURLs(in: folder)
+    guard !imgs.isEmpty else {
+        DispatchQueue.main.async { reportFileError("No images to process", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_rmbg” files).") }
+        onDone?(); return
+    }
+    removeBackgroundForImages(imgs) { _ in onDone?() }
+}
+
+// Batch Chroma Key on a FOLDER (After Effects) — same per-file routing.
 func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
-    guard let still = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
-        reportFileError("After Effects script missing", "NavigatorChromaKeyStill.jsx isn’t bundled in Navigator.app."); return
+    let pngs = batchImageURLs(in: folder).filter { $0.pathExtension.lowercased() == "png" }
+    guard !pngs.isEmpty else {
+        DispatchQueue.main.async { reportFileError("No PNGs to process", "Chroma Key processes PNG images; none found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_rmbg” files).") }
+        onDone?(); return
     }
-    DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying \(folder.lastPathComponent)", total: 0) }
-    DispatchQueue.global(qos: .userInitiated).async {
-        let cfg: [String: Any] = [
-            "sourceFolder": folder.path, "outputFolder": folder.path,
-            "singleScript": still.path, "outputSuffix": "_rmbg",
-            "keyMode": "auto", "finalOutputFormat": "png", "deleteIntermediateRender": true,
-        ]
-        guard let cfgPath = writeChromaConfig(cfg) else {
-            DispatchQueue.main.async { BGJobProgress.shared.finish("Chroma key failed"); reportFileError("Couldn’t start Batch Chroma Key", "Failed to write the temporary config.") }; return
-        }
-        let r = runAfterEffectsScript(resource: "NavigatorChromaKeyFolder", globals: ["H5G_BATCH_CONFIG_FILE": cfgPath], reportError: false)
-        try? FileManager.default.removeItem(atPath: cfgPath)
-        DispatchQueue.main.async {
-            if r.ok { hideApp(bundleID: "com.adobe.AfterEffects") }
-            BGJobProgress.shared.finish(batchSummaryLine("Chroma key", r))
-            if !r.ok { reportFileError("After Effects couldn’t finish Batch Chroma Key", r.message) }
-            onDone?()
-        }
-    }
+    chromaKeyForImages(pngs) { _ in onDone?() }
 }
 
 // Single-image Remove BG usable from anywhere (browser or image viewer): Photoshop
