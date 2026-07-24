@@ -5489,10 +5489,13 @@ final class CompareView: NSView {
         guard let rep = img?.representations.first else { return img?.size ?? .zero }
         return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
     }
-    // Both images draw into this rect (fit from the left image), so a point at
-    // aspect-fraction (u,v) matches between them regardless of pixel resolution.
-    private func destRect() -> NSRect {
-        let s = pixels(leftImage)
+    // Aspect-fit EACH image into the window box, centered — never stretched to
+    // the other's shape (that squashed mismatched-aspect images). Because both
+    // fit the same box, a base and its 2× upscale (same aspect) land on the exact
+    // same on-screen rect and overlay perfectly; different-aspect images each keep
+    // their own shape at a comparable scale. Shared zoom/pan applied on top.
+    private func destRect(for img: NSImage?) -> NSRect {
+        let s = pixels(img)
         guard s.width > 0, s.height > 0, bounds.width > 0, bounds.height > 0 else { return bounds }
         let scale = min(bounds.width / s.width, bounds.height / s.height)
         let w = s.width * scale * CGFloat(_zoom), h = s.height * scale * CGFloat(_zoom)
@@ -5509,21 +5512,21 @@ final class CompareView: NSView {
         // Clear to transparent so the window's checkerboard/frosted-glass backdrop
         // shows through each image's alpha (and the letterbox areas).
         NSGraphicsContext.current?.cgContext.clear(dirtyRect)
-        let r = destRect()
         let hints: [NSImageRep.HintKey: Any] = [.interpolation: NSImageInterpolation.high.rawValue]
         let dx = bounds.minX + dividerFrac * bounds.width
         // Clip EACH image to its own side of the divider, so neither shows through
-        // the other's transparent areas (no v1 head bleeding behind v2).
+        // the other's transparent areas (no v1 head bleeding behind v2). Each draws
+        // into its OWN aspect-fit rect so mismatched aspects aren't squashed.
         if let left = leftImage {
             NSGraphicsContext.current?.saveGraphicsState()
             NSBezierPath(rect: NSRect(x: bounds.minX, y: 0, width: dx - bounds.minX, height: bounds.height)).addClip()
-            left.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
+            left.draw(in: destRect(for: left), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
             NSGraphicsContext.current?.restoreGraphicsState()
         }
         if let right = rightImage {
             NSGraphicsContext.current?.saveGraphicsState()
             NSBezierPath(rect: NSRect(x: dx, y: 0, width: bounds.maxX - dx, height: bounds.height)).addClip()
-            right.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
+            right.draw(in: destRect(for: right), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
             NSGraphicsContext.current?.restoreGraphicsState()
         }
         NSColor.white.withAlphaComponent(0.9).setStroke()
