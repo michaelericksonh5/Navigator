@@ -5180,6 +5180,19 @@ struct CheckerboardBackground: View {
     }
 }
 
+// Frosted-glass backdrop (default) — an image's transparent areas reveal the
+// blurred content behind the window, so it reads as transparent, not black.
+struct VisualEffectBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .hudWindow
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+}
+
 struct ImageViewerView: View {
     @State private var urls: [URL]
     var onTitle: (String) -> Void = { _ in }
@@ -5187,6 +5200,7 @@ struct ImageViewerView: View {
     @State private var dims: String = ""
     @State private var sizeStr: String = ""
     @State private var kindStr: String = ""
+    @AppStorage("viewerBackdrop") private var backdrop = "glass"   // "glass" | "checker"
     @StateObject private var zoomCtl = ZoomController()
     init(urls: [URL], index: Int, onTitle: @escaping (String) -> Void = { _ in }) {
         _urls = State(initialValue: urls); self.onTitle = onTitle; _index = State(initialValue: index)
@@ -5289,7 +5303,7 @@ struct ImageViewerView: View {
     private var isAnimated: Bool { urls.indices.contains(index) && isAnimatedImage(urls[index]) }
     var body: some View {
         ZStack {
-            CheckerboardBackground()
+            if backdrop == "checker" { CheckerboardBackground() } else { VisualEffectBackground().ignoresSafeArea() }
             // Image lives in the area ABOVE the bottom bar so nothing is hidden
             // behind it; the bar is a sibling below, not an overlay.
             VStack(spacing: 0) {
@@ -5365,6 +5379,15 @@ struct ImageViewerView: View {
                 Text("\(index + 1) of \(urls.count)").foregroundStyle(.white.opacity(0.85))
             }
             Spacer(minLength: 12)
+            Menu {
+                Picker("Viewer Background", selection: $backdrop) {
+                    Text("Frosted Glass").tag("glass")
+                    Text("Checkerboard").tag("checker")
+                }.pickerStyle(.inline).labelsHidden()
+            } label: {
+                Image(systemName: backdrop == "checker" ? "square.grid.3x3" : "sparkles")
+            }
+            .menuIndicator(.hidden).fixedSize().help("Viewer background: Frosted Glass or Checkerboard")
             if !isAnimated {
                 Button { zoomCtl.rotate() } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.plain).help("Rotate 90°")
