@@ -5079,7 +5079,9 @@ final class ZoomView: NSView {
         if !didFit, _image != nil, bounds.width > 0, bounds.height > 0 { fit() } else { clampOffset() }
     }
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill(); bounds.fill()
+        // Clear to transparent (not black) so the viewer's checkerboard shows
+        // through an image's alpha — makes transparency visible at a glance.
+        NSGraphicsContext.current?.cgContext.clear(dirtyRect)
         guard let img = _image else { return }
         let s = pixelSize
         let w = CGFloat(s.width) * CGFloat(_zoom), h = CGFloat(s.height) * CGFloat(_zoom)
@@ -5155,6 +5157,27 @@ struct ZoomableImageView: NSViewRepresentable {
     }
     func makeCoordinator() -> Coord { Coord() }
     final class Coord { var url: URL? }
+}
+
+// Transparency checkerboard — the standard way to show that an image is
+// transparent rather than black-backed. Mid grays so it reads clearly as a
+// checker while staying dark enough that the white nav/zoom controls stay legible.
+struct CheckerboardBackground: View {
+    var square: CGFloat = 14
+    var body: some View {
+        Canvas { ctx, size in
+            let light = Color(white: 0.42), dark = Color(white: 0.30)
+            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(dark))
+            let cols = Int(ceil(size.width / square)), rows = Int(ceil(size.height / square))
+            for r in 0..<rows {
+                for c in 0..<cols where (r + c) % 2 == 0 {
+                    ctx.fill(Path(CGRect(x: CGFloat(c) * square, y: CGFloat(r) * square, width: square, height: square)), with: .color(light))
+                }
+            }
+        }
+        .drawingGroup()
+        .ignoresSafeArea()
+    }
 }
 
 struct ImageViewerView: View {
@@ -5266,23 +5289,26 @@ struct ImageViewerView: View {
     private var isAnimated: Bool { urls.indices.contains(index) && isAnimatedImage(urls[index]) }
     var body: some View {
         ZStack {
-            Color.black
-            if urls.indices.contains(index), isAnimated {
-                AnimatedImage(url: urls[index]).padding(44).id(urls[index])
-            } else if urls.indices.contains(index) {
-                ZoomableImageView(url: urls[index], controller: zoomCtl).id(urls[index])
-            } else {
-                Text("Can't load image").foregroundStyle(.white)
-            }
-            HStack {
-                Button { step(-1) } label: { Image(systemName: "chevron.left.circle.fill").font(.system(size: 36)) }
-                    .buttonStyle(.plain).keyboardShortcut(.leftArrow, modifiers: [])
-                Spacer()
-                Button { step(1) } label: { Image(systemName: "chevron.right.circle.fill").font(.system(size: 36)) }
-                    .buttonStyle(.plain).keyboardShortcut(.rightArrow, modifiers: [])
-            }.foregroundStyle(.white.opacity(0.8)).padding(.horizontal, 14)
-            VStack {
-                Spacer()
+            CheckerboardBackground()
+            // Image lives in the area ABOVE the bottom bar so nothing is hidden
+            // behind it; the bar is a sibling below, not an overlay.
+            VStack(spacing: 0) {
+                ZStack {
+                    if urls.indices.contains(index), isAnimated {
+                        AnimatedImage(url: urls[index]).padding(44).id(urls[index])
+                    } else if urls.indices.contains(index) {
+                        ZoomableImageView(url: urls[index], controller: zoomCtl).id(urls[index])
+                    } else {
+                        Text("Can't load image").foregroundStyle(.white)
+                    }
+                    HStack {
+                        Button { step(-1) } label: { Image(systemName: "chevron.left.circle.fill").font(.system(size: 36)) }
+                            .buttonStyle(.plain).keyboardShortcut(.leftArrow, modifiers: [])
+                        Spacer()
+                        Button { step(1) } label: { Image(systemName: "chevron.right.circle.fill").font(.system(size: 36)) }
+                            .buttonStyle(.plain).keyboardShortcut(.rightArrow, modifiers: [])
+                    }.foregroundStyle(.white.opacity(0.8)).padding(.horizontal, 14)
+                }
                 bottomBar
             }
             // ⌘+ / ⌘= zoom in, ⌘- zoom out, ⌘0 fit (hidden shortcut buttons)
