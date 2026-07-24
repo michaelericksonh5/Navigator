@@ -705,7 +705,7 @@ enum AfterEffectsIcon {
         Label("Prep for AI", systemImage: "wand.and.stars")
     }
 }
-// "Upscale (AI)" submenu — the three fal/Topaz presets plus Vertex/Imagen 4.
+// "Upscale (AI)" submenu — the low-quality fal preset plus Vertex/Imagen 4 ×2/×4.
 @ViewBuilder func upscaleMenu(fal: @escaping (UpscaleOption) -> Void,
                               imagen: @escaping (Int) -> Void) -> some View {
     Menu {
@@ -846,10 +846,10 @@ func fillBackgroundForImages(_ srcs: [URL], color: NSColor, suffix: String, rati
 // ===== AI Upscale (fal.ai / Topaz Gigapixel) =====
 
 struct UpscaleOption: Identifiable { let label: String; let model: String; let factor: Int; var id: String { label } }
+// Only the low-quality fal/Topaz preset remains — the Art/Photoreal presets were
+// replaced by Imagen 4 (better results). Imagen options live in upscaleMenu.
 let upscaleOptions: [UpscaleOption] = [
-    .init(label: "Upscale Low Quality ×4", model: "Wonder 3",        factor: 4),
-    .init(label: "Upscale Art",            model: "CGI",             factor: 2),
-    .init(label: "Upscale Photoreal",      model: "High Fidelity V2", factor: 2),
+    .init(label: "Upscale Low Quality ×4", model: "Wonder 3", factor: 4),
 ]
 
 func upscaleOutputURL(_ src: URL) -> URL {
@@ -930,6 +930,48 @@ private func stripGreen(_ data: Data) -> Data? {
         i += 4
     }
     guard let outCG = ctx.makeImage() else { return nil }
+    return encodePNG(outCG)
+}
+
+// Imagen flattens alpha (returns opaque RGB), so for a transparent source we
+// upscale it on a green backing, then rebuild transparency from the ORIGINAL
+// matte — the alpha the background-removal already computed — instead of
+// chroma-keying green back out (which leaves a fringe on soft edges). The
+// original alpha is bilinearly upscaled to the output size for smooth edges;
+// green spill is despilled ONLY on partial-alpha edge pixels so subject colors
+// are untouched. Returns a transparent PNG, or nil to fall back to stripGreen.
+private func recombineUpscaledAlpha(source: URL, upscaledOpaque: Data) -> Data? {
+    guard let srcCG = loadCGImage(source), let upCG = loadCGImage(data: upscaledOpaque) else { return nil }
+    let W = upCG.width, H = upCG.height
+    guard W > 0, H > 0 else { return nil }
+    let cs = CGColorSpaceCreateDeviceRGB()
+    let bmp = CGImageAlphaInfo.premultipliedLast.rawValue
+    guard let aPtr = calloc(W * H * 4, 1), let uPtr = calloc(W * H * 4, 1) else { return nil }
+    defer { free(aPtr); free(uPtr) }
+    guard let aCtx = CGContext(data: aPtr, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4, space: cs, bitmapInfo: bmp),
+          let uCtx = CGContext(data: uPtr, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4, space: cs, bitmapInfo: bmp) else { return nil }
+    aCtx.interpolationQuality = .high
+    aCtx.draw(srcCG, in: CGRect(x: 0, y: 0, width: W, height: H))   // upscaled source → its alpha is our matte
+    uCtx.draw(upCG, in: CGRect(x: 0, y: 0, width: W, height: H))    // Imagen's opaque RGB (alpha 255)
+    let a = aPtr.bindMemory(to: UInt8.self, capacity: W * H * 4)
+    let u = uPtr.bindMemory(to: UInt8.self, capacity: W * H * 4)
+    var i = 0
+    while i < W * H * 4 {
+        let alpha = a[i + 3]
+        if alpha == 0 {
+            u[i] = 0; u[i + 1] = 0; u[i + 2] = 0; u[i + 3] = 0
+        } else {
+            let r = u[i], b = u[i + 2]
+            // Standard green-screen despill: clamp green to the larger of the other
+            // two channels. Only removes green that EXCEEDS both (i.e. spill); a
+            // balanced subject color (gold/teal/skin) is left essentially untouched.
+            let g = min(u[i + 1], max(r, b))
+            let af = Double(alpha) / 255.0         // straight → premultiplied for this context
+            u[i] = UInt8(Double(r) * af); u[i + 1] = UInt8(Double(g) * af); u[i + 2] = UInt8(Double(b) * af); u[i + 3] = alpha
+        }
+        i += 4
+    }
+    guard let outCG = uCtx.makeImage() else { return nil }
     return encodePNG(outCG)
 }
 
@@ -1186,7 +1228,9 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
             let dst = upscaleOutputURL(src)
             do {
                 let data = try Data(contentsOf: savedURL)
-                let finalData = transparent ? (stripGreen(data) ?? data) : data
+                // Rebuild transparency from the original matte (Imagen flattens alpha);
+                // fall back to the green chroma key if recombine fails.
+                let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: data) ?? stripGreen(data) ?? data) : data
                 try finalData.write(to: dst)
                 try? FileManager.default.removeItem(at: savedURL)
                 outs.append(dst)
@@ -5920,9 +5964,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSUpdateDynamicServices()
         // Install the Finder Quick Actions once per version (cheap; skips the pbs
         // flush on subsequent launches). Bump the marker when the workflows change.
-        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 2 {
+        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 3 {
             installFinderQuickActions(nil)
-            Prefs.d.set(2, forKey: "finderQuickActionsVersion")
+            Prefs.d.set(3, forKey: "finderQuickActionsVersion")
         }
         // Show the browser shortly — unless we were launched only to view an image
         // (the open handler sets suppressMainWindow first). The tiny delay also lets
@@ -6042,9 +6086,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "chromakey":
             folders.forEach { batchChromaKeyFolder($0) }
             if !images.isEmpty { chromaKeyForImages(images) }
-        case "upscale-art":    if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("CGI")) }
-        case "upscale-photo":  if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("High Fidelity V2")) }
-        case "upscale-lowq":   if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("Wonder 3")) }
+        case "upscale-lowq":     if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("Wonder 3")) }
+        case "upscale-imagen2":  if !images.isEmpty { upscaleImagesViaImagen(images, factor: 2) }
+        case "upscale-imagen4":  if !images.isEmpty { upscaleImagesViaImagen(images, factor: 4) }
         default: break
         }
     }
@@ -6056,14 +6100,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let finderQuickActions: [FinderQA] = [
         .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
         .init(title: "Chroma Key BG",          action: "chromakey",    requires: "com.adobe.AfterEffects", acceptsFolders: true),
-        .init(title: "Upscale Low Quality ×4", action: "upscale-lowq", requires: nil,                      acceptsFolders: false),
-        .init(title: "Upscale Art",            action: "upscale-art",  requires: nil,                      acceptsFolders: false),
-        .init(title: "Upscale Photoreal",      action: "upscale-photo", requires: nil,                     acceptsFolders: false),
+        .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: false),
+        .init(title: "Upscale (Imagen 4) ×2",  action: "upscale-imagen2", requires: nil,                   acceptsFolders: false),
+        .init(title: "Upscale (Imagen 4) ×4",  action: "upscale-imagen4", requires: nil,                   acceptsFolders: false),
     ]
-    // Older names to clean up so we don't leave stale duplicates behind.
+    // Older names to clean up so we don't leave stale duplicates behind (includes
+    // the retired Art/Photoreal upscalers now replaced by Imagen).
     private static let legacyQuickActionNames = [
         "Navigator — Remove Background", "Navigator — Chroma Key (Green Screen)",
         "Navigator — Upscale (Art)", "Navigator — Upscale (Photoreal)", "Navigator — Upscale (Low Quality ×4)",
+        "Upscale Art", "Upscale Photoreal",
     ]
 
     // Install/refresh the Quick Actions in ~/Library/Services. Photoshop/After
