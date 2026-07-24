@@ -709,14 +709,15 @@ enum AfterEffectsIcon {
     }
 }
 // "Upscale (AI)" submenu — the low-quality fal preset plus Vertex/Imagen 4 ×2/×4.
-@ViewBuilder func upscaleMenu(fal: @escaping (UpscaleOption) -> Void,
+@ViewBuilder func upscaleMenu(label: String = "Upscale (AI)",
+                              fal: @escaping (UpscaleOption) -> Void,
                               imagen: @escaping (Int) -> Void) -> some View {
     Menu {
         ForEach(upscaleOptions) { o in Button(o.label) { fal(o) } }
         Divider()
         Button("Upscale (Imagen 4) ×2") { imagen(2) }
         Button("Upscale (Imagen 4) ×4") { imagen(4) }
-    } label: { Label("Upscale (AI)", systemImage: "arrow.up.backward.and.arrow.down.forward") }
+    } label: { Label(label, systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {
     ForEach(aiPrepColors) { c in
@@ -1279,8 +1280,9 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
 
 // Batch Remove BG on a FOLDER (Photoshop) — shared by Navigator's menu and Finder.
 // Images under a folder for a batch AI op: recurse, skip "EN"/"en" subfolders
-// and our own "_rmbg" outputs (so re-runs are safe). Sorted for stable order.
-func batchImageURLs(in folder: URL) -> [URL] {
+// and our own outputs so re-runs are safe. `skipSuffix` is the output marker to
+// exclude ("_rmbg" for background removal, "_upscaled" for upscaling). Sorted.
+func batchImageURLs(in folder: URL, skipSuffix: String = "_rmbg") -> [URL] {
     let fm = FileManager.default
     guard let en = fm.enumerator(at: folder, includingPropertiesForKeys: [.isDirectoryKey]) else { return [] }
     var out: [URL] = []
@@ -1290,7 +1292,7 @@ func batchImageURLs(in folder: URL) -> [URL] {
             continue
         }
         guard isImageFile(url) else { continue }
-        if url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix("_rmbg") { continue }
+        if url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix(skipSuffix) { continue }
         out.append(url)
     }
     return out.sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
@@ -1317,6 +1319,40 @@ func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
         onDone?(); return
     }
     chromaKeyForImages(pngs) { _ in onDone?() }
+}
+
+// Confirm a folder batch before spending — upscaling is one PAID AI call per
+// image, and a folder can hold hundreds. Returns true to proceed. `perImage` is
+// a known $/image (Imagen) or nil (fal — cost varies).
+func confirmBatchUpscale(count: Int, folder: URL, label: String, perImage: Double?) -> Bool {
+    let a = NSAlert()
+    a.messageText = "Upscale \(count) image\(count == 1 ? "" : "s") with \(label)?"
+    var info = "Every image in “\(folder.lastPathComponent)” (and subfolders) will be upscaled — one paid AI upscale each."
+    if let p = perImage { info += String(format: "\n\nEstimated cost: ~$%.2f (about $%.2f each).", Double(count) * p, p) }
+    a.informativeText = info
+    a.addButton(withTitle: "Upscale \(count)"); a.addButton(withTitle: "Cancel")
+    return a.runModal() == .alertFirstButtonReturn
+}
+
+// Batch upscale a FOLDER — recurse (skip "EN" folders and existing "_upscaled"
+// outputs) and route through the same per-image upscalers used by multi-select.
+func batchUpscaleFolderViaFal(_ folder: URL, option: UpscaleOption, onDone: (() -> Void)? = nil) {
+    let imgs = batchImageURLs(in: folder, skipSuffix: "_upscaled")
+    guard !imgs.isEmpty else {
+        DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
+        onDone?(); return
+    }
+    guard confirmBatchUpscale(count: imgs.count, folder: folder, label: option.label, perImage: nil) else { onDone?(); return }
+    upscaleImagesViaFal(imgs, option: option) { _ in onDone?() }
+}
+func batchUpscaleFolderViaImagen(_ folder: URL, factor: Int, onDone: (() -> Void)? = nil) {
+    let imgs = batchImageURLs(in: folder, skipSuffix: "_upscaled")
+    guard !imgs.isEmpty else {
+        DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
+        onDone?(); return
+    }
+    guard confirmBatchUpscale(count: imgs.count, folder: folder, label: "Imagen 4 ×\(factor)", perImage: 0.06) else { onDone?(); return }
+    upscaleImagesViaImagen(imgs, factor: factor) { _ in onDone?() }
 }
 
 // Single-image Remove BG usable from anywhere (browser or image viewer): Photoshop
@@ -2811,6 +2847,16 @@ final class Browser: ObservableObject, Identifiable {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
         batchRemoveBackgroundFolder(it.url) { [weak self] in self?.refresh() }
     }
+
+    // Batch upscale every image in the selected folder → "<name>_upscaled.png".
+    func batchUpscale(_ ids: Set<String>, _ option: UpscaleOption) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
+        batchUpscaleFolderViaFal(it.url, option: option) { [weak self] in self?.refresh() }
+    }
+    func batchUpscaleImagen(_ ids: Set<String>, factor: Int) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
+        batchUpscaleFolderViaImagen(it.url, factor: factor) { [weak self] in self?.refresh() }
+    }
     // What the address bar shows: inside Google Drive, the clean username-free
     // "Google Drive/Shared drives/…" form (directly shareable — a coworker pastes
     // it into their address bar and it resolves to their own account). Elsewhere,
@@ -4136,6 +4182,11 @@ struct FileTableView: View {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
                 upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
                             imagen: { f in browser.upscaleImagen(ids, factor: f) })
+            } else if browser.items.filter({ ids.contains($0.id) }).count == 1,
+                      browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
+                upscaleMenu(label: "Batch Upscale (AI)",
+                            fal: { opt in browser.batchUpscale(ids, opt) },
+                            imagen: { f in browser.batchUpscaleImagen(ids, factor: f) })
             }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
@@ -4407,6 +4458,10 @@ struct IconGridView: View {
                     prepForAIMenu { c, ratio in browser.fillBackground(bgIDs, c, ratio: ratio) }
                     upscaleMenu(fal: { opt in browser.upscale(bgIDs, opt) },
                                 imagen: { f in browser.upscaleImagen(bgIDs, factor: f) })
+                } else if item.isDirectory, bgSel.count == 1 {
+                    upscaleMenu(label: "Batch Upscale (AI)",
+                                fal: { opt in browser.batchUpscale([item.id], opt) },
+                                imagen: { f in browser.batchUpscaleImagen([item.id], factor: f) })
                 }
                 if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
                 if item.isDirectory {
@@ -6078,9 +6133,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSUpdateDynamicServices()
         // Install the Finder Quick Actions once per version (cheap; skips the pbs
         // flush on subsequent launches). Bump the marker when the workflows change.
-        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 3 {
+        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 4 {
             installFinderQuickActions(nil)
-            Prefs.d.set(3, forKey: "finderQuickActionsVersion")
+            Prefs.d.set(4, forKey: "finderQuickActionsVersion")
         }
         // Show the browser shortly — unless we were launched only to view an image
         // (the open handler sets suppressMainWindow first). The tiny delay also lets
@@ -6200,9 +6255,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "chromakey":
             folders.forEach { batchChromaKeyFolder($0) }
             if !images.isEmpty { chromaKeyForImages(images) }
-        case "upscale-lowq":     if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("Wonder 3")) }
-        case "upscale-imagen2":  if !images.isEmpty { upscaleImagesViaImagen(images, factor: 2) }
-        case "upscale-imagen4":  if !images.isEmpty { upscaleImagesViaImagen(images, factor: 4) }
+        case "upscale-lowq":
+            folders.forEach { batchUpscaleFolderViaFal($0, option: upscalePreset("Wonder 3")) }
+            if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("Wonder 3")) }
+        case "upscale-imagen2":
+            folders.forEach { batchUpscaleFolderViaImagen($0, factor: 2) }
+            if !images.isEmpty { upscaleImagesViaImagen(images, factor: 2) }
+        case "upscale-imagen4":
+            folders.forEach { batchUpscaleFolderViaImagen($0, factor: 4) }
+            if !images.isEmpty { upscaleImagesViaImagen(images, factor: 4) }
         default: break
         }
     }
@@ -6214,9 +6275,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let finderQuickActions: [FinderQA] = [
         .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
         .init(title: "Chroma Key BG",          action: "chromakey",    requires: "com.adobe.AfterEffects", acceptsFolders: true),
-        .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: false),
-        .init(title: "Upscale (Imagen 4) ×2",  action: "upscale-imagen2", requires: nil,                   acceptsFolders: false),
-        .init(title: "Upscale (Imagen 4) ×4",  action: "upscale-imagen4", requires: nil,                   acceptsFolders: false),
+        .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: true),
+        .init(title: "Upscale (Imagen 4) ×2",  action: "upscale-imagen2", requires: nil,                   acceptsFolders: true),
+        .init(title: "Upscale (Imagen 4) ×4",  action: "upscale-imagen4", requires: nil,                   acceptsFolders: true),
     ]
     // Older names to clean up so we don't leave stale duplicates behind (includes
     // the retired Art/Photoreal upscalers now replaced by Imagen).
