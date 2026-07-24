@@ -1986,6 +1986,7 @@ final class Browser: ObservableObject, Identifiable {
         pathText = googleDrivePortablePath(start) ?? start.path
         showHidden = Prefs.showHidden
         viewMode = ViewMode(rawValue: Prefs.viewMode) ?? .list
+        if viewMode == .column { viewMode = .list }   // column view disabled — coerce stale prefs
         iconSize = Prefs.iconSize
         groupBy = GroupBy(rawValue: Prefs.groupBy) ?? .none
         sortOrder = [Browser.comparator(for: SortField(rawValue: Prefs.sortKey) ?? .name, ascending: Prefs.sortAscending)]
@@ -2018,11 +2019,12 @@ final class Browser: ObservableObject, Identifiable {
     static let maxIconSize: CGFloat = 256
     private var scrollAccum: CGFloat = 0
     func adjustViewScale(_ dy: CGFloat) {
+        // Column view is disabled — cycle is Details ↔ Icons(small→large) ↔ Gallery.
         if viewMode == .icon {
             let proposed = iconSize + dy * 1.4
-            if proposed < Browser.minIconSize {          // shrinking past the smallest icons
+            if proposed < Browser.minIconSize {          // shrinking past the smallest icons → Details
                 scrollAccum += dy
-                if scrollAccum <= -6 { viewMode = .column; scrollAccum = 0 }
+                if scrollAccum <= -6 { viewMode = .list; scrollAccum = 0 }
             } else {
                 iconSize = min(Browser.maxIconSize, proposed); scrollAccum = 0
             }
@@ -2031,15 +2033,13 @@ final class Browser: ObservableObject, Identifiable {
             if scrollAccum >= 6 {                          // grow
                 scrollAccum = 0
                 switch viewMode {
-                case .list: viewMode = .column
-                case .column: viewMode = .icon; iconSize = Browser.minIconSize
+                case .list: viewMode = .icon; iconSize = Browser.minIconSize
                 default: break
                 }
             } else if scrollAccum <= -6 {                  // shrink
                 scrollAccum = 0
                 switch viewMode {
                 case .gallery: viewMode = .icon; iconSize = Browser.maxIconSize
-                case .column: viewMode = .list
                 default: break
                 }
             }
@@ -3806,7 +3806,9 @@ struct ControlBar: View {
                     Button { browser.viewMode = .icon; browser.iconSize = 56 } label: { Label("Small icons", systemImage: "square.grid.4x3.fill") }
                     Divider()
                     Button { browser.viewMode = .list } label: { Label("Details", systemImage: "list.bullet") }
-                    Button { browser.viewMode = .column } label: { Label("Columns", systemImage: "rectangle.split.3x1") }
+                    // Column view disabled (didn't lay out correctly) — re-enable this
+                    // button + the .column cases in adjustViewScale/body/Settings to restore.
+                    // Button { browser.viewMode = .column } label: { Label("Columns", systemImage: "rectangle.split.3x1") }
                     Button { browser.viewMode = .gallery } label: { Label("Gallery", systemImage: "photo.on.rectangle") }
                     Divider()
                     Toggle("Preview pane", isOn: $model.showPreview)
@@ -4796,8 +4798,9 @@ struct BrowserContent: View {
                 switch browser.viewMode {
                 case .icon: IconGridView(model: model, browser: browser)
                 case .gallery: GalleryView(model: model, browser: browser)
-                case .column: ColumnView(model: model, browser: browser)
-                case .list: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
+                // Column view disabled — a stale saved "column" pref falls back to Details.
+                // case .column: ColumnView(model: model, browser: browser)
+                default: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
                 }
             }
             .dropDestination(for: URL.self) { urls, _ in
@@ -6024,7 +6027,8 @@ struct SettingsView: View {
             Section("Defaults for new windows & tabs") {
                 Picker("View", selection: $viewMode) {
                     Text("Details").tag("list"); Text("Icons").tag("icon")
-                    Text("Gallery").tag("gallery"); Text("Columns").tag("column")
+                    Text("Gallery").tag("gallery")   // Columns view disabled
+                    // Text("Columns").tag("column")
                 }
                 Picker("Sort by", selection: $sortKey) {
                     Text("Name").tag("name"); Text("Date Modified").tag("modified")
