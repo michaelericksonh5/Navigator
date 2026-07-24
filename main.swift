@@ -711,7 +711,7 @@ enum AfterEffectsIcon {
     Menu {
         ForEach(upscaleOptions) { o in Button(o.label) { fal(o) } }
         Divider()
-        Button("Upscale (Imagen 4)") { imagen(2) }
+        Button("Upscale (Imagen 4) ×2") { imagen(2) }
         Button("Upscale (Imagen 4) ×4") { imagen(4) }
     } label: { Label("Upscale (AI)", systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
@@ -860,6 +860,14 @@ func upscaleOutputURL(_ src: URL) -> URL {
 private func loadCGImage(_ url: URL) -> CGImage? {
     guard let s = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
     return CGImageSourceCreateImageAtIndex(s, 0, nil)
+}
+// Pixel dimensions from the header — no full decode.
+func imagePixelSize(_ url: URL) -> (w: Int, h: Int)? {
+    guard let s = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let p = CGImageSourceCopyPropertiesAtIndex(s, 0, nil) as? [CFString: Any],
+          let w = p[kCGImagePropertyPixelWidth] as? Int,
+          let h = p[kCGImagePropertyPixelHeight] as? Int else { return nil }
+    return (w, h)
 }
 private func loadCGImage(data: Data) -> CGImage? {
     guard let s = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
@@ -1136,14 +1144,32 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
                     ? "Upscaling \(src.lastPathComponent) — Imagen ×\(factor)"
                     : "Upscaling \(idx + 1) of \(imgs.count) — Imagen ×\(factor)"
             }
+            // Preflight against Imagen's documented limits (17 MP output, 10 MB
+            // input) so we fail clearly and cancel instead of spending a call.
+            guard let (w, h) = imagePixelSize(src) else {
+                navLog("  SKIP: can’t read dimensions"); errors.append("\(src.lastPathComponent): can’t read the image"); continue
+            }
+            let outMP = Double(w * factor) * Double(h * factor) / 1_000_000
+            if outMP > 17 {
+                let x2fits = Double(w * 2) * Double(h * 2) / 1_000_000 <= 17
+                let hint = (factor == 4 && x2fits) ? " ×2 (\(String(format: "%.1f", outMP / 4)) MP) would fit." : " Use a smaller source or a lower factor."
+                let m = "can’t upscale \(w)×\(h) at ×\(factor) — that’s \(String(format: "%.1f", outMP)) MP, over Imagen’s 17 MP limit.\(hint)"
+                navLog("  SKIP: \(m)"); errors.append("\(src.lastPathComponent): \(m)"); continue
+            }
             let transparent = imageHasTransparency(src)
-            navLog("[\(idx + 1)/\(imgs.count)] \(src.lastPathComponent) transparent=\(transparent)")
+            navLog("[\(idx + 1)/\(imgs.count)] \(src.lastPathComponent) \(w)×\(h) transparent=\(transparent) → \(String(format: "%.1f", outMP)) MP")
             var inputPath = src.path
             var tmpInput: URL? = nil
             if transparent, let cg = loadCGImage(src), let g = compositeOnGreen(cg), let png = encodePNG(g) {
                 let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
                 if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
                 else { navLog("  green-composite temp write FAILED — sending original transparent PNG") }
+            }
+            let inBytes = ((try? FileManager.default.attributesOfItem(atPath: inputPath))?[.size] as? Int) ?? 0
+            if inBytes > 10 * 1024 * 1024 {
+                if let t = tmpInput { try? FileManager.default.removeItem(at: t) }
+                let m = "can’t upscale — the input is \(String(format: "%.1f", Double(inBytes) / 1_048_576)) MB, over Imagen’s 10 MB limit. Flatten or downsize the source first."
+                navLog("  SKIP: \(m)"); errors.append("\(src.lastPathComponent): \(m)"); continue
             }
             let args = ["imagen-upscale", inputPath, "--factor", "x\(factor)", "--out", FileManager.default.temporaryDirectory.path]
             var r = runH5GClient(args)
