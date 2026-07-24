@@ -5193,6 +5193,31 @@ struct VisualEffectBackground: NSViewRepresentable {
     func updateNSView(_ v: NSVisualEffectView, context: Context) {}
 }
 
+// Shared picker for the viewer/compare background (Frosted Glass vs Checkerboard),
+// persisted in one place so both windows stay in sync.
+struct BackdropPicker: View {
+    @AppStorage("viewerBackdrop") private var backdrop = "glass"
+    var body: some View {
+        Menu {
+            Picker("Viewer Background", selection: $backdrop) {
+                Text("Frosted Glass").tag("glass")
+                Text("Checkerboard").tag("checker")
+            }.pickerStyle(.inline).labelsHidden()
+        } label: {
+            Image(systemName: backdrop == "checker" ? "square.grid.3x3" : "sparkles")
+        }
+        .menuIndicator(.hidden).fixedSize().help("Viewer background: Frosted Glass or Checkerboard")
+    }
+}
+
+// Chosen background as a view — used by both the viewer and swipe-compare.
+struct BackdropView: View {
+    @AppStorage("viewerBackdrop") private var backdrop = "glass"
+    var body: some View {
+        if backdrop == "checker" { CheckerboardBackground() } else { VisualEffectBackground().ignoresSafeArea() }
+    }
+}
+
 struct ImageViewerView: View {
     @State private var urls: [URL]
     var onTitle: (String) -> Void = { _ in }
@@ -5200,7 +5225,6 @@ struct ImageViewerView: View {
     @State private var dims: String = ""
     @State private var sizeStr: String = ""
     @State private var kindStr: String = ""
-    @AppStorage("viewerBackdrop") private var backdrop = "glass"   // "glass" | "checker"
     @StateObject private var zoomCtl = ZoomController()
     init(urls: [URL], index: Int, onTitle: @escaping (String) -> Void = { _ in }) {
         _urls = State(initialValue: urls); self.onTitle = onTitle; _index = State(initialValue: index)
@@ -5303,7 +5327,7 @@ struct ImageViewerView: View {
     private var isAnimated: Bool { urls.indices.contains(index) && isAnimatedImage(urls[index]) }
     var body: some View {
         ZStack {
-            if backdrop == "checker" { CheckerboardBackground() } else { VisualEffectBackground().ignoresSafeArea() }
+            BackdropView()
             // Image lives in the area ABOVE the bottom bar so nothing is hidden
             // behind it; the bar is a sibling below, not an overlay.
             VStack(spacing: 0) {
@@ -5379,15 +5403,7 @@ struct ImageViewerView: View {
                 Text("\(index + 1) of \(urls.count)").foregroundStyle(.white.opacity(0.85))
             }
             Spacer(minLength: 12)
-            Menu {
-                Picker("Viewer Background", selection: $backdrop) {
-                    Text("Frosted Glass").tag("glass")
-                    Text("Checkerboard").tag("checker")
-                }.pickerStyle(.inline).labelsHidden()
-            } label: {
-                Image(systemName: backdrop == "checker" ? "square.grid.3x3" : "sparkles")
-            }
-            .menuIndicator(.hidden).fixedSize().help("Viewer background: Frosted Glass or Checkerboard")
+            BackdropPicker()
             if !isAnimated {
                 Button { zoomCtl.rotate() } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.plain).help("Rotate 90°")
@@ -5490,11 +5506,20 @@ final class CompareView: NSView {
         needsDisplay = true
     }
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill(); bounds.fill()
+        // Clear to transparent so the window's checkerboard/frosted-glass backdrop
+        // shows through each image's alpha (and the letterbox areas).
+        NSGraphicsContext.current?.cgContext.clear(dirtyRect)
         let r = destRect()
         let hints: [NSImageRep.HintKey: Any] = [.interpolation: NSImageInterpolation.high.rawValue]
-        leftImage?.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
         let dx = bounds.minX + dividerFrac * bounds.width
+        // Clip EACH image to its own side of the divider, so neither shows through
+        // the other's transparent areas (no v1 head bleeding behind v2).
+        if let left = leftImage {
+            NSGraphicsContext.current?.saveGraphicsState()
+            NSBezierPath(rect: NSRect(x: bounds.minX, y: 0, width: dx - bounds.minX, height: bounds.height)).addClip()
+            left.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: hints)
+            NSGraphicsContext.current?.restoreGraphicsState()
+        }
         if let right = rightImage {
             NSGraphicsContext.current?.saveGraphicsState()
             NSBezierPath(rect: NSRect(x: dx, y: 0, width: bounds.maxX - dx, height: bounds.height)).addClip()
@@ -5550,7 +5575,7 @@ struct SwipeCompareView: View {
     @State private var rightImg: NSImage?
     var body: some View {
         ZStack {
-            Color.black
+            BackdropView()
             SwipeCompare(left: leftImg, right: rightImg)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onAppear {
@@ -5564,10 +5589,13 @@ struct SwipeCompareView: View {
             VStack {
                 HStack { tag(leftURL.lastPathComponent); Spacer(); tag(rightURL.lastPathComponent) }.padding(12)
                 Spacer()
-                Text("Drag the divider to swipe  ·  scroll to zoom  ·  drag to pan  ·  double-click to reset")
-                    .font(.caption).foregroundStyle(.white.opacity(0.75))
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(.black.opacity(0.5)).clipShape(Capsule()).padding(.bottom, 12)
+                HStack(spacing: 10) {
+                    BackdropPicker().foregroundStyle(.white)
+                    Text("Drag the divider to swipe  ·  scroll to zoom  ·  drag to pan  ·  double-click to reset")
+                        .font(.caption).foregroundStyle(.white.opacity(0.75))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(.black.opacity(0.5)).clipShape(Capsule()).padding(.bottom, 12)
             }
         }.frame(minWidth: 560, minHeight: 440)
     }
