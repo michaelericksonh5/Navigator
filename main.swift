@@ -3523,6 +3523,23 @@ final class Browser: ObservableObject, Identifiable {
                     reportFileError(failures.count == 1 ? "“\(failures[0].name)” couldn't be \(verb)"
                                                         : "\(failures.count) items couldn't be \(verb)", detail)
                 }
+                // Cancel STOPS the transfer; whatever already finished stays put. Say
+                // so plainly — otherwise a cancelled MOVE looks like files vanished
+                // from the source folder for no reason. Undo puts them back.
+                let settled = move ? moved.count : copied.count
+                if progress.cancelled, settled > 0 {
+                    let f = NumberFormatter(); f.numberStyle = .decimal
+                    let n = f.string(from: NSNumber(value: settled)) ?? "\(settled)"
+                    let t = f.string(from: NSNumber(value: total)) ?? "\(total)"
+                    let a = NSAlert()
+                    a.alertStyle = .informational
+                    a.messageText = move ? "Move cancelled" : "Copy cancelled"
+                    a.informativeText = move
+                        ? "\(n) of \(t) items had already been moved into “\(dir.lastPathComponent)”. They were not moved back — press ⌘Z to undo the move."
+                        : "\(n) of \(t) items had already been copied into “\(dir.lastPathComponent)”. They were kept — press ⌘Z to remove them."
+                    a.addButton(withTitle: "OK")
+                    a.runModal()
+                }
             }
         }
     }
