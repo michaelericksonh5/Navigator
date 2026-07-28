@@ -1878,7 +1878,23 @@ func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtensio
 // Cloud (File Provider) download state for a Google Drive / iCloud item, read
 // from standard URL resource keys (local, no network). Matches Finder: a badge
 // only for online-only or actively-downloading items; downloaded items show none.
-enum CloudBadge { case onlineOnly, downloading }
+enum CloudBadge {
+    case onlineOnly, downloading, offlineAvailable
+    var symbol: String {
+        switch self {
+        case .downloading: return "arrow.clockwise"
+        case .onlineOnly: return "icloud.and.arrow.down"
+        case .offlineAvailable: return "internaldrive.fill"   // saved locally
+        }
+    }
+    var helpText: String {
+        switch self {
+        case .downloading: return "Downloading from the cloud…"
+        case .onlineOnly: return "Online only — will download when opened"
+        case .offlineAvailable: return "Available offline — saved on this Mac"
+        }
+    }
+}
 // Only File Provider locations (Google Drive & other CloudStorage providers,
 // iCloud Drive) can be online-only. Gate on the PATH first — a cheap string
 // check — so we never stat SMB / local files per cell. Reading the ubiquitous
@@ -1890,20 +1906,25 @@ func isCloudProviderPath(_ url: URL) -> Bool {
 }
 func cloudBadge(for url: URL) -> CloudBadge? {
     guard isCloudProviderPath(url),
-          let v = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey, .ubiquitousItemIsDownloadingKey]),
+          let v = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey,
+                                                    .ubiquitousItemIsDownloadingKey, .isDirectoryKey]),
           v.isUbiquitousItem == true else { return nil }
     if v.ubiquitousItemIsDownloading == true { return .downloading }
     if v.ubiquitousItemDownloadingStatus == .notDownloaded { return .onlineOnly }
-    return nil   // .current / .downloaded → present locally, no badge
+    // Present locally = available offline. Files only: a FOLDER always reports
+    // "current" regardless of what's inside it, so badging folders would mark
+    // every folder as offline-ready, which isn't true.
+    if v.isDirectory == true { return nil }
+    return .offlineAvailable
 }
 @ViewBuilder func cloudBadgeView(_ badge: CloudBadge?) -> some View {
     if let badge {
-        Image(systemName: badge == .downloading ? "arrow.clockwise" : "icloud.and.arrow.down")
+        Image(systemName: badge.symbol)
             .font(.system(size: 9, weight: .bold))
             .foregroundStyle(.white)
             .padding(3)
             .background(Circle().fill(Color.black.opacity(0.55)))
-            .help(badge == .downloading ? "Downloading from the cloud…" : "Online only — will download when opened")
+            .help(badge.helpText)
     }
 }
 
@@ -1973,6 +1994,9 @@ func volumeLocations() -> [SidebarLocation] {
 final class Browser: ObservableObject, Identifiable {
     let id = UUID()
     @Published var currentURL: URL
+    // Bumped when cloud availability changes so rows re-read their badge — a
+    // refresh alone doesn't do it, since the row's identity (its path) is unchanged.
+    @Published var badgeGeneration = 0
     @Published var items: [FileItem] = [] {
         didSet {
             visibleCache = nil
@@ -2912,6 +2936,45 @@ final class Browser: ObservableObject, Identifiable {
         (selection.contains(id) && selection.count > 1) ? selection : [id]
     }
 
+    // Is everything in this selection already stored locally (available offline)?
+    // Drives which ONE of the two Drive availability items is offered, so they're
+    // never both shown. A file answers for itself; a FOLDER's own status always
+    // reads "current" no matter what's inside, so we judge it by a small sample of
+    // its direct children. Results are cached briefly because this is evaluated
+    // while a context menu is being built.
+    private static var offlineStateCache: [String: (value: Bool, at: Date)] = [:]
+    func driveSelectionIsOffline(_ ids: Set<String>) -> Bool {
+        let urls = items.filter { ids.contains($0.id) }.map { $0.url }
+        guard !urls.isEmpty else { return false }
+        func isLocal(_ u: URL) -> Bool {
+            guard let r = try? u.resourceValues(forKeys: [.ubiquitousItemDownloadingStatusKey]) else { return true }
+            return r.ubiquitousItemDownloadingStatus != .notDownloaded
+        }
+        for u in urls {
+            let key = u.path
+            if let c = Browser.offlineStateCache[key], Date().timeIntervalSince(c.at) < 5 {
+                if !c.value { return false }
+                continue
+            }
+            var local: Bool
+            if (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                // Sample a handful of direct files: any online-only child means the
+                // folder isn't fully offline, so "Make available offline" is the
+                // useful action. ponytail: bounded sample, not a recursive walk —
+                // a full walk would stall the menu on big Drive folders.
+                let kids = (try? FileManager.default.contentsOfDirectory(
+                    at: u, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+                let files = kids.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true }
+                local = files.isEmpty ? true : files.prefix(12).allSatisfy(isLocal)
+            } else {
+                local = isLocal(u)
+            }
+            Browser.offlineStateCache[key] = (local, Date())
+            if !local { return false }
+        }
+        return true
+    }
+
     // "Make available offline" / "Make available online only" for Drive items,
     // via the standard File Provider APIs (verified against Google Drive):
     // startDownloadingUbiquitousItem materialises a file, evictUbiquitousItem
@@ -2951,7 +3014,15 @@ final class Browser: ObservableObject, Identifiable {
                     else { try fm.evictUbiquitousItem(at: u) }
                     done += 1
                 } catch {
-                    errors.append("\(u.lastPathComponent): \(error.localizedDescription)")
+                    // Google Drive refuses eviction (File Provider error -2008) for
+                    // items it insists on keeping local — e.g. pinned for offline use
+                    // or a mirrored folder. Say so instead of showing "couldn't be saved".
+                    let ns = error as NSError
+                    let inner = (ns.userInfo["NSUnderlyingError"] as? NSError)?.code ?? ns.code
+                    let msg = inner == -2008
+                        ? "Google Drive is keeping this file on this Mac (pinned for offline use, or the folder is mirrored). Turn it off in Google Drive to free the space."
+                        : error.localizedDescription
+                    errors.append("\(u.lastPathComponent): \(msg)")
                 }
             }
             DispatchQueue.main.async {
@@ -2963,6 +3034,10 @@ final class Browser: ObservableObject, Identifiable {
                                   done: done, total: files.count, errors: errors,
                                   verb: offline ? "downloaded" : "evicted")
                 }
+                // Drop the cached offline-state decisions and re-read the badges, so
+                // the menu offers the other action and the icons update right away.
+                Browser.offlineStateCache.removeAll()
+                self?.badgeGeneration += 1
                 self?.silentRefresh()
             }
         }
@@ -4031,6 +4106,7 @@ struct NameCell: View {
             cloudBadgeView(cloud)
         }
         .onAppear { cloud = cloudBadge(for: item.url) }
+        .onChange(of: browser.badgeGeneration) { cloud = cloudBadge(for: item.url) }
     }
 }
 
@@ -4293,8 +4369,12 @@ struct FileTableView: View {
                 Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Local Path") }
                 Button { browser.copyPath(ids) } label: { gdLabel("Copy Path for Claude") }
                 Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Web") }
-                Button { browser.setDriveAvailability(ids, offline: true) } label: { gdLabel("Make available offline") }
-                Button { browser.setDriveAvailability(ids, offline: false) } label: { gdLabel("Make available online only") }
+                // Only the applicable one — never both.
+                if browser.driveSelectionIsOffline(ids) {
+                    Button { browser.setDriveAvailability(ids, offline: false) } label: { gdLabel("Make available online only") }
+                } else {
+                    Button { browser.setDriveAvailability(ids, offline: true) } label: { gdLabel("Make available offline") }
+                }
             }
             Divider()
             Button("Move to Trash") { browser.moveToTrash(ids) }
@@ -4340,6 +4420,7 @@ struct IconCell: View {
             }
             cloud = cloudBadge(for: item.url)
         }
+        .onChange(of: browser.badgeGeneration) { cloud = cloudBadge(for: item.url) }
     }
 }
 
@@ -4557,8 +4638,12 @@ struct IconGridView: View {
                     Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Local Path") }
                     Button { browser.copyPath([item.id]) } label: { gdLabel("Copy Path for Claude") }
                     Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Web") }
-                    Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: true) } label: { gdLabel("Make available offline") }
-                    Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: false) } label: { gdLabel("Make available online only") }
+                    // Only the applicable one — never both.
+                    if browser.driveSelectionIsOffline(browser.rowSelection(item.id)) {
+                        Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: false) } label: { gdLabel("Make available online only") }
+                    } else {
+                        Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: true) } label: { gdLabel("Make available offline") }
+                    }
                 }
                 Button("Move to Trash") { browser.moveToTrash([item.id]) }
             }
@@ -4766,6 +4851,7 @@ struct ThumbImage: View {
         .overlay(alignment: .bottomTrailing) { cloudBadgeView(cloud).padding(4) }
         .onAppear { ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }; cloud = cloudBadge(for: item.url) }
         .onChange(of: item.url) { thumb = nil; ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }; cloud = cloudBadge(for: item.url) }
+        .onChange(of: browser.badgeGeneration) { cloud = cloudBadge(for: item.url) }
     }
 }
 
