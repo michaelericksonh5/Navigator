@@ -461,6 +461,22 @@ final class NetworkBrowser: NSObject, ObservableObject, NetServiceBrowserDelegat
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
     private let cache = NSCache<NSString, NSImage>()
+    // Generation runs on a bounded queue. Measured: for ordinary PNG/JPG the bound
+    // makes no difference (40 cold Drive images filled in ~1.2s either way), so this
+    // is a safety valve, not a speed-up — it stops a 300-image folder from queueing
+    // 300 concurrent generations. The real wins here are the failure cache and the
+    // timeout below: a big cloud-hosted PSD can take many seconds (one test never
+    // returned inside two minutes), and without a failure cache an unthumbnailable
+    // file was re-requested on every single scroll.
+    private let queue: OperationQueue = {
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 6
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+    private let lock = NSLock()
+    private var ops: [String: Operation] = [:]
+    private var failed: Set<String> = []      // don't retry a file QuickLook can't do
     func thumbnail(for url: URL, size: CGFloat = 256, completion: @escaping (NSImage?) -> Void) {
         let key = "\(url.path)@\(Int(size))" as NSString
         if let c = cache.object(forKey: key) { completion(c); return }
@@ -477,14 +493,43 @@ final class ThumbnailCache {
         // QuickLook returns a thumbnail for a dataless file WITHOUT materialising it
         // (the File Provider supplies it), so skipping would lose thumbnails for no
         // bandwidth saving.
+        lock.lock()
+        if failed.contains(key as String) { lock.unlock(); completion(nil); return }
+        if ops[key as String] != nil { lock.unlock(); return }   // already being generated
+        lock.unlock()
+
         let scale = NSScreen.main?.backingScaleFactor ?? 2
-        let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
-                                               scale: scale, representationTypes: .thumbnail)
-        QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { [weak self] rep, _ in
-            let img = rep?.nsImage
-            if let img { self?.cache.setObject(img, forKey: key) }
+        let op = BlockOperation()
+        op.addExecutionBlock { [weak self, weak op] in
+            guard let self, op?.isCancelled != true else { return }
+            let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
+                                                   scale: scale, representationTypes: .thumbnail)
+            var img: NSImage?
+            let sem = DispatchSemaphore(value: 0)
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { rep, _ in
+                img = rep?.nsImage; sem.signal()
+            }
+            // Give up on a pathological file rather than holding a slot forever —
+            // some large cloud-hosted PSDs never come back in reasonable time.
+            if sem.wait(timeout: .now() + 15) == .timedOut { QLThumbnailGenerator.shared.cancel(req) }
+            self.lock.lock()
+            self.ops[key as String] = nil
+            if let img { self.cache.setObject(img, forKey: key) }
+            else { self.failed.insert(key as String) }   // don't ask again on every scroll
+            self.lock.unlock()
+            if op?.isCancelled == true { return }
             DispatchQueue.main.async { completion(img) }
         }
+        lock.lock(); ops[key as String] = op; lock.unlock()
+        queue.addOperation(op)
+    }
+
+    // Row scrolled out of view — drop its pending request so the queue stays
+    // focused on what's actually on screen.
+    func cancel(for url: URL, size: CGFloat = 256) {
+        let key = "\(url.path)@\(Int(size))"
+        lock.lock(); let op = ops.removeValue(forKey: key); lock.unlock()
+        op?.cancel()
     }
 }
 
@@ -2503,12 +2548,20 @@ final class Browser: ObservableObject, Identifiable {
             let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
             var result: [FileItem] = []
             var sinceFlush = 0
+            var lastFlush = ProcessInfo.processInfo.systemUptime
             while let u = en?.nextObject() as? URL {
                 guard let self, gen == self.loadGeneration else { return }
                 result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
                 sinceFlush += 1
-                if !hadCache, sinceFlush >= 200 {
-                    sinceFlush = 0
+                // Show what we have as it arrives. The old rule only flushed every
+                // 200 entries, so a folder with fewer than that (most folders) stayed
+                // completely EMPTY behind "Loading…" until the whole enumeration
+                // finished — the worst case being a cloud folder where each entry
+                // costs a provider round-trip. Now: first rows land quickly, then a
+                // flush at least every 100ms.
+                let now = ProcessInfo.processInfo.systemUptime
+                if !hadCache, sinceFlush >= 24 || (sinceFlush > 0 && now - lastFlush >= 0.1) {
+                    sinceFlush = 0; lastFlush = now
                     let snapshot = result
                     DispatchQueue.main.async { [weak self] in
                         guard let self, gen == self.loadGeneration else { return }
@@ -4092,6 +4145,9 @@ struct ThumbIcon: View {
             guard thumb == nil, !item.isDirectory, isThumbnailable(item.url) else { return }
             ThumbnailCache.shared.thumbnail(for: item.url, size: max(40, size * 2)) { if let t = $0 { thumb = t } }
         }
+        .onDisappear {
+            if thumb == nil { ThumbnailCache.shared.cancel(for: item.url, size: max(40, size * 2)) }
+        }
     }
 }
 
@@ -4420,6 +4476,7 @@ struct IconCell: View {
             }
             cloud = cloudBadge(for: item.url)
         }
+        .onDisappear { if thumb == nil { ThumbnailCache.shared.cancel(for: item.url) } }
         .onChange(of: browser.badgeGeneration) { cloud = cloudBadge(for: item.url) }
     }
 }
