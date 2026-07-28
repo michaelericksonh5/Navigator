@@ -2102,6 +2102,10 @@ final class Browser: ObservableObject, Identifiable {
     @Published var busy = false
     @Published var busyText = ""
     @Published var slowNetwork = false   // a network op is taking a while — shown quietly in the breadcrumb bar
+    // A network listing that has produced NOTHING for a long time. The share is
+    // wedged or the server won't answer, and "Loading…" forever with no way out is
+    // what sends people to Finder to reconnect. Drives the recovery panel.
+    @Published var networkStalled = false
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
@@ -2497,6 +2501,7 @@ final class Browser: ObservableObject, Identifiable {
         isRecents = false
         isSearching = false
         slowNetwork = false
+        networkStalled = false
         pathText = addressString(for: currentURL)
         selection = []
         let dir = currentURL
@@ -2611,6 +2616,12 @@ final class Browser: ObservableObject, Identifiable {
                 guard let self, gen == self.loadGeneration, self.busy else { return }
                 self.slowNetwork = true
             }
+            // Nothing at all after this long → treat the share as not responding and
+            // offer a way out, instead of spinning indefinitely.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, gen == self.loadGeneration, self.busy, self.items.isEmpty else { return }
+                self.networkStalled = true
+            }
         }
         let keys = Browser.itemKeys
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
@@ -2635,7 +2646,7 @@ final class Browser: ObservableObject, Identifiable {
                         let snap = out
                         DispatchQueue.main.async { [weak self] in
                             guard let self, gen == self.loadGeneration else { return }
-                            self.items = snap; self.busy = false; self.busyText = ""; self.slowNetwork = false; self.updateStatus()
+                            self.items = snap; self.busy = false; self.busyText = ""; self.slowNetwork = false; self.networkStalled = false; self.updateStatus()
                         }
                     }
                 }
@@ -2807,6 +2818,59 @@ final class Browser: ObservableObject, Identifiable {
     // Mount an SMB/AFP URL directly, without Finder. Blocking — call off the main
     // thread. Returns the real mountpoint path (nil on failure). NetFS uses stored
     // keychain creds and shows its own auth sheet only when none exist.
+    // The network share backing whatever volume `url` sits on, read from the mount
+    // table: f_mntfromname "//user@host/share" → smb://user@host/share, plus the
+    // volume's mountpoint. nil for local disks.
+    static func shareMountInfo(for url: URL) -> (volume: String, share: URL)? {
+        var s = statfs()
+        guard statfs(url.path, &s) == 0 else { return nil }
+        let from = withUnsafeBytes(of: &s.f_mntfromname) { raw -> String in
+            String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+        let on = withUnsafeBytes(of: &s.f_mntonname) { raw -> String in
+            String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+        }
+        guard from.hasPrefix("//"), let u = URL(string: "smb:" + from) else { return nil }
+        return (on, u)
+    }
+
+    // Force-unmount a wedged share and mount it again, then return to the same
+    // folder. This is the "Reconnect" button: a dead SMB session can't be recovered
+    // any other way, and doing it here means no trip to Finder.
+    func reconnectShare() {
+        guard let info = Browser.shareMountInfo(for: currentURL) else { NSSound.beep(); return }
+        // Remember where we were, relative to the volume, so we can come back.
+        let rel = currentURL.path.hasPrefix(info.volume)
+            ? String(currentURL.path.dropFirst(info.volume.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            : ""
+        networkStalled = false
+        busy = true; busyText = "Reconnecting to \(info.share.host ?? "server")…"
+        loadGeneration += 1                     // abandon the stalled enumeration
+        items = []
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let du = Process()
+            du.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+            du.arguments = ["unmount", "force", info.volume]
+            try? du.run(); du.waitUntilExit()
+            let mp = Browser.mountShare(info.share)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.busy = false; self.busyText = ""; self.slowNetwork = false
+                guard let mp else {
+                    reportFileError("Couldn’t reconnect to “\(info.share.host ?? "the server")”",
+                                    "The share didn’t mount. Check your VPN connection and try again.",
+                                    permissionHint: false)
+                    return
+                }
+                // The share can come back under a different mountpoint (…-1) if a
+                // stale folder is holding the old name — re-anchor onto the new one.
+                let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
+                Browser.invalidateCache(target)
+                self.navigate(to: URL(fileURLWithPath: self.fm.fileExists(atPath: target) ? target : mp))
+            }
+        }
+    }
+
     static func mountShare(_ url: URL) -> String? {
         let openOpts = NSMutableDictionary()
         openOpts[kNAUIOptionKey] = kNAUIOptionAllowUI
@@ -5150,12 +5214,16 @@ struct BrowserContent: View {
                 Divider()
             }
             Group {
-                switch browser.viewMode {
-                case .icon: IconGridView(model: model, browser: browser)
-                case .gallery: GalleryView(model: model, browser: browser)
-                // Column view disabled — a stale saved "column" pref falls back to Details.
-                // case .column: ColumnView(model: model, browser: browser)
-                default: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
+                if browser.networkStalled && browser.items.isEmpty {
+                    StalledShareView(browser: browser)
+                } else {
+                    switch browser.viewMode {
+                    case .icon: IconGridView(model: model, browser: browser)
+                    case .gallery: GalleryView(model: model, browser: browser)
+                    // Column view disabled — a stale saved "column" pref falls back to Details.
+                    // case .column: ColumnView(model: model, browser: browser)
+                    default: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
+                    }
                 }
             }
             .dropDestination(for: URL.self) { urls, _ in
@@ -6111,6 +6179,29 @@ final class GetInfoController {
 }
 
 // MARK: - Transfer progress window
+
+// Shown instead of an endless "Loading…" when a network folder returns nothing for
+// 15s. A wedged SMB session can't recover on its own, so give the two things that
+// actually help: reconnect the share, or stop waiting and go somewhere useful.
+struct StalledShareView: View {
+    @ObservedObject var browser: Browser
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "wifi.exclamationmark").font(.system(size: 38)).foregroundStyle(.orange)
+            Text("“\(browser.currentURL.lastPathComponent)” isn’t responding").font(.headline)
+            Text("The network drive stopped answering. Reconnecting drops the stuck connection and mounts the share again.")
+                .font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 420)
+            HStack(spacing: 10) {
+                Button("Reconnect") { browser.reconnectShare() }.keyboardShortcut(.defaultAction)
+                Button("Stop Waiting") { browser.networkStalled = false; browser.busy = false; browser.busyText = "" }
+                Button("Go Up") { browser.networkStalled = false; browser.goUp() }
+            }
+        }
+        .padding(30)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
 
 struct TransferProgressView: View {
     @ObservedObject var progress: TransferProgress
