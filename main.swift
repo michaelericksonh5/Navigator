@@ -27,6 +27,16 @@ final class TransferProgress: ObservableObject {
     @Published var fraction: Double = 0
     @Published var current: String = ""
     @Published var cancelled = false
+    @Published var done = 0            // items finished
+    @Published var total = 0           // items in this transfer (0 = unknown)
+    // "1,234 of 30,000 items" — a percentage alone doesn't tell you how much is left.
+    var countText: String {
+        guard total > 1 else { return "" }
+        let f = NumberFormatter(); f.numberStyle = .decimal
+        let d = f.string(from: NSNumber(value: done)) ?? "\(done)"
+        let t = f.string(from: NSNumber(value: total)) ?? "\(total)"
+        return "\(d) of \(t) items"
+    }
 }
 
 // App-wide, non-blocking progress for background-removal jobs (Photoshop /
@@ -627,15 +637,20 @@ struct SidebarLocation: Identifiable, Hashable {
 
 // Surfaces a file-operation failure instead of failing silently. Must be called
 // on the main thread.
-func reportFileError(_ summary: String, _ detail: String = "") {
+// `permissionHint` appends the Full Disk Access note. Pass false when the failure
+// clearly isn't about permissions (e.g. "a folder can't be copied into itself") —
+// tacking an unrelated FDA paragraph onto a logic error just confuses people.
+func reportFileError(_ summary: String, _ detail: String = "", permissionHint: Bool = true) {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = summary
     var msg = detail
     // Cap the detail so a long message can't make the alert taller than the
     // screen — that pushes the OK button off-screen and it can't be dismissed.
     if msg.count > 1200 { msg = String(msg.prefix(1200)) + "\n… (truncated)" }
-    if !msg.isEmpty { msg += "\n\n" }
-    msg += "Items in protected folders (Desktop, Documents, Pictures, Downloads) or on read-only volumes can need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
+    if permissionHint {
+        if !msg.isEmpty { msg += "\n\n" }
+        msg += "Items in protected folders (Desktop, Documents, Pictures, Downloads) or on read-only volumes can need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
+    }
     a.informativeText = msg
     a.addButton(withTitle: "OK"); a.runModal()
 }
@@ -3195,25 +3210,28 @@ final class Browser: ObservableObject, Identifiable {
         load()
     }
 
-    // File clipboard
-    var cutMode = false
+    // File clipboard. STATIC, not per-Browser: the pasteboard is system-wide, and
+    // every tab/window owns its own Browser. When these were instance properties,
+    // cutting in one tab and pasting in another silently became a COPY — the files
+    // were duplicated and the originals left behind, with no hint anything differed.
+    static var cutMode = false
     // The pasteboard changeCount captured when we cut. A paste is a MOVE only if
     // the pasteboard hasn't changed since — otherwise another app (or a later
     // copy) replaced the contents and we must not move files we didn't cut.
-    var cutChangeCount = -1
+    static var cutChangeCount = -1
     private func selectedURLs() -> [URL] { items.filter { selection.contains($0.id) }.map { $0.url } }
     // Copy/Cut act on an explicit id set when given (the right-clicked row from a
     // context menu, which may not be in `selection`), else the current selection.
     func copyFiles(_ ids: Set<String>? = nil) {
         let urls = items.filter { (ids ?? selection).contains($0.id) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL]); cutMode = false
+        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL]); Browser.cutMode = false
     }
     func cutFiles(_ ids: Set<String>? = nil) {
         let urls = items.filter { (ids ?? selection).contains($0.id) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL])
-        cutMode = true; cutChangeCount = NSPasteboard.general.changeCount
+        Browser.cutMode = true; Browser.cutChangeCount = NSPasteboard.general.changeCount
     }
     private func uniqueDest(_ dir: URL, _ name: String) -> URL {
         let fm = FileManager.default
@@ -3246,7 +3264,7 @@ final class Browser: ObservableObject, Identifiable {
     func pasteFiles() {
         let urls = pasteboardURLs()
         guard !urls.isEmpty else { return }
-        let isMove = cutMode && NSPasteboard.general.changeCount == cutChangeCount
+        let isMove = Browser.cutMode && NSPasteboard.general.changeCount == Browser.cutChangeCount
         if isMove {
             let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
             guard !sources.isEmpty else { return }
@@ -3297,16 +3315,25 @@ final class Browser: ObservableObject, Identifiable {
     // APFS (instant), byte-copies across volumes / SMB / File Provider while
     // reporting bytes, and preserves metadata — the same engine FileManager uses.
     // Used for regular files so a large copy shows a real, moving bar.
-    static func copyWithProgress(_ src: URL, _ dst: URL, onBytes: @escaping (Int64) -> Void) throws {
-        final class Box { let cb: (Int64) -> Void; init(_ c: @escaping (Int64) -> Void) { cb = c } }
-        let boxPtr = Unmanaged.passRetained(Box(onBytes)).toOpaque()
+    static func copyWithProgress(_ src: URL, _ dst: URL,
+                                 isCancelled: @escaping () -> Bool = { false },
+                                 onBytes: @escaping (Int64) -> Void) throws {
+        final class Box {
+            let cb: (Int64) -> Void; let cancelled: () -> Bool
+            init(_ c: @escaping (Int64) -> Void, _ x: @escaping () -> Bool) { cb = c; cancelled = x }
+        }
+        let boxPtr = Unmanaged.passRetained(Box(onBytes, isCancelled)).toOpaque()
         defer { Unmanaged<Box>.fromOpaque(boxPtr).release() }
         let state = copyfile_state_alloc(); defer { copyfile_state_free(state) }
         let cb: copyfile_callback_t = { what, stage, st, _, _, ctx in
             if what == COPYFILE_COPY_DATA, stage == COPYFILE_PROGRESS, let ctx {
+                let box = Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue()
                 var copied: off_t = 0
                 _ = copyfile_state_get(st, UInt32(COPYFILE_STATE_COPIED), &copied)
-                Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue().cb(Int64(copied))
+                box.cb(Int64(copied))
+                // Honour Cancel *during* a single large file. Without this, hitting
+                // Cancel closed the window while the copy ran on to completion.
+                if box.cancelled() { return COPYFILE_QUIT }
             }
             return COPYFILE_CONTINUE
         }
@@ -3318,8 +3345,32 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
 
+    // True when `dir` is `src` itself or lives inside it. Copying/moving a folder
+    // into its own subtree must be refused: FileManager happily recurses into the
+    // copy it is creating, and only stops when the path gets too long — a real test
+    // produced 231 junk directories nested 1000+ characters deep before failing.
+    private static func isSelfOrDescendant(_ dir: URL, of src: URL) -> Bool {
+        let s = src.standardizedFileURL.resolvingSymlinksInPath().path
+        let d = dir.standardizedFileURL.resolvingSymlinksInPath().path
+        return d == s || d.hasPrefix(s.hasSuffix("/") ? s : s + "/")
+    }
+
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
         let fm = FileManager.default
+        // Refuse folder-into-itself before touching the disk (Finder does the same).
+        let recursive = sources.filter {
+            ((try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true)
+                && Browser.isSelfOrDescendant(dir, of: $0)
+        }
+        if !recursive.isEmpty {
+            let names = recursive.map { "“\($0.lastPathComponent)”" }.joined(separator: ", ")
+            reportFileError(recursive.count == 1 ? "\(names) can’t be \(move ? "moved" : "copied") into itself"
+                                                : "\(recursive.count) folders can’t be \(move ? "moved" : "copied") into themselves",
+                            "A folder can’t be \(move ? "moved" : "copied") into itself or into one of its own subfolders. Pick a destination outside \(names).",
+                            permissionHint: false)
+            if resetCut { Browser.cutMode = false }
+            return
+        }
         // A copy whose source already lives in the destination is an in-place
         // duplicate ("paste into same folder") — it gets a numbered name silently,
         // so it's never treated as a conflict.
@@ -3376,6 +3427,7 @@ final class Browser: ObservableObject, Identifiable {
             var copied: [URL] = []
             var failures: [(name: String, reason: String)] = []
             let total = sources.count
+            DispatchQueue.main.async { progress.total = total }
             let step = max(1, total / 50)
             // Byte-level progress so a single large file shows a real, moving bar
             // (not a stuck 0%). Used only for plain file copies; folders and moves
@@ -3410,9 +3462,16 @@ final class Browser: ObservableObject, Identifiable {
                 }
                 do {
                     if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
-                    else if useBytes { try Browser.copyWithProgress(src, dest, onBytes: onBytes); copied.append(dest) }
+                    else if useBytes {
+                        try Browser.copyWithProgress(src, dest, isCancelled: { progress.cancelled }, onBytes: onBytes)
+                        // A cancelled copyfile leaves a truncated file behind — bin it
+                        // rather than leaving a corrupt partial copy in the folder.
+                        if progress.cancelled { try? fm.removeItem(at: dest); break }
+                        copied.append(dest)
+                    }
                     else { try fm.copyItem(at: src, to: dest); copied.append(dest) }   // APFS clones this too
                 } catch {
+                    if progress.cancelled { try? fm.removeItem(at: dest); break }
                     // Cross-volume move (rename fails) or a copyfile hiccup → plain copy.
                     do {
                         try fm.copyItem(at: src, to: dest)
@@ -3425,13 +3484,17 @@ final class Browser: ObservableObject, Identifiable {
                 base += sizes[i]
                 if !useBytes, i % step == 0 || i == total - 1 {
                     let n = src.lastPathComponent, frac = total > 0 ? Double(i + 1) / Double(total) : 0
-                    DispatchQueue.main.async { progress.current = n; progress.fraction = frac }
+                    let d = i + 1
+                    DispatchQueue.main.async { progress.current = n; progress.fraction = frac; progress.done = d }
+                } else if useBytes {
+                    let d = i + 1
+                    DispatchQueue.main.async { progress.done = d }
                 }
             }
             DispatchQueue.main.async {
                 slowHint.cancel()
                 TransferProgressController.shared.hide()
-                if resetCut { self.cutMode = false }
+                if resetCut { Browser.cutMode = false }
                 self.busy = false; self.busyText = ""; self.slowNetwork = false
                 RecentFolders.shared.record(dir)   // you worked in the destination folder
                 if move, !moved.isEmpty {
@@ -6037,11 +6100,16 @@ struct TransferProgressView: View {
     let title: String
     let onCancel: () -> Void
     var body: some View {
+        // No repeated title here — it's already the window's title, and showing
+        // "Copying…" twice in one small panel just looked unfinished. The useful
+        // line is what's being copied and how far along it is.
         VStack(alignment: .leading, spacing: 12) {
-            Text(title).font(.headline)
+            if !progress.countText.isEmpty {
+                Text(progress.countText).font(.headline).monospacedDigit()
+            }
             ProgressView(value: progress.fraction)
             HStack {
-                Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(progress.current).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 8)
                 Text("\(Int((progress.fraction * 100).rounded()))%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
