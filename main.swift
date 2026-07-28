@@ -473,6 +473,10 @@ final class ThumbnailCache {
         default: break
         }
         guard isThumbnailable(url) else { completion(nil); return }
+        // NOTE: do NOT skip online-only cloud files here. Measured on Google Drive:
+        // QuickLook returns a thumbnail for a dataless file WITHOUT materialising it
+        // (the File Provider supplies it), so skipping would lose thumbnails for no
+        // bandwidth saving.
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
                                                scale: scale, representationTypes: .thumbnail)
@@ -2901,6 +2905,68 @@ final class Browser: ObservableObject, Identifiable {
         guard !urls.isEmpty else { NSSound.beep(); return }
         for u in urls { NSWorkspace.shared.open(u) }
     }
+
+    // Right-clicking a row acts on the whole selection when that row is part of a
+    // multi-selection, otherwise just that row (what the BG-removal menus do).
+    func rowSelection(_ id: String) -> Set<String> {
+        (selection.contains(id) && selection.count > 1) ? selection : [id]
+    }
+
+    // "Make available offline" / "Make available online only" for Drive items,
+    // via the standard File Provider APIs (verified against Google Drive):
+    // startDownloadingUbiquitousItem materialises a file, evictUbiquitousItem
+    // drops the local copy (content stays in Drive — reversible either way).
+    // Folders are walked recursively since the APIs act per file. Runs off the
+    // main thread with the shared non-blocking progress line.
+    func setDriveAvailability(_ ids: Set<String>, offline: Bool) {
+        let roots = items.filter { ids.contains($0.id) }.map { $0.url }
+        guard !roots.isEmpty else { NSSound.beep(); return }
+        let label = offline ? "Making available offline" : "Making online only"
+        DispatchQueue.main.async { BGJobProgress.shared.start(label, total: 0) }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let fm = FileManager.default
+            // Expand folders to their files (skipping hidden housekeeping entries).
+            var files: [URL] = []
+            for r in roots {
+                if (try? r.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                    if let en = fm.enumerator(at: r, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+                        for case let u as URL in en
+                        where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true { files.append(u) }
+                    }
+                } else {
+                    files.append(r)
+                }
+            }
+            guard !files.isEmpty else {
+                DispatchQueue.main.async { BGJobProgress.shared.finish("Nothing to change") }; return
+            }
+            var done = 0; var errors: [String] = []
+            for (i, u) in files.enumerated() {
+                if i % 10 == 0 {
+                    let n = i + 1, total = files.count
+                    DispatchQueue.main.async { BGJobProgress.shared.label = "\(label) — \(n) of \(total)" }
+                }
+                do {
+                    if offline { try fm.startDownloadingUbiquitousItem(at: u) }
+                    else { try fm.evictUbiquitousItem(at: u) }
+                    done += 1
+                } catch {
+                    errors.append("\(u.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            DispatchQueue.main.async {
+                let verb = offline ? "Downloading" : "Made online only:"
+                BGJobProgress.shared.finish(offline ? "\(verb) \(done) file\(done == 1 ? "" : "s")…"
+                                                    : "\(verb) \(done) file\(done == 1 ? "" : "s")")
+                if !errors.isEmpty {
+                    showBGSummary(app: offline ? "Make available offline" : "Make online only",
+                                  done: done, total: files.count, errors: errors,
+                                  verb: offline ? "downloaded" : "evicted")
+                }
+                self?.silentRefresh()
+            }
+        }
+    }
     // Copy a clean, username-free path like "Google Drive/Shared drives/…/NB2 pass"
     // (matches the breadcrumb). It carries no home folder or account email, and
     // Navigator's address bar resolves it against the local Drive account — so a
@@ -4227,6 +4293,8 @@ struct FileTableView: View {
                 Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Local Path") }
                 Button { browser.copyPath(ids) } label: { gdLabel("Copy Path for Claude") }
                 Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Web") }
+                Button { browser.setDriveAvailability(ids, offline: true) } label: { gdLabel("Make available offline") }
+                Button { browser.setDriveAvailability(ids, offline: false) } label: { gdLabel("Make available online only") }
             }
             Divider()
             Button("Move to Trash") { browser.moveToTrash(ids) }
@@ -4489,6 +4557,8 @@ struct IconGridView: View {
                     Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Local Path") }
                     Button { browser.copyPath([item.id]) } label: { gdLabel("Copy Path for Claude") }
                     Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Web") }
+                    Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: true) } label: { gdLabel("Make available offline") }
+                    Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: false) } label: { gdLabel("Make available online only") }
                 }
                 Button("Move to Trash") { browser.moveToTrash([item.id]) }
             }
@@ -5840,16 +5910,34 @@ struct TransferProgressView: View {
 final class TransferProgressController {
     static let shared = TransferProgressController()
     private var window: NSWindow?
+    private var pendingShow: DispatchWorkItem?
+    // Delay before the progress window appears. Most copy/pastes (a few small
+    // files) finish well inside this, so no window is ever built or flashed —
+    // that flash, plus the focus theft below, is what made small pastes feel
+    // laggy and weird. Only a genuinely slow transfer gets a window.
+    private static let showDelay: TimeInterval = 0.7
     func show(_ progress: TransferProgress, title: String) {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 130),
-                         styleMask: [.titled], backing: .buffered, defer: false)
-        w.title = title
-        w.isReleasedWhenClosed = false
-        w.contentView = NSHostingView(rootView: TransferProgressView(progress: progress, title: title) { [weak w] in w?.close() })
-        w.center(); w.makeKeyAndOrderFront(nil)
-        window = w
+        pendingShow?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.window == nil else { return }
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 130),
+                             styleMask: [.titled], backing: .buffered, defer: false)
+            w.title = title
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: TransferProgressView(progress: progress, title: title) { [weak w] in w?.close() })
+            w.center()
+            // orderFront, NOT makeKeyAndOrderFront: never steal keyboard focus from
+            // the file list mid-copy (that left later keystrokes going nowhere).
+            w.orderFront(nil)
+            self.window = w
+        }
+        pendingShow = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.showDelay, execute: work)
     }
-    func hide() { window?.close(); window = nil }
+    func hide() {
+        pendingShow?.cancel(); pendingShow = nil
+        window?.close(); window = nil
+    }
 }
 
 // MARK: - Batch rename
@@ -6516,8 +6604,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case 36, 76: // Return / Enter → open
             if !b.selection.isEmpty { b.openSelection(); return nil }
             return event
-        case 51: // Delete/Backspace (no modifier) → enclosing folder
-            if flags.isEmpty { b.goUp(); return nil }
+        case 51: // Delete/Backspace (no modifier) → Move to Trash
+            // Bare Delete trashes the selection (what people expect); ⌘⌫ does too
+            // via the File menu. "Enclosing folder" is ⌘↑ (toolbar Up button's
+            // shortcut), so no navigation is lost. Text fields are handled above,
+            // and moveToTrash still honours the "Confirm before Trash" setting.
+            if flags.isEmpty {
+                if b.selection.isEmpty { return event }
+                b.moveToTrash(b.selection); return nil
+            }
             return event
         case 120: // F2 → rename selected (Windows parity)
             if !b.selection.isEmpty { renameAction(nil); return nil }
@@ -6527,14 +6622,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 QuickLook.shared.show(b.items.filter { b.selection.contains($0.id) }.map { $0.url }); return nil
             }
             return event
-        case 8 where flags == .command: // ⌘C → copy files (text fields handled above)
-            if !b.selection.isEmpty { b.copyFiles() }
-            return nil
-        case 7 where flags == .command: // ⌘X → cut files
-            if !b.selection.isEmpty { b.cutFiles() }
-            return nil
-        case 9 where flags == .command: // ⌘V → paste files into the current folder
-            b.pasteFiles(); return nil
+        // NOTE: ⌘C / ⌘X / ⌘V are deliberately NOT handled here. The Edit menu's
+        // Cut/Copy/Paste items dispatch through the responder chain to the
+        // AppDelegate's cut/copy/paste fallbacks (which already do files when no
+        // text field is focused). Handling them here as well made every ⌘V run
+        // TWICE — pasting two copies of everything and doing double the work,
+        // which is what made copy/paste feel weird and laggy.
         case 125: // Down
             if b.viewMode == .icon, flags.isEmpty { b.moveSelection(dy: 1); return nil }
             return event
@@ -6736,10 +6829,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleDualPaneAction(_ sender: Any?) { appModel.dualPane.toggle() }
     @objc func toggleHiddenAction(_ sender: Any?) { appModel.active.showHidden.toggle() }
     @objc func undoAction(_ sender: Any?) {
-        // When editing text, let the field's own undo run; otherwise undo file operations.
-        if let r = window.firstResponder, r is NSText || r is NSTextView,
-           let um = window.undoManager, um.canUndo { um.undo(); return }
+        // When editing text, let the field's own undo run; otherwise undo file
+        // operations. Uses the KEY window (not the first window) so ⌘Z works in
+        // whichever Navigator window you're actually in.
+        let win = NSApp.keyWindow ?? window
+        if let r = win?.firstResponder, r is NSText || r is NSTextView,
+           let um = win?.undoManager, um.canUndo { um.undo(); return }
         UndoStack.shared.undo()
+    }
+
+    // Keep Edit → Undo honest: it names the operation it will undo and greys out
+    // when there's nothing to undo (text fields keep their own undo).
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard item.action == #selector(undoAction(_:)) else { return true }
+        let r = (NSApp.keyWindow ?? window)?.firstResponder
+        if r is NSText || r is NSTextView { item.title = "Undo"; return true }
+        if let desc = UndoStack.shared.topDescription {
+            item.title = "Undo \(desc)"; return true
+        }
+        item.title = "Undo"; return false
     }
     @objc func setDefaultImageViewerAction(_ sender: Any?) { applyImageDefaults(announce: true) }
 
