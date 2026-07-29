@@ -118,6 +118,19 @@ enum PathRules {
 /// the style reference). So the reference is read by a vision model first and
 /// reduced to subject-free TEXT, and only the image being restyled is ever sent to
 /// the image model as pixels.
+///
+/// A second failure mode surfaced later, independent of the reference entirely:
+/// telling the model to "keep the subject exactly as it is" is not enough — on a
+/// live NB2 run, that generic wording turned a lion character into a human twice in
+/// a row (reproduced, not a fluke). Naming concrete identity anchors instead — "lion
+/// face, mane, markings" rather than "the subject" — fixed it 2/2, and then 3/3 more
+/// after a real second style-reference image was reintroduced alongside explicit
+/// role labels ("IMAGE 1 is the exact character… IMAGE 2 is a style reference
+/// only…"), matching Google's own guidance: name identity anchors as text tokens,
+/// and put the style change at the end of the prompt, not the start. Identity
+/// anchors are generated the same way the style text is — a vision pass on the
+/// SOURCE image, asked for persistent identity features and nothing about pose,
+/// action or setting (those must stay free to change).
 enum RestyleRules {
 
     // MARK: - Aspect ratio
@@ -189,18 +202,42 @@ enum RestyleRules {
         - Output style directives only, as one dense paragraph under 110 words, no preamble.
         """
 
+    /// Instructions for the vision pass that names what must survive a restyle.
+    ///
+    /// Generic wording ("keep the subject exactly as it is") is not an anchor — a live
+    /// NB2 run given only that turned a lion character into an old man, twice in a row.
+    /// Naming the concrete identity features fixed it every time it was tried. Pose,
+    /// action and setting are explicitly excluded because those are exactly what a
+    /// restyle is allowed — often asked — to change.
+    static let identitySystemPrompt = """
+        Describe the persistent IDENTITY of the main subject in this image, so it can be
+        named as an explicit anchor when the image is redrawn in a different style or pose.
+
+        Include: subject type or species, face/head shape, distinguishing markings or \
+        colouring, and any worn items or accessories that define who this is (clothing \
+        style, equipment, colour scheme).
+
+        Do NOT include: pose, action, camera angle, or background/setting — a restyle is \
+        allowed to change all of those; only identity must survive.
+
+        Output one compact sentence of concrete nouns and adjectives, under 40 words, no \
+        preamble. Example shape: "An anthropomorphic lion woman with a golden mane, lion \
+        face and muzzle, and tan Jedi-style robes with leather gloves."
+        """
+
     /// The prompt sent to the image model. Everything that must survive the restyle is
     /// listed explicitly, because "restyle this" alone invites the model to reinterpret
-    /// the art — lettering is the first thing to go.
-    static func restylePrompt(styleText: String, extra: String = "") -> String {
-        var p = """
-            Redraw this image in the following art style.
-
-            Keep the subject, objects, layout, composition, aspect ratio, and all text \
-            and lettering exactly as they are. Change only the rendering style.
-
-            ART STYLE: \(styleText.trimmingCharacters(in: .whitespacesAndNewlines))
-            """
+    /// the art — lettering is the first thing to go. Identity anchors are stated FIRST
+    /// and the style change LAST — reordering a working prompt to lead with the change
+    /// and follow with "but keep X" measurably let identity drift on live runs; stating
+    /// what must survive before what should change did not.
+    static func restylePrompt(identityAnchors: String, styleText: String, extra: String = "") -> String {
+        let anchors = identityAnchors.trimmingCharacters(in: .whitespacesAndNewlines)
+        var p = "This exact character must remain completely unchanged: "
+            + (anchors.isEmpty ? "same subject, same species, same face, same markings, same clothing." : anchors)
+            + " Same pose and composition, same aspect ratio, same text and lettering.\n\n"
+            + "Redraw ONLY the rendering style, to match the following art style.\n\n"
+            + "ART STYLE: \(styleText.trimmingCharacters(in: .whitespacesAndNewlines))"
         let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
         if !e.isEmpty { p += "\n\nADDITIONAL DIRECTION: \(e)" }
         return p
