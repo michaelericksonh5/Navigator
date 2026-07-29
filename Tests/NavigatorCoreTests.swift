@@ -241,6 +241,62 @@ final class FavoriteReorderTests: XCTestCase {
     }
 }
 
+// The Move Up / Move Down / Move to Top menu items, in terms of the offsets they
+// hand to reorder(). Move Down is the off-by-one trap: toOffset means "before the
+// item originally at this index", so going down one place is i+2, not i+1.
+final class FavoriteNudgeTests: XCTestCase {
+
+    private func up(_ i: Int, of n: Int) -> [Int] {
+        PathRules.reorder(count: n, from: IndexSet(integer: i), to: i - 1)
+    }
+    private func down(_ i: Int, of n: Int) -> [Int] {
+        PathRules.reorder(count: n, from: IndexSet(integer: i), to: i + 2)
+    }
+    private func top(_ i: Int, of n: Int) -> [Int] {
+        PathRules.reorder(count: n, from: IndexSet(integer: i), to: 0)
+    }
+
+    func testMoveUpSwapsWithPrevious() {
+        XCTAssertEqual(up(3, of: 5), [0, 1, 3, 2, 4])
+        XCTAssertEqual(up(1, of: 4), [1, 0, 2, 3])
+    }
+
+    // If this returned [0,1,2,3,4] the item wouldn't move at all — the i+1 bug.
+    func testMoveDownSwapsWithNext() {
+        XCTAssertEqual(down(1, of: 5), [0, 2, 1, 3, 4])
+        XCTAssertEqual(down(0, of: 3), [1, 0, 2])
+    }
+
+    func testMoveDownOnLastItemIsCallerGuarded() {
+        // The store refuses this case; reorder itself must still not corrupt anything.
+        XCTAssertEqual(down(4, of: 5).sorted(), [0, 1, 2, 3, 4])
+    }
+
+    func testMoveToTop() {
+        XCTAssertEqual(top(3, of: 5), [3, 0, 1, 2, 4])
+    }
+
+    // Move to Top on a list where Home is pinned puts the item second, not first.
+    func testMoveToTopLandsUnderPinnedHome() {
+        let r = PathRules.reorder(count: 4, from: IndexSet(integer: 3), to: 0, pinnedToFront: 0)
+        XCTAssertEqual(r, [0, 3, 1, 2])
+        XCTAssertEqual(r[1], 3, "the moved item should sit directly under Home")
+    }
+
+    // Up then Down returns to the original order.
+    func testUpThenDownIsIdentity() {
+        for n in 2...6 {
+            for i in 1..<n {
+                let afterUp = up(i, of: n)
+                let pos = afterUp.firstIndex(of: i)!
+                let back = PathRules.reorder(count: n, from: IndexSet(integer: pos), to: pos + 2)
+                    .map { afterUp[$0] }
+                XCTAssertEqual(back, Array(0..<n), "n=\(n) i=\(i)")
+            }
+        }
+    }
+}
+
 final class DropDirectionTests: XCTestCase {
 
     private func u(_ p: String) -> URL { URL(fileURLWithPath: p) }
