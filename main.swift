@@ -2367,6 +2367,35 @@ final class Browser: ObservableObject, Identifiable {
         Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))
     }
 
+    // Names ONLY, straight from POSIX readdir — no attribute fetch of any kind.
+    //
+    // This exists because asking for attributes is catastrophically expensive on
+    // some SMB shares. Measured on a DFS-heavy share: readdir returned 669 entries
+    // in 429 ms, while the same folder enumerated WITH attributes managed 41
+    // entries in 38 seconds (~925 ms each) — every entry that is a DFS referral
+    // costs a round trip. readdir's d_type already tells us file vs folder, which
+    // is all the list needs to paint; sizes and dates arrive in phase 2.
+    static func namesOnlyItems(_ dir: URL, showHidden: Bool) -> [FileItem] {
+        guard let d = opendir(dir.path) else { return [] }
+        defer { closedir(d) }
+        var out: [FileItem] = []
+        while let ent = readdir(d) {
+            var raw = ent.pointee.d_name
+            let name = withUnsafeBytes(of: &raw) { buf in
+                String(cString: buf.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }
+            if name == "." || name == ".." { continue }
+            if !showHidden && name.hasPrefix(".") { continue }
+            let isDir = ent.pointee.d_type == DT_DIR
+            let u = dir.appendingPathComponent(name, isDirectory: isDir)
+            out.append(FileItem(id: u.path, url: u, name: name, isDirectory: isDir,
+                                size: 0, modified: .distantPast, created: .distantPast,
+                                accessed: .distantPast, dateAdded: .distantPast,
+                                kind: localKind(u, isDir: isDir), tags: []))
+        }
+        return out
+    }
+
     // The view order: sort, folders-first, then name filter.
     // Memoized: sorting + filtering 669 items is O(n log n), and this is called
     // from `body`, which SwiftUI re-evaluates on every scroll tick — so without a
@@ -2746,12 +2775,27 @@ final class Browser: ObservableObject, Identifiable {
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // ONE bulk enumeration that fetches names AND metadata together
-            // (includingPropertiesForKeys → getattrlistbulk under the hood). On SMB
-            // this batches attributes into the directory read — far fewer round
-            // trips than readdir + a stat per file, which is the slowest possible
-            // method on a network volume. Stream in batches so rows appear as they
-            // arrive (unless a full-detail seed is already on screen).
+            // PHASE 1 — names only, via readdir. Paints the folder essentially
+            // immediately even on shares where attribute reads crawl (a DFS-heavy
+            // share measured 429 ms for 669 names vs 38 s for 41 entries WITH
+            // attributes). Skipped when a detailed seed is already on screen, so we
+            // never replace real sizes/dates with blanks.
+            if !hadSeed {
+                let quick = Browser.namesOnlyItems(dir, showHidden: showHidden)
+                if !quick.isEmpty {
+                    guard let self, gen == self.loadGeneration else { return }
+                    let sorted = quick
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, gen == self.loadGeneration else { return }
+                        self.items = sorted
+                        self.busy = true; self.busyText = "Loading details…"
+                        self.slowNetwork = false; self.networkStalled = false
+                        self.updateStatus()
+                    }
+                }
+            }
+            // PHASE 2 — the full metadata pass. Slow on some shares, but the list is
+            // already usable while it runs, and it replaces phase 1 when it lands.
             func enumerate() -> [FileItem] {
                 guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts) else { return [] }
                 var out: [FileItem] = []
@@ -2765,6 +2809,10 @@ final class Browser: ObservableObject, Identifiable {
                         let snap = out
                         DispatchQueue.main.async { [weak self] in
                             guard let self, gen == self.loadGeneration else { return }
+                            // Never let a partial detail pass SHRINK what's on screen:
+                            // phase 1 already listed the whole folder, so a 100-item
+                            // snapshot of a 669-item folder must not replace it.
+                            guard snap.count >= self.items.count else { return }
                             self.items = snap; self.busy = false; self.busyText = ""; self.slowNetwork = false; self.networkStalled = false; self.updateStatus()
                         }
                     }
@@ -2788,6 +2836,13 @@ final class Browser: ObservableObject, Identifiable {
                 // A transient empty read (folder briefly unreachable) must not wipe a
                 // seed we're already showing, nor overwrite the persisted cache.
                 if committed.isEmpty && hadSeed { return }
+                // Same protection for the final result: if the detail pass came back
+                // with fewer entries than phase 1 already showed (aborted, or a share
+                // that stopped answering mid-way), keep the fuller list.
+                if committed.count < self.items.count, !self.items.isEmpty {
+                    self.busy = false; self.busyText = ""; self.slowNetwork = false
+                    self.updateFreeSpace(); self.updateStatus(); return
+                }
                 Browser.dirCache[cacheKey] = committed
                 if !committed.isEmpty { DiskCache.put(cacheKey, committed, dirModified: dirMtime) }   // store folder mtime for conditional revalidation
                 self.items = committed
