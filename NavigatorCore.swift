@@ -123,7 +123,12 @@ enum RestyleRules {
     // MARK: - Aspect ratio
 
     /// Ratios the Gemini image endpoint accepts.
-    static let aspects = ["21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"]
+    /// "auto" lets the model keep the source's shape — the right default for a restyle,
+    /// where reframing is the last thing wanted. The rest are the fixed ratios.
+    static let aspects = ["auto", "21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"]
+
+    /// Fixed ratios only — "auto" has no numeric shape, so nearest-match ignores it.
+    static var fixedAspects: [String] { aspects.filter { $0 != "auto" } }
 
     /// The listed ratio closest to a real image's shape, so the sheet opens on
     /// something that won't reframe the art. Compared in log space, so being 10%
@@ -133,7 +138,7 @@ enum RestyleRules {
     static func nearestAspect(width: Int, height: Int) -> String {
         guard width > 0, height > 0 else { return "1:1" }
         let target = log(Double(width) / Double(height))
-        return aspects.min { a, b in
+        return fixedAspects.min { a, b in
             abs(log(ratio(a)) - target) < abs(log(ratio(b)) - target)
         } ?? "1:1"
     }
