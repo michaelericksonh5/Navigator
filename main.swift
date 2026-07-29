@@ -7,6 +7,7 @@ import Quartz
 import QuickLookThumbnailing
 import CoreServices
 import NetFS
+import FinderSync   // detect / offer to enable the Finder menu extension
 import os
 
 // Perf logging — view in Console.app (or `log stream`) filtered by
@@ -6772,6 +6773,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             installFinderQuickActions(nil)
             Prefs.d.set(4, forKey: "finderQuickActionsVersion")
         }
+        // The Finder menu ships inside the app but macOS won't switch a Finder
+        // extension on by itself — the user has to tick it once. Offer to take them
+        // straight there rather than leaving the feature silently absent. Asked at
+        // most once per version, and always reachable from AI → Finder Menu….
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.offerFinderExtensionIfDisabled()
+        }
         // Show the browser shortly — unless we were launched only to view an image
         // (the open handler sets suppressMainWindow first). The tiny delay also lets
         // a folder-open event arrive so it opens as a tab in the same window.
@@ -7269,6 +7277,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let aiMenu = NSMenu(title: "AI"); aiItem.submenu = aiMenu
         let keysItem = aiMenu.addItem(withTitle: "API Keys…", action: #selector(apiKeysAction(_:)), keyEquivalent: "")
         keysItem.target = self
+        let fxItem = aiMenu.addItem(withTitle: "Finder Menu…", action: #selector(finderExtensionAction(_:)), keyEquivalent: "")
+        fxItem.target = self
         let qaItem = aiMenu.addItem(withTitle: "Install Finder Quick Actions", action: #selector(installFinderQuickActions(_:)), keyEquivalent: "")
         qaItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
@@ -7310,6 +7320,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", script]
         try? p.run()
+    }
+
+    // Nudge, once per version, if Navigator's Finder menu is switched off.
+    private func offerFinderExtensionIfDisabled() {
+        guard !FIFinderSyncController.isExtensionEnabled else { return }
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        guard Prefs.d.string(forKey: "finderExtPrompt") != ver else { return }
+        Prefs.d.set(ver, forKey: "finderExtPrompt")
+        let a = NSAlert()
+        a.messageText = "Turn on Navigator’s Finder menu?"
+        a.informativeText = """
+        Navigator can add its own menu to Finder’s right-click menu — Remove BG, \
+        Chroma Key BG and the AI upscalers — so you don’t have to switch apps.
+
+        macOS needs you to switch it on once: tick Navigator under Finder Extensions.
+        """
+        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Not Now")
+        if a.runModal() == .alertFirstButtonReturn {
+            FIFinderSyncController.showExtensionManagementInterface()
+        }
+    }
+
+    // AI → Finder Menu… — say whether it's on, and offer the switch either way.
+    @objc func finderExtensionAction(_ sender: Any?) {
+        let on = FIFinderSyncController.isExtensionEnabled
+        let a = NSAlert()
+        a.messageText = on ? "Navigator’s Finder menu is on" : "Navigator’s Finder menu is off"
+        a.informativeText = on
+            ? "Right-click any file or folder in Finder and look for the Navigator submenu."
+            : "Tick Navigator under Finder Extensions to add its menu to Finder’s right-click menu."
+        a.addButton(withTitle: on ? "Open Settings" : "Open Settings")
+        a.addButton(withTitle: "Done")
+        if a.runModal() == .alertFirstButtonReturn {
+            FIFinderSyncController.showExtensionManagementInterface()
+        }
     }
 
     // AI → Open AI Log — reveal the dev log so failures are easy to inspect.
