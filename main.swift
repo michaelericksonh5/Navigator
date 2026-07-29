@@ -4348,9 +4348,25 @@ struct ControlBar: View {
 
                 HStack(spacing: 6) {
                     Image(systemName: "folder").foregroundStyle(.secondary).font(.caption)
+                    // A long path's useful end is the deep folder you're actually in, so
+                    // show that and hide the front. SwiftUI ignores .truncationMode on an
+                    // editable TextField (it still cuts the tail), so while the field is
+                    // not being edited we make it transparent and draw a head-truncated
+                    // Text over it. The field stays in the hierarchy, so a click still
+                    // lands on it and focuses it, revealing the full path and a cursor.
                     TextField("Type a path and press Return", text: $browser.pathText)
                         .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
                         .focused($addressFocused).onSubmit { browser.submitPath() }
+                        .opacity(addressFocused || browser.pathText.isEmpty ? 1 : 0)
+                        .overlay(alignment: .leading) {
+                            if !addressFocused && !browser.pathText.isEmpty {
+                                Text(browser.pathText)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .lineLimit(1).truncationMode(.head)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .allowsHitTesting(false)
+                            }
+                        }
                 }
                 .padding(.horizontal, 8).padding(.vertical, 5)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
@@ -4499,14 +4515,43 @@ struct BreadcrumbBar: View {
     @ObservedObject var browser: Browser
     var body: some View {
         let crumbs = browser.breadcrumbs()
-        HStack(spacing: 2) {
-            ForEach(Array(crumbs.enumerated()), id: \.offset) { idx, crumb in
-                if idx > 0 { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary) }
-                Button { browser.navigate(to: crumb.url) } label: { Text(crumb.name).font(.callout).lineLimit(1).fixedSize() }
-                    .buttonStyle(.plain).foregroundStyle(.secondary)
+        // Too deep to fit? Drop crumbs from the FRONT, not the back — the folder
+        // you're in is the part worth reading, and clipping the right edge used to
+        // cut it off mid-name. ViewThatFits takes the first candidate that fits, so
+        // these run shallowest-drop first and give up as little of the path as
+        // possible. The extra final candidate lets the last crumb itself shrink,
+        // for a very long folder name in a narrow window.
+        ViewThatFits(in: .horizontal) {
+            ForEach(0..<max(crumbs.count, 1), id: \.self) { drop in
+                trail(crumbs, dropping: drop)
             }
-            Spacer(minLength: 0)
-        }.padding(.horizontal, 10).padding(.vertical, 4).frame(maxWidth: .infinity, alignment: .leading).clipped()
+            trail(crumbs, dropping: max(crumbs.count - 1, 0), flexibleTail: true)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading).clipped()
+    }
+
+    private func trail(_ crumbs: [(name: String, url: URL)], dropping drop: Int,
+                       flexibleTail: Bool = false) -> some View {
+        let shown = Array(crumbs.dropFirst(drop).enumerated())
+        return HStack(spacing: 2) {
+            if drop > 0 { Text("…").font(.callout).foregroundStyle(.tertiary) }
+            ForEach(shown, id: \.offset) { idx, crumb in
+                if idx > 0 || drop > 0 {
+                    Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+                }
+                Button { browser.navigate(to: crumb.url) } label: {
+                    // fixedSize is what makes this work: it holds every candidate at
+                    // its natural width so a too-wide one is genuinely rejected. Let
+                    // a crumb compress and every candidate would "fit" by squeezing,
+                    // and the first (full) one would always win.
+                    Text(crumb.name).font(.callout).lineLimit(1).truncationMode(.head)
+                        .fixedSize(horizontal: !(flexibleTail && idx == shown.count - 1),
+                                   vertical: false)
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
