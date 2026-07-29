@@ -421,6 +421,77 @@ final class UndoStack {
     }
 }
 
+// Keeps pinned network drives mounted, so a share that dropped (sleep, VPN
+// reconnect, reboot) is simply there when you go to use it — no Finder trip, no
+// "Reconnect" click.
+//
+// Deliberately cheap and quiet for people who have NO network drives: if no
+// sidebar favorite carries a mount URL, start() returns immediately and nothing is
+// scheduled or observed at all. It also only mounts shares that are genuinely
+// ABSENT from the mount table — a mounted-but-wedged share is left alone, because
+// fixing that needs a force-unmount, which can destroy unsaved work in other apps.
+// That case gets the explicit Reconnect button instead.
+final class NetworkReconnector {
+    static let shared = NetworkReconnector()
+    private var lastTry: [String: Date] = [:]     // per share, for backoff
+    private var sweeping = false
+    private let retryInterval: TimeInterval = 90  // don't hammer an unreachable server
+    private var timer: Timer?
+
+    private var pinnedShares: [URL] {
+        // Unique share URLs from favorites that were saved as network drives.
+        var seen = Set<String>(); var out: [URL] = []
+        for f in FavoritesStore.shared.items {
+            guard let m = f.mountURL, let u = URL(string: m), u.host != nil else { continue }
+            let key = (u.host ?? "") + u.path
+            if seen.insert(key).inserted { out.append(u) }
+        }
+        return out
+    }
+
+    func start() {
+        guard !pinnedShares.isEmpty else { return }   // no network drives → do nothing, ever
+        // Waking from sleep and coming back on VPN are the two moments shares drop.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.sweep(reason: "wake")
+        }
+        // A light periodic check covers VPN reconnects, which post no notification
+        // we can rely on. 60s is far cheaper than one directory listing.
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.sweep(reason: "timer")
+        }
+        sweep(reason: "launch")
+    }
+
+    func sweep(reason: String) {
+        let shares = pinnedShares
+        guard !shares.isEmpty, !sweeping else { return }
+        sweeping = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer { self?.sweeping = false }
+            guard let self else { return }
+            for share in shares {
+                // Already mounted (even if unhappy)? Leave it completely alone.
+                if Browser.mountedPath(forShare: share) != nil { continue }
+                let key = (share.host ?? "") + share.path
+                if let last = self.lastTry[key], Date().timeIntervalSince(last) < self.retryInterval { continue }
+                self.lastTry[key] = Date()
+                if let mp = Browser.mountShareSilently(share) {
+                    navLog("auto-reconnect (\(reason)): mounted \(share.absoluteString) at \(mp)")
+                    DispatchQueue.main.async {
+                        // A window sitting on the now-restored drive can load for real.
+                        NotificationCenter.default.post(name: .navigatorShareReconnected, object: mp)
+                    }
+                }
+            }
+        }
+    }
+}
+extension Notification.Name {
+    static let navigatorShareReconnected = Notification.Name("navigatorShareReconnected")
+}
+
 // MARK: - Bonjour network discovery (nearby SMB file servers)
 
 final class NetworkBrowser: NSObject, ObservableObject, NetServiceBrowserDelegate, NetServiceDelegate {
@@ -2126,6 +2197,15 @@ final class Browser: ObservableObject, Identifiable {
         groupBy = GroupBy(rawValue: Prefs.groupBy) ?? .none
         sortOrder = [Browser.comparator(for: SortField(rawValue: Prefs.sortKey) ?? .name, ascending: Prefs.sortAscending)]
         load()
+        // A pinned drive came back on its own: if this window was sitting on a folder
+        // that's now reachable again, just load it — the user shouldn't have to retry.
+        NotificationCenter.default.addObserver(forName: .navigatorShareReconnected, object: nil, queue: .main) { [weak self] _ in
+            guard let self, self.items.isEmpty || self.networkStalled else { return }
+            guard self.fm.fileExists(atPath: self.currentURL.path) else { return }
+            self.networkStalled = false
+            Browser.invalidateCache(self.currentURL.path)
+            self.load()
+        }
     }
 
     static func comparator(for f: SortField, ascending: Bool) -> KeyPathComparator<FileItem> {
@@ -2869,6 +2949,50 @@ final class Browser: ObservableObject, Identifiable {
                 self.navigate(to: URL(fileURLWithPath: self.fm.fileExists(atPath: target) ? target : mp))
             }
         }
+    }
+
+    // Is this share already in the mount table? MNT_NOWAIT is essential: a wedged
+    // SMB mount would otherwise block us here. Compares the share path so
+    // "smb://host/Games" matches "//user@host/Games" regardless of the user part or
+    // which /Volumes name it landed on.
+    static func mountedPath(forShare url: URL) -> String? {
+        guard let host = url.host?.lowercased() else { return nil }
+        let share = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        guard !share.isEmpty else { return nil }
+        var buf: UnsafeMutablePointer<statfs>?
+        let n = getmntinfo(&buf, MNT_NOWAIT)
+        guard n > 0, let buf else { return nil }
+        for i in 0..<Int(n) {
+            var fs = buf[i]
+            let from = withUnsafeBytes(of: &fs.f_mntfromname) { raw in
+                String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+            }.lowercased()
+            guard from.hasPrefix("//") else { continue }
+            // "//user@host/share" → host + share
+            let body = String(from.dropFirst(2))
+            let hostPart = body.split(separator: "/").first.map(String.init) ?? ""
+            let sharePart = body.split(separator: "/").dropFirst().joined(separator: "/")
+            let bareHost = hostPart.contains("@") ? String(hostPart.split(separator: "@").last!) : hostPart
+            if sharePart == share, bareHost == host || bareHost.hasPrefix(host + ".") || host.hasPrefix(bareHost + ".") {
+                let on = withUnsafeBytes(of: &fs.f_mntonname) { raw in
+                    String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+                }
+                return on
+            }
+        }
+        return nil
+    }
+
+    // Mount WITHOUT any UI. Used by the background auto-reconnect: it must never
+    // pop an authentication sheet out of nowhere, so it only succeeds when the
+    // credentials are already in the keychain. Clicking a favorite still uses the
+    // interactive mountShare below.
+    static func mountShareSilently(_ url: URL) -> String? {
+        let opts = NSMutableDictionary()
+        opts[kNAUIOptionKey] = kNAUIOptionNoUI
+        var pts: Unmanaged<CFArray>?
+        guard NetFSMountURLSync(url as CFURL, nil, nil, nil, opts as CFMutableDictionary, nil, &pts) == 0 else { return nil }
+        return (pts?.takeRetainedValue() as? [String])?.first
     }
 
     static func mountShare(_ url: URL) -> String? {
@@ -6543,6 +6667,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ensureSMBTuning()
         Updater.check(userInitiated: false)   // silent, throttled to once/day; prompts only if an update exists
         NetworkBrowser.shared.start()
+        // Quietly put pinned network drives back if they dropped. No-op for anyone
+        // whose sidebar has no network drives.
+        NetworkReconnector.shared.start()
         NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
         NSUpdateDynamicServices()
         // Install the Finder Quick Actions once per version (cheap; skips the pbs
