@@ -52,6 +52,20 @@ final class SelfOrDescendantTests: XCTestCase {
         XCTAssertTrue(PathRules.isSelfOrDescendant(u("/tmp/a/b/.."), of: u("/tmp/a")))
         XCTAssertTrue(PathRules.isSelfOrDescendant(u("/tmp//a//b"), of: u("/tmp/a")))
     }
+
+    // The caller applies this rule WITHOUT first checking whether the source is a
+    // directory, because that check would be a stat per source on the main thread
+    // (a round trip each over SMB). That's only safe because a destination
+    // directory can never equal, nor live inside, a file's path — so a plain file
+    // source must never be flagged. These pin that reasoning down.
+    func testFileSourcesAreNeverFlagged() {
+        // The ordinary duplicate case: file's parent is the destination.
+        XCTAssertFalse(PathRules.isSelfOrDescendant(u("/tmp/a"), of: u("/tmp/a/photo.jpg")))
+        // Dropping a file into some unrelated folder.
+        XCTAssertFalse(PathRules.isSelfOrDescendant(u("/tmp/dest"), of: u("/tmp/a/photo.jpg")))
+        // A destination whose name merely starts with the file's name.
+        XCTAssertFalse(PathRules.isSelfOrDescendant(u("/tmp/photo.jpg.backup"), of: u("/tmp/photo.jpg")))
+    }
 }
 
 final class ShareRelativePathTests: XCTestCase {
@@ -165,5 +179,47 @@ final class OwnOutputTests: XCTestCase {
         XCTAssertFalse(PathRules.isOwnOutput(u("/a/pic_rmbg.png"), suffix: "_upscaled"))
         // "_rmbg" in the middle is not an output name.
         XCTAssertFalse(PathRules.isOwnOutput(u("/a/pic_rmbg_final.png"), suffix: "_rmbg"))
+    }
+}
+
+final class DropDirectionTests: XCTestCase {
+
+    private func u(_ p: String) -> URL { URL(fileURLWithPath: p) }
+    private let drive = "/Users/me/Library/CloudStorage/GoogleDrive-me@corp.com/Shared drives/Art"
+    private let icloud = "/Users/me/Library/Mobile Documents/com~apple~CloudDocs/Notes"
+
+    // The dangerous case: cloud providers sit on the local volume, so a volume
+    // comparison says "same volume" and the drop would MOVE — deleting the file out
+    // of a shared team drive for everyone, from a drag that looks like "copy this
+    // out". Must be forced to copy.
+    func testDraggingOutOfCloudMustCopy() {
+        XCTAssertTrue(PathRules.leavesCloudProvider([u(drive + "/logo.png")], into: u("/Users/me/Desktop")))
+        XCTAssertTrue(PathRules.leavesCloudProvider([u(icloud + "/todo.txt")], into: u("/tmp")))
+    }
+
+    // Reorganising inside the provider is a legitimate move.
+    func testMovingWithinCloudIsStillAMove() {
+        XCTAssertFalse(PathRules.leavesCloudProvider([u(drive + "/logo.png")],
+                                                     into: u(drive + "/archive")))
+        XCTAssertFalse(PathRules.leavesCloudProvider([u(icloud + "/a.txt")], into: u(icloud)))
+    }
+
+    // Dropping local files INTO the provider is an upload, not a rescue — normal
+    // volume rules apply, so this rule must not fire.
+    func testDroppingIntoCloudIsNotAffected() {
+        XCTAssertFalse(PathRules.leavesCloudProvider([u("/Users/me/Desktop/a.png")], into: u(drive)))
+    }
+
+    // A mixed selection with even one cloud item must copy, or that one file would
+    // be deleted from the share.
+    func testMixedSelectionErrsTowardCopy() {
+        XCTAssertTrue(PathRules.leavesCloudProvider(
+            [u("/Users/me/Desktop/local.png"), u(drive + "/shared.png")],
+            into: u("/Users/me/Documents")))
+    }
+
+    func testOrdinaryLocalDropIsUnaffected() {
+        XCTAssertFalse(PathRules.leavesCloudProvider([u("/Users/me/Desktop/a.png")],
+                                                     into: u("/Users/me/Documents")))
     }
 }
