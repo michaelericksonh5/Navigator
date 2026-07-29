@@ -12,3 +12,4 @@ run.pid
 *.p12
 *.key
 navcert.*
+ext.entitlements
