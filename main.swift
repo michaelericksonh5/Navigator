@@ -8103,14 +8103,16 @@ func hasTransparency(_ url: URL) -> Bool {
     return false
 }
 
-/// A Gemini image model reachable through the metered client.
 /// A Gemini image model, addressed by its real Vertex model ID.
 ///
-/// These deliberately do NOT match the aliases in the AI hub's client.mjs, which point
-/// at "-preview" spellings (gemini-3.1-flash-image-preview, gemini-3-pro-image-preview)
-/// that Vertex no longer uses. The IDs here are the ones Vertex AI Studio and the
-/// google-genai samples use, which is why Navigator posts the ID itself instead of an
-/// alias.
+/// These deliberately do NOT match the aliases in the AI hub's client.mjs, which
+/// point at "-preview" spellings (gemini-3.1-flash-image-preview,
+/// gemini-3-pro-image-preview). The service used to substitute its own stale
+/// default for any model it didn't recognise -- verified by posting nonsense model
+/// names and seeing Vertex asked for that same "-preview" ID every time -- which
+/// made every model but the original fail regardless of what was requested. Fixed
+/// service-side; re-verified against the live endpoint that all four now generate
+/// under the exact ID sent (the response echoes the model back).
 struct NanoBananaModel: Identifiable, Hashable {
     let flag: String, id: String, name: String, note: String
     static let all = [
@@ -8121,25 +8123,9 @@ struct NanoBananaModel: Identifiable, Hashable {
         NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image", name: "Nano Banana Pro",
                         note: "Highest quality."),
         NanoBananaModel(flag: "nb1", id: "gemini-2.5-flash-image", name: "Nano Banana 1",
-                        note: "The original, tuned for editing. The only one the AI hub currently reaches — see below."),
+                        note: "The original, tuned for editing."),
     ]
     static func byFlag(_ f: String) -> NanoBananaModel { all.first { $0.flag == f } ?? all[0] }
-}
-
-/// Models this Vertex project has refused with NOT_FOUND.
-///
-/// Learned from the first failure rather than hardcoded, so the picker stops
-/// offering something that cannot work, and starts offering it again on a machine
-/// (or after a project change) where it can. Nothing here is billed — an
-/// unavailable model fails before generating.
-enum RestyleAvailability {
-    private static let key = "restyleUnavailableModels"
-    static var unavailable: Set<String> {
-        get { Set(UserDefaults.standard.stringArray(forKey: key) ?? []) }
-        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: key) }
-    }
-    static func mark(_ flag: String) { var s = unavailable; s.insert(flag); unavailable = s }
-    static func forget() { UserDefaults.standard.removeObject(forKey: key) }
 }
 
 /// PNG of `url` with its long edge capped at `maxDim`. Style reads fine small, and a
@@ -8197,26 +8183,20 @@ func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error:
 
 /// Run the restyle. Returns the saved file, or an error to show.
 func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, size: String,
-                nameAfter: URL? = nil) -> (saved: URL?, cost: Double?, error: String?, modelMissing: Bool) {
+                nameAfter: URL? = nil) -> (saved: URL?, cost: Double?, error: String?) {
     let named = nameAfter ?? source
     let model = NanoBananaModel.byFlag(modelFlag)
     guard let png = try? Data(contentsOf: source) else {
-        return (nil, nil, "Couldn’t read \(source.lastPathComponent).", false)
+        return (nil, nil, "Couldn’t read \(source.lastPathComponent).")
     }
     let r = H5GService.image(prompt: prompt, modelID: model.id, inputPNG: png,
                             aspect: aspect, size: size)
-    guard let out = r.png else {
-        let msg = r.error ?? "Restyle failed."
-        // NOT_FOUND from Vertex means the project has no access to that model — worth
-        // remembering so the picker says so instead of failing the same way twice.
-        let missing = msg.contains("NOT_FOUND") || msg.contains("was not found")
-        return (nil, nil, msg, missing)
-    }
+    guard let out = r.png else { return (nil, nil, r.error ?? "Restyle failed.") }
     let dest = PathRules.uniqueDest(named.deletingLastPathComponent(),
                                     named.deletingPathExtension().lastPathComponent + "_restyled.png",
                                     exists: { FileManager.default.fileExists(atPath: $0) })
-    do { try out.write(to: dest) } catch { return (nil, r.cost, "Couldn’t save the result: \(error.localizedDescription)", false) }
-    return (dest, r.cost, nil, false)
+    do { try out.write(to: dest) } catch { return (nil, r.cost, "Couldn’t save the result: \(error.localizedDescription)") }
+    return (dest, r.cost, nil)
 }
 
 /// The Restyle sheet: pick a reference, let Gemini read its style, adjust, run.
@@ -8350,10 +8330,7 @@ struct RestyleSheet: View {
             }
 
             Picker("Model", selection: $modelFlag) {
-                ForEach(models) { m in
-                    let gone = RestyleAvailability.unavailable.contains(m.flag)
-                    Text(gone ? "\(m.name) — hub can’t reach it yet" : m.name).tag(m.flag)
-                }
+                ForEach(models) { m in Text(m.name).tag(m.flag) }
             }
             .onChange(of: modelFlag) { if !sizes.contains(size) { size = sizes.first ?? "1K" } }
             if let note = models.first(where: { $0.flag == modelFlag })?.note {
@@ -8483,14 +8460,6 @@ struct RestyleSheet: View {
                 if let saved = r.saved {
                     if let c = r.cost { navLog("restyle cost $\(String(format: "%.4f", c)) -> \(saved.lastPathComponent)") }
                     onFinished(saved); onClose(); return
-                }
-                if r.modelMissing {
-                    RestyleAvailability.mark(flag)
-                    if flag != "nb1" {
-                        modelFlag = "nb1"
-                        failure = "The AI hub can’t reach that model yet — it asks Vertex for a retired \"-preview\" ID and ignores the model sent, so every model but Nano Banana 1 fails. Not a Vertex access problem. Switched to Nano Banana 1 — press Restyle again."
-                        return
-                    }
                 }
                 failure = r.error ?? "Restyle failed."
             }
