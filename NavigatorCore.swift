@@ -65,4 +65,21 @@ enum PathRules {
     static func isOwnOutput(_ url: URL, suffix: String) -> Bool {
         url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix(suffix)
     }
+
+    /// A File Provider location — Google Drive, iCloud Drive and friends.
+    static func isCloudProvider(_ url: URL) -> Bool {
+        let p = url.path
+        return p.contains("/Library/CloudStorage/") || p.contains("/Library/Mobile Documents/")
+    }
+
+    /// True when a drop must be forced to COPY because it takes items OUT of a cloud
+    /// provider.
+    ///
+    /// Cloud providers live on the local volume, so comparing volume identifiers
+    /// calls them "same volume" and a drag out would MOVE — deleting the original.
+    /// On a shared team drive that removes it for everyone, from a gesture that looks
+    /// like "give me a local copy". Rearranging within the provider stays a move.
+    static func leavesCloudProvider(_ sources: [URL], into dest: URL) -> Bool {
+        !isCloudProvider(dest) && sources.contains(where: isCloudProvider)
+    }
 }

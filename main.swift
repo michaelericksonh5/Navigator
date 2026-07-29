@@ -3558,16 +3558,52 @@ final class Browser: ObservableObject, Identifiable {
     // A drag-drop of external files onto the current folder. Finder-style: move
     // when the sources are on the same volume as this folder, copy across
     // volumes. (This is what a plain drag into a window does.)
-    func dropIntoCurrentFolder(_ urls: [URL]) {
+    // Are all of `urls` on the same volume as `dest`? Decides move-vs-copy for a
+    // drop, Finder-style. Reads a volume identifier per item, which is a stat each
+    // (a round trip over SMB), so callers MUST run this off the main thread — a drop
+    // handler runs on main, and stalling there freezes the UI mid-interaction.
+    static func sameVolume(_ urls: [URL], as dest: URL) -> Bool {
         func volID(_ u: URL) -> NSObject? {
             (try? u.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? NSObject
         }
-        let destVol = volID(currentURL)
-        let sameVolume = urls.allSatisfy { u in
-            guard let a = volID(u), let b = destVol else { return false }
-            return a.isEqual(b)
+        guard let destVol = volID(dest) else { return false }
+        return urls.allSatisfy { volID($0)?.isEqual(destVol) == true }
+    }
+
+    // Should a drop MOVE, or copy? Same rule as Finder — move within a volume, copy
+    // across — with one deliberate exception:
+    //
+    // Dragging OUT of a cloud provider is always a COPY. Google Drive and iCloud are
+    // File Providers living on the local volume, so a plain volume comparison calls
+    // them "same volume" and would move, deleting the original. On a shared team
+    // drive that deletes it for everyone, from a drag that looks like "give me a
+    // local copy". Rearranging WITHIN the provider is still a move.
+    // Runs the volume stats, so call this off the main thread.
+    static func shouldMove(_ urls: [URL], into dest: URL) -> Bool {
+        if PathRules.leavesCloudProvider(urls, into: dest) { return false }   // tested in NavigatorCoreTests
+        return sameVolume(urls, as: dest)
+    }
+
+    func dropIntoCurrentFolder(_ urls: [URL]) {
+        let dest = currentURL
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let same = Browser.shouldMove(urls, into: dest)
+            DispatchQueue.main.async {
+                guard let self, self.currentURL == dest else { return }   // navigated away
+                self.copyURLs(urls, move: same)
+            }
         }
-        copyURLs(urls, move: sameVolume)
+    }
+
+    // Drop onto a specific folder (a folder row, or another tab). Same rule as a
+    // drop into the current folder: move within a volume, COPY across volumes.
+    // These sites used to force move:true, so dragging a file off a network share or
+    // Google Drive onto a local folder deleted the original — Finder copies.
+    func dropInto(_ urls: [URL], folder: URL) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let same = Browser.shouldMove(urls, into: folder)
+            DispatchQueue.main.async { self?.importURLs(urls, into: folder, move: same) }
+        }
     }
 
     // Import (move or copy) dropped items into a target directory (a folder row or another tab).
@@ -3622,10 +3658,14 @@ final class Browser: ObservableObject, Identifiable {
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
         let fm = FileManager.default
         // Refuse folder-into-itself before touching the disk (Finder does the same).
-        let recursive = sources.filter {
-            ((try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true)
-                && Browser.isSelfOrDescendant(dir, of: $0)
-        }
+        //
+        // Note there is deliberately NO isDirectory check here. It would be a stat
+        // per source on the MAIN thread — a round trip each over SMB, which is
+        // exactly what the comment below says never to do, and a drop of a hundred
+        // files from a slow share would freeze the UI. It's also unnecessary: a
+        // destination directory can never equal, nor live inside, a FILE's path, so
+        // path comparison alone can only ever flag a real folder.
+        let recursive = sources.filter { Browser.isSelfOrDescendant(dir, of: $0) }
         if !recursive.isEmpty {
             let names = recursive.map { "“\($0.lastPathComponent)”" }.joined(separator: ", ")
             reportFileError(recursive.count == 1 ? "\(names) can’t be \(move ? "moved" : "copied") into itself"
@@ -4968,7 +5008,7 @@ struct IconGridView: View {
                 else { browser.click(item.id, modifiers: e?.modifierFlags ?? []) }
             }
             .dropDestination(for: URL.self) { urls, _ in
-                if item.isDirectory { browser.importURLs(urls, into: item.url, move: true) }
+                if item.isDirectory { browser.dropInto(urls, folder: item.url) }
                 else { browser.dropIntoCurrentFolder(urls) }
                 return true
             }
@@ -5376,7 +5416,7 @@ struct TabItemView: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .dropDestination(for: URL.self) { urls, _ in
-            browser.importURLs(urls, into: browser.currentURL, move: true)
+            browser.dropInto(urls, folder: browser.currentURL)
             onSelect(); return true
         } isTargeted: { dropTargeted = $0 }
     }
