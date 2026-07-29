@@ -338,3 +338,109 @@ final class DropDirectionTests: XCTestCase {
                                                      into: u("/Users/me/Documents")))
     }
 }
+
+// Restyle: aspect matching, per-model size gating, and the style-leak detector.
+final class RestyleRulesTests: XCTestCase {
+
+    func testNearestAspectForCommonShapes() {
+        XCTAssertEqual(RestyleRules.nearestAspect(width: 1024, height: 1024), "1:1")
+        XCTAssertEqual(RestyleRules.nearestAspect(width: 1920, height: 1080), "16:9")
+        XCTAssertEqual(RestyleRules.nearestAspect(width: 1080, height: 1920), "9:16")
+        XCTAssertEqual(RestyleRules.nearestAspect(width: 2496, height: 1664), "3:2")
+        XCTAssertEqual(RestyleRules.nearestAspect(width: 1200, height: 1500), "4:5")
+    }
+
+    // A shape between two listed ratios must pick one, never crash or default to 1:1.
+    func testNearestAspectHandlesOddShapes() {
+        XCTAssertTrue(RestyleRules.aspects.contains(RestyleRules.nearestAspect(width: 1000, height: 733)))
+        XCTAssertTrue(RestyleRules.aspects.contains(RestyleRules.nearestAspect(width: 3000, height: 1000)))
+    }
+
+    // Log-space comparison means a portrait image can never match a landscape ratio.
+    func testPortraitNeverMatchesLandscape() {
+        for h in [1100, 1400, 1800, 2400] {
+            let a = RestyleRules.nearestAspect(width: 1000, height: h)
+            XCTAssertLessThanOrEqual(RestyleRules.ratio(a), 1.0, "1000x\(h) picked \(a)")
+        }
+    }
+
+    func testDegenerateSizesDoNotCrash() {
+        XCTAssertEqual(RestyleRules.nearestAspect(width: 0, height: 0), "1:1")
+        XCTAssertEqual(RestyleRules.nearestAspect(width: -5, height: 10), "1:1")
+    }
+
+    // Every model offers the full set; the API rejects what it won't render rather
+    // than the picker deciding on its behalf.
+    func testAllModelsOfferFullSizeRange() {
+        for m in ["nb1", "nb2", "nb-lite", "nb-pro"] {
+            XCTAssertEqual(RestyleRules.sizes(forModelFlag: m), ["1K", "2K", "4K"], m)
+        }
+    }
+
+    // The real leak from a live run: "fine strands of fur", "sheen of leather".
+    func testDetectsSubjectLeakage() {
+        let leaked = "highly detailed textures, fine strands of fur and the subtle sheen of leather"
+        XCTAssertEqual(Set(RestyleRules.styleLeaks(in: leaked)), Set(["fur", "leather"]))
+    }
+
+    // The hardened prompt's actual output — must come back clean.
+    func testCleanStyleTextHasNoLeaks() {
+        let clean = """
+            Photorealistic digital rendering with fine, high-frequency detail on organic \
+            surfaces and soft specular sheen on structured elements. The palette is warm \
+            and earthy. Lighting is soft, directional, and slightly dramatic. Edges are \
+            sharp and well-defined.
+            """
+        XCTAssertEqual(RestyleRules.styleLeaks(in: clean), [])
+    }
+
+    // "surface" contains "face"; "skinny" contains "skin". Whole words only, or the
+    // warning cries wolf on every clean description.
+    func testLeakDetectorMatchesWholeWordsOnly() {
+        XCTAssertEqual(RestyleRules.styleLeaks(in: "matte surface, skinny highlights"), [])
+        XCTAssertEqual(RestyleRules.styleLeaks(in: "a face in profile"), ["face"])
+    }
+
+    func testRestylePromptKeepsTextAndAddsExtra() {
+        let p = RestyleRules.restylePrompt(styleText: "warm earthy palette", extra: "more contrast")
+        XCTAssertTrue(p.contains("warm earthy palette"))
+        XCTAssertTrue(p.contains("text and lettering exactly as they are"))
+        XCTAssertTrue(p.contains("ADDITIONAL DIRECTION: more contrast"))
+    }
+
+    func testRestylePromptOmitsEmptyExtra() {
+        XCTAssertFalse(RestyleRules.restylePrompt(styleText: "x", extra: "   ").contains("ADDITIONAL"))
+    }
+}
+
+// Padding decision: an odd shape needs a backing canvas, a standard one doesn't.
+final class RestylePaddingTests: XCTestCase {
+
+    func testStandardRatiosNeedNoPadding() {
+        XCTAssertFalse(RestyleRules.needsPadding(width: 1024, height: 1024))
+        XCTAssertFalse(RestyleRules.needsPadding(width: 1920, height: 1080))
+        XCTAssertFalse(RestyleRules.needsPadding(width: 2496, height: 1664))   // 3:2
+        XCTAssertFalse(RestyleRules.needsPadding(width: 1080, height: 1920))
+    }
+
+    // Rounding in real exports must not trigger a needless canvas.
+    func testNearMissesAreTolerated() {
+        XCTAssertFalse(RestyleRules.needsPadding(width: 1920, height: 1081))
+        XCTAssertFalse(RestyleRules.needsPadding(width: 1001, height: 1000))
+    }
+
+    // Shapes that sit between listed ratios would be reframed, so they get padded.
+    func testOddShapesNeedPadding() {
+        XCTAssertTrue(RestyleRules.needsPadding(width: 1000, height: 300))   // 3.33:1
+        XCTAssertTrue(RestyleRules.needsPadding(width: 500, height: 1200))   // very tall
+        // 1600x1150 sits between 5:4, 4:3 and 3:2 — 4.4% off the nearest.
+        XCTAssertTrue(RestyleRules.needsPadding(width: 1600, height: 1150))
+        // 1600x1200 is exactly 4:3, so it must NOT pad — the case that caught a bad
+        // test assumption here.
+        XCTAssertFalse(RestyleRules.needsPadding(width: 1600, height: 1200))
+    }
+
+    func testDegenerateSizesNeverPad() {
+        XCTAssertFalse(RestyleRules.needsPadding(width: 0, height: 0))
+    }
+}

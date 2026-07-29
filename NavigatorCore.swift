@@ -108,3 +108,127 @@ enum PathRules {
         !isCloudProvider(dest) && sources.contains(where: isCloudProvider)
     }
 }
+
+/// Rules for "Restyle (AI)" — the pure, testable parts.
+///
+/// The pipeline is two calls, and the split is not cosmetic. Sending the style
+/// reference to the image model as a second input does NOT transfer style: tested
+/// against a live model, the reference's SUBJECT took over the output entirely (a
+/// tiki "SUPER WIN" frame came back as a lion in Jedi robes, because the lion was
+/// the style reference). So the reference is read by a vision model first and
+/// reduced to subject-free TEXT, and only the image being restyled is ever sent to
+/// the image model as pixels.
+enum RestyleRules {
+
+    // MARK: - Aspect ratio
+
+    /// Ratios the Gemini image endpoint accepts.
+    static let aspects = ["21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"]
+
+    /// The listed ratio closest to a real image's shape, so the sheet opens on
+    /// something that won't reframe the art. Compared in log space, so being 10%
+    /// too wide counts the same as 10% too tall — a plain difference of ratios
+    /// biases towards the wide end (21:9 and 16:9 are further apart numerically
+    /// than 9:16 and 2:3, though both are one step apart perceptually).
+    static func nearestAspect(width: Int, height: Int) -> String {
+        guard width > 0, height > 0 else { return "1:1" }
+        let target = log(Double(width) / Double(height))
+        return aspects.min { a, b in
+            abs(log(ratio(a)) - target) < abs(log(ratio(b)) - target)
+        } ?? "1:1"
+    }
+
+    /// "16:9" -> 1.777…  Returns 1 for anything unparseable.
+    static func ratio(_ aspect: String) -> Double {
+        let p = aspect.split(separator: ":").compactMap { Double($0) }
+        guard p.count == 2, p[1] != 0 else { return 1 }
+        return p[0] / p[1]
+    }
+
+    // MARK: - Models
+
+    /// Resolutions offered per model.
+    ///
+    /// Driven by the model table rather than a rule of thumb. An earlier version here
+    /// hard-limited every flash model to 1K, on the strength of a note in the AI hub's
+    /// client rather than a measurement — that was wrong to assert, and it hid sizes
+    /// the newer models do render. Anything a model refuses comes back as a plain API
+    /// error, which is better than a picker that quietly withholds an option.
+    static func sizes(forModelFlag flag: String) -> [String] { ["1K", "2K", "4K"] }
+
+    // MARK: - Prompts
+
+    /// Instructions for the vision pass that turns a reference image into style text.
+    ///
+    /// The hard rules are load-bearing and were tuned against a live model. A first
+    /// version that only said "don't mention the subject" still returned "fine
+    /// strands of fur" and "sheen of leather" for a lion in leather robes — material
+    /// nouns that would grow fur on a fish. Naming the banned materials explicitly,
+    /// and asking for rendering behaviour instead, produced zero leakage.
+    static let styleSystemPrompt = """
+        You extract a reusable ART STYLE from a reference image so it can be applied \
+        to a COMPLETELY DIFFERENT subject.
+
+        Describe ONLY: medium and rendering technique, brush/line quality, palette and \
+        colour temperature, lighting character and direction, contrast and value range, \
+        surface finish, edge treatment, level of detail, grain/texture, and overall mood.
+
+        HARD RULES — breaking these ruins the result:
+        - Never name or imply the subject: no species, creature, person, character, \
+        clothing, props, setting, or body parts.
+        - Never name materials that belong to the subject (e.g. fur, hair, scales, \
+        feathers, skin, leather, fabric, metal armour). Describe HOW surfaces are \
+        rendered instead — "fine high-frequency detail on organic surfaces", \
+        "soft specular sheen".
+        - No composition, framing, pose, or background layout.
+        - Output style directives only, as one dense paragraph under 110 words, no preamble.
+        """
+
+    /// The prompt sent to the image model. Everything that must survive the restyle is
+    /// listed explicitly, because "restyle this" alone invites the model to reinterpret
+    /// the art — lettering is the first thing to go.
+    static func restylePrompt(styleText: String, extra: String = "") -> String {
+        var p = """
+            Redraw this image in the following art style.
+
+            Keep the subject, objects, layout, composition, aspect ratio, and all text \
+            and lettering exactly as they are. Change only the rendering style.
+
+            ART STYLE: \(styleText.trimmingCharacters(in: .whitespacesAndNewlines))
+            """
+        let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !e.isEmpty { p += "\n\nADDITIONAL DIRECTION: \(e)" }
+        return p
+    }
+
+    /// Words that mean the style text still describes the reference's subject. Shown as
+    /// a warning rather than a block — an art style legitimately called "painterly fur
+    /// texture" might be intended, and it's the artist's call, not ours.
+    static let leakWords = ["fur", "hair", "scales", "feathers", "skin", "leather",
+                            "fabric", "armour", "armor", "face", "eyes", "mane", "fins"]
+
+    /// Subject words that leaked into supposedly style-only text.
+    static func styleLeaks(in text: String) -> [String] {
+        let lower = text.lowercased()
+        return leakWords.filter { w in
+            guard let r = lower.range(of: w) else { return false }
+            // Whole words only, so "skin" doesn't fire on "skinny" nor "face" on "surface".
+            let before = r.lowerBound == lower.startIndex ? " "
+                : String(lower[lower.index(before: r.lowerBound)])
+            let after = r.upperBound == lower.endIndex ? " " : String(lower[r.upperBound])
+            return !before.first!.isLetter && !after.first!.isLetter
+        }
+    }
+}
+
+extension RestyleRules {
+    /// True when the source's shape is far enough from every ratio the model accepts
+    /// that sending it as-is would get it reframed. 2% covers rounding in real exports
+    /// (1920x1081 is 16:9 for our purposes) without waving through a genuinely odd crop.
+    static func needsPadding(width: Int, height: Int, tolerance: Double = 0.02) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        let actual = Double(width) / Double(height)
+        let nearest = ratio(nearestAspect(width: width, height: height))
+        return abs(actual - nearest) / nearest > tolerance
+    }
+}
