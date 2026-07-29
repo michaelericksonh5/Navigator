@@ -53,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.4.96</string>
-<key>CFBundleVersion</key><string>112</string>
+<key>CFBundleShortVersionString</key><string>1.4.97</string>
+<key>CFBundleVersion</key><string>113</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -102,15 +102,74 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </array>
 </dict></plist>
 PLIST
+# ── Finder Sync extension ────────────────────────────────────────────────────
+# Puts Navigator's own submenu in Finder's MAIN right-click menu. Built here as a
+# plain .appex rather than via an Xcode project, so the single-file workflow
+# stays intact. App extensions enter at _NSExtensionMain, not main().
+if [ -f "$DIR/FinderExt.swift" ]; then
+  EXT="$APP/Contents/PlugIns/NavigatorFinder.appex"
+  mkdir -p "$EXT/Contents/MacOS"
+  for arch in arm64 x86_64; do
+    /usr/bin/swiftc -swift-version 5 "$DIR/FinderExt.swift" \
+      -target ${arch}-apple-macos14.0 \
+      -framework FinderSync -framework Cocoa \
+      -Xlinker -e -Xlinker _NSExtensionMain \
+      -o "$DIR/ext-$arch" || { echo "Finder extension failed to build"; exit 1; }
+  done
+  lipo -create "$DIR/ext-arm64" "$DIR/ext-x86_64" -output "$EXT/Contents/MacOS/NavigatorFinder"
+  rm -f "$DIR/ext-arm64" "$DIR/ext-x86_64"
+  cat > "$EXT/Contents/Info.plist" <<'EXTPLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>NavigatorFinder</string>
+<key>CFBundleDisplayName</key><string>Navigator</string>
+<key>CFBundleIdentifier</key><string>com.merickson.navigator.findersync</string>
+<key>CFBundleExecutable</key><string>NavigatorFinder</string>
+<key>CFBundlePackageType</key><string>XPC!</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>NSExtension</key>
+<dict>
+  <key>NSExtensionPointIdentifier</key><string>com.apple.FinderSync</string>
+  <key>NSExtensionPrincipalClass</key><string>NavigatorFinderSync</string>
+</dict>
+</dict></plist>
+EXTPLIST
+  # macOS REQUIRES Finder Sync plug-ins to be sandboxed — pkd rejects them outright
+  # otherwise ("plug-ins must be sandboxed"). The host app stays unsandboxed; only
+  # this bundle gets the entitlement. It needs no file access of its own: Finder
+  # hands it the selected URLs and it passes the paths to Navigator over the
+  # navigatoraction:// scheme, so the sandbox costs us nothing.
+  cat > "$DIR/ext.entitlements" <<'ENTS'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>com.apple.security.app-sandbox</key><true/>
+  <key>com.apple.security.files.user-selected.read-only</key><true/>
+</dict></plist>
+ENTS
+  echo "Built Finder Sync extension."
+fi
+
 # Sign with the stable "Navigator Dev" self-signed identity if it exists, so the
 # app's designated requirement stays constant across rebuilds and macOS keeps
 # your Full Disk Access / Local Network grants. Falls back to ad-hoc if absent.
 SIGN_ID="Navigator Dev"
 if security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
-  codesign --force --deep -s "$SIGN_ID" "$APP"
+  # Sign the extension FIRST, then the app: a nested bundle must already be
+  # sealed when the outer signature is computed, or the app's seal is invalid.
+  [ -d "$APP/Contents/PlugIns/NavigatorFinder.appex" ] && \
+    codesign --force -s "$SIGN_ID" --entitlements "$DIR/ext.entitlements" \
+      "$APP/Contents/PlugIns/NavigatorFinder.appex"
+  codesign --force -s "$SIGN_ID" "$APP"   # no --deep: it would re-sign the appex and strip its entitlements
   echo "Signed with '$SIGN_ID' (stable identity)."
 else
-  codesign --force --deep -s - "$APP"
+  [ -d "$APP/Contents/PlugIns/NavigatorFinder.appex" ] && \
+    codesign --force -s - --entitlements "$DIR/ext.entitlements" \
+      "$APP/Contents/PlugIns/NavigatorFinder.appex"
+  codesign --force -s - "$APP"   # no --deep (see above)
   echo "Signed ad-hoc (no '$SIGN_ID' identity found)."
 fi
 touch "$APP"
