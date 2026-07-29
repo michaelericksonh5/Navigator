@@ -929,6 +929,20 @@ enum ServiceIcon {
         Button { imagen(4) } label: { serviceLabel("Upscale (Imagen 4) ×4", ServiceIcon.vertex) }
     } label: { Label(label, systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
+/// "Restyle (AI)…" — shown only for exactly one image.
+///
+/// Single image by design: a restyle pairs one source with one style reference and
+/// its own prompt, so a multi-selection has nothing sensible to mean. Lives here
+/// beside upscaleMenu because all three context menus (list, icons, viewer) need it
+/// and none of them should own a second copy.
+@ViewBuilder func restyleMenuItem(_ urls: [URL], onDone: @escaping (URL) -> Void) -> some View {
+    if urls.count == 1, let u = urls.first, isImageFile(u) {
+        Button { RestyleController.show(source: u, onFinished: onDone) } label: {
+            serviceLabel("Restyle (AI)…", ServiceIcon.vertex)
+        }
+    }
+}
+
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {
     ForEach(aiPrepColors) { c in
         Button { action(c, ratio) } label: {
@@ -1008,7 +1022,8 @@ func bgfillOutputURL(_ src: URL, suffix: String) -> URL {
 // `ratio` is nil), pad by 20% (space on all sides), fill the background with
 // `color`, and write "<base>_BG<suffix>.png". The image is centered at its
 // native size — never scaled or cropped, never overwrites the original.
-func fillBackgroundForImage(_ src: URL, color: NSColor, suffix: String, ratio: Double?) -> URL? {
+func fillBackgroundForImage(_ src: URL, color: NSColor, suffix: String, ratio: Double?,
+                            dest explicitDest: URL? = nil) -> URL? {
     guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
           let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
     let w = CGFloat(cg.width), h = CGFloat(cg.height)
@@ -1028,7 +1043,7 @@ func fillBackgroundForImage(_ src: URL, color: NSColor, suffix: String, ratio: D
     let x = (CGFloat(canvasW) - w) / 2, y = (CGFloat(canvasH) - h) / 2
     ctx.draw(cg, in: CGRect(x: x, y: y, width: w, height: h))   // native size, centered
     guard let outImg = ctx.makeImage() else { return nil }
-    let dst = bgfillOutputURL(src, suffix: suffix)
+    let dst = explicitDest ?? bgfillOutputURL(src, suffix: suffix)
     guard let dest = CGImageDestinationCreateWithURL(dst as CFURL, "public.png" as CFString, 1, nil) else { return nil }
     CGImageDestinationAddImage(dest, outImg, nil)
     guard CGImageDestinationFinalize(dest) else { return nil }
@@ -5000,6 +5015,9 @@ struct FileTableView: View {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
                 upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
                             imagen: { f in browser.upscaleImagen(ids, factor: f) })
+                restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
+                    browser.refreshAndReveal([out])
+                }
             } else if browser.items.filter({ ids.contains($0.id) }).count == 1,
                       browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
                 upscaleMenu(label: "Batch Upscale (AI)",
@@ -5284,6 +5302,9 @@ struct IconGridView: View {
                     prepForAIMenu { c, ratio in browser.fillBackground(bgIDs, c, ratio: ratio) }
                     upscaleMenu(fal: { opt in browser.upscale(bgIDs, opt) },
                                 imagen: { f in browser.upscaleImagen(bgIDs, factor: f) })
+                    restyleMenuItem(bgSel.filter { !$0.isDirectory }.map(\.url)) { out in
+                        browser.refreshAndReveal([out])
+                    }
                 } else if item.isDirectory, bgSel.count == 1 {
                     upscaleMenu(label: "Batch Upscale (AI)",
                                 fal: { opt in browser.batchUpscale([item.id], opt) },
@@ -6274,6 +6295,7 @@ struct ImageViewerView: View {
                 }, imagen: { f in
                     upscaleImagesViaImagen([u], factor: f) { outs in if let o = outs.first { revealNewImage(o) } }
                 })
+                restyleMenuItem([u]) { out in revealNewImage(out) }
             }
             if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
@@ -7970,8 +7992,522 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// ===== Restyle (AI) — Gemini style analysis + Nano Banana edit ===============
+//
+// Two calls, and the split is the whole trick. Handing the style reference to the
+// image model as a second input does NOT transfer style — tested against the live
+// model, the reference's SUBJECT replaced the output (a tiki "SUPER WIN" frame came
+// back as a lion in Jedi robes, the lion being the reference). Nano Banana treats
+// the LAST input image as the thing it is editing.
+//
+// So: a vision model reads the reference and reduces it to subject-free TEXT, and
+// only the image being restyled is ever sent as pixels. See RestyleRules.
+
+/// The metered AI service, called directly.
+///
+/// Navigator shells out to client.mjs elsewhere, but not for this: that client's alias
+/// map knows only nb1/nb2/nb-pro and silently substitutes NB2's ID for anything else,
+/// so a model chosen in the UI could quietly run a different one. The service accepts a
+/// full Vertex model ID (verified by posting raw IDs to /v1/images), so Navigator sends
+/// the ID and what you pick is what runs.
+enum H5GService {
+    static var token: String? {
+        let f = (NSHomeDirectory() as NSString).appendingPathComponent(".h5g-ai-gen/token.json")
+        guard let d = FileManager.default.contents(atPath: f),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+        return j["token"] as? String
+    }
+
+    /// The hub's URL. Baked into client.mjs, overridable by the same env var the client
+    /// honours, so a redeploy that moves the service needs no change here.
+    static var baseURL: String? {
+        if let e = ProcessInfo.processInfo.environment["H5G_AIGEN_URL"], !e.isEmpty {
+            return e.hasSuffix("/") ? String(e.dropLast()) : e
+        }
+        guard let client = resolveH5GClient(),
+              let src = try? String(contentsOfFile: client, encoding: .utf8) else { return nil }
+        // SERVICE_URL = "https://…"  — first quoted https URL after the name.
+        guard let r = src.range(of: "SERVICE_URL"),
+              let q = src.range(of: "https://[^\"']+", options: .regularExpression,
+                                range: r.upperBound..<src.endIndex) else { return nil }
+        var u = String(src[q])
+        if u.hasSuffix("/") { u = String(u.dropLast()) }
+        return u
+    }
+
+    /// POST /v1/images. Returns the PNG, what it cost, or an error to show.
+    static func image(prompt: String, modelID: String, inputPNG: Data?,
+                      aspect: String?, size: String?) -> (png: Data?, cost: Double?, error: String?) {
+        guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
+        guard let token else {
+            return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
+        }
+        guard let url = URL(string: base + "/v1/images") else { return (nil, nil, "bad service URL") }
+        var body: [String: Any] = ["prompt": prompt, "model": modelID]
+        if let inputPNG {
+            body["input_images"] = [["mime": "image/png", "data": inputPNG.base64EncodedString()]]
+        }
+        if let aspect, !aspect.isEmpty { body["aspect_ratio"] = aspect }
+        if let size, !size.isEmpty { body["image_size"] = size }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 600
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        var out: (Data?, Double?, String?) = (nil, nil, "no response")
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            defer { sem.signal() }
+            if let err { out = (nil, nil, err.localizedDescription); return }
+            guard let data, let http = resp as? HTTPURLResponse else { out = (nil, nil, "no data"); return }
+            let text = String(data: data, encoding: .utf8) ?? ""
+            guard http.statusCode == 200 else {
+                out = (nil, nil, "AI service HTTP \(http.statusCode): " + String(text.prefix(400))); return
+            }
+            guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let b64 = j["image_base64"] as? String,
+                  let png = Data(base64Encoded: b64) else {
+                out = (nil, nil, "unexpected response: " + String(text.prefix(300))); return
+            }
+            out = (png, j["cost_usd"] as? Double, nil)
+        }.resume()
+        sem.wait()
+        return out
+    }
+}
+
+/// True when the image actually has see-through pixels.
+///
+/// An alpha channel alone isn't enough — plenty of exported PNGs carry one that is
+/// fully opaque. Nano Banana flattens alpha to black, so a cutout sent unpadded comes
+/// back on black; this decides whether a backing colour is needed. Sampled from a
+/// small thumbnail, so it costs nothing on a 4K asset.
+func hasTransparency(_ url: URL) -> Bool {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+              kCGImageSourceThumbnailMaxPixelSize: 128,
+              kCGImageSourceCreateThumbnailFromImageAlways: true,
+          ] as CFDictionary) else { return false }
+    switch cg.alphaInfo {
+    case .none, .noneSkipFirst, .noneSkipLast: return false
+    default: break
+    }
+    let w = cg.width, h = cg.height
+    var buf = [UInt8](repeating: 0, count: w * h * 4)
+    guard let ctx = CGContext(data: &buf, width: w, height: h, bitsPerComponent: 8,
+                              bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    for i in stride(from: 3, to: buf.count, by: 4) where buf[i] < 250 { return true }
+    return false
+}
+
+/// A Gemini image model reachable through the metered client.
+struct NanoBananaModel: Identifiable, Hashable {
+    let flag: String, id: String, name: String, note: String
+    static let all = [
+        NanoBananaModel(flag: "nb2", id: "gemini-3.1-flash-image-preview", name: "Nano Banana 2",
+                        note: "Default."),
+        NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image-preview", name: "Nano Banana Pro",
+                        note: "Highest quality."),
+        NanoBananaModel(flag: "nb1", id: "gemini-2.5-flash-image", name: "Nano Banana 1",
+                        note: "The original, tuned for editing. Currently the only one this Vertex project has access to."),
+    ]
+    static func byFlag(_ f: String) -> NanoBananaModel { all.first { $0.flag == f } ?? all[0] }
+}
+
+/// Models this Vertex project has refused with NOT_FOUND.
+///
+/// Learned from the first failure rather than hardcoded, so the picker stops
+/// offering something that cannot work, and starts offering it again on a machine
+/// (or after a project change) where it can. Nothing here is billed — an
+/// unavailable model fails before generating.
+enum RestyleAvailability {
+    private static let key = "restyleUnavailableModels"
+    static var unavailable: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: key) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue).sorted(), forKey: key) }
+    }
+    static func mark(_ flag: String) { var s = unavailable; s.insert(flag); unavailable = s }
+    static func forget() { UserDefaults.standard.removeObject(forKey: key) }
+}
+
+/// PNG of `url` with its long edge capped at `maxDim`. Style reads fine small, and a
+/// 2500px reference would make the vision request needlessly heavy.
+func downscaledPNG(_ url: URL, maxDim: CGFloat = 768) -> Data? {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let opts: [CFString: Any] = [
+        kCGImageSourceThumbnailMaxPixelSize: maxDim,
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+    return encodePNG(cg)
+}
+
+/// Ask a Gemini flash model to describe ONLY the reference's style.
+///
+/// Routed through fal's OpenRouter vision endpoint because the metered Vertex
+/// service exposes no text/vision endpoint — its image path returns an image, and
+/// omni returns video. Costs about $0.0007 a call.
+func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error: String?) {
+    guard let url = URL(string: "https://fal.run/openrouter/router/vision") else { return (nil, "bad URL") }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 180
+    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+        "model": "google/gemini-2.5-flash",
+        "prompt": "Extract the transferable art style.",
+        "system_prompt": RestyleRules.styleSystemPrompt,
+        "temperature": 0.15,
+        "max_tokens": 400,
+        "image_urls": ["data:image/png;base64," + png.base64EncodedString()],
+    ])
+    var out: (String?, String?) = (nil, "no response")
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, err in
+        defer { sem.signal() }
+        if let err { out = (nil, err.localizedDescription); return }
+        guard let data, let http = resp as? HTTPURLResponse else { out = (nil, "no data"); return }
+        guard http.statusCode == 200 else {
+            out = (nil, "style analysis HTTP \(http.statusCode): "
+                   + (String(data: data, encoding: .utf8)?.prefix(240) ?? "")); return
+        }
+        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let text = j["output"] as? String, !text.isEmpty else {
+            out = (nil, "the vision model returned no description"); return
+        }
+        out = (text.trimmingCharacters(in: .whitespacesAndNewlines), nil)
+    }.resume()
+    sem.wait()
+    return out
+}
+
+/// Run the restyle. Returns the saved file, or an error to show.
+func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, size: String,
+                nameAfter: URL? = nil) -> (saved: URL?, cost: Double?, error: String?, modelMissing: Bool) {
+    let named = nameAfter ?? source
+    let model = NanoBananaModel.byFlag(modelFlag)
+    guard let png = try? Data(contentsOf: source) else {
+        return (nil, nil, "Couldn’t read \(source.lastPathComponent).", false)
+    }
+    let r = H5GService.image(prompt: prompt, modelID: model.id, inputPNG: png,
+                            aspect: aspect, size: size)
+    guard let out = r.png else {
+        let msg = r.error ?? "Restyle failed."
+        // NOT_FOUND from Vertex means the project has no access to that model — worth
+        // remembering so the picker says so instead of failing the same way twice.
+        let missing = msg.contains("NOT_FOUND") || msg.contains("was not found")
+        return (nil, nil, msg, missing)
+    }
+    let dest = PathRules.uniqueDest(named.deletingLastPathComponent(),
+                                    named.deletingPathExtension().lastPathComponent + "_restyled.png",
+                                    exists: { FileManager.default.fileExists(atPath: $0) })
+    do { try out.write(to: dest) } catch { return (nil, r.cost, "Couldn’t save the result: \(error.localizedDescription)", false) }
+    return (dest, r.cost, nil, false)
+}
+
+/// The Restyle sheet: pick a reference, let Gemini read its style, adjust, run.
+struct RestyleSheet: View {
+    let source: URL
+    var onFinished: (URL) -> Void
+    // Hosted in a plain NSWindow (matching the viewer and compare windows), where the
+    // SwiftUI dismiss environment has nothing to act on — so closing is a callback.
+    var onClose: () -> Void
+
+    @State private var reference: URL?
+    @State private var refTargeted = false
+    @State private var styleText = ""
+    @State private var extra = ""
+    @State private var modelFlag = "nb2"
+    @State private var size = "1K"
+    @State private var aspect = ""
+    @State private var busy = false
+    @State private var padColor = aiPrepColors.first!.name
+    @State private var padOn = false
+    @State private var padDecided = false
+    @State private var status = ""
+    @State private var failure = ""
+
+    private var sourceSize: (w: Int, h: Int)? { imagePixelSize(source) }
+    private var models: [NanoBananaModel] { NanoBananaModel.all }
+    private var sizes: [String] { RestyleRules.sizes(forModelFlag: modelFlag) }
+    private var leaks: [String] { RestyleRules.styleLeaks(in: styleText) }
+    private var canRun: Bool { !busy && !styleText.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 18) {
+            images
+            Divider()
+            controls
+        }
+        .padding(18)
+        .frame(width: 780, height: 560)
+        .onAppear {
+            if aspect.isEmpty, let s = sourceSize {
+                aspect = RestyleRules.nearestAspect(width: s.w, height: s.h)
+            }
+            if !sizes.contains(size) { size = sizes.first ?? "1K" }
+            // Transparent or an odd shape? Both come back wrong unpadded — alpha
+            // flattens to black, and an unlisted ratio gets reframed. Default the
+            // backing on, but leave it the artist's call.
+            if !padDecided {
+                let odd = sourceSize.map { RestyleRules.needsPadding(width: $0.w, height: $0.h) } ?? false
+                padOn = hasTransparency(source) || odd
+                padDecided = true
+            }
+        }
+    }
+
+    // MARK: - Left: what's going in
+
+    private var images: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Restyling").font(.caption).foregroundStyle(.secondary)
+            thumb(source)
+            Text(source.lastPathComponent).font(.caption2).lineLimit(2)
+                .frame(width: 240, alignment: .leading)
+            if let s = sourceSize {
+                Text("\(s.w) × \(s.h)").font(.caption2).foregroundStyle(.tertiary)
+            }
+
+            Text("Style reference").font(.caption).foregroundStyle(.secondary).padding(.top, 6)
+            referenceWell
+            HStack(spacing: 8) {
+                Button("Choose…") { pickReference() }
+                if reference != nil {
+                    Button("Clear") { reference = nil; styleText = "" }.foregroundStyle(.secondary)
+                }
+            }.font(.caption)
+        }.frame(width: 250)
+    }
+
+    private func thumb(_ url: URL) -> some View {
+        Group {
+            if let img = NSImage(contentsOf: url) {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.15))
+                    .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+            }
+        }
+        .frame(width: 240, height: 150)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.15)))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// Drop target for the reference. Accepts a drag from Navigator, Finder, anywhere.
+    private var referenceWell: some View {
+        Group {
+            if let reference { thumb(reference) }
+            else {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [5]))
+                    .foregroundStyle(refTargeted ? Color.accentColor : Color.secondary.opacity(0.5))
+                    .frame(width: 240, height: 150)
+                    .overlay(
+                        VStack(spacing: 4) {
+                            Image(systemName: "square.and.arrow.down").font(.title3)
+                            Text("Drag an image here").font(.caption)
+                        }.foregroundStyle(.secondary)
+                    )
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(Color.accentColor.opacity(refTargeted ? 0.15 : 0)))
+        // dropDestination, not onDrop: the file rows publish their URL with
+        // .draggable (Transferable), and pairing that with the older NSItemProvider
+        // onDrop API silently accepts nothing. Verified — the drop did nothing until
+        // both sides spoke Transferable.
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first(where: { isImageFile($0) }) else { return false }
+            reference = url
+            analyze()
+            return true
+        } isTargeted: { refTargeted = $0 }
+    }
+
+    // MARK: - Right: options and prompt
+
+    private var controls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Restyle with AI").font(.headline)
+                Spacer()
+                if busy { ProgressView().controlSize(.small) }
+            }
+
+            Picker("Model", selection: $modelFlag) {
+                ForEach(models) { m in
+                    let gone = RestyleAvailability.unavailable.contains(m.flag)
+                    Text(gone ? "\(m.name) — not enabled on this project" : m.name).tag(m.flag)
+                }
+            }
+            .onChange(of: modelFlag) { if !sizes.contains(size) { size = sizes.first ?? "1K" } }
+            if let note = models.first(where: { $0.flag == modelFlag })?.note {
+                Text(note).font(.caption2).foregroundStyle(.tertiary)
+            }
+
+            HStack(spacing: 12) {
+                Picker("Resolution", selection: $size) {
+                    ForEach(sizes, id: \.self) { Text($0).tag($0) }
+                }.frame(width: 170)
+                Picker("Aspect", selection: $aspect) {
+                    ForEach(RestyleRules.aspects, id: \.self) { a in
+                        Text(a == defaultAspect ? "\(a)  (original)" : a).tag(a)
+                    }
+                }.frame(width: 190)
+            }
+
+            Toggle(isOn: $padOn) { Text("Pad onto a solid background").font(.callout) }
+            if padOn {
+                Picker("Background", selection: $padColor) {
+                    ForEach(aiPrepColors) { c in
+                        Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(c.color)) }.tag(c.name)
+                    }
+                }
+                Text("Centred at native size on a \(padColor.lowercased()) canvas with 20% margin, matching Prep for AI. The original is untouched.")
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Text("Style").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(busy ? "Analyzing…" : "Analyze reference") { analyze() }
+                    .font(.caption).disabled(reference == nil || busy)
+            }
+            TextEditor(text: $styleText)
+                .font(.system(size: 11, design: .monospaced))
+                .frame(height: 132)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+            if styleText.isEmpty {
+                Text("Drop a reference and Gemini writes a style description here — subject removed, so a lion reference can't turn your art into a lion.")
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            } else if !leaks.isEmpty {
+                Label("Mentions \(leaks.joined(separator: ", ")) — that may pull the reference's subject in. Consider editing it out.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("Extra direction (optional)").font(.caption).foregroundStyle(.secondary)
+            TextField("e.g. keep the gold trim brighter", text: $extra)
+
+            if !failure.isEmpty {
+                Text(failure).font(.caption2).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true).lineLimit(4)
+            }
+            if !status.isEmpty {
+                Text(status).font(.caption2).foregroundStyle(.secondary)
+            }
+
+            Spacer()
+            HStack {
+                Text("≈ $0.04 per restyle, plus $0.001 for the style read")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                Spacer()
+                Button("Cancel") { onClose() }.keyboardShortcut(.cancelAction)
+                Button("Restyle") { run() }.keyboardShortcut(.defaultAction).disabled(!canRun)
+            }
+        }
+    }
+
+    private var defaultAspect: String {
+        guard let s = sourceSize else { return "1:1" }
+        return RestyleRules.nearestAspect(width: s.w, height: s.h)
+    }
+
+    // MARK: - Actions
+
+    private func pickReference() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.image]
+        p.allowsMultipleSelection = false
+        p.prompt = "Use as Style Reference"
+        if p.runModal() == .OK, let u = p.url { reference = u; analyze() }
+    }
+
+    /// Read the reference's style with Gemini. Overwrites the text box, so editing by
+    /// hand and then re-analysing loses the edits — that's why it's an explicit button
+    /// as well as automatic on drop.
+    private func analyze() {
+        guard let reference else { return }
+        guard let key = APIKeys.fal, !key.isEmpty else {
+            failure = "Add your fal.ai key first (AI → API Keys…). The style read runs through fal because the Vertex service has no vision endpoint."
+            return
+        }
+        guard let png = downscaledPNG(reference) else { failure = "Couldn’t read that reference image."; return }
+        busy = true; failure = ""; status = "Reading the reference’s style…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = analyzeStyle(referencePNG: png, key: key)
+            DispatchQueue.main.async {
+                busy = false; status = ""
+                if let t = r.text { styleText = t } else { failure = r.error ?? "Style analysis failed." }
+            }
+        }
+    }
+
+    private func run() {
+        let prompt = RestyleRules.restylePrompt(styleText: styleText, extra: extra)
+        let flag = modelFlag, a = aspect, s = size
+        // Pad to a throwaway copy so the folder never gains a _BG file just because
+        // something was restyled. Same canvas logic as Prep for AI.
+        var src = source
+        if padOn, let c = aiPrepColors.first(where: { $0.name == padColor }) {
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("navigator-restyle-pad-\(UUID().uuidString).png")
+            if let padded = fillBackgroundForImage(source, color: c.color, suffix: c.suffix,
+                                                   ratio: RestyleRules.ratio(a), dest: tmp) {
+                src = padded
+            }
+        }
+        let sendURL = src
+        busy = true; failure = ""; status = "Restyling — this usually takes under a minute…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = runRestyle(source: sendURL, prompt: prompt, modelFlag: flag, aspect: a, size: s,
+                               nameAfter: source)
+            if sendURL != source { try? FileManager.default.removeItem(at: sendURL) }
+            DispatchQueue.main.async {
+                busy = false; status = ""
+                if let saved = r.saved {
+                    if let c = r.cost { navLog("restyle cost $\(String(format: "%.4f", c)) -> \(saved.lastPathComponent)") }
+                    onFinished(saved); onClose(); return
+                }
+                if r.modelMissing {
+                    RestyleAvailability.mark(flag)
+                    if flag != "nb1" {
+                        modelFlag = "nb1"
+                        failure = "This Vertex project has no access to that model. Switched to Nano Banana 1 — press Restyle again."
+                        return
+                    }
+                }
+                failure = r.error ?? "Restyle failed."
+            }
+        }
+    }
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
+
+final class RestyleController {
+    private static var windows: [NSWindow] = []
+    static func show(source: URL, onFinished: @escaping (URL) -> Void) {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 560),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.title = "Restyle — \(source.lastPathComponent)"
+        w.contentView = NSHostingView(rootView: RestyleSheet(source: source, onFinished: onFinished,
+                                                            onClose: { [weak w] in w?.close() }))
+        w.center(); windows.append(w)
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+            windows.removeAll { $0 === w }
+        }
+        w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+}
