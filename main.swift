@@ -8146,7 +8146,10 @@ func downscaledPNG(_ url: URL, maxDim: CGFloat = 768) -> Data? {
 /// Routed through fal's OpenRouter vision endpoint because the metered Vertex
 /// service exposes no text/vision endpoint — its image path returns an image, and
 /// omni returns video. Costs about $0.0007 a call.
-func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error: String?) {
+/// One vision call, shared by the style read (on the reference) and the identity
+/// read (on the source) — same endpoint and response shape, different system prompt.
+private func visionAnalyze(png: Data, systemPrompt: String, userPrompt: String, label: String, key: String)
+    -> (text: String?, error: String?) {
     guard let url = URL(string: "https://fal.run/openrouter/router/vision") else { return (nil, "bad URL") }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
@@ -8155,8 +8158,8 @@ func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error:
     req.timeoutInterval = 180
     req.httpBody = try? JSONSerialization.data(withJSONObject: [
         "model": "google/gemini-2.5-flash",
-        "prompt": "Extract the transferable art style.",
-        "system_prompt": RestyleRules.styleSystemPrompt,
+        "prompt": userPrompt,
+        "system_prompt": systemPrompt,
         "temperature": 0.15,
         "max_tokens": 400,
         "image_urls": ["data:image/png;base64," + png.base64EncodedString()],
@@ -8168,7 +8171,7 @@ func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error:
         if let err { out = (nil, err.localizedDescription); return }
         guard let data, let http = resp as? HTTPURLResponse else { out = (nil, "no data"); return }
         guard http.statusCode == 200 else {
-            out = (nil, "style analysis HTTP \(http.statusCode): "
+            out = (nil, "\(label) HTTP \(http.statusCode): "
                    + (String(data: data, encoding: .utf8)?.prefix(240) ?? "")); return
         }
         guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -8179,6 +8182,22 @@ func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error:
     }.resume()
     sem.wait()
     return out
+}
+
+func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error: String?) {
+    visionAnalyze(png: png, systemPrompt: RestyleRules.styleSystemPrompt,
+                 userPrompt: "Extract the transferable art style.", label: "style analysis", key: key)
+}
+
+/// Names what must survive a restyle — species/type, face, markings, defining worn
+/// items — deliberately excluding pose, action and setting. Run on the SOURCE image
+/// (never the reference), for every restyle regardless of whether a reference was
+/// dropped: measured on a live model, generic "keep the subject" wording alone let a
+/// lion character drift into an unrelated human, twice in a row. Naming these
+/// anchors as concrete text tokens fixed it every time it was tried.
+func analyzeIdentity(sourcePNG png: Data, key: String) -> (text: String?, error: String?) {
+    visionAnalyze(png: png, systemPrompt: RestyleRules.identitySystemPrompt,
+                 userPrompt: "Describe the identity to preserve.", label: "identity analysis", key: key)
 }
 
 /// Run the restyle. Returns the saved file, or an error to show.
@@ -8436,7 +8455,6 @@ struct RestyleSheet: View {
     }
 
     private func run() {
-        let prompt = RestyleRules.restylePrompt(styleText: styleText, extra: extra)
         let flag = modelFlag, a = aspect, s = size
         // Pad to a throwaway copy so the folder never gains a _BG file just because
         // something was restyled. Same canvas logic as Prep for AI.
@@ -8450,8 +8468,20 @@ struct RestyleSheet: View {
             }
         }
         let sendURL = src
-        busy = true; failure = ""; status = "Restyling — this usually takes under a minute…"
+        let styleTextNow = styleText, extraNow = extra
+        busy = true; failure = ""; status = "Reading the character’s identity…"
         DispatchQueue.global(qos: .userInitiated).async {
+            // Named identity anchors, not generic "keep the subject" wording — that
+            // generic phrasing measurably let identity drift on a live model. Best
+            // effort: a failed read falls back to restylePrompt's own generic wording
+            // rather than blocking the whole restyle on one extra network call.
+            var anchors = ""
+            if let key = APIKeys.fal, !key.isEmpty, let idPNG = downscaledPNG(sendURL) {
+                let idResult = analyzeIdentity(sourcePNG: idPNG, key: key)
+                anchors = idResult.text ?? ""
+            }
+            let prompt = RestyleRules.restylePrompt(identityAnchors: anchors, styleText: styleTextNow, extra: extraNow)
+            DispatchQueue.main.async { status = "Restyling — this usually takes under a minute…" }
             let r = runRestyle(source: sendURL, prompt: prompt, modelFlag: flag, aspect: a, size: s,
                                nameAfter: source)
             if sendURL != source { try? FileManager.default.removeItem(at: sendURL) }

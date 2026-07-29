@@ -402,14 +402,30 @@ final class RestyleRulesTests: XCTestCase {
     }
 
     func testRestylePromptKeepsTextAndAddsExtra() {
-        let p = RestyleRules.restylePrompt(styleText: "warm earthy palette", extra: "more contrast")
+        let p = RestyleRules.restylePrompt(identityAnchors: "a lion character", styleText: "warm earthy palette", extra: "more contrast")
         XCTAssertTrue(p.contains("warm earthy palette"))
-        XCTAssertTrue(p.contains("text and lettering exactly as they are"))
+        XCTAssertTrue(p.contains("a lion character"))
+        XCTAssertTrue(p.contains("same text and lettering"))
         XCTAssertTrue(p.contains("ADDITIONAL DIRECTION: more contrast"))
     }
 
+    // Identity anchors must come before the style directive — reordering a working
+    // prompt to lead with the change measurably let identity drift on live runs.
+    func testIdentityAnchorsPrecedeStyle() {
+        let p = RestyleRules.restylePrompt(identityAnchors: "ANCHOR_MARKER", styleText: "STYLE_MARKER")
+        XCTAssertLessThan(p.range(of: "ANCHOR_MARKER")!.lowerBound, p.range(of: "STYLE_MARKER")!.lowerBound)
+    }
+
+    // Empty anchors (analysis failed, or was skipped) must not produce a blank or
+    // malformed preservation clause — fall back to generic wording rather than crash
+    // or silently drop the constraint.
+    func testEmptyIdentityAnchorsFallBackToGenericWording() {
+        let p = RestyleRules.restylePrompt(identityAnchors: "  ", styleText: "x")
+        XCTAssertTrue(p.contains("same subject"))
+    }
+
     func testRestylePromptOmitsEmptyExtra() {
-        XCTAssertFalse(RestyleRules.restylePrompt(styleText: "x", extra: "   ").contains("ADDITIONAL"))
+        XCTAssertFalse(RestyleRules.restylePrompt(identityAnchors: "a", styleText: "x", extra: "   ").contains("ADDITIONAL"))
     }
 }
 
