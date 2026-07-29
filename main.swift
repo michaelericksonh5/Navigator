@@ -479,10 +479,16 @@ final class NetworkReconnector {
                 self.lastTry[key] = Date()
                 if let mp = Browser.mountShareSilently(share) {
                     navLog("auto-reconnect (\(reason)): mounted \(share.absoluteString) at \(mp)")
-                    DispatchQueue.main.async {
-                        // A window sitting on the now-restored drive can load for real.
-                        NotificationCenter.default.post(name: .navigatorShareReconnected, object: mp)
-                    }
+                }
+            }
+            // Always finish by pointing favorites at where their shares really are —
+            // a share can be perfectly mounted yet under a different name ("Games-1"),
+            // which makes the sidebar entry look dead. Runs even when nothing needed
+            // mounting, so a stale path is corrected on the very next sweep.
+            DispatchQueue.main.async {
+                let moved = FavoritesStore.shared.reanchorNetworkPaths()
+                if moved || reason == "launch" {
+                    NotificationCenter.default.post(name: .navigatorShareReconnected, object: nil)
                 }
             }
         }
@@ -1946,6 +1952,39 @@ final class FavoritesStore: ObservableObject {
         }
     }
     func contains(_ url: URL) -> Bool { items.contains { $0.path == url.standardizedFileURL.path } }
+
+    // Point network favorites at where their share ACTUALLY is right now.
+    //
+    // A share doesn't always come back on the same mountpoint: if anything is
+    // holding the old name, macOS mounts it as "Games-1" instead of "Games". A
+    // favorite storing the literal old path then points at nothing, and the drive
+    // looks broken even though it's mounted and healthy — which is exactly what
+    // happened to G Drive / ArtSource / T Drive while X Drive kept working.
+    //
+    // So: whenever a favorite's stored path is missing but its share is mounted,
+    // rewrite the path onto the real mountpoint, keeping the same sub-folder. This
+    // is self-healing in both directions — when the share later returns on its
+    // proper name, the paths follow it back. Returns true if anything changed.
+    @discardableResult
+    func reanchorNetworkPaths() -> Bool {
+        let fm = FileManager.default
+        var updated = items
+        var changed = false
+        for i in updated.indices {
+            guard let m = updated[i].mountURL, let share = URL(string: m) else { continue }
+            let stored = updated[i].path
+            if fm.fileExists(atPath: stored) { continue }              // already correct
+            guard let mp = Browser.mountedPath(forShare: share) else { continue }   // share not mounted
+            let rel = Browser.shareRelativePath(stored)                // "artSource", "Tools", or ""
+            let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
+            guard target != stored, fm.fileExists(atPath: target) else { continue }
+            navLog("favorite “\(updated[i].label)” re-anchored: \(stored) → \(target)")
+            updated[i].path = target
+            changed = true
+        }
+        if changed { items = updated; persist() }
+        return changed
+    }
     func add(_ url: URL, label: String? = nil, mountURL: String? = nil) {
         let s = url.standardizedFileURL
         if label == nil, contains(s) { return }   // dedupe plain drag-adds; named drives may share a path
