@@ -8109,6 +8109,8 @@ struct NanoBananaModel: Identifiable, Hashable {
     static let all = [
         NanoBananaModel(flag: "nb2", id: "gemini-3.1-flash-image-preview", name: "Nano Banana 2",
                         note: "Default."),
+        NanoBananaModel(flag: "nb-lite", id: "gemini-3.1-flash-lite-image", name: "Nano Banana 2 Lite",
+                        note: "Faster and cheaper than NB2."),
         NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image-preview", name: "Nano Banana Pro",
                         note: "Highest quality."),
         NanoBananaModel(flag: "nb1", id: "gemini-2.5-flash-image", name: "Nano Banana 1",
