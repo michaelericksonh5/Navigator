@@ -22,9 +22,6 @@ final class NavigatorFinderSync: FIFinderSync {
 
     override init() {
         super.init()
-        // Finder only offers our menu for items inside directories we observe.
-        // Watch the places people actually keep work: home, every mounted volume
-        // (network drives included), and the cloud providers.
         // Observe the whole filesystem root. Finder only offers an extension's menu
         // for items inside an observed directory, and Navigator's actions make sense
         // anywhere — home, network volumes, cloud folders. Narrower roots (home,
@@ -35,8 +32,19 @@ final class NavigatorFinderSync: FIFinderSync {
     // MARK: - Menu
 
     override func menu(for menuKind: FIMenuKind) -> NSMenu? {
-        // Only for a selection of items; the container/sidebar menus would just be
-        // noise since every action needs something selected.
+        // Right-click on empty space in a Finder window: offer to open THAT folder.
+        // Finder decides where an extension's items go (down by Quick Actions) — an
+        // extension can't place them next to Open, so keep them few and obvious.
+        if menuKind == .contextualMenuForContainer {
+            guard let here = FIFinderSyncController.default().targetedURL() else { return nil }
+            let m = NSMenu()
+            let item = NSMenuItem(title: "Open “\(here.lastPathComponent)” in Navigator",
+                                  action: #selector(openContainer(_:)), keyEquivalent: "")
+            item.target = self
+            item.image = Self.appIcon
+            m.addItem(item)
+            return m
+        }
         guard menuKind == .contextualMenuForItems else { return nil }
         let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
         guard !urls.isEmpty else { return nil }
@@ -46,6 +54,16 @@ final class NavigatorFinderSync: FIFinderSync {
         let hasFolder = urls.contains { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
 
         let root = NSMenu()
+
+        // Top level, not tucked inside the submenu — this is the thing people reach
+        // for most, so it takes one click. Opens the folder the selection lives in
+        // (or the folder itself), rather than opening the file.
+        let loc = NSMenuItem(title: "Open Location in Navigator",
+                             action: #selector(openLocation(_:)), keyEquivalent: "")
+        loc.target = self
+        loc.image = Self.appIcon
+        root.addItem(loc)
+
         let parent = NSMenuItem(title: "Navigator", action: nil, keyEquivalent: "")
         parent.image = Self.appIcon
         let sub = NSMenu()
@@ -86,16 +104,41 @@ final class NavigatorFinderSync: FIFinderSync {
 
     // MARK: - Dispatch to Navigator
 
+    /// Right-click empty space → open the folder being viewed.
+    @objc private func openContainer(_ sender: NSMenuItem) {
+        guard let here = FIFinderSyncController.default().targetedURL() else { return }
+        openInNavigator([here])
+    }
+
+    /// Open the folder the selection lives in. For a selected FOLDER that's the
+    /// folder itself; for files it's their enclosing directory. Passing the file
+    /// would open it (an image would land in the viewer) — the point here is the
+    /// location, so resolve to a directory first.
+    @objc private func openLocation(_ sender: NSMenuItem) {
+        let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
+        var dirs: [URL] = []
+        var seen = Set<String>()
+        for u in urls {
+            let isDir = (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            let target = isDir ? u : u.deletingLastPathComponent()
+            if seen.insert(target.path).inserted { dirs.append(target) }
+        }
+        if dirs.isEmpty, let here = FIFinderSyncController.default().targetedURL() { dirs = [here] }
+        openInNavigator(dirs)
+    }
+
+    private func openInNavigator(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.open(urls, withApplicationAt: Self.appURL,
+                                configuration: NSWorkspace.OpenConfiguration())
+    }
+
     @objc private func runAction(_ sender: NSMenuItem) {
         guard let action = sender.representedObject as? String else { return }
         let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
         guard !urls.isEmpty else { return }
 
-        if action == "open" {
-            NSWorkspace.shared.open(urls, withApplicationAt: Self.appURL,
-                                    configuration: NSWorkspace.OpenConfiguration())
-            return
-        }
+        if action == "open" { openInNavigator(urls); return }
         // navigatoraction://<action>?hex=<hex of the newline-joined paths>. Hex keeps
         // spaces, quotes and non-ASCII names intact with no escaping questions.
         let joined = urls.map { $0.path }.joined(separator: "\n")
