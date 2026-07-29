@@ -8104,14 +8104,21 @@ func hasTransparency(_ url: URL) -> Bool {
 }
 
 /// A Gemini image model reachable through the metered client.
+/// A Gemini image model, addressed by its real Vertex model ID.
+///
+/// These deliberately do NOT match the aliases in the AI hub's client.mjs, which point
+/// at "-preview" spellings (gemini-3.1-flash-image-preview, gemini-3-pro-image-preview)
+/// that Vertex no longer uses. The IDs here are the ones Vertex AI Studio and the
+/// google-genai samples use, which is why Navigator posts the ID itself instead of an
+/// alias.
 struct NanoBananaModel: Identifiable, Hashable {
     let flag: String, id: String, name: String, note: String
     static let all = [
-        NanoBananaModel(flag: "nb2", id: "gemini-3.1-flash-image-preview", name: "Nano Banana 2",
+        NanoBananaModel(flag: "nb2", id: "gemini-3.1-flash-image", name: "Nano Banana 2",
                         note: "Default."),
         NanoBananaModel(flag: "nb-lite", id: "gemini-3.1-flash-lite-image", name: "Nano Banana 2 Lite",
                         note: "Faster and cheaper than NB2."),
-        NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image-preview", name: "Nano Banana Pro",
+        NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image", name: "Nano Banana Pro",
                         note: "Highest quality."),
         NanoBananaModel(flag: "nb1", id: "gemini-2.5-flash-image", name: "Nano Banana 1",
                         note: "The original, tuned for editing. Currently the only one this Vertex project has access to."),
