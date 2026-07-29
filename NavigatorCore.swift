@@ -66,6 +66,31 @@ enum PathRules {
         url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix(suffix)
     }
 
+    /// The new element order after a sidebar drag-reorder, as indices into the
+    /// original array, with one element optionally forced back to the front.
+    ///
+    /// Home is that pinned element: it's the fixed anchor of the Favorites list, so
+    /// it returns to the top wherever it gets dropped — and it must also survive
+    /// being displaced when something else is dropped above it. Index math after a
+    /// move is easy to get subtly wrong, so it lives here where it can be tested.
+    /// `to` follows SwiftUI's onMove convention: the dragged items end up just before
+    /// whatever was originally at that offset (`count` means "to the end"). The move
+    /// is spelled out rather than using Array.move(fromOffsets:toOffset:) because that
+    /// lives in SwiftUI, and this file is deliberately UI-free so the tests can reach it.
+    static func reorder(count: Int, from: IndexSet, to: Int, pinnedToFront pin: Int? = nil) -> [Int] {
+        let picked = from.sorted().filter { $0 >= 0 && $0 < count }
+        let moving = picked.map { $0 }
+        var order = Array(0..<count)
+        for i in picked.reversed() { order.remove(at: i) }
+        // Every moved item that sat before the insertion point shifts it left.
+        let insertAt = min(max(to - picked.filter { $0 < to }.count, 0), order.count)
+        order.insert(contentsOf: moving, at: insertAt)
+        if let pin, let at = order.firstIndex(of: pin), at != 0 {
+            order.insert(order.remove(at: at), at: 0)
+        }
+        return order
+    }
+
     /// A File Provider location — Google Drive, iCloud Drive and friends.
     static func isCloudProvider(_ url: URL) -> Bool {
         let p = url.path

@@ -439,6 +439,29 @@ final class NetworkReconnector {
     private let retryInterval: TimeInterval = 90  // don't hammer an unreachable server
     private var timer: Timer?
 
+    // Shares the user disconnected deliberately. Without this, Disconnect is a button
+    // that does nothing: the next sweep sees a missing share, can't tell "the VPN
+    // dropped it" from "the user just let it go", and mounts it straight back —
+    // measured at under 10 seconds. Deliberately NOT persisted: reconnecting
+    // everything at launch is the promised behaviour, so a restart is a clean slate.
+    private var manual = Set<String>()
+
+    private func shareKey(_ u: URL) -> String { (u.host ?? "") + u.path }
+
+    /// Keys of the pinned shares currently mounted at `volume`. Call BEFORE
+    /// unmounting — afterwards there's nothing left to match on.
+    func shareKeys(mountedAt volume: String) -> [String] {
+        pinnedShares.filter { Browser.mountedPath(forShare: $0) == volume }.map(shareKey)
+    }
+    /// Stop auto-mounting these until the user asks for them again.
+    func suppress(_ keys: [String]) { manual.formUnion(keys) }
+    /// The user asked for this location again (clicked the drive, or reconnected a
+    /// stalled one), so resume looking after it.
+    func allowReconnect(mountURL: String?) {
+        guard let m = mountURL, let u = URL(string: m) else { return }
+        manual.remove(shareKey(u))
+    }
+
     private var pinnedShares: [URL] {
         // Unique share URLs from favorites that were saved as network drives.
         var seen = Set<String>(); var out: [URL] = []
@@ -467,6 +490,9 @@ final class NetworkReconnector {
 
     func sweep(reason: String) {
         let shares = pinnedShares
+        // Snapshot on the caller's thread (sweep is always called from main) so the
+        // background pass never reads `manual` while the UI is mutating it.
+        let skip = manual
         guard !shares.isEmpty, !sweeping else { return }
         sweeping = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -476,6 +502,7 @@ final class NetworkReconnector {
                 // Already mounted (even if unhappy)? Leave it completely alone.
                 if Browser.mountedPath(forShare: share) != nil { continue }
                 let key = (share.host ?? "") + share.path
+                if skip.contains(key) { continue }   // user disconnected this on purpose
                 if let last = self.lastTry[key], Date().timeIntervalSince(last) < self.retryInterval { continue }
                 self.lastTry[key] = Date()
                 if let mp = Browser.mountShareSilently(share) {
@@ -711,6 +738,7 @@ struct SidebarLocation: Identifiable, Hashable {
     let url: URL
     let symbol: String
     var ejectable: Bool = false
+    var isNetwork: Bool = false   // "Disconnect" rather than "Eject", and picks the error wording
 }
 
 // Surfaces a file-operation failure instead of failing silently. Must be called
@@ -791,15 +819,29 @@ func googleDrivePortablePath(_ url: URL) -> String? {
 }
 // The installed Google Drive app's own icon, for the Drive context-menu items
 // (mirrors how Finder badges its Quick Actions). Loaded once.
+/// An app icon shrunk to menu-row height.
+///
+/// NSWorkspace hands back a 32pt-plus icon, and a context menu lays icons out at
+/// the NSImage's OWN size — SwiftUI's `.frame()` is ignored once a Label is
+/// rendered into an NSMenu, so the full-size icon stretched every row it appeared
+/// on and left the menu unevenly spaced. Setting the size on a copy is what
+/// actually constrains it (the same thing FinderExt does for its menu items);
+/// copying keeps us from resizing an image other call sites share.
+func menuIcon(_ img: NSImage, _ pt: CGFloat = 14) -> NSImage {
+    guard let c = img.copy() as? NSImage else { return img }
+    c.size = NSSize(width: pt, height: pt)
+    return c
+}
+
 enum GoogleDriveIcon {
-    static let image: NSImage = NSWorkspace.shared.icon(forFile: "/Applications/Google Drive.app")
+    static let image: NSImage = menuIcon(NSWorkspace.shared.icon(forFile: "/Applications/Google Drive.app"))
 }
 // A context-menu label badged with the Google Drive app icon.
 @ViewBuilder func gdLabel(_ title: String) -> some View {
     Label {
         Text(title)
     } icon: {
-        Image(nsImage: GoogleDriveIcon.image).resizable().frame(width: 13, height: 13)
+        Image(nsImage: GoogleDriveIcon.image)
     }.labelStyle(.titleAndIcon)
 }
 
@@ -807,13 +849,13 @@ enum GoogleDriveIcon {
 // `image` is nil (and the menu items are hidden) when Photoshop isn't installed.
 enum PhotoshopIcon {
     static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.Photoshop")
-    static let image: NSImage? = url.map { NSWorkspace.shared.icon(forFile: $0.path) }
+    static let image: NSImage? = url.map { menuIcon(NSWorkspace.shared.icon(forFile: $0.path)) }
 }
 @ViewBuilder func psLabel(_ title: String) -> some View {
     Label {
         Text(title)
     } icon: {
-        if let img = PhotoshopIcon.image { Image(nsImage: img).resizable().frame(width: 14, height: 14) }
+        if let img = PhotoshopIcon.image { Image(nsImage: img) }
     }.labelStyle(.titleAndIcon)
 }
 
@@ -821,13 +863,13 @@ enum PhotoshopIcon {
 // once; menu items are hidden when After Effects isn't installed.
 enum AfterEffectsIcon {
     static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.AfterEffects")
-    static let image: NSImage? = url.map { NSWorkspace.shared.icon(forFile: $0.path) }
+    static let image: NSImage? = url.map { menuIcon(NSWorkspace.shared.icon(forFile: $0.path)) }
 }
 @ViewBuilder func aeLabel(_ title: String) -> some View {
     Label {
         Text(title)
     } icon: {
-        if let img = AfterEffectsIcon.image { Image(nsImage: img).resizable().frame(width: 14, height: 14) }
+        if let img = AfterEffectsIcon.image { Image(nsImage: img) }
     }.labelStyle(.titleAndIcon)
 }
 
@@ -1994,11 +2036,10 @@ final class FavoritesStore: ObservableObject {
     // Drag-to-reorder from the sidebar. Home always snaps back to the top so it
     // stays the fixed anchor, regardless of where it's dropped.
     func move(fromOffsets: IndexSet, toOffset: Int) {
-        items.move(fromOffsets: fromOffsets, toOffset: toOffset)
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        if let hi = items.firstIndex(where: { $0.path == home }), hi != 0 {
-            items.insert(items.remove(at: hi), at: 0)
-        }
+        let order = PathRules.reorder(count: items.count, from: fromOffsets, to: toOffset,
+                                      pinnedToFront: items.firstIndex { $0.path == home })
+        items = order.map { items[$0] }
         persist()
     }
     func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
@@ -2139,6 +2180,35 @@ func cloudLocations() -> [SidebarLocation] {
     return out
 }
 
+/// Unmount a volume — a USB disk, or a network share (NSWorkspace handles both;
+/// verified against a live SMB mount).
+///
+/// Both callers used to do this with `try?`, so the overwhelmingly common failure
+/// — something still has a file open on the share — looked exactly like nothing
+/// happening at all. A volume in use is normal and worth saying out loud, so the
+/// error is reported instead of dropped. `isNetwork` only picks the wording.
+func disconnectVolume(_ url: URL, isNetwork: Bool) {
+    // Callers may hand us a path INSIDE the volume (a favorite pointing at
+    // /Volumes/Games/artSource); unmounting needs the volume root.
+    let c = url.pathComponents
+    let vol = (c.count >= 3 && c[1] == "Volumes") ? URL(fileURLWithPath: "/Volumes/\(c[2])") : url
+    // Work out which pinned shares live here while the volume still exists; only
+    // hold auto-reconnect off if the unmount actually succeeds, so a failed
+    // disconnect leaves the safety net intact. (getmntinfo, so no network I/O.)
+    let keys = isNetwork ? NetworkReconnector.shared.shareKeys(mountedAt: vol.path) : []
+    do {
+        try NSWorkspace.shared.unmountAndEjectDevice(at: vol)
+        NetworkReconnector.shared.suppress(keys)
+    }
+    catch {
+        reportFileError(isNetwork ? "Couldn’t disconnect “\(vol.lastPathComponent)”"
+                                  : "Couldn’t eject “\(vol.lastPathComponent)”",
+                        (error as NSError).localizedDescription
+                        + "\n\nA file on it is probably still open in another app.",
+                        permissionHint: false)
+    }
+}
+
 // Real mounted volumes via the system API (no /Volumes symlink duplicates).
 func volumeLocations() -> [SidebarLocation] {
     let fm = FileManager.default
@@ -2153,9 +2223,13 @@ func volumeLocations() -> [SidebarLocation] {
         let name = rv?.volumeLocalizedName ?? url.lastPathComponent
         let isRoot = rv?.volumeIsRootFileSystem ?? (url.path == "/")
         let isLocal = rv?.volumeIsLocal ?? true
-        let ejectable = ((rv?.volumeIsEjectable ?? false) || (rv?.volumeIsRemovable ?? false)) && !isRoot
+        // A network share reports ejectable=false AND removable=false (checked: every
+        // SMB mount on this Mac does), so keying the button on those flags alone meant
+        // mounted shares could never be disconnected from Navigator at all — Finder
+        // offers it. Any non-root volume that isn't the local disk can be let go of.
+        let ejectable = ((rv?.volumeIsEjectable ?? false) || (rv?.volumeIsRemovable ?? false) || !isLocal) && !isRoot
         let sym = isRoot ? "internaldrive" : (isLocal ? "externaldrive" : "network")
-        out.append(.init(name: name, url: url, symbol: sym, ejectable: ejectable))
+        out.append(.init(name: name, url: url, symbol: sym, ejectable: ejectable, isNetwork: !isLocal))
     }
     return out
 }
@@ -2954,6 +3028,8 @@ final class Browser: ObservableObject, Identifiable {
     // /Volumes using keychain creds (its own auth sheet only if none are stored)
     // and returns the real mountpoint, so no polling/guessing is needed.
     func openFavorite(_ path: String, mountURL: String?) {
+        // Clicking a drive is asking for it back, which cancels an earlier Disconnect.
+        NetworkReconnector.shared.allowReconnect(mountURL: mountURL)
         if fm.fileExists(atPath: path) { navigate(to: URL(fileURLWithPath: path)); return }
         guard let m = mountURL, let smb = URL(string: m) else { NSSound.beep(); return }
         busy = true; busyText = "Connecting to \(smb.host ?? "server")…"
@@ -3012,6 +3088,8 @@ final class Browser: ObservableObject, Identifiable {
     // any other way, and doing it here means no trip to Finder.
     func reconnectShare() {
         guard let info = Browser.shareMountInfo(for: currentURL) else { NSSound.beep(); return }
+        // An explicit repair also means "I want this share", clearing any Disconnect.
+        NetworkReconnector.shared.allowReconnect(mountURL: info.share.absoluteString)
         // Remember where we were, relative to the volume, so we can come back.
         let rel = currentURL.path.hasPrefix(info.volume)
             ? String(currentURL.path.dropFirst(info.volume.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -4201,9 +4279,10 @@ struct SidebarView: View {
                 Label(loc.name, systemImage: loc.symbol).frame(maxWidth: .infinity, alignment: .leading)
             }.buttonStyle(.plain)
             if loc.ejectable {
-                Button { try? NSWorkspace.shared.unmountAndEjectDevice(at: loc.url) } label: {
+                Button { disconnectVolume(loc.url, isNetwork: loc.isNetwork) } label: {
                     Image(systemName: "eject.fill").font(.caption2)
-                }.buttonStyle(.plain).foregroundStyle(.secondary).help("Eject")
+                }.buttonStyle(.plain).foregroundStyle(.secondary)
+                    .help(loc.isNetwork ? "Disconnect" : "Eject")
             }
         }
     }
@@ -4237,29 +4316,38 @@ struct SidebarView: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(n.url.path, forType: .string)
                 }
-                if n.mountURL != nil {   // network drive favorite → offer Eject
-                    Button("Eject") {
-                        let c = n.url.pathComponents
-                        let vol = (c.count >= 3 && c[1] == "Volumes") ? URL(fileURLWithPath: "/Volumes/\(c[2])") : n.url
-                        try? NSWorkspace.shared.unmountAndEjectDevice(at: vol)
-                    }
+                if n.mountURL != nil {   // network drive favorite → offer to disconnect
+                    Button("Disconnect") { disconnectVolume(n.url, isNetwork: true) }
                 }
                 if pinned {
                     Divider()
                     Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
                 }
             }
-            // Drag a pinned favorite onto another to reorder. Uses a String payload
-            // (the path) — distinct from the URL file-drop type, so the two never
-            // collide. OutlineGroup rows don't support List's .onMove, so we do it
-            // explicitly. Dragging a non-favorite row is a harmless no-op.
-            .draggable(n.url.path)
-            .dropDestination(for: String.self) { items, _ in
-                guard let src = items.first,
-                      let from = favStore.items.firstIndex(where: { $0.path == src }),
-                      let target = favStore.items.firstIndex(where: { $0.path == n.url.path }),
-                      from != target else { return false }
-                favStore.move(fromOffsets: IndexSet(integer: from), toOffset: from < target ? target + 1 : target)
+            // Drag a favorite onto another to reorder. Carries the path as plain text,
+            // a different type from the URL file-drops the Favorites section accepts,
+            // so adding a folder and reordering one can't be confused.
+            //
+            // Uses onDrag/onDrop rather than .draggable/.dropDestination: the row's
+            // content is a full-width Button, and the newer API loses the mouse-down
+            // to it so the drag never starts. onDrag hooks in at the AppKit dragging
+            // layer, underneath that. Dragging a subfolder row is a harmless no-op —
+            // its path isn't in the favorites list, so the reorder finds nothing.
+            .onDrag { NSItemProvider(object: n.url.path as NSString) }
+            .onDrop(of: [.text], isTargeted: nil) { providers in
+                guard let p = providers.first else { return false }
+                p.loadObject(ofClass: NSString.self) { obj, _ in
+                    guard let src = obj as? String else { return }
+                    DispatchQueue.main.async {
+                        guard let from = favStore.items.firstIndex(where: { $0.path == src }),
+                              let target = favStore.items.firstIndex(where: { $0.path == n.url.path }),
+                              from != target else { return }
+                        // Dropping onto a row below means "go after it", so the
+                        // insertion point is past the target; above means "go before".
+                        favStore.move(fromOffsets: IndexSet(integer: from),
+                                      toOffset: from < target ? target + 1 : target)
+                    }
+                }
                 return true
             }
         }
@@ -4272,7 +4360,12 @@ struct SidebarView: View {
                 Button { browser.loadRecents() } label: {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
-                ForEach(favNodes) { tree($0, removable: true) }   // reorder via drag (see tree)
+                // Reorder by dragging one favorite onto another — see `tree`. List's
+                // .onMove is NOT usable here: these rows are OutlineGroups (they
+                // expand into subfolders), and a List only offers its own reorder
+                // drag for plain ForEach rows. Tested with a synthetic drag — .onMove
+                // silently does nothing on these rows.
+                ForEach(favNodes) { tree($0, removable: true) }
             }
             .dropDestination(for: URL.self) { urls, _ in
                 for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }

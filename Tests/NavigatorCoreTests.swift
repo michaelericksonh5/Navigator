@@ -182,6 +182,65 @@ final class OwnOutputTests: XCTestCase {
     }
 }
 
+// Sidebar drag-to-reorder. The move itself is stdlib; what's worth pinning down is
+// the interaction with Home being pinned to the front, and that a reorder never
+// loses or duplicates an entry.
+final class FavoriteReorderTests: XCTestCase {
+
+    func testMovesItemDown() {
+        // [0,1,2,3], drag 0 to sit after 2
+        XCTAssertEqual(PathRules.reorder(count: 4, from: IndexSet(integer: 0), to: 3), [1, 2, 0, 3])
+    }
+
+    func testMovesItemUp() {
+        XCTAssertEqual(PathRules.reorder(count: 4, from: IndexSet(integer: 3), to: 1), [0, 3, 1, 2])
+    }
+
+    func testMultiSelectionMovesTogether() {
+        XCTAssertEqual(PathRules.reorder(count: 5, from: IndexSet([0, 1]), to: 4), [2, 3, 0, 1, 4])
+    }
+
+    func testDroppingInPlaceChangesNothing() {
+        XCTAssertEqual(PathRules.reorder(count: 3, from: IndexSet(integer: 1), to: 1), [0, 1, 2])
+        XCTAssertEqual(PathRules.reorder(count: 3, from: IndexSet(integer: 1), to: 2), [0, 1, 2])
+    }
+
+    // Home is the fixed anchor: dragged away from the top, it snaps back.
+    func testPinnedHomeReturnsToTop() {
+        XCTAssertEqual(PathRules.reorder(count: 4, from: IndexSet(integer: 0), to: 3, pinnedToFront: 0),
+                       [0, 1, 2, 3])
+    }
+
+    // The subtler case: Home isn't the thing being dragged, but something is dropped
+    // above it. Home must still end up first.
+    func testPinnedHomeSurvivesBeingDisplaced() {
+        XCTAssertEqual(PathRules.reorder(count: 4, from: IndexSet(integer: 3), to: 0, pinnedToFront: 0),
+                       [0, 3, 1, 2])
+    }
+
+    // Home partway down the list still gets hoisted.
+    func testPinnedHomeHoistedFromMiddle() {
+        XCTAssertEqual(PathRules.reorder(count: 4, from: IndexSet(integer: 0), to: 2, pinnedToFront: 2),
+                       [2, 1, 0, 3])
+    }
+
+    // Whatever the drag, every entry must appear exactly once — a reorder that drops
+    // or duplicates a favorite would quietly lose someone's pinned drive.
+    func testNeverLosesOrDuplicatesEntries() {
+        for from in 0..<5 {
+            for to in 0...5 {
+                for pin in [nil, 0, 2] as [Int?] {
+                    let r = PathRules.reorder(count: 5, from: IndexSet(integer: from), to: to,
+                                              pinnedToFront: pin)
+                    XCTAssertEqual(r.sorted(), [0, 1, 2, 3, 4],
+                                   "from \(from) to \(to) pin \(String(describing: pin))")
+                    if let pin { XCTAssertEqual(r.first, pin) }
+                }
+            }
+        }
+    }
+}
+
 final class DropDirectionTests: XCTestCase {
 
     private func u(_ p: String) -> URL { URL(fileURLWithPath: p) }
