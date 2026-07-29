@@ -4,7 +4,7 @@ set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 APP="/Applications/Navigator.app"
 echo "Compiling (universal: arm64 + x86_64)..."
-SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" \
+SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" "$DIR/NavigatorCore.swift" \
   -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers -framework NetFS -framework Security -framework FinderSync)
 /usr/bin/swiftc "${SWIFT_ARGS[@]}" -target arm64-apple-macos14.0  -o "$DIR/Navigator-arm64"
 /usr/bin/swiftc "${SWIFT_ARGS[@]}" -target x86_64-apple-macos14.0 -o "$DIR/Navigator-x86_64"

@@ -13,3 +13,4 @@ run.pid
 *.key
 navcert.*
 ext.entitlements
+.build

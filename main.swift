@@ -2986,9 +2986,7 @@ final class Browser: ObservableObject, Identifiable {
     // re-anchor onto the actual mountpoint when a share mounts somewhere
     // unexpected. Empty if the favorite IS the volume root.
     static func shareRelativePath(_ path: String) -> String {
-        let parts = path.split(separator: "/").map(String.init)
-        guard parts.count > 2, parts[0] == "Volumes" else { return "" }
-        return parts.dropFirst(2).joined(separator: "/")
+        PathRules.shareRelativePath(path)                   // tested in NavigatorCoreTests
     }
     // Mount an SMB/AFP URL directly, without Finder. Blocking — call off the main
     // thread. Returns the real mountpoint path (nil on failure). NetFS uses stored
@@ -3517,28 +3515,13 @@ final class Browser: ObservableObject, Identifiable {
         Browser.cutMode = true; Browser.cutChangeCount = NSPasteboard.general.changeCount
     }
     private func uniqueDest(_ dir: URL, _ name: String) -> URL {
-        let fm = FileManager.default
-        var dest = dir.appendingPathComponent(name)
-        guard fm.fileExists(atPath: dest.path) else { return dest }
-        let ext = (name as NSString).pathExtension, base = (name as NSString).deletingPathExtension
-        var i = 2
-        while fm.fileExists(atPath: dest.path) {
-            dest = dir.appendingPathComponent(ext.isEmpty ? "\(base) \(i)" : "\(base) \(i).\(ext)"); i += 1
-        }
-        return dest
+        PathRules.uniqueDest(dir, name) { FileManager.default.fileExists(atPath: $0) }
     }
 
     // Name for pasting a file into its own folder: "photo.jpg" -> "photo (1).jpg",
     // then "(2)", "(3)"… (Windows/Explorer-style in-place copy).
     private func numberedCopyDest(_ dir: URL, _ name: String) -> URL {
-        let fm = FileManager.default
-        let ext = (name as NSString).pathExtension, base = (name as NSString).deletingPathExtension
-        func make(_ n: Int) -> URL {
-            dir.appendingPathComponent(ext.isEmpty ? "\(base) (\(n))" : "\(base) (\(n)).\(ext)")
-        }
-        var i = 1, dest = make(1)
-        while fm.fileExists(atPath: dest.path) { i += 1; dest = make(i) }
-        return dest
+        PathRules.numberedCopyDest(dir, name) { FileManager.default.fileExists(atPath: $0) }
     }
 
     // Explicit paste (⌘V / context menu). Pasting a copied item into its own
@@ -3633,9 +3616,7 @@ final class Browser: ObservableObject, Identifiable {
     // copy it is creating, and only stops when the path gets too long — a real test
     // produced 231 junk directories nested 1000+ characters deep before failing.
     private static func isSelfOrDescendant(_ dir: URL, of src: URL) -> Bool {
-        let s = src.standardizedFileURL.resolvingSymlinksInPath().path
-        let d = dir.standardizedFileURL.resolvingSymlinksInPath().path
-        return d == s || d.hasPrefix(s.hasSuffix("/") ? s : s + "/")
+        PathRules.isSelfOrDescendant(dir, of: src)          // tested in NavigatorCoreTests
     }
 
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
