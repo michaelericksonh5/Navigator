@@ -2042,6 +2042,32 @@ final class FavoritesStore: ObservableObject {
         items = order.map { items[$0] }
         persist()
     }
+    /// Index of a favorite by path, for the nudge helpers below.
+    private func index(of path: String) -> Int? { items.firstIndex { $0.path == path } }
+
+    // Keyboard-free, aim-free reordering from the context menu. Dragging is fine when
+    // you hit a row, but "just below Home" is a small target and a miss looks like the
+    // feature is broken — these always land.
+    func moveToTop(path: String) {
+        guard let i = index(of: path) else { return }
+        move(fromOffsets: IndexSet(integer: i), toOffset: 0)
+    }
+    func moveUp(path: String) {
+        guard let i = index(of: path), i > 0 else { return }
+        move(fromOffsets: IndexSet(integer: i), toOffset: i - 1)
+    }
+    func moveDown(path: String) {
+        guard let i = index(of: path), i < items.count - 1 else { return }
+        // toOffset is "before the item originally at this index", so moving down one
+        // place means inserting before i+2, not i+1.
+        move(fromOffsets: IndexSet(integer: i), toOffset: i + 2)
+    }
+    /// Reorder driven by a drop: `src` takes `dest`'s place.
+    func reorder(from src: String, onto dest: String) {
+        guard let from = index(of: src), let target = index(of: dest), from != target else { return }
+        move(fromOffsets: IndexSet(integer: from), toOffset: from < target ? target + 1 : target)
+    }
+
     func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
     func remove(url: URL) { let p = url.standardizedFileURL.path; items.removeAll { $0.path == p }; persist() }
     private func persist() { if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: "favoritesV2") } }
@@ -4271,6 +4297,7 @@ struct SidebarView: View {
     @ObservedObject var network = NetworkBrowser.shared
     @ObservedObject var favStore = FavoritesStore.shared
     @State private var favNodes: [SidebarNode] = []
+    @State private var recentsTargeted = false
     @State private var cloudNodes: [SidebarNode] = []
 
     @ViewBuilder private func row(_ loc: SidebarLocation) -> some View {
@@ -4284,6 +4311,42 @@ struct SidebarView: View {
                 }.buttonStyle(.plain).foregroundStyle(.secondary)
                     .help(loc.isNetwork ? "Disconnect" : "Eject")
             }
+        }
+    }
+
+    /// A sidebar row you can pick up and drop onto another to reorder.
+    ///
+    /// The highlight matters as much as the drag: with no feedback there was no way to
+    /// tell a row apart from the gap above it, the section header, or Recents — none of
+    /// which are drop targets — so a near miss looked exactly like a broken feature.
+    /// Now the row you're about to displace lights up, and nothing lighting up means
+    /// "don't let go here".
+    ///
+    /// onDrag/onDrop rather than draggable/dropDestination: the row's content is a
+    /// full-width Button, and the newer API loses the mouse-down to it, so the drag
+    /// never starts. List's .onMove isn't available either — these rows are
+    /// OutlineGroups and a List only reorders plain ForEach rows (tested).
+    private struct Reorderable<Content: View>: View {
+        let path: String
+        @ObservedObject var favStore: FavoritesStore
+        @ViewBuilder var content: () -> Content
+        @State private var targeted = false
+
+        var body: some View {
+            content()
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color.accentColor.opacity(targeted ? 0.35 : 0))
+                )
+                .onDrag { NSItemProvider(object: path as NSString) }
+                .onDrop(of: [.text], isTargeted: $targeted) { providers in
+                    guard let p = providers.first else { return false }
+                    p.loadObject(ofClass: NSString.self) { obj, _ in
+                        guard let src = obj as? String else { return }
+                        DispatchQueue.main.async { favStore.reorder(from: src, onto: path) }
+                    }
+                    return true
+                }
         }
     }
 
@@ -4321,35 +4384,24 @@ struct SidebarView: View {
                 }
                 if pinned {
                     Divider()
+                    // Always-works alternative to aiming a drag.
+                    Button("Move to Top") { favStore.moveToTop(path: n.url.path) }
+                    Button("Move Up") { favStore.moveUp(path: n.url.path) }
+                    Button("Move Down") { favStore.moveDown(path: n.url.path) }
+                    Divider()
                     Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
                 }
             }
-            // Drag a favorite onto another to reorder. Carries the path as plain text,
-            // a different type from the URL file-drops the Favorites section accepts,
-            // so adding a folder and reordering one can't be confused.
-            //
-            // Uses onDrag/onDrop rather than .draggable/.dropDestination: the row's
-            // content is a full-width Button, and the newer API loses the mouse-down
-            // to it so the drag never starts. onDrag hooks in at the AppKit dragging
-            // layer, underneath that. Dragging a subfolder row is a harmless no-op —
-            // its path isn't in the favorites list, so the reorder finds nothing.
-            .onDrag { NSItemProvider(object: n.url.path as NSString) }
-            .onDrop(of: [.text], isTargeted: nil) { providers in
-                guard let p = providers.first else { return false }
-                p.loadObject(ofClass: NSString.self) { obj, _ in
-                    guard let src = obj as? String else { return }
-                    DispatchQueue.main.async {
-                        guard let from = favStore.items.firstIndex(where: { $0.path == src }),
-                              let target = favStore.items.firstIndex(where: { $0.path == n.url.path }),
-                              from != target else { return }
-                        // Dropping onto a row below means "go after it", so the
-                        // insertion point is past the target; above means "go before".
-                        favStore.move(fromOffsets: IndexSet(integer: from),
-                                      toOffset: from < target ? target + 1 : target)
-                    }
-                }
-                return true
-            }
+            .modifier(ReorderRow(path: n.url.path, favStore: favStore))
+        }
+    }
+
+    // Applying Reorderable as a modifier keeps the OutlineGroup row builder readable.
+    private struct ReorderRow: ViewModifier {
+        let path: String
+        @ObservedObject var favStore: FavoritesStore
+        func body(content: Content) -> some View {
+            Reorderable(path: path, favStore: favStore) { content }
         }
     }
 
@@ -4357,9 +4409,22 @@ struct SidebarView: View {
         let volumes = volumeLocations()
         List {
             Section("Favorites") {
+                // Recents sits above the first favorite, so it's exactly where you let
+                // go when you mean "put it at the very top" — it used to swallow that
+                // drop silently. Accepting it as "move to the top" removes the trap.
                 Button { browser.loadRecents() } label: {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
+                .onDrop(of: [.text], isTargeted: $recentsTargeted) { providers in
+                    guard let p = providers.first else { return false }
+                    p.loadObject(ofClass: NSString.self) { obj, _ in
+                        guard let src = obj as? String else { return }
+                        DispatchQueue.main.async { favStore.moveToTop(path: src) }
+                    }
+                    return true
+                }
+                .background(RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.accentColor.opacity(recentsTargeted ? 0.35 : 0)))
                 // Reorder by dragging one favorite onto another — see `tree`. List's
                 // .onMove is NOT usable here: these rows are OutlineGroups (they
                 // expand into subfolders), and a List only offers its own reorder
