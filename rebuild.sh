@@ -44,6 +44,15 @@ cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
 for jsx in NavigatorRemoveBG NavigatorChromaKeyStill; do
   [ -f "$DIR/$jsx.jsx" ] && cp "$DIR/$jsx.jsx" "$APP/Contents/Resources/$jsx.jsx"
 done
+# Menu icons for services with no installed app to borrow an icon from (Vertex AI,
+# fal). Photoshop/After Effects icons are read from the installed apps instead, so
+# they are never copied here. Drop a 64x64 PNG in Assets/ and it ships; a missing
+# one falls back to an SF Symbol in code.
+if [ -d "$DIR/Assets" ]; then
+  for png in "$DIR/Assets"/*.png; do
+    [ -f "$png" ] && cp "$png" "$APP/Contents/Resources/$(basename "$png")"
+  done
+fi
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,8 +62,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.5.00</string>
-<key>CFBundleVersion</key><string>116</string>
+<key>CFBundleShortVersionString</key><string>1.5.01</string>
+<key>CFBundleVersion</key><string>117</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -118,6 +127,14 @@ if [ -f "$DIR/FinderExt.swift" ]; then
   done
   lipo -create "$DIR/ext-arm64" "$DIR/ext-x86_64" -output "$EXT/Contents/MacOS/NavigatorFinder"
   rm -f "$DIR/ext-arm64" "$DIR/ext-x86_64"
+  # The extension's Bundle.main is the appex, not the app, so it needs its own copy
+  # of the menu icons.
+  if [ -d "$DIR/Assets" ]; then
+    mkdir -p "$EXT/Contents/Resources"
+    for png in "$DIR/Assets"/*.png; do
+      [ -f "$png" ] && cp "$png" "$EXT/Contents/Resources/$(basename "$png")"
+    done
+  fi
   cat > "$EXT/Contents/Info.plist" <<'EXTPLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

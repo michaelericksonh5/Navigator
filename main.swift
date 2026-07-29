@@ -892,15 +892,41 @@ enum AfterEffectsIcon {
         Label("Prep for AI", systemImage: "wand.and.stars")
     }
 }
+/// Icons for the AI services behind menu items. Photoshop and After Effects lend
+/// their own icons because they're installed apps; Vertex and fal are web services
+/// with nothing to borrow from, so their marks ship in Assets/ and are loaded here.
+/// A missing file falls back to an SF Symbol rather than leaving a blank.
+enum ServiceIcon {
+    static let vertex: NSImage? = load("vertex", fallback: "sparkles")
+    static let fal: NSImage? = load("fal", fallback: "bolt.fill")
+
+    private static func load(_ name: String, fallback symbol: String) -> NSImage? {
+        let img = Bundle.main.url(forResource: name, withExtension: "png")
+            .flatMap { NSImage(contentsOf: $0) }
+            ?? NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        img?.size = NSSize(width: 14, height: 14)   // menus size icons from the image
+        return img
+    }
+}
+@ViewBuilder func serviceLabel(_ title: String, _ icon: NSImage?) -> some View {
+    Label {
+        Text(title)
+    } icon: {
+        if let icon { Image(nsImage: icon) }
+    }.labelStyle(.titleAndIcon)
+}
+
 // "Upscale (AI)" submenu — the low-quality fal preset plus Vertex/Imagen 4 ×2/×4.
 @ViewBuilder func upscaleMenu(label: String = "Upscale (AI)",
                               fal: @escaping (UpscaleOption) -> Void,
                               imagen: @escaping (Int) -> Void) -> some View {
     Menu {
-        ForEach(upscaleOptions) { o in Button(o.label) { fal(o) } }
+        ForEach(upscaleOptions) { o in
+            Button { fal(o) } label: { serviceLabel(o.label, ServiceIcon.fal) }
+        }
         Divider()
-        Button("Upscale (Imagen 4) ×2") { imagen(2) }
-        Button("Upscale (Imagen 4) ×4") { imagen(4) }
+        Button { imagen(2) } label: { serviceLabel("Upscale (Imagen 4) ×2", ServiceIcon.vertex) }
+        Button { imagen(4) } label: { serviceLabel("Upscale (Imagen 4) ×4", ServiceIcon.vertex) }
     } label: { Label(label, systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {

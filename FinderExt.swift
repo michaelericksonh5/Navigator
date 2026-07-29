@@ -55,37 +55,39 @@ final class NavigatorFinderSync: FIFinderSync {
 
         let root = NSMenu()
 
-        // Top level, not tucked inside the submenu — this is the thing people reach
-        // for most, so it takes one click. Opens the folder the selection lives in
-        // (or the folder itself), rather than opening the file.
-        let loc = NSMenuItem(title: "Open Location in Navigator",
-                             action: #selector(openLocation(_:)), keyEquivalent: "")
-        loc.target = self
-        loc.image = Self.appIcon
-        root.addItem(loc)
-
+        // Everything lives under the one "Navigator" item. "Open Location" used to also
+        // sit at the top level for one-click reach, but next to the submenu's "Open in
+        // Navigator" it just read as the same command listed twice.
         let parent = NSMenuItem(title: "Navigator", action: nil, keyEquivalent: "")
         parent.image = Self.appIcon
         let sub = NSMenu()
 
-        add(sub, "Open in Navigator", "open")
+        add(sub, "Open in Navigator", "open", Self.appIcon)
+        let loc = NSMenuItem(title: "Open Location in Navigator",
+                             action: #selector(openLocation(_:)), keyEquivalent: "")
+        loc.target = self
+        loc.image = Self.appIcon
+        sub.addItem(loc)
 
         // Photoshop / After Effects entries only when that app is actually present,
-        // matching what Navigator itself shows.
+        // matching what Navigator itself shows. Each carries the icon of the app or
+        // service that does the work, so you can tell at a glance what a row will
+        // launch. One separator divides "open" from "do something", which is the only
+        // grouping worth a gap — two of them left the short menu looking sparse.
         if hasImage || hasFolder {
+            sub.addItem(.separator())
             if Self.installed("com.adobe.Photoshop") {
-                sub.addItem(.separator())
-                add(sub, "Remove BG", "removebg")
+                add(sub, "Remove BG", "removebg", Self.psIcon)
             }
             if Self.installed("com.adobe.AfterEffects"), hasPNG || hasFolder {
-                add(sub, "Chroma Key BG", "chromakey")
+                add(sub, "Chroma Key BG", "chromakey", Self.aeIcon)
             }
-            sub.addItem(.separator())
             let up = NSMenuItem(title: "Upscale (AI)", action: nil, keyEquivalent: "")
+            up.image = Self.icon(systemSymbol: "arrow.up.left.and.arrow.down.right")
             let upSub = NSMenu()
-            add(upSub, "Upscale Low Quality ×4", "upscale-lowq")
-            add(upSub, "Upscale (Imagen 4) ×2", "upscale-imagen2")
-            add(upSub, "Upscale (Imagen 4) ×4", "upscale-imagen4")
+            add(upSub, "Upscale Low Quality ×4", "upscale-lowq", Self.falIcon)
+            add(upSub, "Upscale (Imagen 4) ×2", "upscale-imagen2", Self.vertexIcon)
+            add(upSub, "Upscale (Imagen 4) ×4", "upscale-imagen4", Self.vertexIcon)
             up.submenu = upSub
             sub.addItem(up)
         }
@@ -95,10 +97,11 @@ final class NavigatorFinderSync: FIFinderSync {
         return root
     }
 
-    private func add(_ menu: NSMenu, _ title: String, _ action: String) {
+    private func add(_ menu: NSMenu, _ title: String, _ action: String, _ image: NSImage? = nil) {
         let item = NSMenuItem(title: title, action: #selector(runAction(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = action
+        item.image = image
         menu.addItem(item)
     }
 
@@ -162,9 +165,37 @@ final class NavigatorFinderSync: FIFinderSync {
         .deletingLastPathComponent()   // PlugIns
         .deletingLastPathComponent()   // Contents
         .deletingLastPathComponent()   // Navigator.app
-    private static let appIcon: NSImage? = {
-        let img = NSWorkspace.shared.icon(forFile: appURL.path)
-        img.size = NSSize(width: 16, height: 16)
+    // MARK: - Menu icons
+    //
+    // A menu lays icons out at the NSImage's own size, so everything here is stamped
+    // to 16pt. Miss that and a 32pt app icon stretches its row and throws the whole
+    // menu's spacing out.
+    private static let iconSize = NSSize(width: 16, height: 16)
+
+    private static func sized(_ img: NSImage?) -> NSImage? {
+        img?.size = iconSize
         return img
-    }()
+    }
+    /// The installed app's own icon, or nil when it isn't there.
+    private static func appIcon(_ bundleID: String) -> NSImage? {
+        guard let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
+        return sized(NSWorkspace.shared.icon(forFile: u.path))
+    }
+    private static func icon(systemSymbol: String) -> NSImage? {
+        sized(NSImage(systemSymbolName: systemSymbol, accessibilityDescription: nil))
+    }
+    /// A PNG bundled in Assets/, falling back to an SF Symbol so a missing file
+    /// degrades to a sensible glyph instead of a blank gap. Vertex has no installed
+    /// app to borrow an icon from, and fal is a web service — hence bundling.
+    private static func bundled(_ name: String, fallback symbol: String) -> NSImage? {
+        if let u = Bundle.main.url(forResource: name, withExtension: "png"),
+           let img = NSImage(contentsOf: u) { return sized(img) }
+        return icon(systemSymbol: symbol)
+    }
+
+    private static let appIcon: NSImage? = sized(NSWorkspace.shared.icon(forFile: appURL.path))
+    private static let psIcon: NSImage? = appIcon("com.adobe.Photoshop")
+    private static let aeIcon: NSImage? = appIcon("com.adobe.AfterEffects")
+    private static let vertexIcon: NSImage? = bundled("vertex", fallback: "sparkles")
+    private static let falIcon: NSImage? = bundled("fal", fallback: "bolt.fill")
 }
