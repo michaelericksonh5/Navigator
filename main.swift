@@ -8121,7 +8121,7 @@ struct NanoBananaModel: Identifiable, Hashable {
         NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image", name: "Nano Banana Pro",
                         note: "Highest quality."),
         NanoBananaModel(flag: "nb1", id: "gemini-2.5-flash-image", name: "Nano Banana 1",
-                        note: "The original, tuned for editing. Currently the only one this Vertex project has access to."),
+                        note: "The original, tuned for editing. The only one the AI hub currently reaches — see below."),
     ]
     static func byFlag(_ f: String) -> NanoBananaModel { all.first { $0.flag == f } ?? all[0] }
 }
@@ -8352,7 +8352,7 @@ struct RestyleSheet: View {
             Picker("Model", selection: $modelFlag) {
                 ForEach(models) { m in
                     let gone = RestyleAvailability.unavailable.contains(m.flag)
-                    Text(gone ? "\(m.name) — not enabled on this project" : m.name).tag(m.flag)
+                    Text(gone ? "\(m.name) — hub can’t reach it yet" : m.name).tag(m.flag)
                 }
             }
             .onChange(of: modelFlag) { if !sizes.contains(size) { size = sizes.first ?? "1K" } }
@@ -8488,7 +8488,7 @@ struct RestyleSheet: View {
                     RestyleAvailability.mark(flag)
                     if flag != "nb1" {
                         modelFlag = "nb1"
-                        failure = "This Vertex project has no access to that model. Switched to Nano Banana 1 — press Restyle again."
+                        failure = "The AI hub can’t reach that model yet — it asks Vertex for a retired \"-preview\" ID and ignores the model sent, so every model but Nano Banana 1 fails. Not a Vertex access problem. Switched to Nano Banana 1 — press Restyle again."
                         return
                     }
                 }
