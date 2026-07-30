@@ -185,23 +185,40 @@ enum RestyleRules {
 
     // MARK: - Vision prompts (describe an image in text, via /v1/vision)
 
-    /// Names what must survive a restyle — species/type, face, markings, defining worn
-    /// items — deliberately excluding pose, action and setting, which a restyle is
-    /// allowed (often asked) to change. Read on the SOURCE image.
+    /// Describes WHAT IS IN the source image and HOW IT IS LAID OUT, so a restyle can
+    /// change the rendering without losing content. Read on the SOURCE image.
+    ///
+    /// This started out character-centric — "describe the persistent IDENTITY of the
+    /// main subject" — and that failed badly on real work. Given a slot pay table
+    /// holding ~20 symbols, four pay panels and dozens of numbers, it picked the one
+    /// hooded avatar inside it and returned "a mysterious shadowy figure wearing a
+    /// hooded sweatshirt"; the restyle then dutifully produced exactly that, one
+    /// character full-frame, and the entire layout was gone. Most art here is a sheet
+    /// or art board, not a single subject, so "the main subject" was the wrong frame.
+    ///
+    /// It also used to invite "distinguishing markings or colouring" and "colour
+    /// scheme", which is actively counterproductive: colour and texture are precisely
+    /// what a restyle replaces, so naming them drags the old look into the new one.
+    /// Style is now explicitly forbidden here and lives only in styleSystemPrompt.
     static let identitySystemPrompt = """
-        Describe the persistent IDENTITY of the main subject in this image, so it can be
-        named as an explicit anchor when the image is redrawn in a different style or pose.
+        Describe WHAT IS IN this image and HOW IT IS LAID OUT, so it can be redrawn in a         completely different art style without losing any content.
 
-        Include: subject type or species, face/head shape, distinguishing markings or \
-        colouring, and any worn items or accessories that define who this is (clothing \
-        style, equipment, colour scheme).
+        The image may be any of these — describe whichever it actually is:
+        - a sheet or art board holding many symbols, icons and labels (very common)
+        - a single character, creature, or object
+        - a background, environment or scene with no characters at all
+        - a UI element: panel, frame, banner, button, badge, pay table
 
-        Do NOT include: pose, action, camera angle, or background/setting — a restyle is \
-        allowed to change all of those; only identity must survive.
+        Always cover:
+        - What kind of image it is, in an opening clause.
+        - The layout: how many distinct elements there are and how they are arranged         (grid, rows, columns, groups) and roughly where each sits.
+        - Every distinct element, briefly — what it depicts. Account for all of them.
+        - ALL visible text, numbers and labels, transcribed EXACTLY, and where each belongs.
+        - Structural parts: frames, panels, borders, dividers, badges.
 
-        Output one compact sentence of concrete nouns and adjectives, under 40 words, no \
-        preamble. Example shape: "An anthropomorphic lion woman with a golden mane, lion \
-        face and muzzle, and tan Jedi-style robes with leather gloves."
+        NEVER describe: art style, colour, palette, texture, shading, lighting, glow,         finish, or mood. Every one of those is being replaced, and naming them pulls the         old look into the new one.
+
+        Be complete rather than brief — if there are twenty symbols, account for twenty.         Plain prose or a compact list. No preamble.
         """
 
     /// Extracts a reusable ART STYLE from a reference image, read on the REFERENCE.
@@ -232,51 +249,94 @@ enum RestyleRules {
     // MARK: - Prompts
 
     /// Single-image restyle: no reference, just the source and a typed description of
-    /// the desired look. Identity anchors are stated FIRST and the style change LAST —
-    /// reordering a working prompt to lead with the change and follow with "but keep X"
-    /// measurably let identity drift on live runs; stating what must survive before
-    /// what should change did not.
+    /// the desired look. Contents are stated FIRST and the style change LAST —
+    /// reordering to lead with the change and follow with "but keep X" measurably let
+    /// content drift on live runs.
+    ///
+    /// The preservation clause used to read "This exact character must remain
+    /// unchanged… same species, same face, same markings, same clothing", which is
+    /// meaningless for a pay table or a background and actively harmful: it told the
+    /// model to think in terms of a creature, and a 20-symbol art board came back as
+    /// one hooded figure. It now protects elements, counts, layout and text instead.
     static func restylePrompt(identityAnchors: String, styleText: String, extra: String = "") -> String {
-        let anchors = anchorClause(identityAnchors, fallback: "same subject, same species, same face, same markings, same clothing.")
-        var p = "This exact character must remain completely unchanged: " + anchors
-            + " Same pose and composition, same aspect ratio, same text and lettering.\n\n"
-            + "Redraw ONLY the rendering style, to match the following art style.\n\n"
-            + "ART STYLE: \(styleText.trimmingCharacters(in: .whitespacesAndNewlines))"
+        let contents = anchorClause(identityAnchors,
+                                    fallback: "everything currently in the image, exactly as arranged.")
+        let style = styleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var p = """
+            \(preserveClause)
+
+            CONTENTS TO PRESERVE: \(contents)
+
+            Now replace the art style of this image with the following:
+
+            ART STYLE: \(style)
+            """
         let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !e.isEmpty { p += "\n\nADDITIONAL DIRECTION: \(e)" }
+        if !e.isEmpty { p += "\n\nADDITIONAL STYLE NOTES: \(e)" }
         return p
     }
 
-    /// Two-image restyle: a real style-reference image is sent alongside the source.
-    /// This exact shape — role labels, source described as "IMAGE 1", reference as
-    /// "IMAGE 2", identity anchors named as text before the style instruction — is the
-    /// one combination that held identity 2/2 on a live model; generic role labels
-    /// alone (no named anchors) failed on the same pairing. `anchors` empty is
-    /// possible (the field is optional in the UI) and falls back to generic wording,
-    /// same as the single-image path, at the same reduced reliability.
+    /// Two-image restyle: a real style-reference image alongside the source. Role
+    /// labels ("IMAGE 1 is…", "IMAGE 2 is a style reference only…") are what keep the
+    /// reference's own subject out of the output; without them the reference took the
+    /// output over entirely on live runs.
     static func restylePromptTwoImage(identityAnchors: String, extra: String = "") -> String {
-        let anchors = anchorClause(identityAnchors, fallback: "keep its subject, species, face, markings and clothing exactly as they are.")
-        var p = "IMAGE 1 is the exact character to redraw: " + anchors
-            + " Keep this exact character unchanged — same species, same face, same markings, same clothing, "
-            + "same pose and composition.\n\n"
-            + "IMAGE 2 is a STYLE reference only. Do not copy its subject, objects, or text — "
-            + "none of its content may appear in the output.\n\n"
-            + "Redraw IMAGE 1's exact character using IMAGE 2's rendering technique, colour palette, "
-            + "linework and lighting only."
+        let contents = anchorClause(identityAnchors,
+                                    fallback: "everything currently in IMAGE 1, exactly as arranged.")
+        var p = """
+            IMAGE 1 is the artwork to redraw. \(preserveClause)
+
+            CONTENTS OF IMAGE 1 TO PRESERVE: \(contents)
+
+            IMAGE 2 is a STYLE reference ONLY. Do not copy its subject, objects, layout \
+            or text — none of its content may appear in the output.
+
+            Now replace the art style of IMAGE 1 with the art style of IMAGE 2 — its \
+            rendering technique, colour palette, linework and lighting only.
+            """
         let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !e.isEmpty { p += "\n\nADDITIONAL DIRECTION: \(e)" }
+        if !e.isEmpty { p += "\n\nADDITIONAL STYLE NOTES: \(e)" }
         return p
     }
 
-    /// The identity clause used by both prompt shapes: user-typed anchors if present
-    /// (with a trailing period ensured, so it doesn't run into the next sentence —
-    /// "...leather gloves Keep this exact character..." with no punctuation between
-    /// them, which a live run tolerated but shouldn't have needed to), else a generic
-    /// fallback.
+    /// The contents clause used by both prompt shapes: the description if there is one
+    /// (with a trailing period ensured so it doesn't run into the next sentence), else a
+    /// generic fallback that still forbids reinterpretation.
     private static func anchorClause(_ raw: String, fallback: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fallback }
         return trimmed.hasSuffix(".") ? trimmed : trimmed + "."
+    }
+
+    /// The content-preservation demand shared by both prompt shapes. Deliberately about
+    /// elements, counts, layout and text rather than a character — a pay table, a
+    /// background and a UI panel all have to survive this, not just a creature.
+    private static let preserveClause = """
+        Keep every part of the content exactly as it is: each element, its position, size \
+        and count, the overall layout, and all text and numbers character-for-character. Do \
+        not add, remove, merge, crop, rearrange or reinterpret anything, and do not collapse \
+        a multi-element layout into a single subject.
+        """
+
+    /// Style words that should NOT appear in a CONTENTS description. The contents field
+    /// says what must survive; naming colour or texture there fights the new style
+    /// instead of protecting the layout. Shown as a caution, not a block — the artist
+    /// may have a reason.
+    static let styleWordsInContent = ["neon", "glowing", "glow", "glitchy", "pixelated",
+                                      "cyan", "magenta", "aesthetic", "aesthetics",
+                                      "palette", "gradient", "shading", "textured",
+                                      "retro", "vibrant", "hued", "colour", "color"]
+
+    /// Style words found in a contents description.
+    static func styleLeaksInContents(_ text: String) -> [String] {
+        let lower = text.lowercased()
+        return styleWordsInContent.filter { w in
+            guard let r = lower.range(of: w) else { return false }
+            let before = r.lowerBound == lower.startIndex ? " "
+                : String(lower[lower.index(before: r.lowerBound)])
+            let after = r.upperBound == lower.endIndex ? " " : String(lower[r.upperBound])
+            return !before.first!.isLetter && !after.first!.isLetter
+        }
     }
 
     /// Words that mean a typed style description drifted into describing a subject
