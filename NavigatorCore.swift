@@ -111,35 +111,35 @@ enum PathRules {
 
 /// Rules for "Restyle (AI)" — the pure, testable parts.
 ///
-/// Everything here is Vertex-only, on purpose. An earlier version read a dropped
-/// reference image's style, and the source image's identity, via a vision model
-/// reached through fal — because the metered Vertex service has no endpoint that
-/// returns TEXT from an image (confirmed by probing eight plausible route names,
-/// all 404, and by watching /v1/images silently drop response_modalities and
-/// thinking_level and return image-only no matter what's asked). Told to stop using
-/// fal entirely, that vision pre-pass was removed. What replaced it, in order of
-/// what was actually measured against the live service:
+/// Everything here is Vertex-only. Two things were wrong at different points and
+/// are worth recording so they don't get re-learned the hard way:
 ///
-/// 1. Generic preservation wording ("keep the subject exactly as it is") is not an
-///    anchor. The exact same single-image request, run twice, turned a lion
-///    character into two different human men — reproduced, not noise.
-/// 2. Naming concrete identity anchors instead — species/type, face, markings,
-///    defining worn items — fixed that 2/2 on a single image.
-/// 3. Asking a single Vertex call to "identify then preserve" a real second
-///    reference image's subject, IN THE SAME generation pass, failed 3/3 across two
-///    phrasings (the source became a fox, a mech-suited cat, a human swordsman) —
-///    self-derived anchors inside one call are not reliable.
-/// 4. Supplying the SAME kind of anchors as already-known text (not self-derived)
-///    alongside a real second reference image, under explicit role labels ("IMAGE 1
-///    is the exact character… IMAGE 2 is a style reference only…"), worked 2/2.
+/// 1. There is no Vertex endpoint that returns TEXT from an image — confirmed by
+///    probing ~15 plausible route names (all 404) and by posting real vision
+///    models straight to /v1/images, which correctly rejects anything outside its
+///    four-model image-generation allowlist. A vision pre-pass briefly went
+///    through fal to work around that; told to stop, which is how /v1/vision came
+///    to exist instead — a small endpoint on the SAME Vertex service, added
+///    specifically for this (see the ops runbook).
+/// 2. Separately, and discovered only while wiring up /v1/vision: the image
+///    generation call (H5GService.image) was silently sending every input image
+///    under the wrong JSON key ("data" instead of "base64", the key the service
+///    actually reads). No error, no 400 — the image was just never attached.
+///    Proved directly: a request naming a completely different subject, with a
+///    real photo attached under the wrong key, generated the wrong subject with
+///    zero trace of the real photo. Every restyle before that fix was pure
+///    text-to-image generation from the prompt, not an edit of the source — it
+///    only ever looked like editing when the prompt's identity anchors were
+///    specific enough to regenerate something recognizable from scratch.
 ///
-/// Net effect: identity anchors must exist as text before generation, and nothing
-/// on Vertex can produce that text from a photo today, so the person restyling
-/// types them. `restylePrompt` handles no reference (anchors + a style
-/// description); `restylePromptTwoImage` reproduces the one two-image arrangement
-/// proven to hold identity, and must not be reordered without re-testing — the
-/// working order (source image first, reference second) is not what a naive
-/// "last image wins" rule would predict.
+/// With that fixed, the source image is a genuine edit target and a reference
+/// image is a genuine second input. Named identity anchors ("golden mane, lion
+/// face" rather than "the subject") remain the right call regardless — it's
+/// Google's own documented guidance for holding identity through an edit, not a
+/// workaround for the transport bug — but they're no longer trying to make up
+/// for an image that was never there. `restylePrompt` handles no reference;
+/// `restylePromptTwoImage` handles a real second reference image, source first,
+/// reference second — re-test before reordering.
 enum RestyleRules {
 
     // MARK: - Aspect ratio
@@ -182,6 +182,52 @@ enum RestyleRules {
     /// the newer models do render. Anything a model refuses comes back as a plain API
     /// error, which is better than a picker that quietly withholds an option.
     static func sizes(forModelFlag flag: String) -> [String] { ["1K", "2K", "4K"] }
+
+    // MARK: - Vision prompts (describe an image in text, via /v1/vision)
+
+    /// Names what must survive a restyle — species/type, face, markings, defining worn
+    /// items — deliberately excluding pose, action and setting, which a restyle is
+    /// allowed (often asked) to change. Read on the SOURCE image.
+    static let identitySystemPrompt = """
+        Describe the persistent IDENTITY of the main subject in this image, so it can be
+        named as an explicit anchor when the image is redrawn in a different style or pose.
+
+        Include: subject type or species, face/head shape, distinguishing markings or \
+        colouring, and any worn items or accessories that define who this is (clothing \
+        style, equipment, colour scheme).
+
+        Do NOT include: pose, action, camera angle, or background/setting — a restyle is \
+        allowed to change all of those; only identity must survive.
+
+        Output one compact sentence of concrete nouns and adjectives, under 40 words, no \
+        preamble. Example shape: "An anthropomorphic lion woman with a golden mane, lion \
+        face and muzzle, and tan Jedi-style robes with leather gloves."
+        """
+
+    /// Extracts a reusable ART STYLE from a reference image, read on the REFERENCE.
+    /// The hard rules are load-bearing and were tuned against a live model: a version
+    /// that only said "don't mention the subject" still returned "fine strands of fur"
+    /// and "sheen of leather" for a lion in leather robes — material nouns that would
+    /// grow fur on a fish. Naming the banned materials explicitly, and asking for
+    /// rendering behaviour instead, produced zero leakage.
+    static let styleSystemPrompt = """
+        You extract a reusable ART STYLE from a reference image so it can be applied \
+        to a COMPLETELY DIFFERENT subject.
+
+        Describe ONLY: medium and rendering technique, brush/line quality, palette and \
+        colour temperature, lighting character and direction, contrast and value range, \
+        surface finish, edge treatment, level of detail, grain/texture, and overall mood.
+
+        HARD RULES — breaking these ruins the result:
+        - Never name or imply the subject: no species, creature, person, character, \
+        clothing, props, setting, or body parts.
+        - Never name materials that belong to the subject (e.g. fur, hair, scales, \
+        feathers, skin, leather, fabric, metal armour). Describe HOW surfaces are \
+        rendered instead — "fine high-frequency detail on organic surfaces", \
+        "soft specular sheen".
+        - No composition, framing, pose, or background layout.
+        - Output style directives only, as one dense paragraph under 110 words, no preamble.
+        """
 
     // MARK: - Prompts
 
