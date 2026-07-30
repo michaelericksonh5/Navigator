@@ -427,6 +427,36 @@ final class RestyleRulesTests: XCTestCase {
     func testRestylePromptOmitsEmptyExtra() {
         XCTAssertFalse(RestyleRules.restylePrompt(identityAnchors: "a", styleText: "x", extra: "   ").contains("ADDITIONAL"))
     }
+
+    // Two-image prompt: the exact shape that held identity 2/2 on a live model.
+    // Regression-testing its structure, not just its substring contents, matters here
+    // — a refactor that keeps the words but drops the role labels would reintroduce
+    // the subject-bleed bug this shape exists to prevent.
+    func testTwoImagePromptLabelsBothImageRoles() {
+        let p = RestyleRules.restylePromptTwoImage(identityAnchors: "a lion character")
+        XCTAssertTrue(p.contains("IMAGE 1 is the exact character"))
+        XCTAssertTrue(p.contains("IMAGE 2 is a STYLE reference only"))
+        XCTAssertTrue(p.contains("a lion character"))
+    }
+
+    func testTwoImagePromptIdentityPrecedesStyleRole() {
+        let p = RestyleRules.restylePromptTwoImage(identityAnchors: "ANCHOR_MARKER")
+        XCTAssertLessThan(p.range(of: "ANCHOR_MARKER")!.lowerBound, p.range(of: "IMAGE 2")!.lowerBound)
+    }
+
+    func testTwoImagePromptEmptyAnchorsFallBackToGenericWording() {
+        let p = RestyleRules.restylePromptTwoImage(identityAnchors: "  ")
+        XCTAssertTrue(p.contains("keep its subject"))
+    }
+
+    func testTwoImagePromptAddsExtra() {
+        let p = RestyleRules.restylePromptTwoImage(identityAnchors: "a", extra: "brighter gold trim")
+        XCTAssertTrue(p.contains("ADDITIONAL DIRECTION: brighter gold trim"))
+    }
+
+    func testTwoImagePromptOmitsEmptyExtra() {
+        XCTAssertFalse(RestyleRules.restylePromptTwoImage(identityAnchors: "a", extra: "  ").contains("ADDITIONAL"))
+    }
 }
 
 // Padding decision: an odd shape needs a backing canvas, a standard one doesn't.
