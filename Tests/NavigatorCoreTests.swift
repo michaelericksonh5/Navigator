@@ -567,10 +567,14 @@ final class RestyleContentPreservationTests: XCTestCase {
         XCTAssertFalse(sp.contains("the main subject"), "'the main subject' is what caused the failure")
     }
 
-    // …and must forbid describing style, which is what a restyle replaces.
+    // …and must forbid describing style — colour explicitly and repeatedly, since a
+    // live vision model was measured NOT fully complying with a single soft mention
+    // of "colour" ("dark reddish-brown wooden plank" slipped through) — plus the
+    // other style axes a restyle replaces.
     func testVisionPromptForbidsStyleWords() {
         let sp = RestyleRules.identitySystemPrompt.lowercased()
-        XCTAssertTrue(sp.contains("never describe"))
+        XCTAssertTrue(sp.contains("never mention"))
+        XCTAssertTrue(sp.contains("colour, shade, tone or hue"), "must forbid colour explicitly, not just generically")
         for banned in ["colour scheme", "distinguishing markings or colouring"] {
             XCTAssertFalse(sp.contains(banned), "vision prompt still invites \(banned)")
         }
@@ -614,5 +618,59 @@ extension RestyleContentPreservationTests {
         XCTAssertTrue(two.contains("Now replace the art style of IMAGE 1 with the art style of IMAGE 2"))
         XCTAssertLessThan(two.range(of: "CONTENTS OF IMAGE 1 TO PRESERVE")!.lowerBound,
                           two.range(of: "Now replace the art style")!.lowerBound)
+    }
+}
+
+
+// The A/B regression that proved leaked colour language actually constrains a
+// restyle's output, not just reads badly, plus the fix's own false-positive fix.
+final class RestyleColorLeakTests: XCTestCase {
+
+    // The exact failure: a real vision-model output described the panel as "dark
+    // reddish-brown wood" despite being told never to mention colour. The narrow
+    // original word list (curated from a single earlier example) missed it entirely.
+    func testCatchesTheRealMaterialColorLeak() {
+        let leaked = "A wide, dark reddish-brown wooden plank board with subtle carved "
+                   + "tribal patterns."
+        XCTAssertTrue(RestyleRules.styleLeaksInContents(leaked).contains("brown"),
+                      "must catch \"reddish-brown\" as a whole-word \"brown\" match")
+    }
+
+    // Quoted on-image text is required transcription, not a style leak. A fully
+    // compliant description that quotes a wordmark like "VOLCANO GOLD" must not be
+    // flagged just because the wordmark happens to contain a colour word.
+    func testQuotedTextIsExemptFromTheColorScan() {
+        let clean = "Bottom word: \"VOLCANO GOLD\" in rounded block letters curving along a ribbon."
+        XCTAssertEqual(RestyleRules.styleLeaksInContents(clean), [])
+    }
+
+    // The same sentence WITHOUT quotes around the colour word must still be caught —
+    // proves the exemption is quote-scoped, not accidentally global.
+    func testUnquotedColorNearQuotedTextIsStillCaught() {
+        let mixed = "A gold-trimmed panel below the text \"VOLCANO GOLD\"."
+        XCTAssertEqual(RestyleRules.styleLeaksInContents(mixed), ["gold"])
+    }
+
+    // Real remaining leaks (lighting/texture words the model still let through after
+    // the strengthened system prompt) must still be caught — the quote fix must not
+    // have accidentally widened the exemption.
+    func testStillCatchesNonColorStyleWordsOutsideQuotes() {
+        let leaked = "Framed by a soft ambient outer glow, with a textured pattern inside the letters."
+        let found = Set(RestyleRules.styleLeaksInContents(leaked))
+        XCTAssertTrue(found.contains("glow"))
+        XCTAssertTrue(found.contains("textured"))
+    }
+
+    func testMultipleQuotedSpansAreAllExempt() {
+        let clean = "Label below: \"BONUS\" ... Label below: \"GOLD RUSH\" ... Label below: \"RED HOT\"."
+        XCTAssertEqual(RestyleRules.styleLeaksInContents(clean), [])
+    }
+
+    // An unterminated quote must not eat the rest of the string and hide a real leak
+    // — a malformed/truncated vision response should fail safe (still warn), not
+    // silently swallow everything after a stray quote mark.
+    func testUnterminatedQuoteDoesNotSwallowRealLeaks() {
+        let text = "A gold frame with the text \"UNFINISHED"
+        XCTAssertEqual(RestyleRules.styleLeaksInContents(text), ["gold"])
     }
 }

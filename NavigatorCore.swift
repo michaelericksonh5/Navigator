@@ -201,7 +201,7 @@ enum RestyleRules {
     /// what a restyle replaces, so naming them drags the old look into the new one.
     /// Style is now explicitly forbidden here and lives only in styleSystemPrompt.
     static let identitySystemPrompt = """
-        Describe WHAT IS IN this image and HOW IT IS LAID OUT, so it can be redrawn in a         completely different art style without losing any content.
+        Describe WHAT IS IN this image and HOW IT IS LAID OUT, so it can be redrawn in a completely different art style without losing any content.
 
         The image may be any of these — describe whichever it actually is:
         - a sheet or art board holding many symbols, icons and labels (very common)
@@ -211,14 +211,14 @@ enum RestyleRules {
 
         Always cover:
         - What kind of image it is, in an opening clause.
-        - The layout: how many distinct elements there are and how they are arranged         (grid, rows, columns, groups) and roughly where each sits.
+        - The layout: how many distinct elements there are and how they are arranged (grid, rows, columns, groups) and roughly where each sits.
         - Every distinct element, briefly — what it depicts. Account for all of them.
         - ALL visible text, numbers and labels, transcribed EXACTLY, and where each belongs.
         - Structural parts: frames, panels, borders, dividers, badges.
 
-        NEVER describe: art style, colour, palette, texture, shading, lighting, glow,         finish, or mood. Every one of those is being replaced, and naming them pulls the         old look into the new one.
+        NEVER mention: colour, shade, tone or hue of ANYTHING — not the background, not a border, not a material. "wooden", "metal", "leaf" are fine as WHAT something is; "dark reddish-brown wood", "green leaf", "gold border" are not, because the colour word alone is enough to drag the old palette into a restyle that changes it. If you would name a colour, describe the material or shape instead and stop there. Also never mention: art style, palette, texture, shading, lighting, glow, finish, or mood — all replaced, all forbidden for the same reason.
 
-        Be complete rather than brief — if there are twenty symbols, account for twenty.         Plain prose or a compact list. No preamble.
+        Be complete rather than brief — if there are twenty symbols, account for twenty. Plain prose or a compact list. No preamble.
         """
 
     /// Extracts a reusable ART STYLE from a reference image, read on the REFERENCE.
@@ -322,14 +322,45 @@ enum RestyleRules {
     /// says what must survive; naming colour or texture there fights the new style
     /// instead of protecting the layout. Shown as a caution, not a block — the artist
     /// may have a reason.
+    ///
+    /// Started as a dozen buzzwords curated from one earlier failure (a neon slot
+    /// symbol description) and that was too narrow: tested on a real vision-model
+    /// output, it missed "dark reddish-brown wooden plank" entirely, and an A/B
+    /// restyle proved that leak was not cosmetic — the version WITH "dark
+    /// reddish-brown" in the contents came back with a visibly darker, redder panel
+    /// than the version with it removed, on an otherwise identical prompt. Broadened
+    /// to plain colour names, since those are what actually constrain a recolor, not
+    /// just the buzzwords one bad example happened to use.
     static let styleWordsInContent = ["neon", "glowing", "glow", "glitchy", "pixelated",
-                                      "cyan", "magenta", "aesthetic", "aesthetics",
-                                      "palette", "gradient", "shading", "textured",
-                                      "retro", "vibrant", "hued", "colour", "color"]
+                                      "aesthetic", "aesthetics", "palette", "gradient",
+                                      "shading", "textured", "retro", "vibrant", "hued",
+                                      "colour", "color", "shade", "tone", "hue",
+                                      "red", "reddish", "orange", "yellow", "green",
+                                      "blue", "cyan", "magenta", "purple", "violet",
+                                      "pink", "brown", "black", "white", "grey", "gray",
+                                      "gold", "golden", "silver", "bronze", "copper",
+                                      "dark", "light", "bright", "pale", "deep", "muted",
+                                      "pastel", "warm-toned", "cool-toned"]
 
-    /// Style words found in a contents description.
+    /// Style words found in a contents description, OUTSIDE quoted text.
+    ///
+    /// A contents description legitimately quotes on-image text verbatim — "VOLCANO
+    /// GOLD" as a wordmark — and that quoted colour word is required transcription,
+    /// not a style leak; scanning it anyway flagged a clean, fully-compliant
+    /// description as if it had a problem. Quoted spans are blanked out before the
+    /// scan so only the surrounding prose (which is where a real leak lives) counts.
     static func styleLeaksInContents(_ text: String) -> [String] {
-        let lower = text.lowercased()
+        var scan = text
+        for quote in ["\"", "\u{201C}\u{201D}"] {
+            let opens = quote == "\"" ? "\"" : "\u{201C}"
+            let closes = quote == "\"" ? "\"" : "\u{201D}"
+            while let start = scan.range(of: opens),
+                  let end = scan.range(of: closes, range: start.upperBound..<scan.endIndex) {
+                scan.replaceSubrange(start.lowerBound..<end.upperBound,
+                                     with: String(repeating: " ", count: scan.distance(from: start.lowerBound, to: end.upperBound)))
+            }
+        }
+        let lower = scan.lowercased()
         return styleWordsInContent.filter { w in
             guard let r = lower.range(of: w) else { return false }
             let before = r.lowerBound == lower.startIndex ? " "
