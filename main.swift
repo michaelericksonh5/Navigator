@@ -8409,6 +8409,12 @@ struct RestyleSheet: View {
     @State private var progress = ""
     @State private var status = ""
     @State private var failure = ""
+    // How many restyles run at once during "Restyle All". Kept adjustable rather than
+    // hardcoded: the AI hub's Cloud Run concurrency ceiling wasn't something this could
+    // confirm directly (gcloud auth had expired when this was written), so 4 is a
+    // conservative starting default, not a measured safe maximum. Per-item transient
+    // retry (503/429) already absorbs occasional contention either way.
+    @State private var parallelism = 4
 
     init(sources: [URL], onFinished: @escaping (URL) -> Void, onClose: @escaping () -> Void) {
         let list = sources.map { RestyleItem(url: $0) }
@@ -8663,6 +8669,11 @@ struct RestyleSheet: View {
                 if batchRunning {
                     Button("Stop") { cancelRequested = true }.keyboardShortcut(.cancelAction)
                 } else {
+                    if remaining > 1 {
+                        Picker("Parallel", selection: $parallelism) {
+                            ForEach([1, 2, 4, 8], id: \.self) { Text("\($0)×").tag($0) }
+                        }.frame(width: 130).help("How many images restyle at once during Restyle All")
+                    }
                     Button("Close") { onClose() }.keyboardShortcut(.cancelAction).disabled(anyRunning)
                     Button("Restyle This") { runOne() }.disabled(!canRun)
                     Button("Restyle All (\(remaining))") { runBatch() }
@@ -8887,86 +8898,102 @@ struct RestyleSheet: View {
         }
     }
 
-    /// Walk the queue in order. Each image gets its own identity read first (unless it
-    /// already has one), then its own restyle. One failure marks that item and moves
-    /// on rather than stopping the run — a 20-image batch shouldn't die on image 3.
+    /// Runs the whole queue with up to `parallelism` restyles in flight at once. Each
+    /// image gets its own identity read first (unless it already has one), then its
+    /// own restyle. One failure marks that item and moves on rather than stopping the
+    /// run — a 20-image batch shouldn't die on image 3.
+    ///
+    /// Every `items[...]`, `completed`, `failed` and `totalCost` touch happens inside a
+    /// `DispatchQueue.main.async` block, even though several workers are running at
+    /// once — main is a single serial queue, so these can never actually collide with
+    /// each other no matter how many workers schedule them concurrently. A worker's
+    /// OWN copy of the item it was handed (captured once, before any of this starts)
+    /// is what it reads for the source URL and starting identity, so it never reads
+    /// the live @State array off-main while another worker might be writing it.
+    ///
+    /// With several running at once there's no single "the current image" to follow,
+    /// so — unlike the one-at-a-time version this replaced — nothing forces the
+    /// selection to chase a particular row. Every active row is already called out by
+    /// its own highlighted, bold state in the list; that's the "what's happening now"
+    /// signal now, not the preview pane.
     private func runBatch() {
-        let todo = items.filter { !$0.state.isTerminal }.map { $0.url }
-        guard !todo.isEmpty else { return }
+        let queued = items.filter { !$0.state.isTerminal }
+        guard !queued.isEmpty else { return }
         batchRunning = true; cancelRequested = false; failure = ""
+        let total = queued.count
         var completed = 0, failed = 0
         var totalCost = 0.0
+        let group = DispatchGroup()
+        // Bounds actual concurrent restyles; queued-but-not-yet-started workers just
+        // block here rather than doing any work, so nothing beyond `parallelism` items
+        // is ever really in flight even though all of them are dispatched up front.
+        let gate = DispatchSemaphore(value: parallelism)
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            for (n, url) in todo.enumerated() {
-                if cancelRequested { break }
-
-                // Identity: reuse what's there, otherwise read it now.
-                var identity = ""
-                var sem = DispatchSemaphore(value: 0)
-                DispatchQueue.main.async {
-                    if let i = items.firstIndex(where: { $0.url == url }) {
-                        identity = items[i].identity
-                        items[i].state = identity.isEmpty ? .detecting : .running
-                        // Follow along, so the preview and the description field show the
-                        // image being worked on rather than whatever was selected when the
-                        // run started. detectIdentity() is guarded on !batchRunning, so
-                        // moving the selection here cannot kick off a competing read.
-                        selected = items[i].id
+        for item in queued {
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                gate.wait()
+                defer { gate.signal(); group.leave() }
+                if cancelRequested {
+                    DispatchQueue.main.async {
+                        if let i = items.firstIndex(where: { $0.url == item.url }) { items[i].state = .pending }
                     }
-                    progress = "\(n + 1) of \(todo.count) — \(url.lastPathComponent)"
-                    sem.signal()
+                    return
                 }
-                sem.wait()
 
-                if identity.isEmpty, let png = downscaledPNG(url) {
+                let hadIdentity = !item.identity.isEmpty
+                DispatchQueue.main.async {
+                    if let i = items.firstIndex(where: { $0.url == item.url }) {
+                        items[i].state = hadIdentity ? .running : .detecting
+                    }
+                }
+
+                var identity = item.identity
+                if identity.isEmpty, let png = downscaledPNG(item.url) {
                     identity = analyzeIdentity(sourcePNG: png).text ?? ""
                     let captured = identity
                     DispatchQueue.main.async {
-                        if let i = items.firstIndex(where: { $0.url == url }) {
+                        if let i = items.firstIndex(where: { $0.url == item.url }) {
                             items[i].identity = captured
                             items[i].state = .running
                         }
                     }
                 }
 
-                // Build the job on main (it reads @State), then work off it.
-                var job: Job?
-                sem = DispatchSemaphore(value: 0)
-                DispatchQueue.main.async {
-                    if let i = items.firstIndex(where: { $0.url == url }) {
-                        job = makeJob(for: items[i], identity: identity)
-                    }
-                    sem.signal()
-                }
+                // makeJob reads shared @State (style text, reference, model…), none of
+                // which changes mid-batch, so it's read once on main and handed to this
+                // worker as a plain value from here on.
+                var job: Job!
+                let sem = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async { job = makeJob(for: item, identity: identity); sem.signal() }
                 sem.wait()
-                guard let job else { continue }
 
                 let r = perform(job)
-                if let c = r.cost { totalCost += c }
-                if r.saved != nil { completed += 1 } else { failed += 1 }
 
                 DispatchQueue.main.async {
-                    guard let i = items.firstIndex(where: { $0.url == url }) else { return }
+                    if r.saved != nil { completed += 1 } else { failed += 1 }
+                    if let c = r.cost { totalCost += c }
+                    guard let i = items.firstIndex(where: { $0.url == item.url }) else { return }
                     if let saved = r.saved {
                         items[i].state = .done(saved)
                         onFinished(saved)
                     } else {
                         items[i].state = .failed(r.error ?? "Restyle failed.")
                     }
+                    let running = min(parallelism, total - completed - failed)
+                    progress = "\(completed + failed) of \(total) done · \(running) running"
                 }
             }
+        }
 
-            let done = completed, bad = failed, spent = totalCost, stopped = cancelRequested
-            DispatchQueue.main.async {
-                batchRunning = false
-                progress = ""
-                var parts = ["Restyled \(done)"]
-                if bad > 0 { parts.append("\(bad) failed") }
-                if stopped { parts.append("stopped early") }
-                status = parts.joined(separator: " · ") + String(format: " · $%.2f", spent)
-                navLog("restyle batch: \(done) ok, \(bad) failed, $\(String(format: "%.4f", spent))")
-            }
+        group.notify(queue: .main) {
+            batchRunning = false
+            progress = ""
+            var parts = ["Restyled \(completed)"]
+            if failed > 0 { parts.append("\(failed) failed") }
+            if cancelRequested { parts.append("stopped early") }
+            status = parts.joined(separator: " · ") + String(format: " · $%.2f", totalCost)
+            navLog("restyle batch: \(completed) ok, \(failed) failed, $\(String(format: "%.4f", totalCost))")
         }
     }
 }
