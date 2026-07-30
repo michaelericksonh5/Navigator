@@ -8230,8 +8230,44 @@ struct NanoBananaModel: Identifiable, Hashable {
 /// prompt's identity anchors were specific enough to regenerate something
 /// recognizable from scratch. Fixed; the source and any reference are now genuine
 /// inputs to the edit.
+/// Write a PNG to disk with the restyle recipe embedded in its own metadata.
+///
+/// Re-encodes from the decoded image rather than copying the source through with
+/// AddImageFromSource. That looked wasteful at first, but AddImageFromSource carries
+/// the ORIGINAL file's metadata along and will not reliably overwrite a key it
+/// already has — tested against a Photoshop-saved PNG, the output kept claiming
+/// "Adobe Photoshop 27.8" as its Software no matter what was passed in, which would
+/// have every restyled file lying about how it was made. PNG is lossless, so
+/// re-encoding costs pixels nothing; it just guarantees the metadata is ours alone.
+///
+/// Lands in the PNG's standard text chunks so anything can read it back (Preview's
+/// inspector, exiftool, `sips -g`, Navigator's own Get Info):
+///   Description — the full prompt actually sent
+///   Title       — the identity anchors that were preserved
+///   Software    — model and resolution
+/// Returns false on any failure so the caller can fall back to a plain write rather
+/// than losing the image entirely.
+@discardableResult
+func writePNGWithRestyleMetadata(_ png: Data, to dest: URL, identity: String, prompt: String,
+                                 model: String, size: String) -> Bool {
+    guard let src = CGImageSourceCreateWithData(png as CFData, nil),
+          let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
+          let out = CGImageDestinationCreateWithURL(dest as CFURL, "public.png" as CFString, 1, nil)
+    else { return false }
+    var pngMeta: [CFString: Any] = [
+        kCGImagePropertyPNGSoftware: "Navigator Restyle — \(model), \(size)",
+        kCGImagePropertyPNGCreationTime: ISO8601DateFormatter().string(from: Date()),
+    ]
+    let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !p.isEmpty { pngMeta[kCGImagePropertyPNGDescription] = p }
+    let id = identity.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !id.isEmpty { pngMeta[kCGImagePropertyPNGTitle] = id }
+    CGImageDestinationAddImage(out, img, [kCGImagePropertyPNGDictionary: pngMeta] as CFDictionary)
+    return CGImageDestinationFinalize(out)
+}
+
 func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, size: String,
-                styleReferencePNG: Data? = nil, nameAfter: URL? = nil)
+                styleReferencePNG: Data? = nil, nameAfter: URL? = nil, identity: String = "")
     -> (saved: URL?, cost: Double?, error: String?) {
     let named = nameAfter ?? source
     let model = NanoBananaModel.byFlag(modelFlag)
@@ -8252,7 +8288,13 @@ func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, 
     let dest = PathRules.uniqueDest(named.deletingLastPathComponent(),
                                     named.deletingPathExtension().lastPathComponent + "_restyled.png",
                                     exists: { FileManager.default.fileExists(atPath: $0) })
-    do { try out.write(to: dest) } catch { return (nil, r.cost, "Couldn’t save the result: \(error.localizedDescription)") }
+    // Embed the recipe, falling back to a plain write so a metadata problem can never
+    // cost someone the generated image.
+    if !writePNGWithRestyleMetadata(out, to: dest, identity: identity, prompt: prompt,
+                                    model: model.name, size: size) {
+        do { try out.write(to: dest) }
+        catch { return (nil, r.cost, "Couldn’t save the result: \(error.localizedDescription)") }
+    }
     return (dest, r.cost, nil)
 }
 
@@ -8354,10 +8396,19 @@ struct RestyleSheet: View {
 
             List(selection: $selected) {
                 ForEach(items) { item in
+                    let live = item.state == .running || item.state == .detecting
                     HStack(spacing: 6) {
                         stateIcon(item.state)
-                        Text(item.url.lastPathComponent).font(.caption2).lineLimit(1).truncationMode(.middle)
-                    }.tag(item.id)
+                        Text(item.url.lastPathComponent)
+                            .font(.caption2).lineLimit(1).truncationMode(.middle)
+                            .fontWeight(live ? .bold : .regular)
+                    }
+                    // The row being worked on is called out in the accent colour. Without
+                    // this, a batch looked like it might be reusing one prompt for
+                    // everything, because the only moving part was a small spinner while
+                    // the description field kept showing whatever was SELECTED.
+                    .listRowBackground(live ? Color.accentColor.opacity(0.22) : Color.clear)
+                    .tag(item.id)
                 }
             }
             .frame(height: 190)
@@ -8478,9 +8529,16 @@ struct RestyleSheet: View {
                 Button(identityBusy ? "Detecting…" : "Detect") { detectIdentity(force: true) }
                     .font(.caption).disabled(identityBusy || current == nil)
             }
-            TextField("e.g. an anthropomorphic lion with a golden mane and tan robes",
-                     text: identityBinding, axis: .vertical)
-                .lineLimit(2...3)
+            // TextEditor, not TextField: a vertical TextField clips at its line limit with
+            // no way to reach the rest — the only way to read a long description was to
+            // select the text and drag. A TextEditor scrolls.
+            TextEditor(text: identityBinding)
+                .font(.system(size: 11))
+                .frame(height: 52)
+                .scrollContentBackground(.hidden)
+                .padding(4)
+                .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.3)))
                 .disabled(current == nil)
             Text("Per image — auto-detected when you select it, and again for each image as a batch runs. Edit freely.")
                 .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
@@ -8494,9 +8552,18 @@ struct RestyleSheet: View {
                         .font(.caption).disabled(styleBusy)
                 }
             }
-            TextField(reference == nil ? "e.g. warm illustrated colors, thick outlines" : "e.g. brighter, more saturated",
-                     text: $styleText, axis: .vertical)
-                .lineLimit(1...3)
+            TextEditor(text: $styleText)
+                .font(.system(size: 11))
+                .frame(height: 76)
+                .scrollContentBackground(.hidden)
+                .padding(4)
+                .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.3)))
+            if styleText.isEmpty {
+                Text(reference == nil ? "e.g. warm illustrated colors, thick outlines"
+                                      : "Optional — the reference image drives the look.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
             if !leaks.isEmpty {
                 Label("Mentions \(leaks.joined(separator: ", ")) — make sure that's about the STYLE, not the character.",
                       systemImage: "exclamationmark.triangle")
@@ -8713,7 +8780,8 @@ struct RestyleSheet: View {
             if cancelRequested { return (nil, nil, "Cancelled") }
             let r = runRestyle(source: send, prompt: job.prompt, modelFlag: job.flag,
                                aspect: job.aspect, size: job.size,
-                               styleReferencePNG: job.refPNG, nameAfter: job.url)
+                               styleReferencePNG: job.refPNG, nameAfter: job.url,
+                               identity: job.identity)
             if r.saved != nil { return r }
             last = (r.saved, r.cost, r.error)
             guard let e = r.error, RestyleRules.isTransient(e), attempt < 2 else { break }
@@ -8766,6 +8834,11 @@ struct RestyleSheet: View {
                     if let i = items.firstIndex(where: { $0.url == url }) {
                         identity = items[i].identity
                         items[i].state = identity.isEmpty ? .detecting : .running
+                        // Follow along, so the preview and the description field show the
+                        // image being worked on rather than whatever was selected when the
+                        // run started. detectIdentity() is guarded on !batchRunning, so
+                        // moving the selection here cannot kick off a competing read.
+                        selected = items[i].id
                     }
                     progress = "\(n + 1) of \(todo.count) — \(url.lastPathComponent)"
                     sem.signal()
