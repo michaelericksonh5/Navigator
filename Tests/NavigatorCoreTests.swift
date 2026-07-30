@@ -405,8 +405,8 @@ final class RestyleRulesTests: XCTestCase {
         let p = RestyleRules.restylePrompt(identityAnchors: "a lion character", styleText: "warm earthy palette", extra: "more contrast")
         XCTAssertTrue(p.contains("warm earthy palette"))
         XCTAssertTrue(p.contains("a lion character"))
-        XCTAssertTrue(p.contains("same text and lettering"))
-        XCTAssertTrue(p.contains("ADDITIONAL DIRECTION: more contrast"))
+        XCTAssertTrue(p.contains("character-for-character"))
+        XCTAssertTrue(p.contains("ADDITIONAL STYLE NOTES: more contrast"))
     }
 
     // Identity anchors must come before the style directive — reordering a working
@@ -421,7 +421,7 @@ final class RestyleRulesTests: XCTestCase {
     // or silently drop the constraint.
     func testEmptyIdentityAnchorsFallBackToGenericWording() {
         let p = RestyleRules.restylePrompt(identityAnchors: "  ", styleText: "x")
-        XCTAssertTrue(p.contains("same subject"))
+        XCTAssertTrue(p.contains("everything currently in the image"))
     }
 
     func testRestylePromptOmitsEmptyExtra() {
@@ -434,8 +434,8 @@ final class RestyleRulesTests: XCTestCase {
     // the subject-bleed bug this shape exists to prevent.
     func testTwoImagePromptLabelsBothImageRoles() {
         let p = RestyleRules.restylePromptTwoImage(identityAnchors: "a lion character")
-        XCTAssertTrue(p.contains("IMAGE 1 is the exact character"))
-        XCTAssertTrue(p.contains("IMAGE 2 is a STYLE reference only"))
+        XCTAssertTrue(p.contains("IMAGE 1 is the artwork to redraw"))
+        XCTAssertTrue(p.lowercased().contains("image 2 is a style reference only"))
         XCTAssertTrue(p.contains("a lion character"))
     }
 
@@ -446,12 +446,12 @@ final class RestyleRulesTests: XCTestCase {
 
     func testTwoImagePromptEmptyAnchorsFallBackToGenericWording() {
         let p = RestyleRules.restylePromptTwoImage(identityAnchors: "  ")
-        XCTAssertTrue(p.contains("keep its subject"))
+        XCTAssertTrue(p.contains("everything currently in IMAGE 1"))
     }
 
     func testTwoImagePromptAddsExtra() {
         let p = RestyleRules.restylePromptTwoImage(identityAnchors: "a", extra: "brighter gold trim")
-        XCTAssertTrue(p.contains("ADDITIONAL DIRECTION: brighter gold trim"))
+        XCTAssertTrue(p.contains("ADDITIONAL STYLE NOTES: brighter gold trim"))
     }
 
     func testTwoImagePromptOmitsEmptyExtra() {
@@ -522,5 +522,97 @@ final class RestyleBatchTests: XCTestCase {
         XCTAssertFalse(RestyleRules.isTransient("Model returned no image: safety-filtered"))
         XCTAssertFalse(RestyleRules.isTransient("prompt is required"))
         XCTAssertFalse(RestyleRules.isTransient("Couldn’t read photo.png."))
+    }
+}
+
+
+// Content preservation must work for art boards, backgrounds and UI — not just
+// characters. A pay table holding ~20 symbols came back as a single hooded figure
+// because both the vision prompt and the restyle prompt were character-centric.
+final class RestyleContentPreservationTests: XCTestCase {
+
+    // The restyle prompts must not talk about creatures. "same species / same face /
+    // same markings / same clothing" is meaningless for a pay table and is what told
+    // the model to produce one character.
+    func testPromptsAreNotCharacterCentric() {
+        for p in [RestyleRules.restylePrompt(identityAnchors: "a pay table", styleText: "x"),
+                  RestyleRules.restylePromptTwoImage(identityAnchors: "a pay table")] {
+            let lower = p.lowercased()
+            for banned in ["same species", "same face", "same markings", "same clothing",
+                           "exact character to redraw"] {
+                XCTAssertFalse(lower.contains(banned), "prompt still says \"\(banned)\"")
+            }
+        }
+    }
+
+    // What replaced it has to actually protect a layout.
+    func testPromptsProtectLayoutCountsAndText() {
+        for p in [RestyleRules.restylePrompt(identityAnchors: "a pay table", styleText: "x"),
+                  RestyleRules.restylePromptTwoImage(identityAnchors: "a pay table")] {
+            let lower = p.lowercased()
+            XCTAssertTrue(lower.contains("layout"))
+            XCTAssertTrue(lower.contains("count"))
+            XCTAssertTrue(lower.contains("character-for-character"))
+            XCTAssertTrue(lower.contains("single subject"), "must forbid collapsing to one subject")
+        }
+    }
+
+    // The vision prompt must invite every image type, not "the main subject".
+    func testVisionPromptCoversEveryImageKind() {
+        let sp = RestyleRules.identitySystemPrompt.lowercased()
+        for kind in ["art board", "background", "ui element", "single character"] {
+            XCTAssertTrue(sp.contains(kind), "vision prompt never mentions \(kind)")
+        }
+        XCTAssertTrue(sp.contains("transcribed exactly"), "must demand exact text transcription")
+        XCTAssertFalse(sp.contains("the main subject"), "'the main subject' is what caused the failure")
+    }
+
+    // …and must forbid describing style, which is what a restyle replaces.
+    func testVisionPromptForbidsStyleWords() {
+        let sp = RestyleRules.identitySystemPrompt.lowercased()
+        XCTAssertTrue(sp.contains("never describe"))
+        for banned in ["colour scheme", "distinguishing markings or colouring"] {
+            XCTAssertFalse(sp.contains(banned), "vision prompt still invites \(banned)")
+        }
+    }
+
+    // The real description that came back for download (11) — heavy with style words,
+    // which is what fights the new style. Should be flagged.
+    func testFlagsStyleWordsInAContentsDescription() {
+        let real = "A collection of neon-hued, pixelated slot machine symbols featuring "
+                 + "glitchy textures, glowing colors of cyan, magenta, and purple, with "
+                 + "retro arcade aesthetics."
+        let found = Set(RestyleRules.styleLeaksInContents(real))
+        XCTAssertTrue(found.contains("neon"), "should flag neon")
+        XCTAssertTrue(found.contains("pixelated"), "should flag pixelated")
+        XCTAssertTrue(found.contains("glitchy"), "should flag glitchy")
+        XCTAssertTrue(found.contains("cyan"), "should flag cyan")
+    }
+
+    // A clean structural description must NOT be flagged, or the warning is noise.
+    func testCleanContentsDescriptionIsNotFlagged() {
+        let clean = "A pay table art board. Top row: ten labelled icons — BONUS, PIXEL PATH, "
+                  + "VOID RESPINS, SCATTER, ADD WILDS, GAMES, WILD, MINOR, MAJOR, GRAND. "
+                  + "Below, a heading \"BASE AND BONUS : PAY TABLES\" over four panels."
+        XCTAssertEqual(RestyleRules.styleLeaksInContents(clean), [])
+    }
+}
+
+extension RestyleContentPreservationTests {
+    // The prompt should hand off explicitly into the style section, so the model reads
+    // "preserve all this… now replace the art style with the following" as one
+    // instruction rather than two unrelated ones.
+    func testPromptHandsOffIntoTheStyleSection() {
+        let one = RestyleRules.restylePrompt(identityAnchors: "a pay table", styleText: "STYLE_MARKER")
+        XCTAssertTrue(one.contains("Now replace the art style of this image with the following:"))
+        XCTAssertLessThan(one.range(of: "CONTENTS TO PRESERVE")!.lowerBound,
+                          one.range(of: "Now replace the art style")!.lowerBound)
+        XCTAssertLessThan(one.range(of: "Now replace the art style")!.lowerBound,
+                          one.range(of: "STYLE_MARKER")!.lowerBound)
+
+        let two = RestyleRules.restylePromptTwoImage(identityAnchors: "a pay table")
+        XCTAssertTrue(two.contains("Now replace the art style of IMAGE 1 with the art style of IMAGE 2"))
+        XCTAssertLessThan(two.range(of: "CONTENTS OF IMAGE 1 TO PRESERVE")!.lowerBound,
+                          two.range(of: "Now replace the art style")!.lowerBound)
     }
 }

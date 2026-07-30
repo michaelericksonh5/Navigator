@@ -8359,6 +8359,9 @@ struct RestyleSheet: View {
     private var models: [NanoBananaModel] { NanoBananaModel.all }
     private var sizes: [String] { RestyleRules.sizes(forModelFlag: modelFlag) }
     private var leaks: [String] { RestyleRules.styleLeaks(in: styleText) }
+    private var contentStyleLeaks: [String] {
+        RestyleRules.styleLeaksInContents(current?.identity ?? "")
+    }
     private var remaining: Int { items.filter { !$0.state.isTerminal }.count }
     private var anyRunning: Bool { busy || batchRunning }
     private var canRun: Bool {
@@ -8524,7 +8527,7 @@ struct RestyleSheet: View {
             Divider().padding(.vertical, 2)
 
             HStack {
-                Text("Character / object to preserve").font(.caption).foregroundStyle(.secondary)
+                Text("Content to preserve").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button(identityBusy ? "Detecting…" : "Detect") { detectIdentity(force: true) }
                     .font(.caption).disabled(identityBusy || current == nil)
@@ -8540,8 +8543,13 @@ struct RestyleSheet: View {
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.3)))
                 .disabled(current == nil)
-            Text("Per image — auto-detected when you select it, and again for each image as a batch runs. Edit freely.")
+            Text("Per image — auto-detected when you select it, and again for each image as a batch runs. Covers backgrounds, UI and multi-symbol art boards, not just characters. Edit freely.")
                 .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            if !contentStyleLeaks.isEmpty {
+                Label("Describes style (\(contentStyleLeaks.joined(separator: ", "))) — this field is for WHAT is in the image; style words here fight the new look.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack {
                 Text(reference == nil ? "Style / desired change" : "Style notes (optional)")
