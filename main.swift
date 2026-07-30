@@ -6138,6 +6138,23 @@ struct BackdropView: View {
     }
 }
 
+/// Reads back what writePNGWithRestyleMetadata wrote, if this file was ever
+/// restyled by Navigator. nil for anything else — including a PNG with unrelated
+/// Title/Description metadata from some other app, so this can never show the
+/// wrong tool's notes as if they were a restyle prompt.
+struct RestyleInfo { let prompt: String, contents: String, software: String }
+func readRestyleInfo(_ url: URL) -> RestyleInfo? {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+          let png = props[kCGImagePropertyPNGDictionary] as? [CFString: Any],
+          let software = png[kCGImagePropertyPNGSoftware] as? String,
+          software.hasPrefix("Navigator Restyle") else { return nil }
+    let prompt = png[kCGImagePropertyPNGDescription] as? String ?? ""
+    let contents = png[kCGImagePropertyPNGTitle] as? String ?? ""
+    guard !prompt.isEmpty || !contents.isEmpty else { return nil }
+    return RestyleInfo(prompt: prompt, contents: contents, software: software)
+}
+
 struct ImageViewerView: View {
     @State private var urls: [URL]
     var onTitle: (String) -> Void = { _ in }
@@ -6145,7 +6162,12 @@ struct ImageViewerView: View {
     @State private var dims: String = ""
     @State private var sizeStr: String = ""
     @State private var kindStr: String = ""
+    @State private var showRestyleInfo = false
     @StateObject private var zoomCtl = ZoomController()
+    // Read fresh per access rather than cached in @State — cheap (one CGImageSource
+    // properties read) and guarantees the (i) button never shows stale info if the
+    // file on disk changed under the same viewer session.
+    private var restyleInfo: RestyleInfo? { urls.indices.contains(index) ? readRestyleInfo(urls[index]) : nil }
     init(urls: [URL], index: Int, onTitle: @escaping (String) -> Void = { _ in }) {
         _urls = State(initialValue: urls); self.onTitle = onTitle; _index = State(initialValue: index)
     }
@@ -6322,6 +6344,11 @@ struct ImageViewerView: View {
                 detail("internaldrive", sizeStr)
                 Text("·").foregroundStyle(.white.opacity(0.4))
                 Text("\(index + 1) of \(urls.count)").foregroundStyle(.white.opacity(0.85))
+                if restyleInfo != nil {
+                    Button { showRestyleInfo = true } label: { Image(systemName: "info.circle") }
+                        .buttonStyle(.plain).help("Restyle info — the prompt Navigator used on this image")
+                        .popover(isPresented: $showRestyleInfo, arrowEdge: .top) { RestyleInfoPopover(info: restyleInfo!) }
+                }
             }
             Spacer(minLength: 12)
             BackdropPicker()
@@ -6353,6 +6380,39 @@ struct ImageViewerView: View {
             Label { Text(text) } icon: { Image(systemName: symbol).font(.caption) }
                 .foregroundStyle(.white.opacity(0.85))
         }
+    }
+}
+
+/// Popover content for the viewer's (i) button — read-only, text-selectable, with a
+/// one-click copy since the prompt is often long enough that selecting it by hand is
+/// annoying.
+struct RestyleInfoPopover: View {
+    let info: RestyleInfo
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Restyle Info").font(.headline)
+                    Spacer()
+                    Button { copyAll() } label: { Image(systemName: "doc.on.doc") }
+                        .buttonStyle(.plain).help("Copy prompt")
+                }
+                if !info.contents.isEmpty {
+                    Text("Contents preserved").font(.caption).foregroundStyle(.secondary)
+                    Text(info.contents).font(.system(size: 11)).textSelection(.enabled)
+                }
+                if !info.prompt.isEmpty {
+                    Text("Prompt sent").font(.caption).foregroundStyle(.secondary)
+                    Text(info.prompt).font(.system(size: 11)).textSelection(.enabled)
+                }
+                Text(info.software).font(.caption2).foregroundStyle(.tertiary)
+            }.padding(14)
+        }
+        .frame(width: 340, height: 320)
+    }
+    private func copyAll() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(info.prompt.isEmpty ? info.contents : info.prompt, forType: .string)
     }
 }
 
@@ -6612,6 +6672,12 @@ struct GetInfoView: View {
                         Spacer()
                         Button("Change…") { if let app = chooseApplication() { setDefaultApp(app, for: item.url) } }
                     }.font(.callout)
+                }
+                if let ri = readRestyleInfo(item.url) {
+                    Divider()
+                    Text("Restyle Info").font(.subheadline).bold()
+                    if !ri.contents.isEmpty { row("Contents", ri.contents) }
+                    if !ri.prompt.isEmpty { row("Prompt", ri.prompt) }
                 }
             }.padding(16)
         }
