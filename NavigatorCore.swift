@@ -111,26 +111,35 @@ enum PathRules {
 
 /// Rules for "Restyle (AI)" — the pure, testable parts.
 ///
-/// The pipeline is two calls, and the split is not cosmetic. Sending the style
-/// reference to the image model as a second input does NOT transfer style: tested
-/// against a live model, the reference's SUBJECT took over the output entirely (a
-/// tiki "SUPER WIN" frame came back as a lion in Jedi robes, because the lion was
-/// the style reference). So the reference is read by a vision model first and
-/// reduced to subject-free TEXT, and only the image being restyled is ever sent to
-/// the image model as pixels.
+/// Everything here is Vertex-only, on purpose. An earlier version read a dropped
+/// reference image's style, and the source image's identity, via a vision model
+/// reached through fal — because the metered Vertex service has no endpoint that
+/// returns TEXT from an image (confirmed by probing eight plausible route names,
+/// all 404, and by watching /v1/images silently drop response_modalities and
+/// thinking_level and return image-only no matter what's asked). Told to stop using
+/// fal entirely, that vision pre-pass was removed. What replaced it, in order of
+/// what was actually measured against the live service:
 ///
-/// A second failure mode surfaced later, independent of the reference entirely:
-/// telling the model to "keep the subject exactly as it is" is not enough — on a
-/// live NB2 run, that generic wording turned a lion character into a human twice in
-/// a row (reproduced, not a fluke). Naming concrete identity anchors instead — "lion
-/// face, mane, markings" rather than "the subject" — fixed it 2/2, and then 3/3 more
-/// after a real second style-reference image was reintroduced alongside explicit
-/// role labels ("IMAGE 1 is the exact character… IMAGE 2 is a style reference
-/// only…"), matching Google's own guidance: name identity anchors as text tokens,
-/// and put the style change at the end of the prompt, not the start. Identity
-/// anchors are generated the same way the style text is — a vision pass on the
-/// SOURCE image, asked for persistent identity features and nothing about pose,
-/// action or setting (those must stay free to change).
+/// 1. Generic preservation wording ("keep the subject exactly as it is") is not an
+///    anchor. The exact same single-image request, run twice, turned a lion
+///    character into two different human men — reproduced, not noise.
+/// 2. Naming concrete identity anchors instead — species/type, face, markings,
+///    defining worn items — fixed that 2/2 on a single image.
+/// 3. Asking a single Vertex call to "identify then preserve" a real second
+///    reference image's subject, IN THE SAME generation pass, failed 3/3 across two
+///    phrasings (the source became a fox, a mech-suited cat, a human swordsman) —
+///    self-derived anchors inside one call are not reliable.
+/// 4. Supplying the SAME kind of anchors as already-known text (not self-derived)
+///    alongside a real second reference image, under explicit role labels ("IMAGE 1
+///    is the exact character… IMAGE 2 is a style reference only…"), worked 2/2.
+///
+/// Net effect: identity anchors must exist as text before generation, and nothing
+/// on Vertex can produce that text from a photo today, so the person restyling
+/// types them. `restylePrompt` handles no reference (anchors + a style
+/// description); `restylePromptTwoImage` reproduces the one two-image arrangement
+/// proven to hold identity, and must not be reordered without re-testing — the
+/// working order (source image first, reference second) is not what a naive
+/// "last image wins" rule would predict.
 enum RestyleRules {
 
     // MARK: - Aspect ratio
@@ -176,65 +185,14 @@ enum RestyleRules {
 
     // MARK: - Prompts
 
-    /// Instructions for the vision pass that turns a reference image into style text.
-    ///
-    /// The hard rules are load-bearing and were tuned against a live model. A first
-    /// version that only said "don't mention the subject" still returned "fine
-    /// strands of fur" and "sheen of leather" for a lion in leather robes — material
-    /// nouns that would grow fur on a fish. Naming the banned materials explicitly,
-    /// and asking for rendering behaviour instead, produced zero leakage.
-    static let styleSystemPrompt = """
-        You extract a reusable ART STYLE from a reference image so it can be applied \
-        to a COMPLETELY DIFFERENT subject.
-
-        Describe ONLY: medium and rendering technique, brush/line quality, palette and \
-        colour temperature, lighting character and direction, contrast and value range, \
-        surface finish, edge treatment, level of detail, grain/texture, and overall mood.
-
-        HARD RULES — breaking these ruins the result:
-        - Never name or imply the subject: no species, creature, person, character, \
-        clothing, props, setting, or body parts.
-        - Never name materials that belong to the subject (e.g. fur, hair, scales, \
-        feathers, skin, leather, fabric, metal armour). Describe HOW surfaces are \
-        rendered instead — "fine high-frequency detail on organic surfaces", \
-        "soft specular sheen".
-        - No composition, framing, pose, or background layout.
-        - Output style directives only, as one dense paragraph under 110 words, no preamble.
-        """
-
-    /// Instructions for the vision pass that names what must survive a restyle.
-    ///
-    /// Generic wording ("keep the subject exactly as it is") is not an anchor — a live
-    /// NB2 run given only that turned a lion character into an old man, twice in a row.
-    /// Naming the concrete identity features fixed it every time it was tried. Pose,
-    /// action and setting are explicitly excluded because those are exactly what a
-    /// restyle is allowed — often asked — to change.
-    static let identitySystemPrompt = """
-        Describe the persistent IDENTITY of the main subject in this image, so it can be
-        named as an explicit anchor when the image is redrawn in a different style or pose.
-
-        Include: subject type or species, face/head shape, distinguishing markings or \
-        colouring, and any worn items or accessories that define who this is (clothing \
-        style, equipment, colour scheme).
-
-        Do NOT include: pose, action, camera angle, or background/setting — a restyle is \
-        allowed to change all of those; only identity must survive.
-
-        Output one compact sentence of concrete nouns and adjectives, under 40 words, no \
-        preamble. Example shape: "An anthropomorphic lion woman with a golden mane, lion \
-        face and muzzle, and tan Jedi-style robes with leather gloves."
-        """
-
-    /// The prompt sent to the image model. Everything that must survive the restyle is
-    /// listed explicitly, because "restyle this" alone invites the model to reinterpret
-    /// the art — lettering is the first thing to go. Identity anchors are stated FIRST
-    /// and the style change LAST — reordering a working prompt to lead with the change
-    /// and follow with "but keep X" measurably let identity drift on live runs; stating
-    /// what must survive before what should change did not.
+    /// Single-image restyle: no reference, just the source and a typed description of
+    /// the desired look. Identity anchors are stated FIRST and the style change LAST —
+    /// reordering a working prompt to lead with the change and follow with "but keep X"
+    /// measurably let identity drift on live runs; stating what must survive before
+    /// what should change did not.
     static func restylePrompt(identityAnchors: String, styleText: String, extra: String = "") -> String {
-        let anchors = identityAnchors.trimmingCharacters(in: .whitespacesAndNewlines)
-        var p = "This exact character must remain completely unchanged: "
-            + (anchors.isEmpty ? "same subject, same species, same face, same markings, same clothing." : anchors)
+        let anchors = anchorClause(identityAnchors, fallback: "same subject, same species, same face, same markings, same clothing.")
+        var p = "This exact character must remain completely unchanged: " + anchors
             + " Same pose and composition, same aspect ratio, same text and lettering.\n\n"
             + "Redraw ONLY the rendering style, to match the following art style.\n\n"
             + "ART STYLE: \(styleText.trimmingCharacters(in: .whitespacesAndNewlines))"
@@ -243,9 +201,42 @@ enum RestyleRules {
         return p
     }
 
-    /// Words that mean the style text still describes the reference's subject. Shown as
-    /// a warning rather than a block — an art style legitimately called "painterly fur
-    /// texture" might be intended, and it's the artist's call, not ours.
+    /// Two-image restyle: a real style-reference image is sent alongside the source.
+    /// This exact shape — role labels, source described as "IMAGE 1", reference as
+    /// "IMAGE 2", identity anchors named as text before the style instruction — is the
+    /// one combination that held identity 2/2 on a live model; generic role labels
+    /// alone (no named anchors) failed on the same pairing. `anchors` empty is
+    /// possible (the field is optional in the UI) and falls back to generic wording,
+    /// same as the single-image path, at the same reduced reliability.
+    static func restylePromptTwoImage(identityAnchors: String, extra: String = "") -> String {
+        let anchors = anchorClause(identityAnchors, fallback: "keep its subject, species, face, markings and clothing exactly as they are.")
+        var p = "IMAGE 1 is the exact character to redraw: " + anchors
+            + " Keep this exact character unchanged — same species, same face, same markings, same clothing, "
+            + "same pose and composition.\n\n"
+            + "IMAGE 2 is a STYLE reference only. Do not copy its subject, objects, or text — "
+            + "none of its content may appear in the output.\n\n"
+            + "Redraw IMAGE 1's exact character using IMAGE 2's rendering technique, colour palette, "
+            + "linework and lighting only."
+        let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !e.isEmpty { p += "\n\nADDITIONAL DIRECTION: \(e)" }
+        return p
+    }
+
+    /// The identity clause used by both prompt shapes: user-typed anchors if present
+    /// (with a trailing period ensured, so it doesn't run into the next sentence —
+    /// "...leather gloves Keep this exact character..." with no punctuation between
+    /// them, which a live run tolerated but shouldn't have needed to), else a generic
+    /// fallback.
+    private static func anchorClause(_ raw: String, fallback: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return fallback }
+        return trimmed.hasSuffix(".") ? trimmed : trimmed + "."
+    }
+
+    /// Words that mean a typed style description drifted into describing a subject
+    /// rather than a style. Shown as a warning rather than a block — an art style
+    /// legitimately called "painterly fur texture" might be intended, and it's the
+    /// artist's call, not ours.
     static let leakWords = ["fur", "hair", "scales", "feathers", "skin", "leather",
                             "fabric", "armour", "armor", "face", "eyes", "mane", "fins"]
 

@@ -8036,7 +8036,12 @@ enum H5GService {
     }
 
     /// POST /v1/images. Returns the PNG, what it cost, or an error to show.
-    static func image(prompt: String, modelID: String, inputPNG: Data?,
+    ///
+    /// `inputPNGs` order matters: on a live run, the LAST image is the one the model
+    /// treats as the edit target — an earlier image is a reference. Confirmed by
+    /// swapping the order of the same two images and observing which one the output
+    /// kept as its subject.
+    static func image(prompt: String, modelID: String, inputPNGs: [Data],
                       aspect: String?, size: String?) -> (png: Data?, cost: Double?, error: String?) {
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
         guard let token else {
@@ -8044,8 +8049,8 @@ enum H5GService {
         }
         guard let url = URL(string: base + "/v1/images") else { return (nil, nil, "bad service URL") }
         var body: [String: Any] = ["prompt": prompt, "model": modelID]
-        if let inputPNG {
-            body["input_images"] = [["mime": "image/png", "data": inputPNG.base64EncodedString()]]
+        if !inputPNGs.isEmpty {
+            body["input_images"] = inputPNGs.map { ["mime": "image/png", "data": $0.base64EncodedString()] }
         }
         if let aspect, !aspect.isEmpty { body["aspect_ratio"] = aspect }
         if let size, !size.isEmpty { body["image_size"] = size }
@@ -8128,87 +8133,42 @@ struct NanoBananaModel: Identifiable, Hashable {
     static func byFlag(_ f: String) -> NanoBananaModel { all.first { $0.flag == f } ?? all[0] }
 }
 
-/// PNG of `url` with its long edge capped at `maxDim`. Style reads fine small, and a
-/// 2500px reference would make the vision request needlessly heavy.
-func downscaledPNG(_ url: URL, maxDim: CGFloat = 768) -> Data? {
-    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-    let opts: [CFString: Any] = [
-        kCGImageSourceThumbnailMaxPixelSize: maxDim,
-        kCGImageSourceCreateThumbnailFromImageAlways: true,
-        kCGImageSourceCreateThumbnailWithTransform: true,
-    ]
-    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
-    return encodePNG(cg)
-}
-
 /// Ask a Gemini flash model to describe ONLY the reference's style.
 ///
-/// Routed through fal's OpenRouter vision endpoint because the metered Vertex
-/// service exposes no text/vision endpoint — its image path returns an image, and
-/// omni returns video. Costs about $0.0007 a call.
-/// One vision call, shared by the style read (on the reference) and the identity
-/// read (on the source) — same endpoint and response shape, different system prompt.
-private func visionAnalyze(png: Data, systemPrompt: String, userPrompt: String, label: String, key: String)
-    -> (text: String?, error: String?) {
-    guard let url = URL(string: "https://fal.run/openrouter/router/vision") else { return (nil, "bad URL") }
-    var req = URLRequest(url: url)
-    req.httpMethod = "POST"
-    req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
-    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.timeoutInterval = 180
-    req.httpBody = try? JSONSerialization.data(withJSONObject: [
-        "model": "google/gemini-2.5-flash",
-        "prompt": userPrompt,
-        "system_prompt": systemPrompt,
-        "temperature": 0.15,
-        "max_tokens": 400,
-        "image_urls": ["data:image/png;base64," + png.base64EncodedString()],
-    ])
-    var out: (String?, String?) = (nil, "no response")
-    let sem = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, resp, err in
-        defer { sem.signal() }
-        if let err { out = (nil, err.localizedDescription); return }
-        guard let data, let http = resp as? HTTPURLResponse else { out = (nil, "no data"); return }
-        guard http.statusCode == 200 else {
-            out = (nil, "\(label) HTTP \(http.statusCode): "
-                   + (String(data: data, encoding: .utf8)?.prefix(240) ?? "")); return
-        }
-        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let text = j["output"] as? String, !text.isEmpty else {
-            out = (nil, "the vision model returned no description"); return
-        }
-        out = (text.trimmingCharacters(in: .whitespacesAndNewlines), nil)
-    }.resume()
-    sem.wait()
-    return out
-}
-
-func analyzeStyle(referencePNG png: Data, key: String) -> (text: String?, error: String?) {
-    visionAnalyze(png: png, systemPrompt: RestyleRules.styleSystemPrompt,
-                 userPrompt: "Extract the transferable art style.", label: "style analysis", key: key)
-}
-
-/// Names what must survive a restyle — species/type, face, markings, defining worn
-/// items — deliberately excluding pose, action and setting. Run on the SOURCE image
-/// (never the reference), for every restyle regardless of whether a reference was
-/// dropped: measured on a live model, generic "keep the subject" wording alone let a
-/// lion character drift into an unrelated human, twice in a row. Naming these
-/// anchors as concrete text tokens fixed it every time it was tried.
-func analyzeIdentity(sourcePNG png: Data, key: String) -> (text: String?, error: String?) {
-    visionAnalyze(png: png, systemPrompt: RestyleRules.identitySystemPrompt,
-                 userPrompt: "Describe the identity to preserve.", label: "identity analysis", key: key)
-}
-
-/// Run the restyle. Returns the saved file, or an error to show.
+/// Run the restyle. `styleReferencePNG`, when present, is sent as a real second
+/// input image — Vertex only, no separate vision/captioning call of any kind.
+///
+/// There USED to be a vision pre-pass here (via fal, since the metered Vertex
+/// service has no endpoint that returns text from an image — confirmed by probing
+/// eight plausible route names, all 404, and by observing /v1/images silently drop
+/// `response_modalities`/`thinking_level` and return image-only regardless). That
+/// approach is gone: this app must not call fal for any part of Restyle. Instead,
+/// identity anchors are typed by the person restyling, not auto-derived.
+///
+/// Measured directly against this consequence: a single Vertex call given two real
+/// images and asked to "identify then preserve" the first image's identity in the
+/// SAME generation pass failed 3/3 (a lion became a fox, then a mech-suited cat,
+/// then a human swordsman) across two different phrasings. The one thing proven
+/// reliable — 5/5 across two different image pairs — is supplying the identity
+/// anchors as already-known text before generation, which is exactly what typing
+/// them into "Character to preserve" gives us, at zero extra cost and zero calls.
 func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, size: String,
-                nameAfter: URL? = nil) -> (saved: URL?, cost: Double?, error: String?) {
+                styleReferencePNG: Data? = nil, nameAfter: URL? = nil)
+    -> (saved: URL?, cost: Double?, error: String?) {
     let named = nameAfter ?? source
     let model = NanoBananaModel.byFlag(modelFlag)
-    guard let png = try? Data(contentsOf: source) else {
+    guard let sourcePNG = try? Data(contentsOf: source) else {
         return (nil, nil, "Couldn’t read \(source.lastPathComponent).")
     }
-    let r = H5GService.image(prompt: prompt, modelID: model.id, inputPNG: png,
+    // Raw position alone is NOT the deciding factor — explicit role labels in the
+    // prompt override it. The one combination proven to preserve identity twice in a
+    // row (source FIRST, reference SECOND, both under explicit "IMAGE 1 is..." /
+    // "IMAGE 2 is..." labels) is reproduced exactly here; this is not the position
+    // that a naive "last image wins" rule would predict, and that's the point —
+    // don't reorder this without re-testing.
+    var inputs: [Data] = [sourcePNG]
+    if let styleReferencePNG { inputs.append(styleReferencePNG) }
+    let r = H5GService.image(prompt: prompt, modelID: model.id, inputPNGs: inputs,
                             aspect: aspect, size: size)
     guard let out = r.png else { return (nil, nil, r.error ?? "Restyle failed.") }
     let dest = PathRules.uniqueDest(named.deletingLastPathComponent(),
@@ -8228,6 +8188,10 @@ struct RestyleSheet: View {
 
     @State private var reference: URL?
     @State private var refTargeted = false
+    // Typed by the person restyling, not auto-derived — Vertex has no endpoint that
+    // returns text from an image (see RestyleRules), so there is no vision step to
+    // populate this automatically anymore.
+    @State private var identityText = ""
     @State private var styleText = ""
     @State private var extra = ""
     @State private var modelFlag = "nb2"
@@ -8244,7 +8208,11 @@ struct RestyleSheet: View {
     private var models: [NanoBananaModel] { NanoBananaModel.all }
     private var sizes: [String] { RestyleRules.sizes(forModelFlag: modelFlag) }
     private var leaks: [String] { RestyleRules.styleLeaks(in: styleText) }
-    private var canRun: Bool { !busy && !styleText.trimmingCharacters(in: .whitespaces).isEmpty }
+    // With a reference image, the style comes from the picture, so typed style text is
+    // optional. Without one, it's the only description of the desired look there is.
+    private var canRun: Bool {
+        !busy && (reference != nil || !styleText.trimmingCharacters(in: .whitespaces).isEmpty)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 18) {
@@ -8282,14 +8250,18 @@ struct RestyleSheet: View {
                 Text("\(s.w) × \(s.h)").font(.caption2).foregroundStyle(.tertiary)
             }
 
-            Text("Style reference").font(.caption).foregroundStyle(.secondary).padding(.top, 6)
+            Text("Style reference (optional)").font(.caption).foregroundStyle(.secondary).padding(.top, 6)
             referenceWell
             HStack(spacing: 8) {
                 Button("Choose…") { pickReference() }
                 if reference != nil {
-                    Button("Clear") { reference = nil; styleText = "" }.foregroundStyle(.secondary)
+                    Button("Clear") { reference = nil }.foregroundStyle(.secondary)
                 }
             }.font(.caption)
+            if reference != nil {
+                Text("Sent to the model directly, alongside the character description below — results can vary more than a typed style.")
+                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
         }.frame(width: 250)
     }
 
@@ -8333,7 +8305,6 @@ struct RestyleSheet: View {
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first(where: { isImageFile($0) }) else { return false }
             reference = url
-            analyze()
             return true
         } isTargeted: { refTargeted = $0 }
     }
@@ -8378,26 +8349,25 @@ struct RestyleSheet: View {
                     .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
 
-            HStack {
-                Text("Style").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button(busy ? "Analyzing…" : "Analyze reference") { analyze() }
-                    .font(.caption).disabled(reference == nil || busy)
-            }
-            TextEditor(text: $styleText)
-                .font(.system(size: 11, design: .monospaced))
-                .frame(height: 132)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
-            if styleText.isEmpty {
-                Text("Drop a reference and Gemini writes a style description here — subject removed, so a lion reference can't turn your art into a lion.")
-                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
-            } else if !leaks.isEmpty {
-                Label("Mentions \(leaks.joined(separator: ", ")) — that may pull the reference's subject in. Consider editing it out.",
+            Text("Character to preserve").font(.caption).foregroundStyle(.secondary)
+            TextField("e.g. an anthropomorphic lion with a golden mane, lion face, and tan robes",
+                     text: $identityText, axis: .vertical)
+                .lineLimit(2...4)
+            Text("Name the specific things that must survive — species, face, markings, worn items. Vague wording like \"keep the subject the same\" measurably lets identity drift; naming them concretely is what actually holds it.")
+                .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+
+            Text(reference == nil ? "Style / desired change" : "Style notes (optional — the reference image drives the look)")
+                .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
+            TextField(reference == nil ? "e.g. warm illustrated colors, surfing on a wave" : "e.g. brighter, more saturated",
+                     text: $styleText, axis: .vertical)
+                .lineLimit(1...3)
+            if !leaks.isEmpty {
+                Label("Mentions \(leaks.joined(separator: ", ")) — make sure that's about the STYLE, not the character.",
                       systemImage: "exclamationmark.triangle")
                     .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
 
-            Text("Extra direction (optional)").font(.caption).foregroundStyle(.secondary)
+            Text("Extra direction (optional)").font(.caption).foregroundStyle(.secondary).padding(.top, 4)
             TextField("e.g. keep the gold trim brighter", text: $extra)
 
             if !failure.isEmpty {
@@ -8410,7 +8380,7 @@ struct RestyleSheet: View {
 
             Spacer()
             HStack {
-                Text("≈ $0.04 per restyle, plus $0.001 for the style read")
+                Text("≈ $0.04–0.13 per restyle, depending on model and resolution")
                     .font(.caption2).foregroundStyle(.tertiary)
                 Spacer()
                 Button("Cancel") { onClose() }.keyboardShortcut(.cancelAction)
@@ -8431,27 +8401,7 @@ struct RestyleSheet: View {
         p.allowedContentTypes = [.image]
         p.allowsMultipleSelection = false
         p.prompt = "Use as Style Reference"
-        if p.runModal() == .OK, let u = p.url { reference = u; analyze() }
-    }
-
-    /// Read the reference's style with Gemini. Overwrites the text box, so editing by
-    /// hand and then re-analysing loses the edits — that's why it's an explicit button
-    /// as well as automatic on drop.
-    private func analyze() {
-        guard let reference else { return }
-        guard let key = APIKeys.fal, !key.isEmpty else {
-            failure = "Add your fal.ai key first (AI → API Keys…). The style read runs through fal because the Vertex service has no vision endpoint."
-            return
-        }
-        guard let png = downscaledPNG(reference) else { failure = "Couldn’t read that reference image."; return }
-        busy = true; failure = ""; status = "Reading the reference’s style…"
-        DispatchQueue.global(qos: .userInitiated).async {
-            let r = analyzeStyle(referencePNG: png, key: key)
-            DispatchQueue.main.async {
-                busy = false; status = ""
-                if let t = r.text { styleText = t } else { failure = r.error ?? "Style analysis failed." }
-            }
-        }
+        if p.runModal() == .OK, let u = p.url { reference = u }
     }
 
     private func run() {
@@ -8468,22 +8418,26 @@ struct RestyleSheet: View {
             }
         }
         let sendURL = src
-        let styleTextNow = styleText, extraNow = extra
-        busy = true; failure = ""; status = "Reading the character’s identity…"
+        let identityNow = identityText
+
+        // With a real reference image, the prompt is the two-image shape (role labels,
+        // proven 2/2) and both text fields become supplementary notes. Without one,
+        // styleText IS the description of the desired look.
+        let prompt: String
+        var refPNG: Data? = nil
+        if let reference {
+            refPNG = try? Data(contentsOf: reference)
+            let notes = [styleText, extra].map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }.joined(separator: ". ")
+            prompt = RestyleRules.restylePromptTwoImage(identityAnchors: identityNow, extra: notes)
+        } else {
+            prompt = RestyleRules.restylePrompt(identityAnchors: identityNow, styleText: styleText, extra: extra)
+        }
+
+        busy = true; failure = ""; status = "Restyling — this usually takes under a minute…"
         DispatchQueue.global(qos: .userInitiated).async {
-            // Named identity anchors, not generic "keep the subject" wording — that
-            // generic phrasing measurably let identity drift on a live model. Best
-            // effort: a failed read falls back to restylePrompt's own generic wording
-            // rather than blocking the whole restyle on one extra network call.
-            var anchors = ""
-            if let key = APIKeys.fal, !key.isEmpty, let idPNG = downscaledPNG(sendURL) {
-                let idResult = analyzeIdentity(sourcePNG: idPNG, key: key)
-                anchors = idResult.text ?? ""
-            }
-            let prompt = RestyleRules.restylePrompt(identityAnchors: anchors, styleText: styleTextNow, extra: extraNow)
-            DispatchQueue.main.async { status = "Restyling — this usually takes under a minute…" }
             let r = runRestyle(source: sendURL, prompt: prompt, modelFlag: flag, aspect: a, size: s,
-                               nameAfter: source)
+                               styleReferencePNG: refPNG, nameAfter: source)
             if sendURL != source { try? FileManager.default.removeItem(at: sendURL) }
             DispatchQueue.main.async {
                 busy = false; status = ""
