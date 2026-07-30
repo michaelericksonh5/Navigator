@@ -929,16 +929,20 @@ enum ServiceIcon {
         Button { imagen(4) } label: { serviceLabel("Upscale (Imagen 4) ×4", ServiceIcon.vertex) }
     } label: { Label(label, systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
-/// "Restyle (AI)…" — shown only for exactly one image.
+/// "Restyle (AI)…" — one image or a whole selection.
 ///
-/// Single image by design: a restyle pairs one source with one style reference and
-/// its own prompt, so a multi-selection has nothing sensible to mean. Lives here
-/// beside upscaleMenu because all three context menus (list, icons, viewer) need it
-/// and none of them should own a second copy.
+/// A multi-selection opens the same window with the images queued: one shared style
+/// reference, but each image keeps its own auto-detected identity, since a batch is
+/// usually different subjects heading for one look. Lives here beside upscaleMenu
+/// because all three context menus (list, icons, viewer) need it and none of them
+/// should own a second copy. Skips this feature's own outputs so re-running a
+/// folder doesn't restyle the restyles.
 @ViewBuilder func restyleMenuItem(_ urls: [URL], onDone: @escaping (URL) -> Void) -> some View {
-    if urls.count == 1, let u = urls.first, isImageFile(u) {
-        Button { RestyleController.show(source: u, onFinished: onDone) } label: {
-            serviceLabel("Restyle (AI)…", ServiceIcon.vertex)
+    let imgs = urls.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_restyled") }
+    if !imgs.isEmpty {
+        Button { RestyleController.show(sources: imgs, onFinished: onDone) } label: {
+            serviceLabel(imgs.count == 1 ? "Restyle (AI)…" : "Restyle (AI)… (\(imgs.count) images)",
+                         ServiceIcon.vertex)
         }
     }
 }
@@ -8252,91 +8256,157 @@ func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, 
     return (dest, r.cost, nil)
 }
 
-/// The Restyle sheet: pick a reference, let Gemini read its style, adjust, run.
+/// One image in the restyle queue. Each carries its OWN identity anchors, because
+/// a batch is usually a set of different characters/objects sharing one target
+/// style — a single shared description would drag every output toward whatever the
+/// first image happened to be.
+struct RestyleItem: Identifiable {
+    enum State: Equatable {
+        case pending, detecting, running, done(URL), failed(String)
+        var isTerminal: Bool { if case .done = self { return true }; if case .failed = self { return true }; return false }
+    }
+    let id = UUID()
+    let url: URL
+    var identity: String = ""
+    var state: State = .pending
+}
+
+/// The Restyle window: a queue of images on the left, shared style settings on the
+/// right. Restyle just the selected one, or run the whole list.
 struct RestyleSheet: View {
-    let source: URL
     var onFinished: (URL) -> Void
     // Hosted in a plain NSWindow (matching the viewer and compare windows), where the
     // SwiftUI dismiss environment has nothing to act on — so closing is a callback.
     var onClose: () -> Void
 
+    @State private var items: [RestyleItem]
+    @State private var selected: UUID?
+    @State private var listTargeted = false
+
     @State private var reference: URL?
     @State private var refTargeted = false
-    @State private var identityText = ""
-    @State private var identityBusy = false
     @State private var styleText = ""
     @State private var styleBusy = false
     @State private var extra = ""
     @State private var modelFlag = "nb2"
-    @State private var size = "1K"
-    @State private var aspect = ""
-    @State private var busy = false
-    @State private var padColor = aiPrepColors.first!.name
-    @State private var padOn = false
-    @State private var padDecided = false
+    @State private var size = RestyleRules.defaultSize
+    @State private var aspect = "auto"
+    @State private var padOn = true
+    @State private var padColor = RestyleRules.defaultPadColorName
+    @State private var identityBusy = false
+
+    @State private var busy = false          // a single restyle is running
+    @State private var batchRunning = false
+    @State private var cancelRequested = false
+    @State private var progress = ""
     @State private var status = ""
     @State private var failure = ""
 
-    private var sourceSize: (w: Int, h: Int)? { imagePixelSize(source) }
+    init(sources: [URL], onFinished: @escaping (URL) -> Void, onClose: @escaping () -> Void) {
+        let list = sources.map { RestyleItem(url: $0) }
+        _items = State(initialValue: list)
+        _selected = State(initialValue: list.first?.id)
+        self.onFinished = onFinished
+        self.onClose = onClose
+    }
+
+    // MARK: - Derived
+
+    private var current: RestyleItem? { items.first { $0.id == selected } }
+    private var currentIndex: Int? { items.firstIndex { $0.id == selected } }
     private var models: [NanoBananaModel] { NanoBananaModel.all }
     private var sizes: [String] { RestyleRules.sizes(forModelFlag: modelFlag) }
     private var leaks: [String] { RestyleRules.styleLeaks(in: styleText) }
-    // With a reference image, the style comes from the picture, so typed style text is
-    // optional. Without one, it's the only description of the desired look there is.
+    private var remaining: Int { items.filter { !$0.state.isTerminal }.count }
+    private var anyRunning: Bool { busy || batchRunning }
     private var canRun: Bool {
-        !busy && (reference != nil || !styleText.trimmingCharacters(in: .whitespaces).isEmpty)
+        guard !anyRunning, current != nil else { return false }
+        return reference != nil || !styleText.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 18) {
-            images
+        HStack(alignment: .top, spacing: 16) {
+            queue
             Divider()
             controls
         }
-        .padding(18)
-        .frame(width: 780, height: 560)
+        .padding(16)
+        .frame(width: 900, height: 640)
         .onAppear {
-            if aspect.isEmpty, let s = sourceSize {
-                aspect = RestyleRules.nearestAspect(width: s.w, height: s.h)
-            }
-            if !sizes.contains(size) { size = sizes.first ?? "1K" }
-            // Transparent or an odd shape? Both come back wrong unpadded — alpha
-            // flattens to black, and an unlisted ratio gets reframed. Default the
-            // backing on, but leave it the artist's call.
-            if !padDecided {
-                let odd = sourceSize.map { RestyleRules.needsPadding(width: $0.w, height: $0.h) } ?? false
-                padOn = hasTransparency(source) || odd
-                padDecided = true
-            }
-            detectIdentity()
+            if !sizes.contains(size) { size = sizes.first ?? RestyleRules.defaultSize }
+            detectIdentity()   // for whatever opened selected
         }
+        .onChange(of: selected) { detectIdentity() }
     }
 
-    // MARK: - Left: what's going in
+    // MARK: - Left: the queue
 
-    private var images: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Restyling").font(.caption).foregroundStyle(.secondary)
-            thumb(source)
-            Text(source.lastPathComponent).font(.caption2).lineLimit(2)
-                .frame(width: 240, alignment: .leading)
-            if let s = sourceSize {
-                Text("\(s.w) × \(s.h)").font(.caption2).foregroundStyle(.tertiary)
+    private var queue: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Images (\(items.count))").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { addImages() } label: { Image(systemName: "plus") }
+                    .buttonStyle(.plain).help("Add images")
+                Button { removeSelected() } label: { Image(systemName: "minus") }
+                    .buttonStyle(.plain).disabled(current == nil || anyRunning).help("Remove selected")
             }
 
-            Text("Style reference (optional)").font(.caption).foregroundStyle(.secondary).padding(.top, 6)
-            referenceWell
-            HStack(spacing: 8) {
-                Button("Choose…") { pickReference() }
-                if reference != nil {
-                    Button("Clear") { reference = nil; styleText = "" }.foregroundStyle(.secondary)
+            List(selection: $selected) {
+                ForEach(items) { item in
+                    HStack(spacing: 6) {
+                        stateIcon(item.state)
+                        Text(item.url.lastPathComponent).font(.caption2).lineLimit(1).truncationMode(.middle)
+                    }.tag(item.id)
                 }
-            }.font(.caption)
-            if reference != nil {
-                Text("Sent to the model directly, alongside the character description below.")
-                    .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
-        }.frame(width: 250)
+            .frame(height: 190)
+            .overlay(RoundedRectangle(cornerRadius: 4)
+                .stroke(listTargeted ? Color.accentColor : Color.secondary.opacity(0.25),
+                        lineWidth: listTargeted ? 2 : 1))
+
+            if let item = current {
+                thumb(item.url)
+                Text(item.url.lastPathComponent).font(.caption2).lineLimit(2)
+                    .frame(width: 250, alignment: .leading)
+                if let s = imagePixelSize(item.url) {
+                    Text("\(s.w) × \(s.h)").font(.caption2).foregroundStyle(.tertiary)
+                }
+                if case .failed(let e) = item.state {
+                    Text(e).font(.caption2).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true).lineLimit(3)
+                }
+                if case .done(let out) = item.state {
+                    Text("Saved \(out.lastPathComponent)").font(.caption2).foregroundStyle(.green)
+                        .fixedSize(horizontal: false, vertical: true).lineLimit(2)
+                }
+            } else {
+                Text("Drop images above to build a batch.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+            Spacer()
+        }
+        .frame(width: 250)
+        // Files can come from anywhere — different folders, different volumes — so the
+        // queue takes drops directly, not just whatever was selected when it opened.
+        // The target is this whole column, NOT the List: a List intercepts the drop and
+        // silently accepts nothing (verified — dropping onto the list itself did
+        // nothing at all), the same trap the sidebar reorder hit.
+        .contentShape(Rectangle())
+        .dropDestination(for: URL.self) { urls, _ in
+            addURLs(urls)
+            return true
+        } isTargeted: { listTargeted = $0 }
+    }
+
+    @ViewBuilder private func stateIcon(_ s: RestyleItem.State) -> some View {
+        switch s {
+        case .pending:   Image(systemName: "circle").font(.caption2).foregroundStyle(.tertiary)
+        case .detecting: ProgressView().controlSize(.mini)
+        case .running:   ProgressView().controlSize(.mini)
+        case .done:      Image(systemName: "checkmark.circle.fill").font(.caption2).foregroundStyle(.green)
+        case .failed:    Image(systemName: "exclamationmark.triangle.fill").font(.caption2).foregroundStyle(.orange)
+        }
     }
 
     private func thumb(_ url: URL) -> some View {
@@ -8348,104 +8418,83 @@ struct RestyleSheet: View {
                     .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
             }
         }
-        .frame(width: 240, height: 150)
+        .frame(width: 250, height: 150)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.15)))
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
-    /// Drop target for the reference. Accepts a drag from Navigator, Finder, anywhere.
-    private var referenceWell: some View {
-        Group {
-            if let reference { thumb(reference) }
-            else {
-                RoundedRectangle(cornerRadius: 6)
-                    .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [5]))
-                    .foregroundStyle(refTargeted ? Color.accentColor : Color.secondary.opacity(0.5))
-                    .frame(width: 240, height: 150)
-                    .overlay(
-                        VStack(spacing: 4) {
-                            Image(systemName: "square.and.arrow.down").font(.title3)
-                            Text("Drag an image here").font(.caption)
-                        }.foregroundStyle(.secondary)
-                    )
-            }
-        }
-        .background(RoundedRectangle(cornerRadius: 6)
-            .fill(Color.accentColor.opacity(refTargeted ? 0.15 : 0)))
-        // dropDestination, not onDrop: the file rows publish their URL with
-        // .draggable (Transferable), and pairing that with the older NSItemProvider
-        // onDrop API silently accepts nothing. Verified — the drop did nothing until
-        // both sides spoke Transferable.
-        .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first(where: { isImageFile($0) }) else { return false }
-            reference = url
-            analyzeReferenceStyle()
-            return true
-        } isTargeted: { refTargeted = $0 }
-    }
-
-    // MARK: - Right: options and prompt
+    // MARK: - Right: shared settings
 
     private var controls: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
             HStack {
                 Text("Restyle with AI").font(.headline)
                 Spacer()
-                if busy { ProgressView().controlSize(.small) }
+                if anyRunning { ProgressView().controlSize(.small) }
             }
 
-            Picker("Model", selection: $modelFlag) {
-                ForEach(models) { m in Text(m.name).tag(m.flag) }
-            }
-            .onChange(of: modelFlag) { if !sizes.contains(size) { size = sizes.first ?? "1K" } }
-            if let note = models.first(where: { $0.flag == modelFlag })?.note {
-                Text(note).font(.caption2).foregroundStyle(.tertiary)
-            }
-
-            HStack(spacing: 12) {
-                Picker("Resolution", selection: $size) {
-                    ForEach(sizes, id: \.self) { Text($0).tag($0) }
-                }.frame(width: 170)
-                Picker("Aspect", selection: $aspect) {
-                    ForEach(RestyleRules.aspects, id: \.self) { a in
-                        Text(a == defaultAspect ? "\(a)  (original)" : a).tag(a)
+            HStack(alignment: .top, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Style reference").font(.caption).foregroundStyle(.secondary)
+                    referenceWell
+                    HStack(spacing: 8) {
+                        Button("Choose…") { pickReference() }
+                        if reference != nil {
+                            Button("Clear") { reference = nil; styleText = "" }.foregroundStyle(.secondary)
+                        }
+                    }.font(.caption)
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker("Model", selection: $modelFlag) {
+                        ForEach(models) { m in Text(m.name).tag(m.flag) }
                     }
-                }.frame(width: 190)
-            }
-
-            Toggle(isOn: $padOn) { Text("Pad onto a solid background").font(.callout) }
-            if padOn {
-                Picker("Background", selection: $padColor) {
-                    ForEach(aiPrepColors) { c in
-                        Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(c.color)) }.tag(c.name)
+                    .onChange(of: modelFlag) { if !sizes.contains(size) { size = sizes.first ?? "1K" } }
+                    Picker("Resolution", selection: $size) {
+                        ForEach(sizes, id: \.self) { Text($0).tag($0) }
+                    }
+                    Picker("Aspect", selection: $aspect) {
+                        ForEach(RestyleRules.aspects, id: \.self) { Text($0).tag($0) }
+                    }
+                    Toggle(isOn: $padOn) { Text("Pad transparent art").font(.callout) }
+                    if padOn {
+                        Picker("Background", selection: $padColor) {
+                            ForEach(aiPrepColors) { c in
+                                Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(c.color)) }.tag(c.name)
+                            }
+                        }
                     }
                 }
-                Text("Centred at native size on a \(padColor.lowercased()) canvas with 20% margin, matching Prep for AI. The original is untouched.")
+            }
+            if padOn {
+                Text("Only images that are actually transparent (or an odd aspect) get padded — the rest are sent untouched, and no original is modified either way.")
                     .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
 
+            Divider().padding(.vertical, 2)
+
             HStack {
-                Text("Character to preserve").font(.caption).foregroundStyle(.secondary)
+                Text("Character / object to preserve").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button(identityBusy ? "Detecting…" : "Detect") { detectIdentity() }
-                    .font(.caption).disabled(identityBusy)
+                Button(identityBusy ? "Detecting…" : "Detect") { detectIdentity(force: true) }
+                    .font(.caption).disabled(identityBusy || current == nil)
             }
-            TextField("e.g. an anthropomorphic lion with a golden mane, lion face, and tan robes",
-                     text: $identityText, axis: .vertical)
-                .lineLimit(2...4)
-            Text("Auto-detected from the image on open — edit freely. Vague wording like \"keep the subject the same\" measurably lets identity drift; naming things concretely is what actually holds it.")
+            TextField("e.g. an anthropomorphic lion with a golden mane and tan robes",
+                     text: identityBinding, axis: .vertical)
+                .lineLimit(2...3)
+                .disabled(current == nil)
+            Text("Per image — auto-detected when you select it, and again for each image as a batch runs. Edit freely.")
                 .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                Text(reference == nil ? "Style / desired change" : "Style notes (optional — the reference image drives the look)")
+                Text(reference == nil ? "Style / desired change" : "Style notes (optional)")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 if reference != nil {
                     Button(styleBusy ? "Analyzing…" : "Analyze") { analyzeReferenceStyle() }
                         .font(.caption).disabled(styleBusy)
                 }
-            }.padding(.top, 4)
-            TextField(reference == nil ? "e.g. warm illustrated colors, surfing on a wave" : "e.g. brighter, more saturated",
+            }
+            TextField(reference == nil ? "e.g. warm illustrated colors, thick outlines" : "e.g. brighter, more saturated",
                      text: $styleText, axis: .vertical)
                 .lineLimit(1...3)
             if !leaks.isEmpty {
@@ -8454,65 +8503,144 @@ struct RestyleSheet: View {
                     .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
 
-            Text("Extra direction (optional)").font(.caption).foregroundStyle(.secondary).padding(.top, 4)
-            TextField("e.g. keep the gold trim brighter", text: $extra)
+            TextField("Extra direction (optional)", text: $extra)
 
             if !failure.isEmpty {
                 Text(failure).font(.caption2).foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true).lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true).lineLimit(3)
             }
-            if !status.isEmpty {
+            if !progress.isEmpty {
+                Text(progress).font(.caption2).foregroundStyle(.secondary)
+            } else if !status.isEmpty {
                 Text(status).font(.caption2).foregroundStyle(.secondary)
             }
 
             Spacer()
             HStack {
-                Text("≈ $0.04–0.13 per restyle, depending on model and resolution")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                Text(costHint).font(.caption2).foregroundStyle(.tertiary)
                 Spacer()
-                Button("Cancel") { onClose() }.keyboardShortcut(.cancelAction)
-                Button("Restyle") { run() }.keyboardShortcut(.defaultAction).disabled(!canRun)
+                if batchRunning {
+                    Button("Stop") { cancelRequested = true }.keyboardShortcut(.cancelAction)
+                } else {
+                    Button("Close") { onClose() }.keyboardShortcut(.cancelAction).disabled(anyRunning)
+                    Button("Restyle This") { runOne() }.disabled(!canRun)
+                    Button("Restyle All (\(remaining))") { runBatch() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!canRun || remaining == 0)
+                }
             }
         }
     }
 
-    private var defaultAspect: String {
-        guard let s = sourceSize else { return "1:1" }
-        return RestyleRules.nearestAspect(width: s.w, height: s.h)
+    /// Editing the text field writes straight back into the selected queue item, so a
+    /// hand-tuned description survives switching away and back.
+    private var identityBinding: Binding<String> {
+        Binding(
+            get: { current?.identity ?? "" },
+            set: { v in if let i = currentIndex { items[i].identity = v } }
+        )
     }
 
-    // MARK: - Actions
+    private var costHint: String {
+        let per = size == "4K" ? 0.15 : (size == "2K" ? 0.10 : 0.067)
+        let n = max(remaining, 1)
+        return String(format: "≈ $%.2f each · $%.2f for %d", per, per * Double(n), n)
+    }
 
-    private func pickReference() {
+    /// Drop target for the shared style reference.
+    private var referenceWell: some View {
+        Group {
+            if let reference { thumb2(reference) }
+            else {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [5]))
+                    .foregroundStyle(refTargeted ? Color.accentColor : Color.secondary.opacity(0.5))
+                    .frame(width: 210, height: 118)
+                    .overlay(
+                        VStack(spacing: 3) {
+                            Image(systemName: "square.and.arrow.down")
+                            Text("Drag a style reference").font(.caption2)
+                        }.foregroundStyle(.secondary)
+                    )
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 6)
+            .fill(Color.accentColor.opacity(refTargeted ? 0.15 : 0)))
+        // dropDestination, not onDrop: the file rows publish their URL with
+        // .draggable (Transferable), and pairing that with the older NSItemProvider
+        // onDrop API silently accepts nothing.
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first(where: { isImageFile($0) }) else { return false }
+            reference = url
+            analyzeReferenceStyle()
+            return true
+        } isTargeted: { refTargeted = $0 }
+    }
+
+    private func thumb2(_ url: URL) -> some View {
+        Group {
+            if let img = NSImage(contentsOf: url) {
+                Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.15))
+            }
+        }
+        .frame(width: 210, height: 118)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.15)))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    // MARK: - Queue editing
+
+    private func addImages() {
         let p = NSOpenPanel()
         p.allowedContentTypes = [.image]
-        p.allowsMultipleSelection = false
-        p.prompt = "Use as Style Reference"
-        if p.runModal() == .OK, let u = p.url { reference = u; analyzeReferenceStyle() }
+        p.allowsMultipleSelection = true
+        p.prompt = "Add to Batch"
+        if p.runModal() == .OK { addURLs(p.urls) }
     }
 
-    /// Auto-run once when the sheet opens: names the source's identity so the restyle
-    /// prompt has real anchors instead of generic wording. Editable afterwards — this
-    /// is a starting point, not a lock.
-    private func detectIdentity() {
-        guard let png = downscaledPNG(source) else { return }
+    private func addURLs(_ urls: [URL]) {
+        let existing = Set(items.map { $0.url.standardizedFileURL.path })
+        // Skip this feature's own outputs, so re-running a folder doesn't restyle the
+        // restyles — same rule the other batch actions use.
+        let fresh = urls.filter {
+            isImageFile($0)
+            && !existing.contains($0.standardizedFileURL.path)
+            && !PathRules.isOwnOutput($0, suffix: "_restyled")
+        }
+        guard !fresh.isEmpty else { return }
+        items.append(contentsOf: fresh.map { RestyleItem(url: $0) })
+        if selected == nil { selected = items.first?.id }
+    }
+
+    private func removeSelected() {
+        guard let i = currentIndex else { return }
+        items.remove(at: i)
+        selected = items.indices.contains(i) ? items[i].id : items.last?.id
+    }
+
+    // MARK: - Vision reads
+
+    /// Auto-detect the selected image's identity. Skips when it already has text so
+    /// switching between images doesn't wipe hand-edits; `force` is the Detect button.
+    private func detectIdentity(force: Bool = false) {
+        guard let idx = currentIndex, !batchRunning else { return }
+        if !force, !items[idx].identity.isEmpty { return }
+        let url = items[idx].url
         identityBusy = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = analyzeIdentity(sourcePNG: png)
+            let text = downscaledPNG(url).flatMap { analyzeIdentity(sourcePNG: $0).text }
             DispatchQueue.main.async {
                 identityBusy = false
-                if let t = r.text { identityText = t }
-                // Silent on failure — the field just stays empty/editable, and
-                // restylePrompt already falls back to generic wording rather than
-                // blocking the sheet on a network hiccup.
+                // The selection may have moved while the call was in flight — write
+                // back by URL, not by the index captured earlier.
+                guard let i = items.firstIndex(where: { $0.url == url }), let text else { return }
+                if force || items[i].identity.isEmpty { items[i].identity = text }
             }
         }
     }
 
-    /// Auto-run on drop/choose: a starting-point description of the reference's style,
-    /// editable afterwards. The reference image itself is the real style carrier now
-    /// that it's genuinely sent to the model — this is supplementary notes, not the
-    /// only path style information travels.
     private func analyzeReferenceStyle() {
         guard let reference, let png = downscaledPNG(reference) else { return }
         styleBusy = true; failure = ""
@@ -8525,48 +8653,172 @@ struct RestyleSheet: View {
         }
     }
 
-    private func run() {
-        let flag = modelFlag, a = aspect, s = size
-        // Pad to a throwaway copy so the folder never gains a _BG file just because
-        // something was restyled. Same canvas logic as Prep for AI.
-        var src = source
-        if padOn, let c = aiPrepColors.first(where: { $0.name == padColor }) {
+    private func pickReference() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.image]
+        p.allowsMultipleSelection = false
+        p.prompt = "Use as Style Reference"
+        if p.runModal() == .OK, let u = p.url { reference = u; analyzeReferenceStyle() }
+    }
+
+    // MARK: - Running
+
+    /// Everything one restyle needs, captured on the main thread so the worker never
+    /// touches @State.
+    private struct Job {
+        let url: URL
+        let identity: String
+        let prompt: String
+        let refPNG: Data?
+        let flag: String, aspect: String, size: String
+        let padColor: NSColor?, padSuffix: String
+    }
+
+    private func makeJob(for item: RestyleItem, identity: String) -> Job {
+        let notes = [styleText, extra].map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }.joined(separator: ". ")
+        let prompt = reference != nil
+            ? RestyleRules.restylePromptTwoImage(identityAnchors: identity, extra: notes)
+            : RestyleRules.restylePrompt(identityAnchors: identity, styleText: styleText, extra: extra)
+        let c = padOn ? aiPrepColors.first(where: { $0.name == padColor }) : nil
+        return Job(url: item.url, identity: identity, prompt: prompt,
+                   refPNG: reference.flatMap { try? Data(contentsOf: $0) },
+                   flag: modelFlag, aspect: aspect, size: size,
+                   padColor: c?.color, padSuffix: c?.suffix ?? "")
+    }
+
+    /// One item, start to finish, on a background queue. Pads only when the image
+    /// actually needs it, retries transient Vertex failures, and never writes the
+    /// padded temp file anywhere near the user's folder.
+    private func perform(_ job: Job) -> (saved: URL?, cost: Double?, error: String?) {
+        var send = job.url
+        let needsPad = job.padColor != nil
+            && (hasTransparency(job.url)
+                || (imagePixelSize(job.url).map { RestyleRules.needsPadding(width: $0.w, height: $0.h) } ?? false))
+        if needsPad, let c = job.padColor {
             let tmp = FileManager.default.temporaryDirectory
                 .appendingPathComponent("navigator-restyle-pad-\(UUID().uuidString).png")
-            if let padded = fillBackgroundForImage(source, color: c.color, suffix: c.suffix,
-                                                   ratio: RestyleRules.ratio(a), dest: tmp) {
-                src = padded
+            if let padded = fillBackgroundForImage(job.url, color: c, suffix: job.padSuffix,
+                                                   ratio: job.aspect == "auto" ? nil : RestyleRules.ratio(job.aspect),
+                                                   dest: tmp) {
+                send = padded
             }
         }
-        let sendURL = src
-        let identityNow = identityText
+        defer { if send != job.url { try? FileManager.default.removeItem(at: send) } }
 
-        // With a real reference image, the prompt is the two-image shape (role labels,
-        // proven 2/2) and both text fields become supplementary notes. Without one,
-        // styleText IS the description of the desired look.
-        let prompt: String
-        var refPNG: Data? = nil
-        if let reference {
-            refPNG = try? Data(contentsOf: reference)
-            let notes = [styleText, extra].map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }.joined(separator: ". ")
-            prompt = RestyleRules.restylePromptTwoImage(identityAnchors: identityNow, extra: notes)
-        } else {
-            prompt = RestyleRules.restylePrompt(identityAnchors: identityNow, styleText: styleText, extra: extra)
+        // Vertex 503s under load are common enough that a batch would otherwise
+        // abandon its queue over a condition that clears in seconds.
+        var last: (URL?, Double?, String?) = (nil, nil, "not attempted")
+        for attempt in 0..<3 {
+            if cancelRequested { return (nil, nil, "Cancelled") }
+            let r = runRestyle(source: send, prompt: job.prompt, modelFlag: job.flag,
+                               aspect: job.aspect, size: job.size,
+                               styleReferencePNG: job.refPNG, nameAfter: job.url)
+            if r.saved != nil { return r }
+            last = (r.saved, r.cost, r.error)
+            guard let e = r.error, RestyleRules.isTransient(e), attempt < 2 else { break }
+            Thread.sleep(forTimeInterval: Double(attempt + 1) * 4)
         }
+        return last
+    }
 
-        busy = true; failure = ""; status = "Restyling — this usually takes under a minute…"
+    private func runOne() {
+        guard let idx = currentIndex else { return }
+        let item = items[idx]
+        let job = makeJob(for: item, identity: item.identity)
+        busy = true; failure = ""; status = "Restyling \(item.url.lastPathComponent)…"
+        items[idx].state = .running
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = runRestyle(source: sendURL, prompt: prompt, modelFlag: flag, aspect: a, size: s,
-                               styleReferencePNG: refPNG, nameAfter: source)
-            if sendURL != source { try? FileManager.default.removeItem(at: sendURL) }
+            let r = perform(job)
             DispatchQueue.main.async {
                 busy = false; status = ""
+                guard let i = items.firstIndex(where: { $0.url == job.url }) else { return }
                 if let saved = r.saved {
                     if let c = r.cost { navLog("restyle cost $\(String(format: "%.4f", c)) -> \(saved.lastPathComponent)") }
-                    onFinished(saved); onClose(); return
+                    items[i].state = .done(saved)
+                    onFinished(saved)
+                } else {
+                    items[i].state = .failed(r.error ?? "Restyle failed.")
+                    failure = r.error ?? "Restyle failed."
                 }
-                failure = r.error ?? "Restyle failed."
+            }
+        }
+    }
+
+    /// Walk the queue in order. Each image gets its own identity read first (unless it
+    /// already has one), then its own restyle. One failure marks that item and moves
+    /// on rather than stopping the run — a 20-image batch shouldn't die on image 3.
+    private func runBatch() {
+        let todo = items.filter { !$0.state.isTerminal }.map { $0.url }
+        guard !todo.isEmpty else { return }
+        batchRunning = true; cancelRequested = false; failure = ""
+        var completed = 0, failed = 0
+        var totalCost = 0.0
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            for (n, url) in todo.enumerated() {
+                if cancelRequested { break }
+
+                // Identity: reuse what's there, otherwise read it now.
+                var identity = ""
+                var sem = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async {
+                    if let i = items.firstIndex(where: { $0.url == url }) {
+                        identity = items[i].identity
+                        items[i].state = identity.isEmpty ? .detecting : .running
+                    }
+                    progress = "\(n + 1) of \(todo.count) — \(url.lastPathComponent)"
+                    sem.signal()
+                }
+                sem.wait()
+
+                if identity.isEmpty, let png = downscaledPNG(url) {
+                    identity = analyzeIdentity(sourcePNG: png).text ?? ""
+                    let captured = identity
+                    DispatchQueue.main.async {
+                        if let i = items.firstIndex(where: { $0.url == url }) {
+                            items[i].identity = captured
+                            items[i].state = .running
+                        }
+                    }
+                }
+
+                // Build the job on main (it reads @State), then work off it.
+                var job: Job?
+                sem = DispatchSemaphore(value: 0)
+                DispatchQueue.main.async {
+                    if let i = items.firstIndex(where: { $0.url == url }) {
+                        job = makeJob(for: items[i], identity: identity)
+                    }
+                    sem.signal()
+                }
+                sem.wait()
+                guard let job else { continue }
+
+                let r = perform(job)
+                if let c = r.cost { totalCost += c }
+                if r.saved != nil { completed += 1 } else { failed += 1 }
+
+                DispatchQueue.main.async {
+                    guard let i = items.firstIndex(where: { $0.url == url }) else { return }
+                    if let saved = r.saved {
+                        items[i].state = .done(saved)
+                        onFinished(saved)
+                    } else {
+                        items[i].state = .failed(r.error ?? "Restyle failed.")
+                    }
+                }
+            }
+
+            let done = completed, bad = failed, spent = totalCost, stopped = cancelRequested
+            DispatchQueue.main.async {
+                batchRunning = false
+                progress = ""
+                var parts = ["Restyled \(done)"]
+                if bad > 0 { parts.append("\(bad) failed") }
+                if stopped { parts.append("stopped early") }
+                status = parts.joined(separator: " · ") + String(format: " · $%.2f", spent)
+                navLog("restyle batch: \(done) ok, \(bad) failed, $\(String(format: "%.4f", spent))")
             }
         }
     }
@@ -8580,12 +8832,15 @@ app.run()
 
 final class RestyleController {
     private static var windows: [NSWindow] = []
-    static func show(source: URL, onFinished: @escaping (URL) -> Void) {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 780, height: 560),
+    static func show(sources: [URL], onFinished: @escaping (URL) -> Void) {
+        guard !sources.isEmpty else { return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 640),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
-        w.title = "Restyle — \(source.lastPathComponent)"
-        w.contentView = NSHostingView(rootView: RestyleSheet(source: source, onFinished: onFinished,
+        w.title = sources.count == 1
+            ? "Restyle — \(sources[0].lastPathComponent)"
+            : "Restyle — \(sources.count) images"
+        w.contentView = NSHostingView(rootView: RestyleSheet(sources: sources, onFinished: onFinished,
                                                             onClose: { [weak w] in w?.close() }))
         w.center(); windows.append(w)
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
