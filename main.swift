@@ -8050,7 +8050,14 @@ enum H5GService {
         guard let url = URL(string: base + "/v1/images") else { return (nil, nil, "bad service URL") }
         var body: [String: Any] = ["prompt": prompt, "model": modelID]
         if !inputPNGs.isEmpty {
-            body["input_images"] = inputPNGs.map { ["mime": "image/png", "data": $0.base64EncodedString()] }
+            // "base64", not "data" — the service checks im?.base64 (matches client.mjs's
+            // own { base64, mime } shape). Sending "data" silently drops every input
+            // image: no error, no 400, just zero images reaching the model. Confirmed
+            // directly — a request naming a completely wrong subject, sent with a real
+            // photo attached under the wrong key, generated the WRONG subject with no
+            // trace of the real photo at all. Every restyle before this fix was pure
+            // text-to-image generation from the prompt, not actually editing the source.
+            body["input_images"] = inputPNGs.map { ["mime": "image/png", "base64": $0.base64EncodedString()] }
         }
         if let aspect, !aspect.isEmpty { body["aspect_ratio"] = aspect }
         if let size, !size.isEmpty { body["image_size"] = size }
@@ -8080,6 +8087,79 @@ enum H5GService {
         sem.wait()
         return out
     }
+
+    /// POST /v1/vision — plain Gemini text describing an image, never generating
+    /// one. Distinct from `image` above, which requires an image in the response;
+    /// this requires TEXT and fails if it gets an image back. Model is pinned
+    /// server-side (gemini-3.5-flash-lite) — not client-selectable, so there's no
+    /// modelID parameter here.
+    static func describe(prompt: String, systemPrompt: String?, imagePNG: Data)
+        -> (text: String?, cost: Double?, error: String?) {
+        guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
+        guard let token else {
+            return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
+        }
+        guard let url = URL(string: base + "/v1/vision") else { return (nil, nil, "bad service URL") }
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "input_images": [["mime": "image/png", "base64": imagePNG.base64EncodedString()]],
+        ]
+        if let systemPrompt, !systemPrompt.isEmpty { body["system_prompt"] = systemPrompt }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 60
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        var out: (String?, Double?, String?) = (nil, nil, "no response")
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            defer { sem.signal() }
+            if let err { out = (nil, nil, err.localizedDescription); return }
+            guard let data, let http = resp as? HTTPURLResponse else { out = (nil, nil, "no data"); return }
+            let text = String(data: data, encoding: .utf8) ?? ""
+            guard http.statusCode == 200 else {
+                out = (nil, nil, "AI service HTTP \(http.statusCode): " + String(text.prefix(400))); return
+            }
+            guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let t = j["text"] as? String else {
+                out = (nil, nil, "unexpected response: " + String(text.prefix(300))); return
+            }
+            out = (t, j["cost_usd"] as? Double, nil)
+        }.resume()
+        sem.wait()
+        return out
+    }
+}
+
+/// PNG of `url` with its long edge capped at `maxDim`. A vision read only needs
+/// enough resolution to make out the subject, and a 2500px reference would make
+/// the request needlessly heavy for no benefit.
+func downscaledPNG(_ url: URL, maxDim: CGFloat = 768) -> Data? {
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let opts: [CFString: Any] = [
+        kCGImageSourceThumbnailMaxPixelSize: maxDim,
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+    ]
+    guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+    return encodePNG(cg)
+}
+
+/// Ask Gemini (via /v1/vision) to name the SOURCE image's persistent identity —
+/// species/type, face, markings, worn items — as an anchor for the restyle prompt.
+func analyzeIdentity(sourcePNG png: Data) -> (text: String?, error: String?) {
+    let r = H5GService.describe(prompt: "Describe the identity to preserve.",
+                                systemPrompt: RestyleRules.identitySystemPrompt, imagePNG: png)
+    return (r.text, r.error)
+}
+
+/// Ask Gemini (via /v1/vision) to extract the REFERENCE image's art style as
+/// subject-free text, for the single-image restyle path.
+func analyzeStyle(referencePNG png: Data) -> (text: String?, error: String?) {
+    let r = H5GService.describe(prompt: "Extract the transferable art style.",
+                                systemPrompt: RestyleRules.styleSystemPrompt, imagePNG: png)
+    return (r.text, r.error)
 }
 
 /// True when the image actually has see-through pixels.
@@ -8133,25 +8213,19 @@ struct NanoBananaModel: Identifiable, Hashable {
     static func byFlag(_ f: String) -> NanoBananaModel { all.first { $0.flag == f } ?? all[0] }
 }
 
-/// Ask a Gemini flash model to describe ONLY the reference's style.
-///
 /// Run the restyle. `styleReferencePNG`, when present, is sent as a real second
-/// input image — Vertex only, no separate vision/captioning call of any kind.
+/// input image alongside the source — both through H5GService.image, Vertex only.
 ///
-/// There USED to be a vision pre-pass here (via fal, since the metered Vertex
-/// service has no endpoint that returns text from an image — confirmed by probing
-/// eight plausible route names, all 404, and by observing /v1/images silently drop
-/// `response_modalities`/`thinking_level` and return image-only regardless). That
-/// approach is gone: this app must not call fal for any part of Restyle. Instead,
-/// identity anchors are typed by the person restyling, not auto-derived.
-///
-/// Measured directly against this consequence: a single Vertex call given two real
-/// images and asked to "identify then preserve" the first image's identity in the
-/// SAME generation pass failed 3/3 (a lion became a fox, then a mech-suited cat,
-/// then a human swordsman) across two different phrasings. The one thing proven
-/// reliable — 5/5 across two different image pairs — is supplying the identity
-/// anchors as already-known text before generation, which is exactly what typing
-/// them into "Character to preserve" gives us, at zero extra cost and zero calls.
+/// The input images were silently never reaching the model at all until a real
+/// bug got fixed here: this function built `input_images` under the JSON key
+/// "data", but the service reads `im.base64` — wrong key, no error, image just
+/// never attached. Confirmed directly: a request naming the wrong subject, with a
+/// real photo attached under the wrong key, generated the wrong subject with zero
+/// trace of the real photo. So every restyle before that fix was pure
+/// text-to-image generation, not an edit — it only looked like editing when the
+/// prompt's identity anchors were specific enough to regenerate something
+/// recognizable from scratch. Fixed; the source and any reference are now genuine
+/// inputs to the edit.
 func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, size: String,
                 styleReferencePNG: Data? = nil, nameAfter: URL? = nil)
     -> (saved: URL?, cost: Double?, error: String?) {
@@ -8188,11 +8262,10 @@ struct RestyleSheet: View {
 
     @State private var reference: URL?
     @State private var refTargeted = false
-    // Typed by the person restyling, not auto-derived — Vertex has no endpoint that
-    // returns text from an image (see RestyleRules), so there is no vision step to
-    // populate this automatically anymore.
     @State private var identityText = ""
+    @State private var identityBusy = false
     @State private var styleText = ""
+    @State private var styleBusy = false
     @State private var extra = ""
     @State private var modelFlag = "nb2"
     @State private var size = "1K"
@@ -8235,6 +8308,7 @@ struct RestyleSheet: View {
                 padOn = hasTransparency(source) || odd
                 padDecided = true
             }
+            detectIdentity()
         }
     }
 
@@ -8255,11 +8329,11 @@ struct RestyleSheet: View {
             HStack(spacing: 8) {
                 Button("Choose…") { pickReference() }
                 if reference != nil {
-                    Button("Clear") { reference = nil }.foregroundStyle(.secondary)
+                    Button("Clear") { reference = nil; styleText = "" }.foregroundStyle(.secondary)
                 }
             }.font(.caption)
             if reference != nil {
-                Text("Sent to the model directly, alongside the character description below — results can vary more than a typed style.")
+                Text("Sent to the model directly, alongside the character description below.")
                     .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
         }.frame(width: 250)
@@ -8305,6 +8379,7 @@ struct RestyleSheet: View {
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first(where: { isImageFile($0) }) else { return false }
             reference = url
+            analyzeReferenceStyle()
             return true
         } isTargeted: { refTargeted = $0 }
     }
@@ -8349,15 +8424,27 @@ struct RestyleSheet: View {
                     .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
 
-            Text("Character to preserve").font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Text("Character to preserve").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button(identityBusy ? "Detecting…" : "Detect") { detectIdentity() }
+                    .font(.caption).disabled(identityBusy)
+            }
             TextField("e.g. an anthropomorphic lion with a golden mane, lion face, and tan robes",
                      text: $identityText, axis: .vertical)
                 .lineLimit(2...4)
-            Text("Name the specific things that must survive — species, face, markings, worn items. Vague wording like \"keep the subject the same\" measurably lets identity drift; naming them concretely is what actually holds it.")
+            Text("Auto-detected from the image on open — edit freely. Vague wording like \"keep the subject the same\" measurably lets identity drift; naming things concretely is what actually holds it.")
                 .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
 
-            Text(reference == nil ? "Style / desired change" : "Style notes (optional — the reference image drives the look)")
-                .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
+            HStack {
+                Text(reference == nil ? "Style / desired change" : "Style notes (optional — the reference image drives the look)")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if reference != nil {
+                    Button(styleBusy ? "Analyzing…" : "Analyze") { analyzeReferenceStyle() }
+                        .font(.caption).disabled(styleBusy)
+                }
+            }.padding(.top, 4)
             TextField(reference == nil ? "e.g. warm illustrated colors, surfing on a wave" : "e.g. brighter, more saturated",
                      text: $styleText, axis: .vertical)
                 .lineLimit(1...3)
@@ -8401,7 +8488,41 @@ struct RestyleSheet: View {
         p.allowedContentTypes = [.image]
         p.allowsMultipleSelection = false
         p.prompt = "Use as Style Reference"
-        if p.runModal() == .OK, let u = p.url { reference = u }
+        if p.runModal() == .OK, let u = p.url { reference = u; analyzeReferenceStyle() }
+    }
+
+    /// Auto-run once when the sheet opens: names the source's identity so the restyle
+    /// prompt has real anchors instead of generic wording. Editable afterwards — this
+    /// is a starting point, not a lock.
+    private func detectIdentity() {
+        guard let png = downscaledPNG(source) else { return }
+        identityBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = analyzeIdentity(sourcePNG: png)
+            DispatchQueue.main.async {
+                identityBusy = false
+                if let t = r.text { identityText = t }
+                // Silent on failure — the field just stays empty/editable, and
+                // restylePrompt already falls back to generic wording rather than
+                // blocking the sheet on a network hiccup.
+            }
+        }
+    }
+
+    /// Auto-run on drop/choose: a starting-point description of the reference's style,
+    /// editable afterwards. The reference image itself is the real style carrier now
+    /// that it's genuinely sent to the model — this is supplementary notes, not the
+    /// only path style information travels.
+    private func analyzeReferenceStyle() {
+        guard let reference, let png = downscaledPNG(reference) else { return }
+        styleBusy = true; failure = ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = analyzeStyle(referencePNG: png)
+            DispatchQueue.main.async {
+                styleBusy = false
+                if let t = r.text { styleText = t } else { failure = r.error ?? "Style analysis failed." }
+            }
+        }
     }
 
     private func run() {
