@@ -311,3 +311,33 @@ extension RestyleRules {
         return abs(actual - nearest) / nearest > tolerance
     }
 }
+
+extension RestyleRules {
+    /// Default output resolution. 2K, not 1K: measured 2026-07-30, NB2 with
+    /// `image_size: "2K"` really does return 2K pixels (2528x1684 from a 1024px
+    /// source, 1680 image tokens, $0.1014) — the AI hub runbook's old "flash caps
+    /// ~1K" note was wrong and has been corrected. Art going into a game wants the
+    /// larger render, and the price difference is a few cents.
+    static let defaultSize = "2K"
+
+    /// Default backing colour for transparent art. Magenta, not white: it's the
+    /// least likely colour to appear in real artwork, so anything the model leaves
+    /// behind from the padding is unmistakable rather than blending into pale
+    /// linework — and it matches the greenscreen/magenta convention already in
+    /// Prep for AI's colour list.
+    static let defaultPadColorName = "MagentaScreen"
+
+    /// True when a Vertex error is worth retrying rather than failing the item.
+    ///
+    /// Vertex returns transient 503 UNAVAILABLE under load — seen repeatedly while
+    /// testing. On a one-off restyle that's a visible annoyance; in a batch of
+    /// twenty it would abandon the rest of the queue for a condition that clears in
+    /// seconds, so these are retried and everything else fails fast.
+    static func isTransient(_ error: String) -> Bool {
+        let e = error.lowercased()
+        return e.contains("503") || e.contains("unavailable")
+            || e.contains("429") || e.contains("resource_exhausted")
+            || e.contains("timed out") || e.contains("timeout")
+            || e.contains("network connection was lost")
+    }
+}

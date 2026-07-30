@@ -490,3 +490,37 @@ final class RestylePaddingTests: XCTestCase {
         XCTAssertFalse(RestyleRules.needsPadding(width: 0, height: 0))
     }
 }
+
+// Batch restyle defaults and retry classification.
+final class RestyleBatchTests: XCTestCase {
+
+    // 2K is deliberate and measured — NB2 really returns 2K pixels. A regression to
+    // "1K" would silently halve every output's resolution.
+    func testDefaultSizeIs2K() {
+        XCTAssertEqual(RestyleRules.defaultSize, "2K")
+        XCTAssertTrue(RestyleRules.sizes(forModelFlag: "nb2").contains(RestyleRules.defaultSize))
+    }
+
+    // Magenta, not white — the default backing for transparent art.
+    func testDefaultPadColorIsMagenta() {
+        XCTAssertEqual(RestyleRules.defaultPadColorName, "MagentaScreen")
+    }
+
+    // Vertex 503s are real and frequent under load; a batch must survive them.
+    func testTransientErrorsAreRetryable() {
+        XCTAssertTrue(RestyleRules.isTransient("AI service HTTP 502: Vertex 503: UNAVAILABLE"))
+        XCTAssertTrue(RestyleRules.isTransient("The service is currently unavailable."))
+        XCTAssertTrue(RestyleRules.isTransient("HTTP 429 RESOURCE_EXHAUSTED"))
+        XCTAssertTrue(RestyleRules.isTransient("The request timed out."))
+        XCTAssertTrue(RestyleRules.isTransient("The network connection was lost."))
+    }
+
+    // A real content/config failure must NOT be retried — retrying a safety block or
+    // a bad model name just burns time and money for the same answer.
+    func testPermanentErrorsAreNotRetried() {
+        XCTAssertFalse(RestyleRules.isTransient("Unsupported image model \"gemini-9\""))
+        XCTAssertFalse(RestyleRules.isTransient("Model returned no image: safety-filtered"))
+        XCTAssertFalse(RestyleRules.isTransient("prompt is required"))
+        XCTAssertFalse(RestyleRules.isTransient("Couldn’t read photo.png."))
+    }
+}
