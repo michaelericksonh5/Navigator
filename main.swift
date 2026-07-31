@@ -591,6 +591,16 @@ final class NetworkBrowser: NSObject, ObservableObject, NetServiceBrowserDelegat
 }
 
 // Async thumbnail cache backed by QuickLook. Unlike loading the full NSImage,
+/// True for a file whose bytes are NOT on disk — an online-only item from a File
+/// Provider (Google Drive, iCloud). APFS marks these with SF_DATALESS; reading one
+/// forces the provider to download it. Checked before any local-decode fallback so a
+/// thumbnail pass over a big cloud folder never turns into a mass download.
+func isDatalessFile(_ url: URL) -> Bool {
+    var st = stat()
+    guard lstat(url.path, &st) == 0 else { return false }
+    return (st.st_flags & 0x4000_0000) != 0   // SF_DATALESS (sys/stat.h)
+}
+
 // QLThumbnailGenerator produces a right-sized preview cheaply and supports many
 // formats beyond plain images — PSD, PDF, AI, RAW — via the system's thumbnail
 // generators (and its own on-disk cache). Non-thumbnailable files return nil so
@@ -614,7 +624,14 @@ final class ThumbnailCache {
     }()
     private let lock = NSLock()
     private var ops: [String: Operation] = [:]
-    private var failed: Set<String> = []      // don't retry a file QuickLook can't do
+    // Failures are throttled, NOT permanent. The old Set<String> version cached a
+    // failure for the whole session, which turned any transient miss into a file that
+    // never shows a thumbnail again: a freshly-generated file still syncing to Drive, a
+    // slow-VPN day tripping the 15s timeout once — from then on, generic icon forever,
+    // even after the file was fully materialised. The TTL keeps the original win (no
+    // re-request on every scroll tick) while letting transients heal on the next pass.
+    private var failed: [String: Date] = [:]
+    private let failureRetryAfter: TimeInterval = 20
     func thumbnail(for url: URL, size: CGFloat = 256, completion: @escaping (NSImage?) -> Void) {
         let key = "\(url.path)@\(Int(size))" as NSString
         if let c = cache.object(forKey: key) { completion(c); return }
@@ -632,7 +649,12 @@ final class ThumbnailCache {
         // (the File Provider supplies it), so skipping would lose thumbnails for no
         // bandwidth saving.
         lock.lock()
-        if failed.contains(key as String) { lock.unlock(); completion(nil); return }
+        if let failedAt = failed[key as String] {
+            if Date().timeIntervalSince(failedAt) < failureRetryAfter {
+                lock.unlock(); completion(nil); return
+            }
+            failed[key as String] = nil   // TTL elapsed — try again
+        }
         if ops[key as String] != nil { lock.unlock(); return }   // already being generated
         lock.unlock()
 
@@ -640,8 +662,13 @@ final class ThumbnailCache {
         let op = BlockOperation()
         op.addExecutionBlock { [weak self, weak op] in
             guard let self, op?.isCancelled != true else { return }
+            // lowQualityThumbnail INCLUDED, not just .thumbnail: for online-only cloud
+            // files the File Provider supplies a ready-made low-quality thumb, and
+            // requesting only the full-quality kind rejected it — those files showed
+            // generic icons while Finder, asking for any representation, showed art.
             let req = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
-                                                   scale: scale, representationTypes: .thumbnail)
+                                                   scale: scale,
+                                                   representationTypes: [.lowQualityThumbnail, .thumbnail])
             var img: NSImage?
             let sem = DispatchSemaphore(value: 0)
             QLThumbnailGenerator.shared.generateBestRepresentation(for: req) { rep, _ in
@@ -650,16 +677,42 @@ final class ThumbnailCache {
             // Give up on a pathological file rather than holding a slot forever —
             // some large cloud-hosted PSDs never come back in reasonable time.
             if sem.wait(timeout: .now() + 15) == .timedOut { QLThumbnailGenerator.shared.cancel(req) }
+            // QuickLook failed on a plain image that is actually present on disk —
+            // decode it ourselves. This covers a file QL is being weird about (fresh
+            // sync, odd encoder) with zero QuickLook dependence. Never for dataless
+            // (online-only) files: reading one forces the provider to download it,
+            // and a folder of 300 would become 300 downloads.
+            if img == nil, op?.isCancelled != true, isImageFile(url), !isDatalessFile(url) {
+                img = ThumbnailCache.decodeDownscaled(url, maxPixel: size * scale)
+            }
             self.lock.lock()
             self.ops[key as String] = nil
             if let img { self.cache.setObject(img, forKey: key) }
-            else { self.failed.insert(key as String) }   // don't ask again on every scroll
+            else { self.failed[key as String] = Date() }   // throttled, retried after TTL
             self.lock.unlock()
             if op?.isCancelled == true { return }
             DispatchQueue.main.async { completion(img) }
         }
         lock.lock(); ops[key as String] = op; lock.unlock()
         queue.addOperation(op)
+    }
+
+    /// Straight CGImageSource downscale — the no-QuickLook fallback for plain images.
+    static func decodeDownscaled(_ url: URL, maxPixel: CGFloat) -> NSImage? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize: max(64, maxPixel),
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    /// Everything queued as failed is forgotten — wired to ⌘R, because "refresh" is
+    /// exactly the gesture someone makes at a folder whose thumbnails look wrong.
+    func forgetFailures() {
+        lock.lock(); failed.removeAll(); lock.unlock()
     }
 
     // Row scrolled out of view — drop its pending request so the queue stays
@@ -1320,6 +1373,53 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
 
 struct H5GResult { let out: String; let err: String; let code: Int32 }
 
+/// True when the window's first responder is editing text, so app-wide shortcuts must
+/// keep their hands off.
+///
+/// `NSTextInputClient` is the load-bearing part. The old check was
+/// `r is NSText || r is NSTextView`, which is what an AppKit NSTextField's field editor
+/// looks like — but SwiftUI's TextField does NOT reliably make an NSText/NSTextView the
+/// first responder, so that check reported "not editing" while someone was typing in
+/// the address bar. Two things went wrong as a result: every printable keystroke was
+/// swallowed by type-to-select (so the address bar simply would not accept typing), and
+/// ⌘V reached AppDelegate's file-paste fallback, pasting FILES into the current folder
+/// instead of text into the field. Every text-input responder conforms to
+/// NSTextInputClient, SwiftUI's included, so this catches all of them.
+func isEditingText(in win: NSWindow?) -> Bool {
+    guard let r = win?.firstResponder else { return false }
+    return r is NSTextInputClient || r is NSText || r is NSTextView || r is NSTextField
+}
+
+/// Runs a standard editing action against the focused text responder. Returns true when
+/// the event belongs to text editing and must NOT fall through to a file operation.
+///
+/// Implemented with tryToPerform — dispatch the STANDARD selector up the responder
+/// chain from the focused view — rather than by manipulating NSTextInputClient by hand.
+/// The field's own copy:/cut:/paste:/selectAll: implementations then run, with their
+/// undo support and selection behaviour intact. An earlier hand-rolled version got
+/// Select All wrong in the worst way: it recognised "text is focused", couldn't find a
+/// portable way to select all, and swallowed the event having done NOTHING — ⌘A in the
+/// address bar was a no-op by construction.
+///
+/// Still returns true even if nothing responded to the selector: when text is focused,
+/// falling through to the FILE operation (paste files into the folder because the
+/// caret was in a text field) is strictly worse than doing nothing.
+@discardableResult
+func performTextEditingAction(_ kind: TextEditAction) -> Bool {
+    guard let win = NSApp.keyWindow, isEditingText(in: win) else { return false }
+    let sel: Selector
+    switch kind {
+    case .copy:      sel = #selector(NSText.copy(_:))
+    case .cut:       sel = #selector(NSText.cut(_:))
+    case .paste:     sel = #selector(NSText.paste(_:))
+    case .selectAll: sel = #selector(NSText.selectAll(_:))
+    }
+    _ = win.firstResponder?.tryToPerform(sel, with: nil)
+    return true
+}
+
+enum TextEditAction { case copy, cut, paste, selectAll }
+
 // Append-only dev log at ~/Library/Logs/Navigator.log — while we bring the
 // Vertex/Imagen path up, so failures are diagnosable instead of guesswork.
 // ponytail: plain FileHandle append, no rotation; trim manually if it grows.
@@ -1500,7 +1600,7 @@ func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void
                 // Re-cut the white-backed upscale with Photoshop's Remove BG → clean
                 // high-res transparent PNG (the tool that's best at it).
                 usedPS = true
-                let r2 = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [savedURL.path, dst.path], reportError: false)
+                let r2 = removeBackgroundOnce(src: savedURL, out: dst, reportFinalError: false)
                 try? FileManager.default.removeItem(at: savedURL)
                 if r2.ok {
                     outs.append(dst); navLog("  RESULT: ok (Photoshop re-cut) → \(dst.lastPathComponent)")
@@ -1616,6 +1716,50 @@ func batchUpscaleFolderViaImagen(_ folder: URL, factor: Int, onDone: (() -> Void
     upscaleImagesViaImagen(imgs, factor: factor) { _ in onDone?() }
 }
 
+// Remove BG for ONE file, retrying a failure before giving up.
+//
+// Photoshop intermittently refuses a single file in a long run with a transient
+// scripting error — "General Photoshop error occurred… The command 'Get' is not
+// currently available" — and then processes the very next file fine. It is a
+// Photoshop state problem, not a file problem: in a real 39-image run the one file
+// that failed (HP4_Frame.png) was IDENTICAL to the 38 that succeeded in every
+// property that could matter — 3584x4800, 8-bit, RGB, no alpha, no colour profile,
+// same PNG encoder, comparable byte size. Nothing about it was special.
+//
+// This same error is already recorded in this file's history: the ORIGINAL design ran
+// the batch loop inside one Photoshop script and hit "command Get is not available"
+// on EVERY image, which is why the code moved to one script per file. That change
+// took it from always to rare — it didn't eliminate it. Since the input is provably
+// fine, simply asking again is the correct remedy, and it's the same approach the
+// Restyle path already uses for Vertex's transient 503s.
+//
+// Idempotent by construction: the script re-opens the source read-only and saveAs
+// overwrites the output, so a retry can't corrupt or double-write anything.
+//
+// `reportFinalError` keeps the single-image path's dialog behaviour exactly as it was
+// — only the LAST attempt is allowed to surface an error, so retries stay silent and a
+// genuine failure still reports through the same routing (automation-permission vs
+// script error) it always did.
+func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
+                          reportFinalError: Bool) -> ScriptResult {
+    var last = ScriptResult(ok: false, message: "not attempted")
+    for i in 0..<attempts {
+        let isLast = (i == attempts - 1)
+        last = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path],
+                                 reportError: reportFinalError && isLast)
+        if last.ok {
+            if i > 0 { navLog("remove bg: \(src.lastPathComponent) succeeded on attempt \(i + 1)") }
+            return last
+        }
+        guard !isLast else { break }
+        navLog("remove bg: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
+        // Let Photoshop settle. The failure is it being briefly unable to service a
+        // scripting request, so a short pause is the whole point of the retry.
+        Thread.sleep(forTimeInterval: 1.0 + Double(i))
+    }
+    return last
+}
+
 // Single-image Remove BG usable from anywhere (browser or image viewer): Photoshop
 // opens the ORIGINAL and saves the keyed result as "<name>_rmbg.png" — no redundant
 // pre-copy (faster, especially on network/Drive), and the original is never
@@ -1625,7 +1769,7 @@ func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
     let out = rmbgOutputURL(src)
     DispatchQueue.global(qos: .userInitiated).async {
-        let r = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path])
+        let r = removeBackgroundOnce(src: src, out: out, reportFinalError: true)
         DispatchQueue.main.async {
             guard r.ok else { return }       // failure already surfaced; leave PS visible
             hideApp(bundleID: "com.adobe.Photoshop")
@@ -1646,7 +1790,7 @@ func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) 
         var errors: [String] = []
         for src in imgs {
             let out = rmbgOutputURL(src)
-            let r = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path], reportError: false)
+            let r = removeBackgroundOnce(src: src, out: out, reportFinalError: false)
             if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
@@ -1679,7 +1823,24 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 "deleteIntermediateRender": true, "keyMode": "auto"
             ]
             guard let cfgPath = writeChromaConfig(cfg) else { errors.append("\(src.lastPathComponent): couldn’t write config"); continue }
-            let r = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath], reportError: false)
+            // Same retry as Photoshop's Remove BG, for the same reason: this is one
+            // script invocation per file, so a single transient refusal from the host app
+            // permanently loses that one file out of a long run with no second chance.
+            // The render overwrites its own output, so retrying is idempotent. Config is
+            // reused across attempts and deleted once, after the last one.
+            var r = ScriptResult(ok: false, message: "not attempted")
+            for attempt in 0..<3 {
+                let isLast = (attempt == 2)
+                r = runAfterEffectsScript(resource: "NavigatorChromaKeyStill",
+                                          globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath], reportError: false)
+                if r.ok {
+                    if attempt > 0 { navLog("chroma key: \(src.lastPathComponent) succeeded on attempt \(attempt + 1)") }
+                    break
+                }
+                guard !isLast else { break }
+                navLog("chroma key: \(src.lastPathComponent) attempt \(attempt + 1) failed — \(r.message); retrying")
+                Thread.sleep(forTimeInterval: 1.0 + Double(attempt))
+            }
             try? FileManager.default.removeItem(atPath: cfgPath)
             if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
@@ -2819,6 +2980,9 @@ final class Browser: ObservableObject, Identifiable {
     // re-read from disk/network and show a clean "Loading…" instead of stale cache.
     func refresh() {
         Browser.invalidateCache(currentURL.path)
+        // ⌘R is the natural "these thumbnails look wrong" gesture — forget throttled
+        // thumbnail failures so the reload really does try again immediately.
+        ThumbnailCache.shared.forgetFailures()
         if isSearching { runSearch() } else { load() }
     }
 
@@ -4576,6 +4740,11 @@ struct ControlBar: View {
     @ObservedObject var model: AppModel
     @ObservedObject var browser: Browser
     @FocusState private var addressFocused: Bool
+    // Drives which address-bar state is showing (read-only path vs live field). A plain
+    // @State separate from the FocusState on purpose: the field must EXIST before it can
+    // be focused, so "start editing" inserts it (this flag) and the field then takes
+    // focus in its own onAppear — the order the old single-flag design got wrong.
+    @State private var editingPath = false
     @FocusState private var searchFocused: Bool
     private var folderName: String {
         let n = browser.currentURL.lastPathComponent
@@ -4598,30 +4767,43 @@ struct ControlBar: View {
 
                 HStack(spacing: 6) {
                     Image(systemName: "folder").foregroundStyle(.secondary).font(.caption)
-                    // A long path's useful end is the deep folder you're actually in, so
-                    // show that and hide the front. SwiftUI ignores .truncationMode on an
-                    // editable TextField (it still cuts the tail), so while the field is
-                    // not being edited we make it transparent and draw a head-truncated
-                    // Text over it. The field stays in the hierarchy, so a click still
-                    // lands on it and focuses it, revealing the full path and a cursor.
-                    TextField("Type a path and press Return", text: $browser.pathText)
-                        .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
-                        .focused($addressFocused).onSubmit { browser.submitPath() }
-                        .opacity(addressFocused || browser.pathText.isEmpty ? 1 : 0)
-                        .overlay(alignment: .leading) {
-                            if !addressFocused && !browser.pathText.isEmpty {
-                                Text(browser.pathText)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .lineLimit(1).truncationMode(.head)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .allowsHitTesting(false)
-                            }
-                        }
+                    // Two explicit states, swapped like Windows Explorer's address bar:
+                    // a head-truncated read-only path (the long path's useful end is the
+                    // deep folder you're in), and a real TextField while editing.
+                    //
+                    // Swapped with if/else, NOT the old opacity trick. The previous
+                    // design kept the field at .opacity(0) under a non-hit-testing Text
+                    // and asked FocusState to focus it — but an opacity-0 view isn't
+                    // hit-testable, and AppKit refuses first-responder for it, so the
+                    // focus request usually just failed. That's why the bar took "a few
+                    // double-clicks" to catch: it only worked when a click happened to
+                    // land during a re-render race. Here the field is INSERTED first and
+                    // claims focus in .onAppear, when it demonstrably exists and is
+                    // visible — no race to win.
+                    if editingPath {
+                        TextField("Type a path and press Return", text: $browser.pathText)
+                            .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
+                            .focused($addressFocused)
+                            .onAppear { addressFocused = true }
+                            .onSubmit { browser.submitPath(); editingPath = false }
+                            // Focus left the field (clicked a file, pressed Escape via
+                            // AppKit, tabbed away) — show the truncated path again.
+                            .onChange(of: addressFocused) { if !addressFocused { editingPath = false } }
+                    } else {
+                        Text(browser.pathText.isEmpty ? "Type a path and press Return" : browser.pathText)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(browser.pathText.isEmpty ? Color.secondary : Color.primary)
+                            .lineLimit(1).truncationMode(.head)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .padding(.horizontal, 8).padding(.vertical, 5)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
                 .frame(maxWidth: .infinity)
+                // The whole capsule begins editing — one click, anywhere in the bar.
+                .contentShape(Rectangle())
+                .onTapGesture { if !editingPath { editingPath = true } }
 
                 Button { browser.copyDisplayedPath() } label: { Image(systemName: "doc.on.doc") }
                     .help("Copy Path Shown in Address Bar")
@@ -4730,7 +4912,9 @@ struct ControlBar: View {
             }
         }.padding(.horizontal, 10).padding(.vertical, 8)
         .onReceive(NotificationCenter.default.publisher(for: .navigatorFocusSearch)) { _ in searchFocused = true }
-        .onReceive(NotificationCenter.default.publisher(for: .navigatorResignFields)) { _ in addressFocused = false; searchFocused = false }
+        .onReceive(NotificationCenter.default.publisher(for: .navigatorResignFields)) { _ in
+            addressFocused = false; searchFocused = false; editingPath = false
+        }
     }
 
     @ViewBuilder private func sep() -> some View { Divider().frame(height: 16).padding(.horizontal, 3) }
@@ -5171,6 +5355,11 @@ private final class ClickTimingTableView: NSTableView {
     var onDragTargeted: ((Bool) -> Void)?
 
     override func mouseDown(with event: NSEvent) {
+        // Parity with icon view (whose clicks route through Browser.click): clicking
+        // the file list takes keyboard focus away from the address/search fields, so
+        // typing afterwards is type-to-select — not characters silently appended to a
+        // still-focused address bar. Windows Explorer behaves the same way.
+        NotificationCenter.default.post(name: .navigatorResignFields, object: nil)
         let point = convert(event.locationInWindow, from: nil)
         let clickedRow = row(at: point)
         let clickedColumn = column(at: point)
@@ -5185,14 +5374,50 @@ private final class ClickTimingTableView: NSTableView {
     override func menu(for event: NSEvent) -> NSMenu? {
         onContextMenuRequest?(row(at: convert(event.locationInWindow, from: nil)))
     }
+    // The highlight flag is published ASYNCHRONOUSLY, never synchronously inside these
+    // callbacks. Writing SwiftUI @State from here re-enters the view update on the spot,
+    // and that update path can call reloadData()/selectRowIndexes() on this very table
+    // WHILE a drag is in flight — which throws away the drag's drop targeting and makes
+    // every drop silently do nothing. (That's what broke dragging files onto a folder
+    // row after this view was rewritten on NSTableView.) The coordinator also refuses to
+    // touch the table at all while `isDragActive`; both halves are needed, because a
+    // deferred update can still land mid-drag.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        onDragTargeted?(true); return super.draggingEntered(sender)
+        let op = super.draggingEntered(sender)
+        DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(true) }
+        return op
     }
     override func draggingExited(_ sender: NSDraggingInfo?) {
-        onDragTargeted?(false); super.draggingExited(sender)
+        super.draggingExited(sender)
+        DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(false) }
     }
     override func draggingEnded(_ sender: NSDraggingInfo) {
-        onDragTargeted?(false); super.draggingEnded(sender)
+        super.draggingEnded(sender)
+        DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(false) }
+    }
+
+    // SOURCE side of the drag (the two above are the destination side).
+    //
+    // These are `override`s of NSDraggingSource methods NSTableView already implements,
+    // not optional delegate callbacks — so the compiler guarantees they're wired up. A
+    // mistyped optional delegate method would just silently never fire, which is not a
+    // risk worth taking while chasing this.
+    //
+    // Reports how many rows AppKit actually decided to drag versus how many are
+    // selected: that single comparison distinguishes "the table only put one row in the
+    // drag" from "all rows were dragged but the drop only took one".
+    var onDragSessionBegin: ((_ selectedRows: Int, _ pasteboardItems: Int) -> Void)?
+    var onDragSessionEnd: (() -> Void)?
+
+    override func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
+        super.draggingSession(session, willBeginAt: screenPoint)
+        onDragSessionBegin?(selectedRowIndexes.count,
+                            session.draggingPasteboard.pasteboardItems?.count ?? -1)
+    }
+    override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint,
+                                 operation: NSDragOperation) {
+        super.draggingSession(session, endedAt: screenPoint, operation: operation)
+        onDragSessionEnd?()
     }
 }
 
@@ -5200,8 +5425,54 @@ private final class ClickTimingTableView: NSTableView {
 // swapped in place on reuse instead of tearing the hosting view down — the key
 // to letting each cell's SwiftUI content (NameCell etc.) stay a live, reactive
 // view across ordinary redraws instead of restarting every scroll/update.
+// The SwiftUI host for a cell's content, made TRANSPARENT to the mouse.
+//
+// This is what makes dragging work. NSHostingView hit-tests like any other view, so
+// with plain SwiftUI content it claims the mouse wherever a Text sits — verified by
+// hit-testing this exact cell layout: a press on the filename returned
+// NSHostingView<AnyView>, while the icon and the row's edges returned NSTableRowView.
+// NSTableView therefore never saw the mouseDown over a filename and never started its
+// drag tracking; the event fell through the responder chain and merely selected the
+// row. The symptom was "it just selects instead of dragging", and it was worst exactly
+// where people grab a file — on its name.
+//
+// Returning nil from hitTest hands every click, drag and double-click straight to the
+// table, which is what owns selection, dragging and opening.
+//
+// The exception is real editable content: the inline rename field is an NSTextField
+// living inside this host, and it has to receive clicks so the caret can be placed.
+// `acceptsEvents` is set explicitly by the cell rather than sniffed from the view
+// tree — an earlier version scanned the subtree for an NSTextField and got it wrong,
+// because SwiftUI materialises an NSViewRepresentable's view on its own schedule, so
+// the field often doesn't exist yet at hit-test time. The coordinator already knows
+// exactly which row is renaming; that is the reliable signal.
+//
+// Known trade-off: SwiftUI .help() tooltips inside cells no longer appear, since a
+// tooltip needs the hit-test. Working drag-and-drop is worth more than a tooltip.
+private final class PassthroughHostingView: NSHostingView<AnyView> {
+    var acceptsEvents = false
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        acceptsEvents ? super.hitTest(point) : nil
+    }
+}
+
+// The cell view is transparent to the mouse for the same reason its hosting view is —
+// and this half matters specifically for MULTI-row drag.
+//
+// With only the hosting view transparent, a press still landed on this cell view, so
+// NSTableView saw it only second-hand via the responder chain. AppKit's "a press inside
+// an existing selection drags the WHOLE selection" logic runs in NSTableView's own mouse
+// tracking, and it wants the press to arrive at the table/row view the way it does in a
+// stock text-based table (where a non-editable NSTextField declines the hit for exactly
+// this reason). Declining here restores that arrangement: the press reaches
+// NSTableRowView → NSTableView, and a drag from within a selection carries every
+// selected row instead of just the one grabbed.
 private final class HostingTableCellView: NSTableCellView {
-    private let hosting = NSHostingView(rootView: AnyView(EmptyView()))
+    var acceptsEvents = false
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        acceptsEvents ? super.hitTest(point) : nil
+    }
+    private let hosting = PassthroughHostingView(rootView: AnyView(EmptyView()))
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         self.identifier = identifier
@@ -5219,7 +5490,12 @@ private final class HostingTableCellView: NSTableCellView {
     // happens here, since the hosting view is pinned to the cell's full width.
     // The explicit leading-aligned frame is what makes cell content actually
     // left-align like every other column in a normal table.
-    func update(_ content: AnyView) {
+    /// `interactive` = this cell currently holds an editable control (the rename field),
+    /// so it must receive mouse events. Everything else stays transparent so the table
+    /// owns selection, dragging and double-click.
+    func update(_ content: AnyView, interactive: Bool = false) {
+        acceptsEvents = interactive          // the cell itself, so the press can reach the table
+        hosting.acceptsEvents = interactive  // and the SwiftUI host inside it
         hosting.rootView = AnyView(content.frame(maxWidth: .infinity, alignment: .leading))
     }
 }
@@ -5258,6 +5534,11 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     private var lastRowSignature: [String] = []
     private var lastKeyboardScrollID: String?
     private var isPushingSelectionFromModel = false
+    /// True from the moment a drag enters this table until it leaves or drops. While set,
+    /// `reload()` refuses to touch the table: reloadData() or selectRowIndexes() during a
+    /// live drag discards the drag's drop targeting, and the visible symptom is a drop
+    /// that "does nothing" — no error, no move, no feedback.
+    fileprivate var isDragActive = false
 
     init(model: AppModel, browser: Browser, open: @escaping (Set<String>) -> Void, contextMenu: @escaping (Set<FileItem.ID>) -> AnyView) {
         self.model = model; self.browser = browser; self.open = open; self.contextMenu = contextMenu
@@ -5279,8 +5560,44 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         table.doubleAction = #selector(doubleClicked(_:))
         table.onNameClickCandidate = { [weak self] row in self?.handleNameClickCandidate(row: row) }
         table.onContextMenuRequest = { [weak self] row in self?.buildContextMenu(row: row) }
-        table.onDragTargeted = { [weak self] t in self?.isTargetedBinding?.wrappedValue = t }
+        // Clearing isDragActive here (not only in acceptDrop) matters: a drag that leaves
+        // the table or is cancelled never reaches acceptDrop, and a stuck isDragActive
+        // would freeze the table's updates for the rest of the session.
+        table.onDragTargeted = { [weak self] t in
+            guard let self else { return }
+            if !t { self.isDragActive = false }
+            self.isTargetedBinding?.wrappedValue = t
+            if !t { self.reload() }   // catch up on anything skipped during the drag
+        }
+        // Source side. Previously only the DESTINATION side set isDragActive, which left
+        // a real gap: dragging OUT of Navigator (to Slack, to Finder) never enters this
+        // table as a destination, so nothing stopped a SwiftUI re-render from calling
+        // selectRowIndexes()/reloadData() on the table while its own drag was in flight.
+        table.onDragSessionBegin = { [weak self] selectedRows, pbItems in
+            guard let self else { return }
+            self.isDragActive = true
+            navLog("drag start: \(selectedRows) row(s) selected, \(pbItems) pasteboard item(s), model selection \(self.browser.selection.count)")
+        }
+        table.onDragSessionEnd = { [weak self] in
+            guard let self else { return }
+            self.isDragActive = false
+            self.reload()
+        }
         table.registerForDraggedTypes([.fileURL])
+        // REQUIRED for dragging files OUT to other apps (Slack, Mail, Photoshop, Finder).
+        // NSTableView's documented default is NSDragOperationAll for local drags but
+        // NSDragOperationNone for non-local ones, so without this AppKit refuses to let
+        // the drag leave the app at all — the pasteboard content is irrelevant because no
+        // external drop is ever offered. (Apple's QA1220 is literally "Re-enabling
+        // dragging from NSTableView to other applications".) Dropping onto a folder row
+        // inside Navigator kept working, which is what made this look like a Slack
+        // problem rather than a missing one-liner here.
+        //
+        // .copy only, deliberately not .move: the destination can't move what we don't
+        // offer, and an accidental drag-out that RELOCATES a file off a shared team drive
+        // removes it for everyone. That's the same hazard PathRules.leavesCloudProvider
+        // already forces to copy for in-app drops; this extends the rule to every app.
+        table.setDraggingSourceOperationMask(.copy, forLocal: false)
         for def in fileColumnDefs {
             let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(def.id))
             col.title = def.title
@@ -5311,14 +5628,24 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     // on every unrelated Browser change (selection, badgeGeneration, ...).
     func reload() {
         guard let table = tableView else { return }
+        // Hands off entirely while a drag is over this table — see isDragActive. The
+        // pending state is not lost: the drop itself triggers a reload once it lands, and
+        // draggingExited/Ended schedule one on the way out.
+        if isDragActive { return }
         let newRows: [FileRow] = browser.groupBy == .none
             ? browser.visibleItems().map { .item($0) }
             : browser.groups().flatMap { g -> [FileRow] in
                 g.title.isEmpty ? g.items.map { .item($0) } : [.header(g.title)] + g.items.map { .item($0) }
               }
-        let newSignature = newRows.map { row -> String in
+        // The renaming row is part of the signature so that STARTING or ENDING a rename
+        // rebuilds the cells — which is what refreshes each cell's `interactive` flag
+        // (see PassthroughHostingView). Deliberately keyed on renamingID and nothing
+        // else about the edit: typing doesn't change it, so the field is never torn down
+        // mid-edit, which is the failure the row-set check was written to avoid.
+        var newSignature = newRows.map { row -> String in
             switch row { case .header(let t): return "H:" + t; case .item(let it): return "I:" + it.id }
         }
+        newSignature.append("R:" + (browser.renamingID ?? ""))
         if newSignature != lastRowSignature {
             rows = newRows
             lastRowSignature = newSignature
@@ -5452,11 +5779,13 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         }
         guard case .item(let item) = rows[row], let colID = tableColumn?.identifier.rawValue else { return nil }
         let reuseID = NSUserInterfaceItemIdentifier(colID)
+        // Only the Name column ever holds the rename field, so only it can need events.
+        let interactive = (colID == "name" && browser.renamingID == item.id)
         if let cell = tableView.makeView(withIdentifier: reuseID, owner: self) as? HostingTableCellView {
-            cell.update(cellContent(for: colID, item: item)); return cell
+            cell.update(cellContent(for: colID, item: item), interactive: interactive); return cell
         }
         let cell = HostingTableCellView(identifier: reuseID)
-        cell.update(cellContent(for: colID, item: item))
+        cell.update(cellContent(for: colID, item: item), interactive: interactive)
         return cell
     }
 
@@ -5500,24 +5829,54 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         return item.url as NSURL
     }
 
+    /// The folder row under the cursor, hit-tested from the drag's own location.
+    ///
+    /// Deliberately does NOT trust the `proposedRow`/`proposedDropOperation` AppKit hands
+    /// in. Whether a table proposes `.on` (over a row) versus `.above` (between rows)
+    /// depends on where in the row height the cursor sits, so relying on it made "drop
+    /// onto this folder" work only in part of each row — and every miss fell through to
+    /// "drop into the current folder", which for files already in that folder is a no-op
+    /// that looks exactly like drag-and-drop being broken. Hit-testing directly makes the
+    /// whole row height a valid target.
+    private func folderRow(under info: NSDraggingInfo, in tableView: NSTableView) -> (row: Int, url: URL)? {
+        let point = tableView.convert(info.draggingLocation, from: nil)
+        let hovered = tableView.row(at: point)
+        guard rows.indices.contains(hovered), case .item(let item) = rows[hovered], item.isDirectory else { return nil }
+        return (hovered, item.url)
+    }
+
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int,
                    proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
         guard info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) else { return [] }
-        if dropOperation == .on, rows.indices.contains(row), case .item(let item) = rows[row], item.isDirectory {
+        isDragActive = true
+        if let hit = folderRow(under: info, in: tableView) {
+            // Retarget explicitly so acceptDrop is guaranteed to see this exact row with
+            // .on, no matter what was proposed.
+            tableView.setDropRow(hit.row, dropOperation: .on)
             return .copy
         }
-        // Anything else (between rows, on a file, empty table) → whole-table
-        // background drop, same as Finder proposing "into the current folder".
+        // Empty space, a file row, or between rows → the current folder, which is what
+        // Finder does for a drop that isn't aimed at a specific folder.
         tableView.setDropRow(-1, dropOperation: .on)
         return .copy
     }
 
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int,
                    dropOperation: NSTableView.DropOperation) -> Bool {
-        guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else { return false }
-        if dropOperation == .on, rows.indices.contains(row), case .item(let item) = rows[row], item.isDirectory {
-            browser.dropInto(urls, folder: item.url)
+        isDragActive = false
+        guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+              !urls.isEmpty else { return false }
+        // Re-hit-test rather than trusting `row`: validateDrop already retargeted, but
+        // this keeps the two paths deciding the same way from the same input.
+        if let hit = folderRow(under: info, in: tableView) {
+            // Never drop a folder into itself or its own subtree — FileManager will
+            // happily recurse into the copy it's creating. PathRules has the rule.
+            let safe = urls.filter { !PathRules.isSelfOrDescendant(hit.url, of: $0) }
+            guard !safe.isEmpty else { NSSound.beep(); return false }
+            navLog("drop: \(safe.count) item(s) onto folder \(hit.url.lastPathComponent)")
+            browser.dropInto(safe, folder: hit.url)
         } else {
+            navLog("drop: \(urls.count) item(s) into current folder")
             browser.dropIntoCurrentFolder(urls)
         }
         return true
@@ -5545,11 +5904,6 @@ struct IconCell: View {
                     .multilineTextAlignment(.center)
             } else {
                 Text(item.name).font(.caption).lineLimit(2).multilineTextAlignment(.center)
-                    .onTapGesture {
-                        let e = NSApp.currentEvent
-                        if (e?.clickCount ?? 1) >= 2 { openItem(item, browser) }
-                        else { browser.click(item.id, modifiers: e?.modifierFlags ?? []); browser.handleNameTap(item.id) }
-                    }
             }
         }
         .frame(width: browser.iconSize + 40, height: browser.iconSize + 46)
@@ -5557,7 +5911,30 @@ struct IconCell: View {
         .background(selected ? Color.accentColor.opacity(0.25) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
-        .draggable(item.url)
+        // Replaces .draggable(item.url) AND the name's .onTapGesture. .draggable could
+        // only ever carry ONE file, so dragging a multi-selection dropped just the one
+        // grabbed; this hands the cell's mouse handling to AppKit, which can put every
+        // selected file on the drag. Skipped while renaming so the field keeps its clicks.
+        .overlay {
+            if browser.renamingID != item.id {
+                IconCellMouseHandler(
+                    select: { e in browser.click(item.id, modifiers: e.modifierFlags) },
+                    isSelected: { browser.selection.contains(item.id) },
+                    open: { openItem(item, browser) },
+                    plainClickCompleted: { browser.handleNameTap(item.id) },
+                    urlsForDrag: {
+                        // Selection landed on mouse-down, so by drag time this item is
+                        // in the selection — the drag simply carries whatever is selected.
+                        if browser.selection.contains(item.id), browser.selection.count > 1 {
+                            return browser.orderedVisibleItems()
+                                .filter { browser.selection.contains($0.id) }.map { $0.url }
+                        }
+                        return [item.url]
+                    },
+                    dragIcon: { browser.icon(for: item) }
+                )
+            }
+        }
         .onAppear {
             // Only fetch a thumbnail for files that can have one — folders keep
             // their type icon (matches the list view; avoids per-cell churn).
@@ -5567,7 +5944,133 @@ struct IconCell: View {
             cloud = cloudBadge(for: item.url)
         }
         .onDisappear { if thumb == nil { ThumbnailCache.shared.cancel(for: item.url) } }
-        .onChange(of: browser.badgeGeneration) { cloud = cloudBadge(for: item.url) }
+        .onChange(of: browser.badgeGeneration) {
+            cloud = cloudBadge(for: item.url)
+            // Cloud state changed (a download finished, a sync completed) — the exact
+            // moment a previously-failed thumbnail is worth another try.
+            if thumb == nil, !item.isDirectory, isThumbnailable(item.url) {
+                ThumbnailCache.shared.thumbnail(for: item.url) { if let t = $0 { thumb = t } }
+            }
+        }
+    }
+}
+
+// Owns one icon cell's mouse handling in AppKit, so a drag can carry the WHOLE
+// selection.
+//
+// SwiftUI's `.draggable` carries exactly one item — it has no concept of the current
+// selection — so selecting eight files and dragging them dragged only the one grabbed.
+// There is no SwiftUI API for multi-item drag; putting one NSDraggingItem per file on
+// the pasteboard requires AppKit. Since this view has to receive the mouse-down to
+// start that drag, it also takes over click/double-click for the cell (which means
+// clicking anywhere on a cell now selects it, not just its filename).
+//
+// Selection follows the Finder/NSTableView model — applied on mouse DOWN, not up:
+//   • down on an UNSELECTED item → selection changes immediately (with ⌘/⇧ honoured),
+//     so a drag that follows carries what you see selected;
+//   • down on an ALREADY-SELECTED item → deferred to mouse-up, so grabbing one item of
+//     a multi-selection and dragging doesn't collapse the selection first;
+//   • up without a drag resolves the deferred case (plain → collapse to this item,
+//     ⌘ → toggle it off) and arms click-pause-click rename for plain clicks only.
+// An earlier version did ALL selection on mouse-up, which both deviated from every
+// native file browser and broke ⌘-click multi-select in practice.
+//
+// Not installed while a cell is being renamed — the rename field needs its own clicks.
+struct IconCellMouseHandler: NSViewRepresentable {
+    /// Apply a selection click (modifiers included) to this cell's item.
+    let select: (NSEvent) -> Void
+    /// Is this cell's item currently in the selection?
+    let isSelected: () -> Bool
+    /// Open the item (double-click).
+    let open: () -> Void
+    /// Plain single click fully resolved (no drag, no modifiers) — rename arming.
+    let plainClickCompleted: () -> Void
+    /// Resolved at drag time, not view-build time, so it reflects the selection as it is
+    /// when the drag actually starts.
+    let urlsForDrag: () -> [URL]
+    let dragIcon: () -> NSImage?
+
+    func makeNSView(context: Context) -> Handler {
+        let v = Handler(); apply(to: v); return v
+    }
+    func updateNSView(_ v: Handler, context: Context) { apply(to: v) }
+    private func apply(to v: Handler) {
+        v.select = select; v.isSelected = isSelected; v.open = open
+        v.plainClickCompleted = plainClickCompleted
+        v.urlsForDrag = urlsForDrag; v.dragIcon = dragIcon
+    }
+
+    final class Handler: NSView, NSDraggingSource {
+        var select: ((NSEvent) -> Void)?
+        var isSelected: (() -> Bool)?
+        var open: (() -> Void)?
+        var plainClickCompleted: (() -> Void)?
+        var urlsForDrag: (() -> [URL])?
+        var dragIcon: (() -> NSImage?)?
+        private var downPoint: NSPoint?
+        private var didDrag = false
+        // Selection change postponed to mouse-up (the down landed on an already-
+        // selected item, which may be the start of a whole-selection drag).
+        private var deferredSelection = false
+
+        override func mouseDown(with event: NSEvent) {
+            // A rename in progress on ANOTHER cell must end when the user clicks here
+            // (commit-on-focus-loss, like every native file browser). The rename field
+            // only commits when it loses first responder, and nothing else would take
+            // it — this handler deliberately never becomes first responder itself.
+            if let w = window, isEditingText(in: w) { w.makeFirstResponder(nil) }
+            downPoint = convert(event.locationInWindow, from: nil)
+            didDrag = false
+            deferredSelection = (isSelected?() == true)
+            if !deferredSelection { select?(event) }   // Finder: selection lands on DOWN
+            // Deliberately no super: this view owns the cell's mouse handling.
+        }
+        override func mouseDragged(with event: NSEvent) {
+            guard let start = downPoint, !didDrag else { return }
+            let p = convert(event.locationInWindow, from: nil)
+            // Threshold so a slightly shaky click still counts as a click, not a drag.
+            guard hypot(p.x - start.x, p.y - start.y) >= 6 else { return }
+            didDrag = true
+            beginFileDrag(with: event)
+        }
+        override func mouseUp(with event: NSEvent) {
+            defer { downPoint = nil; deferredSelection = false }
+            guard !didDrag else { return }   // a completed drag is not a click
+            if event.clickCount >= 2 { open?(); return }
+            let mods = event.modifierFlags.intersection([.command, .shift])
+            if deferredSelection {
+                // The down didn't act; resolve now — plain collapses to this item,
+                // ⌘ toggles it out of the selection, ⇧ extends the range.
+                select?(event)
+            }
+            if mods.isEmpty { plainClickCompleted?() }   // arm click-pause-click rename
+        }
+
+        private func beginFileDrag(with event: NSEvent) {
+            let urls = urlsForDrag?() ?? []
+            guard !urls.isEmpty else { return }
+            let fallbackIcon = dragIcon?()
+            let items: [NSDraggingItem] = urls.enumerated().map { i, url in
+                let di = NSDraggingItem(pasteboardWriter: url as NSURL)
+                // One NSDraggingItem per file — this is the part SwiftUI can't express,
+                // and it's what makes the receiving app see eight files instead of one.
+                // Offset each image slightly so a multi-file drag reads as a stack.
+                let side: CGFloat = 48
+                let step = CGFloat(min(i, 4)) * 6
+                di.setDraggingFrame(NSRect(x: step, y: step, width: side, height: side),
+                                    contents: fallbackIcon ?? NSWorkspace.shared.icon(forFile: url.path))
+                return di
+            }
+            navLog("icon drag start: \(items.count) file(s)")
+            beginDraggingSession(with: items, event: event, source: self)
+        }
+
+        func draggingSession(_ session: NSDraggingSession,
+                             sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+            // Other apps (Slack, Finder) get copy; inside Navigator the destination
+            // decides move-vs-copy itself, so offer both.
+            context == .outsideApplication ? .copy : [.copy, .move]
+        }
     }
 }
 
@@ -5588,11 +6091,21 @@ final class FrameStore { var frames: [String: CGRect] = [:] }
 struct MarqueeCatcher: NSViewRepresentable {
     var onRect: (CGRect?) -> Void      // drag rect in grid space; nil when the drag ends
     var onEmptyClick: () -> Void        // a click on empty space (no drag) → deselect
-    func makeNSView(context: Context) -> CatcherView { let v = CatcherView(); v.onRect = onRect; v.onEmptyClick = onEmptyClick; return v }
-    func updateNSView(_ v: CatcherView, context: Context) { v.onRect = onRect; v.onEmptyClick = onEmptyClick }
+    // Right-click on empty space → this menu (Paste / New Folder / …). The catcher is
+    // the AppKit view that owns the grid's empty area, so it's the only place a
+    // blank-space right-click ever arrives — without this, icon view simply had no
+    // empty-area menu at all (the table view has one via its row==-1 path).
+    var emptyAreaMenu: (() -> NSMenu?)? = nil
+    func makeNSView(context: Context) -> CatcherView {
+        let v = CatcherView(); v.onRect = onRect; v.onEmptyClick = onEmptyClick; v.emptyAreaMenu = emptyAreaMenu; return v
+    }
+    func updateNSView(_ v: CatcherView, context: Context) {
+        v.onRect = onRect; v.onEmptyClick = onEmptyClick; v.emptyAreaMenu = emptyAreaMenu
+    }
     final class CatcherView: NSView {
         var onRect: ((CGRect?) -> Void)?
         var onEmptyClick: (() -> Void)?
+        var emptyAreaMenu: (() -> NSMenu?)?
         private var start: NSPoint?
         private var dragged = false
         override var isFlipped: Bool { true }
@@ -5607,6 +6120,7 @@ struct MarqueeCatcher: NSViewRepresentable {
             if !dragged { onEmptyClick?() }
             start = nil; onRect?(nil)
         }
+        override func menu(for event: NSEvent) -> NSMenu? { emptyAreaMenu?() }
     }
 }
 
@@ -5650,7 +6164,19 @@ struct IconGridView: View {
                                     browser.updateStatus()
                                 }
                             },
-                            onEmptyClick: { browser.selection = []; browser.updateStatus() }
+                            onEmptyClick: { browser.selection = []; browser.updateStatus() },
+                            // Same items as the list view's blank-space menu.
+                            emptyAreaMenu: {
+                                NSHostingMenu(rootView: AnyView(Group {
+                                    Button("Paste") { browser.pasteFiles() }
+                                    Button("New Folder") { browser.newFolder() }
+                                    Button("New Text File") { browser.newTextFile() }
+                                    Button("Calculate All Sizes") {
+                                        for it in browser.items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
+                                    }
+                                    Button("Reveal in Finder") { browser.revealInFinder([]) }
+                                }))
+                            }
                         )
                         .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .topLeading)
                         LazyVGrid(columns: columns, spacing: 12) {
@@ -5705,14 +6231,14 @@ struct IconGridView: View {
                 // frame per cell on every layout pass janks LazyVGrid scrolling.
                 Color.clear.onAppear { frameStore.frames[item.id] = g.frame(in: .named("iconGrid")) }
             })
-            // ONE tap recognizer — no count:2 gesture to disambiguate against, so
-            // the select fires on mouse-up with zero double-click delay. A
-            // double-click still opens: macOS reports clickCount==2 on the 2nd press.
-            .onTapGesture {
-                let e = NSApp.currentEvent
-                if (e?.clickCount ?? 1) >= 2 { openItem(item, browser) }
-                else { browser.click(item.id, modifiers: e?.modifierFlags ?? []) }
-            }
+            // NO tap gesture here — and that absence is load-bearing. SwiftUI gesture
+            // recognizers attach at the hosting-view level and fire INDEPENDENTLY of
+            // the AppKit mouse handler inside IconCell consuming the click, so a tap
+            // gesture here ran every click a SECOND time. Plain clicks double-selected
+            // harmlessly (idempotent), but ⌘-click toggled twice: the handler added
+            // the item on mouse-down, this gesture immediately toggled it back off —
+            // "it selects it and deselects it". Confirmed live. Selection, open, and
+            // rename arming all live in IconCellMouseHandler alone.
             .dropDestination(for: URL.self) { urls, _ in
                 if item.isDirectory { browser.dropInto(urls, folder: item.url) }
                 else { browser.dropIntoCurrentFolder(urls) }
@@ -6001,7 +6527,14 @@ struct ThumbImage: View {
         .overlay(alignment: .bottomTrailing) { cloudBadgeView(cloud).padding(4) }
         .onAppear { ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }; cloud = cloudBadge(for: item.url) }
         .onChange(of: item.url) { thumb = nil; ThumbnailCache.shared.thumbnail(for: item.url) { thumb = $0 }; cloud = cloudBadge(for: item.url) }
-        .onChange(of: browser.badgeGeneration) { cloud = cloudBadge(for: item.url) }
+        .onChange(of: browser.badgeGeneration) {
+            cloud = cloudBadge(for: item.url)
+            // Same retry-on-cloud-change as the icon grid: a finished download is the
+            // moment a failed thumbnail becomes generatable.
+            if thumb == nil {
+                ThumbnailCache.shared.thumbnail(for: item.url) { if let t = $0 { thumb = t } }
+            }
+        }
     }
 }
 
@@ -6044,16 +6577,31 @@ struct GalleryView: View {
                                 .background(browser.selection.contains(it.id) ? Color.accentColor.opacity(0.3) : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .id(it.id)
-                                .draggable(it.url)
                                 .dropDestination(for: URL.self) { urls, _ in
                                     if it.isDirectory { browser.dropInto(urls, folder: it.url) }
                                     else { browser.dropIntoCurrentFolder(urls) }
                                     return true
                                 }
-                                .onTapGesture {
-                                    let e = NSApp.currentEvent
-                                    if (e?.clickCount ?? 1) >= 2 { openItem(it, browser) }
-                                    else { browser.click(it.id, modifiers: e?.modifierFlags ?? []) }
+                                // Same reason as the icon grid: .draggable can only carry
+                                // one file, so a multi-selection dragged just the one
+                                // grabbed. AppKit handles the mouse so every selected file
+                                // travels. (No rename arming in the filmstrip — the big
+                                // preview's title handles that.)
+                                .overlay {
+                                    IconCellMouseHandler(
+                                        select: { e in browser.click(it.id, modifiers: e.modifierFlags) },
+                                        isSelected: { browser.selection.contains(it.id) },
+                                        open: { openItem(it, browser) },
+                                        plainClickCompleted: {},
+                                        urlsForDrag: {
+                                            if browser.selection.contains(it.id), browser.selection.count > 1 {
+                                                return browser.orderedVisibleItems()
+                                                    .filter { browser.selection.contains($0.id) }.map { $0.url }
+                                            }
+                                            return [it.url]
+                                        },
+                                        dragIcon: { browser.icon(for: it) }
+                                    )
                                 }
                         }
                     }.padding(8)
@@ -7990,7 +8538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private func handleKey(_ event: NSEvent) -> NSEvent? {
         guard let keyWin = NSApp.keyWindow as? NavWindow else { return event }
-        if let r = keyWin.firstResponder, r is NSText || r is NSTextView { return event }
+        if isEditingText(in: keyWin) { return event }
         let b = keyWin.model.active
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
         switch event.keyCode {
@@ -8105,7 +8653,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        // Targeted at self rather than sent down the responder chain: nil-targeted
+        // NSText.selectAll reached neither the SwiftUI text field nor the file list, so
+        // ⌘A did nothing at all. selectAllAction routes it — text field if one has the
+        // caret, otherwise select every file in view.
+        let sa = editMenu.addItem(withTitle: "Select All", action: #selector(selectAllAction(_:)), keyEquivalent: "a")
+        sa.target = self
 
         let viewItem = NSMenuItem(); mainMenu.addItem(viewItem)
         let viewMenu = NSMenu(title: "View"); viewItem.submenu = viewMenu
@@ -8242,11 +8795,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Fallback handlers: reached only when a text field is NOT the first responder,
-    // so text fields still do text copy/paste while the file list does file copy/paste.
-    @objc func copy(_ sender: Any?) { appModel.active.copyFiles() }
-    @objc func cut(_ sender: Any?) { appModel.active.cutFiles() }
-    @objc func paste(_ sender: Any?) { appModel.active.pasteFiles() }
+    // Fallback handlers for the Edit menu, reached when the responder chain declined the
+    // action. "Declined" does NOT reliably mean "no text field is focused" — SwiftUI's
+    // TextField often lets these fall through while it genuinely has the caret, and the
+    // result was ⌘V in the address bar pasting FILES into the current folder. So each of
+    // these asks first, and only touches files when text editing isn't in play.
+    @objc func copy(_ sender: Any?) {
+        if performTextEditingAction(.copy) { return }
+        appModel.active.copyFiles()
+    }
+    @objc func cut(_ sender: Any?) {
+        if performTextEditingAction(.cut) { return }
+        appModel.active.cutFiles()
+    }
+    @objc func paste(_ sender: Any?) {
+        if performTextEditingAction(.paste) { return }
+        appModel.active.pasteFiles()
+    }
+    @objc func selectAllAction(_ sender: Any?) {
+        if performTextEditingAction(.selectAll) { return }
+        let b = appModel.active
+        b.selection = Set(b.orderedVisibleItems().map { $0.id })
+        b.updateStatus()
+    }
     @objc func newTabAction(_ sender: Any?) { appModel.newTab() }
     @objc func closeTabAction(_ sender: Any?) {
         if appModel.tabs.count > 1 { appModel.closeTab(appModel.selected) } else { NSApp.keyWindow?.performClose(nil) }
@@ -8845,18 +9416,25 @@ struct NanoBananaModel: Identifiable, Hashable {
 /// inspector, exiftool, `sips -g`, Navigator's own Get Info):
 ///   Description — the full prompt actually sent
 ///   Title       — the identity anchors that were preserved
-///   Software    — model and resolution
+///   Software    — model, resolution, and which images were sent
 /// Returns false on any failure so the caller can fall back to a plain write rather
 /// than losing the image entirely.
+///
+/// `mode` is appended to Software rather than given a field of its own so the existing
+/// reader (readRestyleInfo, which gates on the "Navigator Restyle" prefix) and the
+/// (i) popover pick it up with no extra plumbing. It matters because "text only" and
+/// "source + style image" produce very different results from the same settings, and
+/// six months later the prompt alone is a subtle way to tell them apart.
 @discardableResult
 func writePNGWithRestyleMetadata(_ png: Data, to dest: URL, identity: String, prompt: String,
-                                 model: String, size: String) -> Bool {
+                                 model: String, size: String, mode: String = "") -> Bool {
     guard let src = CGImageSourceCreateWithData(png as CFData, nil),
           let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
           let out = CGImageDestinationCreateWithURL(dest as CFURL, "public.png" as CFString, 1, nil)
     else { return false }
     var pngMeta: [CFString: Any] = [
-        kCGImagePropertyPNGSoftware: "Navigator Restyle — \(model), \(size)",
+        kCGImagePropertyPNGSoftware: "Navigator Restyle — \(model), \(size)"
+            + (mode.isEmpty ? "" : ", \(mode)"),
         kCGImagePropertyPNGCreationTime: ISO8601DateFormatter().string(from: Date()),
     ]
     let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -8867,21 +9445,35 @@ func writePNGWithRestyleMetadata(_ png: Data, to dest: URL, identity: String, pr
     return CGImageDestinationFinalize(out)
 }
 
+/// `sendSourceImage: false` withholds the source's pixels and generates from the
+/// prompt's content description instead — the caller must pair that with a `create`
+/// prompt shape (see RestyleRules.prompt), because a "preserve this image exactly"
+/// prompt with no image attached asks the model to be faithful to something it can't
+/// see. The output is still NAMED after `source`/`nameAfter` either way, which is the
+/// point: it's still that file's restyle, just generated from its description.
 func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, size: String,
-                styleReferencePNG: Data? = nil, nameAfter: URL? = nil, identity: String = "")
+                styleReferencePNG: Data? = nil, nameAfter: URL? = nil, identity: String = "",
+                sendSourceImage: Bool = true, modeLabel: String = "")
     -> (saved: URL?, cost: Double?, error: String?) {
     let named = nameAfter ?? source
     let model = NanoBananaModel.byFlag(modelFlag)
-    guard let sourcePNG = try? Data(contentsOf: source) else {
-        return (nil, nil, "Couldn’t read \(source.lastPathComponent).")
-    }
     // Raw position alone is NOT the deciding factor — explicit role labels in the
     // prompt override it. The one combination proven to preserve identity twice in a
     // row (source FIRST, reference SECOND, both under explicit "IMAGE 1 is..." /
     // "IMAGE 2 is..." labels) is reproduced exactly here; this is not the position
     // that a naive "last image wins" rule would predict, and that's the point —
     // don't reorder this without re-testing.
-    var inputs: [Data] = [sourcePNG]
+    //
+    // With the source withheld the reference becomes the ONLY image, which is exactly
+    // what generatePromptStyleImage labels it as ("the attached image is a STYLE
+    // reference ONLY") — so the label still matches the payload.
+    var inputs: [Data] = []
+    if sendSourceImage {
+        guard let sourcePNG = try? Data(contentsOf: source) else {
+            return (nil, nil, "Couldn’t read \(source.lastPathComponent).")
+        }
+        inputs.append(sourcePNG)
+    }
     if let styleReferencePNG { inputs.append(styleReferencePNG) }
     let r = H5GService.image(prompt: prompt, modelID: model.id, inputPNGs: inputs,
                             aspect: aspect, size: size)
@@ -8892,7 +9484,7 @@ func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, 
     // Embed the recipe, falling back to a plain write so a metadata problem can never
     // cost someone the generated image.
     if !writePNGWithRestyleMetadata(out, to: dest, identity: identity, prompt: prompt,
-                                    model: model.name, size: size) {
+                                    model: model.name, size: size, mode: modeLabel) {
         do { try out.write(to: dest) }
         catch { return (nil, r.cost, "Couldn’t save the result: \(error.localizedDescription)") }
     }
@@ -8912,6 +9504,15 @@ struct RestyleItem: Identifiable {
     let url: URL
     var identity: String = ""
     var state: State = .pending
+    /// Send this file's actual pixels, or generate from `identity` alone. Per-item
+    /// rather than one shared switch because a batch is a mix: some files worth
+    /// editing directly, others better rebuilt from a description that's been
+    /// cleaned up by hand.
+    var sendImage: Bool = true
+    /// How many times this item has been run. Regenerating never overwrites — each
+    /// run writes a new "_restyled N.png" — so the count is the only way to tell a
+    /// second attempt's result from the first at a glance.
+    var attempts: Int = 0
 }
 
 /// The Restyle window: a queue of images on the left, shared style settings on the
@@ -8928,6 +9529,11 @@ struct RestyleSheet: View {
 
     @State private var reference: URL?
     @State private var refTargeted = false
+    /// Send the reference's pixels, or let `styleText` carry the style alone. Untick
+    /// after Analyze and the workflow becomes: read the look out of a reference into
+    /// words, edit those words, then generate from the words — which is the whole
+    /// reason a style can be "pure text" while a reference is still on screen.
+    @State private var sendReference = true
     @State private var styleText = ""
     @State private var styleBusy = false
     @State private var extra = ""
@@ -8969,12 +9575,64 @@ struct RestyleSheet: View {
     private var contentStyleLeaks: [String] {
         RestyleRules.styleLeaksInContents(current?.identity ?? "")
     }
-    private var remaining: Int { items.filter { !$0.state.isTerminal }.count }
     private var anyRunning: Bool { busy || batchRunning }
-    private var canRun: Bool {
-        guard !anyRunning, current != nil else { return false }
-        return reference != nil || !styleText.trimmingCharacters(in: .whitespaces).isEmpty
+
+    // MARK: Input mode
+
+    /// True only when a reference image is both present AND ticked to be sent.
+    private var referenceInPlay: Bool { sendReference && reference != nil }
+    /// The mode for one specific item (each carries its own sendImage).
+    private func mode(for item: RestyleItem) -> RestyleInputMode {
+        RestyleInputMode(sendSource: item.sendImage, sendReference: referenceInPlay)
     }
+    private var currentMode: RestyleInputMode? { current.map(mode(for:)) }
+
+    /// A style has to come from SOMEWHERE: either a reference image that's actually
+    /// being sent, or style text. A reference sitting there with its box unticked is not
+    /// a style — that case is exactly why this can't just check `reference != nil`.
+    private var hasStyleSource: Bool {
+        referenceInPlay || !styleText.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+    /// Content has to come from somewhere too. With the source image sent, the image
+    /// itself is the content and an empty description is merely weaker. With it
+    /// withheld, an empty description means there is nothing to draw at all.
+    private func hasContentSource(_ item: RestyleItem) -> Bool {
+        item.sendImage || !item.identity.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    // MARK: Run / regenerate counts
+
+    /// Items a plain "Restyle All" would pick up: everything not already finished.
+    private var pendingCount: Int { items.filter { !$0.state.isTerminal }.count }
+    /// Once every item is finished, "Restyle All" would be a no-op — so the batch
+    /// button turns into "Regenerate All" and resets them instead. That's what makes
+    /// the window re-runnable rather than one-and-done, without a second button that
+    /// does almost the same thing.
+    private var batchIsRegenerate: Bool { !items.isEmpty && pendingCount == 0 }
+    private var batchCount: Int { batchIsRegenerate ? items.count : pendingCount }
+    private var batchLabel: String {
+        batchIsRegenerate ? "Regenerate All (\(batchCount))" : "Restyle All (\(batchCount))"
+    }
+    private var runLabel: String {
+        (current?.state.isTerminal ?? false) ? "Regenerate" : "Restyle This"
+    }
+    private var anyFinished: Bool { items.contains { $0.state.isTerminal } }
+
+    private var canRun: Bool {
+        guard !anyRunning, let cur = current else { return false }
+        return hasStyleSource && hasContentSource(cur)
+    }
+    /// A batch only needs a style up front. Per-item content is deliberately NOT checked
+    /// here: an item with no description still gets one auto-detected as the batch
+    /// reaches it, so demanding one now would disable the button for the normal case.
+    /// The one genuinely unrunnable case — text-only, no description, and detection
+    /// fails too — is caught per item in the worker, which fails just that item with the
+    /// fix in the message.
+    ///
+    /// This is intentionally free of filesystem checks. It runs on every re-render, and
+    /// a stat-per-item here would hit the disk (or a slow SMB share) continuously while
+    /// someone types in the style field.
+    private var canRunBatch: Bool { !anyRunning && hasStyleSource && batchCount > 0 }
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -8983,7 +9641,12 @@ struct RestyleSheet: View {
             controls
         }
         .padding(16)
-        .frame(width: 900, height: 640)
+        // minWidth/minHeight rather than a fixed frame, paired with a resizable window:
+        // the panel grows a few conditional warning lines (missing description, "auto"
+        // aspect with no source image) and a fixed 640pt window would clip the buttons
+        // off the bottom with no way to reach them — this window has no scroll view and
+        // used to have no resize control either.
+        .frame(minWidth: 900, minHeight: 720)
         .onAppear {
             if !sizes.contains(size) { size = sizes.first ?? RestyleRules.defaultSize }
             detectIdentity()   // for whatever opened selected
@@ -8998,6 +9661,16 @@ struct RestyleSheet: View {
             HStack {
                 Text("Images (\(items.count))").font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                Menu {
+                    Button("Send All Images") { setAllSendImage(true) }
+                    Button("All Text-Only (don’t send images)") { setAllSendImage(false) }
+                    Divider()
+                    Button("Reset Finished to Pending") { resetFinished() }
+                        .disabled(!anyFinished)
+                } label: { Image(systemName: "ellipsis") }
+                    .menuStyle(.borderlessButton).fixedSize().frame(width: 28)
+                    .disabled(items.isEmpty || anyRunning)
+                    .help("Bulk image/text mode, and reset finished items so they can run again")
                 Button { addImages() } label: { Image(systemName: "plus") }
                     .buttonStyle(.plain).help("Add images")
                 Button { removeSelected() } label: { Image(systemName: "minus") }
@@ -9012,6 +9685,22 @@ struct RestyleSheet: View {
                         Text(item.url.lastPathComponent)
                             .font(.caption2).lineLimit(1).truncationMode(.middle)
                             .fontWeight(live ? .bold : .regular)
+                        Spacer(minLength: 2)
+                        // Mode shown as a plain glyph, NOT a checkbox: an interactive
+                        // control inside a selectable row competes with the row's own
+                        // click handling, which is exactly what broke selection in the
+                        // file list twice. The real toggle lives under the thumbnail
+                        // below, where nothing contests the click; bulk changes go
+                        // through the menu above.
+                        if !item.sendImage {
+                            Image(systemName: "textformat")
+                                .font(.caption2).foregroundStyle(.orange)
+                                .help("Text-only — this file's pixels aren't sent")
+                        }
+                        if item.attempts > 1 {
+                            Text("×\(item.attempts)").font(.caption2).foregroundStyle(.tertiary)
+                                .help("Run \(item.attempts) times")
+                        }
                     }
                     // The row being worked on is called out in the accent colour. Without
                     // this, a batch looked like it might be reusing one prompt for
@@ -9033,12 +9722,24 @@ struct RestyleSheet: View {
                 if let s = imagePixelSize(item.url) {
                     Text("\(s.w) × \(s.h)").font(.caption2).foregroundStyle(.tertiary)
                 }
+                Toggle(isOn: sendImageBinding) {
+                    Text("Send this image").font(.caption)
+                }
+                .disabled(anyRunning)
+                .help("Off: generate from the content description below instead of this file's pixels")
+                if !item.sendImage {
+                    Text("Text-only — the description below is the whole subject. The result is still saved next to this file.")
+                        .font(.caption2).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if case .failed(let e) = item.state {
                     Text(e).font(.caption2).foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true).lineLimit(3)
                 }
                 if case .done(let out) = item.state {
-                    Text("Saved \(out.lastPathComponent)").font(.caption2).foregroundStyle(.green)
+                    Text("Saved \(out.lastPathComponent)"
+                         + (item.attempts > 1 ? " · attempt \(item.attempts)" : ""))
+                        .font(.caption2).foregroundStyle(.green)
                         .fixedSize(horizontal: false, vertical: true).lineLimit(2)
                 }
             } else {
@@ -9104,6 +9805,16 @@ struct RestyleSheet: View {
                             Button("Clear") { reference = nil; styleText = "" }.foregroundStyle(.secondary)
                         }
                     }.font(.caption)
+                    if reference != nil {
+                        Toggle(isOn: $sendReference) { Text("Send reference image").font(.caption) }
+                            .disabled(anyRunning)
+                            .help("Off: use the style text below instead of the reference's pixels")
+                        if !sendReference {
+                            Text("Style text only — the reference is just a source for Analyze now.")
+                                .font(.caption2).foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true).frame(width: 210, alignment: .leading)
+                        }
+                    }
                 }
                 VStack(alignment: .leading, spacing: 8) {
                     Picker("Model", selection: $modelFlag) {
@@ -9127,15 +9838,22 @@ struct RestyleSheet: View {
                 }
             }
             if padOn {
-                Text("Only images that are actually transparent (or an odd aspect) get padded — the rest are sent untouched, and no original is modified either way.")
+                Text("Only images that are actually transparent (or an odd aspect) get padded — the rest are sent untouched, and no original is modified either way."
+                     + (items.contains { !$0.sendImage } ? " Text-only items skip padding entirely." : ""))
                     .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
+            modeNotes
 
             Divider().padding(.vertical, 2)
 
             HStack {
-                Text("Content to preserve").font(.caption).foregroundStyle(.secondary)
+                // The field's job changes with the mode: anchors protecting a real
+                // image, versus the only description of a subject that doesn't exist yet.
+                Text(currentMode?.needsContentText == true ? "Content to create" : "Content to preserve")
+                    .font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                // Detect still reads the file even in text-only mode — that's the
+                // intended way to get a starting description you can then edit.
                 Button(identityBusy ? "Detecting…" : "Detect") { detectIdentity(force: true) }
                     .font(.caption).disabled(identityBusy || current == nil)
             }
@@ -9150,8 +9868,14 @@ struct RestyleSheet: View {
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.3)))
                 .disabled(current == nil)
-            Text("Per image — auto-detected when you select it, and again for each image as a batch runs. Covers backgrounds, UI and multi-symbol art boards, not just characters. Edit freely.")
+            Text("Per image — auto-detected when you select it, and again for each image as a batch runs. Covers backgrounds, UI and multi-symbol art boards, not just characters. Edit freely, then Regenerate.")
                 .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            if currentMode?.needsContentText == true,
+               (current?.identity ?? "").trimmingCharacters(in: .whitespaces).isEmpty {
+                Label("Nothing to generate from — this image isn't being sent, so this description is the only subject. Press Detect, or type one.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
             if !contentStyleLeaks.isEmpty {
                 Label("Describes style (\(contentStyleLeaks.joined(separator: ", "))) — this field is for WHAT is in the image; style words here fight the new look.",
                       systemImage: "exclamationmark.triangle")
@@ -9159,12 +9883,19 @@ struct RestyleSheet: View {
             }
 
             HStack {
-                Text(reference == nil ? "Style / desired change" : "Style notes (optional)")
+                // "Notes (optional)" only holds while a reference image is actually
+                // being sent — untick that box and this field IS the style, so calling
+                // it optional would be a lie the run then fails on.
+                Text(referenceInPlay ? "Style notes (optional)" : "Style / desired change")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                // Analyze stays available with the box unticked on purpose: reading a
+                // reference INTO this field is how you get editable style text to
+                // generate from without sending the image.
                 if reference != nil {
                     Button(styleBusy ? "Analyzing…" : "Analyze") { analyzeReferenceStyle() }
                         .font(.caption).disabled(styleBusy)
+                        .help("Read this reference's style into the text below — editable, and usable with the image itself switched off")
                 }
             }
             TextEditor(text: $styleText)
@@ -9175,8 +9906,8 @@ struct RestyleSheet: View {
                 .background(RoundedRectangle(cornerRadius: 5).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.3)))
             if styleText.isEmpty {
-                Text(reference == nil ? "e.g. warm illustrated colors, thick outlines"
-                                      : "Optional — the reference image drives the look.")
+                Text(referenceInPlay ? "Optional — the reference image drives the look."
+                                     : "e.g. warm illustrated colors, thick outlines")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
             if !leaks.isEmpty {
@@ -9204,19 +9935,58 @@ struct RestyleSheet: View {
                 if batchRunning {
                     Button("Stop") { cancelRequested = true }.keyboardShortcut(.cancelAction)
                 } else {
-                    if remaining > 1 {
+                    if batchCount > 1 {
                         Picker("Parallel", selection: $parallelism) {
                             ForEach([1, 2, 4, 8], id: \.self) { Text("\($0)×").tag($0) }
                         }.frame(width: 130).help("How many images restyle at once during Restyle All")
                     }
                     Button("Close") { onClose() }.keyboardShortcut(.cancelAction).disabled(anyRunning)
-                    Button("Restyle This") { runOne() }.disabled(!canRun)
-                    Button("Restyle All (\(remaining))") { runBatch() }
+                    Button(runLabel) { runOne() }.disabled(!canRun)
+                        .help(runLabel == "Regenerate"
+                              ? "Run this image again with the current settings — writes a new file, keeps the previous one"
+                              : "Restyle just the selected image")
+                    Button(batchLabel) { runBatch() }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(!canRun || remaining == 0)
+                        .disabled(!canRunBatch)
                 }
             }
         }
+    }
+
+    /// The one caveat worth its own line: "auto" aspect means "match the source image's
+    /// shape", which has no meaning for an item whose source image isn't being sent. Left
+    /// as a warning rather than silently overriding the picker — quietly changing a
+    /// setting someone chose is worse than telling them it won't do what they expect.
+    /// (The padding caveat is folded into the padding line above instead of adding a
+    /// second line here.)
+    @ViewBuilder private var modeNotes: some View {
+        if aspect == "auto", items.contains(where: { !$0.sendImage }) {
+            Label("Aspect “auto” matches the source image's shape — with a source image withheld there's nothing to match, so pick an explicit aspect.",
+                  systemImage: "exclamationmark.triangle")
+                .font(.caption2).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Per-item image toggle, written straight back into the queue item like the
+    /// description field, so it survives switching away and back.
+    private var sendImageBinding: Binding<Bool> {
+        Binding(
+            get: { current?.sendImage ?? true },
+            set: { v in if let i = currentIndex { items[i].sendImage = v } }
+        )
+    }
+
+    private func setAllSendImage(_ on: Bool) {
+        for i in items.indices { items[i].sendImage = on }
+    }
+
+    /// Clears finished states so those items are runnable again. Deliberately does NOT
+    /// touch `identity`, `sendImage` or `attempts` — the whole point of resetting is to
+    /// re-run with the edits you just made, and attempts is the record of how many runs
+    /// this file has had, which a reset doesn't undo.
+    private func resetFinished() {
+        for i in items.indices where items[i].state.isTerminal { items[i].state = .pending }
+        failure = ""; status = ""
     }
 
     /// Editing the text field writes straight back into the selected queue item, so a
@@ -9230,7 +10000,7 @@ struct RestyleSheet: View {
 
     private var costHint: String {
         let per = size == "4K" ? 0.15 : (size == "2K" ? 0.10 : 0.067)
-        let n = max(remaining, 1)
+        let n = max(batchCount, 1)
         return String(format: "≈ $%.2f each · $%.2f for %d", per, per * Double(n), n)
     }
 
@@ -9356,20 +10126,21 @@ struct RestyleSheet: View {
         let url: URL
         let identity: String
         let prompt: String
+        let mode: RestyleInputMode
         let refPNG: Data?
         let flag: String, aspect: String, size: String
         let padColor: NSColor?, padSuffix: String
     }
 
     private func makeJob(for item: RestyleItem, identity: String) -> Job {
-        let notes = [styleText, extra].map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }.joined(separator: ". ")
-        let prompt = reference != nil
-            ? RestyleRules.restylePromptTwoImage(identityAnchors: identity, extra: notes)
-            : RestyleRules.restylePrompt(identityAnchors: identity, styleText: styleText, extra: extra)
-        let c = padOn ? aiPrepColors.first(where: { $0.name == padColor }) : nil
-        return Job(url: item.url, identity: identity, prompt: prompt,
-                   refPNG: reference.flatMap { try? Data(contentsOf: $0) },
+        let m = mode(for: item)
+        let prompt = RestyleRules.prompt(mode: m, contents: identity, styleText: styleText, extra: extra)
+        // Padding is resolved to nil here rather than checked again in perform(): with no
+        // source image being sent there is nothing to pad, and a nil padColor is already
+        // how perform() spells "don't pad". One decision, one place.
+        let c = (padOn && m.padApplies) ? aiPrepColors.first(where: { $0.name == padColor }) : nil
+        return Job(url: item.url, identity: identity, prompt: prompt, mode: m,
+                   refPNG: m.sendsReference ? reference.flatMap { try? Data(contentsOf: $0) } : nil,
                    flag: modelFlag, aspect: aspect, size: size,
                    padColor: c?.color, padSuffix: c?.suffix ?? "")
     }
@@ -9401,7 +10172,8 @@ struct RestyleSheet: View {
             let r = runRestyle(source: send, prompt: job.prompt, modelFlag: job.flag,
                                aspect: job.aspect, size: job.size,
                                styleReferencePNG: job.refPNG, nameAfter: job.url,
-                               identity: job.identity)
+                               identity: job.identity,
+                               sendSourceImage: job.mode.sendsSource, modeLabel: job.mode.label)
             if r.saved != nil { return r }
             last = (r.saved, r.cost, r.error)
             guard let e = r.error, RestyleRules.isTransient(e), attempt < 2 else { break }
@@ -9410,11 +10182,18 @@ struct RestyleSheet: View {
         return last
     }
 
+    /// Restyle — or, if this item already finished, re-run it. A re-run is the same code
+    /// path deliberately: the only difference is that the previous result's file is left
+    /// alone (uniqueDest gives the new one "_restyled 2.png"), so nothing you already
+    /// generated is ever overwritten by trying again.
     private func runOne() {
         guard let idx = currentIndex else { return }
         let item = items[idx]
         let job = makeJob(for: item, identity: item.identity)
-        busy = true; failure = ""; status = "Restyling \(item.url.lastPathComponent)…"
+        let again = item.state.isTerminal
+        busy = true; failure = ""
+        status = (again ? "Regenerating " : "Restyling ") + "\(item.url.lastPathComponent)…"
+        items[idx].attempts += 1
         items[idx].state = .running
         DispatchQueue.global(qos: .userInitiated).async {
             let r = perform(job)
@@ -9422,7 +10201,7 @@ struct RestyleSheet: View {
                 busy = false; status = ""
                 guard let i = items.firstIndex(where: { $0.url == job.url }) else { return }
                 if let saved = r.saved {
-                    if let c = r.cost { navLog("restyle cost $\(String(format: "%.4f", c)) -> \(saved.lastPathComponent)") }
+                    if let c = r.cost { navLog("restyle cost $\(String(format: "%.4f", c)) [\(job.mode.label)] -> \(saved.lastPathComponent)") }
                     items[i].state = .done(saved)
                     onFinished(saved)
                 } else {
@@ -9451,7 +10230,12 @@ struct RestyleSheet: View {
     /// selection to chase a particular row. Every active row is already called out by
     /// its own highlighted, bold state in the list; that's the "what's happening now"
     /// signal now, not the preview pane.
+    /// When every item has already finished, this is a regenerate-all: the finished
+    /// states are cleared first so the same machinery picks them all up again. Reading
+    /// `items` right after mutating it is safe — a @State write is visible to later reads
+    /// in the same call; it's only the re-render that's deferred.
     private func runBatch() {
+        if batchIsRegenerate { resetFinished() }
         let queued = items.filter { !$0.state.isTerminal }
         guard !queued.isEmpty else { return }
         batchRunning = true; cancelRequested = false; failure = ""
@@ -9479,6 +10263,7 @@ struct RestyleSheet: View {
                 let hadIdentity = !item.identity.isEmpty
                 DispatchQueue.main.async {
                     if let i = items.firstIndex(where: { $0.url == item.url }) {
+                        items[i].attempts += 1
                         items[i].state = hadIdentity ? .running : .detecting
                     }
                 }
@@ -9493,6 +10278,23 @@ struct RestyleSheet: View {
                             items[i].state = .running
                         }
                     }
+                }
+
+                // A text-only item with no description has nothing to draw — the vision
+                // read above is its only chance, and if that failed too, generating
+                // anyway would return an unrelated image and bill for it. Fail loudly
+                // instead, with the fix in the message. (canRunBatch can't catch this:
+                // the description may legitimately arrive between the click and here.)
+                if !item.sendImage, identity.trimmingCharacters(in: .whitespaces).isEmpty {
+                    DispatchQueue.main.async {
+                        failed += 1
+                        if let i = items.firstIndex(where: { $0.url == item.url }) {
+                            items[i].state = .failed("No content description, and this image isn't being sent — nothing to generate from. Select it, press Detect or type a description, then Regenerate.")
+                        }
+                        let running = min(parallelism, total - completed - failed)
+                        progress = "\(completed + failed) of \(total) done · \(running) running"
+                    }
+                    return
                 }
 
                 // makeJob reads shared @State (style text, reference, model…), none of
@@ -9543,9 +10345,16 @@ final class RestyleController {
     private static var windows: [NSWindow] = []
     static func show(sources: [URL], onFinished: @escaping (URL) -> Void) {
         guard !sources.isEmpty else { return }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 640),
-                         styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        // .resizable so the panel is never a trap: it grows conditional warning lines,
+        // and long descriptions/style text make the ideal height genuinely variable.
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 720),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                         backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
+        // Matches the sheet's own minWidth/minHeight. Without this, "resizable" would let
+        // someone shrink the window past what the content can compress to and clip the
+        // buttons — resizable has to mean bigger-only here, since there's no scroll view.
+        w.minSize = NSSize(width: 900, height: 720)
         w.title = sources.count == 1
             ? "Restyle — \(sources[0].lastPathComponent)"
             : "Restyle — \(sources.count) images"

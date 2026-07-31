@@ -112,6 +112,39 @@ Notes:
     var LOG_INITIALIZED = false;
     var DID_BEGIN_UNDO = false;
 
+    // Everything this run adds to the AE project, so it can be taken back out again.
+    //
+    // Navigator drives this script once PER IMAGE against one long-lived After Effects
+    // session, so anything left behind accumulates for the whole batch: a 39-image run
+    // was ending with 39 imported footage items, 39 comps all named the same thing, and
+    // 39 render-queue entries in a project that was never cleaned. That is a real cause
+    // of a long run degrading and then failing partway through, and it also left the
+    // user's AE session full of junk.
+    //
+    // Only ever removes items THIS run created — never touches a project the user has
+    // open, and never closes the project, which could destroy unsaved work.
+    var CREATED = { rqItem: null, comp: null, footage: null };
+
+    function cleanupCreatedItems() {
+        // Render queue item first: it references the comp, and removing the comp out
+        // from under a queued item is what leaves AE in a bad state.
+        if (CREATED.rqItem) {
+            try { CREATED.rqItem.remove(); log("Removed render queue item."); }
+            catch (e) { log("WARNING: could not remove render queue item: " + e.toString()); }
+            CREATED.rqItem = null;
+        }
+        if (CREATED.comp) {
+            try { CREATED.comp.remove(); log("Removed comp."); }
+            catch (e) { log("WARNING: could not remove comp: " + e.toString()); }
+            CREATED.comp = null;
+        }
+        if (CREATED.footage) {
+            try { CREATED.footage.remove(); log("Removed imported footage."); }
+            catch (e) { log("WARNING: could not remove footage: " + e.toString()); }
+            CREATED.footage = null;
+        }
+    }
+
     function log(message) {
         // Console only — no log FILE is written (keeps the output folder clean).
         $.writeln("[chroma_key_still] " + message);
@@ -908,6 +941,7 @@ Notes:
 
     function queueRender(comp, outputFolder, outputBaseName, config) {
         var rqItem = app.project.renderQueue.items.add(comp);
+        CREATED.rqItem = rqItem;   // so cleanup can take it back out (see CREATED)
         try {
             rqItem.applyTemplate(config.renderSettingsTemplate);
             log("Applied render settings template: " + config.renderSettingsTemplate);
@@ -981,7 +1015,9 @@ Notes:
 
         log("Source: " + sourceFile.fsName);
         var footage = importFootage(sourceFile);
+        CREATED.footage = footage;
         var made = makeCompFromFootage(footage, CONFIG);
+        CREATED.comp = made.comp;
         var keyInfo = resolveKeyColor(made.comp, made.layer, CONFIG);
         log("Key mode resolved: " + keyInfo.name + " RGB=" + keyInfo.color[0] + "," + keyInfo.color[1] + "," + keyInfo.color[2]);
         if (keyInfo.sampled) {
@@ -1010,6 +1046,10 @@ Notes:
         // surface it — no blocking alert (invisible when the user is in Navigator).
         RESULT = "ERROR: " + e.toString();
     } finally {
+        // Always — success or failure. The rendered PNG is already on disk by this
+        // point (convertRenderedOutputs reads it from the filesystem, not from AE), so
+        // removing the project items can't affect the output.
+        try { cleanupCreatedItems(); } catch (cleanErr) {}
         try {
             if (DID_BEGIN_UNDO) {
                 app.endUndoGroup();

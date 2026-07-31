@@ -459,6 +459,147 @@ final class RestyleRulesTests: XCTestCase {
     }
 }
 
+// Withholding an image: either side of the job (the source, the style reference) can
+// drop to text alone, which is four modes rather than two. These pin down the parts
+// that are easy to get subtly wrong — the create/preserve split, and the fact that
+// typed style text means something DIFFERENT depending on whether an image is also
+// carrying the style.
+final class RestyleInputModeTests: XCTestCase {
+
+    func testModeMapsFromTheTwoSwitches() {
+        XCTAssertEqual(RestyleInputMode(sendSource: true, sendReference: true), .editWithStyleImage)
+        XCTAssertEqual(RestyleInputMode(sendSource: true, sendReference: false), .editWithStyleText)
+        XCTAssertEqual(RestyleInputMode(sendSource: false, sendReference: true), .createWithStyleImage)
+        XCTAssertEqual(RestyleInputMode(sendSource: false, sendReference: false), .createWithStyleText)
+    }
+
+    // The three derived flags exist so callers stop re-deriving them; if they drift from
+    // the mode they're describing, padding runs on nothing and empty descriptions ship.
+    func testDerivedFlagsAgreeWithTheMode() {
+        for m in [RestyleInputMode.editWithStyleImage, .editWithStyleText,
+                  .createWithStyleImage, .createWithStyleText] {
+            XCTAssertEqual(m.padApplies, m.sendsSource, "padding only means something with a source: \(m)")
+            XCTAssertEqual(m.needsContentText, !m.sendsSource, "text is mandatory exactly when no source is sent: \(m)")
+        }
+        XCTAssertTrue(RestyleInputMode.editWithStyleImage.sendsReference)
+        XCTAssertTrue(RestyleInputMode.createWithStyleImage.sendsReference)
+        XCTAssertFalse(RestyleInputMode.editWithStyleText.sendsReference)
+        XCTAssertFalse(RestyleInputMode.createWithStyleText.sendsReference)
+    }
+
+    // The whole point of the split: with no source image, "keep every part exactly as it
+    // is" is an instruction about an image the model cannot see. It must say create.
+    func testNoSourceModesSayCreateAndNeverSayPreserve() {
+        for m in [RestyleInputMode.createWithStyleImage, .createWithStyleText] {
+            let p = RestyleRules.prompt(mode: m, contents: "a pay table with 20 symbols", styleText: "flat vector")
+            XCTAssertTrue(p.contains("Create a NEW image"), "\(m) must instruct creation")
+            XCTAssertTrue(p.contains("CONTENTS TO CREATE"), "\(m) must label contents as created")
+            XCTAssertFalse(p.contains("Keep every part of the content exactly as it is"),
+                           "\(m) must not demand fidelity to an image that was never sent")
+            XCTAssertFalse(p.contains("TO PRESERVE"), "\(m) must not frame contents as preserved")
+        }
+    }
+
+    func testSourceModesStillPreserve() {
+        for m in [RestyleInputMode.editWithStyleImage, .editWithStyleText] {
+            let p = RestyleRules.prompt(mode: m, contents: "a pay table", styleText: "flat vector")
+            XCTAssertTrue(p.contains("TO PRESERVE"), "\(m) must keep the preservation framing")
+            XCTAssertFalse(p.contains("Create a NEW image"), "\(m) edits an image, it doesn't invent one")
+        }
+    }
+
+    // The create prompts keep preserveClause's hard-won rules, because they apply just
+    // as much when DRAWING a 20-symbol pay table from a description as when redrawing
+    // one: account for every element, don't collapse to a single subject, exact text.
+    func testCreatePromptsKeepTheMultiElementAndExactTextRules() {
+        for m in [RestyleInputMode.createWithStyleImage, .createWithStyleText] {
+            let p = RestyleRules.prompt(mode: m, contents: "a pay table", styleText: "x")
+            XCTAssertTrue(p.contains("character-for-character"), "\(m) must demand exact text")
+            XCTAssertTrue(p.lowercased().contains("single subject"),
+                          "\(m) must forbid collapsing a layout to one subject")
+        }
+    }
+
+    // Style text is demoted to supplementary notes when an IMAGE carries the style, and
+    // is the style itself when none does. Getting this backwards either buries the
+    // reference or duplicates the style paragraph into ART STYLE and the notes at once.
+    func testStyleTextIsTheStyleOnlyWhenNoImageCarriesIt() {
+        let textModes: [RestyleInputMode] = [.editWithStyleText, .createWithStyleText]
+        for m in textModes {
+            let p = RestyleRules.prompt(mode: m, contents: "a", styleText: "STYLE_MARKER")
+            XCTAssertTrue(p.contains("ART STYLE: STYLE_MARKER"), "\(m) must use the text as the style")
+        }
+        let imageModes: [RestyleInputMode] = [.editWithStyleImage, .createWithStyleImage]
+        for m in imageModes {
+            let p = RestyleRules.prompt(mode: m, contents: "a", styleText: "STYLE_MARKER")
+            XCTAssertFalse(p.contains("ART STYLE: STYLE_MARKER"),
+                           "\(m) has an image for the style — the text is a note, not the style")
+            XCTAssertTrue(p.contains("ADDITIONAL STYLE NOTES: STYLE_MARKER"),
+                          "\(m) must still pass the text along as a note")
+        }
+    }
+
+    // Reference-only mode has exactly ONE image attached and it is NOT the subject.
+    // Without the role label the model returns the reference's own subject — the same
+    // failure the two-image prompt already had to defend against.
+    func testReferenceOnlyPromptLabelsTheAttachedImageAsStyleOnly() {
+        let p = RestyleRules.prompt(mode: .createWithStyleImage, contents: "a brook trout", styleText: "")
+        XCTAssertTrue(p.contains("STYLE reference ONLY"))
+        XCTAssertTrue(p.contains("a brook trout"))
+        // No "IMAGE 1"/"IMAGE 2" numbering: there is only one image, so numbering it
+        // against a source that isn't there would be a lie the model has to resolve.
+        XCTAssertFalse(p.contains("IMAGE 2"))
+    }
+
+    func testPureTextPromptSendsNoImageRoleLanguageAtAll() {
+        let p = RestyleRules.prompt(mode: .createWithStyleText, contents: "a brook trout", styleText: "flat vector")
+        XCTAssertFalse(p.lowercased().contains("attached image"))
+        XCTAssertFalse(p.contains("IMAGE 1"))
+        XCTAssertTrue(p.contains("a brook trout"))
+        XCTAssertTrue(p.contains("ART STYLE: flat vector"))
+    }
+
+    // Contents-before-style ordering is load-bearing in the existing prompts for a
+    // measured reason; the new ones must not quietly invert it.
+    func testCreatePromptsPutContentsBeforeStyle() {
+        let p = RestyleRules.prompt(mode: .createWithStyleText, contents: "ANCHOR_MARKER", styleText: "STYLE_MARKER")
+        XCTAssertLessThan(p.range(of: "ANCHOR_MARKER")!.lowerBound, p.range(of: "STYLE_MARKER")!.lowerBound)
+    }
+
+    // Empty contents shouldn't produce a malformed prompt even though the UI blocks it —
+    // the same defensive fallback the preserve-side prompts already have.
+    func testCreatePromptsSurviveEmptyContents() {
+        for m in [RestyleInputMode.createWithStyleImage, .createWithStyleText] {
+            let p = RestyleRules.prompt(mode: m, contents: "   ", styleText: "x")
+            XCTAssertFalse(p.contains("CONTENTS TO CREATE: \n"), "\(m) left a blank contents line")
+            XCTAssertTrue(p.contains("described by"), "\(m) should fall back to describing wording")
+        }
+    }
+
+    // Existing two modes must be byte-identical to what the old call sites produced, or
+    // this refactor silently changed the output of every restyle done before today.
+    func testExistingModesMatchTheOriginalPromptBuilders() {
+        let contents = "a lion character", style = "warm earthy palette", extra = "more contrast"
+        XCTAssertEqual(RestyleRules.prompt(mode: .editWithStyleText, contents: contents,
+                                          styleText: style, extra: extra),
+                       RestyleRules.restylePrompt(identityAnchors: contents, styleText: style, extra: extra))
+        // Two-image folded style+extra into `extra`, joined with ". " — reproduced here.
+        XCTAssertEqual(RestyleRules.prompt(mode: .editWithStyleImage, contents: contents,
+                                          styleText: style, extra: extra),
+                       RestyleRules.restylePromptTwoImage(identityAnchors: contents,
+                                                          extra: "\(style). \(extra)"))
+    }
+
+    // Metadata labels are what a file uses to explain itself months later, so they have
+    // to be distinct — two modes sharing a label makes the record useless.
+    func testModeLabelsAreDistinctAndNonEmpty() {
+        let labels = [RestyleInputMode.editWithStyleImage, .editWithStyleText,
+                      .createWithStyleImage, .createWithStyleText].map(\.label)
+        XCTAssertEqual(Set(labels).count, labels.count, "mode labels collide: \(labels)")
+        XCTAssertFalse(labels.contains { $0.isEmpty })
+    }
+}
+
 // Padding decision: an odd shape needs a backing canvas, a standard one doesn't.
 final class RestylePaddingTests: XCTestCase {
 
