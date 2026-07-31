@@ -1741,7 +1741,8 @@ func batchUpscaleFolderViaImagen(_ folder: URL, factor: Int, onDone: (() -> Void
 // genuine failure still reports through the same routing (automation-permission vs
 // script error) it always did.
 func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
-                          reportFinalError: Bool) -> ScriptResult {
+                          reportFinalError: Bool, recovery: AdobeRecovery? = nil) -> ScriptResult {
+    let recovery = recovery ?? AdobeRecovery()
     var last = ScriptResult(ok: false, message: "not attempted")
     for i in 0..<attempts {
         let isLast = (i == attempts - 1)
@@ -1753,9 +1754,21 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
         }
         guard !isLast else { break }
         navLog("remove bg: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
-        // Let Photoshop settle. The failure is it being briefly unable to service a
-        // scripting request, so a short pause is the whole point of the retry.
-        Thread.sleep(forTimeInterval: 1.0 + Double(i))
+        if i == attempts - 2, !recovery.used, let psURL = PhotoshopIcon.url {
+            // Every plain retry failed too, so this is no longer "Photoshop was busy
+            // for a moment" — a long-running hidden Photoshop can wedge into a state
+            // where one call (app.open, live-confirmed) fails PERMANENTLY while the
+            // rest of scripting still answers. Retrying into that process loses every
+            // remaining file in the run; restarting the app is the only cure. Once per
+            // run: if a fresh Photoshop still fails, the problem is the file, and the
+            // remaining files shouldn't each pay the restart again.
+            recovery.markUsed()
+            restartAdobeApp(bundleID: "com.adobe.Photoshop", appURL: psURL)
+        } else {
+            // Let Photoshop settle. The failure is it being briefly unable to service
+            // a scripting request, so a short pause is the whole point of the retry.
+            Thread.sleep(forTimeInterval: 1.0 + Double(i))
+        }
     }
     return last
 }
@@ -1788,9 +1801,10 @@ func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) 
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
         var errors: [String] = []
+        let recovery = AdobeRecovery()   // at most one Photoshop restart for the whole batch
         for src in imgs {
             let out = rmbgOutputURL(src)
-            let r = removeBackgroundOnce(src: src, out: out, reportFinalError: false)
+            let r = removeBackgroundOnce(src: src, out: out, reportFinalError: false, recovery: recovery)
             if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
@@ -1803,6 +1817,39 @@ func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) 
     }
 }
 
+// One chroma-key script run with bounded retries — the After Effects twin of
+// removeBackgroundOnce, for the same two failure modes: a transient refusal (plain
+// retry fixes it) and a wedged host app (only a restart fixes it, once per run).
+// The render overwrites its own output, so retrying is idempotent; the config file
+// is reused across attempts and deleted by the caller after the last one.
+func chromaKeyOnce(cfgPath: String, src: URL, attempts: Int = 3,
+                   reportFinalError: Bool, recovery: AdobeRecovery? = nil) -> ScriptResult {
+    let recovery = recovery ?? AdobeRecovery()
+    var last = ScriptResult(ok: false, message: "not attempted")
+    for i in 0..<attempts {
+        let isLast = (i == attempts - 1)
+        last = runAfterEffectsScript(resource: "NavigatorChromaKeyStill",
+                                     globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath],
+                                     reportError: reportFinalError && isLast)
+        if last.ok {
+            if i > 0 { navLog("chroma key: \(src.lastPathComponent) succeeded on attempt \(i + 1)") }
+            return last
+        }
+        guard !isLast else { break }
+        navLog("chroma key: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
+        if i == attempts - 2, !recovery.used, let aeURL = AfterEffectsIcon.url {
+            // Same reasoning as removeBackgroundOnce: plain retries exhausted means the
+            // host app itself is likely wedged, and restarting it once per run is the
+            // only recovery that can save the remaining files.
+            recovery.markUsed()
+            restartAdobeApp(bundleID: "com.adobe.AfterEffects", appURL: aeURL)
+        } else {
+            Thread.sleep(forTimeInterval: 1.0 + Double(i))
+        }
+    }
+    return last
+}
+
 // Chroma Key for several PNGs in one hidden After Effects session (single still
 // script per file). Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
@@ -1812,6 +1859,7 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
         var errors: [String] = []
+        let recovery = AdobeRecovery()   // at most one After Effects restart for the whole batch
         for src in pngs {
             let folder = src.deletingLastPathComponent()
             let base = src.deletingPathExtension().lastPathComponent
@@ -1823,24 +1871,7 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 "deleteIntermediateRender": true, "keyMode": "auto"
             ]
             guard let cfgPath = writeChromaConfig(cfg) else { errors.append("\(src.lastPathComponent): couldn’t write config"); continue }
-            // Same retry as Photoshop's Remove BG, for the same reason: this is one
-            // script invocation per file, so a single transient refusal from the host app
-            // permanently loses that one file out of a long run with no second chance.
-            // The render overwrites its own output, so retrying is idempotent. Config is
-            // reused across attempts and deleted once, after the last one.
-            var r = ScriptResult(ok: false, message: "not attempted")
-            for attempt in 0..<3 {
-                let isLast = (attempt == 2)
-                r = runAfterEffectsScript(resource: "NavigatorChromaKeyStill",
-                                          globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath], reportError: false)
-                if r.ok {
-                    if attempt > 0 { navLog("chroma key: \(src.lastPathComponent) succeeded on attempt \(attempt + 1)") }
-                    break
-                }
-                guard !isLast else { break }
-                navLog("chroma key: \(src.lastPathComponent) attempt \(attempt + 1) failed — \(r.message); retrying")
-                Thread.sleep(forTimeInterval: 1.0 + Double(attempt))
-            }
+            let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: false, recovery: recovery)
             try? FileManager.default.removeItem(atPath: cfgPath)
             if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
@@ -1901,6 +1932,52 @@ func launchHidden(bundleID: String, appURL: URL) {
     NSWorkspace.shared.openApplication(at: appURL, configuration: cfg) { _, _ in sem.signal() }
     _ = sem.wait(timeout: .now() + 90)
     for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
+}
+
+// One "quit and relaunch the wedged host app" allowed per user-visible operation
+// (a batch shares one; a single-file job gets its own). Restarting is the ONLY cure
+// for the failure this exists for, but it's heavy (~20-60s), so it must never loop.
+final class AdobeRecovery {
+    private(set) var used = false
+    func markUsed() { used = true }
+}
+
+// Quit and relaunch an Adobe host app hidden, because its scripting has wedged.
+//
+// Seen live (Jul 2026): a Photoshop that had been running hidden for ~4.5 hours
+// permanently refused every `app.open` with 'The command "Get" is not currently
+// available' while the rest of scripting still answered fine. No amount of retrying
+// into that process can ever succeed — reproduced with a bare one-line script outside
+// Navigator entirely, and only an app restart cleared it. Blocks; call off main.
+//
+// Quit is polite first (regular Apple-event quit); force-terminate is the logged
+// last resort, for when a hidden "save changes?" prompt (usually from documents our
+// own failed scripts leaked open) blocks the polite quit. In this workflow the host
+// app is a hidden automation appliance Navigator itself launched, so losing user work
+// to the force-kill requires the user to have been editing in an app Navigator keeps
+// hidden — accepted trade against a tool that otherwise stays broken until they
+// notice and restart Photoshop by hand.
+func restartAdobeApp(bundleID: String, appURL: URL) {
+    navLog("\(bundleID): scripting wedged — restarting the app")
+    for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) { app.terminate() }
+    var deadline = Date().addingTimeInterval(20)
+    while Date() < deadline, !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty {
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+    let leftovers = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+    if !leftovers.isEmpty {
+        navLog("\(bundleID): didn't quit politely (likely a hidden modal) — force-terminating")
+        for app in leftovers { app.forceTerminate() }
+        deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty {
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+    }
+    launchHidden(bundleID: bundleID, appURL: appURL)
+    // The next `do javascript` blocks until the app can service it, so no readiness
+    // poll is needed — this pause just spares the relaunch the very first spike.
+    Thread.sleep(forTimeInterval: 3.0)
+    navLog("\(bundleID): restarted")
 }
 
 // While `p` is running, keep `bundleID` hidden — opening a document can un-hide
@@ -2097,7 +2174,9 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
         guard let cfgPath = writeChromaConfig(cfg) else {
             DispatchQueue.main.async { reportFileError("Couldn’t start Chroma Key", "Failed to write the temporary config.") }; return
         }
-        let r = runAfterEffectsScript(resource: "NavigatorChromaKeyStill", globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath])
+        // Same bounded retry + wedged-app restart as the batch path — previously the
+        // single-image path had no retry at all, so one transient AE refusal failed it.
+        let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: true)
         try? FileManager.default.removeItem(atPath: cfgPath)
         DispatchQueue.main.async {
             guard r.ok else { return }       // failure already surfaced; leave AE visible
