@@ -5153,15 +5153,9 @@ struct FileTableView: View {
     @ObservedObject var browser: Browser
     @State private var dropTargeted = false
 
-    private func open(_ ids: Set<String>) {
-        let chosen = browser.items.filter { ids.contains($0.id) }
-        if chosen.count == 1, let only = chosen.first { openItem(only, browser); return }
-        for it in chosen { NSWorkspace.shared.open(it.url) }
-    }
-
     var body: some View {
-        NativeFileTable(model: model, browser: browser, open: open,
-                        contextMenu: { AnyView(contextMenu($0)) },
+        NativeFileTable(model: model, browser: browser, open: { openFileItems($0, browser: browser) },
+                        contextMenu: { AnyView(fileContextMenu(model: model, browser: browser, ids: $0)) },
                         isTargeted: $dropTargeted)
             .overlay {
                 if browser.visibleItems().isEmpty {
@@ -5189,11 +5183,21 @@ struct FileTableView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .allowsHitTesting(false)
     }
+}
 
-    @ViewBuilder
-    private func contextMenu(_ ids: Set<FileItem.ID>) -> some View {
+func openFileItems(_ ids: Set<String>, browser: Browser) {
+    let chosen = browser.items.filter { ids.contains($0.id) }
+    if chosen.count == 1, let only = chosen.first { openItem(only, browser); return }
+    for it in chosen { NSWorkspace.shared.open(it.url) }
+}
+
+// Shared right-click menu for a file/folder selection — used by both List view
+// (NativeFileTable) and Icon view, so a fix or an added action lands in every
+// view mode at once instead of drifting between hand-duplicated copies.
+@ViewBuilder
+func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -> some View {
         if !ids.isEmpty {
-            Button("Open") { open(ids) }
+            Button("Open") { openFileItems(ids, browser: browser) }
             if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }), it.isDirectory {
                 Button("Open in New Tab") { model.newTab(at: it.url) }
                 Button("Open in Second Pane") { model.openInSecondPane(it.url) }
@@ -5296,7 +5300,6 @@ struct FileTableView: View {
             }
             Button("Reveal in Finder") { browser.revealInFinder([]) }
         }
-    }
 }
 
 // One row is either a group-section header or a real file/folder.
@@ -6109,7 +6112,15 @@ struct MarqueeCatcher: NSViewRepresentable {
         private var start: NSPoint?
         private var dragged = false
         override var isFlipped: Bool { true }
-        override func mouseDown(with e: NSEvent) { start = convert(e.locationInWindow, from: nil); dragged = false }
+        override func mouseDown(with e: NSEvent) {
+            // Same commit-on-focus-loss as IconCellMouseHandler.Handler: a rename in
+            // progress must end when the user clicks blank space too, not just when
+            // they click another cell. This view only ever received the marquee
+            // drag/deselect click — nothing here canceled the rename field's edit
+            // session, so it stayed open no matter where else you clicked.
+            if let w = window, isEditingText(in: w) { w.makeFirstResponder(nil) }
+            start = convert(e.locationInWindow, from: nil); dragged = false
+        }
         override func mouseDragged(with e: NSEvent) {
             guard let s = start else { return }
             dragged = true
@@ -6245,83 +6256,13 @@ struct IconGridView: View {
                 return true
             }
             .contextMenu {
-                Button("Open") { openItem(item, browser) }
-                if item.isDirectory {
-                    Button("Open in New Tab") { model.newTab(at: item.url) }
-                    Button("Open in Second Pane") { model.openInSecondPane(item.url) }
-                }
-                if let pair = browser.imagePair(browser.selection) {
-                    Button("Swipe Compare") { CompareController.show(left: pair.0, right: pair.1) }
-                }
-                if !item.isDirectory { OpenWithMenu(urls: [item.url]) }
-                Button("Quick Look") { QuickLook.shared.show([item.url]) }
-                Button("Reveal in Finder") { browser.revealInFinder([item.id]) }
-                Divider()
-                Button("Rename…") { promptRename(browser, item.id) }
-                TagsMenu(browser: browser, ids: [item.id])
-                Button("Edit Comment…") { promptComment(browser, item.id) }
-                Button("Duplicate") { browser.duplicate([item.id]) }
-                Button("Make Alias") { browser.makeAlias([item.id]) }
-                Button("Make Symbolic Link") { browser.makeSymlink([item.id]) }
-                // If the right-clicked cell is part of a multi-selection, act on
-                // the whole selection; otherwise just this item.
-                let bgIDs: Set<String> = (browser.selection.contains(item.id) && browser.selection.count > 1) ? browser.selection : [item.id]
-                let bgSel = browser.items.filter { bgIDs.contains($0.id) }
-                if PhotoshopIcon.image != nil {
-                    let imgCount = bgSel.filter { !$0.isDirectory && isImageFile($0.url) }.count
-                    if imgCount >= 1 {
-                        Button { browser.removeBackground(bgIDs) } label: { psLabel(imgCount == 1 ? "Remove BG" : "Remove BG (\(imgCount) images)") }
-                    } else if item.isDirectory, bgSel.count == 1 {
-                        Button { browser.batchRemoveBackground([item.id]) } label: { psLabel("Batch Remove BG") }
-                    }
-                }
-                if AfterEffectsIcon.image != nil {
-                    let pngCount = bgSel.filter { !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.count
-                    if pngCount >= 1 {
-                        Button { browser.chromaKeyBackground(bgIDs) } label: { aeLabel(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)") }
-                    } else if item.isDirectory, bgSel.count == 1 {
-                        Button { browser.batchChromaKeyBackground([item.id]) } label: { aeLabel("Batch Chroma Key BG") }
-                    }
-                }
-                if bgSel.contains(where: { !$0.isDirectory && isImageFile($0.url) }) {
-                    prepForAIMenu { c, ratio in browser.fillBackground(bgIDs, c, ratio: ratio) }
-                    upscaleMenu(fal: { opt in browser.upscale(bgIDs, opt) },
-                                imagen: { f in browser.upscaleImagen(bgIDs, factor: f) })
-                    restyleMenuItem(bgSel.filter { !$0.isDirectory }.map(\.url)) { out in
-                        browser.refreshAndReveal([out])
-                    }
-                } else if item.isDirectory, bgSel.count == 1 {
-                    upscaleMenu(label: "Batch Upscale (AI)",
-                                fal: { opt in browser.batchUpscale([item.id], opt) },
-                                imagen: { f in browser.batchUpscaleImagen([item.id], factor: f) })
-                }
-                if isArchive(item.url) { Button("Extract") { browser.extract([item.id]) } }
-                if item.isDirectory {
-                    if FavoritesStore.shared.contains(item.url) {
-                        Button("Unpin from Sidebar") { FavoritesStore.shared.remove(url: item.url) }
-                    } else {
-                        Button("Pin to Sidebar") { FavoritesStore.shared.add(item.url) }
-                    }
-                }
-                Button("Get Info") { showInfo(browser, [item.id]) }
-                Divider()
-                Button("Share…") { shareItems([item.url]) }
-                Button("Open in Terminal") { openInTerminal(item.isDirectory ? item.url : browser.currentURL) }
-                if !browser.isGoogleDriveSelection([item.id]) { Button("Copy Path") { browser.copyPath([item.id]) } }
-                Button("Copy Name") { browser.copyName([item.id]) }
-                if browser.isGoogleDriveSelection([item.id]) {
-                    Button { browser.copyGoogleDriveLink([item.id]) } label: { gdLabel("Copy Web Link") }
-                    Button { browser.copyGoogleDrivePath([item.id]) } label: { gdLabel("Copy Local Path") }
-                    Button { browser.copyPath([item.id]) } label: { gdLabel("Copy Path for Claude") }
-                    Button { browser.openGoogleDriveLink([item.id]) } label: { gdLabel("Open in Web") }
-                    // Only the applicable one — never both.
-                    if browser.driveSelectionIsOffline(browser.rowSelection(item.id)) {
-                        Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: false) } label: { gdLabel("Make available online only") }
-                    } else {
-                        Button { browser.setDriveAvailability(browser.rowSelection(item.id), offline: true) } label: { gdLabel("Make available offline") }
-                    }
-                }
-                Button("Move to Trash") { browser.moveToTrash([item.id]) }
+                // Same shared menu as List view: if the right-clicked cell is part of
+                // a multi-selection, act on the whole selection (Copy/Cut/Batch
+                // Rename/etc.); otherwise just this item. Was previously a hand-
+                // duplicated copy of List view's menu that had drifted — missing
+                // Copy/Cut/Paste and the multi-select Batch Rename branch entirely.
+                let ids: Set<String> = (browser.selection.contains(item.id) && browser.selection.count > 1) ? browser.selection : [item.id]
+                fileContextMenu(model: model, browser: browser, ids: ids)
             }
     }
 }
@@ -6543,10 +6484,20 @@ struct GalleryView: View {
     @ObservedObject var browser: Browser
     private var items: [FileItem] { browser.orderedVisibleItems() }
     private var selected: FileItem? { items.first { browser.selection.contains($0.id) } ?? items.first }
+    private func contextIDs(for id: String) -> Set<String> {
+        (browser.selection.contains(id) && browser.selection.count > 1) ? browser.selection : [id]
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
+                // Same commit-on-focus-loss as the icon grid's blank-space catcher:
+                // clicking the empty area around the preview must end an in-progress
+                // rename too, not just clicking another filmstrip thumbnail.
                 Color(nsColor: .textBackgroundColor).opacity(0.25)
+                    .onTapGesture {
+                        if let w = NSApp.keyWindow, isEditingText(in: w) { w.makeFirstResponder(nil) }
+                    }
                 if let it = selected {
                     VStack(spacing: 8) {
                         ThumbImage(item: it, browser: browser).padding(24)
@@ -6562,6 +6513,7 @@ struct GalleryView: View {
                                 }
                         }
                     }
+                    .contextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
                 } else {
                     Text("No items").foregroundStyle(.secondary)
                 }
@@ -6603,6 +6555,7 @@ struct GalleryView: View {
                                         dragIcon: { browser.icon(for: it) }
                                     )
                                 }
+                                .contextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
                         }
                     }.padding(8)
                 }
