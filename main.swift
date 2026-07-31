@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 import ImageIO
 import Security
@@ -172,13 +173,28 @@ final class FolderSizeCache: ObservableObject {
     }
 }
 
+// Compact size string for the narrowest reasonable Size column: no space
+// before the unit, "b" not "bytes", "0KB" not "Zero KB". KB is always a whole
+// number (matches how ByteCountFormatter itself never showed KB with a
+// decimal); MB/GB/TB get one decimal only below 10 of that unit.
+func compactByteCount(_ bytes: Int64) -> String {
+    if bytes == 0 { return "0KB" }
+    if bytes < 1000 { return "\(bytes)b" }
+    if bytes < 1_000_000 { return "\(Int((Double(bytes) / 1000).rounded()))KB" }
+    for (threshold, suffix) in [(1e12, "TB"), (1e9, "GB"), (1e6, "MB")] where Double(bytes) >= threshold {
+        let value = Double(bytes) / threshold
+        return (value < 10 ? String(format: "%.1f", value) : String(format: "%.0f", value)) + suffix
+    }
+    return "\(bytes)b"
+}
+
 struct SizeCell: View {
     let item: FileItem
     @ObservedObject private var cache = FolderSizeCache.shared
     var body: some View {
         if item.isDirectory {
             if let s = cache.cached(item.url) {
-                Text(ByteCountFormatter.string(fromByteCount: s, countStyle: .file)).foregroundStyle(.secondary)
+                Text(compactByteCount(s)).foregroundStyle(.secondary)
             } else {
                 Text("—").foregroundStyle(.secondary)
             }
@@ -186,18 +202,26 @@ struct SizeCell: View {
             // Network item whose size hasn't been fetched yet (see Browser.lightItem).
             Text("—").foregroundStyle(.tertiary)
         } else {
-            Text(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)).foregroundStyle(.secondary)
+            Text(compactByteCount(item.size)).foregroundStyle(.secondary)
         }
     }
 }
 
 // Renders a date column, showing a placeholder while a network item's metadata
 // is still being fetched in the background (sentinel = .distantPast).
+// Explorer-style format: "07/16/2026 8:03AM" — no leading zero on the hour, no
+// space before AM/PM. SwiftUI's .dateTime FormatStyle has no option for that
+// exact spacing, hence the plain DateFormatter.
 struct DateCell: View {
     let date: Date
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM/dd/yyyy h:mma"
+        return f
+    }()
     var body: some View {
         if date == .distantPast { Text("—").foregroundStyle(.tertiary) }
-        else { Text(date, format: .dateTime.year().month().day().hour().minute()).foregroundStyle(.secondary) }
+        else { Text(Self.formatter.string(from: date)).foregroundStyle(.secondary) }
     }
 }
 
@@ -326,7 +350,6 @@ enum Prefs {
         get { let v = d.double(forKey: "previewWidth"); return v < 120 ? 280 : CGFloat(v) }
         set { d.set(Double(newValue), forKey: "previewWidth") }
     }
-    static var columnData: Data? { get { d.data(forKey: "columnCustomization") } set { d.set(newValue, forKey: "columnCustomization") } }
     static var recentFolders: [String] { get { d.stringArray(forKey: "recentFolders") ?? [] } set { d.set(newValue, forKey: "recentFolders") } }
     static var confirmTrash: Bool {
         get { d.object(forKey: "confirmTrash") == nil ? true : d.bool(forKey: "confirmTrash") }
@@ -762,12 +785,14 @@ func reportFileError(_ summary: String, _ detail: String = "", permissionHint: B
 }
 
 // Shared dialogs / actions usable from menus and context menus.
+// Inline rename (Explorer/Finder-style), not a modal dialog: select the row,
+// scroll it into view, and let the Table/Icon/Gallery cell itself swap in
+// RenameField in response to `renamingID`.
 func promptRename(_ browser: Browser, _ id: String) {
-    guard let item = browser.items.first(where: { $0.id == id }) else { return }
-    let a = NSAlert(); a.messageText = "Rename"; a.informativeText = "Enter a new name:"
-    let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24)); f.stringValue = item.name
-    a.accessoryView = f; a.addButton(withTitle: "Rename"); a.addButton(withTitle: "Cancel")
-    if a.runModal() == .alertFirstButtonReturn { browser.rename(id: id, to: f.stringValue) }
+    guard browser.items.contains(where: { $0.id == id }) else { return }
+    browser.selection = [id]
+    browser.keyboardScrollID = id
+    browser.renamingID = id
 }
 func promptComment(_ browser: Browser, _ id: String) {
     guard let item = browser.items.first(where: { $0.id == id }) else { return }
@@ -2323,11 +2348,21 @@ final class Browser: ObservableObject, Identifiable {
                 if !present.isEmpty {
                     pendingRevealPaths = []
                     selection = Set(present); keyboardScrollID = present.first; updateStatus()
+                    // A just-created item (New Folder/New Text File) asked to start in
+                    // rename mode the moment it actually shows up in the listing.
+                    if let p = pendingRenamePath, present.contains(p) { renamingID = p }
+                    pendingRenamePath = nil
                 }
             }
         }
     }
     @Published var selection: Set<String> = []
+    // Drives the inline rename field (Table/Icon/Gallery all read this) — set
+    // directly for the New Folder/keyboard-shortcut path, or via handleNameTap
+    // below for the Explorer-style "click an already-selected name again" path.
+    @Published var renamingID: String?
+    private var pendingRenamePath: String?
+    private var lastNameClick: (id: String, at: Date)?
     // Paths to select + scroll to as soon as the next listing load includes them.
     var pendingRevealPaths: [String] = []
     @Published var pathText: String = ""
@@ -3037,6 +3072,25 @@ final class Browser: ObservableObject, Identifiable {
         updateStatus()
     }
 
+    // Windows Explorer / Finder-style rename: click a name, then click it again
+    // (not a double-click, which opens it) to edit in place. Callers pass every
+    // single (clickCount == 1) tap on a name label here — a double-click's second
+    // press reports clickCount == 2 and is filtered out by the caller before this
+    // is ever reached, so it's never mistaken for a slow second click. Tracked by
+    // "last tap was on this exact id, a deliberate pause ago" rather than by
+    // selection state, since Table/Icon/Gallery all update `selection` at slightly
+    // different points relative to the tap and comparing against selection would
+    // make the very click that first selects an item indistinguishable from a
+    // genuine second click on an already-selected one.
+    func handleNameTap(_ id: String) {
+        let now = Date()
+        defer { lastNameClick = (id, now) }
+        guard let last = lastNameClick, last.id == id else { return }
+        let gap = now.timeIntervalSince(last.at)
+        guard gap > 0.35, gap < 1.4 else { return }
+        renamingID = id
+    }
+
     func updateStatus() {
         let count = items.count
         if selection.isEmpty {
@@ -3625,6 +3679,9 @@ final class Browser: ObservableObject, Identifiable {
         UndoStack.shared.push("New Folder") { [weak self] in
             try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
         }
+        // Reveal it selected and immediately ready to type a name, like Explorer/Finder.
+        pendingRevealPaths = [target.path]
+        pendingRenamePath = target.path
         load()
     }
     func newTextFile() {
@@ -4275,9 +4332,6 @@ final class AppModel: ObservableObject {
     @Published var showSidebar: Bool = Prefs.showSidebar { didSet { Prefs.showSidebar = showSidebar } }
     @Published var dualPane: Bool = Prefs.dualPane { didSet { Prefs.dualPane = dualPane } }
     lazy var secondary = Browser(start: FileManager.default.homeDirectoryForCurrentUser)
-    @Published var columnCustomization: TableColumnCustomization<FileItem> = AppModel.loadColumns() {
-        didSet { AppModel.saveColumns(columnCustomization) }
-    }
     init() {
         // Restore previously open tabs (falling back to Home).
         let fm = FileManager.default
@@ -4307,13 +4361,6 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(tabs.map { $0.currentURL.path }, forKey: "openTabs")
         UserDefaults.standard.set(selected, forKey: "selectedTab")
     }
-    static func loadColumns() -> TableColumnCustomization<FileItem> {
-        if let data = Prefs.columnData,
-           let c = try? JSONDecoder().decode(TableColumnCustomization<FileItem>.self, from: data) { return c }
-        return TableColumnCustomization<FileItem>()
-    }
-    static func saveColumns(_ c: TableColumnCustomization<FileItem>) { Prefs.columnData = try? JSONEncoder().encode(c) }
-
     var active: Browser { tabs[max(0, min(selected, tabs.count - 1))] }
     func newTab(at url: URL? = nil) {
         tabs.append(Browser(start: url ?? FileManager.default.homeDirectoryForCurrentUser))
@@ -4783,6 +4830,66 @@ struct ThumbIcon: View {
     }
 }
 
+// Inline rename field: an NSTextField bridge, not a plain SwiftUI TextField,
+// because only AppKit gives control over the INITIAL selection range — needed to
+// select just the base name and exclude the extension (Explorer/Finder's rename
+// behavior), which a fresh TextField would otherwise select-all or select-none.
+struct RenameField: NSViewRepresentable {
+    let initialText: String
+    let excludeExtension: Bool
+    let onCommit: (String) -> Void
+    let onCancel: () -> Void
+
+    func makeNSView(context: Context) -> NSTextField {
+        let f = NSTextField(string: initialText)
+        f.isBordered = false
+        f.drawsBackground = true
+        f.focusRingType = .default
+        f.font = .systemFont(ofSize: NSFont.systemFontSize)
+        f.delegate = context.coordinator
+        f.lineBreakMode = .byTruncatingTail
+        DispatchQueue.main.async {
+            guard let window = f.window else { return }
+            window.makeFirstResponder(f)
+            let base = (initialText as NSString).deletingPathExtension
+            if excludeExtension, !base.isEmpty, base.count < initialText.count {
+                f.currentEditor()?.selectedRange = NSRange(location: 0, length: base.utf16.count)
+            } else {
+                f.currentEditor()?.selectAll(nil)
+            }
+        }
+        return f
+    }
+    func updateNSView(_ nsView: NSTextField, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onCommit: onCommit, onCancel: onCancel) }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        let onCommit: (String) -> Void
+        let onCancel: () -> Void
+        private var finished = false
+        init(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+            self.onCommit = onCommit; self.onCancel = onCancel
+        }
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                finished = true; onCommit(control.stringValue); return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                finished = true; onCancel(); return true
+            }
+            return false
+        }
+        // Clicking away or Tab-ing out ends editing without going through
+        // doCommandBy above — Finder treats that as a commit, not a cancel, so
+        // this mirrors that rather than silently discarding the typed name.
+        func controlTextDidEndEditing(_ obj: Notification) {
+            guard !finished, let field = obj.object as? NSTextField else { return }
+            finished = true
+            onCommit(field.stringValue)
+        }
+    }
+}
+
 struct NameCell: View {
     let item: FileItem
     @ObservedObject var browser: Browser
@@ -4790,7 +4897,14 @@ struct NameCell: View {
     var body: some View {
         HStack(spacing: 6) {
             ThumbIcon(item: item, browser: browser)
-            Text(item.name).lineLimit(1)
+            if browser.renamingID == item.id {
+                RenameField(initialText: item.name, excludeExtension: !item.isDirectory,
+                           onCommit: { browser.rename(id: item.id, to: $0); browser.renamingID = nil },
+                           onCancel: { browser.renamingID = nil })
+                    .frame(maxWidth: 260)
+            } else {
+                Text(item.name).lineLimit(1)
+            }
             cloudBadgeView(cloud)
         }
         .onAppear { cloud = cloudBadge(for: item.url) }
@@ -4840,10 +4954,20 @@ struct OpenWithMenu: View {
     }
 }
 
+// The list/detail view, hand-built on NSTableView (via NSViewRepresentable)
+// instead of SwiftUI's Table. Table repeatedly broke plain click-to-select and
+// double-click-to-open the moment anything (a nested gesture, a nested drop
+// destination) was attached inside a row or cell — confirmed live, twice, as two
+// separate regressions. NSTableView gives direct control over exactly when a
+// click starts a drag vs. a selection vs. a rename, with zero risk of two
+// recognizers fighting over the same event. Column CONTENT is still ordinary
+// SwiftUI (NameCell, DateCell, SizeCell, MetadataCell, TagsCell) hosted per cell
+// via NSHostingView — only the outer shell (rows, selection, sorting, drag-and-
+// drop, the context menu) is native.
 struct FileTableView: View {
     let model: AppModel
     @ObservedObject var browser: Browser
-    @Binding var columnCustomization: TableColumnCustomization<FileItem>
+    @State private var dropTargeted = false
 
     private func open(_ ids: Set<String>) {
         let chosen = browser.items.filter { ids.contains($0.id) }
@@ -4851,125 +4975,35 @@ struct FileTableView: View {
         for it in chosen { NSWorkspace.shared.open(it.url) }
     }
 
-    // Columns live in their own builder with an explicit type so the compiler
-    // doesn't choke inferring the (large) Table generic signature.
-    @TableColumnBuilder<FileItem, KeyPathComparator<FileItem>>
-    private var columns: some TableColumnContent<FileItem, KeyPathComparator<FileItem>> {
-        Group {
-            TableColumn("Name", value: \FileItem.name) { item in
-                NameCell(item: item, browser: browser)
-            }.customizationID("name")
-            TableColumn("Date Modified", value: \FileItem.modified) { item in
-                DateCell(date: item.modified)
-            }.width(min: 150, ideal: 185).customizationID("modified")
-            TableColumn("Size", value: \FileItem.size) { item in
-                SizeCell(item: item)
-            }.width(min: 70, ideal: 90).customizationID("size")
-            TableColumn("Kind", value: \FileItem.kind) { item in
-                Text(item.kind).foregroundStyle(.secondary).lineLimit(1)
-            }.width(min: 90, ideal: 130).customizationID("kind")
-        }
-        Group {
-            TableColumn("Date Created", value: \FileItem.created) { item in
-                DateCell(date: item.created)
-            }.width(min: 150, ideal: 185).customizationID("created").defaultVisibility(.hidden)
-            TableColumn("Date Last Opened", value: \FileItem.accessed) { item in
-                DateCell(date: item.accessed)
-            }.width(min: 150, ideal: 185).customizationID("accessed").defaultVisibility(.hidden)
-            TableColumn("Date Added", value: \FileItem.dateAdded) { item in
-                DateCell(date: item.dateAdded)
-            }.width(min: 150, ideal: 185).customizationID("dateAdded").defaultVisibility(.hidden)
-            TableColumn("Ext", value: \FileItem.ext) { item in
-                Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary)
-            }.width(min: 44, ideal: 56).customizationID("extension").defaultVisibility(.hidden)
-        }
-        Group {
-            TableColumn("Time") { (item: FileItem) in
-                if item.isDirectory { Text("—").foregroundStyle(.secondary) }
-                else { MetadataCell(url: item.url, field: .duration) }
-            }.width(min: 50, ideal: 64).customizationID("duration").defaultVisibility(.hidden)
-            TableColumn("Dimensions") { (item: FileItem) in
-                if item.isDirectory { Text("—").foregroundStyle(.secondary) }
-                else { MetadataCell(url: item.url, field: .dimensions) }
-            }.width(min: 90, ideal: 110).customizationID("dimensions").defaultVisibility(.hidden)
-            TableColumn("Tags") { (item: FileItem) in
-                TagsCell(tags: item.tags)
-            }.width(min: 90, ideal: 140).customizationID("tags").defaultVisibility(.hidden)
-        }
-    }
-
     var body: some View {
-        ScrollViewReader { proxy in
-            Table(of: FileItem.self, selection: $browser.selection, sortOrder: $browser.sortOrder,
-                  columnCustomization: $columnCustomization) {
-                columns
-            } rows: {
-                if browser.groupBy == .none {
-                    ForEach(browser.visibleItems()) { item in tableRow(item) }
-                } else {
-                    ForEach(browser.groups(), id: \.title) { group in
-                        Section(group.title) {
-                            ForEach(group.items) { item in tableRow(item) }
-                        }
-                    }
-                }
-            }
-            .contextMenu(forSelectionType: FileItem.ID.self) { ids in
-                contextMenu(ids)
-            } primaryAction: { ids in
-                open(ids)
-            }
-            .onChange(of: browser.selection) { browser.updateStatus() }
-            // Type-to-select (and keyboard nav) scrolls the chosen row into view.
-            .onChange(of: browser.keyboardScrollID) {
-                if let id = browser.keyboardScrollID { proxy.scrollTo(id) }
-            }
-            // Drop onto the table's row area → current folder (folder rows take
-            // precedence). SwiftUI's Table only exposes row drops, so the empty
-            // area / empty folders are handled by the overlay below.
-            .dropDestination(for: URL.self) { urls, _ in
-                browser.dropIntoCurrentFolder(urls); return true
-            } isTargeted: { dropInCurrent = $0 }
+        NativeFileTable(model: model, browser: browser, open: open,
+                        contextMenu: { AnyView(contextMenu($0)) },
+                        isTargeted: $dropTargeted)
             .overlay {
                 if browser.visibleItems().isEmpty {
-                    emptyFolderDropZone
-                } else if dropInCurrent {
+                    emptyFolderPlaceholder
+                } else if dropTargeted {
                     RoundedRectangle(cornerRadius: 6)
                         .strokeBorder(Color.accentColor, lineWidth: 2).padding(2).allowsHitTesting(false)
                 }
             }
-        }
     }
 
-    // Shown when the folder has no items: a full-pane drop target (the Table has
-    // no rows to accept a drop, so this covers "drag into an empty folder").
-    private var emptyFolderDropZone: some View {
+    // Purely visual now — the native table underneath already accepts a drop
+    // anywhere in its bounds (including when it has zero rows), so this doesn't
+    // need its own drop target, just the empty-state message.
+    private var emptyFolderPlaceholder: some View {
         ZStack {
-            (dropInCurrent ? Color.accentColor.opacity(0.08) : Color.clear)
+            (dropTargeted ? Color.accentColor.opacity(0.08) : Color.clear)
             VStack(spacing: 6) {
                 Image(systemName: "tray.and.arrow.down")
-                    .font(.system(size: 34)).foregroundStyle(dropInCurrent ? Color.accentColor : Color.secondary.opacity(0.6))
+                    .font(.system(size: 34)).foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary.opacity(0.6))
                 Text("This folder is empty").font(.title3).foregroundStyle(.secondary)
                 Text("Drag files here to add them").font(.callout).foregroundStyle(.tertiary)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-        .dropDestination(for: URL.self) { urls, _ in
-            browser.dropIntoCurrentFolder(urls); return true
-        } isTargeted: { dropInCurrent = $0 }
-    }
-    @State private var dropInCurrent = false
-
-    @TableRowBuilder<FileItem>
-    private func tableRow(_ item: FileItem) -> some TableRowContent<FileItem> {
-        // EXPERIMENT: no row-level .dropDestination — that registers the whole
-        // NSTableView as a drag destination and makes it swallow empty-area drops.
-        // With it gone, the table is drag-transparent and the container-level
-        // .dropDestination should catch drops anywhere. (itemProvider = drag-OUT,
-        // a source, is kept.)
-        TableRow(item)
-            .itemProvider { NSItemProvider(object: item.url as NSURL) }
+        .allowsHitTesting(false)
     }
 
     @ViewBuilder
@@ -5081,6 +5115,415 @@ struct FileTableView: View {
     }
 }
 
+// One row is either a group-section header or a real file/folder.
+private enum FileRow {
+    case header(String)
+    case item(FileItem)
+}
+
+// A column: identifier, header title, widths, default visibility, and (if
+// sortable) how to build the KeyPathComparator for a given direction. Ext and
+// the three extra date columns ARE sortable here (matching the original Table's
+// per-column `value:` bindings) even though Browser's own SortField/setSort only
+// names the four primary ones the toolbar Sort menu exposes — clicking one of
+// these headers sets browser.sortOrder directly.
+private struct FileColumnDef {
+    let id: String
+    let title: String
+    let minWidth: CGFloat
+    let idealWidth: CGFloat
+    let defaultVisible: Bool
+    let comparator: ((Bool) -> KeyPathComparator<FileItem>)?
+}
+
+private let fileColumnDefs: [FileColumnDef] = [
+    FileColumnDef(id: "name", title: "Name", minWidth: 160, idealWidth: 260, defaultVisible: true,
+                 comparator: { KeyPathComparator(\FileItem.name, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "modified", title: "Date Modified", minWidth: 150, idealWidth: 185, defaultVisible: true,
+                 comparator: { KeyPathComparator(\FileItem.modified, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "size", title: "Size", minWidth: 44, idealWidth: 58, defaultVisible: true,
+                 comparator: { KeyPathComparator(\FileItem.size, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "kind", title: "Kind", minWidth: 90, idealWidth: 130, defaultVisible: true,
+                 comparator: { KeyPathComparator(\FileItem.kind, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "created", title: "Date Created", minWidth: 150, idealWidth: 185, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.created, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "accessed", title: "Date Last Opened", minWidth: 150, idealWidth: 185, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.accessed, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "dateAdded", title: "Date Added", minWidth: 150, idealWidth: 185, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.dateAdded, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "extension", title: "Ext", minWidth: 44, idealWidth: 56, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.ext, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "duration", title: "Time", minWidth: 50, idealWidth: 64, defaultVisible: false, comparator: nil),
+    FileColumnDef(id: "dimensions", title: "Dimensions", minWidth: 90, idealWidth: 110, defaultVisible: false, comparator: nil),
+    FileColumnDef(id: "tags", title: "Tags", minWidth: 90, idealWidth: 140, defaultVisible: false, comparator: nil),
+]
+
+// NSTableView subclass that lets a click reach Table's OWN normal handling
+// (selection, drag-start) FIRST via super.mouseDown, and only afterward —
+// never instead of, never racing it — reports "this looked like a rename
+// candidate" so Browser.handleNameTap can apply its own click-pause-click
+// timing check. This is the whole reason for this rewrite: a nested SwiftUI
+// gesture recognizer or drop destination competes with Table's native click
+// handling for the same event; sequencing after super.mouseDown cannot.
+private final class ClickTimingTableView: NSTableView {
+    var onNameClickCandidate: ((Int) -> Void)?
+    var onContextMenuRequest: ((Int) -> NSMenu?)?
+    var onDragTargeted: ((Bool) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: point)
+        let clickedColumn = column(at: point)
+        let wasSoleSelected = clickedRow >= 0 && selectedRowIndexes.count == 1 && selectedRowIndexes.contains(clickedRow)
+        let isNameColumn = clickedColumn >= 0 && tableColumns.indices.contains(clickedColumn)
+            && tableColumns[clickedColumn].identifier.rawValue == "name"
+        super.mouseDown(with: event)
+        if event.clickCount == 1, wasSoleSelected, isNameColumn, clickedRow >= 0 {
+            onNameClickCandidate?(clickedRow)
+        }
+    }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        onContextMenuRequest?(row(at: convert(event.locationInWindow, from: nil)))
+    }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        onDragTargeted?(true); return super.draggingEntered(sender)
+    }
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        onDragTargeted?(false); super.draggingExited(sender)
+    }
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        onDragTargeted?(false); super.draggingEnded(sender)
+    }
+}
+
+// A reusable NSTableCellView holding one NSHostingView, whose rootView is
+// swapped in place on reuse instead of tearing the hosting view down — the key
+// to letting each cell's SwiftUI content (NameCell etc.) stay a live, reactive
+// view across ordinary redraws instead of restarting every scroll/update.
+private final class HostingTableCellView: NSTableCellView {
+    private let hosting = NSHostingView(rootView: AnyView(EmptyView()))
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        addSubview(hosting)
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            hosting.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            hosting.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    // NSHostingView centers its rootView within its own frame by default when
+    // given more space than the content's ideal size — which is exactly what
+    // happens here, since the hosting view is pinned to the cell's full width.
+    // The explicit leading-aligned frame is what makes cell content actually
+    // left-align like every other column in a normal table.
+    func update(_ content: AnyView) {
+        hosting.rootView = AnyView(content.frame(maxWidth: .infinity, alignment: .leading))
+    }
+}
+
+private struct NativeFileTable: NSViewRepresentable {
+    let model: AppModel
+    @ObservedObject var browser: Browser
+    let open: (Set<String>) -> Void
+    let contextMenu: (Set<FileItem.ID>) -> AnyView
+    @Binding var isTargeted: Bool
+
+    func makeCoordinator() -> FileTableCoordinator {
+        FileTableCoordinator(model: model, browser: browser, open: open, contextMenu: contextMenu)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView { context.coordinator.makeScrollView() }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.browser = browser
+        context.coordinator.open = open
+        context.coordinator.contextMenu = contextMenu
+        context.coordinator.isTargetedBinding = $isTargeted
+        context.coordinator.reload()
+    }
+}
+
+private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
+    let model: AppModel
+    var browser: Browser
+    var open: (Set<String>) -> Void
+    var contextMenu: (Set<FileItem.ID>) -> AnyView
+    var isTargetedBinding: Binding<Bool>?
+
+    weak var tableView: ClickTimingTableView?
+    private var rows: [FileRow] = []
+    private var lastRowSignature: [String] = []
+    private var lastKeyboardScrollID: String?
+    private var isPushingSelectionFromModel = false
+
+    init(model: AppModel, browser: Browser, open: @escaping (Set<String>) -> Void, contextMenu: @escaping (Set<FileItem.ID>) -> AnyView) {
+        self.model = model; self.browser = browser; self.open = open; self.contextMenu = contextMenu
+    }
+
+    func makeScrollView() -> NSScrollView {
+        let table = ClickTimingTableView()
+        table.style = .automatic
+        table.rowHeight = 22
+        table.usesAutomaticRowHeights = false
+        table.allowsMultipleSelection = true
+        table.allowsColumnResizing = true
+        table.allowsColumnReordering = true
+        table.autosaveName = "NavigatorFileTableColumnsV1"
+        table.autosaveTableColumns = true
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.doubleAction = #selector(doubleClicked(_:))
+        table.onNameClickCandidate = { [weak self] row in self?.handleNameClickCandidate(row: row) }
+        table.onContextMenuRequest = { [weak self] row in self?.buildContextMenu(row: row) }
+        table.onDragTargeted = { [weak self] t in self?.isTargetedBinding?.wrappedValue = t }
+        table.registerForDraggedTypes([.fileURL])
+        for def in fileColumnDefs {
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(def.id))
+            col.title = def.title
+            col.minWidth = def.minWidth
+            col.width = def.idealWidth
+            if def.comparator != nil { col.sortDescriptorPrototype = NSSortDescriptor(key: def.id, ascending: true) }
+            col.isHidden = !def.defaultVisible
+            table.addTableColumn(col)
+        }
+        let headerMenu = NSMenu(); headerMenu.delegate = self
+        table.headerView?.menu = headerMenu
+        self.tableView = table
+
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        reload()
+        return scroll
+    }
+
+    // Recomputes the row list. Only actually reloads the table (tearing down and
+    // rebuilding every cell) when the row SET changed — a plain selection or
+    // rename-mode change does NOT reload, because each cell's own SwiftUI content
+    // (NameCell etc.) already observes `browser` directly and re-renders itself;
+    // reloading unconditionally would tear down an in-progress RenameField mid-edit
+    // on every unrelated Browser change (selection, badgeGeneration, ...).
+    func reload() {
+        guard let table = tableView else { return }
+        let newRows: [FileRow] = browser.groupBy == .none
+            ? browser.visibleItems().map { .item($0) }
+            : browser.groups().flatMap { g -> [FileRow] in
+                g.title.isEmpty ? g.items.map { .item($0) } : [.header(g.title)] + g.items.map { .item($0) }
+              }
+        let newSignature = newRows.map { row -> String in
+            switch row { case .header(let t): return "H:" + t; case .item(let it): return "I:" + it.id }
+        }
+        if newSignature != lastRowSignature {
+            rows = newRows
+            lastRowSignature = newSignature
+            table.reloadData()
+        }
+        syncSortDescriptors()
+        syncSelection()
+        syncScrollTarget()
+    }
+
+    private func syncSortDescriptors() {
+        guard let table = tableView, let cur = browser.sortOrder.first else { return }
+        for def in fileColumnDefs {
+            guard let make = def.comparator else { continue }
+            let ascVal = make(true), descVal = make(false)
+            guard cur == ascVal || cur == descVal else { continue }
+            let asc = cur == ascVal
+            for col in table.tableColumns {
+                table.setIndicatorImage(col.identifier.rawValue == def.id
+                    ? NSImage(named: asc ? "NSAscendingSortIndicator" : "NSDescendingSortIndicator") : nil, in: col)
+            }
+            let desired = NSSortDescriptor(key: def.id, ascending: asc)
+            if table.sortDescriptors.first?.key != desired.key || table.sortDescriptors.first?.ascending != desired.ascending {
+                table.sortDescriptors = [desired]
+            }
+            return
+        }
+    }
+
+    private func syncSelection() {
+        guard let table = tableView else { return }
+        let indexSet = IndexSet(rows.indices.filter {
+            if case .item(let it) = rows[$0] { return browser.selection.contains(it.id) }
+            return false
+        })
+        guard table.selectedRowIndexes != indexSet else { return }
+        isPushingSelectionFromModel = true
+        table.selectRowIndexes(indexSet, byExtendingSelection: false)
+        isPushingSelectionFromModel = false
+    }
+
+    private func syncScrollTarget() {
+        guard let table = tableView, let id = browser.keyboardScrollID, id != lastKeyboardScrollID else { return }
+        lastKeyboardScrollID = id
+        if let idx = rows.firstIndex(where: { if case .item(let it) = $0, it.id == id { return true }; return false }) {
+            table.scrollRowToVisible(idx)
+        }
+    }
+
+    private func selectedItemIDs() -> Set<String> {
+        Set((tableView?.selectedRowIndexes ?? []).compactMap { idx -> String? in
+            guard rows.indices.contains(idx), case .item(let it) = rows[idx] else { return nil }
+            return it.id
+        })
+    }
+
+    private func handleNameClickCandidate(row: Int) {
+        guard rows.indices.contains(row), case .item(let item) = rows[row] else { return }
+        browser.handleNameTap(item.id)
+    }
+
+    private func buildContextMenu(row: Int) -> NSMenu? {
+        guard let table = tableView else { return nil }
+        var ids: Set<FileItem.ID> = []
+        if row >= 0, rows.indices.contains(row), case .item(let clicked) = rows[row] {
+            if table.selectedRowIndexes.contains(row) { ids = selectedItemIDs() }
+            else { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false); ids = [clicked.id] }
+        }
+        return NSHostingMenu(rootView: contextMenu(ids))
+    }
+
+    @objc private func doubleClicked(_ sender: NSTableView) {
+        let ids = selectedItemIDs()
+        guard !ids.isEmpty else { return }
+        open(ids)
+    }
+
+    @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let col = tableView?.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(id)) else { return }
+        col.isHidden.toggle()
+    }
+
+    // MARK: NSMenuDelegate (right-click on the column header — show/hide optional columns)
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === tableView?.headerView?.menu else { return }
+        menu.removeAllItems()
+        for col in tableView?.tableColumns ?? [] where col.identifier.rawValue != "name" {
+            let def = fileColumnDefs.first { $0.id == col.identifier.rawValue }
+            let item = NSMenuItem(title: def?.title ?? col.title, action: #selector(toggleColumnVisibility(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = col.identifier.rawValue
+            item.state = col.isHidden ? .off : .on
+            menu.addItem(item)
+        }
+    }
+
+    // MARK: NSTableViewDataSource / Delegate
+
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, isGroupRow row: Int) -> Bool {
+        guard rows.indices.contains(row) else { return false }
+        if case .header = rows[row] { return true }
+        return false
+    }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        guard rows.indices.contains(row) else { return false }
+        if case .header = rows[row] { return false }
+        return true
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard rows.indices.contains(row) else { return nil }
+        if case .header(let title) = rows[row] {
+            let id = NSUserInterfaceItemIdentifier("groupRow")
+            if let cell = tableView.makeView(withIdentifier: id, owner: self) as? NSTableCellView {
+                cell.textField?.stringValue = title; return cell
+            }
+            let cell = NSTableCellView(); cell.identifier = id
+            let tf = NSTextField(labelWithString: title)
+            tf.font = .boldSystemFont(ofSize: 12); tf.textColor = .secondaryLabelColor
+            cell.addSubview(tf); cell.textField = tf
+            tf.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+                tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+            return cell
+        }
+        guard case .item(let item) = rows[row], let colID = tableColumn?.identifier.rawValue else { return nil }
+        let reuseID = NSUserInterfaceItemIdentifier(colID)
+        if let cell = tableView.makeView(withIdentifier: reuseID, owner: self) as? HostingTableCellView {
+            cell.update(cellContent(for: colID, item: item)); return cell
+        }
+        let cell = HostingTableCellView(identifier: reuseID)
+        cell.update(cellContent(for: colID, item: item))
+        return cell
+    }
+
+    private func cellContent(for colID: String, item: FileItem) -> AnyView {
+        switch colID {
+        case "name": return AnyView(NameCell(item: item, browser: browser))
+        case "modified": return AnyView(DateCell(date: item.modified))
+        case "size": return AnyView(SizeCell(item: item))
+        case "kind": return AnyView(Text(item.kind).foregroundStyle(.secondary).lineLimit(1))
+        case "created": return AnyView(DateCell(date: item.created))
+        case "accessed": return AnyView(DateCell(date: item.accessed))
+        case "dateAdded": return AnyView(DateCell(date: item.dateAdded))
+        case "extension": return AnyView(Text(item.ext.isEmpty ? "—" : item.ext.uppercased()).foregroundStyle(.secondary))
+        case "duration":
+            return item.isDirectory ? AnyView(Text("—").foregroundStyle(.secondary)) : AnyView(MetadataCell(url: item.url, field: .duration))
+        case "dimensions":
+            return item.isDirectory ? AnyView(Text("—").foregroundStyle(.secondary)) : AnyView(MetadataCell(url: item.url, field: .dimensions))
+        case "tags": return AnyView(TagsCell(tags: item.tags))
+        default: return AnyView(EmptyView())
+        }
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !isPushingSelectionFromModel else { return }
+        let ids = selectedItemIDs()
+        guard browser.selection != ids else { return }
+        browser.selection = ids
+        browser.updateStatus()
+    }
+
+    func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
+        guard let desc = tableView.sortDescriptors.first, let key = desc.key,
+              let def = fileColumnDefs.first(where: { $0.id == key }), let make = def.comparator else { return }
+        browser.sortOrder = [make(desc.ascending)]
+    }
+
+    // MARK: Drag out / drag in
+
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard rows.indices.contains(row), case .item(let item) = rows[row] else { return nil }
+        return item.url as NSURL
+    }
+
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int,
+                   proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        guard info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) else { return [] }
+        if dropOperation == .on, rows.indices.contains(row), case .item(let item) = rows[row], item.isDirectory {
+            return .copy
+        }
+        // Anything else (between rows, on a file, empty table) → whole-table
+        // background drop, same as Finder proposing "into the current folder".
+        tableView.setDropRow(-1, dropOperation: .on)
+        return .copy
+    }
+
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int,
+                   dropOperation: NSTableView.DropOperation) -> Bool {
+        guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else { return false }
+        if dropOperation == .on, rows.indices.contains(row), case .item(let item) = rows[row], item.isDirectory {
+            browser.dropInto(urls, folder: item.url)
+        } else {
+            browser.dropIntoCurrentFolder(urls)
+        }
+        return true
+    }
+}
+
 struct IconCell: View {
     let item: FileItem
     @ObservedObject var browser: Browser
@@ -5095,7 +5538,19 @@ struct IconCell: View {
             }
             .frame(width: browser.iconSize, height: browser.iconSize)
             .overlay(alignment: .bottomTrailing) { cloudBadgeView(cloud) }
-            Text(item.name).font(.caption).lineLimit(2).multilineTextAlignment(.center)
+            if browser.renamingID == item.id {
+                RenameField(initialText: item.name, excludeExtension: !item.isDirectory,
+                           onCommit: { browser.rename(id: item.id, to: $0); browser.renamingID = nil },
+                           onCancel: { browser.renamingID = nil })
+                    .multilineTextAlignment(.center)
+            } else {
+                Text(item.name).font(.caption).lineLimit(2).multilineTextAlignment(.center)
+                    .onTapGesture {
+                        let e = NSApp.currentEvent
+                        if (e?.clickCount ?? 1) >= 2 { openItem(item, browser) }
+                        else { browser.click(item.id, modifiers: e?.modifierFlags ?? []); browser.handleNameTap(item.id) }
+                    }
+            }
         }
         .frame(width: browser.iconSize + 40, height: browser.iconSize + 46)
         .padding(4)
@@ -5562,7 +6017,17 @@ struct GalleryView: View {
                 if let it = selected {
                     VStack(spacing: 8) {
                         ThumbImage(item: it, browser: browser).padding(24)
-                        Text(it.name).font(.callout).lineLimit(1).padding(.bottom, 6)
+                        if browser.renamingID == it.id {
+                            RenameField(initialText: it.name, excludeExtension: !it.isDirectory,
+                                       onCommit: { browser.rename(id: it.id, to: $0); browser.renamingID = nil },
+                                       onCancel: { browser.renamingID = nil })
+                                .frame(maxWidth: 260).padding(.bottom, 6)
+                        } else {
+                            Text(it.name).font(.callout).lineLimit(1).padding(.bottom, 6)
+                                .onTapGesture {
+                                    if (NSApp.currentEvent?.clickCount ?? 1) == 1 { browser.handleNameTap(it.id) }
+                                }
+                        }
                     }
                 } else {
                     Text("No items").foregroundStyle(.secondary)
@@ -5579,6 +6044,12 @@ struct GalleryView: View {
                                 .background(browser.selection.contains(it.id) ? Color.accentColor.opacity(0.3) : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .id(it.id)
+                                .draggable(it.url)
+                                .dropDestination(for: URL.self) { urls, _ in
+                                    if it.isDirectory { browser.dropInto(urls, folder: it.url) }
+                                    else { browser.dropIntoCurrentFolder(urls) }
+                                    return true
+                                }
                                 .onTapGesture {
                                     let e = NSApp.currentEvent
                                     if (e?.clickCount ?? 1) >= 2 { openItem(it, browser) }
@@ -5716,7 +6187,7 @@ struct BrowserContent: View {
                     case .gallery: GalleryView(model: model, browser: browser)
                     // Column view disabled — a stale saved "column" pref falls back to Details.
                     // case .column: ColumnView(model: model, browser: browser)
-                    default: FileTableView(model: model, browser: browser, columnCustomization: $model.columnCustomization)
+                    default: FileTableView(model: model, browser: browser)
                     }
                 }
             }
@@ -6728,7 +7199,7 @@ final class GetInfoController {
     func show(_ browser: Browser, _ item: FileItem) {
         if let w = windows[item.id] { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 540),
-                         styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+                         styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         w.title = "\(item.name) Info"
         w.isReleasedWhenClosed = false
         w.contentView = NSHostingView(rootView: GetInfoView(browser: browser, item: item))
@@ -6883,7 +7354,7 @@ final class BatchRenameController {
     func show(_ browser: Browser, _ items: [FileItem]) {
         guard !items.isEmpty else { return }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 480),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                         styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         w.title = "Batch Rename"
         w.isReleasedWhenClosed = false
         w.contentView = NSHostingView(rootView: BatchRenameView(browser: browser, items: items) { [weak w] in w?.close() })
@@ -7025,6 +7496,31 @@ enum Updater {
 
 final class NavWindow: NSWindow {
     let model = AppModel()
+    private var titleObservers: [AnyCancellable] = []
+
+    // Keeps the title (and so the Dock menu's window list) showing the folder the
+    // active tab is open to, instead of a generic "Navigator" for every window —
+    // watches both tab SWITCHES (model.objectWillChange, since `selected` and `tabs`
+    // are @Published on AppModel itself) and navigation WITHIN a tab (Browser is its
+    // own ObservableObject, so its currentURL change doesn't bubble into AppModel's
+    // own objectWillChange — .navigatorDidNavigate is the existing cross-cutting
+    // signal the rest of the app already posts on every navigation).
+    func startObservingFolderTitle() {
+        updateTitleFromFolder()
+        titleObservers = [
+            model.objectWillChange.sink { [weak self] _ in
+                DispatchQueue.main.async { self?.updateTitleFromFolder() }
+            },
+            NotificationCenter.default.publisher(for: .navigatorDidNavigate).sink { [weak self] _ in
+                self?.updateTitleFromFolder()
+            },
+        ]
+    }
+
+    private func updateTitleFromFolder() {
+        let name = model.active.currentURL.lastPathComponent
+        title = name.isEmpty ? "Navigator" : name
+    }
 
     // ⌘ + scroll wheel resizes/cycles the view (Windows 11 Ctrl+scroll). Handled
     // here in sendEvent so the event is fully consumed — a local event monitor
@@ -7134,6 +7630,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the user's own navigation for the choked connection and made browsing
         // hang. The persistent cache + mtime revalidation already make revisits
         // instant without any background traffic.)
+    }
+
+    @objc private func bringDockWindowToFront(_ sender: NSMenuItem) {
+        guard let w = sender.representedObject as? NSWindow else { return }
+        if w.isMiniaturized { w.deminiaturize(nil) }
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     // Bring up the browser window (idempotent) and flush any queued folder opens.
@@ -7452,7 +7955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
-        w.title = "Navigator"
+        w.startObservingFolderTitle()
         w.contentView = NSHostingView(rootView: ContentView(model: w.model))
         w.center()
         return w
@@ -7614,6 +8117,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dp.keyEquivalentModifierMask = [.command, .option]; dp.target = self
         let sh = viewMenu.addItem(withTitle: "Toggle Hidden Files", action: #selector(toggleHiddenAction(_:)), keyEquivalent: ".")
         sh.keyEquivalentModifierMask = [.command, .shift]; sh.target = self
+
+        // Window menu: standard Minimize/Zoom/Bring All to Front. Deliberately NOT set
+        // as NSApp.windowsMenu — confirmed live that doing so makes the Dock's
+        // right-click menu ALSO merge in its own auto-tracked window list on top of the
+        // one applicationDockMenu() already builds below, duplicating every window
+        // entry. The Dock menu is the one place this app needs a live window list
+        // (matching Chrome), so it owns that job alone.
+        let windowItem = NSMenuItem(); mainMenu.addItem(windowItem)
+        let windowMenu = NSMenu(title: "Window"); windowItem.submenu = windowMenu
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
 
         let aiItem = NSMenuItem(); mainMenu.addItem(aiItem)
         let aiMenu = NSMenu(title: "AI"); aiItem.submenu = aiMenu
@@ -7898,7 +8414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showSettingsAction(_ sender: Any?) {
         if settingsWindow == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 360),
-                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
             w.title = "Settings"
             w.contentView = NSHostingView(rootView: SettingsView())
             w.isReleasedWhenClosed = false
@@ -8005,6 +8521,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let m = NSMenu()
         func add(_ title: String, _ sel: Selector) {
             m.addItem(withTitle: title, action: sel, keyEquivalent: "").target = self
+        }
+        // Every open Navigator window (browser, image viewer, Compare, Restyle…) listed
+        // by title, so one is always reachable after minimizing — like Chrome's Dock
+        // icon. Needed regardless of the system's "Minimize windows into application
+        // icon" preference: verified live that with that preference off, even Chrome's
+        // own Dock menu shows no window list, so Chrome must build this itself too.
+        // isVisible goes false the instant a window is miniaturized (confirmed live) —
+        // isMiniaturized is what keeps it listed here after that.
+        let openWindows = NSApp.windows.filter {
+            ($0.isVisible || $0.isMiniaturized) && !$0.title.isEmpty && !$0.isExcludedFromWindowsMenu
+        }
+        if !openWindows.isEmpty {
+            for w in openWindows {
+                let item = m.addItem(withTitle: w.title, action: #selector(bringDockWindowToFront(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = w
+                item.state = w.isKeyWindow ? .on : .off
+            }
+            m.addItem(.separator())
         }
         add("New Window", #selector(newWindowAction(_:)))
         add("New Tab", #selector(dockNewTabAction(_:)))
@@ -9009,7 +9544,7 @@ final class RestyleController {
     static func show(sources: [URL], onFinished: @escaping (URL) -> Void) {
         guard !sources.isEmpty else { return }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 640),
-                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                         styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
         w.title = sources.count == 1
             ? "Restyle — \(sources[0].lastPathComponent)"
