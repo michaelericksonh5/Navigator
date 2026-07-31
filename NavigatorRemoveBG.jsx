@@ -139,6 +139,27 @@ function doWork() {
     }
 }
 
+// app.open can throw AFTER the document actually opened — seen live: a wedged
+// Photoshop opened the file and then failed the internal Get that returns it, so
+// `doc` in doWork was never assigned, its catch closed nothing, and every retry
+// stacked another hidden open copy (9 were found piled up). Close exactly the file
+// we were asked to open, matched by full path — never a user document that merely
+// shares the name. Runs only when doWork failed at the open step.
+function closeLeakedSource() {
+    if (!SOURCE) { return; }
+    try {
+        for (var i = app.documents.length - 1; i >= 0; i--) {
+            var full = null;
+            try { full = app.documents[i].fullName ? app.documents[i].fullName.fsName : null; } catch (fErr) {}
+            if (full === SOURCE) {
+                app.documents[i].close(SaveOptions.DONOTSAVECHANGES);
+                return;
+            }
+        }
+    } catch (sweepErr) {}
+}
+
 var RESULT;
 try { RESULT = doWork(); } catch (e) { RESULT = "ERROR: [" + STEP + "] " + e.message; }
+if (RESULT && RESULT.indexOf("ERROR: [open]") === 0) { closeLeakedSource(); }
 RESULT;  // returned to osascript stdout so Navigator can report it
