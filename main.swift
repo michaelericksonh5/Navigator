@@ -1850,6 +1850,63 @@ func chromaKeyOnce(cfgPath: String, src: URL, attempts: Int = 3,
     return last
 }
 
+// True when Photoshop's Quick Export as PNG applies to this file — the layered
+// Photoshop formats. Plain images don't need Photoshop to become a PNG.
+func isPhotoshopDocument(_ url: URL) -> Bool {
+    ["psd", "psb"].contains(url.pathExtension.lowercased())
+}
+
+// Quick Export as PNG for one or more PSDs, in one hidden Photoshop session (one
+// script run per file — the Remove BG model exactly: bounded retries per file, at
+// most one wedged-app restart per run, progress + end-of-run summary, PSD opened
+// read-only and never written). Output is "<name>.png" next to the PSD, uniqued so
+// an existing "<name>.png" the user already has is never overwritten.
+func exportPSDsToPNG(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    let psds = srcs.filter { isPhotoshopDocument($0) }
+    guard !psds.isEmpty else { NSSound.beep(); return }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Exporting PNGs", total: psds.count) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []
+        var errors: [String] = []
+        let recovery = AdobeRecovery()   // at most one Photoshop restart for the whole run
+        for src in psds {
+            let dir = src.deletingLastPathComponent()
+            let out = PathRules.uniqueDest(dir, src.deletingPathExtension().lastPathComponent + ".png") {
+                FileManager.default.fileExists(atPath: $0)
+            }
+            var r = ScriptResult(ok: false, message: "not attempted")
+            for i in 0..<3 {
+                let isLast = (i == 2)
+                r = runPhotoshopScript(resource: "NavigatorExportPNG", arguments: [src.path, out.path],
+                                       reportError: false)
+                if r.ok {
+                    if i > 0 { navLog("export png: \(src.lastPathComponent) succeeded on attempt \(i + 1)") }
+                    break
+                }
+                guard !isLast else { break }
+                navLog("export png: \(src.lastPathComponent) attempt \(i + 1) failed — \(r.message); retrying")
+                if i == 1, !recovery.used, let psURL = PhotoshopIcon.url {
+                    // Same reasoning as removeBackgroundOnce: plain retries exhausted
+                    // means Photoshop itself is likely wedged; restarting it once per
+                    // run is the only recovery that can save the remaining files.
+                    recovery.markUsed()
+                    restartAdobeApp(bundleID: "com.adobe.Photoshop", appURL: psURL)
+                } else {
+                    Thread.sleep(forTimeInterval: 1.0 + Double(i))
+                }
+            }
+            if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
+            DispatchQueue.main.async { BGJobProgress.shared.advance() }
+        }
+        DispatchQueue.main.async {
+            hideApp(bundleID: "com.adobe.Photoshop")
+            BGJobProgress.shared.finish("Exported \(outs.count) of \(psds.count) PNG\(psds.count == 1 ? "" : "s")")
+            if !errors.isEmpty { showBGSummary(app: "Photoshop", done: outs.count, total: psds.count, errors: errors, verb: "exported") }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
 // Chroma Key for several PNGs in one hidden After Effects session (single still
 // script per file). Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
@@ -3628,6 +3685,15 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
 
+    // Quick Export as PNG: Photoshop flattens each selected PSD/PSB into
+    // "<name>.png" alongside it (uniqued, never overwriting an existing PNG);
+    // then we refresh and highlight the new file(s). One or many.
+    func exportPNG(_ ids: Set<String>) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isPhotoshopDocument($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        exportPSDsToPNG(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
     // Prep for AI — Fill Background: fit each selected image to the nearest NB2
     // aspect ratio, pad 20%, fill with `color`, write "<name>_bgfill.png". Native
     // (no Adobe app); originals untouched.
@@ -5304,6 +5370,10 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                     Button { browser.removeBackground(ids) } label: { psLabel(imgCount == 1 ? "Remove BG" : "Remove BG (\(imgCount) images)") }
                 } else if dirs.count == 1, sel.count == 1 {
                     Button { browser.batchRemoveBackground(ids) } label: { psLabel("Batch Remove BG") }
+                }
+                let psdCount = sel.filter { !$0.isDirectory && isPhotoshopDocument($0.url) }.count
+                if psdCount >= 1 {
+                    Button { browser.exportPNG(ids) } label: { psLabel(psdCount == 1 ? "Quick Export as PNG" : "Quick Export as PNG (\(psdCount) PSDs)") }
                 }
             }
             if AfterEffectsIcon.image != nil {
