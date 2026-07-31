@@ -140,6 +140,60 @@ enum PathRules {
 /// for an image that was never there. `restylePrompt` handles no reference;
 /// `restylePromptTwoImage` handles a real second reference image, source first,
 /// reference second — re-test before reordering.
+
+/// Which of the two possible images actually reach the model: the SOURCE (the file
+/// being restyled) and the style REFERENCE. Either can be withheld, leaving its side
+/// of the job to text alone — a content description instead of the source, style notes
+/// instead of the reference.
+///
+/// This exists as one named type rather than two loose Bools because four things have
+/// to stay in agreement about the mode: which prompt shape is used ("preserve this
+/// image" vs "create a new image"), whether padding means anything (it only protects a
+/// source image that's actually being sent), whether an empty content description is
+/// fatal (it is, when the description is the only thing defining the subject), and what
+/// gets recorded in the output's metadata. Deriving each of those separately from
+/// `sendSource`/`sendReference` is how they'd drift apart.
+enum RestyleInputMode: String {
+    /// Source + reference: redraw this image in that image's style. The original mode.
+    case editWithStyleImage
+    /// Source only: redraw this image in a described style.
+    case editWithStyleText
+    /// Reference only: build the subject from its description, in that image's style.
+    case createWithStyleImage
+    /// Neither: pure text-to-image from a described subject and a described style.
+    case createWithStyleText
+
+    init(sendSource: Bool, sendReference: Bool) {
+        switch (sendSource, sendReference) {
+        case (true, true):   self = .editWithStyleImage
+        case (true, false):  self = .editWithStyleText
+        case (false, true):  self = .createWithStyleImage
+        case (false, false): self = .createWithStyleText
+        }
+    }
+
+    var sendsSource: Bool { self == .editWithStyleImage || self == .editWithStyleText }
+    var sendsReference: Bool { self == .editWithStyleImage || self == .createWithStyleImage }
+
+    /// True when the content description is the ONLY thing defining the subject, so an
+    /// empty one can't produce a restyle of anything — it produces an unrelated image.
+    var needsContentText: Bool { !sendsSource }
+
+    /// Padding exists to stop Nano Banana flattening a transparent SOURCE to black.
+    /// With no source image being sent there is nothing to pad.
+    var padApplies: Bool { sendsSource }
+
+    /// Recorded in the output PNG so a file can still say how it was made months later.
+    var label: String {
+        switch self {
+        case .editWithStyleImage:   return "source + style image"
+        case .editWithStyleText:    return "source + style text"
+        case .createWithStyleImage: return "text content + style image"
+        case .createWithStyleText:  return "text only"
+        }
+    }
+}
+
 enum RestyleRules {
 
     // MARK: - Aspect ratio
@@ -317,6 +371,85 @@ enum RestyleRules {
         not add, remove, merge, crop, rearrange or reinterpret anything, and do not collapse \
         a multi-element layout into a single subject.
         """
+
+    /// The counterpart to preserveClause for the two modes that send NO source image.
+    /// There is no existing image to protect, so this demands completeness of the
+    /// DESCRIPTION instead of fidelity to a source — but it keeps preserveClause's
+    /// hard-won lessons, because they apply just as much when drawing a pay table
+    /// from a description as when redrawing one: account for every element, don't
+    /// invent extras, and get the text exactly right.
+    private static let createClause = """
+        Create a NEW image from the description below. Draw every element it names, in the \
+        arrangement it describes, and reproduce all text and numbers character-for-character. \
+        Do not add elements it does not mention, and do not collapse a multi-element layout \
+        into a single subject.
+        """
+
+    /// Text-to-image: no source image and no reference image. The content description
+    /// IS the subject here, not a set of anchors protecting an existing image, so the
+    /// wording flips from "preserve" to "create" — telling a model to "keep every part
+    /// exactly as it is" when it has no image to look at invites it to invent one and
+    /// call that faithful.
+    ///
+    /// Contents first, style last, mirroring restylePrompt for the same measured
+    /// reason: leading with the style change let the subject drift on live runs.
+    static func generatePrompt(contents: String, styleText: String, extra: String = "") -> String {
+        let c = anchorClause(contents, fallback: "the subject described by the art style notes below.")
+        let style = styleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var p = """
+            \(createClause)
+
+            CONTENTS TO CREATE: \(c)
+
+            Render it in the following art style:
+
+            ART STYLE: \(style)
+            """
+        let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !e.isEmpty { p += "\n\nADDITIONAL STYLE NOTES: \(e)" }
+        return p
+    }
+
+    /// One image is attached and it is the STYLE reference — no source image. The role
+    /// label carries even more weight than in restylePromptTwoImage: with nothing to
+    /// redraw, an unlabelled reference is simply "the image", and the model returns its
+    /// subject straight back. Same failure the two-image prompt already had to defend
+    /// against, minus the source image that used to compete for the model's attention.
+    static func generatePromptStyleImage(contents: String, extra: String = "") -> String {
+        let c = anchorClause(contents, fallback: "the subject described by the style notes below.")
+        var p = """
+            \(createClause)
+
+            CONTENTS TO CREATE: \(c)
+
+            The attached image is a STYLE reference ONLY. Do not copy its subject, objects, \
+            layout or text — none of its content may appear in the output. Take from it only \
+            the rendering technique, colour palette, linework and lighting.
+            """
+        let e = extra.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !e.isEmpty { p += "\n\nADDITIONAL STYLE NOTES: \(e)" }
+        return p
+    }
+
+    /// The single place that turns "which images are we sending?" into a prompt, so the
+    /// UI, the metadata and the prompt can never disagree about the mode.
+    ///
+    /// The styleText/extra split is NOT uniform across modes, and that asymmetry is
+    /// deliberate and pre-existing: when an IMAGE carries the style, typed style text is
+    /// demoted to supplementary notes, because a full style paragraph competing with a
+    /// style reference wins and defeats the point of attaching the reference at all.
+    /// When no image carries the style, that same text IS the style.
+    static func prompt(mode: RestyleInputMode, contents: String,
+                       styleText: String, extra: String = "") -> String {
+        let folded = [styleText, extra].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }.joined(separator: ". ")
+        switch mode {
+        case .editWithStyleImage:   return restylePromptTwoImage(identityAnchors: contents, extra: folded)
+        case .editWithStyleText:    return restylePrompt(identityAnchors: contents, styleText: styleText, extra: extra)
+        case .createWithStyleImage: return generatePromptStyleImage(contents: contents, extra: folded)
+        case .createWithStyleText:  return generatePrompt(contents: contents, styleText: styleText, extra: extra)
+        }
+    }
 
     /// Style words that should NOT appear in a CONTENTS description. The contents field
     /// says what must survive; naming colour or texture there fights the new style
