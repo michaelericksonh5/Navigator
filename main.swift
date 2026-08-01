@@ -22,7 +22,7 @@ extension Notification.Name {
     static let navigatorResignFields = Notification.Name("navigatorResignFields")   // drop address/search focus so typing → type-to-select
 }
 
-enum ViewMode: String { case list, icon, gallery, column }
+enum ViewMode: String { case list, icon, gallery }
 enum ConflictPolicy { case keepBoth, replace, skip }
 
 final class TransferProgress: ObservableObject {
@@ -130,6 +130,66 @@ final class MetadataCache {
             self.lock.lock(); self.store[key] = m; self.lock.unlock()
             DispatchQueue.main.async { completion(m) }
         }
+    }
+
+    /// What's already known about a file, without starting a lookup. Sorting by Time or
+    /// Dimensions runs over every item on every re-sort, so it must never block and must
+    /// never kick off work — `prefetch` below does the loading, once.
+    func cached(for url: URL) -> FileMeta? {
+        lock.lock(); defer { lock.unlock() }
+        return store[url.path]
+    }
+
+    /// Load metadata for a whole listing and call back ONCE, when the last one lands.
+    ///
+    /// Sorting by Time or Dimensions is the reason this exists. Those values arrive
+    /// per-cell, asynchronously, and only for cells that have actually been drawn — so a
+    /// header click that sorted on whatever happened to be loaded produced a visibly
+    /// wrong order (everything below the fold counted as unknown) that then never
+    /// corrected itself, because nothing re-sorted when the values arrived. Filling the
+    /// cache first and re-sorting after is what makes those two columns honest.
+    func prefetch(_ urls: [URL], completion: @escaping () -> Void) {
+        let missing = urls.filter { cached(for: $0) == nil }
+        guard !missing.isEmpty else { completion(); return }
+        let group = DispatchGroup()
+        for u in missing {
+            group.enter()
+            meta(for: u) { _ in group.leave() }
+        }
+        group.notify(queue: .main, execute: completion)
+    }
+}
+
+// MARK: - File owner (POSIX)
+
+/// The POSIX owner name for a path, for the Owner column.
+///
+/// Deliberately NOT added to the listing's URLResourceKeys. Those are fetched for every
+/// entry the moment a folder is enumerated, and on a DFS-heavy SMB share each extra
+/// attribute is a round trip per file — the exact cost `namesOnlyItems` exists to dodge.
+/// This is asked for only when the Owner column is on screen or being sorted by.
+///
+/// Only the uid→name mapping is cached, because that is the expensive half (getpwuid can
+/// hit a directory service) and it does not change under us. The stat itself is repeated
+/// every time, so a chown shows up on the next redraw instead of being remembered wrong
+/// forever.
+/// ponytail: stat-per-render is fine locally (~µs) and rides the SMB attribute cache
+/// remotely; if the Owner column ever feels slow on a big network folder, cache
+/// path→name per directory load and clear it in Browser.load().
+enum FileOwner {
+    private static var names: [uid_t: String] = [:]
+    private static let lock = NSLock()
+
+    static func name(for url: URL) -> String {
+        var st = stat()
+        guard stat(url.path, &st) == 0 else { return "—" }
+        let uid = st.st_uid
+        lock.lock()
+        if let cached = names[uid] { lock.unlock(); return cached }
+        lock.unlock()
+        let resolved = getpwuid(uid).flatMap { String(validatingUTF8: $0.pointee.pw_name) } ?? String(uid)
+        lock.lock(); names[uid] = resolved; lock.unlock()
+        return resolved
     }
 }
 
@@ -358,8 +418,71 @@ enum Prefs {
     static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
     static var didOfferDefaults: Bool { get { d.bool(forKey: "didOfferDefaults") } set { d.set(newValue, forKey: "didOfferDefaults") } }
     static var warnImageDelete: Bool { get { d.object(forKey: "warnImageDelete") == nil ? true : d.bool(forKey: "warnImageDelete") } set { d.set(newValue, forKey: "warnImageDelete") } }
+    static var warnExtensionChange: Bool { get { d.object(forKey: "warnExtensionChange") == nil ? true : d.bool(forKey: "warnExtensionChange") } set { d.set(newValue, forKey: "warnExtensionChange") } }
     static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
     static var skipUpdateVersion: String { get { d.string(forKey: "skipUpdateVersion") ?? "" } set { d.set(newValue, forKey: "skipUpdateVersion") } }
+    /// Globally visible Details columns. `nil` (the key absent) deliberately means "use
+    /// each column's own defaultVisible", so an install that predates this key — and a
+    /// fresh install — shows exactly the four columns it always did.
+    static var columns: [String]? {
+        get { d.stringArray(forKey: "detailColumns") }
+        set { newValue == nil ? d.removeObject(forKey: "detailColumns") : d.set(newValue, forKey: "detailColumns") }
+    }
+    /// The per-folder view options blob (a JSON-encoded ViewOptionsLRU). Stored as Data
+    /// rather than a plist dictionary for the same reason favoritesV2 is: one Codable
+    /// type on both sides means the shape can't drift.
+    static var folderViewOptions: Data? {
+        get { d.data(forKey: "folderViewOptionsV1") }
+        set { d.set(newValue, forKey: "folderViewOptionsV1") }
+    }
+}
+
+// MARK: - Per-folder view options (⌘J)
+
+/// The store behind "this folder should always open in Details sorted by date".
+///
+/// Same shape as FavoritesStore: an ObservableObject singleton holding a Codable value
+/// and writing it straight back to UserDefaults on every change. The interesting half
+/// (recency, the cap, and "what applies to a folder with nothing saved") is pure logic
+/// in NavigatorCore's ViewOptionsLRU, where it is unit-tested.
+///
+/// Nothing is written for a folder until the user explicitly asks for it in the ⌘J panel
+/// — which is what keeps the default experience byte-for-byte unchanged for anyone who
+/// never opens that panel.
+final class FolderViewOptionsStore: ObservableObject {
+    static let shared = FolderViewOptionsStore()
+    @Published private var lru: ViewOptionsLRU
+
+    private init() {
+        if let data = Prefs.folderViewOptions,
+           let decoded = try? JSONDecoder().decode(ViewOptionsLRU.self, from: data) {
+            lru = decoded
+        } else {
+            lru = ViewOptionsLRU()
+        }
+    }
+
+    func contains(_ path: String) -> Bool { lru.contains(path) }
+    func options(for path: String) -> ViewOptions? { lru.value(for: path) }
+    var rememberedCount: Int { lru.count }
+
+    func save(_ options: ViewOptions, for path: String) {
+        guard lru.value(for: path) != options else { return }   // no churn on a re-save of the same thing
+        lru.set(options, for: path)
+        persist()
+    }
+    func forget(_ path: String) {
+        guard lru.contains(path) else { return }
+        lru.remove(path)
+        persist()
+    }
+    /// Called when a folder with saved options is opened, so the folders you actually
+    /// keep visiting are the ones that survive the cap. Writes only when the order
+    /// genuinely moved — otherwise every refresh of the current folder would hit disk.
+    func markUsed(_ path: String) {
+        if lru.touch(path) { persist() }
+    }
+    private func persist() { Prefs.folderViewOptions = try? JSONEncoder().encode(lru) }
 }
 
 // MARK: - Recent folders (Windows Quick Access-style MRU list)
@@ -378,6 +501,13 @@ final class RecentFolders: ObservableObject {
         urls.removeAll { $0.path == std.path }
         urls.insert(std, at: 0)
         if urls.count > cap { urls = Array(urls.prefix(cap)) }
+        Prefs.recentFolders = urls.map { $0.path }
+    }
+    // Drop one entry (sidebar context menu) — a folder you visited once by mistake
+    // shouldn't cost you the whole list to get rid of.
+    func remove(_ url: URL) {
+        let p = url.standardizedFileURL.path
+        urls.removeAll { $0.path == p }
         Prefs.recentFolders = urls.map { $0.path }
     }
     func clear() { urls = []; Prefs.recentFolders = [] }
@@ -428,22 +558,142 @@ final class DirectoryWatcher {
     deinit { if let s = stream { FSEventStreamStop(s); FSEventStreamInvalidate(s); FSEventStreamRelease(s) } }
 }
 
-// MARK: - Undo stack (file operations)
+// Live refresh for NETWORK folders, which FSEvents cannot do: SMB emits no
+// filesystem events, so DirectoryWatcher above is deliberately skipped on network
+// volumes and every window showing a share used to go stale until ⌘R.
+//
+// One shared timer for the whole app, not a timer per Browser. That is the entire
+// reason this is a coordinator: a per-tab repeating timer is how you end up with a
+// dozen of them hammering a dead SMB mount long after the user navigated away, and
+// the failure mode (the app wedging on a share nobody is looking at) is far worse
+// than the staleness it fixes. Here there is exactly one timer, it only exists while
+// the app is active, and it re-derives its targets from the live window list on every
+// tick — so navigating away, switching tabs, minimising, or closing a window stops
+// the polling for free, with nothing to remember to cancel.
+//
+// What it polls: the ACTIVE tab of each visible, non-miniaturised window. A
+// background tab on a slow share is never touched.
+//
+// How it detects change: one stat of the folder's own mtime — a single round-trip,
+// off the main thread. A full reload only happens when that mtime actually moved,
+// because reloading on a timer would fight the user's scroll position and selection
+// for no reason. (An in-place edit of a file doesn't bump the parent's mtime, so that
+// case still needs ⌘R; catching it would mean enumerating the whole folder every few
+// seconds over SMB, which is exactly the cost this design exists to avoid.)
+final class NetworkPollCoordinator {
+    static let shared = NetworkPollCoordinator()
 
-final class UndoStack {
-    static let shared = UndoStack()
-    private var stack: [(desc: String, action: () -> Void)] = []
-    var canUndo: Bool { !stack.isEmpty }
-    var topDescription: String? { stack.last?.desc }
-    func push(_ desc: String, _ action: @escaping () -> Void) {
-        stack.append((desc, action))
-        if stack.count > 50 { stack.removeFirst() }
+    /// Base interval. Long enough that an unattended window costs one stat every few
+    /// seconds, short enough that a file someone else drops in a shared folder shows
+    /// up while you're still looking at the folder.
+    private let interval: TimeInterval = 4
+    /// A stat slower than this means the share is struggling — back off rather than
+    /// queue up more work on a connection that can't keep up.
+    private let slowStatBudget: TimeInterval = 2
+
+    private struct State {
+        var path: String = ""
+        var signature: Date?
+        var strikes = 0
+        var quietUntil: Date?
+        var statInFlight = false
     }
-    func undo() {
-        guard let entry = stack.popLast() else { NSSound.beep(); return }
-        entry.action()
+    private var state: [ObjectIdentifier: State] = [:]
+    private var timer: Timer?
+
+    func start() {
+        let nc = NotificationCenter.default
+        // Polling exists to keep the window you are LOOKING at fresh. When the app
+        // isn't active nobody is looking, so the timer shouldn't exist at all —
+        // this is what guarantees a backgrounded Navigator never touches a share.
+        nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.schedule() }
+        nc.addObserver(forName: NSApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in self?.suspend() }
+        if NSApp.isActive { schedule() }
+    }
+
+    private func schedule() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: interval, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        t.tolerance = 1   // let the OS coalesce this with other timers; 4s ± 1s is fine
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+    private func suspend() { timer?.invalidate(); timer = nil }
+
+    @objc private func tick() {
+        for w in NSApp.windows.compactMap({ $0 as? NavWindow }) where w.isVisible && !w.isMiniaturized {
+            poll(w.model.active)
+        }
+        // Bound the bookkeeping. Entries belong to Browsers that may be long gone
+        // (closed tabs); keeping the map small is cheaper than tracking their deaths.
+        if state.count > 64 { state.removeAll() }
+    }
+
+    private func poll(_ browser: Browser) {
+        guard browser.currentIsNetwork, !browser.isSearching, !browser.isRecents else { return }
+        // busy / stalled / slow are the app's own "this share is not answering right
+        // now" signals. Adding poll traffic on top of a load that is already crawling
+        // makes both slower.
+        guard !browser.busy, !browser.slowNetwork, !browser.networkStalled else { return }
+        let key = ObjectIdentifier(browser)
+        var s = state[key] ?? State()
+        let path = browser.currentURL.path
+        // Navigated to a different folder: adopt the new folder without treating the
+        // change of signature as "the folder changed", which would fire a pointless
+        // reload of a listing that was just loaded.
+        if s.path != path { s = State(path: path); state[key] = s }
+        if s.statInFlight { return }                                  // previous stat still outstanding
+        if let q = s.quietUntil, q > Date() { return }                // backing off
+
+        s.statInFlight = true
+        state[key] = s
+        let dir = browser.currentURL
+        let t0 = Date()
+        DispatchQueue.global(qos: .utility).async { [weak self, weak browser] in
+            // POSIX stat, NOT URL.resourceValues: a URL CACHES its resource values, and
+            // every copy of `currentURL` shares that cache — so the second poll onwards
+            // kept handing back the mtime from the first one and the folder never
+            // appeared to change. (Measured: files added on an SMB share, the shell saw
+            // the new mtime immediately, the poll saw the original value forever.)
+            var st = stat()
+            let mtime: Date? = stat(dir.path, &st) == 0
+                ? Date(timeIntervalSince1970: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9)
+                : nil
+            let elapsed = Date().timeIntervalSince(t0)
+            DispatchQueue.main.async {
+                guard let self, let browser else { return }
+                var s = self.state[key] ?? State(path: dir.path)
+                s.statInFlight = false
+                // The folder moved out from under us while the stat was in flight —
+                // whatever came back describes a folder nobody is looking at.
+                guard s.path == dir.path, browser.currentURL.path == dir.path else {
+                    self.state[key] = s; return
+                }
+                if mtime == nil || elapsed > self.slowStatBudget {
+                    s.strikes += 1
+                    // 15s, 30s, 45s, 60s… capped. An unreachable mount gets a stat a
+                    // minute instead of one every four seconds.
+                    s.quietUntil = Date().addingTimeInterval(min(60, 15 * Double(s.strikes)))
+                    self.state[key] = s
+                    return
+                }
+                s.strikes = 0; s.quietUntil = nil
+                let previous = s.signature
+                s.signature = mtime
+                self.state[key] = s
+                // First successful stat only establishes the baseline — there is
+                // nothing to compare against yet, and reloading here would mean every
+                // arrival at a network folder immediately re-enumerated it.
+                guard let previous, previous != mtime else { return }
+                browser.silentRefresh()
+            }
+        }
     }
 }
+
+// The undo/redo stack itself lives in NavigatorCore.swift — it is pure ordering
+// logic (what invalidates a redo, what a failed half does to the entry) and that is
+// exactly the part worth pinning down with tests.
 
 // Keeps pinned network drives mounted, so a share that dropped (sleep, VPN
 // reconnect, reboot) is simply there when you go to use it — no Finder trip, no
@@ -759,6 +1009,23 @@ struct FileItem: Identifiable, Hashable, Codable {
     var ext: String { isDirectory ? "" : url.pathExtension.lowercased() }
     var baseName: String { (name as NSString).deletingPathExtension }
 
+    /// POSIX owner name, for the Owner column. See FileOwner for why it isn't fetched
+    /// with the rest of the listing's metadata.
+    var owner: String { FileOwner.name(for: url) }
+
+    /// Sort keys for the two columns whose values arrive from Spotlight. Read from
+    /// MetadataCache WITHOUT triggering a lookup — a comparator runs O(n log n) times per
+    /// sort and must not start n² pieces of background work. Browser.sortOrder's setter
+    /// fills the cache first (MetadataCache.prefetch) and re-sorts once it's full, which
+    /// is what makes an unloaded value a transient 0 rather than a permanently wrong one.
+    var durationSortKey: MediaSortKey {
+        MediaSortKey.duration(isDirectory ? nil : MetadataCache.shared.cached(for: url)?.duration, name: name)
+    }
+    var dimensionsSortKey: MediaSortKey {
+        let m = isDirectory ? nil : MetadataCache.shared.cached(for: url)
+        return MediaSortKey.pixelArea(width: m?.width, height: m?.height, name: name)
+    }
+
     static func == (l: FileItem, r: FileItem) -> Bool { l.id == r.id }
     func hash(into h: inout Hasher) { h.combine(id) }
 }
@@ -837,6 +1104,32 @@ func reportFileError(_ summary: String, _ detail: String = "", permissionHint: B
     a.addButton(withTitle: "OK"); a.runModal()
 }
 
+// The "an item with that name already exists" prompt, shared by copy/move/paste and by
+// rename so both speak the same language. Must be called on the main thread; returns
+// nil when the user cancels.
+//
+// `options` is the button set, in order, with Cancel always appended. It varies because
+// not every choice makes sense everywhere: a single-item rename has nothing to Skip
+// past, so it offers Keep Both and Replace only. Rename used to have no prompt at all —
+// it let moveItem fail and reported the raw Cocoa error plus an unrelated Full Disk
+// Access paragraph, which is actively misleading for a plain name clash.
+func askConflictPolicy(_ message: String, informative: String,
+                       options: [ConflictPolicy]) -> ConflictPolicy? {
+    let a = NSAlert()
+    a.messageText = message
+    a.informativeText = informative
+    for o in options {
+        switch o {
+        case .keepBoth: a.addButton(withTitle: "Keep Both")
+        case .replace:  a.addButton(withTitle: "Replace")
+        case .skip:     a.addButton(withTitle: "Skip")
+        }
+    }
+    a.addButton(withTitle: "Cancel")
+    let i = a.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+    return options.indices.contains(i) ? options[i] : nil
+}
+
 // Shared dialogs / actions usable from menus and context menus.
 // Inline rename (Explorer/Finder-style), not a modal dialog: select the row,
 // scroll it into view, and let the Table/Icon/Gallery cell itself swap in
@@ -858,13 +1151,12 @@ func promptComment(_ browser: Browser, _ id: String) {
     if a.runModal() == .alertFirstButtonReturn { browser.setComment(id: id, f.stringValue) }
 }
 func showInfo(_ browser: Browser, _ ids: Set<String>) {
-    guard !ids.isEmpty else { return }
-    if ids.count == 1, let it = browser.items.first(where: { $0.id == ids.first }) {
-        GetInfoController.shared.show(browser, it)
-    } else {
-        let a = NSAlert(); a.messageText = "Get Info"; a.informativeText = browser.infoText(ids)
-        a.addButton(withTitle: "OK"); a.runModal()
-    }
+    // A multi-selection gets the SAME window, in summary mode (combined size, file and
+    // folder counts) — it used to get a three-line NSAlert with no permissions, no
+    // tags and no way to act on anything.
+    let sel = browser.items.filter { ids.contains($0.id) }
+    guard !sel.isEmpty else { return }
+    GetInfoController.shared.show(browser, sel)
 }
 // Google Drive for desktop stamps every synced item with its Drive item ID in
 // this extended attribute. That ID maps to a universal drive.google.com link
@@ -2277,6 +2569,84 @@ func applicationsToOpen(_ url: URL) -> [URL] {
 func openWith(_ urls: [URL], app: URL) {
     NSWorkspace.shared.open(urls, withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
 }
+// MARK: - Custom search range prompts
+
+/// The two custom-range prompts live in an NSAlert accessory view rather than in the
+/// filter Menu itself: a DatePicker (or a text field) inside a SwiftUI Menu on macOS
+/// renders as a menu item you cannot actually type into or open a calendar from.
+private final class RangeBox: ObservableObject {
+    @Published var from: Date
+    @Published var to: Date
+    @Published var fromText: String
+    @Published var toText: String
+    init(from: Date, to: Date, fromText: String = "", toText: String = "") {
+        self.from = from; self.to = to; self.fromText = fromText; self.toText = toText
+    }
+}
+
+/// Whole-day range, inclusive of both ends (SearchDateFilter.custom does the
+/// end-of-day arithmetic). Returns nil if cancelled.
+func promptCustomDateRange(from: Date?, to: Date?) -> (from: Date, to: Date)? {
+    let cal = Calendar.current
+    let box = RangeBox(from: from ?? cal.date(byAdding: .day, value: -7, to: Date()) ?? Date(),
+                       to: to ?? Date())
+    let a = NSAlert()
+    a.messageText = "Custom Date Range"
+    a.informativeText = "Show items modified between these dates, including both days."
+    let host = NSHostingView(rootView: VStack(alignment: .leading, spacing: 8) {
+        DatePicker("From", selection: Binding(get: { box.from }, set: { box.from = $0 }), displayedComponents: .date)
+        DatePicker("To", selection: Binding(get: { box.to }, set: { box.to = $0 }), displayedComponents: .date)
+    }.frame(width: 260))
+    host.frame = NSRect(x: 0, y: 0, width: 260, height: 56)
+    a.accessoryView = host
+    a.addButton(withTitle: "Apply"); a.addButton(withTitle: "Cancel")
+    guard a.runModal() == .alertFirstButtonReturn else { return nil }
+    // Accept the two dates in either order rather than returning an empty range for
+    // what is obviously "between these two days".
+    return box.from <= box.to ? (box.from, box.to) : (box.to, box.from)
+}
+
+/// Custom size bounds in MB, either side may be left blank for "no limit".
+/// Returns nil if cancelled; a bound of nil means unbounded on that side.
+func promptCustomSizeRange(from: Int64?, to: Int64?) -> (from: Int64?, to: Int64?)? {
+    func mbText(_ v: Int64?) -> String {
+        guard let v else { return "" }
+        let mb = Double(v) / Double(SearchSizeFilter.mb)
+        return mb == mb.rounded() ? String(Int(mb)) : String(format: "%.3f", mb)
+    }
+    let box = RangeBox(from: Date(), to: Date(), fromText: mbText(from), toText: mbText(to))
+    let a = NSAlert()
+    a.messageText = "Custom Size Range"
+    a.informativeText = "In megabytes. Leave either box empty for no limit."
+    let host = NSHostingView(rootView: VStack(alignment: .leading, spacing: 8) {
+        HStack {
+            Text("At least").frame(width: 60, alignment: .trailing)
+            TextField("any", text: Binding(get: { box.fromText }, set: { box.fromText = $0 })).frame(width: 90)
+            Text("MB")
+        }
+        HStack {
+            Text("Less than").frame(width: 60, alignment: .trailing)
+            TextField("any", text: Binding(get: { box.toText }, set: { box.toText = $0 })).frame(width: 90)
+            Text("MB")
+        }
+    }.frame(width: 240))
+    host.frame = NSRect(x: 0, y: 0, width: 240, height: 56)
+    a.accessoryView = host
+    a.addButton(withTitle: "Apply"); a.addButton(withTitle: "Cancel")
+    guard a.runModal() == .alertFirstButtonReturn else { return nil }
+    func bytes(_ s: String) -> Int64? {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, let mb = Double(t), mb >= 0 else { return nil }
+        return Int64(mb * Double(SearchSizeFilter.mb))
+    }
+    let lo = bytes(box.fromText), hi = bytes(box.toText)
+    // Both blank is not a filter — refuse rather than arm a "custom" that matches
+    // everything and looks broken.
+    guard lo != nil || hi != nil else { return nil }
+    if let lo, let hi, lo > hi { return (hi, lo) }
+    return (lo, hi)
+}
+
 func chooseApplication() -> URL? {
     let panel = NSOpenPanel()
     panel.message = "Choose an application"
@@ -2631,13 +3001,24 @@ func volumeLocations() -> [SidebarLocation] {
 
 final class Browser: ObservableObject, Identifiable {
     let id = UUID()
-    @Published var currentURL: URL
+    // The one place a folder change is noticed, which is why per-folder view options are
+    // applied here rather than in load(): load() also runs for ⌘R, a Show-Hidden toggle
+    // and an FSEvents refresh, and re-applying settings on those would undo a view change
+    // the user just made in a folder that has nothing saved.
+    @Published var currentURL: URL {
+        didSet {
+            guard oldValue.path != currentURL.path else { return }
+            applyFolderViewOptions()
+            collapsedGroups = collapsedByFolder[currentURL.path] ?? []
+        }
+    }
     // Bumped when cloud availability changes so rows re-read their badge — a
     // refresh alone doesn't do it, since the row's identity (its path) is unchanged.
     @Published var badgeGeneration = 0
     @Published var items: [FileItem] = [] {
         didSet {
             visibleCache = nil
+            prefetchMetadataIfSortingOnIt()
             // A background op (e.g. Remove BG) asked to reveal file(s) once the
             // listing reloads and contains them — select + scroll to them now.
             if !pendingRevealPaths.isEmpty {
@@ -2668,23 +3049,70 @@ final class Browser: ObservableObject, Identifiable {
     @Published var isSearching = false
     @Published var searchThisMac = false
     @Published var searchKind: SearchKind = .any
+    /// Date Modified + Size narrowing, applied identically by both search backends —
+    /// see SearchFilters in NavigatorCore.
+    @Published var searchFilters = SearchFilters()
     @Published var showHidden = false { didSet { Prefs.showHidden = showHidden; load() } }
     @Published var sortOrder: [KeyPathComparator<FileItem>] = [KeyPathComparator(\FileItem.name, order: .forward)] {
         didSet {
             visibleCache = nil
+            prefetchMetadataIfSortingOnIt()
             for f in SortField.allCases {
                 for asc in [true, false] where sortOrder.first == Browser.comparator(for: f, ascending: asc) {
-                    Prefs.sortKey = f.rawValue; Prefs.sortAscending = asc; return
+                    persistViewSetting { Prefs.sortKey = f.rawValue; Prefs.sortAscending = asc }
+                    return
                 }
             }
+            // Sorted by a column SortField cannot name (Ext, the extra dates, Time,
+            // Dimensions, Owner). There has never been a global pref for those, and this
+            // deliberately doesn't add one — but a folder with its own remembered options
+            // still records it, which is the only way "always sort this folder by
+            // Dimensions" can survive navigating away.
+            persistViewSetting {}
         }
     }
-    @Published var groupBy: GroupBy = .none { didSet { Prefs.groupBy = groupBy.rawValue } }
+    @Published var groupBy: GroupBy = .none {
+        didSet {
+            // Titles from the OLD grouping must not survive into the new one. "Folders" is
+            // a group title under both Kind and Size, so collapsing it under one and
+            // switching to the other would arrive already collapsed for no visible reason.
+            //
+            // NOT while applyFolderViewOptions is assigning. On a folder CHANGE that runs
+            // before load(), so groups() still describes the folder we just left: the
+            // prune measured the new folder's remembered titles against the old folder's
+            // items, and collapsedGroups.didSet then wrote that wrong answer into
+            // collapsedByFolder[the new path] — destroying the destination's own state
+            // and carrying the old folder's collapse across. The folder-change hook on
+            // currentURL restores the right set itself, immediately after this.
+            guard !applyingViewOptions else { return }   // persistViewSetting is a no-op then too
+            collapsedGroups = GroupCollapse.pruned(collapsedGroups, toTitles: groups().map(\.title))
+            persistViewSetting { Prefs.groupBy = groupBy.rawValue }
+        }
+    }
     @Published var status: String = ""
     @Published var freeSpace: String = ""
     @Published var isRecents = false
-    @Published var viewMode: ViewMode = .list { didSet { Prefs.viewMode = viewMode.rawValue } }
-    @Published var iconSize: CGFloat = 76 { didSet { Prefs.iconSize = iconSize } }
+    @Published var viewMode: ViewMode = .list { didSet { persistViewSetting { Prefs.viewMode = viewMode.rawValue } } }
+    @Published var iconSize: CGFloat = 76 { didSet { persistViewSetting { Prefs.iconSize = iconSize } } }
+    /// Which Details columns are shown. This is the SINGLE source both the View ▸ Columns
+    /// menu and the header right-click menu read and write; the NSTableColumn `isHidden`
+    /// flags are pushed from here on every reload and never treated as the truth. Two
+    /// menus each holding their own idea of what's visible is precisely the drift that has
+    /// already caused real bugs in this app's menus.
+    @Published var visibleColumns: Set<String> = Set(defaultVisibleColumnIDs) {
+        didSet { persistViewSetting { Prefs.columns = fileColumnIDs.filter { visibleColumns.contains($0) } } }
+    }
+    /// Group titles collapsed in the CURRENT folder. Group headers are always rendered;
+    /// only their contents hide, so there is always something left to click.
+    @Published var collapsedGroups: Set<String> = [] {
+        didSet { collapsedByFolder[currentURL.path] = collapsedGroups.isEmpty ? nil : collapsedGroups }
+    }
+    /// Collapsed groups per folder, so navigating away and back doesn't silently
+    /// re-expand everything. Deliberately in memory and per tab, NOT persisted: a
+    /// collapsed group is a temporary "get this out of my way while I look at the rest",
+    /// not a preference worth surviving a relaunch — and persisting it would need its own
+    /// eviction policy for a value nobody would miss.
+    private var collapsedByFolder: [String: Set<String>] = [:]
     @Published var gridColumns = 1
     @Published var keyboardScrollID: String?
     @Published var busy = false
@@ -2708,11 +3136,10 @@ final class Browser: ObservableObject, Identifiable {
         currentURL = start
         pathText = googleDrivePortablePath(start) ?? start.path
         showHidden = Prefs.showHidden
-        viewMode = ViewMode(rawValue: Prefs.viewMode) ?? .list
-        if viewMode == .column { viewMode = .list }   // column view disabled — coerce stale prefs
-        iconSize = Prefs.iconSize
-        groupBy = GroupBy(rawValue: Prefs.groupBy) ?? .none
-        sortOrder = [Browser.comparator(for: SortField(rawValue: Prefs.sortKey) ?? .name, ascending: Prefs.sortAscending)]
+        // Swift doesn't run a property's didSet for an assignment made in init, so the
+        // folder-options hook on currentURL above never fires for the very first folder —
+        // this call is that hook, not a duplicate of it.
+        applyFolderViewOptions()
         load()
         // A pinned drive came back on its own: if this window was sitting on a folder
         // that's now reachable again, just load it — the user shouldn't have to retry.
@@ -2742,8 +3169,163 @@ final class Browser: ObservableObject, Identifiable {
     var currentAscending: Bool { sortOrder.first?.order == .forward }
     func setSort(_ f: SortField, ascending: Bool) { sortOrder = [Browser.comparator(for: f, ascending: ascending)] }
 
+    // MARK: Per-folder view options (⌘J)
+
+    /// Comparator for a Details COLUMN id ("name", "dimensions", "owner", …).
+    ///
+    /// Per-folder options store the column id rather than a SortField, because a folder
+    /// sorted by Dimensions or Owner has to come back sorted that way and SortField only
+    /// names the four the toolbar Sort menu offers. Falls back to Name so a saved id whose
+    /// column no longer exists can't leave a folder unsorted.
+    static func comparator(forColumn id: String, ascending: Bool) -> KeyPathComparator<FileItem> {
+        fileColumnDefs.first { $0.id == id }?.comparator?(ascending)
+            ?? comparator(for: .name, ascending: ascending)
+    }
+    /// The column id the current sort corresponds to — the inverse of the above, and what
+    /// gets written into a folder's record.
+    var currentSortColumn: String {
+        guard let cur = sortOrder.first else { return "name" }
+        for def in fileColumnDefs {
+            guard let make = def.comparator else { continue }
+            if cur == make(true) || cur == make(false) { return def.id }
+        }
+        return "name"
+    }
+
+    /// The global defaults: what a folder with nothing saved looks like. Every value comes
+    /// from the same Prefs keys the app has always read, so this is today's behaviour
+    /// expressed as a record — which is what makes an untouched folder identical.
+    static var defaultViewOptions: ViewOptions {
+        ViewOptions(viewMode: Prefs.viewMode, iconSize: Double(Prefs.iconSize),
+                    sortKey: Prefs.sortKey, sortAscending: Prefs.sortAscending,
+                    groupBy: Prefs.groupBy,
+                    columns: Prefs.columns ?? defaultVisibleColumnIDs)
+    }
+    /// This browser's current arrangement, in the form the ⌘J panel shows and a folder
+    /// record stores.
+    var currentViewOptions: ViewOptions {
+        ViewOptions(viewMode: viewMode.rawValue, iconSize: Double(iconSize),
+                    sortKey: currentSortColumn, sortAscending: currentAscending,
+                    groupBy: groupBy.rawValue,
+                    columns: fileColumnIDs.filter { visibleColumns.contains($0) })
+    }
+
+    /// True while applyFolderViewOptions is assigning, so the didSet on each property
+    /// doesn't echo what we just applied straight back into storage. Without this, opening
+    /// a folder that remembers "Icons" would immediately rewrite the GLOBAL default to
+    /// Icons — one visit to one customized folder would silently change every other
+    /// folder in the app.
+    private var applyingViewOptions = false
+
+    /// Where a view change lands.
+    ///
+    /// • Folder with its own remembered options (⌘J → "Always open this folder…") → that
+    ///   folder's record, and nothing global moves.
+    /// • Every other folder → `global()`, exactly as before any of this existed. That
+    ///   branch is why anyone who never opens ⌘J sees no change whatsoever: view mode,
+    ///   sort and grouping still carry from folder to folder the way they always have.
+    private func persistViewSetting(_ global: () -> Void) {
+        guard !applyingViewOptions else { return }
+        if FolderViewOptionsStore.shared.contains(currentURL.path) {
+            FolderViewOptionsStore.shared.save(currentViewOptions, for: currentURL.path)
+        } else {
+            global()
+        }
+    }
+
+    /// Apply whatever governs the folder we're now in: its own options if it has any,
+    /// otherwise the global defaults.
+    func applyFolderViewOptions() {
+        let path = currentURL.path
+        let store = FolderViewOptionsStore.shared
+        let o = store.options(for: path) ?? Browser.defaultViewOptions
+        store.markUsed(path)              // recency by use, so the cap evicts the right folder
+        applyingViewOptions = true
+        // A saved "column" from the removed Columns view no longer parses, so it falls
+        // back to Details here for free — no coercion step needed.
+        viewMode = ViewMode(rawValue: o.viewMode) ?? .list
+        iconSize = max(Browser.minIconSize, min(Browser.maxIconSize, CGFloat(o.iconSize)))
+        groupBy = GroupBy(rawValue: o.groupBy) ?? .none
+        sortOrder = [Browser.comparator(forColumn: o.sortKey, ascending: o.sortAscending)]
+        visibleColumns = Set(o.columns.isEmpty ? defaultVisibleColumnIDs : o.columns)
+        applyingViewOptions = false
+    }
+
+    var remembersViewOptions: Bool { FolderViewOptionsStore.shared.contains(currentURL.path) }
+
+    /// The ⌘J panel's "Always open this folder with these options" switch. Turning it on
+    /// snapshots what's on screen right now (so nothing visibly changes); turning it off
+    /// drops the record and re-applies the global defaults, which is Finder's
+    /// revert-to-defaults.
+    func setRemembersViewOptions(_ on: Bool) {
+        if on {
+            FolderViewOptionsStore.shared.save(currentViewOptions, for: currentURL.path)
+            objectWillChange.send()
+        } else {
+            FolderViewOptionsStore.shared.forget(currentURL.path)
+            applyFolderViewOptions()
+            // groupBy's own prune is suppressed while applyFolderViewOptions assigns (see
+            // there). We're still in the SAME folder, so groups() describes what's on
+            // screen and the prune is both safe and needed — otherwise reverting to a
+            // different Group By leaves titles collapsed that the new grouping never had.
+            collapsedGroups = GroupCollapse.pruned(collapsedGroups, toTitles: groups().map(\.title))
+        }
+    }
+    /// "Use as Defaults": what's on screen becomes the global default, i.e. what every
+    /// folder with no saved options of its own will show from now on.
+    func useCurrentViewOptionsAsDefaults() {
+        let o = currentViewOptions
+        Prefs.viewMode = o.viewMode
+        Prefs.iconSize = CGFloat(o.iconSize)
+        Prefs.groupBy = o.groupBy
+        Prefs.columns = o.columns
+        // Prefs.sortKey only understands the four SortField columns. Sorting by Ext,
+        // Dimensions or Owner is per-folder-only, so a global default is simply left
+        // alone rather than written as something SettingsView's picker can't display.
+        if let f = SortField(rawValue: o.sortKey) {
+            Prefs.sortKey = f.rawValue
+            Prefs.sortAscending = o.sortAscending
+        }
+        objectWillChange.send()
+    }
+
+    // MARK: Collapsible group headers
+
+    func toggleGroupCollapsed(_ title: String) {
+        collapsedGroups = GroupCollapse.toggled(collapsedGroups, title: title)
+        // A collapsed group can swallow the selection. Dropping anything now hidden is
+        // what stops Return/Delete from acting on a file the user can't see.
+        let visible = Set(orderedVisibleItems().map(\.id))
+        let survivors = selection.intersection(visible)
+        if survivors != selection { selection = survivors; updateStatus() }
+    }
+    func isGroupCollapsed(_ title: String) -> Bool {
+        GroupCollapse.canCollapse(title: title) && collapsedGroups.contains(title)
+    }
+
+    /// Fill the metadata cache and re-sort, when (and only when) the sort is on a column
+    /// whose values come from Spotlight. Without this, sorting by Time or Dimensions ranks
+    /// every not-yet-drawn row as unknown and then never corrects itself.
+    private func prefetchMetadataIfSortingOnIt() {
+        // Called both when the sort changes AND when a listing arrives. The listing hook is
+        // the one that matters for a folder that REMEMBERS a Time/Dimensions sort: the sort
+        // is applied while `items` is still empty, so without it that folder would come
+        // back in name order and never correct itself.
+        guard fileColumnNeedsMetadata(currentSortColumn) else { return }
+        let urls = items.filter { !$0.isDirectory }.map(\.url)
+        guard !urls.isEmpty else { return }
+        let gen = loadGeneration
+        MetadataCache.shared.prefetch(urls) { [weak self] in
+            // A different folder loaded while Spotlight was answering — re-sorting now
+            // would sort the new folder against the old folder's reason for sorting.
+            guard let self, gen == self.loadGeneration else { return }
+            self.visibleCache = nil
+            self.objectWillChange.send()
+        }
+    }
+
     // ⌘ + scroll wheel changes the view size, Windows 11-style: a continuum from
-    // Details → Columns → Icons, and within Icons a smooth resize (small → extra
+    // Details → Icons → Gallery, and within Icons a smooth resize (small → extra
     // large). Icon sizing is continuous (real-time micro-adjustments); crossing a
     // view boundary needs a bit of accumulated scroll so one flick doesn't skip
     // through everything. dy > 0 = larger. minIcon 44 ≈ "small", 256 ≈ "extra large".
@@ -2751,7 +3333,7 @@ final class Browser: ObservableObject, Identifiable {
     static let maxIconSize: CGFloat = 256
     private var scrollAccum: CGFloat = 0
     func adjustViewScale(_ dy: CGFloat) {
-        // Column view is disabled — cycle is Details ↔ Icons(small→large) ↔ Gallery.
+        // The cycle is Details ↔ Icons (small→large) ↔ Gallery.
         if viewMode == .icon {
             let proposed = iconSize + dy * 1.4
             if proposed < Browser.minIconSize {          // shrinking past the smallest icons → Details
@@ -2927,7 +3509,16 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
     // Flat order matching what the user sees (used for keyboard navigation).
-    func orderedVisibleItems() -> [FileItem] { groupBy == .none ? visibleItems() : groups().flatMap { $0.items } }
+    //
+    // "What the user sees" now excludes the contents of a collapsed group, and that is
+    // load-bearing rather than cosmetic: arrow keys, Tab/⇧Tab, type-to-select, ⇧-click
+    // ranges and Select All all walk this list, so leaving hidden items in it means Tab
+    // selects a file that isn't on screen — the status bar updates and Return opens
+    // something invisible, with nothing to explain it.
+    func orderedVisibleItems() -> [FileItem] {
+        guard groupBy != .none else { return visibleItems() }
+        return GroupCollapse.visibleOrder(groups: groups(), collapsed: collapsedGroups)
+    }
 
     // Spotlight-backed Recents (recently used/modified files), like Finder's Recents.
     // Recents = the folders you've actually worked in: every folder you've
@@ -2980,7 +3571,10 @@ final class Browser: ObservableObject, Identifiable {
     // Spotlight search within the current folder subtree (name + content).
     func runSearch() {
         let query = searchText.trimmingCharacters(in: .whitespaces)
-        guard !query.isEmpty else { clearSearch(); return }
+        // A Date/Size filter on its own IS a search ("everything modified today"), which
+        // is how Explorer and Finder both behave. Only a search with no text AND no
+        // filter is nothing at all.
+        guard !query.isEmpty || searchFilters.isActive else { clearSearch(); return }
         isSearching = true
         dirWatcher.stop()
         selection = []
@@ -2997,12 +3591,59 @@ final class Browser: ObservableObject, Identifiable {
             walkSearch(query, root: currentURL, gen: searchGen)
         }
     }
+    /// Combines metadata subpredicates, unwrapping the single-element case.
+    ///
+    /// This is not tidiness — it is the fix for a search that did not work at all.
+    /// NSMetadataQuery RAISES on a compound predicate holding only one subpredicate
+    /// ("NSAndPredicateType NSCompoundPredicate with wrong number (1) of subpredicates
+    /// given to NSMetadataQuery", caught in the log). "This Mac" with Kind = Any and no
+    /// Date/Size filter builds exactly one subpredicate — the name match — so the
+    /// commonest possible Spotlight search threw inside menu tracking and silently
+    /// returned nothing. It only ever appeared to work when a second filter happened to
+    /// be set.
+    static func metadataCompound(_ subs: [NSPredicate], and: Bool) -> NSPredicate? {
+        switch subs.count {
+        case 0: return nil
+        case 1: return subs[0]
+        default: return and ? NSCompoundPredicate(andPredicateWithSubpredicates: subs)
+                            : NSCompoundPredicate(orPredicateWithSubpredicates: subs)
+        }
+    }
     private func runSpotlight(_ query: String) {
         let q = NSMetadataQuery()
         q.searchScopes = searchThisMac ? [NSMetadataQueryLocalComputerScope] : [currentURL]
-        var subs = [NSPredicate(format: "kMDItemDisplayName LIKE[cd] %@ OR kMDItemTextContent CONTAINS[cd] %@", "*\(query)*", query)]
+        var subs: [NSPredicate] = []
+        if !query.isEmpty {
+            subs.append(NSPredicate(format: "kMDItemDisplayName LIKE[cd] %@ OR kMDItemTextContent CONTAINS[cd] %@", "*\(query)*", query))
+        }
         if let tree = searchKind.typeTree { subs.append(NSPredicate(format: "kMDItemContentTypeTree == %@", tree)) }
-        q.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: subs)
+        // Date/Size go into the PREDICATE as well as the post-hoc check in
+        // searchGathered, purely so the 500-result cap is spent on rows that can
+        // actually match — filtering after the cap would drop real hits. The post-hoc
+        // check is still the authority (a stale Spotlight index can disagree with disk).
+        let dates = searchFilters.dateRange()
+        if let f = dates.from { subs.append(NSPredicate(format: "kMDItemFSContentChangeDate >= %@", f as NSDate)) }
+        if let t = dates.to { subs.append(NSPredicate(format: "kMDItemFSContentChangeDate < %@", t as NSDate)) }
+        let sizes = searchFilters.sizeRange()
+        if sizes.from != nil || sizes.to != nil {
+            var sizeSubs: [NSPredicate] = []
+            if let f = sizes.from { sizeSubs.append(NSPredicate(format: "kMDItemFSSize >= %lld", f)) }
+            if let t = sizes.to { sizeSubs.append(NSPredicate(format: "kMDItemFSSize < %lld", t)) }
+            // OR'd with "is a folder", because kMDItemFSSize on a directory is its
+            // directory entry, not its contents. Without this the two backends would
+            // disagree: SearchFilters exempts folders from the size test, so a folder
+            // Spotlight had already thrown away would still show up in walkSearch.
+            if let sizeClause = Browser.metadataCompound(sizeSubs, and: true) {
+                subs.append(NSCompoundPredicate(orPredicateWithSubpredicates: [
+                    sizeClause,
+                    NSPredicate(format: "kMDItemContentTypeTree == %@", "public.folder"),
+                ]))
+            }
+        }
+        // runSearch has already guaranteed there is at least text or a filter, so subs
+        // is never empty and this is never nil.
+        guard let predicate = Browser.metadataCompound(subs, and: true) else { return }
+        q.predicate = predicate
         q.sortDescriptors = [NSSortDescriptor(key: "kMDItemFSName", ascending: true)]
         NotificationCenter.default.addObserver(self, selector: #selector(searchGathered(_:)),
                                                name: .NSMetadataQueryDidFinishGathering, object: q)
@@ -3018,6 +3659,11 @@ final class Browser: ObservableObject, Identifiable {
         let extQ = q.trimmingCharacters(in: CharacterSet(charactersIn: "*."))
         let kindTree = searchKind.typeTree   // optional kind constraint (Images, etc.)
         let showHidden = self.showHidden
+        // Snapshot the filters (and "now") once, off the main thread's back: a walk of a
+        // big tree can straddle midnight, and re-deriving "Today" per file would then
+        // change the answer halfway through the results.
+        let filters = self.searchFilters
+        let now = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let keys = Browser.itemKeys
             var opts: FileManager.DirectoryEnumerationOptions = []
@@ -3040,8 +3686,14 @@ final class Browser: ObservableObject, Identifiable {
                 if kindTree != nil {   // kind filter set → require a matching content type
                     if !(UTType(filenameExtension: ext)?.conforms(to: UTType(kindTree!) ?? .data) ?? false) { continue }
                 }
-                guard name.contains(q) || (!extQ.isEmpty && ext == extQ) else { continue }
-                batch.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                // Empty query = filter-only search, so every name qualifies.
+                if !q.isEmpty {
+                    guard name.contains(q) || (!extQ.isEmpty && ext == extQ) else { continue }
+                }
+                let item = Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys)))
+                guard filters.matches(modified: item.modified, size: item.size,
+                                      isDirectory: item.isDirectory, now: now) else { continue }
+                batch.append(item)
                 total += 1
                 if batch.count >= 40 { flush(final: false) }
                 if total >= 10_000 { break }   // sanity cap on huge trees
@@ -3050,14 +3702,28 @@ final class Browser: ObservableObject, Identifiable {
         }
     }
     @objc private func searchGathered(_ note: Notification) {
-        guard let q = searchQuery else { return }
+        // Take the query from the NOTIFICATION, and ignore it unless it is still the
+        // current one. Reading `searchQuery` instead was a live bug: changing two
+        // filters at once starts two queries in the same frame, and when the FIRST
+        // one finished gathering this handler read results from the SECOND (which had
+        // gathered nothing yet), published an empty list, and then stopped it — so the
+        // real results never arrived and the search looked like it found nothing.
+        guard let q = note.object as? NSMetadataQuery, q === searchQuery else { return }
         q.disableUpdates()
         var result: [FileItem] = []
         let n = min(q.resultCount, 500)
+        let now = Date()
         for i in 0..<n {
             guard let mi = q.result(at: i) as? NSMetadataItem,
                   let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-            result.append(makeItem(URL(fileURLWithPath: path)))
+            let item = makeItem(URL(fileURLWithPath: path))
+            // Re-check against the SAME predicate walkSearch uses. Spotlight's index can
+            // lag the disk (a file saved seconds ago still carries its old size there),
+            // and a filter that means one thing on the Spotlight path and another on the
+            // recursive path is worse than no filter at all.
+            guard searchFilters.matches(modified: item.modified, size: item.size,
+                                        isDirectory: item.isDirectory, now: now) else { continue }
+            result.append(item)
         }
         items = result
         updateStatus()
@@ -3065,10 +3731,30 @@ final class Browser: ObservableObject, Identifiable {
         NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
         searchQuery = nil
     }
+    /// This tab's window is gone — stop everything that would otherwise keep running.
+    ///
+    /// A closed NavWindow does NOT deallocate: it is `isReleasedWhenClosed = false` (and
+    /// must stay that way — flipping it crashes in _NSWindowTransformAnimation dealloc,
+    /// measured), and AppKit still holds it after the app drops its own reference. So
+    /// without this, every window you closed left an FSEvents stream watching a folder
+    /// and a live Spotlight query answering notifications for the rest of the session.
+    /// Called from AppModel.forgetSession, which is the one "this window is finished"
+    /// signal — deliberately NOT on quit, where the process is going away anyway.
+    func stopWatching() {
+        dirWatcher.stop()
+        recentsQuery?.stop(); recentsQuery = nil
+        searchQuery?.stop(); searchQuery = nil
+        searchGen += 1   // cancel any in-flight recursive walk
+        loadGeneration += 1   // and any in-flight listing, so it can't restart the watcher
+    }
+
     func clearSearch() {
         searchQuery?.stop(); searchQuery = nil
         searchGen += 1   // cancel any in-flight recursive walk
         searchText = ""; isSearching = false
+        // Filters go too. A filter left armed after the search is closed is invisible
+        // state that silently narrows the NEXT search for no reason the user can see.
+        searchFilters = SearchFilters()
         load()
     }
 
@@ -3085,9 +3771,18 @@ final class Browser: ObservableObject, Identifiable {
     // when its contents change on disk (e.g. a download finishes, another app
     // adds a file). Preserves selection; no "Loading…" flash.
     private lazy var dirWatcher = DirectoryWatcher { [weak self] in self?.silentRefresh() }
+    /// Re-reads the current folder in place: same items array, so selection survives
+    /// (filtered to what still exists) and the table/grid keeps its scroll offset,
+    /// because every row's identity is its path and only the changed rows differ.
+    ///
+    /// Network folders reach this from NetworkPollCoordinator rather than FSEvents —
+    /// SMB emits no FSEvents at all. They also refresh the PERSISTED cache, or the
+    /// next visit's mtime revalidation would compare against a stale stored mtime and
+    /// throw away the listing we just paid for.
     func silentRefresh() {
-        guard !isSearching, !isRecents, !currentIsNetwork else { return }
+        guard !isSearching, !isRecents else { return }
         let dir = currentURL, sh = showHidden
+        let isNet = currentIsNetwork
         let cacheKey = dir.path + (sh ? "\u{1}h" : "")
         loadGeneration += 1
         let gen = loadGeneration
@@ -3102,9 +3797,19 @@ final class Browser: ObservableObject, Identifiable {
                 result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
             }
             let final = result
+            // stat(), not resourceValues — a URL caches those, so the value stored
+            // alongside the cached listing would be the mtime from an earlier read.
+            var dst = stat()
+            let mtime: Date? = (isNet && stat(dir.path, &dst) == 0)
+                ? Date(timeIntervalSince1970: Double(dst.st_mtimespec.tv_sec) + Double(dst.st_mtimespec.tv_nsec) / 1e9)
+                : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
+                // A share that went away mid-read enumerates as empty. Replacing a good
+                // listing with nothing looks exactly like "someone deleted everything".
+                if final.isEmpty, isNet, !self.items.isEmpty { return }
                 Browser.dirCache[cacheKey] = final
+                if isNet, !final.isEmpty { DiskCache.put(cacheKey, final, dirModified: mtime) }
                 self.items = final
                 self.selection = self.selection.filter { sel in final.contains { $0.id == sel } }
                 self.updateStatus()
@@ -3133,6 +3838,9 @@ final class Browser: ObservableObject, Identifiable {
         networkStalled = false
         pathText = addressString(for: currentURL)
         selection = []
+        // Arriving in the Trash: read Finder's put-back records so Put Back knows
+        // where items trashed by other apps came from.
+        if isTrash { loadTrashPutBack() }
         let dir = currentURL
         loadGeneration += 1
         let gen = loadGeneration
@@ -3157,9 +3865,18 @@ final class Browser: ObservableObject, Identifiable {
         // mount, so never on the main thread.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self, gen == self.loadGeneration else { return }
-            let rv = try? dir.resourceValues(forKeys: [.volumeIsLocalKey, .contentModificationDateKey])
+            let rv = try? dir.resourceValues(forKeys: [.volumeIsLocalKey])
             let isNetwork = rv?.volumeIsLocal == false
-            let dirMtime = rv?.contentModificationDate
+            // The folder's mtime comes from POSIX stat, NOT from resourceValues.
+            // resourceValues is cached — measured on an SMB share: 46 files were added
+            // and `stat` in a shell saw the new folder mtime immediately, while
+            // .contentModificationDateKey kept returning the mtime from before they
+            // existed. Feeding that into the revalidation below said "nothing changed"
+            // and served the stale cached listing until the 15-minute TTL expired.
+            var dst = stat()
+            let dirMtime: Date? = stat(dir.path, &dst) == 0
+                ? Date(timeIntervalSince1970: Double(dst.st_mtimespec.tv_sec) + Double(dst.st_mtimespec.tv_nsec) / 1e9)
+                : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
                 self.currentIsNetwork = isNetwork
@@ -3420,6 +4137,20 @@ final class Browser: ObservableObject, Identifiable {
         let item = list[idx]
         selection = [item.id]; keyboardScrollID = item.id; updateStatus()
     }
+    /// Tab / ⇧Tab move the selection one item along the CURRENT visible order.
+    ///
+    /// Deliberately not routed through moveSelection: that one is grid geometry
+    /// (it multiplies dy by gridColumns and CLAMPS at both ends), which is right
+    /// for arrow keys in icon view and wrong here — Tab is a flat walk of the
+    /// sorted/grouped list that has to wrap, and it has to behave identically in
+    /// list and gallery view where there is no meaningful column count.
+    func cycleSelection(_ delta: Int) {
+        let list = orderedVisibleItems()
+        let cur = selection.first.flatMap { id in list.firstIndex { $0.id == id } }
+        guard let idx = cycledSelectionIndex(from: cur, delta: delta, count: list.count) else { return }
+        let item = list[idx]
+        selection = [item.id]; keyboardScrollID = item.id; updateStatus()
+    }
     func typeSelect(_ s: String) {
         let now = Date()
         if now.timeIntervalSince(lastTypeAt) > 0.8 { typeBuffer = "" }
@@ -3659,13 +4390,58 @@ final class Browser: ObservableObject, Identifiable {
         else { NSWorkspace.shared.activateFileViewerSelecting(urls) }
     }
     func copyPath(_ ids: Set<String>) {
-        let paths = items.filter { ids.contains($0.id) }.map { $0.url.path }
-        let text = paths.isEmpty ? currentURL.path : paths.joined(separator: "\n")
-        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+        copyToClipboard(pathStrings(ids).joined(separator: "\n"))
+    }
+
+    /// The URLs behind an id set, in listing order.
+    func urls(_ ids: Set<String>) -> [URL] { items.filter { ids.contains($0.id) }.map { $0.url } }
+
+    /// Paths for a "Copy …" item, falling back to the CURRENT FOLDER when nothing is
+    /// selected — that's what the blank-area menu means by "copy the path", and every
+    /// copy variant has to agree on it or they contradict each other on an empty click.
+    private func pathStrings(_ ids: Set<String>) -> [String] {
+        let paths = urls(ids).map { $0.path }
+        return paths.isEmpty ? [currentURL.path] : paths
+    }
+
+    /// One place that touches the pasteboard for text, so the half-dozen "Copy …"
+    /// items can't drift into forgetting clearContents() (which silently appends to
+    /// whatever was there instead of replacing it).
+    func copyToClipboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    // The quoting/escaping rules themselves live in NavigatorCore's PathText (tested
+    // there); these just decide WHAT to hand them.
+    func copyQuotedPath(_ ids: Set<String>) { copyToClipboard(PathText.quoted(pathStrings(ids))) }
+    func copyFileURL(_ ids: Set<String>) { copyToClipboard(PathText.fileURLs(pathStrings(ids))) }
+    func copyParentPath(_ ids: Set<String>) {
+        let parents = urls(ids).map { $0.deletingLastPathComponent().path }
+        copyToClipboard((parents.isEmpty ? [currentURL.deletingLastPathComponent().path] : parents)
+                            .joined(separator: "\n"))
+    }
+    func copyNameWithoutExtension(_ ids: Set<String>) {
+        let names = items.filter { ids.contains($0.id) }.map { $0.name }
+        copyToClipboard(PathText.namesWithoutExtension(names.isEmpty ? [currentURL.lastPathComponent] : names))
+    }
+    func copyMarkdownLink(_ ids: Set<String>) {
+        let sel = items.filter { ids.contains($0.id) }.map { (name: $0.name, path: $0.url.path) }
+        copyToClipboard(PathText.markdownLinks(sel.isEmpty
+            ? [(name: currentURL.lastPathComponent, path: currentURL.path)] : sel))
     }
 
     // Refresh the listing and, once it reloads with the file(s) present, select +
     // scroll to them (used to highlight just-produced "_rmbg" results).
+    /// Show `url` selected IN Navigator, navigating to its folder first if we aren't
+    /// already there. Finder's "Reveal Original" hands you off to Finder; doing that
+    /// from a file manager is an odd thing to do, so this stays in the app.
+    func revealInApp(_ url: URL) {
+        let dir = url.deletingLastPathComponent()
+        pendingRevealPaths = [url.path]
+        if currentURL.standardizedFileURL.path == dir.standardizedFileURL.path { refresh() }
+        else { navigate(to: dir) }
+    }
     func refreshAndReveal(_ url: URL) { refreshAndReveal([url]) }
     func refreshAndReveal(_ urls: [URL]) {
         pendingRevealPaths = urls.map { $0.path }
@@ -3939,7 +4715,51 @@ final class Browser: ObservableObject, Identifiable {
         guard !names.isEmpty else { return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(names.joined(separator: "\n"), forType: .string)
     }
+    // Undo/redo for any operation whose result is a set of NEW items — New Folder,
+    // New Text File, Duplicate, drag-Copy, Compress, Extract, aliases, symlinks.
+    // Undo bins them and redo restores those exact items from the Trash, so anything
+    // the user put inside a new folder before pressing ⌘Z survives the round trip.
+    func pushCreation(_ desc: String, _ created: [URL]) {
+        var restores: [(from: URL, to: URL)] = []
+        UndoStack.shared.push(desc, undo: { [weak self] in
+            let r = trashItems(created)
+            restores = r.restores
+            self?.load()
+            return r.problem
+        }, redo: { [weak self] in
+            let problem = restoreItems(restores)
+            self?.load()
+            return problem
+        })
+    }
+
+    // Tags are an xattr, not a file, so writing a snapshot back IS the whole undo and
+    // the whole redo — the two halves are the same call with a different snapshot.
+    private func pushTags(_ before: [(URL, [String])], _ after: [(URL, [String])]) {
+        let apply: ([(URL, [String])]) -> UndoAction = { snapshot in
+            { [weak self] in
+                // setxattr on a vanished file fails mutely, so check first: otherwise
+                // undoing a tag on a file that Finder deleted looks like it worked.
+                var missing: [String] = []
+                for (u, tags) in snapshot {
+                    guard FileManager.default.fileExists(atPath: u.path) else {
+                        missing.append("• \(u.lastPathComponent)"); continue
+                    }
+                    Browser.writeTags(u, tags)
+                }
+                self?.load()
+                return missing.isEmpty ? nil
+                     : "These items are no longer where they were:\n" + missing.prefix(5).joined(separator: "\n")
+            }
+        }
+        UndoStack.shared.push("Tag", undo: apply(before), redo: apply(after))
+    }
+
     func moveToTrash(_ ids: Set<String>) {
+        // Already in the Trash — trashItem would either fail or shuffle the item
+        // around inside the Trash. The Trash view offers Delete Immediately instead,
+        // which is destructive and must be an explicit choice, never what ⌘⌫ does.
+        guard !isTrash else { NSSound.beep(); return }
         let urls = items.filter { ids.contains($0.id) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
         if Prefs.confirmTrash {
@@ -3950,19 +4770,34 @@ final class Browser: ObservableObject, Identifiable {
             a.addButton(withTitle: "Move to Trash"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
-        var restores: [(trash: URL, original: URL)] = []
+        var restores: [(from: URL, to: URL)] = []   // where it landed in the Trash → where it came from
         var failures: [(url: URL, reason: String)] = []
         for u in urls {
             var out: NSURL?
-            do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((t, u)) } }
+            do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((from: t, to: u)) } }
             catch { failures.append((u, error.localizedDescription)) }
         }
         if !restores.isEmpty {
+            TrashOrigins.record(restores)   // powers Put Back in the Trash view; see trashItems()
             RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Move to Trash") { [weak self] in
-                for r in restores { try? FileManager.default.moveItem(at: r.trash, to: r.original) }
+            UndoStack.shared.push("Move to Trash", undo: { [weak self] in
+                let problem = restoreItems(restores)
+                // The items are out of the Trash again, so their origin records name
+                // paths that no longer exist. Left behind they would be handed to the
+                // next thing that lands on the same Trash path (same name, same
+                // collision suffix) as ITS origin — a Put Back to the wrong folder.
+                TrashOrigins.forget(restores.map { $0.from.path })
                 self?.load()
-            }
+                return problem
+            }, redo: { [weak self] in
+                // Re-trashing lands at a DIFFERENT path each round (the Trash renames
+                // collisions), so the undo half has to be re-pointed at where the items
+                // actually went this time.
+                let r = trashItems(restores.map { $0.to })
+                restores = r.restores
+                self?.load()
+                return r.problem
+            })
         }
         // Surface failures instead of silently doing nothing (e.g. protected
         // folders like ~/Pictures need Full Disk Access to trash).
@@ -3985,24 +4820,87 @@ final class Browser: ObservableObject, Identifiable {
         do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
         catch { reportFileError("Couldn't create the folder", error.localizedDescription); return }
         RecentFolders.shared.record(currentURL)
-        UndoStack.shared.push("New Folder") { [weak self] in
-            try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
-        }
+        pushCreation("New Folder", [target])
         // Reveal it selected and immediately ready to type a name, like Explorer/Finder.
         pendingRevealPaths = [target.path]
         pendingRenamePath = target.path
         load()
     }
-    func newTextFile() {
-        let target = uniqueDest(currentURL, "New Text File.txt")
-        guard fm.createFile(atPath: target.path, contents: Data()) else {
-            reportFileError("Couldn't create the text file",
+    func newTextFile() { newEmptyFile("New Text File.txt", Data(), desc: "New Text File") }
+
+    // .rtf rather than a Word format: an RTF document opens in TextEdit on a stock
+    // Mac, so this can never produce a file the machine has nothing to open it with.
+    // The header is the minimum RTF a reader will accept — a zero-byte .rtf makes
+    // TextEdit report a corrupt file.
+    func newRichTextFile() {
+        let rtf = Data("{\\rtf1\\ansi\\ansicpg1252\\cocoartf2818\n{\\fonttbl}\n}\n".utf8)
+        newEmptyFile("New Rich Text.rtf", rtf, desc: "New Rich Text Document")
+    }
+
+    private func newEmptyFile(_ name: String, _ contents: Data, desc: String) {
+        let target = uniqueDest(currentURL, name)
+        guard fm.createFile(atPath: target.path, contents: contents) else {
+            reportFileError("Couldn't create “\(name)”",
                             "Navigator couldn't write to “\(currentURL.lastPathComponent)”."); return
         }
         RecentFolders.shared.record(currentURL)
-        UndoStack.shared.push("New Text File") { [weak self] in
-            try? FileManager.default.trashItem(at: target, resultingItemURL: nil); self?.load()
+        pushCreation(desc, [target])
+        load()
+    }
+
+    // Finder's "New Folder with Selection": make a folder here and move the selected
+    // items into it.
+    //
+    // The moves are done inline rather than through performTransfer, and that's the
+    // point: every source is already IN this folder, so each move is a same-directory
+    // rename — instant, and impossible to collide inside a folder created empty a line
+    // earlier. That also lets undo be ONE step (put the items back AND remove the
+    // folder we made); handing the moves to performTransfer would push its own "Move"
+    // entry and leave an orphaned empty folder behind after a single ⌘Z.
+    func newFolderWithSelection(_ ids: Set<String>) {
+        let sources = urls(ids)
+        guard !sources.isEmpty else { NSSound.beep(); return }
+        let dir = currentURL
+        let target = uniqueDest(dir, sources.count == 1 ? "New Folder With Item" : "New Folder With Items")
+        do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
+        catch { reportFileError("Couldn't create the folder", error.localizedDescription); return }
+        var moved: [(from: URL, to: URL)] = []
+        var failures: [String] = []
+        for src in sources {
+            let dest = target.appendingPathComponent(src.lastPathComponent)
+            do { try fm.moveItem(at: src, to: dest); moved.append((from: src, to: dest)) }
+            catch { failures.append("• \(src.lastPathComponent): \(error.localizedDescription)") }
         }
+        // Nothing made it in — bin the folder rather than leaving an empty stray behind.
+        if moved.isEmpty {
+            try? fm.removeItem(at: target)
+            reportFileError("Couldn't move the items into a new folder", failures.joined(separator: "\n"))
+            return
+        }
+        if !failures.isEmpty {
+            reportFileError(failures.count == 1 ? "1 item couldn't be moved into the new folder"
+                                                : "\(failures.count) items couldn't be moved into the new folder",
+                            failures.prefix(5).joined(separator: "\n"))
+        }
+        RecentFolders.shared.record(dir)
+        UndoStack.shared.push("New Folder with Selection", undo: { [weak self] in
+            let problem = restoreItems(moved.map { (from: $0.to, to: $0.from) })
+            // Only remove it if it's genuinely empty: the user may have dropped
+            // something else in since, and deleting that would be data loss.
+            if (try? FileManager.default.contentsOfDirectory(atPath: target.path))?.isEmpty == true {
+                try? FileManager.default.removeItem(at: target)
+            }
+            self?.load()
+            return problem
+        }, redo: { [weak self] in
+            try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+            let problem = restoreItems(moved)
+            self?.load()
+            return problem
+        })
+        Browser.invalidateCache(dir.path)
+        pendingRevealPaths = [target.path]
+        pendingRenamePath = target.path
         load()
     }
 
@@ -4099,7 +4997,19 @@ final class Browser: ObservableObject, Identifiable {
         return sameVolume(urls, as: dest)
     }
 
-    func dropIntoCurrentFolder(_ urls: [URL]) {
+    /// Every drop surface in the app funnels through here or `dropInto`, which is why the
+    /// non-file filter lives at these two doors rather than at each of the eight callers.
+    ///
+    /// The app's private drag tokens are URLs that are deliberately NOT files
+    /// (`navreorder:` for a sidebar reorder, `navtab:` for a tab drag), and any
+    /// `.dropDestination(for: URL.self)` in the app will happily hand one over if the user
+    /// releases it in the wrong place. Passed on, it reached performTransfer and raised a
+    /// copy error about a file that never existed. Dropped here, a stray token does
+    /// nothing at all — which is what a missed aim should do.
+    func dropIntoCurrentFolder(_ incoming: [URL]) {
+        let urls = incoming.filter { $0.isFileURL }
+        guard !urls.isEmpty else { return }
+        SpringLoader.shared.noteDrop()
         let dest = currentURL
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let same = Browser.shouldMove(urls, into: dest)
@@ -4114,11 +5024,24 @@ final class Browser: ObservableObject, Identifiable {
     // drop into the current folder: move within a volume, COPY across volumes.
     // These sites used to force move:true, so dragging a file off a network share or
     // Google Drive onto a local folder deleted the original — Finder copies.
-    func dropInto(_ urls: [URL], folder: URL) {
+    func dropInto(_ incoming: [URL], folder: URL) {
+        let urls = incoming.filter { $0.isFileURL }   // see dropIntoCurrentFolder
+        guard !urls.isEmpty else { return }
+        SpringLoader.shared.noteDrop()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let same = Browser.shouldMove(urls, into: folder)
             DispatchQueue.main.async { self?.importURLs(urls, into: folder, move: same) }
         }
+    }
+
+    // "Send To" (Windows Explorer parity): COPY the selection into a well-known folder
+    // or a mounted removable drive. Deliberately routed through the same transfer path
+    // as paste and drag-drop, so name conflicts prompt the same way and ⌘Z undoes it
+    // identically — a private copy loop here would have neither.
+    func sendTo(_ ids: Set<String>, folder: URL) {
+        let sources = urls(ids)
+        guard !sources.isEmpty else { NSSound.beep(); return }
+        importURLs(sources, into: folder, move: false)
     }
 
     // Import (move or copy) dropped items into a target directory (a folder row or another tab).
@@ -4216,20 +5139,15 @@ final class Browser: ObservableObject, Identifiable {
                 var cancel = false
                 let sem = DispatchSemaphore(value: 0)
                 DispatchQueue.main.async {
-                    let a = NSAlert()
-                    a.messageText = conflicts.count == 1
-                        ? "“\(conflicts[0].lastPathComponent)” already exists in “\(dir.lastPathComponent)”"
-                        : "\(conflicts.count) items already exist in “\(dir.lastPathComponent)”"
-                    a.informativeText = "Choose how to handle items with the same name."
-                    a.addButton(withTitle: "Keep Both")
-                    a.addButton(withTitle: "Replace")
-                    a.addButton(withTitle: "Skip")
-                    a.addButton(withTitle: "Cancel")
-                    switch a.runModal() {
-                    case .alertFirstButtonReturn: policy = .keepBoth
-                    case .alertSecondButtonReturn: policy = .replace
-                    case .alertThirdButtonReturn: policy = .skip
-                    default: cancel = true
+                    if let p = askConflictPolicy(
+                        conflicts.count == 1
+                            ? "“\(conflicts[0].lastPathComponent)” already exists in “\(dir.lastPathComponent)”"
+                            : "\(conflicts.count) items already exist in “\(dir.lastPathComponent)”",
+                        informative: "Choose how to handle items with the same name.",
+                        options: [.keepBoth, .replace, .skip]) {
+                        policy = p
+                    } else {
+                        cancel = true
                     }
                     sem.signal()
                 }
@@ -4317,15 +5235,17 @@ final class Browser: ObservableObject, Identifiable {
                 self.busy = false; self.busyText = ""; self.slowNetwork = false
                 RecentFolders.shared.record(dir)   // you worked in the destination folder
                 if move, !moved.isEmpty {
-                    UndoStack.shared.push("Move") { [weak self] in
-                        for m in moved { try? FileManager.default.moveItem(at: m.to, to: m.from) }
+                    UndoStack.shared.push("Move", undo: { [weak self] in
+                        let problem = restoreItems(moved.map { (from: $0.to, to: $0.from) })
                         self?.load()
-                    }
+                        return problem
+                    }, redo: { [weak self] in
+                        let problem = restoreItems(moved)
+                        self?.load()
+                        return problem
+                    })
                 } else if !copied.isEmpty {
-                    UndoStack.shared.push("Copy") { [weak self] in
-                        for c in copied { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
-                        self?.load()
-                    }
+                    self.pushCreation("Copy", copied)
                 }
                 Browser.invalidateCache(dir.path)
                 // Only re-read the current folder if it actually changed: files
@@ -4377,10 +5297,7 @@ final class Browser: ObservableObject, Identifiable {
         if let failure { reportFileError("Couldn't make an alias", failure) }
         if !created.isEmpty {
             RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Make Alias") { [weak self] in
-                for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
-                self?.load()
-            }
+            pushCreation("Make Alias", created)
         }
         load()
     }
@@ -4408,15 +5325,14 @@ final class Browser: ObservableObject, Identifiable {
         let affected = items.filter { ids.contains($0.id) }
         guard !affected.isEmpty else { return }
         let undoData: [(URL, [String])] = affected.map { ($0.url, $0.tags) }
+        var redoData: [(URL, [String])] = []
         for it in affected {
             var t = it.tags
             if let idx = t.firstIndex(of: tag) { t.remove(at: idx) } else { t.append(tag) }
             Browser.writeTags(it.url, t)
+            redoData.append((it.url, t))
         }
-        UndoStack.shared.push("Tag") { [weak self] in
-            for (u, old) in undoData { Browser.writeTags(u, old) }
-            self?.load()
-        }
+        pushTags(undoData, redoData)
         load()
     }
     func setTags(_ ids: Set<String>, tags: [String]) {
@@ -4424,10 +5340,7 @@ final class Browser: ObservableObject, Identifiable {
         guard !affected.isEmpty else { return }
         let undoData: [(URL, [String])] = affected.map { ($0.url, $0.tags) }
         for it in affected { Browser.writeTags(it.url, tags) }
-        UndoStack.shared.push("Tag") { [weak self] in
-            for (u, old) in undoData { Browser.writeTags(u, old) }
-            self?.load()
-        }
+        pushTags(undoData, affected.map { ($0.url, tags) })
         load()
     }
     func setComment(id: String, _ comment: String) {
@@ -4443,23 +5356,28 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     func applyRenames(_ pairs: [(url: URL, newName: String)]) {
-        var undo: [(URL, URL)] = []
+        var undo: [(from: URL, to: URL)] = []   // renamed → original
         var failure: String?
         for (url, newName) in pairs {
             let n = newName.trimmingCharacters(in: .whitespaces)
             guard !n.isEmpty, n != url.lastPathComponent else { continue }
             let dest = url.deletingLastPathComponent().appendingPathComponent(n)
             guard !fm.fileExists(atPath: dest.path) else { continue }
-            do { try fm.moveItem(at: url, to: dest); undo.append((dest, url)) }
+            do { try fm.moveItem(at: url, to: dest); undo.append((from: dest, to: url)) }
             catch { failure = failure ?? error.localizedDescription }
         }
         if let failure { reportFileError("Some items couldn't be renamed", failure) }
         if !undo.isEmpty { RecentFolders.shared.record(currentURL) }
         if !undo.isEmpty {
-            UndoStack.shared.push("Batch Rename") { [weak self] in
-                for (newURL, oldURL) in undo { try? FileManager.default.moveItem(at: newURL, to: oldURL) }
+            UndoStack.shared.push("Batch Rename", undo: { [weak self] in
+                let problem = restoreItems(undo)
                 self?.load()
-            }
+                return problem
+            }, redo: { [weak self] in
+                let problem = restoreItems(undo.map { (from: $0.to, to: $0.from) })
+                self?.load()
+                return problem
+            })
         }
         load()
     }
@@ -4476,26 +5394,120 @@ final class Browser: ObservableObject, Identifiable {
         }
         if !created.isEmpty {
             RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Make Symbolic Link") { [weak self] in
-                for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
-                self?.load()
-            }
+            pushCreation("Make Symbolic Link", created)
         }
         load()
     }
 
+    /// Do these two paths name the SAME item on disk? File identity, not a string
+    /// compare: macOS volumes are case-insensitive by default, so "photo.png" and
+    /// "Photo.png" are one file and a case-only rename must not be mistaken for a
+    /// collision with itself. Also gets hardlinks and "/tmp" vs "/private/tmp" right,
+    /// which path normalisation alone would not.
+    static func isSameItem(_ path: String, as url: URL) -> Bool {
+        let k: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+        guard let a = (try? URL(fileURLWithPath: path).resourceValues(forKeys: k))?
+                .fileResourceIdentifier as? NSObject,
+              let b = (try? url.resourceValues(forKeys: k))?
+                .fileResourceIdentifier as? NSObject else { return false }
+        return a.isEqual(b)
+    }
+
+    // Rename is the one file operation whose destination name is typed by hand, so it's
+    // the one that collides most — and every check below deliberately runs BEFORE
+    // moveItem. Letting moveItem fail produced "couldn't be moved because an item with
+    // the same name already exists" wrapped in reportFileError's Full Disk Access
+    // paragraph: a permissions lecture for what is really just a name clash.
     func rename(id: String, to newName: String) {
         guard let item = items.first(where: { $0.id == id }) else { return }
-        let n = newName.trimmingCharacters(in: .whitespaces)
+        var n = newName.trimmingCharacters(in: .whitespaces)
         guard !n.isEmpty, n != item.name else { return }
-        let oldURL = item.url
-        let dest = oldURL.deletingLastPathComponent().appendingPathComponent(n)
-        do {
-            try fm.moveItem(at: oldURL, to: dest)
-            RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Rename") { [weak self] in
-                try? FileManager.default.moveItem(at: dest, to: oldURL); self?.load()
+        if let why = PathRules.invalidNameReason(n) {
+            reportFileError("The name “\(n)” can’t be used.", why, permissionHint: false)
+            return
+        }
+        // Finder's extension warning. The rename field pre-selects the base name only,
+        // so the extension survives an ordinary rename untouched — which means a change
+        // to it is either deliberate or a select-all-and-paste accident, and the accident
+        // silently changes which app opens the file. Suppressible (Settings → Behavior).
+        if Prefs.warnExtensionChange,
+           let ch = PathRules.extensionChange(from: item.name, to: n, isDirectory: item.isDirectory) {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            let fromLabel = ch.from.isEmpty ? "no extension" : "“.\(ch.from)”"
+            let toLabel = ch.to.isEmpty ? "no extension" : "“.\(ch.to)”"
+            a.messageText = "Are you sure you want to change the extension from \(fromLabel) to \(toLabel)?"
+            a.informativeText = "If you make this change, your document may open in a different application."
+            a.showsSuppressionButton = true
+            a.suppressionButton?.title = "Don't ask again"
+            a.addButton(withTitle: ch.to.isEmpty ? "Remove Extension" : "Use “.\(ch.to)”")
+            a.addButton(withTitle: ch.from.isEmpty ? "Keep No Extension" : "Keep “.\(ch.from)”")
+            let resp = a.runModal()
+            if a.suppressionButton?.state == .on { Prefs.warnExtensionChange = false }
+            if resp != .alertFirstButtonReturn {
+                // "Keep" re-applies the ORIGINAL extension on top of whatever was typed,
+                // exactly as Finder does — "a.jpg" renamed to "b.png" becomes "b.png.jpg".
+                n = ch.from.isEmpty ? (n as NSString).deletingPathExtension : n + "." + ch.from
             }
+            // Keeping the extension can land back on the name we started from
+            // ("a.jpg" -> "a" -> keep -> "a.jpg"); moveItem onto itself would throw.
+            guard !n.isEmpty, n != item.name else { return }
+        }
+        let oldURL = item.url
+        let dir = oldURL.deletingLastPathComponent()
+        var dest = dir.appendingPathComponent(n)
+        // The item displaced by Replace, so Undo can put it back.
+        var replaced: URL?
+        if PathRules.renameCollides(dest: dest.path,
+                                    exists: { self.fm.fileExists(atPath: $0) },
+                                    isSameItem: { Browser.isSameItem($0, as: oldURL) }) {
+            switch askConflictPolicy("“\(n)” already exists in “\(dir.lastPathComponent)”",
+                                     informative: "Choose how to handle items with the same name.",
+                                     options: [.keepBoth, .replace]) {
+            case .keepBoth:
+                dest = uniqueDest(dir, n)
+            case .replace:
+                // Trash rather than delete: Undo has to be able to restore the item that
+                // was clobbered, and the Trash is the only place it can be restored from.
+                //
+                // Through trashItems, not fm.trashItem directly: that helper is also what
+                // records the TrashOrigins entry. Binning the displaced item by hand left
+                // it in the Trash with no origin, so Put Back on it fell through to
+                // Finder's lazily-written .DS_Store and usually offered nothing at all.
+                let r = trashItems([dest])
+                guard let t = r.restores.first?.from else {
+                    reportFileError("Couldn't replace “\(n)”", r.problem ?? "")
+                    return
+                }
+                replaced = t
+            default:
+                return   // Cancel — the original name stands
+            }
+        }
+        let finalDest = dest
+        do {
+            try fm.moveItem(at: oldURL, to: finalDest)
+            RecentFolders.shared.record(currentURL)
+            UndoStack.shared.push("Rename", undo: { [weak self] in
+                var problem = restoreItems([(from: finalDest, to: oldURL)])
+                if let r = replaced { problem = problem ?? restoreItems([(from: r, to: finalDest)]) }
+                self?.load()
+                return problem
+            }, redo: { [weak self] in
+                // The undo put any displaced item back at the destination name, so it
+                // has to be binned again before the rename can re-take that name —
+                // moveItem onto an occupied path just fails. Re-binning yields a fresh
+                // Trash path, which the undo half above then needs.
+                var problem: String?
+                if replaced != nil {
+                    let r = trashItems([finalDest])
+                    replaced = r.restores.first?.from
+                    problem = r.problem
+                }
+                problem = problem ?? restoreItems([(from: oldURL, to: finalDest)])
+                self?.load()
+                return problem
+            })
             load()
         } catch { reportFileError("Couldn't rename “\(item.name)”", error.localizedDescription) }
     }
@@ -4514,10 +5526,7 @@ final class Browser: ObservableObject, Identifiable {
         if let failure { reportFileError("Couldn't duplicate", failure) }
         if !created.isEmpty {
             RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Duplicate") { [weak self] in
-                for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
-                self?.load()
-            }
+            pushCreation("Duplicate", created)
         }
         load()
     }
@@ -4562,9 +5571,7 @@ final class Browser: ObservableObject, Identifiable {
                 self?.busy = false; self?.busyText = ""
                 if ok {
                     RecentFolders.shared.record(dir)
-                    UndoStack.shared.push("Compress") { [weak self] in
-                        try? FileManager.default.trashItem(at: dest, resultingItemURL: nil); self?.load()
-                    }
+                    self?.pushCreation("Compress", [dest])
                 } else {
                     try? FileManager.default.removeItem(at: dest)   // clean up partial archive
                     reportFileError("Couldn't create the archive",
@@ -4607,10 +5614,7 @@ final class Browser: ObservableObject, Identifiable {
                 self.busy = false; self.busyText = ""
                 if !created.isEmpty {
                     RecentFolders.shared.record(dir)
-                    UndoStack.shared.push("Extract") { [weak self] in
-                        for c in created { try? FileManager.default.trashItem(at: c, resultingItemURL: nil) }
-                        self?.load()
-                    }
+                    self.pushCreation("Extract", created)
                 }
                 self.load()
                 if !failures.isEmpty {
@@ -4622,36 +5626,272 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     func emptyTrash() {
-        let trash = fm.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+        let trash = Browser.trashURL
         guard let entries = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
         var failure: String?
+        var gone: [String] = []
         for e in entries {
-            do { try fm.removeItem(at: e) } catch { failure = failure ?? error.localizedDescription }
+            do { try fm.removeItem(at: e); gone.append(e.path) } catch { failure = failure ?? error.localizedDescription }
         }
+        TrashOrigins.forget(gone)
         if let failure { reportFileError("Some items couldn't be removed from the Trash", failure) }
+        if isTrash { load() }
+    }
+
+    // MARK: Trash browsing & Put Back
+
+    static let trashURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+
+    /// True only for the Trash ITSELF, not folders inside it: put-back is recorded for
+    /// the top-level item that was trashed, so a file three levels down inside a
+    /// trashed folder has no origin of its own and must not be offered one.
+    var isTrash: Bool { currentURL.standardizedFileURL.path == Browser.trashURL.standardizedFileURL.path }
+
+    /// Finder's put-back records for the Trash, read once per visit. Keyed by the
+    /// item's name inside the Trash.
+    private var trashPutBack: [String: TrashOrigin] = [:]
+
+    /// Where a trashed item came from, or nil if nothing knows.
+    ///
+    /// Navigator's own record wins: it is written the instant we trash something,
+    /// whereas Finder's `.DS_Store` is written lazily and typically has no entry yet
+    /// for a file trashed seconds ago — which is exactly when Put Back gets used.
+    func trashOrigin(of item: FileItem) -> TrashOrigin? {
+        TrashOrigins.origin(of: item.url.path) ?? trashPutBack[item.name]
+    }
+
+    /// Reads the Trash's put-back records off the main thread and republishes, so the
+    /// context menu can enable/disable Put Back per item. Called on arrival in the
+    /// Trash; `.DS_Store` there can be several KB and is on disk, so never on-main.
+    func loadTrashPutBack() {
+        let url = Browser.trashURL.appendingPathComponent(".DS_Store")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let recs = (try? Data(contentsOf: url)).map { DSStore.putBackRecords($0) } ?? [:]
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.trashPutBack = recs
+                self.objectWillChange.send()   // menus read trashOrigin(of:) — let them re-evaluate
+            }
+        }
+    }
+
+    /// Finder's "Put Back": each selected item returns to the folder it was trashed
+    /// from, under the name it had BEFORE the Trash renamed it for a collision.
+    ///
+    /// Items whose origin can't be resolved are skipped, not guessed at — dropping a
+    /// file into some plausible-looking folder is worse than not restoring it, because
+    /// the user has no way to know it happened.
+    func putBack(_ ids: Set<String>) {
+        let sel = items.filter { ids.contains($0.id) }
+        var moves: [(from: URL, to: URL)] = []
+        var unresolved: [String] = []
+        var missingFolders: [String] = []
+        for it in sel {
+            guard let origin = trashOrigin(of: it) else { unresolved.append(it.name); continue }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: origin.directory, isDirectory: &isDir), isDir.boolValue else {
+                missingFolders.append("• \(it.name) → \(origin.directory)")
+                continue
+            }
+            // Something already lives at the original path. Keep Both rather than
+            // clobber: the file at the destination is one the user still has, and
+            // silently replacing it with a deleted version is unrecoverable.
+            let dest = fm.fileExists(atPath: origin.url.path)
+                ? uniqueDest(URL(fileURLWithPath: origin.directory), origin.name)
+                : origin.url
+            moves.append((from: it.url, to: dest))
+        }
+        if !moves.isEmpty {
+            let problem = restoreItems(moves)
+            TrashOrigins.forget(moves.map { $0.from.path })
+            let undoPairs = moves.map { (from: $0.to, to: $0.from) }
+            UndoStack.shared.push("Put Back", undo: { [weak self] in
+                let p = restoreItems(undoPairs)
+                TrashOrigins.record(undoPairs.map { (from: $0.to, to: $0.from) })
+                self?.load(); return p
+            }, redo: { [weak self] in
+                let p = restoreItems(moves)
+                TrashOrigins.forget(moves.map { $0.from.path })
+                self?.load(); return p
+            })
+            load()
+            if let problem { reportFileError("Some items couldn't be put back", problem) }
+        }
+        if !missingFolders.isEmpty {
+            reportFileError("The original folder no longer exists",
+                            missingFolders.prefix(5).joined(separator: "\n")
+                            + "\n\nUse “Move to…” to choose somewhere else.", permissionHint: false)
+        }
+        if !unresolved.isEmpty {
+            reportFileError(unresolved.count == 1
+                            ? "Navigator doesn't know where “\(unresolved[0])” came from"
+                            : "\(unresolved.count) items have no recorded original location",
+                            "macOS only records an item's original location when it's moved to the Trash, and that record can be missing for items trashed by other apps or on an earlier system.\n\nUse “Move to…” to put them somewhere you choose.",
+                            permissionHint: false)
+        }
+    }
+
+    /// The fallback for items with no recorded origin: the user picks the folder.
+    func moveOutOfTrash(_ ids: Set<String>) {
+        let sel = items.filter { ids.contains($0.id) }
+        guard !sel.isEmpty else { NSSound.beep(); return }
+        let p = NSOpenPanel()
+        p.message = sel.count == 1 ? "Move “\(sel[0].name)” out of the Trash to…" : "Move \(sel.count) items out of the Trash to…"
+        p.prompt = "Move"
+        p.canChooseFiles = false
+        p.canChooseDirectories = true
+        p.canCreateDirectories = true
+        guard p.runModal() == .OK, let dir = p.url else { return }
+        let moves = sel.map { (from: $0.url, to: uniqueDest(dir, $0.name)) }
+        let problem = restoreItems(moves)
+        TrashOrigins.forget(moves.map { $0.from.path })
+        let undoPairs = moves.map { (from: $0.to, to: $0.from) }
+        UndoStack.shared.push("Move Out of Trash", undo: { [weak self] in
+            let p = restoreItems(undoPairs); self?.load(); return p
+        }, redo: { [weak self] in
+            let p = restoreItems(moves); self?.load(); return p
+        })
+        load()
+        if let problem { reportFileError("Some items couldn't be moved", problem) }
+    }
+
+    /// Permanent delete of selected Trash items. Not undoable, hence the confirmation
+    /// — and it exists because the alternative in a Trash view is "Move to Trash",
+    /// which is nonsense for something already there.
+    func deleteFromTrash(_ ids: Set<String>) {
+        let sel = items.filter { ids.contains($0.id) }
+        guard !sel.isEmpty else { NSSound.beep(); return }
+        let a = NSAlert(); a.alertStyle = .warning
+        a.messageText = sel.count == 1
+            ? "Delete “\(sel[0].name)” permanently?"
+            : "Delete \(sel.count) items permanently?"
+        a.informativeText = "This can't be undone."
+        a.addButton(withTitle: "Delete"); a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        var failure: String?
+        var gone: [String] = []
+        for it in sel {
+            do { try fm.removeItem(at: it.url); gone.append(it.url.path) }
+            catch { failure = failure ?? "• \(it.name): \(error.localizedDescription)" }
+        }
+        TrashOrigins.forget(gone)
+        load()
+        if let failure { reportFileError("Some items couldn't be deleted", failure) }
     }
 }
 
 // MARK: - App model (tabs)
 
+/// One window's worth of restorable state.
+struct WindowSession: Codable {
+    var tabs: [String]
+    var selected: Int
+}
+
+/// Per-WINDOW tab persistence.
+///
+/// The bug this replaces: every window's AppModel wrote its tab list to the same
+/// single "openTabs" array, so the last window to navigate overwrote every other
+/// window's tabs and a relaunch restored exactly one window's worth — whichever
+/// happened to save last. Worse, `openWindow(showing:)` assigns a brand-new
+/// single-tab list, so merely tearing a tab off into its own window destroyed the
+/// original window's persisted tabs.
+///
+/// Windows register here in creation order and each one only ever rewrites its OWN
+/// slot, identified by a UUID that has nothing to do with its index — a window
+/// closing must not silently reassign another window's saved tabs to it.
+/// Registration order is the restore order, so windows come back in the order they
+/// were opened.
+enum WindowSessions {
+    private static let key = "windowSessionsV1"
+    private static var live: [(id: UUID, session: WindowSession)] = []
+    /// Sessions read at launch for windows that have not been created yet.
+    ///
+    /// DATA LOSS this prevents: an image-only launch (double-clicking a PNG) never
+    /// shows the browser, so the extra windows are never restored — but the main
+    /// window's AppModel still registered itself, and `persist()` writes the WHOLE
+    /// list. That rewrote the file with ONE session, and every other window's tabs
+    /// were gone from disk the moment you quit. Held here they are still persisted,
+    /// so a launch that restores nothing destroys nothing either.
+    private static var held: [WindowSession] = []
+
+    /// What to restore, oldest window first. Falls back to the pre-multi-window
+    /// single "openTabs" list so an upgrade doesn't lose the tabs you had open.
+    static func saved() -> [WindowSession] {
+        if let d = UserDefaults.standard.data(forKey: key),
+           let s = try? JSONDecoder().decode([WindowSession].self, from: d), !s.isEmpty {
+            return s
+        }
+        let legacy = UserDefaults.standard.stringArray(forKey: "openTabs") ?? []
+        guard !legacy.isEmpty else { return [] }
+        return [WindowSession(tabs: legacy, selected: UserDefaults.standard.integer(forKey: "selectedTab"))]
+    }
+
+    static func register(_ id: UUID, _ session: WindowSession) {
+        if let i = live.firstIndex(where: { $0.id == id }) { live[i].session = session }
+        else { live.append((id, session)) }
+        persist()
+    }
+
+    /// Park the sessions whose windows haven't been opened yet (see `held`).
+    static func hold(_ sessions: [WindowSession]) { held = sessions; persist() }
+    /// Claimed by whoever is about to turn them into real windows — those windows
+    /// register themselves, so holding them any longer would double them up.
+    static func takeHeld() -> [WindowSession] {
+        let s = held
+        held = []
+        return s
+    }
+    /// Called when a window closes. Without this, a window you closed comes back on
+    /// the next launch — its slot is still in the list.
+    static func unregister(_ id: UUID) {
+        live.removeAll { $0.id == id }
+        // Never persist an EMPTY list: the last window closing is how the app quits,
+        // and blanking the file there would mean every quit wipes the session.
+        if !live.isEmpty || !held.isEmpty { persist() }
+    }
+    private static func persist() {
+        let all = live.map { $0.session } + held
+        if let d = try? JSONEncoder().encode(all) { UserDefaults.standard.set(d, forKey: key) }
+    }
+}
+
 final class AppModel: ObservableObject {
     @Published var tabs: [Browser]
+    /// This window's identity in the persisted session list — see WindowSessions.
+    let sessionID = UUID()
     @Published var selected: Int = 0 { didSet { saveState() } }
     @Published var showPreview: Bool = Prefs.showPreview { didSet { Prefs.showPreview = showPreview } }
     @Published var showSidebar: Bool = Prefs.showSidebar { didSet { Prefs.showSidebar = showSidebar } }
     @Published var dualPane: Bool = Prefs.dualPane { didSet { Prefs.dualPane = dualPane } }
-    lazy var secondary = Browser(start: FileManager.default.homeDirectoryForCurrentUser)
-    init() {
-        // Restore previously open tabs (falling back to Home).
+    /// The dual-pane right-hand browser, created on first use. Spelled out rather than
+    /// `lazy var`, because forgetSession has to be able to ask whether it exists — and
+    /// merely READING a lazy var creates it, which would spin up a Browser (and its
+    /// folder watcher) for a window that is closing.
+    private var secondaryIfLoaded: Browser?
+    var secondary: Browser {
+        if let s = secondaryIfLoaded { return s }
+        let s = Browser(start: FileManager.default.homeDirectoryForCurrentUser)
+        secondaryIfLoaded = s
+        return s
+    }
+    /// `session` is this window's saved tabs, or nil for a window that starts fresh
+    /// (New Window, or a torn-off tab). Passed in rather than read from UserDefaults
+    /// here, because a second window must NOT restore the first window's tab list —
+    /// that is what made "Move Tab to New Window" arrive alongside a copy of every
+    /// other tab.
+    init(session: WindowSession? = nil) {
         let fm = FileManager.default
-        let saved = (UserDefaults.standard.stringArray(forKey: "openTabs") ?? []).filter { fm.fileExists(atPath: $0) }
+        let saved = (session?.tabs ?? []).filter { fm.fileExists(atPath: $0) }
         if saved.isEmpty {
             tabs = [Browser(start: fm.homeDirectoryForCurrentUser)]
         } else {
             tabs = saved.map { Browser(start: URL(fileURLWithPath: $0)) }
-            let savedSel = UserDefaults.standard.integer(forKey: "selectedTab")
-            selected = max(0, min(savedSel, tabs.count - 1))
+            selected = max(0, min(session?.selected ?? 0, tabs.count - 1))
         }
+        // Claim a persistence slot immediately, so a window whose tabs are never
+        // touched still comes back next launch.
+        WindowSessions.register(sessionID, WindowSession(tabs: tabs.map { $0.currentURL.path }, selected: selected))
         // Refresh the sidebar the instant a disk/USB/network share mounts or ejects,
         // so new volumes appear (and stale ones disappear) automatically.
         let nc = NSWorkspace.shared.notificationCenter
@@ -4667,8 +5907,25 @@ final class AppModel: ObservableObject {
         }
     }
     func saveState() {
-        UserDefaults.standard.set(tabs.map { $0.currentURL.path }, forKey: "openTabs")
-        UserDefaults.standard.set(selected, forKey: "selectedTab")
+        // A forgotten window must never claim a slot again. It could: a closed
+        // NavWindow stays in NSApp.windows (isReleasedWhenClosed = false), so quitting
+        // re-saved it and it came back next launch — and the .navigatorDidNavigate
+        // observer below is app-wide, so ANY navigation in ANY window re-registered it
+        // too. Both defeat the one thing forgetSession() exists to do.
+        guard !forgotten else { return }
+        WindowSessions.register(sessionID, WindowSession(tabs: tabs.map { $0.currentURL.path }, selected: selected))
+    }
+    private var forgotten = false
+    /// This window is going away for good — drop its slot so it doesn't reopen next
+    /// launch. NOT called on quit: quitting closes every window, and forgetting them
+    /// all is precisely what session restore exists to avoid.
+    func forgetSession() {
+        forgotten = true
+        WindowSessions.unregister(sessionID)
+        // AppKit keeps a closed window alive (see Browser.stopWatching), so the work has
+        // to be stopped by hand or every closed window keeps watching folders forever.
+        tabs.forEach { $0.stopWatching() }
+        secondaryIfLoaded?.stopWatching()
     }
     var active: Browser { tabs[max(0, min(selected, tabs.count - 1))] }
     func newTab(at url: URL? = nil) {
@@ -4682,14 +5939,305 @@ final class AppModel: ObservableObject {
         if selected >= tabs.count { selected = tabs.count - 1 }
         saveState()
     }
+    // Tab-strip right-click commands. Each one checks TabMenuRules (tested) so the
+    // menu's disabled state and the action's own guard can never disagree — a menu
+    // item that looks live and then does nothing reads as a broken app.
+    func closeOtherTabs(_ index: Int) {
+        guard TabMenuRules.canCloseOthers(index: index, count: tabs.count) else { return }
+        tabs = [tabs[index]]
+        selected = 0
+        saveState()
+    }
+    func closeTabsToRight(_ index: Int) {
+        guard TabMenuRules.canCloseToRight(index: index, count: tabs.count) else { return }
+        tabs.removeSubrange((index + 1)...)
+        if selected > index { selected = index }
+        saveState()
+    }
+    // Moves the tab OUT: it leaves this window's strip and the folder opens in a fresh
+    // window. Window creation lives on the AppDelegate (it owns the retain of extra
+    // windows), so this goes through the one existing path rather than a second copy.
+    /// `at` is where a tear-off drag was released, so the new window appears under the
+    /// cursor instead of at the stock cascade offset. nil from the context menu, which has
+    /// no meaningful position to offer.
+    func moveTabToNewWindow(_ index: Int, at screenPoint: CGPoint? = nil) {
+        guard TabMenuRules.canMoveToNewWindow(index: index, count: tabs.count) else { return }
+        let url = tabs[index].currentURL
+        closeTab(index)
+        (NSApp.delegate as? AppDelegate)?.openWindow(showing: url, at: screenPoint)
+    }
     // Open a folder in the right-hand pane, turning on dual-pane view if needed.
     func openInSecondPane(_ url: URL) {
         dualPane = true
         secondary.navigate(to: url)
     }
+
+    /// Reorder the strip by dragging one tab onto another. The selected tab is carried by
+    /// IDENTITY, not by index: keeping `selected` on the same slot would silently switch
+    /// which folder the window is showing every time you rearranged tabs.
+    func moveTab(from: Int, to: Int) {
+        guard let order = TabMoveRules.reordered(count: tabs.count, from: from, to: to) else { return }
+        let current = tabs[max(0, min(selected, tabs.count - 1))]
+        tabs = order.map { tabs[$0] }
+        selected = tabs.firstIndex { $0 === current } ?? selected
+        saveState()
+    }
+}
+
+// MARK: - Drag lifetime
+
+/// Runs `body` once the left mouse button comes back up — the only signal available for
+/// "the drag is over, whoever started it and however it ended".
+///
+/// Polling `NSEvent.pressedMouseButtons` rather than watching for a mouse-up event: a
+/// drag session consumes its own mouse-up, so no local monitor ever sees it, and a
+/// GLOBAL monitor needs the accessibility trust this app deliberately never asks for.
+/// AppKit's own drag-ended callbacks are no use either — they only fire on the surface
+/// that owns the session, and a drag can start in Finder and end over the sidebar.
+///
+/// `grace` exists because the drop handler fires on that same mouse-up: without a delay,
+/// spring-back raced the drop and could navigate away from the folder just dropped into.
+final class MouseUpWatch {
+    private var timer: Timer?
+    /// True across the post-mouse-up grace delay, when `timer` is already nil but this
+    /// watch has not run its body yet.
+    private var settling = false
+    var isRunning: Bool { timer != nil || settling }
+
+    func start(grace: TimeInterval = 0.25, _ body: @escaping () -> Void) {
+        guard !isRunning else { return }   // already watching this same drag
+        // Gating on `timer == nil` alone left the door open for the whole grace window,
+        // so a second drag begun within 0.25s armed a SECOND watch on top of the first.
+        // `settling` closes it — see isRunning.
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] t in
+            guard NSEvent.pressedMouseButtons & 1 == 0 else { return }
+            t.invalidate()
+            self?.timer = nil
+            self?.settling = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + grace) { self?.settling = false; body() }
+        }
+        // .common, NOT Timer.scheduledTimer: a drag that STARTED in this app runs the
+        // main run loop in NSEventTrackingRunLoopMode, and a .default-mode timer does
+        // not tick at all until the drag is over. See SpringLoader.hover for the
+        // user-visible half of this bug.
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+}
+
+// MARK: - Spring-loaded folders
+
+/// Hover a folder mid-drag and it opens, so you can keep going and drop deeper — the
+/// Finder/Explorer behaviour. One shared instance drives every drop surface (list rows,
+/// icon cells, gallery cells, sidebar rows) because only one drag can be in flight at a
+/// time, and because a per-surface timer could not do the one thing that makes this
+/// usable: reset when the pointer crosses from one folder to a different one.
+///
+/// The dangerous failure mode is a timer that fires AFTER the drag is over — navigating
+/// the window out from under someone who already let go. Three things prevent it: the
+/// dwell timer is cancelled on every drag exit, `noteDrop` records that a drop landed,
+/// and `finish` (driven by MouseUpWatch, which sees the end of any drag from anywhere)
+/// tears the whole thing down.
+final class SpringLoader {
+    static let shared = SpringLoader()
+
+    /// The folder the dwell timer is counting down on, if any.
+    private var armed: URL?
+    private var dwell: Timer?
+    /// The folder the window was showing before the FIRST spring of this drag — where
+    /// spring-back returns to. nil means nothing has sprung, so there is nothing to undo.
+    private var origin: URL?
+    private weak var sprung: Browser?
+    private var didDrop = false
+    private let watch = MouseUpWatch()
+
+    /// The pointer is over `folder` with a drag in flight. Called repeatedly (AppKit's
+    /// validateDrop fires on every mouse move) — repeats on the SAME folder deliberately
+    /// leave the countdown running, or it would restart forever and never fire.
+    func hover(folder: URL, browser: Browser) {
+        guard SpringRules.canSpring(into: folder, from: browser.currentURL,
+                                    dragging: Self.draggedFiles()) else { cancel(); return }
+        watch.start { [weak self] in self?.finish() }
+        let path = folder.standardizedFileURL.path
+        if armed?.standardizedFileURL.path == path { return }
+        // A different folder: restart the countdown from zero. THIS is what stops a drag
+        // that merely sweeps across a folder on the way somewhere else from opening it.
+        cancel()
+        armed = folder
+        let t = Timer(timeInterval: SpringRules.dwell, repeats: false) { [weak self, weak browser] _ in
+            guard let self, let browser else { return }
+            self.dwell = nil
+            self.armed = nil
+            if self.origin == nil { self.origin = browser.currentURL; self.sprung = browser }
+            navLog("spring: opening \(folder.lastPathComponent) mid-drag")
+            browser.navigate(to: folder)
+        }
+        // .common mode is LOAD-BEARING. Timer.scheduledTimer schedules in .default only,
+        // and a drag that BEGAN inside Navigator puts the main run loop in
+        // NSEventTrackingRunLoopMode for its whole duration — so the dwell timer never
+        // ticked until the drag was already over and spring-loading simply did not
+        // happen for the drags that matter most. Drags from OTHER apps kept working,
+        // which is exactly why this survived testing. Same pattern as
+        // NetworkPollCoordinator. Do not go back to scheduledTimer.
+        RunLoop.main.add(t, forMode: .common)
+        dwell = t
+    }
+
+    /// The pointer left `folder`. Ignored unless that folder is the one counting down:
+    /// SwiftUI reports the NEW cell as targeted BEFORE the old one un-targets, so an
+    /// unconditional cancel here would kill the countdown the next cell just armed.
+    func leave(_ folder: URL) {
+        if armed?.standardizedFileURL.path == folder.standardizedFileURL.path { cancel() }
+    }
+
+    /// Unconditional — for surfaces that report "the drag left me entirely" (the table's
+    /// draggingExited/draggingEnded), where there is no ambiguity to protect against.
+    func cancel() {
+        dwell?.invalidate()
+        dwell = nil
+        armed = nil
+    }
+
+    /// A drop landed somewhere. Suppresses spring-back: the user finished their drag, and
+    /// yanking the view back to where they started would hide the file they just moved.
+    func noteDrop() {
+        didDrop = true
+        // Cancels the countdown too. A drop can land while the dwell is still running —
+        // measured: drop a file onto a folder row and the spring fired 0.3s LATER, moving
+        // the window into that folder after the user had already let go. That is the
+        // fire-after-the-drag-is-over failure this class exists to prevent; it only became
+        // reachable once the dwell timer started ticking during in-app drags (see hover).
+        cancel()
+    }
+
+    /// Finder's spring-back. A drag abandoned without dropping leaves you where you
+    /// started rather than parked several folders deep in something you only passed
+    /// through. Either way the spring navigations went through `navigate(to:)`, so every
+    /// hop is on the back stack and ⌘← walks out by hand — that is the real guarantee
+    /// against being stranded, and it holds even if this never runs.
+    private func finish() {
+        cancel()
+        if let o = origin, let b = sprung, !didDrop {
+            navLog("spring: drag ended with no drop, springing back to \(o.lastPathComponent)")
+            b.navigate(to: o)
+        }
+        origin = nil
+        sprung = nil
+        didDrop = false
+    }
+
+    /// What the in-flight drag is actually carrying, read from the drag pasteboard.
+    ///
+    /// Read from the pasteboard rather than tracked from our own drag sources, because
+    /// SwiftUI's `isTargeted:` callback hands over a Bool and nothing else — there is no
+    /// payload to inspect at hover time. This also covers drags that started in another
+    /// app. Non-file URLs are dropped, which is what makes the sidebar's `navreorder:`
+    /// token and the tab strip's `navtab:` token spring nothing.
+    private static func draggedFiles() -> [URL] {
+        let objs = NSPasteboard(name: .drag).readObjects(forClasses: [NSURL.self], options: nil)
+        return (objs as? [URL] ?? []).filter { $0.isFileURL }
+    }
+}
+
+// MARK: - Tab tear-off
+
+/// What a tab drag puts on the pasteboard: the tab's index, plus which window's strip it
+/// came from.
+///
+/// A private URL scheme, exactly like the sidebar's ReorderToken and for the same reason
+/// — a tab needs to receive BOTH file drops and tab drops, and one row can only have one
+/// drop handler, so one handler means one payload type. The window key is what stops a
+/// tab dragged out of window A from reordering window B's strip at the same index.
+enum TabDragToken {
+    static let scheme = "navtab"
+
+    static func key(_ model: AppModel) -> String {
+        String(UInt(bitPattern: ObjectIdentifier(model).hashValue), radix: 16)
+    }
+    static func provider(model: AppModel, index: Int) -> NSItemProvider {
+        var c = URLComponents()
+        c.scheme = scheme
+        c.host = key(model)
+        c.path = "/\(index)"
+        return NSItemProvider(object: (c.url ?? URL(fileURLWithPath: "/")) as NSURL)
+    }
+    /// The dragged tab's index, or nil if this drop isn't a tab from `model`'s own strip.
+    static func index(of url: URL, model: AppModel) -> Int? {
+        guard url.scheme == scheme, url.host == key(model) else { return nil }
+        return Int(url.lastPathComponent)
+    }
+}
+
+/// Drag a tab out of the strip and let go: it becomes its own window (Safari/Chrome).
+///
+/// There is no "my drag was refused" callback in SwiftUI, so tear-off can't be driven by
+/// the absence of a drop. Instead the gesture itself decides: a release more than
+/// `pullOut` points above or below where the drag started means the tab was pulled OUT of
+/// the strip, which is the same vertical-detach rule Chrome uses. Sideways travel, however
+/// far, is a reorder — so releasing in the 6pt gap between two tabs leaves the strip alone
+/// instead of surprising the user with a new window.
+final class TabDrag {
+    static let shared = TabDrag()
+    /// ~1.5 tab heights. Big enough that no reorder along the strip trips it.
+    private static let pullOut: CGFloat = 40
+
+    private weak var model: AppModel?
+    private var index = 0
+    private var startPoint = CGPoint.zero
+    private var handled = false
+    private let watch = MouseUpWatch()
+
+    func begin(model: AppModel, index: Int) {
+        self.model = model
+        self.index = index
+        startPoint = NSEvent.mouseLocation
+        handled = false
+        watch.start { [weak self] in self?.end() }
+    }
+
+    /// A tab in the strip took this drop (a reorder, or a release back on the tab itself),
+    /// so it was never a tear-off however far the pointer wandered on the way.
+    func noteHandled() { handled = true }
+
+    private func end() {
+        let m = model
+        model = nil
+        guard !handled, let m else { return }
+        // The SAME rule the context-menu item is enabled by, checked here too so the log
+        // below never claims a tear-off that moveTabToNewWindow is about to refuse. Its
+        // refusal to move the ONLY tab out is what keeps this from leaving an empty ghost
+        // window behind — dragging a lone tab anywhere simply does nothing.
+        guard TabMenuRules.canMoveToNewWindow(index: index, count: m.tabs.count) else { return }
+        let p = NSEvent.mouseLocation
+        guard abs(p.y - startPoint.y) > Self.pullOut else { return }
+        navLog("tab tear-off: index \(index) at \(Int(p.x)),\(Int(p.y))")
+        m.moveTabToNewWindow(index, at: p)
+    }
 }
 
 // MARK: - Components
+
+/// The commands every folder-backed row shares, in the order and wording the sidebar
+/// already uses — a right-click has to mean the same thing on a sidebar row, a
+/// breadcrumb segment and a Favorites entry, or they stop reading as one app.
+///
+/// A free function rather than a method so the breadcrumb bar can use the SAME list
+/// the sidebar does; it was private to SidebarView before there was a second caller.
+@ViewBuilder func folderLocationMenu(_ url: URL, browser: Browser, model: AppModel) -> some View {
+    Button("Open") { browser.navigate(to: url) }
+    Button("Open in New Tab") { model.newTab(at: url) }
+    Button("Open in Second Pane") { model.openInSecondPane(url) }
+    Divider()
+    Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+    Button("Copy Path") { browser.copyToClipboard(url.path) }
+}
+
+/// Get Info for something that isn't in any listing (a volume row, a breadcrumb
+/// segment): builds the FileItem from the URL itself, since showInfo() can only look
+/// ids up in browser.items, which only ever holds the CURRENT folder's contents.
+func showFolderInfo(_ url: URL, browser: Browser) {
+    GetInfoController.shared.show(browser, Browser.item(from: url, try? url.resourceValues(forKeys: Set(Browser.itemKeys))))
+}
 
 struct SidebarView: View {
     @ObservedObject var browser: Browser
@@ -4713,41 +6261,126 @@ struct SidebarView: View {
                     .help(loc.isNetwork ? "Disconnect" : "Eject")
             }
         }
+        .modifier(FolderDropRow(folder: loc.url, browser: browser))
+        .contextMenu {
+            locationMenu(loc.url)
+            Button("Get Info") { showRowInfo(loc.url) }
+            // Same condition as the eject button above, so the two can never
+            // disagree about whether a volume can be let go of (the startup disk
+            // reports ejectable=false and must never be offered).
+            if loc.ejectable {
+                Divider()
+                Button(loc.isNetwork ? "Disconnect" : "Eject") { disconnectVolume(loc.url, isNetwork: loc.isNetwork) }
+            }
+        }
     }
 
-    /// A sidebar row you can pick up and drop onto another to reorder.
+    // The shared list and the URL-only Get Info both live at file scope now
+    // (folderLocationMenu / showFolderInfo) so the breadcrumb bar offers the same
+    // commands from the same source.
+    @ViewBuilder private func locationMenu(_ url: URL) -> some View {
+        folderLocationMenu(url, browser: browser, model: model)
+    }
+    private func showRowInfo(_ url: URL) { showFolderInfo(url, browser: browser) }
+
+    /// What a favorite-reorder drag puts on the pasteboard: the row's path wrapped in
+    /// a private URL scheme.
     ///
-    /// The highlight matters as much as the drag: with no feedback there was no way to
-    /// tell a row apart from the gap above it, the section header, or Recents — none of
-    /// which are drop targets — so a near miss looked exactly like a broken feature.
-    /// Now the row you're about to displace lights up, and nothing lighting up means
-    /// "don't let go here".
+    /// It used to be the bare path as plain text, which cannot survive next to file
+    /// drops — `.dropDestination(for: URL.self)` shadows a sibling `.onDrop(of: [.text])`
+    /// on the same row and then declines the text itself (verified with synthesized
+    /// drags: the reorder never reached either handler). One drop handler per row is
+    /// the fix, and one handler means one payload type, so the token became a URL that
+    /// is unmistakably not a file: `navreorder:` says "this is a row, not a document"
+    /// no matter which sidebar section it lands on.
+    private enum ReorderToken {
+        static let scheme = "navreorder"
+        static func provider(_ path: String) -> NSItemProvider {
+            var c = URLComponents()
+            c.scheme = scheme
+            c.path = path   // percent-encodes for us, so spaces in a path survive
+            return NSItemProvider(object: (c.url ?? URL(fileURLWithPath: path)) as NSURL)
+        }
+        /// The favorite path this drop carries, or nil if it isn't a reorder at all.
+        static func path(of url: URL) -> String? { url.scheme == scheme ? url.path : nil }
+    }
+
+    /// THE drop handler for a sidebar row — both kinds of drop, one modifier.
     ///
-    /// onDrag/onDrop rather than draggable/dropDestination: the row's content is a
-    /// full-width Button, and the newer API loses the mouse-down to it, so the drag
-    /// never starts. List's .onMove isn't available either — these rows are
-    /// OutlineGroups and a List only reorders plain ForEach rows (tested).
-    private struct Reorderable<Content: View>: View {
-        let path: String
-        @ObservedObject var favStore: FavoritesStore
-        @ViewBuilder var content: () -> Content
+    /// Files dropped ON a row go INTO that folder — the same move-or-copy the file
+    /// list does for a folder row, through the same Browser call, so conflict
+    /// prompts, undo and error reporting are identical. Before this, a file dropped
+    /// on a favorite vanished into the section-level "pin this folder" handler,
+    /// which only accepted directories and so silently did nothing.
+    ///
+    /// A favorite row ALSO receives the reorder drag, and it must be handled here,
+    /// in the same closure. Two drop modifiers on one row is a trap, not a layering:
+    /// an earlier version put this URL destination inside a separate
+    /// `.onDrop(of: [.text])` that did the reordering, expecting the text drag to
+    /// fall through to the outer one. It never does — the URL destination wins the
+    /// hit test and then refuses the text itself, so reordering died silently while
+    /// file drops kept working. Both payloads arrive here, and are told apart by
+    /// what they are (see ReorderToken). Do NOT add a second drop modifier here.
+    ///
+    /// The highlight matters as much as the drop: with no feedback there was no way
+    /// to tell a row apart from the gap above it, the section header, or Recents —
+    /// so a near miss looked exactly like a broken feature. Now the row you're about
+    /// to displace (or drop into) lights up, and nothing lighting up means "don't
+    /// let go here".
+    private struct FolderDropRow: ViewModifier {
+        let folder: URL
+        @ObservedObject var browser: Browser
+        /// The favorite this row IS, or nil on rows that can't be a reorder target
+        /// (Locations, Recents, Cloud, expanded subfolders) — none of those are
+        /// entries in favStore, so reorder() could never find them.
+        var reorderOnto: String?
         @State private var targeted = false
 
-        var body: some View {
-            content()
+        func body(content: Content) -> some View {
+            content
                 .background(
                     RoundedRectangle(cornerRadius: 4)
                         .fill(Color.accentColor.opacity(targeted ? 0.35 : 0))
                 )
-                .onDrag { NSItemProvider(object: path as NSString) }
-                .onDrop(of: [.text], isTargeted: $targeted) { providers in
-                    guard let p = providers.first else { return false }
-                    p.loadObject(ofClass: NSString.self) { obj, _ in
-                        guard let src = obj as? String else { return }
-                        DispatchQueue.main.async { favStore.reorder(from: src, onto: path) }
+                .dropDestination(for: URL.self) { urls, _ in
+                    guard let first = urls.first else { return false }
+                    if let src = ReorderToken.path(of: first) {
+                        guard let onto = reorderOnto else { return false }
+                        FavoritesStore.shared.reorder(from: src, onto: onto)
+                        return true
                     }
+                    // Drop a folder on its own row (or on a row inside it) and there
+                    // is nothing sane to do — dropInto would alert about copying a
+                    // folder into itself for what was obviously just a missed aim.
+                    let safe = urls.filter { !PathRules.isSelfOrDescendant(folder, of: $0) }
+                    guard !safe.isEmpty else { return false }
+                    browser.dropInto(safe, folder: folder)
                     return true
+                } isTargeted: { t in
+                    targeted = t
+                    // Spring-loading: hovering a pinned folder mid-drag navigates the main
+                    // view there, so a favorite works as a shortcut INTO a hierarchy and
+                    // not only as a place to let go. A reorder drag springs nothing — its
+                    // pasteboard holds no file (see SpringLoader.draggedFiles).
+                    if t { SpringLoader.shared.hover(folder: folder, browser: browser) }
+                    else { SpringLoader.shared.leave(folder) }
                 }
+        }
+    }
+
+    /// The drag SOURCE half of favorite reordering; the drop half lives in
+    /// FolderDropRow, which is the row's one and only drop handler (read the trap
+    /// documented there before touching either).
+    ///
+    /// onDrag rather than draggable: the row's content is a full-width Button, and
+    /// the newer API loses the mouse-down to it, so the drag never starts. List's
+    /// .onMove isn't available either — these rows are OutlineGroups and a List only
+    /// reorders plain ForEach rows (tested).
+    private struct ReorderDrag: ViewModifier {
+        let path: String
+        let enabled: Bool
+        @ViewBuilder func body(content: Content) -> some View {
+            if enabled { content.onDrag { ReorderToken.provider(path) } } else { content }
         }
     }
 
@@ -4793,16 +6426,14 @@ struct SidebarView: View {
                     Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
                 }
             }
-            .modifier(ReorderRow(path: n.url.path, favStore: favStore))
-        }
-    }
-
-    // Applying Reorderable as a modifier keeps the OutlineGroup row builder readable.
-    private struct ReorderRow: ViewModifier {
-        let path: String
-        @ObservedObject var favStore: FavoritesStore
-        func body(content: Content) -> some View {
-            Reorderable(path: path, favStore: favStore) { content }
+            // Offer the reorder drag ONLY where reordering is real: a row that is
+            // itself an entry in favStore.items, i.e. a top-level Favorites row.
+            // Cloud rows (removable: false) and expanded subfolders aren't in the
+            // store, so reorder() could never find them — the drag they advertised
+            // always ended in nothing happening.
+            .modifier(FolderDropRow(folder: n.url, browser: browser,
+                                    reorderOnto: removable && isTop ? n.url.path : nil))
+            .modifier(ReorderDrag(path: n.url.path, enabled: removable && isTop))
         }
     }
 
@@ -4816,14 +6447,25 @@ struct SidebarView: View {
                 Button { browser.loadRecents() } label: {
                     Label("Recents", systemImage: "clock").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.plain)
-                .onDrop(of: [.text], isTargeted: $recentsTargeted) { providers in
-                    guard let p = providers.first else { return false }
-                    p.loadObject(ofClass: NSString.self) { obj, _ in
-                        guard let src = obj as? String else { return }
-                        DispatchQueue.main.async { favStore.moveToTop(path: src) }
+                .dropDestination(for: URL.self) { urls, _ in
+                    // The drag ENDED here, so there must be no spring-back: a drag that
+                    // sprung into a folder on its way to this row used to yank the window
+                    // back to where it started 0.25s after the drop landed. Every drop
+                    // path has to say so — dropInto/dropIntoCurrentFolder do it for the
+                    // file surfaces, these two sidebar handlers call neither.
+                    SpringLoader.shared.noteDrop()
+                    if let src = urls.first.flatMap(ReorderToken.path(of:)) {
+                        favStore.moveToTop(path: src)
+                        return true
                     }
-                    return true
-                }
+                    // Not a reorder, so it's a folder someone means to pin — and this
+                    // row shadows the section's own pin drop (a row's drop destination
+                    // always beats its section's), so it has to do that job itself
+                    // rather than swallow the drop.
+                    let dirs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+                    dirs.forEach { favStore.add($0) }
+                    return !dirs.isEmpty
+                } isTargeted: { recentsTargeted = $0 }
                 .background(RoundedRectangle(cornerRadius: 4)
                     .fill(Color.accentColor.opacity(recentsTargeted ? 0.35 : 0)))
                 // Reorder by dragging one favorite onto another — see `tree`. List's
@@ -4834,6 +6476,7 @@ struct SidebarView: View {
                 ForEach(favNodes) { tree($0, removable: true) }
             }
             .dropDestination(for: URL.self) { urls, _ in
+                SpringLoader.shared.noteDrop()   // see the Recents row above
                 for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }
                 return true
             }
@@ -4844,6 +6487,13 @@ struct SidebarView: View {
                             Label(u.lastPathComponent.isEmpty ? u.path : u.lastPathComponent, systemImage: "clock.arrow.circlepath")
                                 .frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
                         }.buttonStyle(.plain).help(u.path)
+                        .modifier(FolderDropRow(folder: u, browser: browser))
+                        .contextMenu {
+                            locationMenu(u)
+                            Divider()
+                            Button("Remove from Recents") { recents.remove(u) }
+                            Button("Clear Recents") { recents.clear() }
+                        }
                     }
                 } header: {
                     HStack {
@@ -4856,13 +6506,41 @@ struct SidebarView: View {
             if !cloudNodes.isEmpty {
                 Section("Cloud") { ForEach(cloudNodes) { tree($0, removable: false) } }
             }
-            Section("Locations") { ForEach(volumes) { row($0) } }
+            Section("Locations") {
+                ForEach(volumes) { row($0) }
+                // The Trash is a location like any other — browsing it is the only way
+                // to get at Put Back, and before this the Trash was reachable from
+                // Navigator only by typing its path. Deliberately NOT a drop target:
+                // dropping files on it would be a delete disguised as a move, and
+                // ⌘⌫ / the toolbar trash button are the explicit ways to do that.
+                Button { browser.navigate(to: Browser.trashURL) } label: {
+                    Label("Trash", systemImage: "trash").frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.plain)
+                .contextMenu {
+                    Button("Open") { browser.navigate(to: Browser.trashURL) }
+                    Button("Open in New Tab") { model.newTab(at: Browser.trashURL) }
+                    Divider()
+                    Button("Empty Trash…") { confirmEmptyTrash(browser) }
+                }
+            }
             if !network.servers.isEmpty {
                 Section("Network") {
                     ForEach(network.servers) { s in
                         Button { NSWorkspace.shared.open(s.url) } label: {
                             Label(s.name, systemImage: "network").frame(maxWidth: .infinity, alignment: .leading)
                         }.buttonStyle(.plain).help("Connect to \(s.url.absoluteString)")
+                        // Deliberately NOT the shared locationMenu: a discovered
+                        // server is an smb:// address, not a mounted folder, so
+                        // "New Tab"/"Second Pane"/"Reveal in Finder" would all be
+                        // handed a URL no file API can open. Once it IS mounted it
+                        // appears under Locations, which has the full menu.
+                        .contextMenu {
+                            Button("Open") { NSWorkspace.shared.open(s.url) }
+                            Button("Copy Address") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(s.url.absoluteString, forType: .string)
+                            }
+                        }
                     }
                 }
             }
@@ -4884,13 +6562,15 @@ struct SidebarView: View {
 struct ControlBar: View {
     @ObservedObject var model: AppModel
     @ObservedObject var browser: Browser
-    @FocusState private var addressFocused: Bool
+    // Only the search field uses SwiftUI focus. It is never removed from the
+    // hierarchy, so its focus value cannot go stale the way the address bar's did —
+    // that field is an AppKit bridge for exactly that reason (see AddressField).
+    @FocusState private var searchFocused: Bool
     // Drives which address-bar state is showing (read-only path vs live field). A plain
     // @State separate from the FocusState on purpose: the field must EXIST before it can
     // be focused, so "start editing" inserts it (this flag) and the field then takes
     // focus in its own onAppear — the order the old single-flag design got wrong.
     @State private var editingPath = false
-    @FocusState private var searchFocused: Bool
     private var folderName: String {
         let n = browser.currentURL.lastPathComponent
         return n.isEmpty ? "Macintosh HD" : n
@@ -4901,12 +6581,18 @@ struct ControlBar: View {
             HStack(spacing: 8) {
                 Button { model.showSidebar.toggle() } label: { Image(systemName: "sidebar.left") }
                     .help("Navigation Pane (⌥⌘S)").foregroundStyle(model.showSidebar ? Color.accentColor : .secondary)
+                // ⌘[ / ⌘] / ⌘↑ live in the Go menu, NOT here. A SwiftUI
+                // .keyboardShortcut and an NSMenuItem key equivalent for the same
+                // chord are two independent handlers, and both fire — ⌘[ went back
+                // TWO steps. The menu owns the chords (it's the discoverable place
+                // and it can grey out at the ends of the history); these buttons are
+                // click-only.
                 Button { browser.goBack() } label: { Image(systemName: "chevron.left") }
-                    .disabled(!browser.canGoBack).keyboardShortcut("[", modifiers: .command).help("Back")
+                    .disabled(!browser.canGoBack).help("Back (⌘[)")
                 Button { browser.goForward() } label: { Image(systemName: "chevron.right") }
-                    .disabled(!browser.canGoForward).keyboardShortcut("]", modifiers: .command).help("Forward")
+                    .disabled(!browser.canGoForward).help("Forward (⌘])")
                 Button { browser.goUp() } label: { Image(systemName: "chevron.up") }
-                    .keyboardShortcut(.upArrow, modifiers: .command).help("Up")
+                    .help("Up (⌘↑)")
                 Button { browser.refresh() } label: { Image(systemName: "arrow.clockwise") }
                     .keyboardShortcut("r", modifiers: .command).help("Refresh")
 
@@ -4923,17 +6609,17 @@ struct ControlBar: View {
                     // focus request usually just failed. That's why the bar took "a few
                     // double-clicks" to catch: it only worked when a click happened to
                     // land during a re-render race. Here the field is INSERTED first and
-                    // claims focus in .onAppear, when it demonstrably exists and is
-                    // visible — no race to win.
+                    // takes first responder itself (see AddressField) — no race to win.
                     if editingPath {
-                        TextField("Type a path and press Return", text: $browser.pathText)
-                            .textFieldStyle(.plain).font(.system(size: 12, design: .monospaced))
-                            .focused($addressFocused)
-                            .onAppear { addressFocused = true }
-                            .onSubmit { browser.submitPath(); editingPath = false }
-                            // Focus left the field (clicked a file, pressed Escape via
-                            // AppKit, tabbed away) — show the truncated path again.
-                            .onChange(of: addressFocused) { if !addressFocused { editingPath = false } }
+                        // Return navigates; Escape restores the real path. Both also put
+                        // the bar back to its read-only display.
+                        AddressField(text: $browser.pathText,
+                                     onCommit: { browser.submitPath(); editingPath = false },
+                                     onCancel: {
+                                         browser.pathText = browser.addressString(for: browser.currentURL)
+                                         editingPath = false
+                                     })
+                            .frame(maxWidth: .infinity)
                     } else {
                         Text(browser.pathText.isEmpty ? "Type a path and press Return" : browser.pathText)
                             .font(.system(size: 12, design: .monospaced))
@@ -4959,7 +6645,12 @@ struct ControlBar: View {
                         .textFieldStyle(.plain).focused($searchFocused)
                         .onSubmit { browser.runSearch() }
                         .onChange(of: browser.searchText) {
-                            if browser.searchText.isEmpty && browser.isSearching { browser.clearSearch() }
+                            // Emptying the text ends the search ONLY if no filter is
+                            // armed — "everything modified today" is still a search
+                            // with no text in the box.
+                            if browser.searchText.isEmpty && browser.isSearching {
+                                if browser.searchFilters.isActive { browser.runSearch() } else { browser.clearSearch() }
+                            }
                         }
                     if !browser.searchText.isEmpty {
                         Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("Clear Search")
@@ -4971,17 +6662,70 @@ struct ControlBar: View {
                         Picker("Kind", selection: $browser.searchKind) {
                             ForEach(SearchKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                         }
-                    } label: { Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary) }
-                        .menuStyle(.borderlessButton).frame(width: 20).help("Search Scope & Kind")
+                        Picker("Date Modified", selection: $browser.searchFilters.date) {
+                            ForEach(SearchDateFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                        }
+                        Picker("Size", selection: $browser.searchFilters.size) {
+                            ForEach(SearchSizeFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                        }
+                        if browser.searchFilters.isActive {
+                            Divider()
+                            // Resetting the struct is enough: the two .onChange handlers
+                            // below see date and size go back to .any and re-run the
+                            // search themselves. Calling runSearch() here as well only
+                            // started a third query for the same keystroke.
+                            Button("Clear Date & Size Filters") { browser.searchFilters = SearchFilters() }
+                        }
+                    } label: {
+                        // The icon fills in when a filter is armed. Without it a
+                        // filter-narrowed result list is indistinguishable from a folder
+                        // that simply doesn't contain what you're looking for.
+                        Image(systemName: browser.searchFilters.isActive || browser.searchKind != .any
+                              ? "line.3.horizontal.decrease.circle.fill"
+                              : "line.3.horizontal.decrease.circle")
+                            .foregroundStyle(browser.searchFilters.isActive || browser.searchKind != .any ? Color.accentColor : Color.secondary)
+                    }
+                        .menuStyle(.borderlessButton).frame(width: 20).help("Search Scope, Kind, Date & Size")
                         .onChange(of: browser.searchThisMac) { if browser.isSearching { browser.runSearch() } }
                         .onChange(of: browser.searchKind) { if browser.isSearching { browser.runSearch() } }
+                        // Picking "Custom Range…" has to collect the range BEFORE the
+                        // search runs, and a cancelled prompt must not leave the picker
+                        // reading "Custom Range…" while matching everything.
+                        .onChange(of: browser.searchFilters.date) {
+                            if browser.searchFilters.date == .custom {
+                                guard let r = promptCustomDateRange(from: browser.searchFilters.customDateFrom,
+                                                                    to: browser.searchFilters.customDateTo) else {
+                                    browser.searchFilters.date = .any; return
+                                }
+                                browser.searchFilters.customDateFrom = r.from
+                                browser.searchFilters.customDateTo = r.to
+                            }
+                            browser.runSearch()
+                        }
+                        .onChange(of: browser.searchFilters.size) {
+                            if browser.searchFilters.size == .custom {
+                                guard let r = promptCustomSizeRange(from: browser.searchFilters.customSizeFrom,
+                                                                    to: browser.searchFilters.customSizeTo) else {
+                                    browser.searchFilters.size = .any; return
+                                }
+                                browser.searchFilters.customSizeFrom = r.from
+                                browser.searchFilters.customSizeTo = r.to
+                            }
+                            browser.runSearch()
+                        }
                 }
                 .padding(.horizontal, 7).padding(.vertical, 5)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
                 .frame(width: 200)
 
-                Button("") { addressFocused = true }.keyboardShortcut("l", modifiers: .command)
+                // ⌘L has to INSERT the field, not just ask for focus. The address bar
+                // only exists as an editable field while editingPath is true, so the
+                // old focus-only version aimed a focus request at a view that wasn't in
+                // the hierarchy and did nothing whatsoever — ⌘L was dead. Focus, and the
+                // whole path arriving selected so you can type a replacement, come from
+                // AddressField itself.
+                Button("") { editingPath = true }.keyboardShortcut("l", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
                 Button("") { searchFocused = true }.keyboardShortcut("f", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
@@ -4990,8 +6734,7 @@ struct ControlBar: View {
             // Row 2: Windows 11-style command bar
             HStack(spacing: 6) {
                 Menu {
-                    Button { browser.newFolder() } label: { Label("Folder", systemImage: "folder.badge.plus") }
-                    Button { browser.newTextFile() } label: { Label("Text File", systemImage: "doc.badge.plus") }
+                    newItemsMenu(browser, ids: browser.selection)
                 } label: { Label("New", systemImage: "plus") }
                     .menuStyle(.borderlessButton).fixedSize().help("New")
 
@@ -5001,7 +6744,17 @@ struct ControlBar: View {
                 Button { browser.pasteFiles() } label: { Image(systemName: "doc.on.clipboard") }.help("Paste")
                 Button { if let id = browser.selection.first { promptRename(browser, id) } } label: { Image(systemName: "pencil") }.help("Rename").disabled(!oneSel)
                 Button { shareItems(selURLs) } label: { Image(systemName: "square.and.arrow.up") }.help("Share").disabled(!hasSel)
-                Button { browser.moveToTrash(browser.selection) } label: { Image(systemName: "trash") }.help("Delete (⌘⌫)").disabled(!hasSel)
+                // In the Trash, "move to trash" is meaningless — the two things you
+                // actually want there are Put Back and Empty, so the button becomes
+                // the one that can't be reached any other way from the toolbar.
+                if browser.isTrash {
+                    Button { browser.putBack(browser.selection) } label: { Image(systemName: "arrow.uturn.backward") }
+                        .help("Put Back").disabled(!hasSel)
+                    Button { confirmEmptyTrash(browser) } label: { Image(systemName: "trash.slash") }
+                        .help("Empty Trash")
+                } else {
+                    Button { browser.moveToTrash(browser.selection) } label: { Image(systemName: "trash") }.help("Delete (⌘⌫)").disabled(!hasSel)
+                }
 
                 sep()
                 Menu {
@@ -5030,15 +6783,28 @@ struct ControlBar: View {
                     Button { browser.viewMode = .icon; browser.iconSize = 56 } label: { Label("Small icons", systemImage: "square.grid.4x3.fill") }
                     Divider()
                     Button { browser.viewMode = .list } label: { Label("Details", systemImage: "list.bullet") }
-                    // Column view disabled (didn't lay out correctly) — re-enable this
-                    // button + the .column cases in adjustViewScale/body/Settings to restore.
-                    // Button { browser.viewMode = .column } label: { Label("Columns", systemImage: "rectangle.split.3x1") }
                     Button { browser.viewMode = .gallery } label: { Label("Gallery", systemImage: "photo.on.rectangle") }
                     Divider()
+                    // Same ColumnMenu source as the menu-bar submenu and the header
+                    // right-click menu, so all three always agree.
+                    Menu("Columns") {
+                        ForEach(ColumnMenu.togglableIDs, id: \.self) { id in
+                            Toggle(fileColumnTitle(id), isOn: Binding(
+                                get: { browser.visibleColumns.contains(id) },
+                                set: { _ in
+                                    browser.visibleColumns = ColumnMenu.toggled(browser.visibleColumns, id: id)
+                                    if browser.viewMode != .list { browser.viewMode = .list }
+                                }))
+                        }
+                    }
                     Toggle("Preview pane", isOn: $model.showPreview)
                     Menu("Show") {
                         Toggle("Navigation pane", isOn: $model.showSidebar)
                         Toggle("Hidden items", isOn: $browser.showHidden)
+                    }
+                    Divider()
+                    Button { ViewOptionsController.shared.toggle(model) } label: {
+                        Label("Show View Options (⌘J)", systemImage: "slider.horizontal.3")
                     }
                 } label: { Label("View", systemImage: "square.grid.2x2") }.menuStyle(.borderlessButton).fixedSize().help("View")
 
@@ -5058,7 +6824,7 @@ struct ControlBar: View {
         }.padding(.horizontal, 10).padding(.vertical, 8)
         .onReceive(NotificationCenter.default.publisher(for: .navigatorFocusSearch)) { _ in searchFocused = true }
         .onReceive(NotificationCenter.default.publisher(for: .navigatorResignFields)) { _ in
-            addressFocused = false; searchFocused = false; editingPath = false
+            searchFocused = false; editingPath = false
         }
     }
 
@@ -5092,6 +6858,8 @@ struct SearchBanner: View {
 
 struct BreadcrumbBar: View {
     @ObservedObject var browser: Browser
+    @ObservedObject var model: AppModel
+    @ObservedObject private var favStore = FavoritesStore.shared
     var body: some View {
         let crumbs = browser.breadcrumbs()
         // Too deep to fit? Drop crumbs from the FRONT, not the back — the folder
@@ -5129,7 +6897,25 @@ struct BreadcrumbBar: View {
                                    vertical: false)
                 }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
+                // Every item acts on THIS crumb's folder, not browser.currentURL —
+                // `crumb.url` is captured per iteration, which is the whole reason a
+                // per-segment menu is worth having (right-clicking "Users" and getting
+                // the deepest folder's menu would be worse than no menu).
+                .contextMenu { crumbMenu(crumb.url) }
             }
+        }
+    }
+
+    // Reuses the sidebar's shared folder commands verbatim, plus the two that only
+    // make sense for a real directory on disk.
+    @ViewBuilder private func crumbMenu(_ url: URL) -> some View {
+        folderLocationMenu(url, browser: browser, model: model)
+        Divider()
+        Button("Get Info") { showFolderInfo(url, browser: browser) }
+        if favStore.contains(url) {
+            Button("Unpin from Sidebar") { FavoritesStore.shared.remove(url: url) }
+        } else {
+            Button("Pin to Sidebar") { FavoritesStore.shared.add(url) }
         }
     }
 }
@@ -5163,6 +6949,73 @@ struct ThumbIcon: View {
 // because only AppKit gives control over the INITIAL selection range — needed to
 // select just the base name and exclude the extension (Explorer/Finder's rename
 // behavior), which a fresh TextField would otherwise select-all or select-none.
+// The address bar's editor: an NSTextField bridge for the same reason RenameField is
+// one — SwiftUI's @FocusState could not be made to focus this field reliably. Because
+// the field is INSERTED and REMOVED (the bar is a truncated Text the rest of the time),
+// SwiftUI keeps the focus value pointing at it after removal and re-syncs that value
+// back from the platform responder, so the "focus me" assignment on the next open was
+// a same-value write that moved nothing. Measured on every variation tried (two Bools,
+// one enum, clearing on submit/disappear): ⌘L focused the bar once per launch, and
+// after that the caret went to the SEARCH box instead. Taking first responder here has
+// no SwiftUI state that can go stale, and it selects the whole path for free.
+struct AddressField: NSViewRepresentable {
+    @Binding var text: String
+    let onCommit: () -> Void
+    let onCancel: () -> Void
+
+    func makeNSView(context: Context) -> NSTextField {
+        let f = NSTextField(string: text)
+        f.isBordered = false
+        f.drawsBackground = false
+        f.focusRingType = .none
+        f.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        f.placeholderString = "Type a path and press Return"
+        f.delegate = context.coordinator
+        f.lineBreakMode = .byTruncatingHead
+        DispatchQueue.main.async {
+            guard let window = f.window else { return }
+            window.makeFirstResponder(f)
+            f.currentEditor()?.selectAll(nil)   // whole path selected: type to replace it
+        }
+        return f
+    }
+    // Only push text IN when the field isn't being typed in, so navigation that
+    // rewrites pathText while the bar is open can't fight the caret.
+    func updateNSView(_ nsView: NSTextField, context: Context) {
+        if nsView.currentEditor() == nil, nsView.stringValue != text { nsView.stringValue = text }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        private let parent: AddressField
+        private var finished = false
+        init(_ parent: AddressField) { self.parent = parent }
+        func controlTextDidChange(_ obj: Notification) {
+            guard let f = obj.object as? NSTextField else { return }
+            parent.text = f.stringValue
+        }
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                finished = true; parent.text = control.stringValue; parent.onCommit(); return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                finished = true; parent.onCancel(); return true
+            }
+            return false
+        }
+        // Unlike RenameField, ending the edit any other way (clicking a file, tabbing
+        // away) must NOT commit: navigating somewhere because the caret happened to
+        // leave a half-typed path is the opposite of what the user asked for. Only
+        // Return navigates — which is also how the bar behaved before it could be
+        // opened with ⌘L at all.
+        func controlTextDidEndEditing(_ obj: Notification) {
+            guard !finished else { return }
+            finished = true
+            parent.onCancel()
+        }
+    }
+}
+
 struct RenameField: NSViewRepresentable {
     let initialText: String
     let excludeExtension: Bool
@@ -5336,6 +7189,150 @@ func openFileItems(_ ids: Set<String>, browser: Browser) {
     for it in chosen { NSWorkspace.shared.open(it.url) }
 }
 
+// THE list of "New …" items, in one place.
+//
+// Four surfaces offer it — the toolbar's New button, List view's blank-area menu,
+// Icon view's blank-area menu and the file context menu — and they were previously
+// four hand-written copies that had already drifted apart once. Anything added here
+// appears in all of them at once. (The menu-bar File menu is an AppKit NSMenu and
+// can't share a ViewBuilder; it calls the same Browser methods, which is where the
+// behaviour actually lives.)
+//
+// `ids` is what the selection-dependent entries act on: the right-clicked items for a
+// context menu, `browser.selection` for the toolbar and the blank-area menus.
+@ViewBuilder
+func newItemsMenu(_ browser: Browser, ids: Set<FileItem.ID>) -> some View {
+    Button { browser.newFolder() } label: { Label("Folder", systemImage: "folder.badge.plus") }
+    if !ids.isEmpty {
+        Button { browser.newFolderWithSelection(ids) } label: {
+            Label(ids.count == 1 ? "Folder with Selection" : "Folder with Selection (\(ids.count) items)",
+                  systemImage: "folder.badge.gearshape")
+        }
+    }
+    Divider()
+    Button { browser.newTextFile() } label: { Label("Text File", systemImage: "doc.badge.plus") }
+    Button { browser.newRichTextFile() } label: { Label("Rich Text Document", systemImage: "doc.richtext") }
+    // Zip and Alias need something to act ON, so they're absent rather than disabled
+    // when nothing is selected — an "empty archive" is not a thing anyone wants, and
+    // zip refuses to create one anyway.
+    if !ids.isEmpty {
+        Divider()
+        Button { browser.compress(ids) } label: { Label("Zip Archive from Selection", systemImage: "doc.zipper") }
+        Button { browser.makeAlias(ids) } label: { Label("Alias of Selection", systemImage: "arrow.uturn.forward") }
+    }
+}
+
+// "Send To" (Windows Explorer parity), mapped onto macOS. Everything here COPIES —
+// never moves — because that's what Explorer's Send To does, and because a move to a
+// removable drive that turns out to be full or read-only would take the original with it.
+@ViewBuilder
+func sendToMenu(_ browser: Browser, ids: Set<FileItem.ID>) -> some View {
+    Menu {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        Button("Desktop") { browser.sendTo(ids, folder: home.appendingPathComponent("Desktop")) }
+        Button("Documents") { browser.sendTo(ids, folder: home.appendingPathComponent("Documents")) }
+        Button("Downloads") { browser.sendTo(ids, folder: home.appendingPathComponent("Downloads")) }
+        Button("Home Folder") { browser.sendTo(ids, folder: home) }
+        Divider()
+        Button("Compressed (zipped) Folder") { browser.compress(ids) }
+        // Mail only if the system can actually do it. canPerform() is the whole point:
+        // with no mail account configured, perform() silently does nothing, and a menu
+        // item that quietly fails is worse than one that isn't there.
+        let selURLs = browser.urls(ids)
+        if let mail = NSSharingService(named: .composeEmail), mail.canPerform(withItems: selURLs) {
+            Button("Mail Recipient") { mail.perform(withItems: selURLs) }
+        }
+        // Removable drives, enumerated live. Network shares are excluded even though
+        // volumeLocations() marks them ejectable too — Explorer's Send To means "a stick
+        // you're about to walk away with", and a slow SMB copy started from a submenu
+        // with no obvious destination is a nasty surprise.
+        let drives = volumeLocations().filter { $0.ejectable && !$0.isNetwork }
+        if !drives.isEmpty {
+            Divider()
+            ForEach(drives, id: \.url) { d in
+                Button { browser.sendTo(ids, folder: d.url) } label: { Label(d.name, systemImage: d.symbol) }
+            }
+        }
+    } label: {
+        Label("Send To", systemImage: "paperplane")
+    }
+}
+
+// Shift+right-click = Windows 11's "Show more options". True only when Shift was held
+// for the click that ASKED for this menu.
+//
+// Two sources, and both are needed. The click event's OWN flags come first: that is the
+// only reading tied to the gesture that opened this menu, and it is what a right-click
+// carries no matter which of the three surfaces built the menu (NSTableView's
+// menu(for:), MarqueeCatcher's NSHostingMenu, or SwiftUI's .contextMenu — all three are
+// constructed while the right-mouse-down is NSApp.currentEvent). The live keyboard state
+// is the fallback for the case where the current event is something else entirely (a
+// menu-tracking or periodic event), where "is Shift down right now" is the best answer
+// available. Reading ONLY the live state was measured NOT to work with synthesized
+// input, so the event flags are not a redundant belt.
+func contextMenuIsExtended() -> Bool {
+    if let e = NSApp.currentEvent {
+        switch e.type {
+        case .rightMouseDown, .rightMouseUp, .leftMouseDown, .leftMouseUp:
+            return e.modifierFlags.contains(.shift)
+        default: break
+        }
+    }
+    return NSEvent.modifierFlags.contains(.shift)
+}
+
+// The extra developer/power items Shift+right-click reveals.
+//
+// Deliberately NOT including a "Copy POSIX Path": that is byte-for-byte what the plain
+// "Copy Path" above already does, and two items with identical behaviour is how a menu
+// starts lying about itself.
+@ViewBuilder
+func extendedCopyItems(_ browser: Browser, ids: Set<FileItem.ID>) -> some View {
+    // A Section, not a Divider + Text: a bare Text inside a menu ViewBuilder was
+    // measured to silently drop ITSELF AND EVERY BUTTON AFTER IT from the rendered
+    // NSMenu — the flag was read correctly and the extra items simply never appeared.
+    // Only real menu content (Button/Divider/Menu/Section) survives the conversion.
+    Section("More Options") {
+        Button("Copy file:// URL") { browser.copyFileURL(ids) }
+        Button("Copy Name Without Extension") { browser.copyNameWithoutExtension(ids) }
+        Button("Copy as Markdown Link") { browser.copyMarkdownLink(ids) }
+        Button("Copy Enclosing Folder Path") { browser.copyParentPath(ids) }
+    }
+}
+
+/// What replaces "Move to Trash" when you're already looking AT the Trash.
+///
+/// Put Back is offered only for items whose original location is actually known, and
+/// the disabled item says so rather than looking live and doing nothing. For the rest
+/// there is "Move to…", which asks where — because the one thing a Restore must never
+/// do is guess and drop a file somewhere the user won't think to look.
+@ViewBuilder
+func trashItemMenu(_ browser: Browser, ids: Set<FileItem.ID>) -> some View {
+    let sel = browser.items.filter { ids.contains($0.id) }
+    let known = sel.filter { browser.trashOrigin(of: $0) != nil }
+    if known.count == sel.count, let first = known.first {
+        // No force-unwrap on the second lookup. It was only safe because the filter and
+        // the unwrap happened in one synchronous pass — and loadTrashPutBack republishes
+        // trashPutBack from a background read, so an origin that existed a moment ago can
+        // be gone by the next evaluation. A crash in a menu builder is not worth the
+        // shorter line; a plain "Put Back" reads fine.
+        let title = (sel.count == 1 ? browser.trashOrigin(of: first)?.directory : nil)
+            .map { "Put Back to “\($0)”" } ?? "Put Back"
+        Button(title) { browser.putBack(ids) }
+    } else if known.isEmpty {
+        Button("Put Back") {}
+            .disabled(true)
+            .help("macOS didn't record where \(sel.count == 1 ? "this item came" : "these items came") from — use “Move to…” instead.")
+    } else {
+        Button("Put Back (\(known.count) of \(sel.count))") { browser.putBack(ids) }
+            .help("\(sel.count - known.count) of these have no recorded original location.")
+    }
+    Button("Move to…") { browser.moveOutOfTrash(ids) }
+    Divider()
+    Button("Delete Immediately…") { browser.deleteFromTrash(ids) }
+    Button("Empty Trash…") { confirmEmptyTrash(browser) }
+}
+
 // Shared right-click menu for a file/folder selection — used by both List view
 // (NativeFileTable) and Icon view, so a fix or an added action lands in every
 // view mode at once instead of drifting between hand-duplicated copies.
@@ -5416,6 +7413,12 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 Button("Extract") { browser.extract(ids) }
             }
             Divider()
+            sendToMenu(browser, ids: ids)
+            // Same "New" list as the blank-area menu and the toolbar, driven by the
+            // right-clicked items — that's what makes "Folder with Selection" reachable
+            // from a right-click on the files it should wrap up.
+            Menu { newItemsMenu(browser, ids: ids) } label: { Label("New", systemImage: "plus") }
+            Divider()
             Button("Share…") { shareItems(browser.items.filter { ids.contains($0.id) }.map { $0.url }) }
             if let it = browser.items.first(where: { $0.id == ids.first }) {
                 Button("Open in Terminal") { openInTerminal(it.isDirectory ? it.url : browser.currentURL) }
@@ -5424,7 +7427,13 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             Button("Copy") { browser.copyFiles(ids) }
             Button("Cut") { browser.cutFiles(ids) }
             Button("Paste") { browser.pasteFiles() }
-            if !browser.isGoogleDriveSelection(ids) { Button("Copy Path") { browser.copyPath(ids) } }
+            if !browser.isGoogleDriveSelection(ids) {
+                Button("Copy Path") { browser.copyPath(ids) }
+                // Windows' "Copy as path" — the same path in QUOTED form, so it can be
+                // pasted straight into a shell. The suffix is in the title because
+                // "Copy Path" and "Copy as Path" are otherwise indistinguishable.
+                Button("Copy as Path (Quoted)") { browser.copyQuotedPath(ids) }
+            }
             Button("Copy Name") { browser.copyName(ids) }
             if browser.isGoogleDriveSelection(ids) {
                 Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Web Link") }
@@ -5438,16 +7447,26 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                     Button { browser.setDriveAvailability(ids, offline: true) } label: { gdLabel("Make available offline") }
                 }
             }
+            if contextMenuIsExtended() { extendedCopyItems(browser, ids: ids) }
             Divider()
-            Button("Move to Trash") { browser.moveToTrash(ids) }
+            if browser.isTrash {
+                trashItemMenu(browser, ids: ids)
+            } else {
+                Button("Move to Trash") { browser.moveToTrash(ids) }
+            }
+        } else if browser.isTrash {
+            Button("Empty Trash…") { confirmEmptyTrash(browser) }
+            Button("Refresh") { browser.refresh() }
         } else {
             Button("Paste") { browser.pasteFiles() }
-            Button("New Folder") { browser.newFolder() }
-            Button("New Text File") { browser.newTextFile() }
+            Menu { newItemsMenu(browser, ids: browser.selection) } label: { Label("New", systemImage: "plus") }
             Button("Calculate All Sizes") {
                 for it in browser.items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
             }
             Button("Reveal in Finder") { browser.revealInFinder([]) }
+            Button("Copy Path") { browser.copyPath([]) }
+            Button("Copy as Path (Quoted)") { browser.copyQuotedPath([]) }
+            if contextMenuIsExtended() { extendedCopyItems(browser, ids: []) }
         }
 }
 
@@ -5489,10 +7508,52 @@ private let fileColumnDefs: [FileColumnDef] = [
                  comparator: { KeyPathComparator(\FileItem.dateAdded, order: $0 ? .forward : .reverse) }),
     FileColumnDef(id: "extension", title: "Ext", minWidth: 44, idealWidth: 56, defaultVisible: false,
                  comparator: { KeyPathComparator(\FileItem.ext, order: $0 ? .forward : .reverse) }),
-    FileColumnDef(id: "duration", title: "Time", minWidth: 50, idealWidth: 64, defaultVisible: false, comparator: nil),
-    FileColumnDef(id: "dimensions", title: "Dimensions", minWidth: 90, idealWidth: 110, defaultVisible: false, comparator: nil),
+    // Time and Dimensions sort through MediaSortKey rather than a bare Double, because
+    // their values arrive from Spotlight asynchronously: see MediaSortKey for why absent
+    // and not-yet-loaded both have to collapse to one end, and why the file name is
+    // folded into the key. The cache is filled before the sort lands — see
+    // Browser.sortOrder / prefetchMetadataIfSortingOnIt.
+    FileColumnDef(id: "duration", title: "Time", minWidth: 50, idealWidth: 64, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.durationSortKey, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "dimensions", title: "Dimensions", minWidth: 90, idealWidth: 110, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.dimensionsSortKey, order: $0 ? .forward : .reverse) }),
+    FileColumnDef(id: "owner", title: "Owner", minWidth: 70, idealWidth: 100, defaultVisible: false,
+                 comparator: { KeyPathComparator(\FileItem.owner, order: $0 ? .forward : .reverse) }),
+    // Tags stays unsortable on purpose: an item can carry SEVERAL tags, so there is no
+    // single value to order by, and sorting on the joined string would rank "Blue, Red"
+    // above "Red" for reasons no one could predict from looking at the column.
     FileColumnDef(id: "tags", title: "Tags", minWidth: 90, idealWidth: 140, defaultVisible: false, comparator: nil),
 ]
+
+/// Every column id, in header order — the ONE list both column menus are built from.
+let fileColumnIDs: [String] = fileColumnDefs.map(\.id)
+/// The columns shown when nothing has been customized. Also what "Restore Defaults"
+/// falls back to.
+let defaultVisibleColumnIDs: [String] = fileColumnDefs.filter(\.defaultVisible).map(\.id)
+func fileColumnTitle(_ id: String) -> String { fileColumnDefs.first { $0.id == id }?.title ?? id }
+/// True when this column's values come from Spotlight and therefore have to be
+/// prefetched before a sort on them means anything.
+func fileColumnNeedsMetadata(_ id: String) -> Bool { id == "duration" || id == "dimensions" }
+
+/// The rules BOTH column pickers obey — the header right-click menu and View ▸ Columns.
+///
+/// One source deliberately, because the header menu was for a long time the only way to
+/// reach column visibility at all (undiscoverable), and adding a second entry point is
+/// precisely how two menus start listing different columns. Neither menu decides anything
+/// for itself: both enumerate `togglableIDs` and both call `toggled`.
+enum ColumnMenu {
+    /// Name is excluded: hiding it would leave rows with no filename and no way to click
+    /// one, and the rename field lives in that column.
+    static let togglableIDs: [String] = fileColumnIDs.filter { $0 != "name" }
+
+    static func toggled(_ visible: Set<String>, id: String) -> Set<String> {
+        guard id != "name" else { return visible }
+        var out = visible
+        if out.contains(id) { out.remove(id) } else { out.insert(id) }
+        out.insert("name")            // never reachable as a toggle, but never lost either
+        return out
+    }
+}
 
 // NSTableView subclass that lets a click reach Table's OWN normal handling
 // (selection, drag-start) FIRST via super.mouseDown, and only afterward —
@@ -5505,6 +7566,12 @@ private final class ClickTimingTableView: NSTableView {
     var onNameClickCandidate: ((Int) -> Void)?
     var onContextMenuRequest: ((Int) -> NSMenu?)?
     var onDragTargeted: ((Bool) -> Void)?
+    /// Clicking a group header collapses/expands it. Reported from here rather than from a
+    /// button or a SwiftUI gesture inside the header cell so there is exactly ONE handler
+    /// for the click — the failure mode when two exist is a toggle that fires twice and
+    /// looks like nothing happened.
+    var onGroupRowClick: ((Int) -> Void)?
+    var isGroupRowAt: ((Int) -> Bool)?
 
     override func mouseDown(with event: NSEvent) {
         // Parity with icon view (whose clicks route through Browser.click): clicking
@@ -5514,6 +7581,14 @@ private final class ClickTimingTableView: NSTableView {
         NotificationCenter.default.post(name: .navigatorResignFields, object: nil)
         let point = convert(event.locationInWindow, from: nil)
         let clickedRow = row(at: point)
+        // Group headers are handled entirely here and super is deliberately NOT called:
+        // the row is unselectable, so super would only start a drag-select from it, and a
+        // double-click on a header would otherwise reach doubleAction and try to open a
+        // selection the click never made.
+        if clickedRow >= 0, isGroupRowAt?(clickedRow) == true {
+            if event.clickCount == 1 { onGroupRowClick?(clickedRow) }
+            return
+        }
         let clickedColumn = column(at: point)
         let wasSoleSelected = clickedRow >= 0 && selectedRowIndexes.count == 1 && selectedRowIndexes.contains(clickedRow)
         let isNameColumn = clickedColumn >= 0 && tableColumns.indices.contains(clickedColumn)
@@ -5652,6 +7727,49 @@ private final class HostingTableCellView: NSTableCellView {
     }
 }
 
+// A group header row: disclosure triangle + title, both drawn by AppKit.
+//
+// Not a HostingTableCellView like the data cells, on purpose. This row's only job is to
+// be clicked, and the whole row is the target — wrapping a SwiftUI view in an
+// NSHostingView here would put a second mouse handler in the path for one gesture, which
+// is the shape of bug this file has been bitten by repeatedly. Plain NSViews decline the
+// hit and the click reaches the table.
+private final class GroupHeaderCellView: NSTableCellView {
+    private let chevron = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        label.font = .boldSystemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        chevron.contentTintColor = .secondaryLabelColor
+        chevron.imageScaling = .scaleProportionallyDown
+        textField = label
+        for v in [chevron, label] as [NSView] {
+            addSubview(v)
+            v.translatesAutoresizingMaskIntoConstraints = false
+        }
+        NSLayoutConstraint.activate([
+            chevron.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            chevron.centerYAnchor.constraint(equalTo: centerYAnchor),
+            chevron.widthAnchor.constraint(equalToConstant: 11),
+            label.leadingAnchor.constraint(equalTo: chevron.trailingAnchor, constant: 5),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(title: String, collapsed: Bool) {
+        label.stringValue = title
+        chevron.image = NSImage(systemSymbolName: collapsed ? "chevron.right" : "chevron.down",
+                                accessibilityDescription: collapsed ? "Expand group" : "Collapse group")
+    }
+    /// Declines the mouse for the same reason the data cells do — the click has to reach
+    /// NSTableView, which is where the collapse toggle is wired up.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 private struct NativeFileTable: NSViewRepresentable {
     let model: AppModel
     @ObservedObject var browser: Browser
@@ -5674,6 +7792,24 @@ private struct NativeFileTable: NSViewRepresentable {
     }
 }
 
+/// A column header that sorts on the FIRST click, even when the window isn't key.
+///
+/// THIS IS THE FIX FOR A CONFIRMED REGRESSION — do not delete it as a no-op subclass.
+///
+/// AppKit's default is `acceptsFirstMouse == false`, which means the click that brings a
+/// window forward is consumed by the activation and never reaches the view. Once the app
+/// grew a floating ⌘J View Options panel, any use of that panel handed key away from the
+/// browser window, and the next click on a column header did nothing whatsoever: no
+/// re-sort, no indicator move. A RIGHT-click at the same point still opened the column
+/// picker (context menus don't need a key window), which made it look like left-click
+/// sorting specifically had broken, when the sorting code was never involved.
+///
+/// Returning true here makes a header click always mean "sort", the way it did before any
+/// panel existed, and it does so for EVERY window that could steal key — not just ⌘J.
+private final class FirstMouseTableHeaderView: NSTableHeaderView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     let model: AppModel
     var browser: Browser
@@ -5691,6 +7827,9 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     /// live drag discards the drag's drop targeting, and the visible symptom is a drop
     /// that "does nothing" — no error, no move, no feedback.
     fileprivate var isDragActive = false
+    /// The folder the last reload was built from — the one thing `isDragActive` lets
+    /// through, so a spring-loaded folder actually appears while the drag continues.
+    private var lastReloadPath: String?
 
     init(model: AppModel, browser: Browser, open: @escaping (Set<String>) -> Void, contextMenu: @escaping (Set<FileItem.ID>) -> AnyView) {
         self.model = model; self.browser = browser; self.open = open; self.contextMenu = contextMenu
@@ -5712,11 +7851,23 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         table.doubleAction = #selector(doubleClicked(_:))
         table.onNameClickCandidate = { [weak self] row in self?.handleNameClickCandidate(row: row) }
         table.onContextMenuRequest = { [weak self] row in self?.buildContextMenu(row: row) }
+        table.isGroupRowAt = { [weak self] row in
+            guard let self, self.rows.indices.contains(row) else { return false }
+            if case .header = self.rows[row] { return true }
+            return false
+        }
+        table.onGroupRowClick = { [weak self] row in
+            guard let self, self.rows.indices.contains(row), case .header(let title) = self.rows[row] else { return }
+            self.browser.toggleGroupCollapsed(title)
+        }
         // Clearing isDragActive here (not only in acceptDrop) matters: a drag that leaves
         // the table or is cancelled never reaches acceptDrop, and a stuck isDragActive
         // would freeze the table's updates for the rest of the session.
         table.onDragTargeted = { [weak self] t in
             guard let self else { return }
+            // The drag left this table (or ended): a dwell timer that outlived it would
+            // navigate the window after the user had already let go.
+            if !t { SpringLoader.shared.cancel() }
             if !t { self.isDragActive = false }
             self.isTargetedBinding?.wrappedValue = t
             if !t { self.reload() }   // catch up on anything skipped during the drag
@@ -5756,9 +7907,17 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
             col.minWidth = def.minWidth
             col.width = def.idealWidth
             if def.comparator != nil { col.sortDescriptorPrototype = NSSortDescriptor(key: def.id, ascending: true) }
-            col.isHidden = !def.defaultVisible
+            // Visibility is pushed from browser.visibleColumns in reload(), never seeded
+            // from def.defaultVisible here — one source, so the View menu and the header
+            // menu cannot disagree. (autosaveTableColumns still owns width and order,
+            // which is why column resize and drag-reorder keep working.)
             table.addTableColumn(col)
         }
+        // Replaces AppKit's header purely to get acceptsFirstMouse — see
+        // FirstMouseTableHeaderView for the regression this prevents.
+        let header = FirstMouseTableHeaderView()
+        header.frame = table.headerView?.frame ?? .zero
+        table.headerView = header
         let headerMenu = NSMenu(); headerMenu.delegate = self
         table.headerView?.menu = headerMenu
         self.tableView = table
@@ -5780,14 +7939,23 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     // on every unrelated Browser change (selection, badgeGeneration, ...).
     func reload() {
         guard let table = tableView else { return }
-        // Hands off entirely while a drag is over this table — see isDragActive. The
-        // pending state is not lost: the drop itself triggers a reload once it lands, and
+        // Hands off while a drag is over this table — see isDragActive. The pending state
+        // is not lost: the drop itself triggers a reload once it lands, and
         // draggingExited/Ended schedule one on the way out.
-        if isDragActive { return }
+        //
+        // The one exception is a FOLDER CHANGE, which mid-drag means a spring-loaded
+        // folder just opened and showing it is the entire point. Keeping the old rows
+        // would be worse than the reload this lock guards against: the drop would target
+        // rows that no longer exist. Drop targeting survives because validateDrop
+        // re-hit-tests and re-setDropRow on every mouse move afterwards.
+        if isDragActive, browser.currentURL.path == lastReloadPath { return }
+        lastReloadPath = browser.currentURL.path
         let newRows: [FileRow] = browser.groupBy == .none
             ? browser.visibleItems().map { .item($0) }
             : browser.groups().flatMap { g -> [FileRow] in
-                g.title.isEmpty ? g.items.map { .item($0) } : [.header(g.title)] + g.items.map { .item($0) }
+                guard !g.title.isEmpty else { return g.items.map { .item($0) } }
+                // The header always stays — it's what you click to get the group back.
+                return [.header(g.title)] + (browser.isGroupCollapsed(g.title) ? [] : g.items.map { .item($0) })
               }
         // The renaming row is part of the signature so that STARTING or ENDING a rename
         // rebuilds the cells — which is what refreshes each cell's `interactive` flag
@@ -5803,9 +7971,31 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
             lastRowSignature = newSignature
             table.reloadData()
         }
+        syncColumnVisibility()
         syncSortDescriptors()
         syncSelection()
         syncScrollTarget()
+    }
+
+    /// Push browser.visibleColumns onto the table. Assigning isHidden unconditionally
+    /// would post a column-visibility change (and an autosave write) on every reload, so
+    /// only genuine differences are written.
+    private func syncColumnVisibility() {
+        guard let table = tableView else { return }
+        for col in table.tableColumns {
+            let shouldHide = !browser.visibleColumns.contains(col.identifier.rawValue)
+            if col.isHidden != shouldHide { col.isHidden = shouldHide }
+        }
+        // NOTE: deliberately does NOT reflow column widths to pull a newly revealed column
+        // into view when the columns already overflow the window.
+        //
+        // Turning on a column whose slot is past the right edge does look like nothing
+        // happened (seen live with Owner, behind a column that had been dragged — and
+        // autosaved — to 1174pt). A table.sizeToFit() here fixes that, but it also
+        // rewrites every column's width, throwing away widths the user set by hand, and
+        // it fires from inside the SwiftUI update that reload() runs in. Not worth that
+        // trade for a cosmetic gain: widening the window, or dragging the greedy column
+        // narrower, brings the new column into view, and both are one gesture.
     }
 
     private func syncSortDescriptors() {
@@ -5819,9 +8009,12 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
                 table.setIndicatorImage(col.identifier.rawValue == def.id
                     ? NSImage(named: asc ? "NSAscendingSortIndicator" : "NSDescendingSortIndicator") : nil, in: col)
             }
-            let desired = NSSortDescriptor(key: def.id, ascending: asc)
-            if table.sortDescriptors.first?.key != desired.key || table.sortDescriptors.first?.ascending != desired.ascending {
-                table.sortDescriptors = [desired]
+            // Rewrites the WHOLE stack, not just a differing first entry — see
+            // TableSortRules for why a stale tail matters even though only the first
+            // descriptor is ever read.
+            if TableSortRules.needsRewrite(current: table.sortDescriptors.map { ($0.key ?? "", $0.ascending) },
+                                           desiredKey: def.id, desiredAscending: asc) {
+                table.sortDescriptors = [NSSortDescriptor(key: def.id, ascending: asc)]
             }
             return
         }
@@ -5875,10 +8068,14 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         open(ids)
     }
 
+    // Toggles the MODEL, not the NSTableColumn. Flipping col.isHidden directly (what this
+    // used to do) made the table its own source of truth, which the View ▸ Columns menu
+    // could not see — and two menus each holding their own idea of what's visible is
+    // exactly the drift that has already produced real bugs here. reload() pushes the
+    // model back onto the columns.
     @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let col = tableView?.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(id)) else { return }
-        col.isHidden.toggle()
+        guard let id = sender.representedObject as? String else { return }
+        browser.visibleColumns = ColumnMenu.toggled(browser.visibleColumns, id: id)
     }
 
     // MARK: NSMenuDelegate (right-click on the column header — show/hide optional columns)
@@ -5886,12 +8083,13 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     func menuNeedsUpdate(_ menu: NSMenu) {
         guard menu === tableView?.headerView?.menu else { return }
         menu.removeAllItems()
-        for col in tableView?.tableColumns ?? [] where col.identifier.rawValue != "name" {
-            let def = fileColumnDefs.first { $0.id == col.identifier.rawValue }
-            let item = NSMenuItem(title: def?.title ?? col.title, action: #selector(toggleColumnVisibility(_:)), keyEquivalent: "")
+        // Built from fileColumnIDs — the same list the View ▸ Columns menu uses — rather
+        // than from the table's own columns, so the two menus cannot list different things.
+        for id in ColumnMenu.togglableIDs {
+            let item = NSMenuItem(title: fileColumnTitle(id), action: #selector(toggleColumnVisibility(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = col.identifier.rawValue
-            item.state = col.isHidden ? .off : .on
+            item.representedObject = id
+            item.state = browser.visibleColumns.contains(id) ? .on : .off
             menu.addItem(item)
         }
     }
@@ -5914,19 +8112,17 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard rows.indices.contains(row) else { return nil }
         if case .header(let title) = rows[row] {
+            // A disclosure triangle plus the title. The triangle is a plain image, not a
+            // button: the whole row is already the click target (see
+            // ClickTimingTableView.onGroupRowClick), and a real NSButton on top of it would
+            // give the row two competing mouse handlers for one gesture.
+            let collapsed = browser.isGroupCollapsed(title)
             let id = NSUserInterfaceItemIdentifier("groupRow")
-            if let cell = tableView.makeView(withIdentifier: id, owner: self) as? NSTableCellView {
-                cell.textField?.stringValue = title; return cell
+            if let cell = tableView.makeView(withIdentifier: id, owner: self) as? GroupHeaderCellView {
+                cell.update(title: title, collapsed: collapsed); return cell
             }
-            let cell = NSTableCellView(); cell.identifier = id
-            let tf = NSTextField(labelWithString: title)
-            tf.font = .boldSystemFont(ofSize: 12); tf.textColor = .secondaryLabelColor
-            cell.addSubview(tf); cell.textField = tf
-            tf.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-                tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            ])
+            let cell = GroupHeaderCellView(identifier: id)
+            cell.update(title: title, collapsed: collapsed)
             return cell
         }
         guard case .item(let item) = rows[row], let colID = tableColumn?.identifier.rawValue else { return nil }
@@ -5955,6 +8151,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
             return item.isDirectory ? AnyView(Text("—").foregroundStyle(.secondary)) : AnyView(MetadataCell(url: item.url, field: .duration))
         case "dimensions":
             return item.isDirectory ? AnyView(Text("—").foregroundStyle(.secondary)) : AnyView(MetadataCell(url: item.url, field: .dimensions))
+        case "owner": return AnyView(Text(item.owner).foregroundStyle(.secondary).lineLimit(1))
         case "tags": return AnyView(TagsCell(tags: item.tags))
         default: return AnyView(EmptyView())
         }
@@ -6002,11 +8199,16 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         guard info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) else { return [] }
         isDragActive = true
         if let hit = folderRow(under: info, in: tableView) {
+            // Spring-loading hangs off validateDrop because it is already the one place
+            // that knows which folder row the pointer is over, and AppKit calls it on
+            // every mouse move — exactly the signal a dwell timer needs.
+            SpringLoader.shared.hover(folder: hit.url, browser: browser)
             // Retarget explicitly so acceptDrop is guaranteed to see this exact row with
             // .on, no matter what was proposed.
             tableView.setDropRow(hit.row, dropOperation: .on)
             return .copy
         }
+        SpringLoader.shared.cancel()   // over empty space or a file: nothing to spring into
         // Empty space, a file row, or between rows → the current folder, which is what
         // Finder does for a drop that isn't aimed at a specific folder.
         tableView.setDropRow(-1, dropOperation: .on)
@@ -6240,6 +8442,63 @@ final class FrameStore { var frames: [String: CGRect] = [:] }
 // real NSView that receives mouseDragged directly. It sits behind the cells, so
 // only drags/clicks on empty space reach it. Coordinates are top-left (flipped)
 // to match SwiftUI's grid space.
+/// A right-click-ONLY overlay whose NSMenu is built at click time.
+///
+/// Why this has to exist at all: SwiftUI's `.contextMenu` content is a View, and SwiftUI
+/// evaluates it during ordinary body updates — measured here, an icon cell's menu was
+/// built while the pointer was merely MOVING over the grid, long before any right-click
+/// (`NSApp.currentEvent` was a `mouseMoved`). So a menu that has to branch on the click's
+/// modifier keys (Shift+right-click → the extended menu) cannot be a `.contextMenu`: by
+/// the time it is shown, the flags it would have read are long gone. AppKit's
+/// `menu(for:)` is handed the actual right-mouse-down, which is the only moment those
+/// flags are still true.
+///
+/// The overlay is invisible to every event EXCEPT a right-click, because `hitTest` is
+/// consulted per event and declines unless the event being dispatched IS the
+/// right-mouse-down. That is what makes it safe to lay over cells that already own their
+/// mouse handling (IconCellMouseHandler) or carry SwiftUI tap gestures: neither sees any
+/// change at all, so the "SwiftUI gesture and AppKit mouseDown both fire on one click"
+/// trap that has caused five regressions in this file cannot apply here.
+struct RightClickMenu: NSViewRepresentable {
+    let build: () -> NSMenu?
+    func makeNSView(context: Context) -> CatcherView { let v = CatcherView(); v.build = build; return v }
+    func updateNSView(_ v: CatcherView, context: Context) { v.build = build }
+    final class CatcherView: NSView {
+        var build: (() -> NSMenu?)?
+        /// macOS has TWO context-click gestures and this used to answer only one.
+        /// Control + left click arrives as a `.leftMouseDown` with `.control` set, so
+        /// the right-click-only guard declined it and it fell through as a plain
+        /// selection — Details/List view kept working (AppKit's `menu(for:)` covers
+        /// both gestures for a real NSTableView), so Icon, Gallery and the filmstrip
+        /// were the only surfaces where Ctrl-click silently did nothing.
+        private static func isContextClick(_ e: NSEvent?) -> Bool {
+            guard let e else { return false }
+            return e.type == .rightMouseDown
+                || (e.type == .leftMouseDown && e.modifierFlags.contains(.control))
+        }
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            // Still invisible to an ORDINARY left click, which is what keeps
+            // IconCellMouseHandler owning selection and drag — one click must never be
+            // processed by both this and the handler underneath.
+            guard Self.isContextClick(NSApp.currentEvent) else { return nil }
+            return super.hitTest(point)
+        }
+        /// Reached for BOTH gestures: AppKit asks the hit view for its menu on a
+        /// right-mouse-down and on a control-left-click alike (verified live), so
+        /// letting the click through hitTest above is the whole fix.
+        override func menu(for event: NSEvent) -> NSMenu? { build?() }
+    }
+}
+
+extension View {
+    /// Drop-in replacement for `.contextMenu` wherever the menu must react to the
+    /// modifier keys held during the right-click. See RightClickMenu for why
+    /// `.contextMenu` cannot.
+    func appKitContextMenu<M: View>(@ViewBuilder _ content: @escaping () -> M) -> some View {
+        overlay { RightClickMenu { NSHostingMenu(rootView: content()) } }
+    }
+}
+
 struct MarqueeCatcher: NSViewRepresentable {
     var onRect: (CGRect?) -> Void      // drag rect in grid space; nil when the drag ends
     var onEmptyClick: () -> Void        // a click on empty space (no drag) → deselect
@@ -6325,17 +8584,14 @@ struct IconGridView: View {
                                 }
                             },
                             onEmptyClick: { browser.selection = []; browser.updateStatus() },
-                            // Same items as the list view's blank-space menu.
+                            // Literally the list view's blank-space menu: the ids.isEmpty
+                            // branch of the shared builder, not a hand-written twin. The
+                            // twin it replaced had already drifted (no Copy Path, no
+                            // extended items) — and it drifts again the moment anything
+                            // is added on only one side.
                             emptyAreaMenu: {
-                                NSHostingMenu(rootView: AnyView(Group {
-                                    Button("Paste") { browser.pasteFiles() }
-                                    Button("New Folder") { browser.newFolder() }
-                                    Button("New Text File") { browser.newTextFile() }
-                                    Button("Calculate All Sizes") {
-                                        for it in browser.items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
-                                    }
-                                    Button("Reveal in Finder") { browser.revealInFinder([]) }
-                                }))
+                                NSHostingMenu(rootView: AnyView(
+                                    fileContextMenu(model: model, browser: browser, ids: [])))
                             }
                         )
                         .frame(maxWidth: .infinity, minHeight: geo.size.height, alignment: .topLeading)
@@ -6344,13 +8600,27 @@ struct IconGridView: View {
                                 ForEach(browser.visibleItems()) { item in cell(item) }
                             } else {
                                 ForEach(browser.groups(), id: \.title) { group in
+                                    let collapsed = browser.isGroupCollapsed(group.title)
                                     Section {
-                                        ForEach(group.items) { item in cell(item) }
+                                        // The header stays either way — it's the only thing
+                                        // left to click to bring the group back.
+                                        if !collapsed { ForEach(group.items) { item in cell(item) } }
                                     } header: {
-                                        HStack {
+                                        HStack(spacing: 5) {
+                                            Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                                                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                                             Text(group.title).font(.headline).foregroundStyle(.secondary)
                                             Spacer()
                                         }.padding(.top, 8).padding(.horizontal, 4)
+                                        .contentShape(Rectangle())
+                                        // Safe to use a plain tap gesture here, unlike on a
+                                        // file cell: a group header carries no
+                                        // IconCellMouseHandler, so nothing else is competing
+                                        // for this click and it cannot fire twice. (The
+                                        // MarqueeCatcher sitting behind the grid may also see
+                                        // the press and clear the selection — which is what
+                                        // clicking a header should do anyway.)
+                                        .onTapGesture { browser.toggleGroupCollapsed(group.title) }
                                     }
                                 }
                             }
@@ -6403,13 +8673,23 @@ struct IconGridView: View {
                 if item.isDirectory { browser.dropInto(urls, folder: item.url) }
                 else { browser.dropIntoCurrentFolder(urls) }
                 return true
+            } isTargeted: { t in
+                // Spring-loading. `leave` rather than an unconditional cancel: SwiftUI
+                // reports the next cell as targeted BEFORE this one un-targets, so
+                // cancelling blindly here would kill the countdown that cell just armed.
+                guard item.isDirectory else { return }
+                if t { SpringLoader.shared.hover(folder: item.url, browser: browser) }
+                else { SpringLoader.shared.leave(item.url) }
             }
-            .contextMenu {
-                // Same shared menu as List view: if the right-clicked cell is part of
-                // a multi-selection, act on the whole selection (Copy/Cut/Batch
-                // Rename/etc.); otherwise just this item. Was previously a hand-
-                // duplicated copy of List view's menu that had drifted — missing
-                // Copy/Cut/Paste and the multi-select Batch Rename branch entirely.
+            // Same shared menu as List view: if the right-clicked cell is part of
+            // a multi-selection, act on the whole selection (Copy/Cut/Batch
+            // Rename/etc.); otherwise just this item. Was previously a hand-
+            // duplicated copy of List view's menu that had drifted — missing
+            // Copy/Cut/Paste and the multi-select Batch Rename branch entirely.
+            //
+            // appKitContextMenu, not .contextMenu: the menu has to be built by the
+            // right-click itself for Shift+right-click to be visible to it.
+            .appKitContextMenu {
                 let ids: Set<String> = (browser.selection.contains(item.id) && browser.selection.count > 1) ? browser.selection : [item.id]
                 fileContextMenu(model: model, browser: browser, ids: ids)
             }
@@ -6529,80 +8809,6 @@ final class SidebarNode: Identifiable {
     }
 }
 
-struct ColumnView: View {
-    let model: AppModel
-    @ObservedObject var browser: Browser
-    @State private var path: [URL] = []   // selected sub-folder chain below the root
-
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: true) {
-            HStack(spacing: 0) {
-                colList(browser.currentURL, level: 0)
-                ForEach(Array(path.enumerated()), id: \.offset) { idx, url in
-                    Divider()
-                    colList(url, level: idx + 1)
-                }
-            }
-        }
-        .onChange(of: browser.currentURL) { path = [] }
-    }
-
-    @ViewBuilder private func colList(_ dir: URL, level: Int) -> some View {
-        ColumnList(dir: dir, browser: browser,
-                   onPickFolder: { folder in path = Array(path.prefix(level)) + [folder] },
-                   onPickFile: { path = Array(path.prefix(level)) },
-                   onOpen: { openItem($0, browser) })
-            .frame(width: 250)
-    }
-}
-
-struct ColumnList: View {
-    let dir: URL
-    @ObservedObject var browser: Browser
-    let onPickFolder: (URL) -> Void
-    let onPickFile: () -> Void
-    let onOpen: (FileItem) -> Void
-    @State private var items: [FileItem] = []
-    @State private var sel: String?
-
-    var body: some View {
-        // Native List → robust click handling, real selection highlight, and
-        // keyboard arrows within the column. Single-select drills; double-click opens.
-        List(selection: $sel) {
-            ForEach(items) { item in
-                HStack(spacing: 6) {
-                    ThumbIcon(item: item, browser: browser)
-                    Text(item.name).lineLimit(1)
-                    Spacer(minLength: 0)
-                    if item.isDirectory { Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary) }
-                }
-                .tag(item.id)
-                .contentShape(Rectangle())
-                .simultaneousGesture(TapGesture(count: 2).onEnded { onOpen(item) })
-            }
-        }
-        .listStyle(.plain)
-        .onChange(of: sel) { handleSelection() }
-        .onAppear { load() }
-        .onChange(of: dir) { sel = nil; load() }
-    }
-    private func handleSelection() {
-        guard let id = sel, let item = items.first(where: { $0.id == id }) else { onPickFile(); return }
-        browser.selection = [id]; browser.updateStatus()
-        if item.isDirectory { onPickFolder(item.url) } else { onPickFile() }
-    }
-    private func load() {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .localizedTypeDescriptionKey]
-        var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
-        if !browser.showHidden { opts.insert(.skipsHiddenFiles) }
-        var result: [FileItem] = []
-        if let urls = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys, options: opts) {
-            for u in urls { result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))) }
-        }
-        items = result.sorted { ($0.isDirectory ? 0 : 1, $0.name.localizedLowercase) < ($1.isDirectory ? 0 : 1, $1.name.localizedLowercase) }
-    }
-}
-
 // Shared image/thumbnail view with icon fallback, used by Gallery view.
 struct ThumbImage: View {
     let item: FileItem
@@ -6649,7 +8855,19 @@ struct GalleryView: View {
                     }
                 if let it = selected {
                     VStack(spacing: 8) {
+                        // The big preview was the last gallery surface with no click
+                        // handler of its own: a click here reaches neither the background
+                        // Color (it's underneath), nor the name label, nor a filmstrip
+                        // cell — so nothing took first responder away and an in-progress
+                        // rename stayed stuck open. A plain SwiftUI gesture is safe HERE
+                        // and only here: unlike the filmstrip thumbnails, this instance of
+                        // ThumbImage carries no IconCellMouseHandler overlay, so there's
+                        // no AppKit mouseDown to fire a second time on the same click.
                         ThumbImage(item: it, browser: browser).padding(24)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if let w = NSApp.keyWindow, isEditingText(in: w) { w.makeFirstResponder(nil) }
+                            }
                         if browser.renamingID == it.id {
                             RenameField(initialText: it.name, excludeExtension: !it.isDirectory,
                                        onCommit: { browser.rename(id: it.id, to: $0); browser.renamingID = nil },
@@ -6658,11 +8876,21 @@ struct GalleryView: View {
                         } else {
                             Text(it.name).font(.callout).lineLimit(1).padding(.bottom, 6)
                                 .onTapGesture {
-                                    if (NSApp.currentEvent?.clickCount ?? 1) == 1 { browser.handleNameTap(it.id) }
+                                    // Same gate as IconCellMouseHandler.mouseUp: a click
+                                    // carrying ⌘ or ⇧ is a selection gesture, never the
+                                    // second half of click-pause-click rename. Without the
+                                    // modifier test, ⌘-clicking the name armed a rename.
+                                    let e = NSApp.currentEvent
+                                    guard (e?.clickCount ?? 1) == 1,
+                                          e?.modifierFlags.intersection([.command, .shift]).isEmpty ?? true
+                                    else { return }
+                                    browser.handleNameTap(it.id)
                                 }
                         }
                     }
-                    .contextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
+                    // Built by the right-click (see RightClickMenu) so Shift+right-click
+                    // reaches the extended menu here too.
+                    .appKitContextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
                 } else {
                     Text("No items").foregroundStyle(.secondary)
                 }
@@ -6682,6 +8910,10 @@ struct GalleryView: View {
                                     if it.isDirectory { browser.dropInto(urls, folder: it.url) }
                                     else { browser.dropIntoCurrentFolder(urls) }
                                     return true
+                                } isTargeted: { t in
+                                    guard it.isDirectory else { return }   // see IconCell
+                                    if t { SpringLoader.shared.hover(folder: it.url, browser: browser) }
+                                    else { SpringLoader.shared.leave(it.url) }
                                 }
                                 // Same reason as the icon grid: .draggable can only carry
                                 // one file, so a multi-selection dragged just the one
@@ -6704,7 +8936,7 @@ struct GalleryView: View {
                                         dragIcon: { browser.icon(for: it) }
                                     )
                                 }
-                                .contextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
+                                .appKitContextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
                         }
                     }.padding(8)
                 }
@@ -6759,7 +8991,9 @@ struct StatusBar: View {
 }
 
 struct TabItemView: View {
+    @ObservedObject var model: AppModel
     @ObservedObject var browser: Browser
+    let index: Int
     let isSelected: Bool
     let showClose: Bool
     let onSelect: () -> Void
@@ -6790,10 +9024,58 @@ struct TabItemView: View {
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.accentColor, lineWidth: dropTargeted ? 2 : 0))
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
+        // THE tab's one and only drop handler, for BOTH payloads. A second destination for
+        // the reorder token would win the hit test over this one and then decline the file
+        // URLs it doesn't recognise, silently killing drop-a-file-onto-a-tab — the exact
+        // bug that broke sidebar favorite reordering. Told apart by what they are, like the
+        // sidebar does (TabDragToken / ReorderToken). Do NOT add a second drop modifier.
         .dropDestination(for: URL.self) { urls, _ in
+            if let src = urls.first.flatMap({ TabDragToken.index(of: $0, model: model) }) {
+                // Released ON a tab, so this was a reorder however far the pointer roamed —
+                // including a release back on the source tab, which does nothing. Either
+                // way it must not also tear the tab off into a new window.
+                TabDrag.shared.noteHandled()
+                model.moveTab(from: src, to: index)
+                return true
+            }
             browser.dropInto(urls, folder: browser.currentURL)
             onSelect(); return true
         } isTargeted: { dropTargeted = $0 }
+        // Drag a tab: sideways onto another tab reorders, pulled out of the strip it
+        // becomes its own window (see TabDrag). onDrag rather than draggable for the same
+        // reason the sidebar uses it — draggable loses the mouse-down to the content.
+        //
+        // The .onTapGesture above still fires (verified live): onDrag only claims the
+        // gesture once the press has travelled past the drag threshold, and a press that
+        // moves ~12pt before releasing IS a drag, in this strip exactly as in Chrome's.
+        .onDrag {
+            TabDrag.shared.begin(model: model, index: index)
+            return TabDragToken.provider(model: model, index: index)
+        }
+        // Safe to attach here, unlike on a file cell: a tab carries no
+        // NSViewRepresentable mouse handler, so nothing else is competing for the
+        // click and the existing .onTapGesture / .dropDestination keep working.
+        .contextMenu {
+            Button("New Tab") { model.newTab() }
+            Button("Duplicate Tab") { model.newTab(at: browser.currentURL) }
+            Divider()
+            Button("Close Tab") { onClose() }
+                .disabled(model.tabs.count < 2)
+            // Disabled, not silently inert, when there is nothing to close — the same
+            // TabMenuRules checks the actions themselves guard on.
+            Button("Close Other Tabs") { model.closeOtherTabs(index) }
+                .disabled(!TabMenuRules.canCloseOthers(index: index, count: model.tabs.count))
+            Button("Close Tabs to the Right") { model.closeTabsToRight(index) }
+                .disabled(!TabMenuRules.canCloseToRight(index: index, count: model.tabs.count))
+            Divider()
+            Button("Move Tab to New Window") { model.moveTabToNewWindow(index) }
+                .disabled(!TabMenuRules.canMoveToNewWindow(index: index, count: model.tabs.count))
+            Divider()
+            // This tab's folder, never the active one — that distinction is the whole
+            // point of a per-tab menu.
+            Button("Copy Path") { browser.copyToClipboard(browser.currentURL.path) }
+            Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([browser.currentURL]) }
+        }
     }
 }
 
@@ -6802,7 +9084,7 @@ struct TabStrip: View {
     var body: some View {
         HStack(spacing: 6) {
             ForEach(Array(model.tabs.enumerated()), id: \.element.id) { idx, browser in
-                TabItemView(browser: browser,
+                TabItemView(model: model, browser: browser, index: idx,
                             isSelected: idx == model.selected,
                             showClose: model.tabs.count > 1,
                             onSelect: { model.selected = idx },
@@ -6825,7 +9107,7 @@ struct BrowserContent: View {
                 SearchBanner(browser: browser)
                 Divider()
             } else {
-                BreadcrumbBar(browser: browser)
+                BreadcrumbBar(browser: browser, model: model)
                 Divider()
             }
             Group {
@@ -6835,8 +9117,6 @@ struct BrowserContent: View {
                     switch browser.viewMode {
                     case .icon: IconGridView(model: model, browser: browser)
                     case .gallery: GalleryView(model: model, browser: browser)
-                    // Column view disabled — a stale saved "column" pref falls back to Details.
-                    // case .column: ColumnView(model: model, browser: browser)
                     default: FileTableView(model: model, browser: browser)
                     }
                 }
@@ -7298,13 +9578,24 @@ struct ImageViewerView: View {
         guard urls.indices.contains(index) else { return }
         let target = urls[index]
         let perform = {
-            var out: NSURL?
-            do { try FileManager.default.trashItem(at: target, resultingItemURL: &out) }
-            catch { reportFileError("Couldn't move “\(target.lastPathComponent)” to the Trash.", error.localizedDescription); return }
-            let trashed = out as URL?
-            UndoStack.shared.push("Delete “\(target.lastPathComponent)”") {
-                if let t = trashed { try? FileManager.default.moveItem(at: t, to: target) }
+            // trashItems, not fm.trashItem: the helper records where this came from, so
+            // Put Back works on an image deleted here. A bare trashItem left it in the
+            // Trash with no origin at all.
+            let r = trashItems([target])
+            guard let landed = r.restores.first?.from else {
+                reportFileError("Couldn't move “\(target.lastPathComponent)” to the Trash.", r.problem ?? "")
+                return
             }
+            var trashed: URL? = landed   // re-pointed by redo; the Trash path changes each round
+            UndoStack.shared.push("Delete “\(target.lastPathComponent)”", undo: {
+                guard let t = trashed else { return nil }
+                return restoreItems([(from: t, to: target)])
+            }, redo: {
+                // Fresh Trash path on every re-bin, so point the undo half at it.
+                let r = trashItems([target])
+                trashed = r.restores.first?.from
+                return r.problem
+            })
             urls.remove(at: index)
             if urls.isEmpty { NSApp.keyWindow?.close(); return }
             if index >= urls.count { index = urls.count - 1 }
@@ -7420,6 +9711,7 @@ struct ImageViewerView: View {
                 Button("") { zoomCtl.fit() }.keyboardShortcut("0", modifiers: .command)
                 Button("") { deleteCurrent() }.keyboardShortcut(.delete, modifiers: [])
                 Button("") { UndoStack.shared.undo() }.keyboardShortcut("z", modifiers: .command)
+                Button("") { UndoStack.shared.redo() }.keyboardShortcut("z", modifiers: [.command, .shift])
                 Button("") { NSApp.keyWindow?.close() }.keyboardShortcut(.escape, modifiers: [])
             }.frame(width: 0, height: 0).opacity(0)
         }
@@ -7729,22 +10021,98 @@ final class CompareController {
 
 // MARK: - Rich Get Info window
 
+/// Everything Get Info's Sharing & Permissions section needs, read in ONE pass —
+/// stat + two directory-service lookups + one resource read. Off the main thread,
+/// because on a network file each of those is a round-trip.
+struct FileAccess {
+    var mode: UInt16 = 0
+    var owner = "—"
+    var group = "—"
+    var locked = false
+    var isDirectory = false
+    /// Only the owner (or root) can chmod, so the pickers are read-only for anyone
+    /// else — offering an editable control that always fails is worse than showing
+    /// the truth.
+    var canChangeMode = false
+}
+
+func readFileAccess(_ url: URL) -> FileAccess? {
+    var st = stat()
+    // stat, not lstat: chmod() FOLLOWS a symlink, so reading the link's own mode here
+    // would show one thing and change another — the picker would say "Read only" for
+    // the link while the change landed on the file it points at. lstat is only the
+    // fallback for a BROKEN link, where there is nothing else to describe.
+    guard stat(url.path, &st) == 0 || lstat(url.path, &st) == 0 else { return nil }
+    var a = FileAccess()
+    a.mode = UInt16(st.st_mode) & 0o7777
+    a.isDirectory = (st.st_mode & S_IFMT) == S_IFDIR
+    a.owner = getpwuid(st.st_uid).flatMap { String(validatingUTF8: $0.pointee.pw_name) } ?? String(st.st_uid)
+    a.group = getgrgid(st.st_gid).flatMap { String(validatingUTF8: $0.pointee.gr_name) } ?? String(st.st_gid)
+    a.locked = (st.st_flags & UInt32(UF_IMMUTABLE)) != 0
+    a.canChangeMode = st.st_uid == geteuid() || geteuid() == 0
+    return a
+}
+
+/// chmod, returning nil on success or a message to show. Deliberately NOT
+/// `try? FileManager.setAttributes`: that swallows the reason, and "you are not the
+/// owner" is the entire useful content of the failure.
+func setPosixMode(_ url: URL, _ mode: UInt16) -> String? {
+    guard chmod(url.path, mode_t(mode)) != 0 else { return nil }
+    return String(cString: strerror(errno))
+}
+
+/// Finder's "Locked" checkbox — the UF_IMMUTABLE (uchg) flag, which stops the file
+/// being renamed, moved, edited or deleted until it's cleared.
+func setLocked(_ url: URL, _ locked: Bool) -> String? {
+    var u = url
+    var v = URLResourceValues()
+    v.isUserImmutable = locked
+    do { try u.setResourceValues(v); return nil }
+    catch { return error.localizedDescription }
+}
+
+/// What an alias or symlink points at, or nil if this isn't one.
+///
+/// Symlinks are checked FIRST: `.isAliasFileKey` is true for symbolic links as well
+/// as for Finder aliases, so testing it first would send every symlink through the
+/// bookmark resolver, which can't read one.
+func aliasTarget(_ url: URL) -> URL? {
+    let rv = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isAliasFileKey])
+    if rv?.isSymbolicLink == true {
+        guard let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path) else { return nil }
+        return dest.hasPrefix("/")
+            ? URL(fileURLWithPath: dest)
+            : url.deletingLastPathComponent().appendingPathComponent(dest).standardizedFileURL
+    }
+    if rv?.isAliasFile == true, let t = try? URL(resolvingAliasFileAt: url, options: []),
+       t.standardizedFileURL != url.standardizedFileURL {
+        return t
+    }
+    return nil
+}
+
 struct GetInfoView: View {
     @ObservedObject var browser: Browser
-    let item: FileItem
+    /// One item, or a whole selection. A multi-item window shows the combined
+    /// summary instead of per-item fields — the old behaviour for >1 item was a bare
+    /// NSAlert with three lines of text.
+    let items: [FileItem]
+    private var item: FileItem { items[0] }
+    private var isMulti: Bool { items.count > 1 }
     @ObservedObject private var sizeCache = FolderSizeCache.shared
     @State private var name: String
     @State private var comment: String = ""
     @State private var tags: [String]
     @State private var thumb: NSImage?
     @State private var meta = FileMeta()
-    @State private var perms = "—"
+    @State private var access: FileAccess?
+    @State private var target: URL?
     private static let df: DateFormatter = { let d = DateFormatter(); d.dateStyle = .long; d.timeStyle = .short; return d }()
 
-    init(browser: Browser, item: FileItem) {
-        self.browser = browser; self.item = item
-        _name = State(initialValue: item.name)
-        _tags = State(initialValue: item.tags)
+    init(browser: Browser, items: [FileItem]) {
+        self.browser = browser; self.items = items
+        _name = State(initialValue: items[0].name)
+        _tags = State(initialValue: items[0].tags)
     }
     var body: some View {
         ScrollView {
@@ -7752,25 +10120,70 @@ struct GetInfoView: View {
                 HStack {
                     Spacer()
                     Group {
-                        if let t = thumb { Image(nsImage: t).resizable().scaledToFit() }
-                        else { Image(nsImage: browser.icon(for: item)).resizable().scaledToFit() }
+                        if isMulti {
+                            Image(systemName: "square.stack.3d.up").resizable().scaledToFit().foregroundStyle(.secondary)
+                        } else if let t = thumb {
+                            Image(nsImage: t).resizable().scaledToFit()
+                        } else {
+                            Image(nsImage: browser.icon(for: item)).resizable().scaledToFit()
+                        }
                     }.frame(width: 120, height: 120)
                     Spacer()
                 }
-                TextField("Name", text: $name).textFieldStyle(.roundedBorder).font(.headline)
-                    .onSubmit { if name != item.name { browser.rename(id: item.id, to: name) } }
+                if isMulti {
+                    Text("\(items.count) items selected").font(.headline)
+                    Divider()
+                    Group {
+                        row("Total Size", multiSizeText())
+                        row("Files", "\(items.filter { !$0.isDirectory }.count)")
+                        row("Folders", "\(items.filter { $0.isDirectory }.count)")
+                        row("Where", item.url.deletingLastPathComponent().path)
+                    }.font(.callout)
+                    if items.contains(where: { $0.isDirectory }) {
+                        Button("Calculate Folder Sizes") {
+                            for it in items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
+                        }
+                    }
+                } else {
+                    TextField("Name", text: $name).textFieldStyle(.roundedBorder).font(.headline)
+                        .onSubmit { if name != item.name { browser.rename(id: item.id, to: name) } }
+                }
                 Divider()
-                Group {
-                    row("Kind", item.kind)
-                    row("Size", sizeText())
-                    if let d = meta.duration, d >= 1 { row("Duration", formatDuration(d)) }
-                    if let w = meta.width, let h = meta.height, w > 0, h > 0 { row("Dimensions", "\(w) × \(h)") }
-                    row("Created", Self.df.string(from: item.created))
-                    row("Modified", Self.df.string(from: item.modified))
-                    row("Added", Self.df.string(from: item.dateAdded))
-                    row("Where", item.url.deletingLastPathComponent().path)
-                    row("Permissions", perms)
-                }.font(.callout)
+                if !isMulti {
+                    Group {
+                        row("Kind", item.kind)
+                        row("Size", sizeText())
+                        if let d = meta.duration, d >= 1 { row("Duration", formatDuration(d)) }
+                        if let w = meta.width, let h = meta.height, w > 0, h > 0 { row("Dimensions", "\(w) × \(h)") }
+                        row("Created", Self.df.string(from: item.created))
+                        row("Modified", Self.df.string(from: item.modified))
+                        row("Added", Self.df.string(from: item.dateAdded))
+                        row("Where", item.url.deletingLastPathComponent().path)
+                    }.font(.callout)
+                    // An alias/symlink whose target is shown and reachable — the whole
+                    // point of Get Info on one is finding out what it actually points at.
+                    if let target {
+                        Divider()
+                        Text("Original").font(.subheadline).bold()
+                        row("Points to", target.path)
+                        let exists = FileManager.default.fileExists(atPath: target.path)
+                        HStack {
+                            Button("Reveal Original") { browser.revealInApp(target) }.disabled(!exists)
+                            if !exists {
+                                Label("The original is missing.", systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(.orange)
+                            }
+                        }
+                    }
+                    Divider()
+                    Toggle("Locked", isOn: Binding(
+                        get: { access?.locked ?? false },
+                        set: { changeLocked($0) }
+                    )).disabled(access == nil)
+                        .help("A locked item can't be renamed, moved, edited or deleted until it's unlocked.")
+                }
+                Divider()
+                sharingSection()
                 Divider()
                 Text("Tags").font(.subheadline).bold()
                 HStack(spacing: 8) {
@@ -7781,36 +10194,79 @@ struct GetInfoView: View {
                         }.buttonStyle(.plain).help(t)
                     }
                 }
-                Divider()
-                Text("Comment").font(.subheadline).bold()
-                TextEditor(text: $comment).frame(height: 56)
-                    .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
-                Button("Save Comment") { browser.setComment(id: item.id, comment) }
-                if !item.isDirectory {
+                if !isMulti {
                     Divider()
-                    HStack {
-                        Text("Opens with").foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Change…") { if let app = chooseApplication() { setDefaultApp(app, for: item.url) } }
-                    }.font(.callout)
-                }
-                if let ri = readRestyleInfo(item.url) {
-                    Divider()
-                    Text("Restyle Info").font(.subheadline).bold()
-                    if !ri.contents.isEmpty { row("Contents", ri.contents) }
-                    if !ri.prompt.isEmpty { row("Prompt", ri.prompt) }
+                    Text("Comment").font(.subheadline).bold()
+                    TextEditor(text: $comment).frame(height: 56)
+                        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.3)))
+                    Button("Save Comment") { browser.setComment(id: item.id, comment) }
+                    if !item.isDirectory {
+                        Divider()
+                        HStack {
+                            Text("Opens with").foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Change…") { if let app = chooseApplication() { setDefaultApp(app, for: item.url) } }
+                        }.font(.callout)
+                    }
+                    if let ri = readRestyleInfo(item.url) {
+                        Divider()
+                        Text("Restyle Info").font(.subheadline).bold()
+                        if !ri.contents.isEmpty { row("Contents", ri.contents) }
+                        if !ri.prompt.isEmpty { row("Prompt", ri.prompt) }
+                    }
                 }
             }.padding(16)
         }
-        .frame(minWidth: 320, minHeight: 480)
+        .frame(minWidth: 340, minHeight: 480)
         .onAppear { load() }
     }
+
+    /// Finder's Sharing & Permissions, including the part Finder gets right and a
+    /// raw "rwxr-xr-x" string does not: the levels are editable, and a change that
+    /// the filesystem refuses says so instead of appearing to work.
+    @ViewBuilder private func sharingSection() -> some View {
+        Text("Sharing & Permissions").font(.subheadline).bold()
+        if let a = access {
+            let levels = PosixMode.levels(a.mode)
+            Group {
+                accessRow(a.owner, levels.owner, .owner, editable: a.canChangeMode)
+                accessRow(a.group, levels.group, .group, editable: a.canChangeMode)
+                accessRow("everyone", levels.other, .other, editable: a.canChangeMode)
+                row("POSIX", PosixMode.string(a.mode) + "  (\(String(a.mode, radix: 8)))")
+            }.font(.callout)
+            if !a.canChangeMode {
+                Label("You can only change these if you own the item.", systemImage: "lock")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if isMulti {
+                Label("Showing “\(item.name)”. Changes apply to all \(items.count) selected items.",
+                      systemImage: "info.circle").font(.caption).foregroundStyle(.secondary)
+            }
+        } else {
+            Text("Reading…").font(.callout).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private func accessRow(_ who: String, _ level: PosixAccess, _ cls: PosixClass, editable: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(who).foregroundStyle(.secondary).frame(width: 92, alignment: .trailing).lineLimit(1)
+            if editable {
+                Picker("", selection: Binding(get: { level }, set: { changeAccess(cls, $0) })) {
+                    ForEach(PosixAccess.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }.labelsHidden().frame(maxWidth: 200, alignment: .leading)
+            } else {
+                Text(level.rawValue).frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
     @ViewBuilder private func row(_ k: String, _ v: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(k).foregroundStyle(.secondary).frame(width: 92, alignment: .trailing)
             Text(v).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+
     private func sizeText() -> String {
         if item.isDirectory {
             if let s = sizeCache.cached(item.url) { return ByteCountFormatter.string(fromByteCount: s, countStyle: .file) }
@@ -7818,27 +10274,98 @@ struct GetInfoView: View {
         }
         return ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
     }
+    /// Combined size of a selection. Folders only count once their recursive size has
+    /// been computed, and the total says so rather than quietly under-reporting.
+    private func multiSizeText() -> String {
+        var total: Int64 = 0
+        var pendingFolders = 0
+        for it in items {
+            if it.isDirectory {
+                if let s = sizeCache.cached(it.url) { total += s } else { pendingFolders += 1 }
+            } else {
+                total += it.size
+            }
+        }
+        let s = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+        return pendingFolders == 0 ? s : "\(s) + \(pendingFolders) folder\(pendingFolders == 1 ? "" : "s") not yet calculated"
+    }
+
+    // Kept for the Owner column, which wants the string form.
     static func permString(_ url: URL) -> String {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let perm = attrs[.posixPermissions] as? NSNumber else { return "—" }
-        let p = perm.uint16Value
-        func rwx(_ v: UInt16) -> String { "\(v & 4 != 0 ? "r" : "-")\(v & 2 != 0 ? "w" : "-")\(v & 1 != 0 ? "x" : "-")" }
-        return "\(rwx((p >> 6) & 7))\(rwx((p >> 3) & 7))\(rwx(p & 7))"
+        return PosixMode.string(perm.uint16Value)
     }
+
     private func toggle(_ t: String) {
         if let i = tags.firstIndex(of: t) { tags.remove(at: i) } else { tags.append(t) }
-        browser.setTags([item.id], tags: tags)
+        browser.setTags(Set(items.map { $0.id }), tags: tags)
     }
+
+    /// chmod every selected item, then RE-READ from disk. Re-reading is the point:
+    /// the picker must show what the filesystem actually says, not what we asked for,
+    /// or a refused change leaves the UI claiming a permission the file doesn't have.
+    private func changeAccess(_ cls: PosixClass, _ level: PosixAccess) {
+        guard let a = access else { return }
+        // OFF-MAIN. A stat and a chmod are one network round-trip each, so this loop was
+        // 2N round-trips run on the main thread from a Picker's setter — pick a
+        // permission for twenty files on a VPN'd share and the whole window froze,
+        // beachball and all, until every one of them answered. Same shape as load().
+        let targets = items
+        let probe = item.url
+        DispatchQueue.global(qos: .userInitiated).async {
+            var failures: [String] = []
+            for it in targets {
+                guard let cur = readFileAccess(it.url) else { failures.append("• \(it.name): can't be read"); continue }
+                let next = PosixMode.setting(cur.mode, cls, to: level, isDirectory: cur.isDirectory)
+                if next == cur.mode { continue }
+                if let err = setPosixMode(it.url, next) { failures.append("• \(it.name): \(err)") }
+            }
+            let fresh = readFileAccess(probe)
+            DispatchQueue.main.async {
+                access = fresh ?? a
+                if !failures.isEmpty {
+                    reportFileError(failures.count == 1 ? "The permission couldn't be changed" : "\(failures.count) items couldn't be changed",
+                                    failures.prefix(5).joined(separator: "\n"))
+                }
+            }
+        }
+    }
+
+    private func changeLocked(_ locked: Bool) {
+        guard let a = access else { return }
+        let targets = items
+        let probe = item.url
+        DispatchQueue.global(qos: .userInitiated).async {   // one round-trip per item — see changeAccess
+            var failures: [String] = []
+            for it in targets {
+                if let err = setLocked(it.url, locked) { failures.append("• \(it.name): \(err)") }
+            }
+            let fresh = readFileAccess(probe)
+            DispatchQueue.main.async {
+                access = fresh ?? a
+                if !failures.isEmpty {
+                    reportFileError(locked ? "The item couldn't be locked" : "The item couldn't be unlocked",
+                                    failures.prefix(5).joined(separator: "\n"))
+                }
+            }
+        }
+    }
+
     private func load() {
-        ThumbnailCache.shared.thumbnail(for: item.url, size: 512) { thumb = $0 }
-        MetadataCache.shared.meta(for: item.url) { m in meta = m; if let c = m.comment, comment.isEmpty { comment = c } }
-        if item.isDirectory { FolderSizeCache.shared.compute(item.url) }
-        // Permissions read is a stat — off-main so opening Get Info on a network
-        // file doesn't hitch.
+        if !isMulti {
+            ThumbnailCache.shared.thumbnail(for: item.url, size: 512) { thumb = $0 }
+            MetadataCache.shared.meta(for: item.url) { m in meta = m; if let c = m.comment, comment.isEmpty { comment = c } }
+        }
+        for it in items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
+        // stat + directory-service lookups + the alias resolve are all round-trips on a
+        // network file, so opening Get Info there doesn't hitch the window.
         let url = item.url
+        let multi = isMulti
         DispatchQueue.global(qos: .utility).async {
-            let p = GetInfoView.permString(url)
-            DispatchQueue.main.async { perms = p }
+            let a = readFileAccess(url)
+            let t = multi ? nil : aliasTarget(url)
+            DispatchQueue.main.async { access = a; target = t }
         }
     }
 }
@@ -7846,16 +10373,26 @@ struct GetInfoView: View {
 final class GetInfoController {
     static let shared = GetInfoController()
     private var windows: [String: NSWindow] = [:]
-    func show(_ browser: Browser, _ item: FileItem) {
-        if let w = windows[item.id] { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 540),
+    func show(_ browser: Browser, _ item: FileItem) { show(browser, [item]) }
+    func show(_ browser: Browser, _ items: [FileItem]) {
+        guard !items.isEmpty else { return }
+        // Keyed by the whole selection, so re-asking for the same multi-selection
+        // reuses its window instead of stacking a new one every time.
+        let key = items.map { $0.id }.sorted().joined(separator: "\u{1}")
+        if let w = windows[key] { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 600),
                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
-        w.title = "\(item.name) Info"
+        w.title = items.count == 1 ? "\(items[0].name) Info" : "\(items.count) Items Info"
         w.isReleasedWhenClosed = false
-        w.contentView = NSHostingView(rootView: GetInfoView(browser: browser, item: item))
+        w.contentView = NSHostingView(rootView: GetInfoView(browser: browser, items: items))
         w.center()
         w.makeKeyAndOrderFront(nil)
-        windows[item.id] = w
+        windows[key] = w
+        // Without this the map grows for the life of the process and a reopened Get
+        // Info hands back a window that has already been closed.
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+            self?.windows[key] = nil
+        }
         NSApp.activate(ignoringOtherApps: true)
     }
 }
@@ -8144,8 +10681,31 @@ enum Updater {
     }
 }
 
+// A view with one job: hold the keyboard focus that would otherwise land in the
+// search box. AppKit gives first responder to the first view in the key-view loop
+// that will take it whenever a window has no initial first responder, and in this
+// window the empty search field is the only taker — so the app opened with the caret
+// in Search and the first thing typed went there instead of doing type-to-select.
+// Handles no keys itself: events fall straight through to the window (Tab) and the
+// app's key monitor (type-to-select, arrows, Space, …), which is the point.
+final class FocusParkView: NSView {
+    override var acceptsFirstResponder: Bool { true }
+}
+
 final class NavWindow: NSWindow {
-    let model = AppModel()
+    let model: AppModel
+
+    /// `session` is the saved tab list this window is restoring, or nil for a fresh
+    /// one. It has to arrive through the initialiser: the model reads it once, and a
+    /// window created without one must not go looking for somebody else's tabs.
+    init(session: WindowSession?) {
+        model = AppModel(session: session)
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
+                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                   backing: .buffered, defer: false)
+    }
+    // Retained by the view hierarchy; kept here so it can be re-parked if needed.
+    let focusPark = FocusParkView(frame: NSRect(x: 0, y: 0, width: 1, height: 1))
     private var titleObservers: [AnyCancellable] = []
 
     // Keeps the title (and so the Dock menu's window list) showing the folder the
@@ -8172,11 +10732,53 @@ final class NavWindow: NSWindow {
         title = name.isEmpty ? "Navigator" : name
     }
 
+    // Never leave the WINDOW ITSELF holding first responder — park it on focusPark.
+    // Two separate breakages, both measured, come from letting focus sit on the window:
+    // AppKit reads that state as "no view has focus" and its pick-the-first-key-view
+    // fallback can hand focus to the empty search box, and SwiftUI's .keyboardShortcut
+    // buttons (⌘L, ⌘F, ⌘R) stop firing because there is no focused view inside the
+    // hosting view to dispatch through — after committing a path with Return, the very
+    // next ⌘L did nothing at all until focus was parked here.
+    //
+    // nil and self are the two ways callers land on the window: makeFirstResponder(nil)
+    // is how the app force-ends an edit (rename commit, .navigatorResignFields, a click
+    // in the file list), and AppKit's own endEditingFor: passes the window.
+    //
+    // The `parking` flag is load-bearing: making focusPark first responder resigns the
+    // old responder, and AppKit's resign path calls straight back in here with the
+    // window again — without the flag that recurses until the stack runs out.
+    private var parking = false
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+        guard !parking, responder == nil || responder === self, focusPark.window === self else {
+            return super.makeFirstResponder(responder)
+        }
+        parking = true
+        defer { parking = false }
+        return super.makeFirstResponder(focusPark)
+    }
+
     // ⌘ + scroll wheel resizes/cycles the view (Windows 11 Ctrl+scroll). Handled
     // here in sendEvent so the event is fully consumed — a local event monitor
     // isn't reliable because AppKit's responsive scrolling can still deliver the
     // wheel event to the list, making it scroll while zooming.
     override func sendEvent(_ event: NSEvent) {
+        // Tab / ⇧Tab cycles the file selection, Finder-style — handled HERE rather
+        // than in AppDelegate's key monitor for the same reason ⌘-scroll is: the
+        // monitor cannot make the keystroke go away. Measured live: with the monitor
+        // returning nil, AppKit still ran the key event through the key-view loop a
+        // few tens of milliseconds later, which parked first responder in the search
+        // field — so every OTHER Tab then looked like "text is being edited, keep
+        // out" and did nothing. Consuming it in sendEvent means the key-view loop
+        // never sees it, and Tab cycles on every press.
+        //
+        // While a field IS being edited (rename editor, address bar, search) the
+        // event falls through untouched, so Tab still does normal field-to-field
+        // navigation there.
+        if event.type == .keyDown, event.keyCode == 48, !isEditingText(in: self),
+           event.modifierFlags.intersection([.command, .option, .control]).isEmpty {
+            model.active.cycleSelection(event.modifierFlags.contains(.shift) ? -1 : 1)
+            return   // consume — do not forward to AppKit's key-view loop
+        }
         if event.type == .scrollWheel,
            event.modifierFlags.intersection([.command, .option, .control, .shift]) == .command {
             let dy = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
@@ -8184,6 +10786,193 @@ final class NavWindow: NSWindow {
             return   // consume — do not forward to the content/scroll view
         }
         super.sendEvent(event)
+    }
+}
+
+// MARK: - View Options panel (⌘J)
+
+/// Finder's ⌘J, for the folder the front window is showing.
+///
+/// Every control writes straight through to the live Browser, so the folder rearranges as
+/// you change things rather than on an OK button — which is also what makes "Always open
+/// this folder with these options" honest: it snapshots what you are already looking at.
+///
+/// The panel binds to `model.active`, not to a Browser captured when it opened, so
+/// switching tabs or navigating retargets it instead of quietly editing a folder that is
+/// no longer on screen.
+struct ViewOptionsView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject private var store = FolderViewOptionsStore.shared
+
+    var body: some View {
+        // Observing the active Browser is what refreshes this panel when the folder or its
+        // arrangement changes underneath it.
+        ViewOptionsBody(browser: model.active, store: store)
+            .frame(width: 300)
+    }
+}
+
+private struct ViewOptionsBody: View {
+    @ObservedObject var browser: Browser
+    @ObservedObject var store: FolderViewOptionsStore
+
+    private var remembers: Bool { store.contains(browser.currentURL.path) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(browser.currentURL.lastPathComponent.isEmpty ? "/" : browser.currentURL.lastPathComponent)
+                .font(.headline).lineLimit(1).truncationMode(.middle)
+
+            Toggle("Always open this folder with these options", isOn: Binding(
+                get: { remembers },
+                set: { browser.setRemembersViewOptions($0) }))
+            .help("On: this folder keeps its own view options and changes here stop affecting other folders. Off: the folder uses the global defaults.")
+
+            Divider()
+
+            Picker("View", selection: Binding(get: { browser.viewMode }, set: { browser.viewMode = $0 })) {
+                Text("Details").tag(ViewMode.list)
+                Text("Icons").tag(ViewMode.icon)
+                Text("Gallery").tag(ViewMode.gallery)
+            }
+            Picker("Sort by", selection: Binding(
+                get: { browser.currentSortColumn },
+                set: { browser.sortOrder = [Browser.comparator(forColumn: $0, ascending: browser.currentAscending)] })) {
+                // Only the sortable columns — an unsortable one (Tags) in this picker would
+                // silently do nothing when chosen.
+                ForEach(sortableColumnIDs, id: \.self) { Text(fileColumnTitle($0)).tag($0) }
+            }
+            Picker("Order", selection: Binding(
+                get: { browser.currentAscending },
+                set: { browser.sortOrder = [Browser.comparator(forColumn: browser.currentSortColumn, ascending: $0)] })) {
+                Text("Ascending").tag(true); Text("Descending").tag(false)
+            }
+            Picker("Group by", selection: Binding(get: { browser.groupBy }, set: { browser.groupBy = $0 })) {
+                Text("(None)").tag(GroupBy.none)
+                Text("Kind").tag(GroupBy.kind)
+                Text("Date Modified").tag(GroupBy.date)
+                Text("Size").tag(GroupBy.size)
+            }
+
+            // Icon size only means something in the two grid modes; shown disabled rather
+            // than hidden so the panel doesn't change height as you switch views.
+            HStack {
+                Text("Icon size")
+                Slider(value: Binding(get: { browser.iconSize }, set: { browser.iconSize = $0 }),
+                       in: Browser.minIconSize...Browser.maxIconSize)
+                Text("\(Int(browser.iconSize))").monospacedDigit().foregroundStyle(.secondary)
+                    .frame(width: 30, alignment: .trailing)
+            }
+            .disabled(browser.viewMode == .list)
+
+            Divider()
+            Text("Columns").font(.subheadline).foregroundStyle(.secondary)
+            // Same source as the View ▸ Columns menu and the header right-click menu.
+            ForEach(ColumnMenu.togglableIDs, id: \.self) { id in
+                Toggle(fileColumnTitle(id), isOn: columnBinding(id))
+            }
+            .disabled(browser.viewMode != .list)
+
+            Divider()
+            HStack {
+                Button("Use as Defaults") { browser.useCurrentViewOptionsAsDefaults() }
+                    .help("Make these the options every folder without its own saved options uses.")
+                Spacer()
+                Button("Restore Defaults") { browser.setRemembersViewOptions(false) }
+                    .disabled(!remembers)
+                    .help("Forget this folder's own options and go back to the global defaults.")
+            }
+        }
+        .padding(14)
+    }
+
+    private var sortableColumnIDs: [String] { fileColumnDefs.filter { $0.comparator != nil }.map(\.id) }
+
+    private func columnBinding(_ id: String) -> Binding<Bool> {
+        Binding(get: { browser.visibleColumns.contains(id) },
+                set: { _ in browser.visibleColumns = ColumnMenu.toggled(browser.visibleColumns, id: id) })
+    }
+}
+
+/// One floating panel for the whole app, retargeted at whichever window is key — the same
+/// arrangement Finder's ⌘J has. A utility panel (not a window) so it stays above the
+/// browser and doesn't take over the menu bar while you keep working in the folder.
+final class ViewOptionsController {
+    static let shared = ViewOptionsController()
+    private var panel: NSPanel?
+    /// Whose options the panel is currently editing.
+    private weak var target: AppModel?
+
+    private init() {
+        // Follow the frontmost browser window. Without this the panel stayed bound to
+        // whichever window opened it, so clicking into window B left a panel that read
+        // and WROTE window A's folder options — silent, and invisible unless you knew.
+        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
+                                               object: nil, queue: .main) { [weak self] n in
+            guard let self, self.panel?.isVisible == true,
+                  let w = n.object as? NavWindow, w.model !== self.target else { return }
+            self.show(w.model)
+        }
+    }
+
+    func toggle(_ model: AppModel) {
+        // RETARGET, don't close. ⌘J in a second window used to order the panel out
+        // because it was visible — so there was no way at all to open View Options for
+        // any window but the one that already had it. Only ⌘J on the window the panel
+        // is ALREADY editing means "close it".
+        if let p = panel, p.isVisible, target === model { p.orderOut(nil); return }
+        show(model)
+    }
+    private func show(_ model: AppModel) {
+        target = model
+        let p = panel ?? {
+            // .nonactivatingPanel + becomesKeyOnlyIfNeeded, and orderFront rather than
+            // makeKeyAndOrderFront, are LOAD-BEARING — this is the fix for a confirmed
+            // regression, do not "simplify" them away.
+            //
+            // A plain utility panel that takes key steals it from the browser window, and
+            // the next left-click anywhere in that window is then eaten by AppKit as the
+            // window-activation click (NSTableHeaderView, like most AppKit views, returns
+            // false from acceptsFirstMouse). The visible symptom was that clicking a
+            // Details column header did nothing at all — no re-sort, no indicator move —
+            // while a RIGHT-click at the identical point still opened the column menu,
+            // because context menus don't need a key window. It looked exactly like
+            // "header sorting is broken" and had nothing to do with the sorting code.
+            //
+            // Nothing in this panel edits text, so it never needs key: with these flags it
+            // floats above the browser, its controls still work on a single click, and the
+            // browser window keeps key the whole time.
+            let new = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 560),
+                              styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
+            new.title = "View Options"
+            new.isFloatingPanel = true
+            new.becomesKeyOnlyIfNeeded = true
+            new.hidesOnDeactivate = false
+            new.isReleasedWhenClosed = false
+            panel = new
+            return new
+        }()
+        // Rebuilt on each show so it binds to the CURRENT window's AppModel — ⌘J in a
+        // second window must configure that window's folder, not the first one's.
+        let host = NSHostingView(rootView: ViewOptionsView(model: model))
+        p.contentView = host
+        // A fixed height rather than fittingSize: an NSHostingView reports a zero-ish
+        // fitting size before its first layout pass, which produced a panel a few pixels
+        // tall with the content clipped away.
+        p.setContentSize(NSSize(width: 300, height: 620))
+        // Placed beside the browser window rather than centred on top of it: centring put
+        // the panel straight over the column headers of the window it configures.
+        p.setFrameTopLeftPoint(panelOrigin(besides: NSApp.keyWindow ?? NSApp.mainWindow, size: p.frame.size))
+        p.orderFront(nil)
+    }
+
+    /// Top-left corner just outside the browser window's right edge, pulled back onto the
+    /// screen if it won't fit there.
+    private func panelOrigin(besides w: NSWindow?, size: NSSize) -> NSPoint {
+        guard let w, let vis = (w.screen ?? NSScreen.main)?.visibleFrame else { return NSPoint(x: 80, y: 700) }
+        let x = min(w.frame.maxX + 12, vis.maxX - size.width)
+        return NSPoint(x: max(vis.minX, x), y: min(w.frame.maxY, vis.maxY))
     }
 }
 
@@ -8198,13 +10987,13 @@ struct SettingsView: View {
     @AppStorage("showHidden") private var showHidden = false
     @AppStorage("confirmTrash") private var confirmTrash = true
     @AppStorage("thumbnailMode") private var thumbnailMode = "all"
+    @AppStorage("warnExtensionChange") private var warnExtensionChange = true
     var body: some View {
         Form {
             Section("Defaults for new windows & tabs") {
                 Picker("View", selection: $viewMode) {
                     Text("Details").tag("list"); Text("Icons").tag("icon")
-                    Text("Gallery").tag("gallery")   // Columns view disabled
-                    // Text("Columns").tag("column")
+                    Text("Gallery").tag("gallery")
                 }
                 Picker("Sort by", selection: $sortKey) {
                     Text("Name").tag("name"); Text("Date Modified").tag("modified")
@@ -8215,6 +11004,7 @@ struct SettingsView: View {
             }
             Section("Behavior") {
                 Toggle("Confirm before moving to Trash", isOn: $confirmTrash)
+                Toggle("Warn before changing a file extension", isOn: $warnExtensionChange)
                 Picker("Thumbnails", selection: $thumbnailMode) {
                     Text("All files").tag("all")
                     Text("Images only").tag("images")
@@ -8227,8 +11017,16 @@ struct SettingsView: View {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+// NSMenuItemValidation conformance is load-bearing, not decoration: validateMenuItem
+// below is a plain Swift method, so without an @objc protocol requiring it AppKit
+// never finds it and never calls it. Verified live — File → Eject stayed enabled on
+// a disk that can't be ejected, and Edit → Undo never greyed out or renamed itself.
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate {
     var window: NavWindow!
+    /// View ▸ Columns. Rebuilt on open (menuNeedsUpdate) rather than filled once at
+    /// startup, because its tick marks belong to whichever folder is showing right now —
+    /// and because the header right-click menu can change them behind its back.
+    fileprivate var columnsMenu: NSMenu?
     private var extraWindows: [NavWindow] = []
     private var keyMonitor: Any?
     private var mainWindowShown = false
@@ -8237,15 +11035,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var suppressMainWindow = false
 
     // Menu commands and keyboard nav target whichever Navigator window is key.
-    var appModel: AppModel { (NSApp.keyWindow as? NavWindow)?.model ?? window.model }
+    //
+    // The fallback is the LAST browser window that was key, not the main window: while
+    // a panel holds key (View Options, Get Info), `NSApp.keyWindow as? NavWindow` is
+    // nil and this resolved to the main window — so a menu command issued while
+    // working in window B silently acted on window A's folder.
+    var appModel: AppModel { ((NSApp.keyWindow as? NavWindow) ?? lastKeyNavWindow ?? window).model }
+    private weak var lastKeyNavWindow: NavWindow?
 
     private var pendingFolders: [URL] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // The undo stack is pure logic in NavigatorCore (so it can be unit-tested and
+        // never reaches for AppKit); these hook its two user-visible outcomes back up.
+        UndoStack.shared.onEmpty = { NSSound.beep() }
+        UndoStack.shared.onFailure = { reportFileError($0, $1, permissionHint: false) }
+        // Remembered so menu commands still find the right window when a panel takes
+        // key away from it — see `appModel`.
+        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
+                                               object: nil, queue: .main) { [weak self] n in
+            if let w = n.object as? NavWindow { self?.lastKeyNavWindow = w }
+        }
         setupMenu()
-        window = makeWindow(restoreState: true)   // created, but not shown yet
+        // Every window the last session had open comes back, each with its OWN tabs.
+        // The first saved session belongs to the main window (it registered first, so
+        // it is first in the list); the rest get real extra windows behind it.
+        let sessions = WindowSessions.saved()
+        window = makeWindow(session: sessions.first)   // created, but not shown yet
         window.setFrameAutosaveName("NavigatorMainWindow")
+        // Deferred to showMainWindow: an image-only launch (double-clicking a PNG)
+        // suppresses the browser entirely, and popping five restored browser windows
+        // over the image viewer would be worse than the single-window bug this fixes.
+        // Parked in WindowSessions rather than in a field of our own, because a launch
+        // that never restores them must still PERSIST them — see WindowSessions.held.
+        WindowSessions.hold(Array(sessions.dropFirst()))
         installKeyMonitor()
         ensureSMBTuning()
         Updater.check(userInitiated: false)   // silent, throttled to once/day; prompts only if an update exists
@@ -8253,6 +11077,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Quietly put pinned network drives back if they dropped. No-op for anyone
         // whose sidebar has no network drives.
         NetworkReconnector.shared.start()
+        // Live refresh for network folders (FSEvents doesn't fire for SMB).
+        NetworkPollCoordinator.shared.start()
         NSApp.servicesProvider = self   // powers the "Open in Navigator" Finder Services entry
         NSUpdateDynamicServices()
         // Install the Finder Quick Actions once per version (cheap; skips the pbs
@@ -8293,6 +11119,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showMainWindow() {
         if !mainWindowShown {
             mainWindowShown = true
+            // Extras first, then the main window on top of them.
+            let extras = WindowSessions.takeHeld()
+            if !extras.isEmpty { restoreExtraWindows(extras) }
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         } else {
@@ -8599,24 +11428,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         folders.forEach { window.model.newTab(at: $0) }
     }
 
+    /// True from applicationWillTerminate onward, so the windowWillClose hook can tell
+    /// "the user closed this window" (forget its tabs) from "the app is quitting"
+    /// (keep every window's tabs for next launch).
+    private var terminating = false
+
     @discardableResult
-    private func makeWindow(restoreState: Bool) -> NavWindow {
-        let w = NavWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 680),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                          backing: .buffered, defer: false)
+    private func makeWindow(session: WindowSession?) -> NavWindow {
+        let w = NavWindow(session: session)
         w.isReleasedWhenClosed = false
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self, weak w] _ in
+            guard let self, let w else { return }
+            if !self.terminating { w.model.forgetSession() }
+            if let token { NotificationCenter.default.removeObserver(token) }
+            // Drop our strong reference or the window NEVER deallocates — with
+            // isReleasedWhenClosed = false, `extraWindows` was the last owner and had
+            // no matching removal, so every window you closed leaked its AppModel, its
+            // Browsers and their DirectoryWatchers for the life of the process (each
+            // one still watching a folder and still answering notifications).
+            // Deferred: releasing a window from inside its own willClose is a
+            // use-after-free waiting to happen.
+            DispatchQueue.main.async { self.extraWindows.removeAll { $0 === w } }
+        }
         w.startObservingFolderTitle()
         w.contentView = NSHostingView(rootView: ContentView(model: w.model))
+        // Park the window's initial keyboard focus somewhere harmless. Leaving this
+        // nil is what put the caret in the SEARCH BOX on launch: AppKit's
+        // -[NSWindow _setUpFirstResponder] falls back to _selectFirstKeyView, which
+        // hands first responder to the first view in the key-view loop that will take
+        // it — and the empty search field is the only one in this window that will.
+        // The window then opened with Search focused (measured: on most launches), so
+        // the first thing typed went silently into the search box instead of doing
+        // type-to-select on the files. The hosting view itself is NOT a usable stand-in
+        // here: it refuses first responder often enough that AppKit fell back to the
+        // search field on some launches anyway (measured), hence the dedicated view.
+        w.contentView?.addSubview(w.focusPark)
+        w.initialFirstResponder = w.focusPark
         w.center()
         return w
     }
 
-    @objc func newWindowAction(_ sender: Any?) {
-        let w = makeWindow(restoreState: false)
-        var f = w.frame; f.origin.x += 28; f.origin.y -= 28; w.setFrame(f, display: false)
+    @objc func newWindowAction(_ sender: Any?) { openWindow() }
+
+    /// Opens an extra browser window, optionally showing exactly one folder.
+    ///
+    /// `showing` is what makes "Move Tab to New Window" land on the right folder: a
+    /// fresh NavWindow's AppModel restores the SAVED tab list in its initialiser, so
+    /// without replacing that list the moved tab would arrive alongside a copy of every
+    /// other tab. Assigned directly and NOT via newTab(), because newTab() calls
+    /// saveState() — which would immediately overwrite the persisted tab list of the
+    /// window the tab just left.
+    /// `at` places the window's top-left corner at a screen point — where a torn-off tab
+    /// was dropped. Constrained to the screen afterwards, or a drop near the bottom-right
+    /// corner would put most of the new window off-display.
+    @discardableResult
+    func openWindow(showing url: URL? = nil, at topLeft: CGPoint? = nil,
+                    session: WindowSession? = nil, activate: Bool = true) -> NavWindow {
+        let w = makeWindow(session: session)
+        if let topLeft {
+            w.setFrameTopLeftPoint(topLeft)
+            w.setFrame(w.constrainFrameRect(w.frame, to: w.screen), display: false)
+        } else {
+            var f = w.frame; f.origin.x += 28; f.origin.y -= 28; w.setFrame(f, display: false)
+        }
         extraWindows.append(w)
+        if let url {
+            w.model.tabs = [Browser(start: url)]
+            w.model.selected = 0
+            w.model.saveState()   // assigning `tabs` directly doesn't fire saveState
+        }
         w.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if activate { NSApp.activate(ignoringOtherApps: true) }
+        return w
+    }
+
+    /// Puts back the extra windows a previous session had open, behind the main
+    /// window. Ordered oldest-first and NOT activated, so restoring five windows
+    /// doesn't leave a random one in front of the one the user was last using.
+    private func restoreExtraWindows(_ sessions: [WindowSession]) {
+        for (i, s) in sessions.enumerated() {
+            let w = openWindow(session: s, activate: false)
+            var f = w.frame
+            f.origin.x += CGFloat(28 * (i + 1)); f.origin.y -= CGFloat(28 * (i + 1))
+            w.setFrame(w.constrainFrameRect(f, to: w.screen), display: false)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -8627,7 +11523,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !flag { showMainWindow() }
         return true
     }
-    func applicationWillTerminate(_ notification: Notification) { window.model.saveState() }
+    func applicationWillTerminate(_ notification: Notification) {
+        // Set BEFORE the save: quitting closes every window, and the willClose hook
+        // must not read those closes as "the user doesn't want these tabs back".
+        terminating = true
+        for w in NSApp.windows.compactMap({ $0 as? NavWindow }) { w.model.saveState() }
+    }
 
     // Keyboard navigation for the file list/grid. Runs only when our window is key
     // and a text field isn't being edited, so typing in the address/search/filter
@@ -8657,6 +11558,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 b.moveToTrash(b.selection); return nil
             }
             return event
+        // NOTE: Tab / ⇧Tab is NOT handled here — see NavWindow.sendEvent. Returning
+        // nil from this monitor does not stop AppKit's key-view loop from also seeing
+        // the keystroke, and that second look moved first responder into the search
+        // field, which made the NEXT Tab look like "a text field is focused, keep
+        // out". Only sendEvent consumes it early enough.
         case 120: // F2 → rename selected (Windows parity)
             if !b.selection.isEmpty { renameAction(nil); return nil }
             return event
@@ -8720,14 +11626,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let nw = fileMenu.addItem(withTitle: "New Window", action: #selector(newWindowAction(_:)), keyEquivalent: "n"); nw.target = self
         let nt = fileMenu.addItem(withTitle: "New Tab", action: #selector(newTabAction(_:)), keyEquivalent: "t"); nt.target = self
         let ct = fileMenu.addItem(withTitle: "Close Tab", action: #selector(closeTabAction(_:)), keyEquivalent: "w"); ct.target = self
+        // ⌘W closes the TAB (falling back to the window on the last one), so a window
+        // full of tabs took one ⌘W per tab to get rid of. ⌘⇧W closes the lot at once,
+        // matching Finder and Safari.
+        let cw = fileMenu.addItem(withTitle: "Close Window", action: #selector(closeWindowAction(_:)), keyEquivalent: "w")
+        cw.keyEquivalentModifierMask = [.command, .shift]; cw.target = self
         fileMenu.addItem(.separator())
         let nf = fileMenu.addItem(withTitle: "New Folder", action: #selector(newFolderAction(_:)), keyEquivalent: "n")
         nf.keyEquivalentModifierMask = [.command, .shift]; nf.target = self
         let ntf = fileMenu.addItem(withTitle: "New Text File", action: #selector(newTextFileAction(_:)), keyEquivalent: "n")
         ntf.keyEquivalentModifierMask = [.command, .option]; ntf.target = self
+        // The rest of the "New" family. No key equivalents: the three chords above are
+        // the ones worth spending, and these all reach the same Browser methods the
+        // toolbar/context "New" submenu uses (newItemsMenu) — that's where the list of
+        // items is defined; an NSMenu can't share a SwiftUI ViewBuilder.
+        let nrt = fileMenu.addItem(withTitle: "New Rich Text Document", action: #selector(newRichTextFileAction(_:)), keyEquivalent: "")
+        nrt.target = self
+        let nfs = fileMenu.addItem(withTitle: "New Folder with Selection", action: #selector(newFolderWithSelectionAction(_:)), keyEquivalent: "")
+        nfs.target = self
         fileMenu.addItem(.separator())
         let gi = fileMenu.addItem(withTitle: "Get Info", action: #selector(getInfoAction(_:)), keyEquivalent: "i"); gi.target = self
         let dup = fileMenu.addItem(withTitle: "Duplicate", action: #selector(duplicateAction(_:)), keyEquivalent: "d"); dup.target = self
+        // ⌃⌘A, the modern Finder chord — NOT Finder's historical ⌘L, which this app
+        // spends on "focus the address bar" (used far more often than aliasing).
+        let mka = fileMenu.addItem(withTitle: "Make Alias", action: #selector(makeAliasAction(_:)), keyEquivalent: "a")
+        mka.keyEquivalentModifierMask = [.command, .control]; mka.target = self
         let rn = fileMenu.addItem(withTitle: "Rename…", action: #selector(renameAction(_:)), keyEquivalent: ""); rn.target = self
         let ql = fileMenu.addItem(withTitle: "Quick Look", action: #selector(quickLookAction(_:)), keyEquivalent: "y"); ql.target = self
         let zip = fileMenu.addItem(withTitle: "Compress", action: #selector(compressAction(_:)), keyEquivalent: ""); zip.target = self
@@ -8737,10 +11660,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let et = fileMenu.addItem(withTitle: "Empty Trash", action: #selector(emptyTrashAction(_:)), keyEquivalent: "\u{8}")
         et.keyEquivalentModifierMask = [.command, .shift]; et.target = self
         fileMenu.addItem(.separator())
-        let cs = fileMenu.addItem(withTitle: "Connect to Server…", action: #selector(connectServerAction(_:)), keyEquivalent: "k")
-        cs.target = self
+        // Connect to Server (⌘K) now lives in the Go menu, where Finder keeps it — one
+        // menu item per chord, so nothing has to arbitrate between two copies of ⌘K.
         let and = fileMenu.addItem(withTitle: "Add Network Drive…", action: #selector(addNetworkDriveAction(_:)), keyEquivalent: "")
         and.target = self
+        let ej = fileMenu.addItem(withTitle: "Eject", action: #selector(ejectAction(_:)), keyEquivalent: "e"); ej.target = self
         fileMenu.addItem(.separator())
         let expF = fileMenu.addItem(withTitle: "Export Favorites…", action: #selector(exportFavoritesAction(_:)), keyEquivalent: ""); expF.target = self
         let impF = fileMenu.addItem(withTitle: "Import Favorites…", action: #selector(importFavoritesAction(_:)), keyEquivalent: ""); impF.target = self
@@ -8750,6 +11674,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let editItem = NSMenuItem(); mainMenu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit"); editItem.submenu = editMenu
         let undo = editMenu.addItem(withTitle: "Undo", action: #selector(undoAction(_:)), keyEquivalent: "z"); undo.target = self
+        let redo = editMenu.addItem(withTitle: "Redo", action: #selector(redoAction(_:)), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]; redo.target = self
         editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -8772,6 +11698,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dp.keyEquivalentModifierMask = [.command, .option]; dp.target = self
         let sh = viewMenu.addItem(withTitle: "Toggle Hidden Files", action: #selector(toggleHiddenAction(_:)), keyEquivalent: ".")
         sh.keyEquivalentModifierMask = [.command, .shift]; sh.target = self
+        viewMenu.addItem(.separator())
+        // Finder's ⌘J, in Finder's place in the View menu.
+        let vo = viewMenu.addItem(withTitle: "Show View Options", action: #selector(showViewOptionsAction(_:)), keyEquivalent: "j")
+        vo.keyEquivalentModifierMask = [.command]; vo.target = self
+        // The column picker used to exist ONLY as a right-click on a column header, which
+        // nobody finds. This submenu is built from the same ColumnMenu source as that menu,
+        // and menuNeedsUpdate below re-ticks it every time it opens, so the two can't drift.
+        let colsItem = viewMenu.addItem(withTitle: "Columns", action: nil, keyEquivalent: "")
+        let colsMenu = NSMenu(title: "Columns")
+        colsMenu.delegate = self
+        colsItem.submenu = colsMenu
+        columnsMenu = colsMenu
+
+        // Go menu, in Finder's position (after View). Before this, the only way to
+        // reach Applications / Volumes / Home / Go to Folder was the Dock icon's
+        // right-click menu — undiscoverable, and unusable while the app is frontmost.
+        //
+        // This menu OWNS ⌘[ / ⌘] / ⌘↑; the toolbar buttons deliberately carry no
+        // .keyboardShortcut, because both would fire (see ControlBar).
+        let goItem = NSMenuItem(); mainMenu.addItem(goItem)
+        let goMenu = NSMenu(title: "Go"); goItem.submenu = goMenu
+        let back = goMenu.addItem(withTitle: "Back", action: #selector(goBackAction(_:)), keyEquivalent: "[")
+        back.target = self
+        let fwd = goMenu.addItem(withTitle: "Forward", action: #selector(goForwardAction(_:)), keyEquivalent: "]")
+        fwd.target = self
+        let up = goMenu.addItem(withTitle: "Enclosing Folder", action: #selector(goUpAction(_:)), keyEquivalent: "\u{F700}")
+        up.keyEquivalentModifierMask = [.command]; up.target = self
+        goMenu.addItem(.separator())
+        let rec = goMenu.addItem(withTitle: "Recents", action: #selector(goRecentsAction(_:)), keyEquivalent: "")
+        rec.target = self
+        // One selector for every fixed destination, with the URL on the item itself:
+        // validateMenuItem reads the same representedObject to grey out anything this
+        // Mac doesn't have (/Network on most of them), so a chord for a missing folder
+        // is dead rather than navigating somewhere broken.
+        func dest(_ title: String, _ path: String, _ key: String, _ mods: NSEvent.ModifierFlags) {
+            let it = goMenu.addItem(withTitle: title, action: #selector(goToLocationAction(_:)), keyEquivalent: key)
+            it.keyEquivalentModifierMask = mods
+            it.representedObject = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            it.target = self
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        dest("Home", home, "h", [.command, .shift])
+        dest("Desktop", home + "/Desktop", "d", [.command, .shift])
+        dest("Documents", home + "/Documents", "o", [.command, .shift])
+        dest("Downloads", home + "/Downloads", "l", [.command, .option])
+        goMenu.addItem(.separator())
+        dest("Applications", "/Applications", "a", [.command, .shift])
+        dest("Utilities", "/Applications/Utilities", "u", [.command, .shift])
+        // Finder's ⌘⇧C is "Computer"; /Volumes is this app's equivalent (it's what the
+        // Dock menu's "Volumes" already opens) and it always exists.
+        dest("Computer", "/Volumes", "c", [.command, .shift])
+        dest("Network", "/Network", "k", [.command, .shift])
+        goMenu.addItem(.separator())
+        // No AirDrop item: macOS exposes no public API to open an AirDrop browsing
+        // view, in-app or otherwise, and a fake one that opens something else is worse
+        // than its absence.
+        let gtf = goMenu.addItem(withTitle: "Go to Folder…", action: #selector(goToFolderAction(_:)), keyEquivalent: "g")
+        gtf.keyEquivalentModifierMask = [.command, .shift]; gtf.target = self
+        let cs = goMenu.addItem(withTitle: "Connect to Server…", action: #selector(connectServerAction(_:)), keyEquivalent: "k")
+        cs.target = self
 
         // Window menu: standard Minimize/Zoom/Bring All to Front. Deliberately NOT set
         // as NSApp.windowsMenu — confirmed live that doing so makes the Dock's
@@ -8924,8 +11910,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func closeTabAction(_ sender: Any?) {
         if appModel.tabs.count > 1 { appModel.closeTab(appModel.selected) } else { NSApp.keyWindow?.performClose(nil) }
     }
+    @objc func closeWindowAction(_ sender: Any?) { (NSApp.keyWindow ?? window)?.performClose(nil) }
+    @objc func makeAliasAction(_ sender: Any?) { appModel.active.makeAlias(appModel.active.selection) }
+
+    // MARK: Go menu
+    @objc func goBackAction(_ sender: Any?) { appModel.active.goBack() }
+    @objc func goForwardAction(_ sender: Any?) { appModel.active.goForward() }
+    @objc func goUpAction(_ sender: Any?) { appModel.active.goUp() }
+    @objc func goRecentsAction(_ sender: Any?) { appModel.active.loadRecents() }
+    // Navigates the CURRENT tab, like the sidebar and unlike the Dock menu's
+    // openFolderTab — a Go menu that spawned a tab per destination would pile them up.
+    @objc func goToLocationAction(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        let win = (NSApp.keyWindow as? NavWindow) ?? window!
+        win.makeKeyAndOrderFront(nil)
+        win.model.active.navigate(to: url)
+    }
     @objc func newFolderAction(_ sender: Any?) { appModel.active.newFolder() }
     @objc func newTextFileAction(_ sender: Any?) { appModel.active.newTextFile() }
+    @objc func newRichTextFileAction(_ sender: Any?) { appModel.active.newRichTextFile() }
+    @objc func newFolderWithSelectionAction(_ sender: Any?) {
+        appModel.active.newFolderWithSelection(appModel.active.selection)
+    }
     @objc func moveToTrashAction(_ sender: Any?) { appModel.active.moveToTrash(appModel.active.selection) }
     @objc func getInfoAction(_ sender: Any?) { showInfo(appModel.active, appModel.active.selection) }
     @objc func duplicateAction(_ sender: Any?) { appModel.active.duplicate(appModel.active.selection) }
@@ -8941,6 +11947,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func compressAction(_ sender: Any?) { appModel.active.compress(appModel.active.selection) }
     @objc func emptyTrashAction(_ sender: Any?) { confirmEmptyTrash(appModel.active) }
+
+    // File → Eject (⌘E). Finder ejects the SELECTED disk; the sidebar here has no
+    // selection to read (its rows are buttons), so the unambiguous equivalent is the
+    // volume the folder you're looking at lives on. validateMenuItem below greys the
+    // item out when that volume can't be let go of, so ⌘E never quietly does nothing.
+    @objc func ejectAction(_ sender: Any?) {
+        guard let v = ejectableVolume() else { return }
+        disconnectVolume(v.url, isNetwork: v.isNetwork)
+    }
+    private func ejectableVolume() -> SidebarLocation? {
+        let vols = volumeLocations().filter { $0.ejectable }
+        guard let root = PathRules.deepestRoot(containing: appModel.active.currentURL,
+                                               among: vols.map { $0.url }) else { return nil }
+        return vols.first { $0.url == root }
+    }
     @objc func togglePreviewAction(_ sender: Any?) { appModel.showPreview.toggle() }
     @objc func toggleSidebarAction(_ sender: Any?) { appModel.showSidebar.toggle() }
     @objc func toggleDualPaneAction(_ sender: Any?) { appModel.dualPane.toggle() }
@@ -8954,10 +11975,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            let um = win?.undoManager, um.canUndo { um.undo(); return }
         UndoStack.shared.undo()
     }
+    @objc func redoAction(_ sender: Any?) {
+        let win = NSApp.keyWindow ?? window
+        if let r = win?.firstResponder, r is NSText || r is NSTextView,
+           let um = win?.undoManager, um.canRedo { um.redo(); return }
+        UndoStack.shared.redo()
+    }
 
-    // Keep Edit → Undo honest: it names the operation it will undo and greys out
-    // when there's nothing to undo (text fields keep their own undo).
+    // Keep Edit → Undo/Redo honest: each names the operation it will act on and greys
+    // out when its stack is empty (text fields keep their own undo). Eject is the
+    // same deal — it names the disk it will eject, and is disabled (so ⌘E is dead
+    // too, not silently ignored) when the current folder isn't on an ejectable one.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        // Go menu. A destination this Mac doesn't have (/Network is absent unless
+        // something mounts it, and ~/Documents can be missing too) is greyed out, so
+        // its chord is dead rather than navigating into a folder that isn't there.
+        if item.action == #selector(goToLocationAction(_:)) {
+            guard let url = item.representedObject as? URL else { return false }
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+        }
+        if item.action == #selector(goBackAction(_:)) { return appModel.active.canGoBack }
+        if item.action == #selector(goForwardAction(_:)) { return appModel.active.canGoForward }
+        if item.action == #selector(goUpAction(_:)) {
+            let u = appModel.active.currentURL
+            return u.deletingLastPathComponent().path != u.path
+        }
+        if item.action == #selector(makeAliasAction(_:)) { return !appModel.active.selection.isEmpty }
+        // Grey out rather than beep: with nothing selected there is nothing to wrap up.
+        if item.action == #selector(newFolderWithSelectionAction(_:)) { return !appModel.active.selection.isEmpty }
+        if item.action == #selector(ejectAction(_:)) {
+            guard let v = ejectableVolume() else { item.title = "Eject"; return false }
+            item.title = v.isNetwork ? "Disconnect “\(v.name)”" : "Eject “\(v.name)”"
+            return true
+        }
+        if item.action == #selector(redoAction(_:)) {
+            let r = (NSApp.keyWindow ?? window)?.firstResponder
+            if r is NSText || r is NSTextView { item.title = "Redo"; return true }
+            if let desc = UndoStack.shared.topRedoDescription {
+                item.title = "Redo \(desc)"; return true
+            }
+            item.title = "Redo"; return false
+        }
         guard item.action == #selector(undoAction(_:)) else { return true }
         let r = (NSApp.keyWindow ?? window)?.firstResponder
         if r is NSText || r is NSTextView { item.title = "Undo"; return true }
@@ -9080,6 +12139,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         default:
             break
         }
+    }
+
+    @objc func showViewOptionsAction(_ sender: Any?) { ViewOptionsController.shared.toggle(appModel) }
+
+    /// View ▸ Columns, ticked from the live folder's visible set — the SAME set the header
+    /// right-click menu reads and writes (see ColumnMenu). Neither menu keeps its own copy,
+    /// so toggling Owner in one shows it ticked in the other.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === columnsMenu else { return }
+        menu.removeAllItems()
+        let visible = appModel.active.visibleColumns
+        for id in ColumnMenu.togglableIDs {
+            let item = menu.addItem(withTitle: fileColumnTitle(id), action: #selector(toggleColumnAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = id
+            item.state = visible.contains(id) ? .on : .off
+        }
+    }
+    @objc func toggleColumnAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        let b = appModel.active
+        b.visibleColumns = ColumnMenu.toggled(b.visibleColumns, id: id)
+        // Columns only exist in Details view, so a column turned on from the menu while in
+        // Icons/Gallery would appear to do nothing at all. Switching there is what the user
+        // asked for by asking for a column.
+        if b.viewMode != .list { b.viewMode = .list }
     }
 
     @objc func checkForUpdatesAction(_ sender: Any?) { Updater.check(userInitiated: true) }
@@ -9858,6 +12943,7 @@ struct RestyleSheet: View {
         // nothing at all), the same trap the sidebar reorder hit.
         .contentShape(Rectangle())
         .dropDestination(for: URL.self) { urls, _ in
+            SpringLoader.shared.noteDrop()   // a completed drag must not spring back — see the sidebar
             addURLs(urls)
             return true
         } isTargeted: { listTargeted = $0 }
@@ -10129,6 +13215,7 @@ struct RestyleSheet: View {
         // .draggable (Transferable), and pairing that with the older NSItemProvider
         // onDrop API silently accepts nothing.
         .dropDestination(for: URL.self) { urls, _ in
+            SpringLoader.shared.noteDrop()   // a completed drag must not spring back — see the sidebar
             guard let url = urls.first(where: { isImageFile($0) }) else { return false }
             reference = url
             analyzeReferenceStyle()

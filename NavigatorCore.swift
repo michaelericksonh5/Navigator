@@ -22,6 +22,16 @@ enum PathRules {
         return d == s || d.hasPrefix(s.hasSuffix("/") ? s : s + "/")
     }
 
+    /// The deepest of `roots` that contains `url`, or nil if none do.
+    ///
+    /// Used to answer "which mounted volume is this folder actually on?" for Eject.
+    /// Deepest, not first match: "/" contains every path, and a volume can be
+    /// mounted inside another one — the longer mount point is always the real owner.
+    static func deepestRoot(containing url: URL, among roots: [URL]) -> URL? {
+        roots.filter { isSelfOrDescendant(url, of: $0) }
+             .max { $0.standardizedFileURL.path.count < $1.standardizedFileURL.path.count }
+    }
+
     /// A favourite's location beneath its volume root:
     /// "/Volumes/Games/artSource" -> "artSource". Empty when the path IS the volume
     /// root. Used to re-anchor a network favourite when its share comes back on a
@@ -45,6 +55,47 @@ enum PathRules {
             i += 1
         }
         return dest
+    }
+
+    /// True when renaming an item to `dest` would clobber a DIFFERENT item, so the
+    /// user has to be asked before anything touches the disk.
+    ///
+    /// `isSameItem` must be a file-IDENTITY check (fileResourceIdentifier), never a
+    /// path or string comparison. macOS volumes are case-insensitive by default, so
+    /// renaming "photo.png" -> "Photo.png" finds the file ITSELF sitting at the
+    /// destination: a bare `exists` check calls that a collision and refuses a rename
+    /// that FileManager.moveItem performs perfectly happily.
+    static func renameCollides(dest: String,
+                               exists: (String) -> Bool,
+                               isSameItem: (String) -> Bool) -> Bool {
+        exists(dest) && !isSameItem(dest)
+    }
+
+    /// Why `name` can't be used as a filename, or nil if it can.
+    ///
+    /// "/" is the POSIX path separator and ":" is the classic-Mac one the Finder still
+    /// swaps with "/" when it displays a name. Handed to FileManager they either build
+    /// a path into some other directory or fail with "the file doesn't exist" —
+    /// an error naming a folder the user never mentioned, which explains nothing.
+    static func invalidNameReason(_ name: String) -> String? {
+        if name.contains("/") { return "A file name can’t contain “/”." }
+        if name.contains(":") { return "A file name can’t contain “:”." }
+        return nil
+    }
+
+    /// The extension change a rename makes, or nil when there's nothing worth raising
+    /// Finder's "are you sure you want to change the extension?" prompt over.
+    ///
+    /// Directories are exempt: Foundation happily reports a pathExtension for a folder
+    /// named "My.Backups", but nothing opens a folder by extension, so warning about it
+    /// is pure noise. Only the LAST dot component counts, which is why "archive.tar.gz"
+    /// -> "archive.tar.bz2" reports gz -> bz2 and says nothing about ".tar". Case
+    /// differences count ("a.PNG" -> "a.png"): the name on disk really does change.
+    static func extensionChange(from old: String, to new: String,
+                                isDirectory: Bool) -> (from: String, to: String)? {
+        guard !isDirectory else { return nil }
+        let o = (old as NSString).pathExtension, n = (new as NSString).pathExtension
+        return o == n ? nil : (o, n)
     }
 
     /// Name for pasting a file into its own folder: "photo.jpg" -> "photo (1).jpg",
@@ -107,6 +158,21 @@ enum PathRules {
     static func leavesCloudProvider(_ sources: [URL], into dest: URL) -> Bool {
         !isCloudProvider(dest) && sources.contains(where: isCloudProvider)
     }
+}
+
+/// Index Tab / ⇧Tab should land on, given where the selection is now.
+///
+/// Split out from the Browser because the two ends are where this goes wrong and a
+/// UI test can't pin them down: Swift's `%` returns a NEGATIVE remainder for a
+/// negative left operand, so the obvious `(cur + delta) % count` sends ⇧Tab on the
+/// first item to index -1 and traps. Adding `count` before the modulo is what makes
+/// the backwards wrap land on the last item. `nil` (nothing selected yet) starts at
+/// the first item going forward and the last going backward, so Tab into an empty
+/// selection always picks the end you're heading away from.
+func cycledSelectionIndex(from current: Int?, delta: Int, count: Int) -> Int? {
+    guard count > 0 else { return nil }
+    guard let cur = current else { return delta < 0 ? count - 1 : 0 }
+    return ((cur + delta) % count + count) % count
 }
 
 /// Rules for "Restyle (AI)" — the pure, testable parts.
@@ -563,5 +629,919 @@ extension RestyleRules {
             || e.contains("429") || e.contains("resource_exhausted")
             || e.contains("timed out") || e.contains("timeout")
             || e.contains("network connection was lost")
+    }
+}
+
+// MARK: - Undo / redo of file operations
+
+/// One half of an undoable operation. Returns nil on success, or a message naming
+/// what went wrong.
+///
+/// It reports rather than just running because the filesystem changes underneath
+/// recorded operations all the time — the user bins the file in Finder, a share
+/// drops, a folder gets renamed. The old `try?`-and-shrug closures turned that into
+/// a silent no-op, which reads as "Undo is broken"; the returned message is what
+/// the user actually gets shown.
+typealias UndoAction = () -> String?
+
+/// Undo/redo stack for file operations.
+///
+/// Both halves are supplied at push time rather than having `undo()` hand back its
+/// own inverse. Several operations land somewhere different every time they re-run
+/// — re-trashing an item gets a fresh, de-duplicated path inside the Trash — so the
+/// two halves must share mutable state. Capturing one local `var` in both closures
+/// does that in a line; threading an inverse back out through every early return of
+/// fifteen call sites does not.
+final class UndoStack {
+    static let shared = UndoStack()
+    struct Entry { let desc: String; let undo: UndoAction; let redo: UndoAction }
+
+    /// 200, not the old 50: an entry is two closures over a handful of URLs, a few
+    /// hundred bytes, so history is essentially free and the old cap threw away a
+    /// morning's work to save nothing. The drop stays silent — an alert about a
+    /// ceiling nobody reaches is pure nagging.
+    static let limit = 200
+
+    private(set) var undoStack: [Entry] = []
+    private(set) var redoStack: [Entry] = []
+
+    /// Injected by the app. This type is compiled into the test bundle, which has no
+    /// business beeping or opening alerts, so the two user-visible outcomes are hooks
+    /// rather than direct AppKit calls.
+    var onEmpty: () -> Void = {}
+    var onFailure: (_ summary: String, _ detail: String) -> Void = { _, _ in }
+
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+    var topDescription: String? { undoStack.last?.desc }
+    var topRedoDescription: String? { redoStack.last?.desc }
+
+    func push(_ desc: String, undo: @escaping UndoAction, redo: @escaping UndoAction) {
+        undoStack.append(Entry(desc: desc, undo: undo, redo: redo))
+        if undoStack.count > Self.limit { undoStack.removeFirst() }
+        // Any NEW operation invalidates every pending redo. Those closures hold paths
+        // the new operation may have just renamed, moved or binned, so replaying one
+        // would act on files the user never asked about — the classic corruption bug
+        // in hand-rolled undo.
+        redoStack.removeAll()
+    }
+
+    func undo() {
+        guard let e = undoStack.popLast() else { onEmpty(); return }
+        // A failed half DROPS the entry (popLast already removed it and we return
+        // without re-filing it): its recorded state is demonstrably wrong now, and
+        // offering to replay it would only compound the mess.
+        if let problem = e.undo() { onFailure("Couldn’t undo \(e.desc)", problem); return }
+        redoStack.append(e)
+        if redoStack.count > Self.limit { redoStack.removeFirst() }
+    }
+
+    func redo() {
+        guard let e = redoStack.popLast() else { onEmpty(); return }
+        if let problem = e.redo() { onFailure("Couldn’t redo \(e.desc)", problem); return }
+        // Straight append, NOT push(): push() clears the redo stack, which would make
+        // a redo wipe out every remaining redo behind it.
+        undoStack.append(e)
+        if undoStack.count > Self.limit { undoStack.removeFirst() }
+    }
+
+    /// Only for tests and for a fresh app state — the app never discards history.
+    func clear() { undoStack.removeAll(); redoStack.removeAll() }
+}
+
+/// Moves each `from` back to its `to`, collecting what failed into one message.
+///
+/// Every undo/redo closure funnels through this so an item the user deleted or moved
+/// in Finder after the operation names itself in a single alert, instead of being
+/// swallowed by `try?` and looking like Undo did nothing.
+func restoreItems(_ pairs: [(from: URL, to: URL)]) -> String? {
+    var failed: [String] = []
+    for p in pairs {
+        do { try FileManager.default.moveItem(at: p.from, to: p.to) }
+        catch { failed.append("• \(p.to.lastPathComponent): \(error.localizedDescription)") }
+    }
+    return failed.isEmpty ? nil : failed.prefix(5).joined(separator: "\n")
+}
+
+/// Bins each URL and hands back where each one landed, so the matching half can
+/// restore exactly these items.
+///
+/// Restoring from the Trash, rather than re-running the original operation, is what
+/// makes redo safe for anything that CREATES items: re-running would rebuild an
+/// empty "New Folder" and throw away whatever the user had dropped into it, or
+/// re-zip contents that have since changed.
+func trashItems(_ urls: [URL]) -> (restores: [(from: URL, to: URL)], problem: String?) {
+    var restores: [(from: URL, to: URL)] = []
+    var failed: [String] = []
+    for u in urls {
+        var out: NSURL?
+        do {
+            try FileManager.default.trashItem(at: u, resultingItemURL: &out)
+            if let t = out as URL? { restores.append((from: t, to: u)) }
+        } catch { failed.append("• \(u.lastPathComponent): \(error.localizedDescription)") }
+    }
+    // Remember where each one came from, so the Trash view's Put Back can restore it
+    // even after the app has been quit and relaunched. Recorded HERE because every
+    // trash operation in the app funnels through either this or moveToTrash — putting
+    // it in only one of them is how half the Trash ends up unrestorable.
+    TrashOrigins.record(restores)
+    return (restores, failed.isEmpty ? nil : failed.prefix(5).joined(separator: "\n"))
+}
+
+// MARK: - Clipboard text forms for a selection
+
+/// The text forms the "Copy …" context-menu items put on the clipboard.
+///
+/// These live here — and are tested — because every one of them is a quoting rule,
+/// and quoting is exactly what goes wrong invisibly: a path holding a space, a
+/// double quote or a `]` looks correct in the menu and then breaks whatever it was
+/// pasted into. Multi-selection joins with newlines to match the existing
+/// `Copy Path`, so the plain and the quoted item differ ONLY in the quoting.
+enum PathText {
+
+    /// Windows' "Copy as path": the path wrapped in double quotes so pasting it into a
+    /// shell survives spaces. Backslash and double quote are escaped because those are
+    /// the two characters a POSIX filename may legally contain that a double-quoted
+    /// shell word still interprets — leaving a raw `"` in would end the quoted run
+    /// early and hand the shell a mangled command.
+    static func quoted(_ paths: [String]) -> String {
+        paths.map { p in
+            let esc = p.replacingOccurrences(of: "\\", with: "\\\\")
+                       .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(esc)\""
+        }.joined(separator: "\n")
+    }
+
+    /// `file://` URLs. Percent-encoded by URL itself, which is what a browser or a
+    /// Markdown link needs — a raw path with a space in it is not a usable URL.
+    static func fileURLs(_ paths: [String]) -> String {
+        paths.map { URL(fileURLWithPath: $0).absoluteString }.joined(separator: "\n")
+    }
+
+    /// Base names with the extension dropped: "shot.png" → "shot".
+    ///
+    /// A dotfile (".gitignore") is deliberately returned whole: its dot starts the
+    /// name rather than an extension, and treating it as one would copy an empty
+    /// string. A name with no dot at all is likewise returned unchanged.
+    static func namesWithoutExtension(_ names: [String]) -> String {
+        names.map { n -> String in
+            guard let dot = n.lastIndex(of: "."), dot != n.startIndex else { return n }
+            return String(n[n.startIndex..<dot])
+        }.joined(separator: "\n")
+    }
+
+    /// `[name](file:///…)`, pasteable into Markdown.
+    ///
+    /// BOTH brackets are escaped, not just the closing one. CommonMark accepts raw
+    /// brackets in link text only as a matched pair, so a filename like "shot [1].png"
+    /// with only its `]` escaped leaves an unmatched `[` and the whole link stops
+    /// parsing — it pastes as visible junk instead of a link.
+    static func markdownLinks(_ items: [(name: String, path: String)]) -> String {
+        items.map { i in
+            let label = i.name.replacingOccurrences(of: "\\", with: "\\\\")
+                              .replacingOccurrences(of: "[", with: "\\[")
+                              .replacingOccurrences(of: "]", with: "\\]")
+            return "[\(label)](\(URL(fileURLWithPath: i.path).absoluteString))"
+        }.joined(separator: "\n")
+    }
+}
+
+// MARK: - Tab context-menu enablement
+
+/// Which items a tab's right-click menu may offer, as plain index arithmetic.
+///
+/// Kept here so "would this actually do anything?" is decided once and pinned by
+/// tests: an off-by-one shows up as a menu item that looks enabled and then does
+/// nothing at all, which reads as a broken app rather than a disabled command.
+enum TabMenuRules {
+    static func canCloseOthers(index: Int, count: Int) -> Bool {
+        count > 1 && (0..<count).contains(index)
+    }
+    static func canCloseToRight(index: Int, count: Int) -> Bool {
+        index >= 0 && index < count - 1
+    }
+    /// Moving the ONLY tab out would leave an empty window behind, so it's refused
+    /// rather than silently producing one.
+    static func canMoveToNewWindow(index: Int, count: Int) -> Bool {
+        count > 1 && (0..<count).contains(index)
+    }
+}
+
+/// Where every tab ends up after one is dragged onto another (Chrome/Safari reorder).
+///
+/// Returns the new order as indices INTO THE OLD ARRAY rather than mutating anything,
+/// so the caller can carry the selection across by identity instead of by index — a
+/// reorder that keeps `selected` pointing at the same slot silently switches which
+/// folder you are looking at, which is the bug this shape exists to make impossible.
+enum TabMoveRules {
+    /// nil when the drag changes nothing (bad index, single tab, dropped on itself) —
+    /// the caller then skips the mutation AND the state save entirely.
+    static func reordered(count: Int, from: Int, to: Int) -> [Int]? {
+        guard count > 1, (0..<count).contains(from), (0..<count).contains(to), from != to else { return nil }
+        var order = Array(0..<count)
+        order.remove(at: from)
+        order.insert(from, at: to)
+        return order
+    }
+}
+
+// MARK: - Spring-loaded folders
+
+/// When hovering a folder mid-drag is allowed to open it (Finder/Explorer spring-loading).
+///
+/// The rules are here rather than inline at each of the four drop surfaces because a
+/// surface that disagrees with the others is exactly how "it springs in the list but
+/// not in the grid" happens — and because two of them are genuinely dangerous to get
+/// wrong (see below).
+enum SpringRules {
+    /// 0.7s. Under ~0.5s an ordinary sweep across a folder on the way to somewhere else
+    /// trips it, which is worse than not having the feature: you lose your place while
+    /// still holding the drag. Over ~1s and people give up and let go, assuming nothing
+    /// is going to happen. Finder sits in the same window; 0.7 is the middle of it.
+    static let dwell: TimeInterval = 0.7
+
+    static func canSpring(into folder: URL, from current: URL, dragging sources: [URL]) -> Bool {
+        // No file in the payload means this isn't a file drag at all — it's the sidebar's
+        // own reorder token, or something from another app we would refuse anyway. Opening
+        // folders under a drag we can't accept would just lose the user's place.
+        guard !sources.isEmpty else { return false }
+        // Already looking at it: springing would be a no-op navigation that still pushes a
+        // history entry and re-runs a directory read over what may be a slow SMB mount.
+        // Compared as PATHS, never as URLs: "file:///tmp/a/" and "file:///tmp/a" are the
+        // same folder but two different URL values, and URL equality is string equality.
+        let f = folder.standardizedFileURL.resolvingSymlinksInPath().path
+        if f == current.standardizedFileURL.resolvingSymlinksInPath().path { return false }
+        // Dragging a folder into itself or its own subtree can never be dropped (see
+        // PathRules.isSelfOrDescendant), so opening it would strand the user inside the
+        // thing they are carrying, with the drag still live and nowhere valid to release.
+        return !sources.contains { PathRules.isSelfOrDescendant(folder, of: $0) }
+    }
+}
+
+// MARK: - Per-folder view options (⌘J)
+
+/// Everything one folder can remember about how to display itself — the exact set the
+/// ⌘J panel shows.
+///
+/// Deliberately a COMPLETE record rather than six independent optionals. Finder's ⌘J
+/// writes the whole arrangement for a folder, and a full record makes "what applies
+/// here?" a single `?? defaults` instead of six separate merges, each of which can be
+/// half-applied. The half-applied case is the one that bites: a folder remembering only
+/// `groupBy` while inheriting a sort key that the global default later changes shows an
+/// arrangement the user never chose and can't explain.
+///
+/// `sortKey` is a Details COLUMN id ("name", "size", "dimensions", …), not the
+/// four-case SortField the toolbar Sort menu exposes — a folder sorted by a column the
+/// toolbar can't name must still come back sorted that way.
+struct ViewOptions: Codable, Equatable {
+    var viewMode: String
+    var iconSize: Double
+    var sortKey: String
+    var sortAscending: Bool
+    var groupBy: String
+    var columns: [String]
+
+    init(viewMode: String, iconSize: Double, sortKey: String, sortAscending: Bool,
+         groupBy: String, columns: [String]) {
+        self.viewMode = viewMode
+        self.iconSize = iconSize
+        self.sortKey = sortKey
+        self.sortAscending = sortAscending
+        self.groupBy = groupBy
+        self.columns = columns
+    }
+}
+
+/// Per-folder view options keyed by path, with a hard cap and least-recently-used
+/// eviction.
+///
+/// Why a cap at all: this is ONE UserDefaults blob, not Finder's per-folder .DS_Store.
+/// Nothing ever deletes a folder's entry when the folder is deleted or renamed, so
+/// without a bound the dictionary only ever grows — and it is decoded in full on every
+/// launch. 200 is far more folders than anyone deliberately arranges by hand, and at
+/// roughly 150 bytes per record it holds the blob near 30 KB, small enough that the
+/// launch decode stays invisible.
+///
+/// Recency is refreshed on READ (`touch`), not only on write. Evicting by insertion
+/// order instead would throw away the folder you open every day in favour of one you
+/// customized once and never returned to — which is exactly backwards.
+struct ViewOptionsLRU: Codable, Equatable {
+    /// Paths, most-recently-used FIRST. Kept in step with `byPath`: every key in one
+    /// appears in the other, which is what makes eviction a plain `order.last`.
+    private(set) var order: [String] = []
+    private(set) var byPath: [String: ViewOptions] = [:]
+    static let cap = 200
+
+    init() {}
+
+    var count: Int { byPath.count }
+    func contains(_ path: String) -> Bool { byPath[path] != nil }
+    func value(for path: String) -> ViewOptions? { byPath[path] }
+
+    /// Save (or replace) one folder's options, making it the most recently used and
+    /// evicting the least recently used once past the cap.
+    mutating func set(_ options: ViewOptions, for path: String) {
+        byPath[path] = options
+        order.removeAll { $0 == path }
+        order.insert(path, at: 0)
+        while order.count > ViewOptionsLRU.cap, let victim = order.popLast() {
+            byPath[victim] = nil
+        }
+    }
+
+    mutating func remove(_ path: String) {
+        byPath[path] = nil
+        order.removeAll { $0 == path }
+    }
+
+    /// Mark a folder as just used. Returns true only when the order actually moved, so
+    /// the caller can skip a UserDefaults write on the common case of re-reading the
+    /// folder that is already at the front (every refresh of the current folder).
+    @discardableResult
+    mutating func touch(_ path: String) -> Bool {
+        guard byPath[path] != nil, order.first != path else { return false }
+        order.removeAll { $0 == path }
+        order.insert(path, at: 0)
+        return true
+    }
+
+    /// The options that apply to a folder: its own if it has any, otherwise the global
+    /// defaults. The whole point of the feature in one line — and the reason a folder
+    /// that was never arranged by hand behaves exactly as it did before any of this
+    /// existed.
+    func effective(for path: String, defaults: ViewOptions) -> ViewOptions {
+        byPath[path] ?? defaults
+    }
+}
+
+// MARK: - Sorting the lazily-loaded media columns (Time, Dimensions)
+
+/// Sort key for the two Details columns whose values arrive asynchronously from
+/// Spotlight: Time (duration) and Dimensions.
+///
+/// Two things this has to get right, both of which a bare `Double` key path gets wrong:
+///
+/// 1. **Missing and not-yet-loaded values must not scatter.** A text file has no
+///    duration and a freshly listed video hasn't been asked yet; both come through as
+///    nil and both map to 0, so they land together at the low end instead of wherever
+///    an uninitialized read happened to put them. This matches what the Size column
+///    already does with folders (size 0, so they clump), which is the behaviour this app
+///    has always had for "no meaningful number here".
+///    ponytail: the low end means unknowns lead when ascending and trail when
+///    descending, rather than always trailing the way Finder does. Always-trailing is
+///    not expressible as a KeyPathComparator — reversing the order reverses the whole
+///    key — so it would mean replacing the comparator type everywhere `sortOrder` is
+///    used. Worth doing only if the asymmetry actually annoys someone.
+///
+/// 2. **Ties must be deterministic.** Swift's sort is not documented as stable, so two
+///    files with equal duration (or, far more common, the whole block of 0s) could come
+///    back in a different order every time the list re-sorts — which reads as the list
+///    shuffling itself for no reason. Folding the name into the key makes every
+///    comparison total, so equal values always land in name order.
+struct MediaSortKey: Comparable {
+    /// Seconds for Time, width × height for Dimensions. 0 when absent or not yet loaded.
+    let value: Double
+    /// Tie-break, so equal values can never reorder between sorts.
+    let name: String
+
+    /// Duration in seconds, 0 when unknown. Negative durations (which some broken
+    /// media files report) are clamped, or they would sort below genuinely unknown
+    /// files and look like a rendering bug in the Time column.
+    static func duration(_ seconds: Double?, name: String) -> MediaSortKey {
+        MediaSortKey(value: max(0, seconds ?? 0), name: name)
+    }
+
+    /// Total pixel area, 0 when either dimension is unknown or non-positive.
+    ///
+    /// Area rather than width-then-height because area is the single number people
+    /// mean by "bigger image": it ranks a 4000×3000 photo above a 5000×200 banner,
+    /// which is the answer someone sorting a folder of images is looking for, whereas
+    /// width-first would put the banner on top.
+    static func pixelArea(width: Int?, height: Int?, name: String) -> MediaSortKey {
+        guard let w = width, let h = height, w > 0, h > 0 else { return MediaSortKey(value: 0, name: name) }
+        return MediaSortKey(value: Double(w) * Double(h), name: name)
+    }
+
+    static func < (l: MediaSortKey, r: MediaSortKey) -> Bool {
+        l.value == r.value
+            ? l.name.localizedStandardCompare(r.name) == .orderedAscending
+            : l.value < r.value
+    }
+}
+
+// MARK: - Collapsible group headers
+
+/// Which items a set of collapsed groups leaves visible, and in what order.
+///
+/// Keeping `NSTableView.sortDescriptors` down to the ONE descriptor the app actually
+/// sorts on.
+///
+/// AppKit does not replace the stack when a header is clicked — it PREPENDS the clicked
+/// column's descriptor and keeps every earlier one as a secondary sort, and
+/// `autosaveTableColumns` then persists that growing stack across launches (seen live:
+/// ["modified:false", "kind:true", "name:true", "size:false"]). Navigator sorts on the
+/// first descriptor only, so the leftovers never change the row order — but AppKit reuses
+/// a remembered entry's DIRECTION, so clicking a column you last sorted descending brings
+/// it back descending instead of starting ascending, which is not what a header click
+/// promises. Rewriting down to the single active descriptor is what keeps "click a new
+/// column → ascending, click again → descending" true.
+enum TableSortRules {
+    /// True when the table's stack is anything other than exactly the active sort.
+    /// Deliberately also true for a stack whose FIRST entry already matches — that is the
+    /// case that leaves stale directions behind for every other column.
+    static func needsRewrite(current: [(key: String, ascending: Bool)],
+                             desiredKey: String, desiredAscending: Bool) -> Bool {
+        guard current.count == 1, let only = current.first else { return true }
+        return only.key != desiredKey || only.ascending != desiredAscending
+    }
+}
+
+/// This is here, tested, and used by BOTH renderers because of one subtle bug it
+/// prevents: keyboard navigation (arrows, Tab/⇧Tab, type-to-select) walks the flat
+/// visible order, and if that order still contains the items inside a collapsed group
+/// then Tab silently selects something the user cannot see — the status bar changes,
+/// Return opens a file that isn't on screen, and nothing on screen explains why.
+/// Filtering the flat order is the fix, so it has to be the SAME filter the views use.
+enum GroupCollapse {
+
+    /// A group can only be collapsed if it has a header to click. `groups()` returns a
+    /// single untitled group when Group By is off, and collapsing that would hide the
+    /// entire folder with no header left to click to get it back.
+    static func canCollapse(title: String) -> Bool { !title.isEmpty }
+
+    /// The flat item order the given collapsed set leaves on screen. Group headers stay
+    /// (they are what you click to expand again); only their contents disappear.
+    static func visibleOrder<T>(groups: [(title: String, items: [T])], collapsed: Set<String>) -> [T] {
+        groups.flatMap { g in
+            canCollapse(title: g.title) && collapsed.contains(g.title) ? [] : g.items
+        }
+    }
+
+    /// Toggling one group, with the untitled group refused for the reason above.
+    static func toggled(_ collapsed: Set<String>, title: String) -> Set<String> {
+        guard canCollapse(title: title) else { return collapsed }
+        var out = collapsed
+        if out.contains(title) { out.remove(title) } else { out.insert(title) }
+        return out
+    }
+
+    /// Group titles that no longer exist are dropped: the folder changed (different
+    /// Group By, files added, a filter typed) and keeping a stale title alive means a
+    /// group that reappears later comes back mysteriously collapsed.
+    static func pruned(_ collapsed: Set<String>, toTitles titles: [String]) -> Set<String> {
+        collapsed.intersection(titles)
+    }
+}
+
+// MARK: - Search filters (Date Modified / Size)
+
+/// The Date Modified buckets in the search filter menu, as CALENDAR-DAY ranges.
+///
+/// Day boundaries, not "now minus 24 hours": a file saved at 9am does not stop
+/// matching "Today" as the afternoon wears on, which is what an elapsed-seconds
+/// window would do and is never what "Today" means to anyone.
+///
+/// Every range is half-open [from, to) so a file whose mtime is EXACTLY midnight
+/// belongs to the day that is starting, in exactly one bucket — an inclusive upper
+/// bound would put midnight in both "Yesterday" and "Today".
+enum SearchDateFilter: String, CaseIterable, Codable {
+    case any = "Any Date"
+    case today = "Today"
+    case yesterday = "Yesterday"
+    case last7 = "Last 7 Days"
+    case last30 = "Last 30 Days"
+    case thisYear = "This Year"
+    case custom = "Custom Range…"
+
+    /// `from` inclusive, `to` exclusive; nil means unbounded on that side.
+    ///
+    /// `custom` takes whole days from the two date pickers — the pickers only offer a
+    /// day, so treating `customTo` as an instant would silently exclude everything
+    /// written on the last day the user picked.
+    func range(now: Date, calendar: Calendar = .current,
+               customFrom: Date? = nil, customTo: Date? = nil) -> (from: Date?, to: Date?) {
+        let sod = calendar.startOfDay(for: now)
+        func day(_ n: Int) -> Date { calendar.date(byAdding: .day, value: n, to: sod) ?? sod }
+        switch self {
+        case .any:       return (nil, nil)
+        case .today:     return (sod, day(1))
+        case .yesterday: return (day(-1), sod)
+        // "Last 7 Days" is today plus the six days before it — the same seven calendar
+        // days Explorer's "Last week" covers, and it must include today.
+        case .last7:     return (day(-6), day(1))
+        case .last30:    return (day(-29), day(1))
+        case .thisYear:
+            let start = calendar.date(from: calendar.dateComponents([.year], from: now)) ?? sod
+            return (start, day(1))
+        case .custom:
+            let lo = customFrom.map { calendar.startOfDay(for: $0) }
+            let hi = customTo.flatMap { calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: $0)) }
+            return (lo, hi)
+        }
+    }
+}
+
+/// The Size buckets in the search filter menu.
+///
+/// Non-overlapping, so picking one bucket can never also mean "and everything
+/// smaller" — the labels carry the exact edges because "Small" means nothing on its
+/// own and a filter you can't predict is worse than no filter.
+///
+/// Decimal KB/MB/GB (1000-based), NOT 1024: every size this app displays comes from
+/// ByteCountFormatter with .file, which is decimal. A 1024-based threshold here
+/// would reject a file the size column calls "100 KB" for being 100 KB.
+enum SearchSizeFilter: String, CaseIterable, Codable {
+    case any = "Any Size"
+    case empty = "Empty (0 bytes)"
+    case tiny = "Tiny (< 100 KB)"
+    case small = "Small (100 KB – 1 MB)"
+    case medium = "Medium (1 MB – 100 MB)"
+    case large = "Large (100 MB – 1 GB)"
+    case huge = "Huge (> 1 GB)"
+    case custom = "Custom Range…"
+
+    static let kb: Int64 = 1_000
+    static let mb: Int64 = 1_000_000
+    static let gb: Int64 = 1_000_000_000
+
+    /// `from` inclusive, `to` exclusive; nil means unbounded on that side.
+    /// Custom bounds arrive in BYTES (the UI multiplies its KB/MB field out).
+    func range(customFrom: Int64? = nil, customTo: Int64? = nil) -> (from: Int64?, to: Int64?) {
+        switch self {
+        case .any:    return (nil, nil)
+        case .empty:  return (0, 1)
+        case .tiny:   return (1, 100 * Self.kb)
+        case .small:  return (100 * Self.kb, Self.mb)
+        case .medium: return (Self.mb, 100 * Self.mb)
+        case .large:  return (100 * Self.mb, Self.gb)
+        case .huge:   return (Self.gb, nil)
+        case .custom: return (customFrom, customTo)
+        }
+    }
+}
+
+/// The one place a search result is tested against the Date/Size filters.
+///
+/// BOTH backends run this: the Spotlight path builds an equivalent NSMetadataQuery
+/// predicate to keep the result set small, then re-checks here, and the recursive
+/// walkSearch (SMB / Google Drive, which Spotlight cannot index) has only this. Two
+/// separate implementations is how a filter ends up silently ignored on one path —
+/// and Spotlight's own index can be stale about size, so the re-check is not
+/// redundant even where the predicate already ran.
+struct SearchFilters {
+    var date: SearchDateFilter = .any
+    var size: SearchSizeFilter = .any
+    var customDateFrom: Date?
+    var customDateTo: Date?
+    var customSizeFrom: Int64?
+    var customSizeTo: Int64?
+
+    var isActive: Bool { date != .any || size != .any }
+
+    func dateRange(now: Date = Date(), calendar: Calendar = .current) -> (from: Date?, to: Date?) {
+        date.range(now: now, calendar: calendar, customFrom: customDateFrom, customTo: customDateTo)
+    }
+    func sizeRange() -> (from: Int64?, to: Int64?) {
+        size.range(customFrom: customSizeFrom, customTo: customSizeTo)
+    }
+
+    /// `isDirectory` items are exempt from the SIZE filter: a folder's `size` in a
+    /// listing is its directory-entry size (a few hundred bytes), not its contents, so
+    /// judging folders by it would drop every folder from "Large" and file every folder
+    /// under "Tiny" — both plainly wrong. Dates apply to folders normally.
+    func matches(modified: Date, size bytes: Int64, isDirectory: Bool,
+                 now: Date = Date(), calendar: Calendar = .current) -> Bool {
+        let d = dateRange(now: now, calendar: calendar)
+        if let f = d.from, modified < f { return false }
+        if let t = d.to, modified >= t { return false }
+        if !isDirectory {
+            let s = sizeRange()
+            if let f = s.from, bytes < f { return false }
+            if let t = s.to, bytes >= t { return false }
+        }
+        return true
+    }
+}
+
+// MARK: - Sharing & Permissions (Get Info)
+
+/// A POSIX permission triad shown the way Finder shows it, because "rwxr-xr-x" is
+/// not something most people can read and is certainly not something they can edit.
+///
+/// The execute bit is deliberately NOT part of the level: stripping it turns a
+/// directory into one you cannot enter (and a tool into one you cannot run), so a
+/// user picking "Read only" for a group must not silently break traversal. See
+/// `bits(existing:isDirectory:)`.
+enum PosixAccess: String, CaseIterable, Codable {
+    case readWrite = "Read & Write"
+    case readOnly = "Read only"
+    case writeOnly = "Write only (Drop Box)"
+    case noAccess = "No Access"
+
+    /// From one octal digit (0...7).
+    static func from(bits: UInt16) -> PosixAccess {
+        switch (bits & 4 != 0, bits & 2 != 0) {
+        case (true, true):   return .readWrite
+        case (true, false):  return .readOnly
+        case (false, true):  return .writeOnly
+        case (false, false): return .noAccess
+        }
+    }
+
+    /// The octal digit for this level.
+    ///
+    /// `existing` supplies the execute/search bit, which is carried through unchanged
+    /// for files — chmod'ing a script to "Read only" should not also un-run it.
+    /// Directories are the exception: read access to a directory is useless without
+    /// search permission (you can list names but cannot stat anything inside), so
+    /// granting read to a directory grants search with it, which is what Finder does.
+    func bits(existing: UInt16, isDirectory: Bool) -> UInt16 {
+        guard self != .noAccess else { return 0 }   // no access means none, execute included
+        // A directory always keeps search permission alongside any granted access: a
+        // "Write only (Drop Box)" you cannot enter is not a drop box, and a readable
+        // directory you cannot search lists names whose contents nothing can stat.
+        let x: UInt16 = isDirectory ? 1 : (existing & 1)
+        switch self {
+        case .readWrite: return 6 | x
+        case .readOnly:  return 4 | x
+        case .writeOnly: return 2 | x
+        case .noAccess:  return 0
+        }
+    }
+}
+
+/// Which triad of a mode a change applies to.
+enum PosixClass: Int, CaseIterable { case owner = 6, group = 3, other = 0 }
+
+enum PosixMode {
+    /// The three levels of a full mode, for display.
+    static func levels(_ mode: UInt16) -> (owner: PosixAccess, group: PosixAccess, other: PosixAccess) {
+        (.from(bits: (mode >> 6) & 7), .from(bits: (mode >> 3) & 7), .from(bits: mode & 7))
+    }
+    /// `mode` with one triad replaced. Only the 12 permission bits are touched —
+    /// setuid/setgid/sticky live above them and dropping them silently would break
+    /// shared drop folders that rely on setgid.
+    static func setting(_ mode: UInt16, _ cls: PosixClass, to level: PosixAccess, isDirectory: Bool) -> UInt16 {
+        let shift = UInt16(cls.rawValue)
+        let existing = (mode >> shift) & 7
+        let replaced = level.bits(existing: existing, isDirectory: isDirectory)
+        return (mode & ~(7 << shift)) | (replaced << shift)
+    }
+    /// "rwxr-xr-x" — kept because it's the form you can paste into a chmod discussion.
+    static func string(_ mode: UInt16) -> String {
+        func rwx(_ v: UInt16) -> String { "\(v & 4 != 0 ? "r" : "-")\(v & 2 != 0 ? "w" : "-")\(v & 1 != 0 ? "x" : "-")" }
+        return rwx((mode >> 6) & 7) + rwx((mode >> 3) & 7) + rwx(mode & 7)
+    }
+}
+
+// MARK: - Trash put-back
+
+/// Where a trashed item came from, so "Put Back" lands it where Finder would.
+struct TrashOrigin: Equatable {
+    /// Absolute directory the item was in.
+    var directory: String
+    /// The name it had BEFORE the Trash renamed it for a collision — "New Folder",
+    /// not "New Folder 08-27-42-686". Restoring under the trash-mangled name is the
+    /// classic way a Restore feature quietly returns the wrong thing.
+    var name: String
+    var url: URL { URL(fileURLWithPath: directory).appendingPathComponent(name) }
+}
+
+/// Reads Finder's put-back records out of a Trash folder's `.DS_Store`.
+///
+/// This is the only place the original location of an item trashed by ANOTHER app
+/// is recorded — there is no xattr and no metadata attribute for it (checked: a
+/// freshly trashed file carries only com.apple.provenance). The records are
+/// `ptbL` (original directory, as a path with no leading slash) and `ptbN`
+/// (original name), keyed by the item's name inside the Trash.
+///
+/// The file is an undocumented "Bud1" buddy-allocator wrapping a B-tree, and it is
+/// UNTRUSTED input: every read below is bounds-checked and every failure returns
+/// what has been decoded so far rather than trapping. A corrupt .DS_Store must
+/// degrade Restore to "origin unknown", never crash the app.
+///
+/// It is also written LAZILY by Finder, so an item trashed seconds ago may have no
+/// record yet. That is why Navigator persists its own trash→origin map as well and
+/// consults it first (see TrashOrigins); this parser is the fallback that makes
+/// Restore work for the rest of the Trash.
+enum DSStore {
+    static func putBackRecords(_ data: Data) -> [String: TrashOrigin] {
+        var out: [String: TrashOrigin] = [:]
+        let b = [UInt8](data)
+        func u32(_ o: Int) -> UInt32? {
+            guard o >= 0, o + 4 <= b.count else { return nil }
+            return (UInt32(b[o]) << 24) | (UInt32(b[o + 1]) << 16) | (UInt32(b[o + 2]) << 8) | UInt32(b[o + 3])
+        }
+        guard u32(0) == 1, b.count > 8,
+              b[4] == 0x42, b[5] == 0x75, b[6] == 0x64, b[7] == 0x31 else { return out }  // "Bud1"
+        // Header: allocator-info offset at 0x08. All block offsets in this format are
+        // relative to the end of the 4-byte magic, hence the +4 everywhere.
+        guard let infoOff = u32(0x08).map({ Int($0) + 4 }), let blockCount = u32(infoOff) else { return out }
+        guard blockCount > 0, blockCount < 100_000 else { return out }
+        let addrStart = infoOff + 8
+        // The address list is padded out to a whole multiple of 256 entries.
+        let addrSlots = ((Int(blockCount) + 255) / 256) * 256
+        var dirOff = addrStart + addrSlots * 4
+        guard let dirCount = u32(dirOff), dirCount < 10_000 else { return out }
+        dirOff += 4
+        var dsdbBlock: Int?
+        for _ in 0..<Int(dirCount) {
+            guard dirOff < b.count else { return out }
+            let nameLen = Int(b[dirOff]); dirOff += 1
+            guard dirOff + nameLen + 4 <= b.count else { return out }
+            let name = String(decoding: b[dirOff..<(dirOff + nameLen)], as: UTF8.self)
+            dirOff += nameLen
+            let block = u32(dirOff); dirOff += 4
+            if name == "DSDB" { dsdbBlock = block.map(Int.init) }
+        }
+        // A block's address packs its offset and its log2 size into one word.
+        func block(_ n: Int) -> Int? {
+            guard let a = u32(addrStart + n * 4) else { return nil }
+            return Int(a & ~0x1f) + 4
+        }
+        guard let dsdb = dsdbBlock, let dsdbOff = block(dsdb), let rootNode = u32(dsdbOff) else { return out }
+
+        /// One key/value record. Returns the offset just past it, or nil to abandon
+        /// the walk — an unrecognised value type means we no longer know how many
+        /// bytes to skip, and guessing would read garbage as a filesystem path.
+        func record(_ off: Int) -> Int? {
+            guard let nameLen = u32(off), nameLen < 4096 else { return nil }
+            var o = off + 4
+            let nameBytes = Int(nameLen) * 2
+            guard o + nameBytes + 8 <= b.count else { return nil }
+            // Decode as UTF-16, not scalar-at-a-time: an emoji in a filename is a
+            // surrogate PAIR, and treating each half as a scalar throws the name away.
+            var units: [UInt16] = []
+            var i = o
+            while i + 1 < o + nameBytes {
+                units.append((UInt16(b[i]) << 8) | UInt16(b[i + 1]))
+                i += 2
+            }
+            let key = String(decoding: units, as: UTF16.self)
+            o += nameBytes
+            let sid = String(decoding: b[o..<(o + 4)], as: UTF8.self); o += 4
+            let type = String(decoding: b[o..<(o + 4)], as: UTF8.self); o += 4
+            var text: String?
+            switch type {
+            case "long", "shor", "type": o += 4
+            case "bool": o += 1
+            case "comp", "dutc": o += 8
+            case "blob":
+                guard let n = u32(o), n < 1 << 24 else { return nil }
+                o += 4 + Int(n)
+            case "ustr":
+                guard let n = u32(o), n < 1 << 20 else { return nil }
+                o += 4
+                let bytes = Int(n) * 2
+                guard o + bytes <= b.count else { return nil }
+                var vu: [UInt16] = []
+                var j = o
+                while j + 1 < o + bytes {
+                    vu.append((UInt16(b[j]) << 8) | UInt16(b[j + 1]))
+                    j += 2
+                }
+                text = String(decoding: vu, as: UTF16.self)
+                o += bytes
+            default: return nil
+            }
+            guard o <= b.count else { return nil }
+            if let text {
+                switch sid {
+                case "ptbL": out[key, default: TrashOrigin(directory: "", name: "")].directory = normalize(text)
+                case "ptbN": out[key, default: TrashOrigin(directory: "", name: "")].name = text
+                default: break
+                }
+            }
+            return o
+        }
+
+        // Depth-first over the B-tree, with an EXPLICIT stack rather than recursion.
+        //
+        // The node-count bound below does not bound DEPTH: a corrupt file whose nodes
+        // form a 10,000-long chain (each one naming the next, none of them repeating)
+        // was 10,000 live stack frames deep. This runs from loadTrashPutBack on a
+        // DispatchQueue.global worker, whose stack is 512 KB — deep enough to overflow
+        // and take the whole app down with no error anyone could act on. A worklist has
+        // no such ceiling. `visited` is still not paranoia: a block number that points
+        // back at an ancestor would otherwise loop forever.
+        //
+        // Visiting order changes (LIFO, so `next` before the children) and that is safe:
+        // `out` is keyed by filename+field and a B-tree holds each key once, so no
+        // ordering of the same node set can produce a different result.
+        var visited = Set<Int>()
+        var stack = [Int(rootNode)]
+        while let n = stack.popLast() {
+            guard !visited.contains(n), visited.count < 10_000, let off = block(n) else { continue }
+            visited.insert(n)
+            guard let next = u32(off), let count = u32(off + 4), count < 100_000 else { continue }
+            var o = off + 8
+            if next == 0 {
+                for _ in 0..<Int(count) {
+                    guard let after = record(o) else { break }
+                    o = after
+                }
+            } else {
+                // An unreadable record abandons the REST of this node — including its
+                // right-hand `next` sibling — exactly as the recursive form's early
+                // return did. Children already read are still walked: they were read
+                // before the bad record and are as trustworthy as anything else here.
+                var truncated = false
+                for _ in 0..<Int(count) {
+                    guard let child = u32(o) else { truncated = true; break }
+                    o += 4
+                    // Bounded, and skipping the already-seen: `count` is only bounded at
+                    // 100,000, so a corrupt node claiming that many children would
+                    // otherwise queue work no visit budget can ever consume — trading the
+                    // stack overflow this rewrite fixes for an out-of-memory one.
+                    // Anything past the visit budget is unreachable by definition.
+                    if !visited.contains(Int(child)), stack.count < 10_000 { stack.append(Int(child)) }
+                    guard let after = record(o) else { truncated = true; break }
+                    o = after
+                }
+                if !truncated, !visited.contains(Int(next)) { stack.append(Int(next)) }
+            }
+        }
+        return out.filter { !$0.value.directory.isEmpty && !$0.value.name.isEmpty }
+    }
+
+    /// A `ptbL` value into a path you can hand to FileManager.
+    ///
+    /// Two fixups. The leading "/" is absent from the stored form. And Finder often
+    /// records the firmlink path "/System/Volumes/Data/Users/…", which is the SAME
+    /// directory as "/Users/…" but is a second name for it — restoring through it
+    /// works, yet every path we then show the user, compare, or navigate to would be
+    /// a path they have never seen anywhere else in the OS.
+    static func normalize(_ raw: String) -> String {
+        var p = raw
+        if !p.hasPrefix("/") { p = "/" + p }
+        while p.count > 1, p.hasSuffix("/") { p.removeLast() }
+        let firmlink = "/System/Volumes/Data"
+        if p == firmlink { return "/" }
+        if p.hasPrefix(firmlink + "/") { p = String(p.dropFirst(firmlink.count)) }
+        return p
+    }
+}
+
+/// Navigator's own record of where the things IT trashed came from — the
+/// authoritative half of Put Back.
+///
+/// Finder's `.DS_Store` put-back records are written lazily (a file trashed seconds
+/// ago is often not in them yet, measured), so relying on them alone would make
+/// Restore fail exactly when it is most likely to be used: right after a delete.
+/// Every trash operation records here immediately instead.
+///
+/// Keyed by the item's path INSIDE the Trash, which is unique — the Trash renames
+/// collisions — and pruned to a bounded, recent set so this can't grow without end.
+enum TrashOrigins {
+    static let key = "trashOrigins"
+    private static let limit = 500
+    /// Injected in tests; UserDefaults.standard in the app.
+    static var defaults: UserDefaults = .standard
+
+    static func record(_ pairs: [(from: URL, to: URL)]) {
+        guard !pairs.isEmpty else { return }
+        var map = defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+        for p in pairs { map[p.from.path] = p.to.path }
+        // Drop entries whose trashed item is gone (emptied, or put back already);
+        // that both prunes and keeps the map honest about what it can still restore.
+        map = map.filter { FileManager.default.fileExists(atPath: $0.key) }
+        // Age = when the item entered the Trash, which is exactly what
+        // .addedToDirectoryDate records. An unreadable date sorts oldest, so an entry
+        // we can no longer date is the first to go rather than the last.
+        map = evict(map, limit: limit) {
+            (try? URL(fileURLWithPath: $0).resourceValues(forKeys: [.addedToDirectoryDateKey]))?
+                .addedToDirectoryDate ?? .distantPast
+        }
+        defaults.set(map, forKey: key)
+    }
+
+    /// Keep the `limit` most recently trashed entries.
+    ///
+    /// The bug this replaces: `Array(map).suffix(limit)` over a Dictionary. Dictionary
+    /// iteration order is unspecified AND seeded per process, so eviction dropped an
+    /// arbitrary set that differed on every launch — a Put Back that worked yesterday
+    /// could silently have no origin today, for no reason the user could see or undo.
+    /// Ordering by age makes the survivors the ones anybody would actually reach for.
+    static func evict(_ map: [String: String], limit: Int, age: (String) -> Date) -> [String: String] {
+        guard map.count > limit else { return map }
+        let dated: [(path: String, at: Date)] = map.keys.map { (path: $0, at: age($0)) }
+        // Path breaks ties, so two items trashed in the same instant still evict
+        // deterministically instead of by hash order.
+        let sorted = dated.sorted { $0.at == $1.at ? $0.path < $1.path : $0.at < $1.at }
+        var out: [String: String] = [:]
+        for e in sorted.suffix(limit) { out[e.path] = map[e.path] }
+        return out
+    }
+
+    static func origin(of trashedPath: String) -> TrashOrigin? {
+        guard let p = (defaults.dictionary(forKey: key) as? [String: String])?[trashedPath] else { return nil }
+        let u = URL(fileURLWithPath: p)
+        return TrashOrigin(directory: u.deletingLastPathComponent().path, name: u.lastPathComponent)
+    }
+
+    static func forget(_ trashedPaths: [String]) {
+        guard var map = defaults.dictionary(forKey: key) as? [String: String], !map.isEmpty else { return }
+        for p in trashedPaths { map[p] = nil }
+        defaults.set(map, forKey: key)
     }
 }
