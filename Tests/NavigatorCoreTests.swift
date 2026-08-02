@@ -2516,3 +2516,103 @@ final class CollisionSafeOrderTests: XCTestCase {
         XCTAssertEqual(names(ordered), ["photo.png->Photo.png"])
     }
 }
+
+/// The four selection cases the Open/Save-dialog hotkey has to get right. It fires while
+/// Navigator is in the BACKGROUND, so a wrong answer is invisible until someone's dialog
+/// has already jumped to the wrong place.
+final class PickerBridgeRulesTests: XCTestCase {
+
+    func testNothingSelectedCopiesTheCurrentFolder() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(folder: "/tmp/navpath", selection: []),
+                       "/tmp/navpath")
+    }
+
+    // A single file is the file, NOT its folder: ⌘⇧G in an Open panel both navigates to
+    // it and preselects it, which is the whole point of the feature.
+    func testOneFileCopiesTheFile() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(folder: "/tmp/navpath",
+                                                    selection: ["/tmp/navpath/red.png"]),
+                       "/tmp/navpath/red.png")
+    }
+
+    func testOneFolderCopiesTheFolder() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(folder: "/tmp/navpath",
+                                                    selection: ["/tmp/navpath/sub"]),
+                       "/tmp/navpath/sub")
+    }
+
+    func testMultipleSelectionCopiesTheirFolder() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(
+            folder: "/tmp/navpath",
+            selection: ["/tmp/navpath/red.png", "/tmp/navpath/green.png"]), "/tmp/navpath")
+    }
+
+    // Search results: the hits can live below the folder being browsed, and the folder
+    // they SHARE is a better destination than the search root.
+    func testMultipleSelectionInOneSubfolderPrefersThatSubfolder() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(
+            folder: "/tmp/navpath",
+            selection: ["/tmp/navpath/sub/a.png", "/tmp/navpath/sub/b.png"]), "/tmp/navpath/sub")
+    }
+
+    // Hits from unrelated folders share nothing, so the browsed folder is the only
+    // answer that isn't a guess.
+    func testMultipleSelectionAcrossFoldersFallsBackToTheCurrentFolder() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(
+            folder: "/tmp/navpath",
+            selection: ["/tmp/navpath/sub/a.png", "/tmp/navpath/other/b.png"]), "/tmp/navpath")
+    }
+
+    // A stale/empty id must never be handed to a dialog as an empty path.
+    func testEmptySelectionEntryFallsBackToTheFolder() {
+        XCTAssertEqual(PickerBridgeRules.pathToCopy(folder: "/tmp/navpath", selection: [""]),
+                       "/tmp/navpath")
+    }
+
+    func testDefaultChordIsControlOptionCommandG() {
+        let c = PickerBridgeRules.chord(id: nil)
+        XCTAssertEqual(c.display, "\u{2303}\u{2325}\u{2318}G")
+        XCTAssertEqual(c.keyCode, 5)
+    }
+
+    // A pref written by a later version must not silently disable the hotkey.
+    func testUnknownChordIdFallsBackToTheDefault() {
+        XCTAssertEqual(PickerBridgeRules.chord(id: "nonsense"), PickerBridgeRules.chords[0])
+    }
+
+    // The teleport chord is derived by adding Shift, so no offered chord may already
+    // contain it — otherwise the two hot keys would be the same one.
+    func testNoOfferedChordContainsShift() {
+        for c in PickerBridgeRules.chords {
+            XCTAssertEqual(c.carbonModifiers & PickerBridgeRules.shiftKeyMask, 0, c.id)
+        }
+    }
+
+    func testTeleportChordAddsShiftAndNothingElse() {
+        let base = PickerBridgeRules.chords[0]
+        let t = PickerBridgeRules.teleportChord(for: base)
+        XCTAssertEqual(t.keyCode, base.keyCode)
+        XCTAssertEqual(t.carbonModifiers, base.carbonModifiers | PickerBridgeRules.shiftKeyMask)
+        XCTAssertEqual(t.display, "\u{2303}\u{2325}\u{21E7}\u{2318}G")
+        XCTAssertNotEqual(t.carbonModifiers, base.carbonModifiers)
+    }
+
+    func testShortPathIsShownWhole() {
+        XCTAssertEqual(PickerBridgeRules.hudLabel("/tmp/navpath/red.png"), "/tmp/navpath/red.png")
+    }
+
+    // Shortening drops leading components, never the file name.
+    func testLongPathKeepsItsTail() {
+        let p = "/Users/merickson/Pictures/2026/Q3/campaign/hero/final/approved/banner-wide.png"
+        let label = PickerBridgeRules.hudLabel(p, max: 40)
+        XCTAssertLessThanOrEqual(label.count, 40)
+        XCTAssertTrue(label.hasSuffix("banner-wide.png"), label)
+        XCTAssertTrue(label.hasPrefix("\u{2026}/"), label)
+    }
+
+    func testOneOverlongComponentKeepsItsEnd() {
+        let label = PickerBridgeRules.hudLabel("/" + String(repeating: "x", count: 90) + "9.png", max: 20)
+        XCTAssertEqual(label.count, 20)
+        XCTAssertTrue(label.hasSuffix("9.png"), label)
+    }
+}

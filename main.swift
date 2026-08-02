@@ -9,6 +9,7 @@ import QuickLookThumbnailing
 import CoreServices
 import NetFS
 import FinderSync   // detect / offer to enable the Finder menu extension
+import Carbon.HIToolbox   // RegisterEventHotKey — the ONLY permission-free global hotkey
 import os
 
 // Perf logging — view in Console.app (or `log stream`) filtered by
@@ -417,6 +418,22 @@ enum Prefs {
     }
     static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
     static var didOfferDefaults: Bool { get { d.bool(forKey: "didOfferDefaults") } set { d.set(newValue, forKey: "didOfferDefaults") } }
+    /// The Open/Save dialog bridge (PickerBridge). On by default: its chord is ⌃⌥⌘-based
+    /// so it shadows nothing, and a global hotkey nobody knows about is a feature nobody
+    /// finds. The teleport variant is off by default — it needs Accessibility, and asking
+    /// for that unprompted is not something an app should do on its own.
+    static var pickerHotkeyEnabled: Bool {
+        get { d.object(forKey: "pickerHotkeyEnabled") == nil ? true : d.bool(forKey: "pickerHotkeyEnabled") }
+        set { d.set(newValue, forKey: "pickerHotkeyEnabled") }
+    }
+    static var pickerHotkeyChord: String {
+        get { d.string(forKey: "pickerHotkeyChord") ?? PickerBridgeRules.chords[0].id }
+        set { d.set(newValue, forKey: "pickerHotkeyChord") }
+    }
+    static var pickerTeleportEnabled: Bool {
+        get { d.bool(forKey: "pickerTeleportEnabled") }
+        set { d.set(newValue, forKey: "pickerTeleportEnabled") }
+    }
     static var warnImageDelete: Bool { get { d.object(forKey: "warnImageDelete") == nil ? true : d.bool(forKey: "warnImageDelete") } set { d.set(newValue, forKey: "warnImageDelete") } }
     static var warnExtensionChange: Bool { get { d.object(forKey: "warnExtensionChange") == nil ? true : d.bool(forKey: "warnExtensionChange") } set { d.set(newValue, forKey: "warnExtensionChange") } }
     static var lastUpdateCheck: Double { get { d.double(forKey: "lastUpdateCheck") } set { d.set(newValue, forKey: "lastUpdateCheck") } }
@@ -11343,6 +11360,303 @@ final class ViewOptionsController {
     }
 }
 
+// MARK: - Open/Save dialog bridge
+
+/// A brief label near the pointer, shown when a global hotkey did something while
+/// Navigator was in the BACKGROUND — where its own window is nowhere the user is looking
+/// and there is otherwise no sign at all that the key press landed.
+///
+/// Non-activating, never key, mouse-transparent. That isn't politeness: the whole point
+/// of the feature is to serve an Open/Save panel in ANOTHER app, and a panel of ours that
+/// took key would deactivate that app and pull focus off the dialog the user is standing
+/// in. (ViewOptionsController documents what a key-taking panel costs even inside our own
+/// window.)
+final class PathHUD {
+    static let shared = PathHUD()
+    private var panel: NSPanel?
+    private var label: NSTextField?
+    private var hideTimer: Timer?
+    private init() {}
+
+    static func show(_ text: String) { shared.present(text) }
+
+    private func present(_ text: String) {
+        let p = panel ?? make()
+        guard let label else { return }
+        label.stringValue = text
+        label.sizeToFit()
+        let size = NSSize(width: min(max(label.frame.width + 28, 180), 640), height: 40)
+        p.setContentSize(size)
+        label.frame = NSRect(x: 14, y: (size.height - label.frame.height) / 2,
+                             width: size.width - 28, height: label.frame.height)
+        p.setFrameOrigin(origin(for: size))
+        p.orderFront(nil)     // NOT makeKeyAndOrderFront — see the class comment
+        hideTimer?.invalidate()
+        // Timer(…) + RunLoop.main.add(forMode: .common), never Timer.scheduledTimer: a
+        // default-mode timer doesn't fire while a drag or menu-tracking loop is running,
+        // and a HUD that can get stuck on screen over someone else's dialog is worse than
+        // no HUD at all.
+        let t = Timer(timeInterval: 1.8, repeats: false) { [weak p] _ in p?.orderOut(nil) }
+        RunLoop.main.add(t, forMode: .common)
+        hideTimer = t
+    }
+
+    /// Just below-right of the pointer — where the user is already looking — pulled back
+    /// onto whichever screen that is. NSEvent.mouseLocation needs no permission: it's the
+    /// cursor's position, not another app's input.
+    private func origin(for size: NSSize) -> NSPoint {
+        let m = NSEvent.mouseLocation
+        let vis = (NSScreen.screens.first { $0.frame.contains(m) } ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        return NSPoint(x: min(max(m.x + 16, vis.minX + 8), vis.maxX - size.width - 8),
+                       y: min(max(m.y - size.height - 16, vis.minY + 8), vis.maxY - size.height - 8))
+    }
+
+    private func make() -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 40),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.isFloatingPanel = true
+        p.becomesKeyOnlyIfNeeded = true
+        p.hidesOnDeactivate = false        // it exists PRECISELY while we are deactivated
+        p.isReleasedWhenClosed = false
+        p.ignoresMouseEvents = true        // never between the user and the dialog beneath
+        p.isOpaque = false
+        p.backgroundColor = .clear
+        // .statusBar to sit above the frontmost app's windows and its Open/Save sheet;
+        // .canJoinAllSpaces so it appears on whichever Space that app is on.
+        p.level = .statusBar
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        let bg = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 240, height: 40))
+        bg.material = .hudWindow
+        bg.state = .active
+        bg.blendingMode = .behindWindow
+        bg.autoresizingMask = [.width, .height]
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 11
+        bg.layer?.masksToBounds = true
+        let l = NSTextField(labelWithString: "")
+        l.font = .systemFont(ofSize: 12, weight: .medium)
+        l.lineBreakMode = .byTruncatingMiddle
+        bg.addSubview(l)
+        p.contentView = bg
+        label = l
+        panel = p
+        return p
+    }
+}
+
+/// Puts Navigator's location on the clipboard for ANOTHER app's Open/Save panel, from a
+/// system-wide hotkey that works while Navigator is in the background — the only state
+/// that matters, since the user is standing in Photoshop's or Chrome's dialog when they
+/// press it. PickerBridgeRules explains why the clipboard is the bridge and which path
+/// gets copied.
+///
+/// Carbon's RegisterEventHotKey, deliberately NOT NSEvent.addGlobalMonitorForEvents: the
+/// monitor needs Accessibility trust. Navigator is signed with a local identity and no
+/// Team ID, so TCC grants for it are fragile — an ad-hoc build is identified by code hash
+/// alone and loses every grant on each rebuild — and a feature whose entire job is "it's
+/// always there" must not be built on one. A Carbon hot key needs no permission at all.
+final class PickerBridge {
+    static let shared = PickerBridge()
+    /// 'NAVP', so our hot keys can't be confused with any other client's.
+    private static let signature = OSType(0x4E415650)
+    private static let copyID: UInt32 = 1
+    private static let teleportID: UInt32 = 2
+    static let accessibilityPane = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+
+    private var refs: [EventHotKeyRef] = []
+    private var handler: EventHandlerRef?
+    private var lastFired = Date.distantPast
+    /// Set when the one-key variant was pressed without Accessibility, so the
+    /// explanation can wait for a moment where an alert isn't stealing a dialog's focus.
+    private var owesAccessibilityExplanation = false
+
+    private init() {
+        // The alert below is deferred to the next time Navigator is frontmost on purpose:
+        // the hotkey fires while another app owns the screen, and an alert thrown up then
+        // would take focus off the very dialog the user is trying to fill in.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.explainAccessibilityIfOwed()
+        }
+    }
+
+    /// (Re)register from prefs — called at launch and after every change in Settings.
+    func reload() {
+        refs.forEach { UnregisterEventHotKey($0) }
+        refs = []
+        guard Prefs.pickerHotkeyEnabled else { return }
+        installHandler()
+        let copy = PickerBridgeRules.chord(id: Prefs.pickerHotkeyChord)
+        var failed: [String] = []
+        if !register(copy, id: Self.copyID) { failed.append(copy.display) }
+        if Prefs.pickerTeleportEnabled {
+            let go = PickerBridgeRules.teleportChord(for: copy)
+            if !register(go, id: Self.teleportID) { failed.append(go.display) }
+        }
+        guard !failed.isEmpty else { return }
+        // A global hotkey that silently failed to register is the worst outcome this
+        // feature has available: the user presses it in Photoshop forever, nothing
+        // happens, and there is nothing anywhere to look at. Another app already holding
+        // the chord is the usual cause. Deferred one turn so it never runs modal inside
+        // applicationDidFinishLaunching.
+        DispatchQueue.main.async {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = "Navigator couldn’t register \(failed.joined(separator: " and "))"
+            a.informativeText = "Another app already owns that shortcut system-wide, so it will never reach Navigator. Pick a different one in Settings ▸ Open/Save Dialogs.\n\nGo ▸ “Copy Path for Open/Save Dialog” still works while Navigator is frontmost."
+            a.addButton(withTitle: "OK")
+            a.runModal()
+        }
+    }
+
+    private func register(_ c: PickerBridgeRules.Chord, id: UInt32) -> Bool {
+        var ref: EventHotKeyRef?
+        let err = RegisterEventHotKey(c.keyCode, c.carbonModifiers,
+                                      EventHotKeyID(signature: Self.signature, id: id),
+                                      GetApplicationEventTarget(), 0, &ref)
+        guard err == noErr, let ref else { return false }
+        refs.append(ref)
+        return true
+    }
+
+    /// Installed once and left in place: the handler is keyed by hot-key id, so
+    /// re-registering chords never needs a second one.
+    private func installHandler() {
+        guard handler == nil else { return }
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var hk = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &hk)
+            // Everything downstream is AppKit and pasteboard work; hop to main rather
+            // than trusting a Carbon callback's thread.
+            DispatchQueue.main.async { PickerBridge.shared.fire(hk.id) }
+            return noErr
+        }, 1, &spec, nil, &handler)
+    }
+
+    /// Go ▸ Copy Path for Open/Save Dialog — the same action, so the menu can never
+    /// disagree with the hotkey about which folder is "current".
+    func copyNow() { fire(Self.copyID) }
+
+    private func fire(_ id: UInt32) {
+        // The menu item carries the same chord (that's how anyone discovers the feature),
+        // so one press while Navigator IS frontmost can arrive twice: once as the Carbon
+        // hot key, once as the menu key equivalent. Copying twice is harmless — two HUDs
+        // stacked on each other, and two bursts of synthesized keystrokes, are not.
+        guard Date().timeIntervalSince(lastFired) > 0.35 else { return }
+        lastFired = Date()
+        // Read BEFORE we overwrite it: only the teleport path can put it back (it pastes
+        // for the user), and only if it's plain text — see Settings for that admission.
+        let previousText = NSPasteboard.general.string(forType: .string)
+        let path = currentPath()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(path, forType: .string)
+        if id == Self.teleportID {
+            teleport(to: path, restoring: previousText)
+        } else {
+            PathHUD.show("Copied \(PickerBridgeRules.hudLabel(path))   ·   ⌘⇧G then ⌘V in the dialog")
+        }
+    }
+
+    /// Resolved through `appModel`, the same window every menu command acts on, so the
+    /// hotkey can't copy a different folder than the menu item beside it.
+    private func currentPath() -> String {
+        guard let d = NSApp.delegate as? AppDelegate else { return NSHomeDirectory() }
+        let b = d.appModel.active
+        return PickerBridgeRules.pathToCopy(folder: b.currentURL.path,
+                                            selection: b.urls(b.selection).map { $0.path })
+    }
+
+    private func teleport(to path: String, restoring previousText: String?) {
+        let label = PickerBridgeRules.hudLabel(path)
+        // Posting keystrokes into another process IS input control, and macOS gates it
+        // behind Accessibility. Degrade to exactly what the other hotkey does rather than
+        // failing: the path is already on the clipboard, so the manual three keys work.
+        guard AXIsProcessTrusted() else {
+            PathHUD.show("Copied \(label)   ·   one-key needs Accessibility — use ⌘⇧G then ⌘V")
+            owesAccessibilityExplanation = true
+            explainAccessibilityIfOwed()   // fires now only if we happen to be frontmost
+            return
+        }
+        // Never at ourselves: with Navigator frontmost there is no foreign dialog to
+        // teleport, and ⌘⇧G would open Navigator's OWN Go to Folder sheet and paste into
+        // it — which reads as the feature misfiring.
+        let front = NSWorkspace.shared.frontmostApplication
+        guard front?.processIdentifier != getpid() else {
+            PathHUD.show("Copied \(label)   ·   no other app’s dialog is in front")
+            return
+        }
+        PathHUD.show("Sending \(label) to \(front?.localizedName ?? "the frontmost app")")
+        // Off the main thread: the panel needs a beat to raise its Go-to-Folder sheet
+        // between keystrokes, and sleeping on main would freeze our UI (and this HUD)
+        // mid-send.
+        DispatchQueue.global(qos: .userInitiated).async {
+            Self.post(key: 5, flags: [.maskCommand, .maskShift])   // ⌘⇧G  (kVK_ANSI_G)
+            usleep(250_000)
+            Self.post(key: 9, flags: .maskCommand)                 // ⌘V   (kVK_ANSI_V)
+            usleep(150_000)
+            Self.post(key: 36, flags: [])                          // ⏎    (kVK_Return)
+            // Only plain text is ever restored. A pasteboard can promise its data lazily
+            // (Photoshop does exactly that for images), and there is no way to snapshot
+            // such a promise without forcing the producer to render it — so anything that
+            // isn't text is left alone and Settings says so outright.
+            guard let previousText else { return }
+            usleep(400_000)
+            DispatchQueue.main.async {
+                // Only while OUR path is still what's on the clipboard: if anything else
+                // copied in the meantime, putting the old text back would make US the
+                // thing that destroyed the user's clipboard.
+                guard NSPasteboard.general.string(forType: .string) == path else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(previousText, forType: .string)
+            }
+        }
+    }
+
+    /// Carbon mask → Cocoa mask, so the menu item can advertise the very chord that was
+    /// registered instead of a hand-kept copy of it.
+    static func cocoaModifiers(_ carbon: UInt32) -> NSEvent.ModifierFlags {
+        var m: NSEvent.ModifierFlags = []
+        if carbon & PickerBridgeRules.controlKeyMask != 0 { m.insert(.control) }
+        if carbon & PickerBridgeRules.optionKeyMask  != 0 { m.insert(.option) }
+        if carbon & PickerBridgeRules.shiftKeyMask   != 0 { m.insert(.shift) }
+        if carbon & PickerBridgeRules.commandKeyMask != 0 { m.insert(.command) }
+        return m
+    }
+
+    private static func post(key: CGKeyCode, flags: CGEventFlags) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) else { continue }
+            e.flags = flags
+            e.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// Said once, ever, and only while we're frontmost — a HUD line is too small to carry
+    /// "here is the switch to flip", and an alert raised mid-dialog would break the thing
+    /// the user was doing.
+    private func explainAccessibilityIfOwed() {
+        guard owesAccessibilityExplanation, NSApp.isActive, !AXIsProcessTrusted(),
+              !Prefs.d.bool(forKey: "pickerAXExplained") else { return }
+        owesAccessibilityExplanation = false
+        Prefs.d.set(true, forKey: "pickerAXExplained")
+        let a = NSAlert()
+        a.messageText = "The one-key version needs Accessibility"
+        a.informativeText = "Sending ⌘⇧G, ⌘V and Return to another app is input control, which macOS only allows with Accessibility permission.\n\nUntil it's granted the shortcut still copies the path — press ⌘⇧G then ⌘V in the dialog yourself.\n\nNavigator is signed locally, so macOS drops this grant every time the app is rebuilt or updated and you'll have to tick it again."
+        a.addButton(withTitle: "Open Accessibility Settings…")
+        a.addButton(withTitle: "Later")
+        if a.runModal() == .alertFirstButtonReturn {
+            PermissionProbe.openPane(Self.accessibilityPane)
+        }
+    }
+}
+
 // Settings window (⌘,). Bound directly to the same UserDefaults keys the app
 // reads via Prefs, so changes take effect with no plumbing: the behavioral ones
 // (Trash confirm, thumbnails) are read live at point-of-use; view/sort/hidden
@@ -11356,6 +11670,9 @@ struct SettingsView: View {
     @AppStorage("thumbnailMode") private var thumbnailMode = "all"
     @AppStorage("warnExtensionChange") private var warnExtensionChange = true
     @AppStorage("inferFolderView") private var inferFolderView = true
+    @AppStorage("pickerHotkeyEnabled") private var pickerHotkeyEnabled = true
+    @AppStorage("pickerHotkeyChord") private var pickerHotkeyChord = PickerBridgeRules.chords[0].id
+    @AppStorage("pickerTeleportEnabled") private var pickerTeleportEnabled = false
     var body: some View {
         Form {
             Section("Defaults for new windows & tabs") {
@@ -11381,9 +11698,58 @@ struct SettingsView: View {
                     Text("Off (fastest on slow drives)").tag("off")
                 }
             }
+            // Wordier than the rest of this window on purpose: this section reaches into
+            // another app's dialog, replaces the clipboard, and optionally leans on a
+            // permission macOS revokes behind the user's back. None of that should be
+            // discovered by surprise.
+            Section("Open/Save dialogs in other apps") {
+                Toggle("Global shortcut to copy this folder’s path", isOn: $pickerHotkeyEnabled)
+                Picker("Shortcut", selection: $pickerHotkeyChord) {
+                    ForEach(PickerBridgeRules.chords, id: \.id) { Text($0.display).tag($0.id) }
+                }
+                .disabled(!pickerHotkeyEnabled)
+                Text("Press it in any app — Navigator needn’t be in front — then ⌘⇧G, ⌘V, Return in the Open or Save dialog. One selected item copies that item; several copy their folder; none copies the folder you’re browsing.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Toggle("One keystroke: also send ⌘⇧G, paste and Return to the frontmost app",
+                       isOn: $pickerTeleportEnabled)
+                    .disabled(!pickerHotkeyEnabled)
+                // The note and its remedy live in ONE row, and the link shows whenever the
+                // permission is missing rather than only while the toggle is on: as a
+                // separate Form row it was the first thing to fall off the bottom of the
+                // window — the button that fixes the problem, invisible.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(teleportNote)
+                    if !AXIsProcessTrusted() {
+                        Button("Open Accessibility Settings…") {
+                            PermissionProbe.openPane(PickerBridge.accessibilityPane)
+                        }
+                        .buttonStyle(.link)
+                    }
+                }
+                .font(.callout).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 360)
+        // Width fixed, height derived from the content. NOT a hard height: a grouped Form
+        // pinned to one CLIPS instead of scrolling (a ScrollView doesn't help — the Form
+        // still takes the whole height offered), and what fell off the bottom was the
+        // dialog-bridge section's Accessibility warning and the button that resolves it.
+        .frame(width: 460)
+        .fixedSize(horizontal: false, vertical: true)
+        // Every one of these three changes the registered hot keys, so they all go
+        // through the one re-registration path rather than each doing its own thing.
+        .onChange(of: pickerHotkeyEnabled) { _, _ in PickerBridge.shared.reload() }
+        .onChange(of: pickerHotkeyChord) { _, _ in PickerBridge.shared.reload() }
+        .onChange(of: pickerTeleportEnabled) { _, _ in PickerBridge.shared.reload() }
+    }
+
+    /// Stated plainly rather than reassuringly: the Accessibility grant really does vanish
+    /// on every rebuild, and the clipboard really is only put back when it held text.
+    private var teleportNote: String {
+        let chord = PickerBridgeRules.teleportChord(for: PickerBridgeRules.chord(id: pickerHotkeyChord)).display
+        let ax = AXIsProcessTrusted() ? "Needs Accessibility — granted."
+                                      : "Needs Accessibility — not granted, so it only copies."
+        return "\(chord) does it in one press. \(ax) macOS drops that grant whenever Navigator is rebuilt or updated (signed locally, no Team ID). Only a plain-text clipboard is put back; anything else keeps the path."
     }
 }
 
@@ -11794,6 +12160,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // that never restores them must still PERSIST them — see WindowSessions.held.
         WindowSessions.hold(Array(sessions.dropFirst()))
         installKeyMonitor()
+        // The system-wide chord for "copy my location for another app's Open/Save panel".
+        // Registered at launch, not on first use: its whole value is being available while
+        // Navigator sits in the background.
+        PickerBridge.shared.reload()
         ensureSMBTuning()
         Updater.check(userInitiated: false)   // silent, throttled to once/day; prompts only if an update exists
         NetworkBrowser.shared.start()
@@ -12486,6 +12856,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         gtf.keyEquivalentModifierMask = [.command, .shift]; gtf.target = self
         let cs = goMenu.addItem(withTitle: "Connect to Server…", action: #selector(connectServerAction(_:)), keyEquivalent: "k")
         cs.target = self
+        goMenu.addItem(.separator())
+        // The discoverable face of the global hotkey — nobody finds a system-wide chord
+        // that exists only in Settings. Its key equivalent is refreshed from the pref in
+        // validateMenuItem, since the chord is configurable and this is built once.
+        let cpd = goMenu.addItem(withTitle: "Copy Path for Open/Save Dialog",
+                                 action: #selector(copyPathForDialogAction(_:)), keyEquivalent: "")
+        cpd.target = self
+        cpd.toolTip = "Copies this folder (or the selected item) so any app's Open/Save dialog can jump to it with ⌘⇧G, ⌘V. Works while Navigator is in the background."
 
         // Window menu: standard Minimize/Zoom/Bring All to Front. Deliberately NOT set
         // as NSApp.windowsMenu — confirmed live that doing so makes the Dock's
@@ -12646,6 +13024,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
     @objc func newTabAction(_ sender: Any?) { appModel.newTab() }
     @objc func closeTabAction(_ sender: Any?) {
+        // ⌘W has to mean "close what I'm looking at". This is a single app-wide menu
+        // item, so without the NavWindow check it reached past a focused Settings /
+        // Get Info / Setup Assistant / viewer window and closed a browser TAB behind
+        // it — the user loses a tab they could still see while the window they aimed
+        // at stays open. `appModel` deliberately falls back to the last key browser
+        // window, which is what let it find a tab to close from any window at all.
+        guard NSApp.keyWindow is NavWindow else { NSApp.keyWindow?.performClose(nil); return }
         if appModel.tabs.count > 1 { appModel.closeTab(appModel.selected) } else { NSApp.keyWindow?.performClose(nil) }
     }
     @objc func closeWindowAction(_ sender: Any?) { (NSApp.keyWindow ?? window)?.performClose(nil) }
@@ -12738,6 +13123,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if item.action == #selector(goUpAction(_:)) {
             let u = appModel.active.currentURL
             return u.deletingLastPathComponent().path != u.path
+        }
+        // The chord is a user pref and this item is built once at launch, so it re-reads
+        // it as the menu opens — an item advertising a shortcut the user has since changed
+        // would be a lie the user can see.
+        if item.action == #selector(copyPathForDialogAction(_:)) {
+            let c = PickerBridgeRules.chord(id: Prefs.pickerHotkeyChord)
+            item.keyEquivalent = c.key.lowercased()
+            item.keyEquivalentModifierMask = PickerBridge.cocoaModifiers(c.carbonModifiers)
+            return true
         }
         if item.action == #selector(makeAliasAction(_:)) { return !appModel.active.selection.isEmpty }
         // Grey out rather than beep: with nothing selected there is nothing to wrap up.
@@ -12921,6 +13315,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // center() above ran against the 440x360 placeholder; the hosting view then resizes
+        // the window to whatever its content needs, growing DOWNWARD from that origin. With
+        // the taller pane that put the last rows below the screen edge and behind the Dock —
+        // including the Accessibility warning and its button. Re-centre once the real height
+        // is known, and only when the window doesn't fit where it is.
+        DispatchQueue.main.async { [weak self] in
+            guard let w = self?.settingsWindow,
+                  let vis = (w.screen ?? NSScreen.main)?.visibleFrame,
+                  !vis.contains(w.frame) else { return }
+            w.center()
+        }
     }
 
     @objc func exportFavoritesAction(_ sender: Any?) {
@@ -13073,6 +13478,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         NSApp.activate(ignoringOtherApps: true)
         NotificationCenter.default.post(name: .navigatorFocusSearch, object: nil)
     }
+    /// The mirror image of Go to Folder: instead of taking a path from the clipboard, it
+    /// puts one there for somebody else's Open/Save panel to receive.
+    @objc func copyPathForDialogAction(_ sender: Any?) { PickerBridge.shared.copyNow() }
+
     @objc func goToFolderAction(_ sender: Any?) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
