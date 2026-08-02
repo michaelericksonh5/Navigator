@@ -2631,3 +2631,160 @@ final class PickerBridgeRulesTests: XCTestCase {
         XCTAssertTrue(label.hasSuffix("9.png"), label)
     }
 }
+
+// MARK: - Save-panel safety
+
+/// The one-key teleport wrote a real file into a real shared drive once. These pin the
+/// decision that stops it: Return goes out only into a panel proven to be an Open panel,
+/// and nothing is pasted before the Go-to-Folder field is proven to have focus.
+final class PickerBridgeSavePanelTests: XCTestCase {
+
+    func testSavePanelIsIdentifiedByItsAppKitIdentifier() {
+        XCTAssertEqual(PickerBridgeRules.panelKind(identifier: "save-panel", hasFilenameField: false),
+                       .savePanel)
+    }
+
+    func testOpenPanelIsIdentifiedByItsAppKitIdentifier() {
+        XCTAssertEqual(PickerBridgeRules.panelKind(identifier: "open-panel", hasFilenameField: false),
+                       .openPanel)
+    }
+
+    /// A filename field beats the identifier: whatever the panel calls itself, one that
+    /// can name a new file can create one.
+    func testFilenameFieldOutranksAnOpenPanelIdentifier() {
+        XCTAssertEqual(PickerBridgeRules.panelKind(identifier: "open-panel", hasFilenameField: true),
+                       .savePanel)
+    }
+
+    func testAnythingElseIsUnknown() {
+        XCTAssertEqual(PickerBridgeRules.panelKind(identifier: nil, hasFilenameField: false), .unknown)
+        XCTAssertEqual(PickerBridgeRules.panelKind(identifier: "_NS:12", hasFilenameField: false), .unknown)
+    }
+
+    /// The whole guarantee. `unknown` staying on the no-Return side is the point — a
+    /// dialog Navigator can't read is exactly the one it must not press Return in.
+    func testReturnIsSentOnlyIntoAProvenOpenPanel() {
+        XCTAssertTrue(PickerBridgeRules.mayPostReturn(.openPanel))
+        XCTAssertFalse(PickerBridgeRules.mayPostReturn(.savePanel))
+        XCTAssertFalse(PickerBridgeRules.mayPostReturn(.unknown))
+    }
+
+    func testGoToFolderIsRecognisedFromTheFieldOrItsSheet() {
+        XCTAssertTrue(PickerBridgeRules.isGoToFolderFocused(["PathTextField", "GoToWindow"]))
+        XCTAssertTrue(PickerBridgeRules.isGoToFolderFocused(["_NS:116", "GoToWindow"]))
+    }
+
+    /// The filename field of a Save panel is the exact place a paste must never land.
+    func testSavePanelsOwnFieldIsNotGoToFolder() {
+        XCTAssertFalse(PickerBridgeRules.isGoToFolderFocused(["saveAsNameTextField", "save-panel"]))
+        XCTAssertFalse(PickerBridgeRules.isGoToFolderFocused([]))
+    }
+
+    /// The three outcomes have to read differently, or a user in a Save panel is left
+    /// wondering why nothing moved.
+    func testHUDNamesWhichOutcomeHappened() {
+        let jumped = PickerBridgeRules.teleportHUD(label: "/tmp/x", app: "Photoshop",
+                                                   rescued: false, outcome: .jumped)
+        let waiting = PickerBridgeRules.teleportHUD(label: "/tmp/x", app: "Photoshop",
+                                                    rescued: false, outcome: .pastedAwaitingReturn)
+        let none = PickerBridgeRules.teleportHUD(label: "/tmp/x", app: "Photoshop",
+                                                 rescued: false, outcome: .noGoToFolder)
+        XCTAssertEqual(Set([jumped, waiting, none]).count, 3)
+        XCTAssertTrue(waiting.contains("press Return"), waiting)
+        XCTAssertFalse(jumped.contains("press Return"), jumped)
+        for s in [jumped, waiting, none] { XCTAssertTrue(s.contains("Photoshop"), s) }
+    }
+
+    /// Which source won still has to be visible — that was true before this fix and the
+    /// rewritten HUD must not have dropped it.
+    func testHUDStillNamesAClipboardRescue() {
+        let s = PickerBridgeRules.teleportHUD(label: "/tmp/x", app: "Chrome",
+                                              rescued: true, outcome: .jumped)
+        XCTAssertTrue(s.contains("clipboard"), s)
+    }
+}
+
+// MARK: - Google Drive path forms
+
+/// Every one of these is a string somebody can hand Navigator — from Slack, from a
+/// coworker's Mac, from Navigator's own Copy Local Path — that an Open/Save dialog
+/// cannot resolve. The two failures that matter are inventing a path for something
+/// that was never a Drive location, and mangling one that was already correct.
+final class GoogleDrivePathTests: XCTestCase {
+    private let root = "/Users/me/Library/CloudStorage/GoogleDrive-me@x.com"
+    private let target = "/Users/me/Library/CloudStorage/GoogleDrive-me@x.com/Shared drives/Content/Buffalo"
+
+    func testPortableForm() {
+        XCTAssertEqual(PathRules.googleDrivePath("Google Drive/Shared drives/Content/Buffalo",
+                                                 accountRoot: root), target)
+    }
+
+    func testAnotherMacsFullPath() {
+        XCTAssertEqual(PathRules.googleDrivePath(
+            "/Users/them/Library/CloudStorage/GoogleDrive-them@x.com/Shared drives/Content/Buffalo",
+            accountRoot: root), target)
+    }
+
+    func testBareSharedDrivesAndMyDrive() {
+        XCTAssertEqual(PathRules.googleDrivePath("Shared drives/Content/Buffalo", accountRoot: root), target)
+        XCTAssertEqual(PathRules.googleDrivePath("My Drive/Notes", accountRoot: root), root + "/My Drive/Notes")
+    }
+
+    /// The whole point of routing this through one resolver: a path that is already
+    /// right must survive it byte for byte, not gain or lose a component.
+    func testAlreadyCorrectLocalPathIsUnchanged() {
+        XCTAssertEqual(PathRules.googleDrivePath(target, accountRoot: root), target)
+    }
+
+    func testNonDrivePathIsNotAPath() {
+        XCTAssertNil(PathRules.googleDrivePath("/Users/me/Pictures/hero.png", accountRoot: root))
+        XCTAssertNil(PathRules.googleDrivePath("~/Desktop", accountRoot: root))
+        // A prefix match would anchor this stranger's folder inside Drive.
+        XCTAssertNil(PathRules.googleDrivePath("Shared drivesXYZ/thing", accountRoot: root))
+    }
+
+    func testJunkNeverProducesAPath() {
+        for junk in ["", "   ", "///", "Google Drive/", "Google Drive", "My Drive/",
+                     "/CloudStorage/GoogleDrive-them@x.com", "Shared drives//", "\n\n"] {
+            let out = PathRules.googleDrivePath(junk, accountRoot: root)
+            // Landing on the account root itself is the dangerous near-miss: it looks
+            // like success and sends the dialog somewhere nobody asked for.
+            XCTAssertNotEqual(out, root, junk)
+            XCTAssertNotEqual(out, root + "/", junk)
+        }
+    }
+
+    func testWhitespaceAroundAPastedPath() {
+        XCTAssertEqual(PathRules.googleDrivePath("  Shared drives/Content/Buffalo\n", accountRoot: root), target)
+    }
+
+    func testDriveRelativeFromAParentWalk() {
+        XCTAssertEqual(PathRules.driveRelativePath(leafFirst: ["Buffalo", "Content"], isSharedDrive: true),
+                       "Shared drives/Content/Buffalo")
+        XCTAssertEqual(PathRules.driveRelativePath(leafFirst: ["Notes", "My Drive"], isSharedDrive: false),
+                       "My Drive/Notes")
+        XCTAssertNil(PathRules.driveRelativePath(leafFirst: [], isSharedDrive: true))
+        XCTAssertNil(PathRules.driveRelativePath(leafFirst: ["a", ""], isSharedDrive: true))
+        // A walk that ended somewhere other than a mounted root (an orphan, or a
+        // "Shared with me" item) has no local path at all.
+        XCTAssertNil(PathRules.driveRelativePath(leafFirst: ["Buffalo", "Content"], isSharedDrive: false))
+    }
+
+    func testWebLinkItemIDs() {
+        let id = "11XITyXnwsHaTnH1Nx6xZlU2WH0qzsnzU"
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/\(id)"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/\(id)?usp=sharing"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/file/d/\(id)/view?usp=drive_link"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://docs.google.com/document/d/\(id)/edit"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/open?id=\(id)"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: " https://drive.google.com/drive/folders/\(id) "), id)
+    }
+
+    func testNonDriveLinksHaveNoItemID() {
+        for s in ["", "https://example.com/drive/folders/\(String(repeating: "a", count: 20))",
+                  "https://drive.google.com/drive/folders/", "https://drive.google.com/drive/my-drive",
+                  "https://drive.google.com/file/d/view", "/Users/me/Pictures", "Shared drives/Content"] {
+            XCTAssertNil(PathRules.googleDriveItemID(webURL: s), s)
+        }
+    }
+}

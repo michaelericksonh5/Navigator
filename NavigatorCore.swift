@@ -158,6 +158,82 @@ enum PathRules {
     static func leavesCloudProvider(_ sources: [URL], into dest: URL) -> Bool {
         !isCloudProvider(dest) && sources.contains(where: isCloudProvider)
     }
+
+    /// Every way a Google Drive location can be written down, re-anchored onto ONE
+    /// Mac's Drive account root (".../Library/CloudStorage/GoogleDrive-me@x.com").
+    ///
+    /// Four inputs, one answer: a full path from ANOTHER Mac (different home folder,
+    /// different account email), the username-free "Google Drive/…" form Navigator's
+    /// own Copy Local Path produces, a bare "Shared drives/…" or "My Drive/…", and —
+    /// for free, because it carries the same marker — a path that is already correct
+    /// here, which re-anchors onto itself and comes back byte-identical.
+    ///
+    /// nil means "not a Drive path", never "couldn't fix it": callers keep whatever
+    /// they had rather than substituting a guess. The account folder is the one
+    /// component always dropped, because it is the one thing that is never portable.
+    static func googleDrivePath(_ input: String, accountRoot: String) -> String? {
+        let s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        var rel: String?
+        if let r = s.range(of: "/CloudStorage/GoogleDrive-") {
+            let after = s[r.upperBound...]
+            if let slash = after.firstIndex(of: "/") { rel = String(after[after.index(after: slash)...]) }
+        } else if s.hasPrefix("Google Drive/") {
+            rel = String(s.dropFirst("Google Drive/".count))
+        // Matched on a whole component, not a prefix: "Shared drivesXYZ" is somebody
+        // else's folder name, and anchoring it under Drive would invent a path.
+        } else if driveRoots.contains(where: { s == $0 || s.hasPrefix($0 + "/") }) {
+            rel = s
+        }
+        // A leading "/" would make appending produce "…/GoogleDrive-me//Shared drives",
+        // and an empty tail would silently hand back the account root — neither is a
+        // location anyone asked for.
+        guard let rel, !rel.isEmpty, !rel.hasPrefix("/") else { return nil }
+        return accountRoot + "/" + rel
+    }
+
+    /// The two folders Drive for desktop always mounts at the account root.
+    private static let driveRoots = ["Shared drives", "My Drive"]
+
+    /// The drive-relative path ("Shared drives/A/B") for a chain of folder titles
+    /// walked from an item UP to its root — the order a parent walk produces.
+    ///
+    /// A shared drive's root folder is the drive itself, and Drive for desktop mounts
+    /// those one level down under "Shared drives"; a My Drive walk already ends at a
+    /// folder called "My Drive", so that one needs no prefix. Feed the result back
+    /// through `googleDrivePath` rather than joining a real path here — one place
+    /// knows where the mount lives.
+    static func driveRelativePath(leafFirst chain: [String], isSharedDrive: Bool) -> String? {
+        guard !chain.isEmpty, !chain.contains(where: { $0.isEmpty }) else { return nil }
+        let parts = (isSharedDrive ? ["Shared drives"] : []) + chain.reversed()
+        guard driveRoots.contains(parts[0]) else { return nil }
+        return parts.joined(separator: "/")
+    }
+
+    /// The Drive item id inside a drive.google.com / docs.google.com link, which is
+    /// the only part of such a URL that means anything locally — Drive for desktop
+    /// stamps that same id on the synced file as an xattr.
+    ///
+    /// Covers the three shapes Google hands out: /drive/folders/<id>, /file/d/<id>/view
+    /// (and every /<kind>/d/<id> Docs variant), and the legacy /open?id=<id>.
+    static func googleDriveItemID(webURL: String) -> String? {
+        guard let c = URLComponents(string: webURL.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let host = c.host, host == "drive.google.com" || host == "docs.google.com"
+        else { return nil }
+        let parts = c.path.split(separator: "/").map(String.init)
+        if let i = parts.firstIndex(where: { $0 == "folders" || $0 == "d" }), i + 1 < parts.count {
+            return validDriveID(parts[i + 1])
+        }
+        return validDriveID(c.queryItems?.first { $0.name == "id" }?.value)
+    }
+
+    /// Drive ids are long base64url-ish strings. Checked so that a truncated or
+    /// decorative URL ("/drive/folders/" + nothing, ".../d/view") yields nil instead
+    /// of a lookup for a word.
+    private static func validDriveID(_ s: String?) -> String? {
+        guard let s, s.count >= 12,
+              s.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) else { return nil }
+        return s
+    }
 }
 
 /// Index Tab / ⇧Tab should land on, given where the selection is now.
@@ -2061,5 +2137,84 @@ enum PickerBridgeRules {
         // One component longer than the whole budget (a very long file name): keep its
         // end, since that is where the extension and any numbering live.
         return "\u{2026}" + String(path.suffix(max - 1))
+    }
+
+    // MARK: The Save-panel escape (bug: "one-key teleport wrote a file")
+    //
+    // The one-key variant used to post ⌘⇧G, wait a fixed 250 ms, ⌘V, wait 150 ms, ⏎.
+    // In a Save panel that combination CREATED A FILE — once into a real Google Drive
+    // shared-drive folder. The mechanism, measured rather than guessed:
+    //
+    //   Return is NOT delivered twice. When the Go-to-Folder sheet is genuinely up, one
+    //   Return only navigates and the Save panel stays open. What goes wrong is the ⌘V:
+    //   whenever the sheet has NOT appeared — the app doesn't honour ⌘⇧G, the panel is
+    //   busy, 250 ms simply wasn't enough — the paste lands in the panel's OWN filename
+    //   field, and NSSavePanel reads an absolute path there as a destination. The single
+    //   Return then completes a real Save.
+    //
+    // So both halves get closed here: nothing is pasted until the Go-to-Folder field is
+    // observed to hold focus, and Return is posted only into a panel proven to be an
+    // Open panel. Neither is sufficient alone — the first makes the paste land where it
+    // was aimed, the second means that even a misaimed paste can't be committed by us.
+
+    /// What kind of Open/Save panel has keyboard focus, as far as the Accessibility tree
+    /// will admit. `unknown` is a real and common answer — Photoshop's own Save As sheet,
+    /// an ordinary window, an app that won't answer AX — and it is treated exactly like a
+    /// Save panel, because the only safe reading of "I can't tell what this Return will
+    /// do" is "then don't press it".
+    enum PanelKind: Equatable { case openPanel, savePanel, unknown }
+
+    /// Decided on AXIdentifiers, never on button titles: `open-panel`, `save-panel` and
+    /// `saveAsNameTextField` are AppKit's own identifiers and are not localized, so this
+    /// still works on a French Mac where the default button says "Enregistrer".
+    static func panelKind(identifier: String?, hasFilenameField: Bool) -> PanelKind {
+        // The filename field OUTRANKS the identifier: a panel that can name a new file is
+        // a panel that can create one, whatever the panel calls itself.
+        if hasFilenameField { return .savePanel }
+        switch identifier {
+        case "open-panel": return .openPanel
+        case "save-panel": return .savePanel
+        default:           return .unknown
+        }
+    }
+
+    /// The hard constraint, in one line. Do not "simplify" this to `kind != .savePanel`:
+    /// `unknown` must stay on the no-Return side or the guarantee is gone.
+    static func mayPostReturn(_ kind: PanelKind) -> Bool { kind == .openPanel }
+
+    /// Identifiers that mean "focus is in a dialog's Go-to-Folder field". `PathTextField`
+    /// is the field itself and `GoToWindow` its sheet; either proves the sheet is up and
+    /// listening, which is the precondition for pasting at all.
+    static let goToFolderIdentifiers: Set<String> = ["PathTextField", "GoToWindow"]
+
+    /// `chain` is the focused element and its ancestors, outward.
+    static func isGoToFolderFocused(_ chain: [String]) -> Bool {
+        chain.contains { goToFolderIdentifiers.contains($0) }
+    }
+
+    /// What actually happened, so the HUD can say it. Behaviour that differs between an
+    /// Open and a Save panel is only acceptable if the user is told which one they got.
+    enum TeleportOutcome: Equatable {
+        /// Open panel: pasted and Return sent — the original one-press behaviour.
+        case jumped
+        /// Save panel or unidentifiable: pasted into Go to Folder, Return left to the user.
+        case pastedAwaitingReturn
+        /// Go to Folder never opened, so nothing was pasted anywhere.
+        case noGoToFolder
+    }
+
+    static func teleportHUD(label: String, app: String, rescued: Bool,
+                            outcome: TeleportOutcome) -> String {
+        // Names the SOURCE, not just the path: when the clipboard's Drive path overrode
+        // Navigator's own folder, the one case where it guessed wrong must be visible.
+        let what = (rescued ? "clipboard\u{2019}s Drive path " : "") + label
+        switch outcome {
+        case .jumped:
+            return "Jumped to \(what) in \(app)"
+        case .pastedAwaitingReturn:
+            return "Pasted \(what) in \(app) \u{00B7} press Return to go \u{2014} Navigator won\u{2019}t, in case it saves"
+        case .noGoToFolder:
+            return "Copied \(what) \u{00B7} \(app) didn\u{2019}t open Go to Folder \u{2014} press \u{2318}\u{21E7}G then \u{2318}V"
+        }
     }
 }
