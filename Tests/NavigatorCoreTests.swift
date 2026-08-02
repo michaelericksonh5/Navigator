@@ -2247,8 +2247,272 @@ final class PermissionStateTests: XCTestCase {
     }
 
     func testEveryStateHasItsOwnWordAndBadge() {
-        let all: [PermissionState] = [.granted, .denied, .notAsked, .unknown, .off]
+        let all: [PermissionState] = [.granted, .denied, .notAsked, .unknown, .off, .covered]
         XCTAssertEqual(Set(all.map(\.label)).count, all.count)
         XCTAssertEqual(Set(all.map(\.symbol)).count, all.count)
+    }
+
+    func testCoveredIsSatisfied() {
+        XCTAssertFalse(PermissionState.covered.needsAttention)
+    }
+}
+
+// MARK: - What the Setup Assistant is allowed to claim
+
+/// These exist because the assistant shipped telling the owner of a machine that HAS Full
+/// Disk Access to go turn on four folder switches macOS was not showing him, and offering
+/// a button to a pane where the named row could not exist. The rules are pure so the
+/// footer count and the row badges cannot drift apart again.
+final class SetupAuditTests: XCTestCase {
+
+    private let files = ["Desktop", "Documents", "Downloads", "network", "removable"]
+
+    func testFullDiskAccessSilencesEveryFileRowItCovers() {
+        for id in files {
+            for probed: PermissionState in [.notAsked, .denied, .off] {
+                XCTAssertEqual(SetupAudit.effectiveState(id: id, probed: probed, fullDisk: .granted), .covered,
+                               "\(id)/\(probed) should be covered by FDA")
+            }
+        }
+    }
+
+    /// FDA is about permission, not about proof or existence. A probe that actually
+    /// performed the access keeps saying so, and a volume class with nothing mounted stays
+    /// unknown — claiming "covered" there would be inventing an answer we never got.
+    func testCoverageNeverOverwritesAnAnswerWeActuallyHave() {
+        XCTAssertEqual(SetupAudit.effectiveState(id: "Desktop", probed: .granted, fullDisk: .granted), .granted)
+        XCTAssertEqual(SetupAudit.effectiveState(id: "removable", probed: .unknown, fullDisk: .granted), .unknown)
+    }
+
+    /// Full Disk Access says nothing about Automation or the Finder extension, so those
+    /// rows must survive it — the original bug in mirror image.
+    func testCoverageStopsAtTheRowsFullDiskAccessActuallyCovers() {
+        for id in ["automation", "finderext", "fda"] {
+            XCTAssertEqual(SetupAudit.effectiveState(id: id, probed: .off, fullDisk: .granted), .off)
+        }
+        for id in files {
+            XCTAssertEqual(SetupAudit.effectiveState(id: id, probed: .notAsked, fullDisk: .denied), .notAsked)
+            XCTAssertEqual(SetupAudit.effectiveState(id: id, probed: .notAsked, fullDisk: .unknown), .notAsked)
+        }
+    }
+
+    /// The exact machine this was reported from: FDA on, the three home folders never
+    /// asked for, no removable drive mounted, everything else fine. The old code said
+    /// "4 items still need attention"; the only true answer is none.
+    func testTheReportedMachineCountsZero() {
+        let rows: [(id: String, probed: PermissionState, optional: Bool)] = [
+            ("fda", .granted, true), ("Desktop", .notAsked, false), ("Documents", .notAsked, false),
+            ("Downloads", .notAsked, false), ("network", .granted, false), ("removable", .unknown, false),
+            ("automation", .granted, false), ("finderext", .granted, false)
+        ]
+        XCTAssertEqual(SetupAudit.attentionCount(rows, fullDisk: .granted), 0)
+    }
+
+    /// Without FDA the same install has real work in it — the assistant must not go quiet
+    /// in the other direction. Full Disk Access itself is never part of the count: it is
+    /// optional, and counting an optional switch is how the first version cried wolf.
+    func testWithoutFullDiskAccessRealWorkIsStillCounted() {
+        let rows: [(id: String, probed: PermissionState, optional: Bool)] = [
+            ("fda", .denied, true), ("Desktop", .notAsked, false), ("Documents", .granted, false),
+            ("Downloads", .denied, false), ("removable", .unknown, false), ("finderext", .off, false)
+        ]
+        XCTAssertEqual(SetupAudit.attentionCount(rows, fullDisk: .denied), 3)
+    }
+
+    /// A button is a promise that pressing it does something.
+    func testNoButtonPointsSomewhereTheUserCannotAct() {
+        // The dead end that started this: not yet requested, so System Settings has no row.
+        XCTAssertEqual(SetupAudit.buttons(state: .notAsked, canAsk: true, listedOnlyAfterRequest: true).settings, false)
+        XCTAssertEqual(SetupAudit.buttons(state: .notAsked, canAsk: true, listedOnlyAfterRequest: true).ask, true)
+        XCTAssertEqual(SetupAudit.buttons(state: .unknown, canAsk: false, listedOnlyAfterRequest: true).settings, false)
+        // Once macOS HAS a decision on file the row exists and Settings is the way to change it.
+        XCTAssertEqual(SetupAudit.buttons(state: .denied, canAsk: true, listedOnlyAfterRequest: true).settings, true)
+        XCTAssertEqual(SetupAudit.buttons(state: .denied, canAsk: true, listedOnlyAfterRequest: true).ask, false)
+        XCTAssertEqual(SetupAudit.buttons(state: .granted, canAsk: true, listedOnlyAfterRequest: true).settings, true)
+        // A row macOS lists unconditionally (the Finder extension) always has somewhere to go.
+        XCTAssertEqual(SetupAudit.buttons(state: .off, canAsk: false, listedOnlyAfterRequest: false).settings, true)
+        // Covered: nothing to ask for, and nothing to look at — macOS hides the switch.
+        let covered = SetupAudit.buttons(state: .covered, canAsk: true, listedOnlyAfterRequest: true)
+        XCTAssertFalse(covered.ask); XCTAssertFalse(covered.settings)
+    }
+}
+
+// MARK: - The one key a per-folder record is filed under
+
+final class FolderKeyTests: XCTestCase {
+
+    /// A real directory plus a real symlink to it, because the whole point of folderKey
+    /// is what the filesystem says — a test built out of strings alone would pass against
+    /// an implementation that resolves nothing.
+    private var root = ""
+    override func setUpWithError() throws {
+        // Under /tmp specifically, not NSTemporaryDirectory(): /tmp is the symlink to
+        // /private/tmp that this whole function exists to see through, and the test
+        // bundle's own temporary directory is a real /var/folders path with nothing to
+        // resolve.
+        root = "/tmp/navkey-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: root + "/Real", withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: root + "/Link", withDestinationPath: root + "/Real")
+    }
+    override func tearDownWithError() throws { try? FileManager.default.removeItem(atPath: root) }
+
+    /// THE bug: `/tmp` is a symlink to `/private/tmp`, so a folder reached via the
+    /// address bar and the same folder reached via the sidebar were two records, and
+    /// each forgot the view set through the other. Note this is the case
+    /// `standardizedFileURL.resolvingSymlinksInPath()` gets WRONG — it un-prefixes
+    /// `/private` only at the root, leaving the deeper path split in two.
+    func testPrivateTmpAndTmpAreOneFolder() {
+        XCTAssertEqual(folderKey(root), folderKey("/private" + root))
+        XCTAssertEqual(folderKey(root + "/Real"), folderKey("/private" + root + "/Real"))
+    }
+
+    func testSymlinkedFolderKeysAsItsTarget() {
+        XCTAssertEqual(folderKey(root + "/Link"), folderKey(root + "/Real"))
+    }
+
+    func testTrailingSlashAndDotDotAreTheSameFolder() {
+        XCTAssertEqual(folderKey(root + "/Real/"), folderKey(root + "/Real"))
+        XCTAssertEqual(folderKey(root + "/Real/../Real"), folderKey(root + "/Real"))
+    }
+
+    /// Typing a path into the address bar preserves whatever case was typed; the volume
+    /// does not care. Two records for `Photos` and `photos` is the failure people hit.
+    func testCaseDoesNotSplitAFolder() {
+        XCTAssertEqual(folderKey(root + "/REAL"), folderKey(root + "/Real"))
+        XCTAssertEqual(folderKey("/NoSuchPlace/Here"), folderKey("/nosuchplace/here"))
+    }
+
+    /// A stored key naming a folder that has since been deleted, or a share that isn't
+    /// mounted: realpath fails on both, and this must hand back a key rather than trap.
+    func testUnresolvablePathStillProducesAKey() {
+        XCTAssertEqual(folderKey("/Volumes/GoneAway/Work/"), "/volumes/goneaway/work")
+        XCTAssertEqual(folderKey(""), "")
+        XCTAssertEqual(folderKey("/"), "/")
+    }
+
+    /// Distinct folders must stay distinct — a normaliser that over-collapses would
+    /// hand one folder's view options to another.
+    func testDifferentFoldersKeepDifferentKeys() {
+        XCTAssertNotEqual(folderKey(root + "/Real"), folderKey(root))
+    }
+}
+
+final class FolderKeyedStoreTests: XCTestCase {
+
+    private func opts(_ mode: String) -> ViewOptions {
+        ViewOptions(viewMode: mode, iconSize: 76, sortKey: "name", sortAscending: true,
+                    groupBy: "none", columns: ["name"])
+    }
+
+    /// The user-visible bug, at the layer that caused it: set a folder to Gallery having
+    /// arrived one way, come back the other way, and the view must still be Gallery.
+    func testTheSameFolderReachedTwoWaysIsOneRecord() {
+        var lru = ViewOptionsLRU()
+        lru.set(opts("gallery"), for: "/private/tmp")
+        XCTAssertEqual(lru.value(for: "/tmp")?.viewMode, "gallery")
+        XCTAssertTrue(lru.contains("/tmp/"))
+        XCTAssertEqual(lru.count, 1)
+        lru.set(opts("icon"), for: "/tmp")
+        XCTAssertEqual(lru.count, 1)          // not a second record
+        lru.remove("/private/tmp/")
+        XCTAssertFalse(lru.contains("/tmp"))
+    }
+
+    /// Records written before folderKey existed are keyed on the raw path. They are the
+    /// user's own arrangements — earned back only by redoing every one by hand — so they
+    /// are re-filed, not dropped.
+    func testStoredRecordsMigrateToNormalisedKeys() {
+        var old = ViewOptionsLRU()
+        old.set(opts("icon"), for: "/nowhere/DEEP/Folder")   // pre-normalisation raw key
+        // Same folder, two ways, from before the fix — the more recently used wins, and
+        // ends up at the front where a plain overwrite would have left it buried.
+        var raw = ViewOptionsLRU()
+        raw.set(opts("list"), for: "/nowhere/A")
+        raw.set(opts("gallery"), for: "/NOWHERE/a")
+        let migrated = raw.migratedToNormalizedKeys()
+        XCTAssertEqual(migrated.count, 1)
+        XCTAssertEqual(migrated.value(for: "/nowhere/a")?.viewMode, "gallery")
+        XCTAssertEqual(migrated.order, ["/nowhere/a"])
+        XCTAssertEqual(old.migratedToNormalizedKeys().value(for: "/nowhere/deep/folder")?.viewMode, "icon")
+    }
+
+    /// A store already in normal form must come back byte-identical, so the migration
+    /// doesn't rewrite UserDefaults on every launch for the rest of the app's life.
+    func testMigrationIsANoOpOnAnAlreadyNormalisedStore() {
+        var lru = ViewOptionsLRU()
+        lru.set(opts("icon"), for: "/nowhere/a")
+        lru.set(opts("list"), for: "/nowhere/b")
+        XCTAssertEqual(lru.migratedToNormalizedKeys(), lru)
+    }
+
+    /// Scroll position splits on the same key, and used to split the same way: walk into
+    /// a folder from the sidebar, back out, and return via the address bar, and you were
+    /// put back at the top.
+    func testScrollPlaceIsFoundWhicheverWayTheFolderWasReached() {
+        var lru = FolderPlaceLRU()
+        lru.set(FolderPlace(anchorID: "x", anchorIndex: 12, selection: ["x"]), for: "/private/tmp")
+        XCTAssertEqual(lru.value(for: "/tmp/")?.anchorIndex, 12)
+        XCTAssertEqual(lru.count, 1)
+    }
+}
+
+// MARK: - Undoing a batch of renames without colliding with itself
+
+final class CollisionSafeOrderTests: XCTestCase {
+
+    private func u(_ p: String) -> URL { URL(fileURLWithPath: p) }
+    private func names(_ pairs: [(from: URL, to: URL)]) -> [String] {
+        pairs.map { "\($0.from.lastPathComponent)->\($0.to.lastPathComponent)" }
+    }
+
+    /// The reported bug. Batch Rename did B→C then A→B, so undo was recorded as
+    /// C→B, B→A — and replaying it in that order moved C onto the B that A was still
+    /// occupying. B must be vacated first.
+    func testChainUndoesTheOccupiedNameLast() {
+        let ordered = collisionSafeOrder([(from: u("/t/C"), to: u("/t/B")),
+                                          (from: u("/t/B"), to: u("/t/A"))])
+        XCTAssertEqual(names(ordered), ["B->A", "C->B"])
+    }
+
+    /// Three deep, to prove this is a dependency order and not just "reverse the list":
+    /// D→C, C→B, B→A only works innermost-first, whichever order it arrives in.
+    func testLongerChainIsFullyOrdered() {
+        let ordered = collisionSafeOrder([(from: u("/t/C"), to: u("/t/B")),
+                                          (from: u("/t/D"), to: u("/t/C")),
+                                          (from: u("/t/B"), to: u("/t/A"))])
+        XCTAssertEqual(names(ordered), ["B->A", "C->B", "D->C"])
+    }
+
+    /// A swap has no safe order at all — every move wants a name another move still
+    /// holds — so one member has to go through a name nobody wants. applyRenames' own
+    /// fileExists guard means the app can't currently produce one, which is exactly why
+    /// this is tested rather than assumed.
+    func testSwapGoesThroughATemporaryName() {
+        let ordered = collisionSafeOrder([(from: u("/t/A"), to: u("/t/B")),
+                                          (from: u("/t/B"), to: u("/t/A"))],
+                                         tempSuffix: "tmp")
+        XCTAssertEqual(names(ordered), ["A->A.tmp", "B->A", "A.tmp->B"])
+        // Every item still ends up where it was asked to go, and nothing is left parked.
+        XCTAssertEqual(Set(ordered.map(\.to.path)).intersection(["/t/A", "/t/B"]).count, 2)
+        XCTAssertEqual(ordered.last?.to.path, "/t/B")
+    }
+
+    /// An ordinary batch — every one of restoreItems' other callers — must come back
+    /// untouched and in its original order.
+    func testUnrelatedBatchIsLeftAlone() {
+        let pairs = [(from: u("/t/.Trash/a"), to: u("/t/x/a")),
+                     (from: u("/t/.Trash/b"), to: u("/t/y/b")),
+                     (from: u("/t/.Trash/c"), to: u("/t/z/c"))]
+        XCTAssertEqual(names(collisionSafeOrder(pairs)), ["a->a", "b->b", "c->c"])
+        XCTAssertEqual(collisionSafeOrder(pairs).map(\.from.path), pairs.map(\.from.path))
+        XCTAssertEqual(collisionSafeOrder([]).count, 0)
+    }
+
+    /// A rename that only changes case is one file on a case-insensitive volume, and
+    /// there is nothing to sequence — but the paths differ as strings, so a naive
+    /// "is the destination occupied" check must not decide it needs parking.
+    func testCaseOnlyRenameNeedsNoParking() {
+        let ordered = collisionSafeOrder([(from: u("/t/photo.png"), to: u("/t/Photo.png"))])
+        XCTAssertEqual(names(ordered), ["photo.png->Photo.png"])
     }
 }

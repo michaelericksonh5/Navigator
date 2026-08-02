@@ -709,14 +709,60 @@ final class UndoStack {
     func clear() { undoStack.removeAll(); redoStack.removeAll() }
 }
 
+/// Sequence a batch of moves so none of them lands on a path another move in the same
+/// batch has not vacated yet.
+///
+/// The bug this fixes: Batch Rename records its undo pairs in the order it renamed, and
+/// undo replayed them in exactly that order. Rename B→C and then A→B — a chain, and the
+/// order the listing hands the pairs over whenever B sorts ahead of A — records undo as
+/// C→B, B→A, and replaying that moves C onto the B that A is still sitting on. moveItem
+/// fails, so Undo reported an error and left the batch half restored.
+///
+/// Emitting only the moves whose destination nothing else still holds is the whole fix
+/// for a chain, and it leaves a batch with no interdependencies in its original order —
+/// which is every other caller of restoreItems. A true CYCLE (A→B, B→A) has no such move
+/// at all, so one member is parked under a name nobody wants and finished last.
+/// `applyRenames`' own `fileExists` guard means a cycle cannot currently reach here — it
+/// skips any rename whose destination already exists, so a swap renames nothing — but
+/// undo is the path that moves the user's files back, and "the caller filters that out
+/// today" is exactly the guarantee that stops being true without anyone noticing.
+///
+/// `tempSuffix` is a parameter only so a test can pin it; nothing in the app passes it.
+func collisionSafeOrder(_ pairs: [(from: URL, to: URL)],
+                        tempSuffix: @autoclosure () -> String = UUID().uuidString) -> [(from: URL, to: URL)] {
+    var remaining = pairs
+    var out: [(from: URL, to: URL)] = []
+    while !remaining.isEmpty {
+        let occupied = Set(remaining.map { $0.from.path })
+        var ready: [(from: URL, to: URL)] = []
+        var blocked: [(from: URL, to: URL)] = []
+        for p in remaining { occupied.contains(p.to.path) ? blocked.append(p) : ready.append(p) }
+        if ready.isEmpty {
+            // Every move left wants a path another one still holds: park the first out of
+            // the way, which frees its own path and unblocks whoever was waiting on it.
+            var p = blocked.removeFirst()
+            let parked = p.from.appendingPathExtension(tempSuffix())
+            out.append((from: p.from, to: parked))
+            p.from = parked
+            blocked.append(p)
+        } else {
+            out += ready
+        }
+        remaining = blocked
+    }
+    return out
+}
+
 /// Moves each `from` back to its `to`, collecting what failed into one message.
 ///
 /// Every undo/redo closure funnels through this so an item the user deleted or moved
 /// in Finder after the operation names itself in a single alert, instead of being
-/// swallowed by `try?` and looking like Undo did nothing.
+/// swallowed by `try?` and looking like Undo did nothing. That single funnel is also
+/// why the collision ordering lives here rather than in Batch Rename: any caller whose
+/// pairs overlap gets it without having to know it exists.
 func restoreItems(_ pairs: [(from: URL, to: URL)]) -> String? {
     var failed: [String] = []
-    for p in pairs {
+    for p in collisionSafeOrder(pairs) {
         do { try FileManager.default.moveItem(at: p.from, to: p.to) }
         catch { failed.append("• \(p.to.lastPathComponent): \(error.localizedDescription)") }
     }
@@ -912,6 +958,40 @@ struct ViewOptions: Codable, Equatable {
     }
 }
 
+/// The one key any per-folder record is filed under.
+///
+/// The bug this exists to end: everything per-folder was keyed on the raw
+/// `currentURL.path`, and the same directory has more than one raw path. `/tmp` is a
+/// symlink to `/private/tmp`, so the sidebar and the address bar reached one folder
+/// under two keys and each kept its own view options — a folder silently forgot the
+/// view you had just set on it, depending on how you got there. Same for a trailing
+/// slash, for a path carrying `..`, and for the case someone typed.
+///
+/// `realpath(3)` and NOT `standardizedFileURL.resolvingSymlinksInPath()`, which is the
+/// obvious answer and the wrong one: Foundation deliberately maps `/private/tmp` back to
+/// `/tmp` — but only for the root itself, so `/tmp/Photos` and `/private/tmp/Photos`
+/// survive that pair of calls as two different strings, which is precisely the bug.
+/// realpath resolves every component, and also eats `..` and the trailing slash.
+///
+/// A path realpath can't resolve — a deleted folder, an unmounted share, a stored key
+/// from a volume that isn't here — falls back to Foundation's normalisation rather than
+/// failing. A record filed under a folder that no longer exists is only ever going to be
+/// evicted anyway; refusing to produce a key for it would just move the crash here.
+///
+/// Lowercased LAST, and deliberately: macOS volumes are case-insensitive by default, so
+/// `Photos` and `photos` are one folder and two records for them is the mistake people
+/// actually hit. On a case-SENSITIVE volume two genuinely different folders then share
+/// one record — a view arriving wrong, never a file touched, which is much the cheaper
+/// of the two mistakes.
+func folderKey(_ path: String) -> String {
+    guard !path.isEmpty else { return "" }
+    if let real = realpath(path, nil) {
+        defer { free(real) }
+        return String(cString: real).lowercased()
+    }
+    return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
+}
+
 /// Per-folder view options keyed by path, with a hard cap and least-recently-used
 /// eviction.
 ///
@@ -940,12 +1020,13 @@ struct ViewOptionsLRU: Codable, Equatable {
     init() {}
 
     var count: Int { byPath.count }
-    func contains(_ path: String) -> Bool { byPath[path] != nil }
-    func value(for path: String) -> ViewOptions? { byPath[path] }
+    func contains(_ path: String) -> Bool { byPath[folderKey(path)] != nil }
+    func value(for path: String) -> ViewOptions? { byPath[folderKey(path)] }
 
     /// Save (or replace) one folder's options, making it the most recently used and
     /// evicting the least recently used once past the cap.
     mutating func set(_ options: ViewOptions, for path: String) {
+        let path = folderKey(path)
         byPath[path] = options
         order.removeAll { $0 == path }
         order.insert(path, at: 0)
@@ -955,6 +1036,7 @@ struct ViewOptionsLRU: Codable, Equatable {
     }
 
     mutating func remove(_ path: String) {
+        let path = folderKey(path)
         byPath[path] = nil
         order.removeAll { $0 == path }
     }
@@ -964,10 +1046,29 @@ struct ViewOptionsLRU: Codable, Equatable {
     /// folder that is already at the front (every refresh of the current folder).
     @discardableResult
     mutating func touch(_ path: String) -> Bool {
+        let path = folderKey(path)
         guard byPath[path] != nil, order.first != path else { return false }
         order.removeAll { $0 == path }
         order.insert(path, at: 0)
         return true
+    }
+
+    /// Re-file a decoded store whose keys were written before `folderKey` existed.
+    ///
+    /// Migrating rather than dropping: these records are the user's own arrangements and
+    /// there is no way to earn them back except by redoing every one of them by hand.
+    /// Two raw keys can collapse onto one normalised key (`/tmp/x` and `/private/tmp/x`),
+    /// and the more recently used of the pair wins — rebuilding least-recent-first means
+    /// the later `set` both overwrites the value and lifts it to the front, which is the
+    /// same answer the LRU would have given had the records never split.
+    func migratedToNormalizedKeys() -> ViewOptionsLRU {
+        guard order.contains(where: { $0 != folderKey($0) }) else { return self }
+        var out = ViewOptionsLRU()
+        for path in order.reversed() {
+            guard let o = byPath[path] else { continue }   // a blob whose halves disagree
+            out.set(o, for: path)
+        }
+        return out
     }
 
     /// The options that apply to a folder: its own if it has any, otherwise the global
@@ -975,7 +1076,7 @@ struct ViewOptionsLRU: Codable, Equatable {
     /// that was never arranged by hand behaves exactly as it did before any of this
     /// existed.
     func effective(for path: String, defaults: ViewOptions) -> ViewOptions {
-        byPath[path] ?? defaults
+        byPath[folderKey(path)] ?? defaults
     }
 }
 
@@ -1111,12 +1212,13 @@ struct FolderPlaceLRU: Equatable {
     static let cap = 100
 
     var count: Int { byPath.count }
-    func value(for path: String) -> FolderPlace? { byPath[path] }
+    func value(for path: String) -> FolderPlace? { byPath[folderKey(path)] }
 
     /// Record (or replace) one folder's place, making it the most recently used. Recency
     /// needs no separate `touch` here: you cannot return to a folder without having left
     /// one, so every visit ends in a `set`.
     mutating func set(_ place: FolderPlace, for path: String) {
+        let path = folderKey(path)
         byPath[path] = place
         order.removeAll { $0 == path }
         order.insert(path, at: 0)
@@ -1712,8 +1814,12 @@ enum TrashOrigins {
 /// `.off` is kept apart from `.denied` for the same reason: a Finder extension nobody
 /// has ever ticked was not "denied" by anyone, and saying so would have the user hunting
 /// System Settings for a refusal that never happened.
+/// `.covered` is the answer to a question macOS never lets an app ask directly: the
+/// permission was never recorded, and never will be, because a broader one already
+/// stands in for it. It reads as satisfied — because it IS — without claiming the
+/// probe proved anything, which `.granted` would.
 enum PermissionState: String, Equatable {
-    case granted, denied, notAsked, unknown, off
+    case granted, denied, notAsked, unknown, off, covered
 
     var label: String {
         switch self {
@@ -1722,6 +1828,7 @@ enum PermissionState: String, Equatable {
         case .notAsked: return "Not yet asked"
         case .unknown:  return "Unknown"
         case .off:      return "Off"
+        case .covered:  return "Covered by Full Disk Access"
         }
     }
 
@@ -1732,6 +1839,7 @@ enum PermissionState: String, Equatable {
         case .notAsked: return "circle.dashed"
         case .unknown:  return "questionmark.circle"
         case .off:      return "circle.slash"
+        case .covered:  return "checkmark.circle"
         }
     }
 
@@ -1739,6 +1847,63 @@ enum PermissionState: String, Equatable {
     /// we have no evidence anything is wrong, and sending someone to System Settings to
     /// fix a permission that may well be fine is how a setup screen loses its credibility.
     var needsAttention: Bool { self == .denied || self == .notAsked || self == .off }
+}
+
+/// The rules the Setup Assistant's rows and its footer count BOTH read.
+///
+/// They live together here because they used to be worked out separately and disagreed:
+/// the footer counted rows whose only offered fix was a switch macOS was not showing, so
+/// the very first screen of a fresh install announced work that did not exist and pointed
+/// at a pane where the named row could not appear. A setup screen that cries wolf once is
+/// worse than no setup screen, so both numbers now come out of the same three functions.
+enum SetupAudit {
+
+    /// The rows Full Disk Access makes moot.
+    ///
+    /// FDA (kTCCServiceSystemPolicyAllFiles) is a strict superset of the per-folder and
+    /// per-volume-class Files & Folders grants, and macOS acts on that: an app holding it
+    /// gets ONE greyed "Full Disk Access" line in the Files & Folders pane INSTEAD of the
+    /// individual switches. So a row saying "go turn Desktop on" names a control that is
+    /// provably not on the screen we just sent the user to.
+    ///
+    /// Automation and the Finder extension are deliberately absent: FDA says nothing about
+    /// either, and folding them in would swap one false statement for another.
+    static let coveredByFullDisk: Set<String> = ["Desktop", "Documents", "Downloads", "network", "removable"]
+
+    /// What a row should actually say, given its own probe and the Full Disk Access answer.
+    ///
+    /// Only an answer that would otherwise raise an alarm gets rewritten. A probe that came
+    /// back `.granted` keeps that word because it is proof — the access was performed — and
+    /// `.unknown` stays unknown because FDA tells us nothing about a volume class with no
+    /// volume mounted, and unknown is already not an alarm.
+    static func effectiveState(id: String, probed: PermissionState, fullDisk: PermissionState) -> PermissionState {
+        guard probed.needsAttention, fullDisk == .granted, coveredByFullDisk.contains(id) else { return probed }
+        return .covered
+    }
+
+    /// The footer's number, from the same inputs the rows draw themselves from.
+    ///
+    /// Optional rows never count: Navigator is fully usable without Full Disk Access, so an
+    /// unlit optional switch is a choice the user has made, not a job they still owe.
+    static func attentionCount(_ rows: [(id: String, probed: PermissionState, optional: Bool)],
+                               fullDisk: PermissionState) -> Int {
+        rows.filter { !$0.optional && effectiveState(id: $0.id, probed: $0.probed, fullDisk: fullDisk).needsAttention }
+            .count
+    }
+
+    /// Which of a row's two buttons lead somewhere the user can actually do something.
+    ///
+    /// `listedOnlyAfterRequest` is the whole point: macOS creates a Files & Folders (or
+    /// Automation) row for an app only once the app has attempted the access — before that
+    /// the pane has no switch to flip, so "Open Settings" is a guaranteed dead end and the
+    /// only thing that works is provoking the real system prompt. A `.covered` row offers
+    /// neither: there is nothing to ask for and nothing in Settings to look at.
+    static func buttons(state: PermissionState, canAsk: Bool,
+                        listedOnlyAfterRequest: Bool) -> (ask: Bool, settings: Bool) {
+        let unrequested = state == .notAsked || state == .unknown
+        return (ask: canAsk && unrequested,
+                settings: state != .covered && !(listedOnlyAfterRequest && unrequested))
+    }
 }
 
 enum PermissionDiagnosis {

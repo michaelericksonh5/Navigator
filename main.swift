@@ -473,7 +473,11 @@ final class FolderViewOptionsStore: ObservableObject {
     private init() {
         if let data = Prefs.folderViewOptions,
            let decoded = try? JSONDecoder().decode(ViewOptionsLRU.self, from: data) {
-            lru = decoded
+            // Records written before folderKey existed are keyed on the raw path. Re-file
+            // them once and write the result straight back, so the migration is paid on
+            // one launch instead of being redone on every launch for a store nobody edits.
+            lru = decoded.migratedToNormalizedKeys()
+            if lru != decoded { persist() }
         } else {
             lru = ViewOptionsLRU()
         }
@@ -814,6 +818,10 @@ final class NetworkReconnector {
 }
 extension Notification.Name {
     static let navigatorShareReconnected = Notification.Name("navigatorShareReconnected")
+    /// Undo/redo of the image viewer's own Delete telling that viewer to take the picture
+    /// back into (or out of) its list. See ImageViewerView.deleteCurrent for why this is
+    /// a notification and not a direct write.
+    static let navigatorImageViewerUndo = Notification.Name("navigatorImageViewerUndo")
 }
 
 // MARK: - Bonjour network discovery (nearby SMB file servers)
@@ -1761,18 +1769,31 @@ enum TextEditAction { case copy, cut, paste, selectAll }
 
 // Append-only dev log at ~/Library/Logs/Navigator.log — while we bring the
 // Vertex/Imagen path up, so failures are diagnosable instead of guesswork.
-// ponytail: plain FileHandle append, no rotation; trim manually if it grows.
 let navLogURL = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/Navigator.log"))
+/// Roll over at 4 MB, keeping one previous file, so the pair is bounded at 8 MB. Big
+/// enough that the whole of a long Imagen batch or a day of drags is still in the live
+/// file when someone comes to read it, which is the only reason this log exists.
+private let navLogMaxBytes: UInt64 = 4 << 20
 func navLog(_ msg: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
     guard let data = "[\(stamp)] \(msg)\n".data(using: .utf8) else { return }
-    if let fh = try? FileHandle(forWritingTo: navLogURL) {
-        defer { try? fh.close() }
-        _ = try? fh.seekToEnd(); try? fh.write(contentsOf: data)
-    } else {
+    guard let fh = try? FileHandle(forWritingTo: navLogURL) else {
         try? FileManager.default.createDirectory(at: navLogURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: navLogURL)
+        return
     }
+    // seekToEnd already hands back the size, so rotation costs no stat at all — which
+    // matters because this runs on drag and spring-load paths, per event.
+    let size = ((try? fh.seekToEnd()) ?? 0) + UInt64(data.count)
+    try? fh.write(contentsOf: data)
+    try? fh.close()
+    guard size > navLogMaxBytes else { return }
+    // Rotate AFTER the write and with the handle closed: the line that tripped the
+    // threshold belongs in the file it was written to, not in a gap between the two.
+    let fm = FileManager.default
+    let previous = navLogURL.appendingPathExtension("1")
+    try? fm.removeItem(at: previous)
+    try? fm.moveItem(at: navLogURL, to: previous)
 }
 
 // GUI apps launched from Finder/Dock have a minimal PATH (no nvm/homebrew), so
@@ -3073,7 +3094,7 @@ final class Browser: ObservableObject, Identifiable {
             pendingPlace = places.value(for: currentURL.path)
             topVisibleID = nil          // the arriving view owns this; the old one's value is not ours
             applyFolderViewOptions()
-            collapsedGroups = collapsedByFolder[currentURL.path] ?? []
+            collapsedGroups = collapsedByFolder[folderKey(currentURL.path)] ?? []
             // The app-wide "a tab moved" signal, posted from the ONE place every route
             // goes through. It used to be posted by navigate(to:) alone, so goBack() and
             // goForward() — which assign currentURL directly — left the window title (and
@@ -3179,7 +3200,7 @@ final class Browser: ObservableObject, Identifiable {
     /// Group titles collapsed in the CURRENT folder. Group headers are always rendered;
     /// only their contents hide, so there is always something left to click.
     @Published var collapsedGroups: Set<String> = [] {
-        didSet { collapsedByFolder[currentURL.path] = collapsedGroups.isEmpty ? nil : collapsedGroups }
+        didSet { collapsedByFolder[folderKey(currentURL.path)] = collapsedGroups.isEmpty ? nil : collapsedGroups }
     }
     /// Collapsed groups per folder, so navigating away and back doesn't silently
     /// re-expand everything. Deliberately in memory and per tab, NOT persisted: a
@@ -9851,6 +9872,10 @@ struct ImageViewerView: View {
     @State private var sizeStr: String = ""
     @State private var kindStr: String = ""
     @State private var showRestyleInfo = false
+    /// Identifies THIS viewer to its own undo notifications. @State, not a plain `let`:
+    /// SwiftUI re-creates the struct on every update, so a `let` would hand out a fresh
+    /// id each time and the undo posted by one instance would match none of them.
+    @State private var viewerID = UUID()
     @StateObject private var zoomCtl = ZoomController()
     // Read fresh per access rather than cached in @State — cheap (one CGImageSource
     // properties read) and guarantees the (i) button never shows stale info if the
@@ -9874,13 +9899,34 @@ struct ImageViewerView: View {
                 return
             }
             var trashed: URL? = landed   // re-pointed by redo; the Trash path changes each round
+            // Where it was in THIS viewer's list, captured now: the closures below run
+            // long after `index` has moved on to the next picture.
+            let wasAt = index
+            let vid = viewerID
+            // Undoing the delete used to put the file back on disk and nothing else, so
+            // the picture stayed missing from the viewer you deleted it in until you
+            // closed and reopened the folder — the one place the user is looking.
+            //
+            // Posted rather than written straight into `urls`: this closure outlives the
+            // window (the undo stack is app-wide, and the viewer closes itself when the
+            // last image goes), and writing into a torn-down @State is a SwiftUI warning
+            // and a silently dropped update. A notification nobody is listening for is
+            // simply nothing.
+            let tell = { (insert: Bool) in
+                NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
+                                                userInfo: ["viewer": vid, "url": target,
+                                                           "index": wasAt, "insert": insert])
+            }
             UndoStack.shared.push("Delete “\(target.lastPathComponent)”", undo: {
                 guard let t = trashed else { return nil }
-                return restoreItems([(from: t, to: target)])
+                if let problem = restoreItems([(from: t, to: target)]) { return problem }
+                tell(true)
+                return nil
             }, redo: {
                 // Fresh Trash path on every re-bin, so point the undo half at it.
                 let r = trashItems([target])
                 trashed = r.restores.first?.from
+                if r.problem == nil { tell(false) }
                 return r.problem
             })
             urls.remove(at: index)
@@ -10005,6 +10051,25 @@ struct ImageViewerView: View {
         .frame(minWidth: 520, minHeight: 420)
         .onAppear { loadInfo() }
         .onChange(of: index) { loadInfo() }
+        // ⌘Z / ⇧⌘Z on an image deleted from this viewer. Only this viewer's own id is
+        // honoured, so a second open viewer doesn't grow a picture it never deleted.
+        .onReceive(NotificationCenter.default.publisher(for: .navigatorImageViewerUndo)) { note in
+            guard let info = note.userInfo, info["viewer"] as? UUID == viewerID,
+                  let u = info["url"] as? URL else { return }
+            if info["insert"] as? Bool == true {
+                guard !urls.contains(u) else { index = urls.firstIndex(of: u) ?? index; return }
+                // Clamped: the viewer may have been reordered or shortened by a later
+                // delete, so the recorded index is a hint, not a promise.
+                let at = min(info["index"] as? Int ?? urls.count, urls.count)
+                urls.insert(u, at: at)
+                index = at
+            } else if let at = urls.firstIndex(of: u) {
+                urls.remove(at: at)
+                if urls.isEmpty { NSApp.keyWindow?.close(); return }
+                index = min(index, urls.count - 1)
+            }
+            loadInfo()
+        }
         .contextMenu {
             Button("Copy to Clipboard") { copyImageToClipboard() }
             Button("Copy File") { copyFileToClipboard() }
@@ -11400,6 +11465,21 @@ enum PermissionProbe {
     }
 }
 
+/// Where, in words, `FIFinderSyncController.showExtensionManagementInterface()` actually
+/// lands — checked on this machine, not assumed from Apple's docs.
+///
+/// The name matters because guessing it wasted the app's owner's evening: the copy used to
+/// say "Finder Extensions", and there is no such section. On macOS 26.6 the API opens
+/// System Settings ▸ Login Items & Extensions and pops the sheet headed "File Providers",
+/// and THAT is where a Finder Sync extension's tick lives — Navigator sits in it alongside
+/// Core Sync and Google Drive's FinderHelper, which `pluginkit -p com.apple.FinderSync`
+/// confirms are Finder Sync plug-ins too. The category actually named "Finder" in that
+/// pane is Quick Actions (Convert Image, Create PDF, Markup) and never lists us.
+///
+/// Named once and shared by all three places that say it — the assistant row, the AI ▸
+/// Finder Menu… alert and the once-per-version nudge — so they cannot drift apart again.
+let finderExtensionSectionName = "Login Items & Extensions ▸ File Providers"
+
 /// One row of the assistant: what the permission is FOR in the user's words, how to find
 /// out whether we have it, and where they go to change it.
 struct SetupItem: Identifiable {
@@ -11414,6 +11494,13 @@ struct SetupItem: Identifiable {
     /// True when macOS can be made to ask. False means the switch is the user's to flip
     /// in System Settings and no app is allowed to raise a dialog for it — the row says so.
     let canAsk: Bool
+    /// True when System Settings lists this permission only AFTER the app has asked for it
+    /// once. Sending someone to the pane before that is the dead end the app's owner hit:
+    /// they went to Files & Folders looking for a Removable Volumes switch that macOS had
+    /// never had reason to create. SetupAudit.buttons drops "Open Settings" for those rows.
+    var listedOnlyAfterRequest = false
+    /// Never counted in the footer — see SetupAudit.attentionCount.
+    var optional = false
     var settingsLabel = "Open Settings"
     let openSettings: () -> Void
 
@@ -11423,35 +11510,46 @@ struct SetupItem: Identifiable {
         func homeFolder(_ name: String, _ why: String) -> SetupItem {
             SetupItem(id: name, title: name, why: why,
                       probe: { _ in PermissionProbe.folder(home.appendingPathComponent(name)) },
-                      probeMayPrompt: true, canAsk: true, openSettings: files)
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      openSettings: files)
         }
         return [
+            // Listed FIRST, and in this section rather than under Extras, because it is the
+            // row that explains the five below it: when it reads Granted they all read
+            // "Covered by Full Disk Access", and a user who scrolled past a green tick at
+            // the bottom would have no idea why.
+            SetupItem(id: "fda", title: "Full Disk Access",
+                      why: "Optional, and it changes what the rows below mean: with it on, macOS grants Navigator every file permission listed here and REPLACES their individual switches in Files & Folders with a single greyed “Full Disk Access” line — so there is nothing left to turn on there. It reaches what those switches don’t, too: other apps’ Library folders, another user’s home, some system folders. It does NOT override a file’s own owner or read-only flag, everyday browsing works without it, and macOS never asks — you turn it on yourself.",
+                      probe: { _ in PermissionProbe.fullDisk() },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.fullDiskPane) }),
             homeFolder("Desktop", "Browse your Desktop, and drop files onto it with Send To."),
             homeFolder("Documents", "Browse, rename and organise everything in Documents."),
             homeFolder("Downloads", "Browse Downloads and move things out of it."),
             // Volumes are probed live rather than gated behind a button: with none of the
             // kind mounted the probe is free and answers "Unknown", and with one mounted
             // reading it is both the honest test and the prompt you'd want anyway.
+            //
+            // canAsk stays false for both, and that is not an oversight: with no volume of
+            // the kind mounted there is nothing to attempt, so an "Ask macOS…" button would
+            // be a button that provably does nothing. The wording carries that instead.
             SetupItem(id: "network", title: "Network volumes",
-                      why: "Open shared drives you connect to (⌘K), and copy files to and from them.",
+                      why: "Open shared drives you connect to (⌘K), and copy files to and from them. With none mounted there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: true) },
-                      probeMayPrompt: false, canAsk: false, openSettings: files),
+                      probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
+                      openSettings: files),
             SetupItem(id: "removable", title: "USB & external drives",
-                      why: "Browse sticks and external disks, and use them as a Send To target.",
+                      why: "Browse sticks and external disks, and use them as a Send To target. With none plugged in there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: false) },
-                      probeMayPrompt: false, canAsk: false, openSettings: files),
-            SetupItem(id: "fda", title: "Full Disk Access (optional)",
-                      why: "Reaches what the switches above don’t: other apps’ Library folders, another user’s home, some system folders. It does NOT override a file’s own owner or read-only flag, and everyday browsing works without it. macOS never asks for this one — you turn it on yourself.",
-                      probe: { _ in PermissionProbe.fullDisk() },
-                      probeMayPrompt: false, canAsk: false,
-                      openSettings: { PermissionProbe.openPane(PermissionProbe.fullDiskPane) }),
+                      probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
+                      openSettings: files),
             SetupItem(id: "automation", title: "Control Finder",
-                      why: "Used for one thing: saving the Comment field in Get Info. Finder owns Finder comments, so Finder has to be the one to write them.",
+                      why: "Used for one thing: saving the Comment field in Get Info. Finder owns Finder comments, so Finder has to be the one to write them. Automation only lists Navigator once it has asked, so use the button — the pane is empty of us until then.",
                       probe: { _ in PermissionProbe.finderAutomation() },
-                      probeMayPrompt: true, canAsk: true,
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
             SetupItem(id: "finderext", title: "Navigator’s Finder menu",
-                      why: "Adds Navigator’s submenu — Remove BG, Chroma Key, the AI upscalers — to Finder’s own right-click menu. macOS makes you tick this one yourself.",
+                      why: "Adds Navigator’s submenu — Remove BG, Chroma Key, the AI upscalers — to Finder’s own right-click menu. macOS makes you tick this one yourself, in \(finderExtensionSectionName).",
                       probe: { _ in FIFinderSyncController.isExtensionEnabled ? .granted : .off },
                       probeMayPrompt: false, canAsk: false,
                       settingsLabel: "Open Extensions",
@@ -11477,12 +11575,14 @@ struct SetupAssistantView: View {
     var body: some View {
         Form {
             Section {
-                Text("macOS keeps Navigator out of your files until you say otherwise. This checks what it can actually reach right now.\n\n“Ask macOS” makes macOS put up its own permission dialog. The rest are switches only you can flip, so those rows just take you to the right pane.")
+                Text("macOS keeps Navigator out of your files until you say otherwise. This checks what it can actually reach right now.\n\n“Ask macOS” makes macOS put up its own permission dialog. A row with no button needs nothing from you — either it is already covered, or macOS has nowhere for you to change it yet and will decide the first time Navigator tries.")
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Section("Files & folders") { ForEach(items.prefix(5)) { row($0) } }
-            Section("Extras") { ForEach(items.dropFirst(5)) { row($0) } }
+            // Split by id rather than by count: the sections used to be prefix(5)/dropFirst(5)
+            // and reordering the list silently moved a row into the wrong one.
+            Section("Files & folders") { ForEach(items.filter { $0.id != "automation" && $0.id != "finderext" }) { row($0) } }
+            Section("Extras") { ForEach(items.filter { $0.id == "automation" || $0.id == "finderext" }) { row($0) } }
             Section("How folders open") {
                 Picker("New windows and tabs", selection: $viewMode) {
                     Text("Details").tag("list"); Text("Icons").tag("icon"); Text("Gallery").tag("gallery")
@@ -11523,17 +11623,25 @@ struct SetupAssistantView: View {
         }
     }
 
+    /// Every row's status is read through here, and so is the footer count — the two can
+    /// only ever be the same answer because they are literally the same function.
+    private var fullDisk: PermissionState { states["fda"] ?? .unknown }
+    private func state(of item: SetupItem) -> PermissionState {
+        SetupAudit.effectiveState(id: item.id, probed: states[item.id] ?? .unknown, fullDisk: fullDisk)
+    }
+
     private var summary: String {
         let stamp = checkedAt.map { " · checked " + $0.formatted(date: .omitted, time: .standard) } ?? ""
         if checking { return "Checking…" }
-        let bad = items.filter { (states[$0.id] ?? .unknown).needsAttention }.count
-        if bad == 0 { return "Everything Navigator needs is granted" + stamp }
+        let bad = SetupAudit.attentionCount(items.map { ($0.id, states[$0.id] ?? .unknown, $0.optional) },
+                                            fullDisk: fullDisk)
+        if bad == 0 { return "Nothing needs your attention" + stamp }
         return "\(bad) item\(bad == 1 ? "" : "s") still need\(bad == 1 ? "s" : "") attention" + stamp
     }
 
     private func tint(_ s: PermissionState) -> Color {
         switch s {
-        case .granted: return .green
+        case .granted, .covered: return .green
         case .denied:  return .red
         case .off, .notAsked: return .orange
         case .unknown: return .secondary
@@ -11541,7 +11649,9 @@ struct SetupAssistantView: View {
     }
 
     @ViewBuilder private func row(_ item: SetupItem) -> some View {
-        let state = states[item.id] ?? .unknown
+        let state = state(of: item)
+        let buttons = SetupAudit.buttons(state: state, canAsk: item.canAsk,
+                                         listedOnlyAfterRequest: item.listedOnlyAfterRequest)
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: state.symbol)
                 .foregroundStyle(tint(state)).frame(width: 16).padding(.top, 2)
@@ -11555,10 +11665,10 @@ struct SetupAssistantView: View {
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 4) {
-                if item.canAsk, state == .notAsked {
+                if buttons.ask {
                     Button("Ask macOS…") { ask(item) }.buttonStyle(.borderedProminent)
                 }
-                Button(item.settingsLabel) { item.openSettings() }
+                if buttons.settings { Button(item.settingsLabel) { item.openSettings() } }
             }
             .controlSize(.small)
         }
@@ -11589,6 +11699,9 @@ struct SetupAssistantView: View {
         let items = self.items
         DispatchQueue.global(qos: .userInitiated).async {
             let asked = PermissionProbe.asked
+            // Full Disk Access is first in the list on purpose: every row below it reads its
+            // answer, so probing it first means no row ever paints "Not yet asked" for a
+            // second before flipping to "Covered".
             for item in items {
                 let s = (item.probeMayPrompt && !asked.contains(item.id)) ? .notAsked : item.probe(false)
                 DispatchQueue.main.async { states[item.id] = s }
@@ -12458,7 +12571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         Navigator can add its own menu to Finder’s right-click menu — Remove BG, \
         Chroma Key BG and the AI upscalers — so you don’t have to switch apps.
 
-        macOS needs you to switch it on once: tick Navigator under Finder Extensions.
+        macOS needs you to switch it on once: tick Navigator in \(finderExtensionSectionName).
         """
         a.addButton(withTitle: "Open Settings")
         a.addButton(withTitle: "Not Now")
@@ -12474,7 +12587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         a.messageText = on ? "Navigator’s Finder menu is on" : "Navigator’s Finder menu is off"
         a.informativeText = on
             ? "Right-click any file or folder in Finder and look for the Navigator submenu."
-            : "Tick Navigator under Finder Extensions to add its menu to Finder’s right-click menu."
+            : "Tick Navigator in \(finderExtensionSectionName) to add its menu to Finder’s right-click menu."
         a.addButton(withTitle: on ? "Open Settings" : "Open Settings")
         a.addButton(withTitle: "Done")
         if a.runModal() == .alertFirstButtonReturn {
