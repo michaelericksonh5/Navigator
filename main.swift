@@ -435,6 +435,22 @@ enum Prefs {
         get { d.data(forKey: "folderViewOptionsV1") }
         set { d.set(newValue, forKey: "folderViewOptionsV1") }
     }
+    /// Pick the view from what's IN a folder (FolderKind) when the folder has nothing
+    /// remembered of its own. Default on, like Explorer — and off in one checkbox,
+    /// because a guess about your folders is precisely the kind of help some people
+    /// want nothing to do with.
+    static var inferFolderView: Bool {
+        get { d.object(forKey: "inferFolderView") == nil ? true : d.bool(forKey: "inferFolderView") }
+        set { d.set(newValue, forKey: "inferFolderView") }
+    }
+    /// Has the Setup Assistant opened itself once on this install?
+    ///
+    /// Set the moment it is SHOWN, not when it is completed: someone who closes it
+    /// straight away has answered the question, and a setup screen that reappears until
+    /// you satisfy it is the exact behaviour that trains people to dismiss things
+    /// unread — which is how this install ended up with Desktop denied in the first
+    /// place. Help ▸ Setup Assistant… is always there when they want it back.
+    static var didRunSetup: Bool { get { d.bool(forKey: "didRunSetup") } set { d.set(newValue, forKey: "didRunSetup") } }
 }
 
 // MARK: - Per-folder view options (⌘J)
@@ -446,9 +462,10 @@ enum Prefs {
 /// (recency, the cap, and "what applies to a folder with nothing saved") is pure logic
 /// in NavigatorCore's ViewOptionsLRU, where it is unit-tested.
 ///
-/// Nothing is written for a folder until the user explicitly asks for it in the ⌘J panel
-/// — which is what keeps the default experience byte-for-byte unchanged for anyone who
-/// never opens that panel.
+/// A folder gets a record the moment its view is CHANGED while you're in it — no opt-in,
+/// the way Explorer works. Merely visiting a folder writes nothing, so browsing a tree
+/// costs no records and a user who never changes a view setting still has an empty store
+/// and the behaviour they always had.
 final class FolderViewOptionsStore: ObservableObject {
     static let shared = FolderViewOptionsStore()
     @Published private var lru: ViewOptionsLRU
@@ -1084,12 +1101,42 @@ struct SidebarLocation: Identifiable, Hashable {
     var isNetwork: Bool = false   // "Disconnect" rather than "Eject", and picks the error wording
 }
 
+// The one alert for "macOS said no", with the fix one click away. Must be called on
+// the main thread.
+//
+// Everything that can fail on a permission routes here rather than each growing its
+// own wording, so the user always gets the same sentence and the same button no matter
+// which feature they were using when they hit it.
+func reportPermissionDenied(_ summary: String, _ detail: String) {
+    let a = NSAlert(); a.alertStyle = .warning
+    a.messageText = summary
+    a.informativeText = detail
+    a.addButton(withTitle: "Open Setup Assistant…")
+    a.addButton(withTitle: "OK")
+    if a.runModal() == .alertFirstButtonReturn { SetupAssistantController.shared.show() }
+}
+
 // Surfaces a file-operation failure instead of failing silently. Must be called
 // on the main thread.
 // `permissionHint` appends the Full Disk Access note. Pass false when the failure
 // clearly isn't about permissions (e.g. "a folder can't be copied into itself") —
 // tacking an unrelated FDA paragraph onto a logic error just confuses people.
-func reportFileError(_ summary: String, _ detail: String = "", permissionHint: Bool = true) {
+// `at` is the destination the operation was aiming at, when there is one: it lets a
+// denial name the folder ("your Desktop") instead of talking about permissions in the
+// abstract. Optional so the forty existing call sites need no change.
+func reportFileError(_ summary: String, _ detail: String = "", permissionHint: Bool = true, at destination: URL? = nil) {
+    // A failure macOS caused is a different problem with a different fix, so it gets
+    // its own alert rather than the generic one with a paragraph bolted on. This is
+    // where Send To ▸ Desktop used to die quietly on an install whose Desktop
+    // permission had been dismissed: "couldn't be copied" plus an FDA note that
+    // wasn't the actual missing switch.
+    if permissionHint, PermissionDiagnosis.looksLikeDenial(detail) {
+        let folder = destination.flatMap { PermissionDiagnosis.protectedFolder(for: $0.path, home: NSHomeDirectory()) }
+        reportPermissionDenied(summary, folder.map {
+            "macOS is blocking Navigator from your \($0) folder — the files themselves are fine.\n\nThe Setup Assistant shows which permissions are missing and takes you straight to the switch."
+        } ?? "macOS blocked this: \(detail)\n\nThe Setup Assistant shows which of Navigator's permissions are missing and takes you straight to the switch.")
+        return
+    }
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = summary
     var msg = detail
@@ -1098,7 +1145,7 @@ func reportFileError(_ summary: String, _ detail: String = "", permissionHint: B
     if msg.count > 1200 { msg = String(msg.prefix(1200)) + "\n… (truncated)" }
     if permissionHint {
         if !msg.isEmpty { msg += "\n\n" }
-        msg += "Items in protected folders (Desktop, Documents, Pictures, Downloads) or on read-only volumes can need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
+        msg += "Items in protected folders (Desktop, Documents, Pictures, Downloads) or on read-only volumes can need Navigator to have Full Disk Access — see Help → “Setup Assistant…”."
     }
     a.informativeText = msg
     a.addButton(withTitle: "OK"); a.runModal()
@@ -2847,7 +2894,8 @@ final class FavoritesStore: ObservableObject {
     }
 }
 
-let imageExtensions: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","tif","heic","heif","webp","ico"]
+// imageExtensions/videoExtensions themselves live in NavigatorCore, next to the folder
+// classifier that has to agree with them (FolderKind).
 func isImageFile(_ url: URL) -> Bool { imageExtensions.contains(url.pathExtension.lowercased()) }
 
 // Cloud (File Provider) download state for a Google Drive / iCloud item, read
@@ -2903,7 +2951,6 @@ func cloudBadge(for url: URL) -> CloudBadge? {
     }
 }
 
-let videoExtensions: Set<String> = ["mp4","mov","m4v","avi","mkv","webm","wmv","flv","mpg","mpeg","3gp","m2ts","mts","m2v","ts"]
 func isVideoFile(_ url: URL) -> Bool { videoExtensions.contains(url.pathExtension.lowercased()) }
 // Formats that should play (not just show a frame) in the viewer/preview.
 func isAnimatedImage(_ url: URL) -> Bool { url.pathExtension.lowercased() == "gif" }
@@ -2999,6 +3046,13 @@ func volumeLocations() -> [SidebarLocation] {
 
 // MARK: - Browser state (one per tab)
 
+/// "Scroll this item back to the top of the view." The sequence number is what makes a
+/// repeat of the same anchor a new instruction — see Browser.restoreScroll.
+struct ScrollRestore: Equatable {
+    let id: String
+    let seq: Int
+}
+
 final class Browser: ObservableObject, Identifiable {
     let id = UUID()
     // The one place a folder change is noticed, which is why per-folder view options are
@@ -3008,8 +3062,23 @@ final class Browser: ObservableObject, Identifiable {
     @Published var currentURL: URL {
         didSet {
             guard oldValue.path != currentURL.path else { return }
+            // Record where we were BEFORE anything reloads: `items`, `selection` and the
+            // view's scroll are all still the folder we are leaving at this point, and
+            // load() (which runs right after every assignment to currentURL) clears them.
+            rememberPlace(leaving: oldValue)
+            // Deliberately staged here and not in load(): load() also runs for ⌘R, a
+            // Show-Hidden toggle and an FSEvents refresh, and replaying a stored
+            // selection on those would resurrect whatever was selected when you last LEFT
+            // the folder over what you have selected right now.
+            pendingPlace = places.value(for: currentURL.path)
+            topVisibleID = nil          // the arriving view owns this; the old one's value is not ours
             applyFolderViewOptions()
             collapsedGroups = collapsedByFolder[currentURL.path] ?? []
+            // The app-wide "a tab moved" signal, posted from the ONE place every route
+            // goes through. It used to be posted by navigate(to:) alone, so goBack() and
+            // goForward() — which assign currentURL directly — left the window title (and
+            // the saved session) describing the folder you had just left.
+            NotificationCenter.default.post(name: .navigatorDidNavigate, object: nil)
         }
     }
     // Bumped when cloud availability changes so rows re-read their badge — a
@@ -3032,6 +3101,16 @@ final class Browser: ObservableObject, Identifiable {
                     pendingRenamePath = nil
                 }
             }
+            restorePendingPlace()
+            // Content-based view inference. Hooked to `items` rather than to load()'s
+            // completion because every backend (local, network phase 1 and 2, cache seed,
+            // FSEvents refresh) ends up here — one hook covers all of them.
+            //
+            // Deferred by one runloop turn on purpose: all of those assign `items` and
+            // only THEN clear `busy`, so asking right here always sees a listing that
+            // claims to still be arriving, and the classification never runs at all.
+            // (Measured: without the hop, a folder of 30 images opened in Details.)
+            DispatchQueue.main.async { [weak self] in self?.applyInferredView() }
         }
     }
     @Published var selection: Set<String> = []
@@ -3057,18 +3136,13 @@ final class Browser: ObservableObject, Identifiable {
         didSet {
             visibleCache = nil
             prefetchMetadataIfSortingOnIt()
-            for f in SortField.allCases {
-                for asc in [true, false] where sortOrder.first == Browser.comparator(for: f, ascending: asc) {
-                    persistViewSetting { Prefs.sortKey = f.rawValue; Prefs.sortAscending = asc }
-                    return
-                }
-            }
-            // Sorted by a column SortField cannot name (Ext, the extra dates, Time,
-            // Dimensions, Owner). There has never been a global pref for those, and this
-            // deliberately doesn't add one — but a folder with its own remembered options
-            // still records it, which is the only way "always sort this folder by
-            // Dimensions" can survive navigating away.
-            persistViewSetting {}
+            // Every sort lands in the folder's own record, including one on a column
+            // SortField cannot name (Ext, the extra dates, Time, Dimensions, Owner) —
+            // which is the only way "always sort this folder by Dimensions" survives
+            // navigating away. The global sort default has no such gap to fill: it is set
+            // from Settings and from ⌘J's Use as Defaults, both of which offer only
+            // columns it can express.
+            persistViewSetting()
         }
     }
     @Published var groupBy: GroupBy = .none {
@@ -3086,21 +3160,21 @@ final class Browser: ObservableObject, Identifiable {
             // currentURL restores the right set itself, immediately after this.
             guard !applyingViewOptions else { return }   // persistViewSetting is a no-op then too
             collapsedGroups = GroupCollapse.pruned(collapsedGroups, toTitles: groups().map(\.title))
-            persistViewSetting { Prefs.groupBy = groupBy.rawValue }
+            persistViewSetting()
         }
     }
     @Published var status: String = ""
     @Published var freeSpace: String = ""
     @Published var isRecents = false
-    @Published var viewMode: ViewMode = .list { didSet { persistViewSetting { Prefs.viewMode = viewMode.rawValue } } }
-    @Published var iconSize: CGFloat = 76 { didSet { persistViewSetting { Prefs.iconSize = iconSize } } }
+    @Published var viewMode: ViewMode = .list { didSet { persistViewSetting() } }
+    @Published var iconSize: CGFloat = 76 { didSet { persistViewSetting() } }
     /// Which Details columns are shown. This is the SINGLE source both the View ▸ Columns
     /// menu and the header right-click menu read and write; the NSTableColumn `isHidden`
     /// flags are pushed from here on every reload and never treated as the truth. Two
     /// menus each holding their own idea of what's visible is precisely the drift that has
     /// already caused real bugs in this app's menus.
     @Published var visibleColumns: Set<String> = Set(defaultVisibleColumnIDs) {
-        didSet { persistViewSetting { Prefs.columns = fileColumnIDs.filter { visibleColumns.contains($0) } } }
+        didSet { persistViewSetting() }
     }
     /// Group titles collapsed in the CURRENT folder. Group headers are always rendered;
     /// only their contents hide, so there is always something left to click.
@@ -3125,6 +3199,65 @@ final class Browser: ObservableObject, Identifiable {
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
+
+    // MARK: Coming back to where you were
+    //
+    // Back that lands you at the top of the folder with nothing selected is Back that
+    // makes you find your place again. These three fields are the whole feature: the
+    // views report what is at the top of the viewport, leaving a folder files that away,
+    // and arriving at one replays it.
+
+    /// The item currently at the top of the viewport, pushed by whichever view is on
+    /// screen (list, icon; the gallery filmstrip has no meaningful "top" and leaves it
+    /// nil, where the selection is a better anchor anyway).
+    ///
+    /// Deliberately NOT @Published: it changes on every scroll tick, and publishing it
+    /// would re-render the entire file view continuously while you drag the scrollbar.
+    var topVisibleID: String?
+    private var places = FolderPlaceLRU()
+    private var pendingPlace: FolderPlace?
+    /// Set once when a stored place is replayed. Carries a sequence number because the
+    /// same anchor is the right answer twice in a row — dive into a subfolder and come
+    /// back a second time and the id is unchanged, so a bare String would compare equal
+    /// and the views would never fire.
+    @Published var restoreScroll: ScrollRestore?
+
+    private func rememberPlace(leaving old: URL) {
+        let ids = orderedVisibleItems().map(\.id)
+        guard !ids.isEmpty else { return }
+        // The gallery reports no top item, so fall back to the selection — which is
+        // exactly what its filmstrip and big preview are showing you.
+        let anchor = topVisibleID ?? ids.first { selection.contains($0) }
+        let place = FolderPlace(anchorID: anchor,
+                                anchorIndex: anchor.flatMap { ids.firstIndex(of: $0) } ?? 0,
+                                selection: selection)
+        places.set(place, for: old.path)
+    }
+
+    /// Replay a stored place once the listing that can satisfy it has arrived.
+    private func restorePendingPlace() {
+        guard let place = pendingPlace, !items.isEmpty else { return }
+        // A background op asking to reveal specific files (Remove BG, New Folder) is a
+        // deliberate, more recent instruction than "put me back where I was" — let it win
+        // rather than have the two fight over the selection.
+        guard pendingRevealPaths.isEmpty else { pendingPlace = nil; return }
+        let ids = orderedVisibleItems().map(\.id)
+        // `busy` still set means more of this folder is on its way; restoreAnchor uses it
+        // to tell "gone" from "not here yet". Nil means it wants to wait, so keep the
+        // record and try again on the next batch.
+        guard let anchor = place.restoreAnchor(among: ids, settled: !busy) else { return }
+        pendingPlace = nil
+        // Only ids that still exist — a selection naming deleted files would show a
+        // status line counting items that aren't there.
+        let survivors = place.selection.intersection(ids)
+        if !survivors.isEmpty { selection = survivors; updateStatus() }
+        // Deliberately NOT keyboardScrollID: that one scrolls its target to the CENTRE
+        // (right for arrow keys, wrong here) and would fight the anchor by aiming at the
+        // first selected item instead of the item that was at the top. Also deliberately
+        // not touching renamingID or lastNameClick — restoring a selection must never
+        // arm the click-pause-click rename.
+        restoreScroll = ScrollRestore(id: anchor, seq: (restoreScroll?.seq ?? 0) + 1)
+    }
     private var recentsQuery: NSMetadataQuery?
     private var searchQuery: NSMetadataQuery?
     private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
@@ -3217,29 +3350,33 @@ final class Browser: ObservableObject, Identifiable {
     /// folder in the app.
     private var applyingViewOptions = false
 
-    /// Where a view change lands.
+    /// Where a view change lands: ALWAYS in this folder's own record, never in the global
+    /// default. Changing the view is how a folder starts remembering — there is nothing
+    /// to opt into, which is the whole of Item 1.
     ///
-    /// • Folder with its own remembered options (⌘J → "Always open this folder…") → that
-    ///   folder's record, and nothing global moves.
-    /// • Every other folder → `global()`, exactly as before any of this existed. That
-    ///   branch is why anyone who never opens ⌘J sees no change whatsoever: view mode,
-    ///   sort and grouping still carry from folder to folder the way they always have.
-    private func persistViewSetting(_ global: () -> Void) {
-        guard !applyingViewOptions else { return }
-        if FolderViewOptionsStore.shared.contains(currentURL.path) {
-            FolderViewOptionsStore.shared.save(currentViewOptions, for: currentURL.path)
-        } else {
-            global()
-        }
+    /// It used to fall through to the global default for any folder without a record, and
+    /// that is precisely what can't survive automatic remembering: switching one folder to
+    /// Gallery would both remember it here AND redefine what every folder nobody has ever
+    /// opened looks like. The global default now moves only when the user says so —
+    /// "Use as Defaults" in ⌘J, or the Settings pickers.
+    ///
+    /// Recents is not a folder. It force-sorts by date on entry (loadRecents) without
+    /// changing currentURL, so persisting from there would stamp that sort onto whichever
+    /// real folder the tab happens to be sitting on.
+    private func persistViewSetting() {
+        guard !applyingViewOptions, !isRecents else { return }
+        FolderViewOptionsStore.shared.save(currentViewOptions, for: currentURL.path)
     }
 
     /// Apply whatever governs the folder we're now in: its own options if it has any,
-    /// otherwise the global defaults.
+    /// otherwise the global defaults. Content inference is the third source and can't
+    /// happen here — see applyInferredView, which needs a listing this runs before.
     func applyFolderViewOptions() {
         let path = currentURL.path
         let store = FolderViewOptionsStore.shared
         let o = store.options(for: path) ?? Browser.defaultViewOptions
         store.markUsed(path)              // recency by use, so the cap evicts the right folder
+        viewWasInferred = false           // whatever we're about to apply, it isn't a guess
         applyingViewOptions = true
         // A saved "column" from the removed Columns view no longer parses, so it falls
         // back to Details here for free — no coercion step needed.
@@ -3251,25 +3388,67 @@ final class Browser: ObservableObject, Identifiable {
         applyingViewOptions = false
     }
 
-    var remembersViewOptions: Bool { FolderViewOptionsStore.shared.contains(currentURL.path) }
-
-    /// The ⌘J panel's "Always open this folder with these options" switch. Turning it on
-    /// snapshots what's on screen right now (so nothing visibly changes); turning it off
-    /// drops the record and re-applies the global defaults, which is Finder's
-    /// revert-to-defaults.
-    func setRemembersViewOptions(_ on: Bool) {
-        if on {
-            FolderViewOptionsStore.shared.save(currentViewOptions, for: currentURL.path)
-            objectWillChange.send()
-        } else {
-            FolderViewOptionsStore.shared.forget(currentURL.path)
-            applyFolderViewOptions()
-            // groupBy's own prune is suppressed while applyFolderViewOptions assigns (see
-            // there). We're still in the SAME folder, so groups() describes what's on
-            // screen and the prune is both safe and needed — otherwise reverting to a
-            // different Group By leaves titles collapsed that the new grouping never had.
-            collapsedGroups = GroupCollapse.pruned(collapsedGroups, toTitles: groups().map(\.title))
+    /// Windows-style folder-type detection: a folder nobody has arranged by hand, whose
+    /// contents are mostly pictures or video, opens in big thumbnails instead of a list of
+    /// names. Third in the resolution order, behind this folder's own record and ahead of
+    /// nothing — a folder it declines to classify simply keeps the global default.
+    ///
+    /// Driven by the LISTING, not by the folder change: classification needs names, and
+    /// applyFolderViewOptions runs before load() has any. Re-running it on every settled
+    /// reload is deliberate and costs nothing — the first time the user changes anything
+    /// here the folder gets a record of its own, and the `options(for:)` guard below then
+    /// makes this a permanent no-op for that folder.
+    ///
+    /// Applied behind `applyingViewOptions`, so the guess is NOT written down as the
+    /// user's own choice. An inference that persisted itself would outlive turning the
+    /// preference off, which is not what turning it off means.
+    private func applyInferredView() {
+        // `busy` is the same "the listing has settled" signal restorePendingPlace uses.
+        // Classifying a 24-file first batch of a big folder would flip the view mode and
+        // then flip it back when the rest arrives.
+        guard Prefs.inferFolderView, !busy, !isRecents, !isSearching,
+              FolderViewOptionsStore.shared.options(for: currentURL.path) == nil,
+              // Already a thumbnail view — the user's default is Icons or Gallery, and
+              // there is nothing here worth overriding it with.
+              viewMode == .list,
+              FolderKind.infer(items.map { ($0.name, $0.isDirectory) }) == .media else { return }
+        applyingViewOptions = true
+        viewMode = .icon
+        iconSize = max(iconSize, 128)     // Explorer's "Large Icons"; never SHRINK the user's icons
+        applyingViewOptions = false
+        viewWasInferred = true
+        // Coming BACK into this folder, restorePendingPlace has already asked the Details
+        // list to scroll to where you were — and we have just replaced that list with a
+        // grid. Both grid renderers consume restoreScroll through .onChange alone, so a
+        // view mounted after the value was set never sees it and you land at the top.
+        // Re-issue on the next turn, once the grid exists to observe the change.
+        if let r = restoreScroll {
+            DispatchQueue.main.async { [weak self] in
+                self?.restoreScroll = ScrollRestore(id: r.id, seq: r.seq + 1)
+            }
         }
+    }
+
+    /// True when what's on screen came from applyInferredView rather than from a saved
+    /// record or the global default. Read by the ⌘J panel, which must not describe a guess
+    /// as a setting — cached rather than recomputed, because the panel re-renders on every
+    /// selection change and the classifier walks the whole listing.
+    @Published private(set) var viewWasInferred = false
+
+    /// ⌘J → "Restore Defaults": forget this folder's own options so it falls back to
+    /// inference, then the global defaults. Finder's revert-to-defaults.
+    func forgetFolderViewOptions() {
+        FolderViewOptionsStore.shared.forget(currentURL.path)
+        applyFolderViewOptions()
+        // groupBy's own prune is suppressed while applyFolderViewOptions assigns (see
+        // there). We're still in the SAME folder, so groups() describes what's on
+        // screen and the prune is both safe and needed — otherwise reverting to a
+        // different Group By leaves titles collapsed that the new grouping never had.
+        collapsedGroups = GroupCollapse.pruned(collapsedGroups, toTitles: groups().map(\.title))
+        // The listing is already loaded, so inference can take over immediately instead of
+        // waiting for a refresh — otherwise "Restore Defaults" in a photo folder lands on
+        // Details and only becomes the inferred view the next time you walk back into it.
+        applyInferredView()
     }
     /// "Use as Defaults": what's on screen becomes the global default, i.e. what every
     /// folder with no saved options of its own will show from now on.
@@ -4170,11 +4349,12 @@ final class Browser: ObservableObject, Identifiable {
         // on a stat over a slow SMB mount.
         if recordHistory { backStack.append(currentURL); forwardStack.removeAll() }
         searchText = ""; isSearching = false; searchQuery?.stop(); searchQuery = nil
-        currentURL = url
-        load()
         // NOTE: navigating does NOT record a recent folder — "Recent Folders" is
         // only folders you've worked in (created/saved/moved/renamed files).
-        NotificationCenter.default.post(name: .navigatorDidNavigate, object: nil)
+        // .navigatorDidNavigate is posted by currentURL's own didSet, so Back/Forward
+        // and any future direct assignment get it too.
+        currentURL = url
+        load()
     }
 
     // Navigate to a sidebar favorite. For a network drive whose volume isn't
@@ -5259,8 +5439,10 @@ final class Browser: ObservableObject, Identifiable {
                 if !failures.isEmpty {
                     let verb = move ? "moved" : "copied"
                     let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
+                    // `at: dir` is what lets a denial say "your Desktop" — this is the
+                    // path Send To ▸ Desktop takes.
                     reportFileError(failures.count == 1 ? "“\(failures[0].name)” couldn't be \(verb)"
-                                                        : "\(failures.count) items couldn't be \(verb)", detail)
+                                                        : "\(failures.count) items couldn't be \(verb)", detail, at: dir)
                 }
                 // Cancel STOPS the transfer; whatever already finished stays put. Say
                 // so plainly — otherwise a cancelled MOVE looks like files vanished
@@ -5351,7 +5533,19 @@ final class Browser: ObservableObject, Identifiable {
         DispatchQueue.global(qos: .userInitiated).async {
             var err: NSDictionary?
             NSAppleScript(source: src)?.executeAndReturnError(&err)
-            if let err { NSLog("setComment error: \(err)") }
+            if let err {
+                NSLog("setComment error: \(err)")
+                // -1743 is macOS refusing Automation ▸ Finder. A Finder comment is
+                // WRITTEN BY FINDER (there is no supported API to set one directly), so
+                // a denied Automation grant made Get Info's Save Comment do precisely
+                // nothing, with no error anywhere the user could see it.
+                if (err[NSAppleScript.errorNumber] as? Int) == -1743 {
+                    DispatchQueue.main.async {
+                        reportPermissionDenied("Navigator isn’t allowed to control Finder",
+                            "Finder comments are stored by Finder itself, so macOS needs Navigator to have permission to control it. Your comment wasn’t saved.")
+                    }
+                }
+            }
         }
     }
 
@@ -7821,6 +8015,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     private var rows: [FileRow] = []
     private var lastRowSignature: [String] = []
     private var lastKeyboardScrollID: String?
+    private var lastRestoreScroll: ScrollRestore?
     private var isPushingSelectionFromModel = false
     /// True from the moment a drag enters this table until it leaves or drops. While set,
     /// `reload()` refuses to touch the table: reloadData() or selectRowIndexes() during a
@@ -7927,8 +8122,45 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.drawsBackground = false
+        // Report the row at the top of the viewport as it changes, so leaving the folder
+        // can record it (see Browser.topVisibleID). Bounds-change is the cheap way to
+        // learn about EVERY scroll — wheel, scrollbar, keyboard and programmatic alike.
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(didScroll(_:)),
+                                               name: NSView.boundsDidChangeNotification, object: scroll.contentView)
         reload()
         return scroll
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    @objc private func didScroll(_ n: Notification) { browser.topVisibleID = topVisibleItemID() }
+
+    /// The first FILE row fully or partly at the top of the viewport — group headers are
+    /// skipped, because a header is not something you can navigate back to.
+    private func topVisibleItemID() -> String? {
+        guard let table = tableView else { return nil }
+        let range = table.rows(in: table.visibleRect)
+        guard range.length > 0 else { return nil }
+        for idx in range.location..<(range.location + range.length) where rows.indices.contains(idx) {
+            if case .item(let it) = rows[idx] { return it.id }
+        }
+        return nil
+    }
+
+    /// Put the remembered item back at the TOP of the viewport.
+    ///
+    /// Deliberately not scrollRowToVisible: that scrolls the minimum distance needed, so
+    /// coming from the top of a fresh listing it parks the target at the BOTTOM of the
+    /// window — every row you were looking at replaced by the rows above it. scroll(_:)
+    /// to the row's own origin puts the folder back exactly as you left it, and NSClipView
+    /// clamps the point for us when the folder has since got shorter.
+    private func syncRestoreScroll() {
+        guard let table = tableView, let r = browser.restoreScroll, r != lastRestoreScroll else { return }
+        lastRestoreScroll = r
+        guard let idx = rows.firstIndex(where: { if case .item(let it) = $0, it.id == r.id { return true }; return false })
+        else { return }
+        table.scroll(NSPoint(x: 0, y: table.rect(ofRow: idx).minY))
     }
 
     // Recomputes the row list. Only actually reloads the table (tearing down and
@@ -7975,6 +8207,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         syncSortDescriptors()
         syncSelection()
         syncScrollTarget()
+        syncRestoreScroll()
     }
 
     /// Push browser.visibleColumns onto the table. Assigning isHidden unconditionally
@@ -8168,7 +8401,15 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard let desc = tableView.sortDescriptors.first, let key = desc.key,
               let def = fileColumnDefs.first(where: { $0.id == key }), let make = def.comparator else { return }
-        browser.sortOrder = [make(desc.ascending)]
+        let new = make(desc.ascending)
+        // AppKit calls this for a PROGRAMMATIC assignment to tableView.sortDescriptors as
+        // well as for a header click, and updateNSView pushes the browser's sort into the
+        // table on every refresh — so this fires with the sort we just gave it, on every
+        // folder we open. Harmless while a view change only rewrote the global default to
+        // the value it already had; not harmless now that a change is what makes a folder
+        // remember itself, where it wrote a record for every folder merely VISITED.
+        guard browser.sortOrder.first != new else { return }
+        browser.sortOrder = [new]
     }
 
     // MARK: Drag out / drag in
@@ -8566,6 +8807,8 @@ struct IconGridView: View {
     @ObservedObject var browser: Browser
     @State private var frameStore = FrameStore()
     @State private var marquee: CGRect?
+    /// The item at the top-leading corner of the viewport, maintained by SwiftUI.
+    @State private var topID: String?
     private var columns: [GridItem] { [GridItem(.adaptive(minimum: browser.iconSize + 44), spacing: 12)] }
 
     var body: some View {
@@ -8625,6 +8868,11 @@ struct IconGridView: View {
                                 }
                             }
                         }
+                        // Marks the grid as the thing .scrollPosition(id:) reads its
+                        // answer from. Harmless on its own — it only becomes a snapping
+                        // behaviour when paired with .scrollTargetBehavior, which we
+                        // deliberately do not use.
+                        .scrollTargetLayout()
                         .padding(14)
                     }
                     .coordinateSpace(name: "iconGrid")
@@ -8632,8 +8880,20 @@ struct IconGridView: View {
                         if let m = marquee { MarqueeRect(rect: m) }
                     }
                 }
+                // AppKit hands us the top row for free in list view; here SwiftUI's own
+                // scrollPosition is the equivalent, and it costs nothing per scroll tick —
+                // unlike reading a named-coordinate-space frame, which is exactly the
+                // measured expense the cell frames below are written to avoid.
+                .scrollPosition(id: $topID)
+                .onChange(of: topID) { browser.topVisibleID = topID }
                 .onChange(of: browser.keyboardScrollID) {
                     if let id = browser.keyboardScrollID { withAnimation { proxy.scrollTo(id, anchor: .center) } }
+                }
+                // No animation: this is restoring a view you already had, not moving you
+                // somewhere. Animating it makes returning to a folder look like a scroll
+                // you didn't ask for.
+                .onChange(of: browser.restoreScroll) {
+                    if let r = browser.restoreScroll { proxy.scrollTo(r.id, anchor: .top) }
                 }
             }
             .onAppear { updateColumns(geo.size.width) }
@@ -8944,6 +9204,12 @@ struct GalleryView: View {
                 .onChange(of: browser.keyboardScrollID) {
                     if let id = browser.keyboardScrollID { withAnimation { proxy.scrollTo(id) } }
                 }
+                // Coming back to a folder in gallery view: the restored selection is
+                // already driving the big preview, this brings its thumbnail back into
+                // the filmstrip so the strip agrees with what's on show.
+                .onChange(of: browser.restoreScroll) {
+                    if let r = browser.restoreScroll { proxy.scrollTo(r.id) }
+                }
             }
         }
     }
@@ -9221,15 +9487,36 @@ final class PaneController: NSViewController, NSSplitViewDelegate {
         subview === sidebarPane || subview === previewPane
     }
     // Drag limits. Bypassed during programmatic collapse/expand so panes can hit 0.
+    //
+    // THE COLLAPSED CASES ARE NOT OPTIONAL — they are the fix for "when I drag to resize
+    // the window, the Details pane appears".
+    //
+    // A collapsed pane is a divider parked at an extreme: preview collapsed → divider 1
+    // sits at `total`, sidebar collapsed → divider 0 sits at 0. Those are exactly the two
+    // x positions where the window's own left/right resize border is, and the divider's
+    // grab zone wins the hit test over it. So aiming at the window edge to resize grabs
+    // the divider instead — and because these methods described the OPEN pane's drag
+    // limits regardless of the collapsed state, that divider was free to travel to
+    // `total - previewMin`, yanking a 200pt preview pane out of nothing. Confirmed by
+    // measurement: one press-drag 1pt inside the right border moved no window at all and
+    // took the preview pane from 0pt to 199pt.
+    //
+    // Pinning min == max at the extreme while collapsed makes that divider immovable, so
+    // a mis-aimed window resize can no longer open the pane; the toggles stay the only
+    // way in or out. (A live window resize was NOT the mechanism — verified separately
+    // that AppKit leaves a collapsed subview collapsed across a resize, so re-asserting
+    // the layout afterwards would have fixed nothing.)
     func splitView(_ sv: NSSplitView, constrainMinCoordinate proposedMin: CGFloat, ofSubviewAt i: Int) -> CGFloat {
         if bypassConstraints { return 0 }
-        if i == 0 { return sidebarMin }
+        if i == 0 { return sidebarCollapsed ? 0 : sidebarMin }
+        if previewCollapsed { return total }
         // divider 1: keep content ≥ contentMin and preview ≤ previewMax
         return max(sidebarPane.frame.maxX + thickness + contentMin, total - previewMax)
     }
     func splitView(_ sv: NSSplitView, constrainMaxCoordinate proposedMax: CGFloat, ofSubviewAt i: Int) -> CGFloat {
         if bypassConstraints { return total }
-        if i == 0 { return min(sidebarMax, previewPane.frame.minX - thickness - contentMin) }
+        if i == 0 { return sidebarCollapsed ? 0 : min(sidebarMax, previewPane.frame.minX - thickness - contentMin) }
+        if previewCollapsed { return total }
         // divider 1: keep preview ≥ previewMin
         return total - previewMin
     }
@@ -10823,10 +11110,13 @@ private struct ViewOptionsBody: View {
             Text(browser.currentURL.lastPathComponent.isEmpty ? "/" : browser.currentURL.lastPathComponent)
                 .font(.headline).lineLimit(1).truncationMode(.middle)
 
-            Toggle("Always open this folder with these options", isOn: Binding(
-                get: { remembers },
-                set: { browser.setRemembersViewOptions($0) }))
-            .help("On: this folder keeps its own view options and changes here stop affecting other folders. Off: the folder uses the global defaults.")
+            // Replaces the old "Always open this folder with these options" toggle. That
+            // switch is a lie now: every folder keeps its own options the moment you change
+            // one, so there is nothing left to turn on — only a fact to state, and a way
+            // (Restore Defaults, below) to take it back.
+            Text(stateLine)
+                .font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             Divider()
 
@@ -10875,15 +11165,27 @@ private struct ViewOptionsBody: View {
 
             Divider()
             HStack {
+                // Explorer calls this "Apply to Folders"; the app has always called it Use
+                // as Defaults and renaming it would only orphan the muscle memory. It is
+                // now the ONLY way a view change reaches the global default, so it gets
+                // the leading, prominent slot rather than sitting beside its opposite.
                 Button("Use as Defaults") { browser.useCurrentViewOptionsAsDefaults() }
-                    .help("Make these the options every folder without its own saved options uses.")
+                    .help("Apply to folders: make these the options every folder without its own uses.")
                 Spacer()
-                Button("Restore Defaults") { browser.setRemembersViewOptions(false) }
+                Button("Restore Defaults") { browser.forgetFolderViewOptions() }
                     .disabled(!remembers)
-                    .help("Forget this folder's own options and go back to the global defaults.")
+                    .help("Forget this folder's own options and go back to the default view.")
             }
         }
         .padding(14)
+    }
+
+    /// What is actually governing this folder right now, in the same order the code
+    /// resolves it: the folder's own record, then content inference, then the defaults.
+    private var stateLine: String {
+        if remembers { return "Remembering this folder's own view options." }
+        if browser.viewWasInferred { return "Large icons, chosen because this folder is mostly images or video." }
+        return "Using the default view options."
     }
 
     private var sortableColumnIDs: [String] { fileColumnDefs.filter { $0.comparator != nil }.map(\.id) }
@@ -10988,6 +11290,7 @@ struct SettingsView: View {
     @AppStorage("confirmTrash") private var confirmTrash = true
     @AppStorage("thumbnailMode") private var thumbnailMode = "all"
     @AppStorage("warnExtensionChange") private var warnExtensionChange = true
+    @AppStorage("inferFolderView") private var inferFolderView = true
     var body: some View {
         Form {
             Section("Defaults for new windows & tabs") {
@@ -11003,6 +11306,8 @@ struct SettingsView: View {
                 Toggle("Show hidden files", isOn: $showHidden)
             }
             Section("Behavior") {
+                Toggle("Open image folders in large icons", isOn: $inferFolderView)
+                    .help("Folders you haven't arranged yourself open in large icons when they're mostly images or video. Off: every such folder uses the default view above.")
                 Toggle("Confirm before moving to Trash", isOn: $confirmTrash)
                 Toggle("Warn before changing a file extension", isOn: $warnExtensionChange)
                 Picker("Thumbnails", selection: $thumbnailMode) {
@@ -11015,6 +11320,305 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 440, height: 360)
     }
+}
+
+// MARK: - Setup Assistant (first launch, and Help ▸ Setup Assistant…)
+
+/// Live answers to "can Navigator actually do this right now?".
+///
+/// Every answer here comes from ATTEMPTING the thing, never from reading TCC's
+/// database: that file is private, needs Full Disk Access to read at all, and its
+/// schema is Apple's to change. A capability probe cannot be wrong about the only
+/// question the user has — whether the feature works — and it keeps working when
+/// Apple next moves the furniture.
+enum PermissionProbe {
+    // Where System Settings keeps each switch. The com.apple.preference.security
+    // anchors still resolve on macOS 14/15 (the app already ships the AllFiles and
+    // Automation ones); each was opened and screenshotted before being trusted here.
+    static let filesAndFoldersPane = "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"
+    static let fullDiskPane        = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+    static let automationPane      = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+
+    static func openPane(_ url: String) { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }
+
+    /// Rows whose probe IS the request — reading a protected folder is what makes macOS
+    /// put its dialog up. Until an id is in here the row honestly reads "Not yet asked",
+    /// so merely opening this window can't spawn a stack of system dialogs at someone.
+    /// Once macOS has a decision on file the same probe is silent, which is what makes
+    /// the refresh-on-focus below possible at all.
+    static var asked: Set<String> {
+        get { Set(Prefs.d.stringArray(forKey: "setupAsked") ?? []) }
+        set { Prefs.d.set(newValue.sorted(), forKey: "setupAsked") }
+    }
+
+    /// Can we list this folder right now? Success is the only proof of access that counts.
+    /// A folder that isn't there is `.unknown`, not `.denied` — nothing is wrong with the
+    /// permission, and saying "Denied" would send the user after a switch that is fine.
+    static func folder(_ url: URL) -> PermissionState {
+        do { _ = try FileManager.default.contentsOfDirectory(atPath: url.path); return .granted }
+        catch let e as NSError {
+            return PermissionDiagnosis.isDenial(domain: e.domain, code: e.code) ? .denied : .unknown
+        }
+    }
+
+    /// Network / removable volumes can only be tested against a volume of that kind that
+    /// is actually mounted — with none mounted there is literally nothing to read, and
+    /// the honest answer is `.unknown` (macOS asks the first time one is opened). This
+    /// costs nothing in that case: no volume of the class means no filesystem call.
+    static func volumes(network: Bool) -> PermissionState {
+        let match = volumeLocations().first { network ? $0.isNetwork : (!$0.isNetwork && $0.ejectable) }
+        guard let v = match else { return .unknown }
+        return folder(v.url)
+    }
+
+    /// Full Disk Access has no API and macOS never prompts for it, so the only thing an
+    /// ordinary app can observe is whether it can OPEN a file that nothing but FDA opens.
+    /// We ask for a handle to TCC's own database and drop it immediately — nothing is
+    /// read from it and nothing here parses it, which is the line this must not cross.
+    static func fullDisk() -> PermissionState {
+        let p = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db")
+        do { try FileHandle(forReadingFrom: URL(fileURLWithPath: p)).close(); return .granted }
+        catch let e as NSError {
+            return PermissionDiagnosis.isDenial(domain: e.domain, code: e.code) ? .denied : .unknown
+        }
+    }
+
+    /// Automation ▸ Finder, probed by sending Finder a harmless event — the SAME call
+    /// setComment makes, so this answer is literally the feature's answer.
+    ///
+    /// Deliberately NOT AEDeterminePermissionToAutomateTarget, the API that appears to
+    /// exist for exactly this: measured live, it blocks forever inside TCC when a consent
+    /// dialog can't be put up (screen locked), and because the probes share a queue that
+    /// left EVERY row stuck on "Unknown". A status that can hang is worse than no API.
+    /// -1743 is macOS refusing; anything else (Finder not running, a script error) is
+    /// not evidence of a denial and must not be reported as one.
+    static func finderAutomation() -> PermissionState {
+        var err: NSDictionary?
+        NSAppleScript(source: "tell application \"Finder\" to return version")?.executeAndReturnError(&err)
+        guard let err else { return .granted }
+        return (err[NSAppleScript.errorNumber] as? Int) == -1743 ? .denied : .unknown
+    }
+}
+
+/// One row of the assistant: what the permission is FOR in the user's words, how to find
+/// out whether we have it, and where they go to change it.
+struct SetupItem: Identifiable {
+    let id: String
+    let title: String
+    let why: String
+    /// `prompt` is true only from the row's own "Ask macOS" button.
+    let probe: (_ prompt: Bool) -> PermissionState
+    /// True when merely RUNNING the probe is what makes macOS ask. Those rows stay at
+    /// "Not yet asked" until the user presses the button — see PermissionProbe.asked.
+    let probeMayPrompt: Bool
+    /// True when macOS can be made to ask. False means the switch is the user's to flip
+    /// in System Settings and no app is allowed to raise a dialog for it — the row says so.
+    let canAsk: Bool
+    var settingsLabel = "Open Settings"
+    let openSettings: () -> Void
+
+    static func all() -> [SetupItem] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        func files() { PermissionProbe.openPane(PermissionProbe.filesAndFoldersPane) }
+        func homeFolder(_ name: String, _ why: String) -> SetupItem {
+            SetupItem(id: name, title: name, why: why,
+                      probe: { _ in PermissionProbe.folder(home.appendingPathComponent(name)) },
+                      probeMayPrompt: true, canAsk: true, openSettings: files)
+        }
+        return [
+            homeFolder("Desktop", "Browse your Desktop, and drop files onto it with Send To."),
+            homeFolder("Documents", "Browse, rename and organise everything in Documents."),
+            homeFolder("Downloads", "Browse Downloads and move things out of it."),
+            // Volumes are probed live rather than gated behind a button: with none of the
+            // kind mounted the probe is free and answers "Unknown", and with one mounted
+            // reading it is both the honest test and the prompt you'd want anyway.
+            SetupItem(id: "network", title: "Network volumes",
+                      why: "Open shared drives you connect to (⌘K), and copy files to and from them.",
+                      probe: { _ in PermissionProbe.volumes(network: true) },
+                      probeMayPrompt: false, canAsk: false, openSettings: files),
+            SetupItem(id: "removable", title: "USB & external drives",
+                      why: "Browse sticks and external disks, and use them as a Send To target.",
+                      probe: { _ in PermissionProbe.volumes(network: false) },
+                      probeMayPrompt: false, canAsk: false, openSettings: files),
+            SetupItem(id: "fda", title: "Full Disk Access (optional)",
+                      why: "Reaches what the switches above don’t: other apps’ Library folders, another user’s home, some system folders. It does NOT override a file’s own owner or read-only flag, and everyday browsing works without it. macOS never asks for this one — you turn it on yourself.",
+                      probe: { _ in PermissionProbe.fullDisk() },
+                      probeMayPrompt: false, canAsk: false,
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.fullDiskPane) }),
+            SetupItem(id: "automation", title: "Control Finder",
+                      why: "Used for one thing: saving the Comment field in Get Info. Finder owns Finder comments, so Finder has to be the one to write them.",
+                      probe: { _ in PermissionProbe.finderAutomation() },
+                      probeMayPrompt: true, canAsk: true,
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
+            SetupItem(id: "finderext", title: "Navigator’s Finder menu",
+                      why: "Adds Navigator’s submenu — Remove BG, Chroma Key, the AI upscalers — to Finder’s own right-click menu. macOS makes you tick this one yourself.",
+                      probe: { _ in FIFinderSyncController.isExtensionEnabled ? .granted : .off },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: "Open Extensions",
+                      // The SAME call the AI ▸ Finder Menu… item and the once-per-version
+                      // nudge already use — one path to that pane, not two.
+                      openSettings: { FIFinderSyncController.showExtensionManagementInterface() })
+        ]
+    }
+}
+
+// Laid out like SettingsView — grouped Form, one Section per topic — because it IS the
+// same kind of window and should not read as a bolted-on wizard.
+struct SetupAssistantView: View {
+    @State private var states: [String: PermissionState] = [:]
+    @State private var checking = false
+    @State private var checkedAt: Date?
+    @AppStorage("viewMode") private var viewMode = "list"
+    @AppStorage("iconSize") private var iconSize = 76.0
+    @AppStorage("inferFolderView") private var inferFolderView = true
+
+    private let items = SetupItem.all()
+
+    var body: some View {
+        Form {
+            Section {
+                Text("macOS keeps Navigator out of your files until you say otherwise. This checks what it can actually reach right now.\n\n“Ask macOS” makes macOS put up its own permission dialog. The rest are switches only you can flip, so those rows just take you to the right pane.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Section("Files & folders") { ForEach(items.prefix(5)) { row($0) } }
+            Section("Extras") { ForEach(items.dropFirst(5)) { row($0) } }
+            Section("How folders open") {
+                Picker("New windows and tabs", selection: $viewMode) {
+                    Text("Details").tag("list"); Text("Icons").tag("icon"); Text("Gallery").tag("gallery")
+                }
+                // A slider over the same range as View Options (⌘J), not a Small/Medium/Large
+                // picker: icon size is continuous here — the pinch gesture and ⌘J both write
+                // arbitrary values — so a picker showed an EMPTY selection for anyone whose
+                // size didn't land exactly on one of three magic numbers.
+                HStack {
+                    Text("Icon size")
+                    Slider(value: $iconSize, in: Double(Browser.minIconSize)...Double(Browser.maxIconSize))
+                    Text("\(Int(iconSize))").monospacedDigit().foregroundStyle(.secondary)
+                        .frame(width: 30, alignment: .trailing)
+                }
+                Toggle("Open image folders in large icons", isOn: $inferFolderView)
+                    .help("Folders you haven’t arranged yourself open in large icons when they’re mostly images or video.")
+            }
+            Section {
+                HStack(spacing: 8) {
+                    if checking { ProgressView().controlSize(.small) }
+                    Text(summary).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Check Again") { refresh() }
+                    Button("Done") { SetupAssistantController.shared.close() }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 560, height: 660)
+        .onAppear { refresh() }
+        // Returning from System Settings re-activates Navigator, which is the only
+        // signal we get that a switch may have moved. Re-probing here is what stops
+        // this window from showing yesterday's answer until the app is restarted.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            guard SetupAssistantController.shared.isVisible else { return }
+            refresh()
+        }
+    }
+
+    private var summary: String {
+        let stamp = checkedAt.map { " · checked " + $0.formatted(date: .omitted, time: .standard) } ?? ""
+        if checking { return "Checking…" }
+        let bad = items.filter { (states[$0.id] ?? .unknown).needsAttention }.count
+        if bad == 0 { return "Everything Navigator needs is granted" + stamp }
+        return "\(bad) item\(bad == 1 ? "" : "s") still need\(bad == 1 ? "s" : "") attention" + stamp
+    }
+
+    private func tint(_ s: PermissionState) -> Color {
+        switch s {
+        case .granted: return .green
+        case .denied:  return .red
+        case .off, .notAsked: return .orange
+        case .unknown: return .secondary
+        }
+    }
+
+    @ViewBuilder private func row(_ item: SetupItem) -> some View {
+        let state = states[item.id] ?? .unknown
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: state.symbol)
+                .foregroundStyle(tint(state)).frame(width: 16).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(item.title).fontWeight(.medium)
+                    Text(state.label).font(.caption).foregroundStyle(tint(state))
+                }
+                Text(item.why).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 4) {
+                if item.canAsk, state == .notAsked {
+                    Button("Ask macOS…") { ask(item) }.buttonStyle(.borderedProminent)
+                }
+                Button(item.settingsLabel) { item.openSettings() }
+            }
+            .controlSize(.small)
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// The row's own button: run the probe in its PROMPTING form. For a folder that
+    /// simply means reading it — attempting the access is the only way to get the real
+    /// system dialog, and no API exists to raise one on demand.
+    private func ask(_ item: SetupItem) {
+        checking = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let s = item.probe(true)
+            PermissionProbe.asked.insert(item.id)
+            DispatchQueue.main.async { states[item.id] = s; checking = false; checkedAt = Date() }
+        }
+    }
+
+    /// Off the main thread: a network-volume probe is a directory listing over SMB, and
+    /// a TCC dialog blocks whichever thread triggered it until the user answers.
+    ///
+    /// Each row is published as its own probe finishes rather than all at the end, so one
+    /// slow or wedged probe can no longer hold every other row hostage — the panel showed
+    /// nothing but "Unknown" for as long as a single hung TCC call kept the loop from
+    /// completing, which is precisely the "confident wrong status" this is meant to avoid.
+    private func refresh() {
+        checking = true
+        let items = self.items
+        DispatchQueue.global(qos: .userInitiated).async {
+            let asked = PermissionProbe.asked
+            for item in items {
+                let s = (item.probeMayPrompt && !asked.contains(item.id)) ? .notAsked : item.probe(false)
+                DispatchQueue.main.async { states[item.id] = s }
+            }
+            DispatchQueue.main.async { checking = false; checkedAt = Date() }
+        }
+    }
+}
+
+final class SetupAssistantController {
+    static let shared = SetupAssistantController()
+    private var window: NSWindow?
+    /// Read by the view before it re-probes on app activation, so a window that has been
+    /// closed stops costing directory reads on every switch back to Navigator.
+    var isVisible: Bool { window?.isVisible == true }
+
+    func show() {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 660),
+                             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            w.title = "Navigator Setup"
+            w.contentView = NSHostingView(rootView: SetupAssistantView())
+            w.isReleasedWhenClosed = false
+            w.center()
+            window = w
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    func close() { window?.orderOut(nil) }
 }
 
 // NSMenuItemValidation conformance is load-bearing, not decoration: validateMenuItem
@@ -11045,8 +11649,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     private var pendingFolders: [URL] = []
 
+    /// Read (and immediately consumed) at the top of launch, because two later
+    /// deferred blocks both need to know it and the flag is set the moment it's read.
+    private var isFirstRun = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        isFirstRun = !Prefs.didRunSetup
+        Prefs.didRunSetup = true
         // The undo stack is pure logic in NavigatorCore (so it can be unit-tested and
         // never reaches for AppKit); these hook its two user-visible outcomes back up.
         UndoStack.shared.onEmpty = { NSSound.beep() }
@@ -11101,6 +11711,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             guard let self, !self.suppressMainWindow else { return }
             self.showMainWindow()
             self.offerDefaultsIfNeeded()   // one-time; only on a normal (visible) launch
+            // First launch of this install: open the Setup Assistant so a new user sees
+            // what macOS is still blocking, instead of discovering it months later as a
+            // Send To that silently does nothing. Marked shown, not completed — it never
+            // reappears on its own, and Help ▸ Setup Assistant… brings it back.
+            if self.isFirstRun { SetupAssistantController.shared.show() }
         }
         // (Background pre-indexing was removed: on a degraded VPN it competed with
         // the user's own navigation for the choked connection and made browsing
@@ -11788,6 +12403,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let vLog = aiMenu.addItem(withTitle: "Open AI Log…", action: #selector(openAILogAction(_:)), keyEquivalent: "")
         vLog.target = self
 
+        // Help, in its conventional last position — where someone who half-set-up their
+        // permissions months ago will actually go looking for a way back.
+        let helpItem = NSMenuItem(); mainMenu.addItem(helpItem)
+        let helpMenu = NSMenu(title: "Help"); helpItem.submenu = helpMenu
+        let setupItem = helpMenu.addItem(withTitle: "Setup Assistant…", action: #selector(showSetupAssistantAction(_:)), keyEquivalent: "")
+        setupItem.target = self
+
         NSApp.mainMenu = mainMenu
     }
 
@@ -11824,6 +12446,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     // Nudge, once per version, if Navigator's Finder menu is switched off.
     private func offerFinderExtensionIfDisabled() {
         guard !FIFinderSyncController.isExtensionEnabled else { return }
+        // The Setup Assistant has a row for this and opened moments ago — two prompts
+        // about the same switch on someone's very first launch is one too many.
+        guard !isFirstRun else { return }
         let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         guard Prefs.d.string(forKey: "finderExtPrompt") != ver else { return }
         Prefs.d.set(ver, forKey: "finderExtPrompt")
@@ -12166,6 +12791,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // asked for by asking for a column.
         if b.viewMode != .list { b.viewMode = .list }
     }
+
+    @objc func showSetupAssistantAction(_ sender: Any?) { SetupAssistantController.shared.show() }
 
     @objc func checkForUpdatesAction(_ sender: Any?) { Updater.check(userInitiated: true) }
     private var settingsWindow: NSWindow?

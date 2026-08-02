@@ -918,9 +918,14 @@ struct ViewOptions: Codable, Equatable {
 /// Why a cap at all: this is ONE UserDefaults blob, not Finder's per-folder .DS_Store.
 /// Nothing ever deletes a folder's entry when the folder is deleted or renamed, so
 /// without a bound the dictionary only ever grows — and it is decoded in full on every
-/// launch. 200 is far more folders than anyone deliberately arranges by hand, and at
-/// roughly 150 bytes per record it holds the blob near 30 KB, small enough that the
-/// launch decode stays invisible.
+/// launch.
+///
+/// The cap was 200 when a folder only got a record by ticking a checkbox. Remembering is
+/// automatic now, so a record appears every time anyone changes a view setting anywhere —
+/// still not once per folder VISITED (browsing writes nothing), but a far bigger working
+/// set than "folders I deliberately arranged". 400 covers a year of that for a heavy
+/// user, and at roughly 150 bytes per record it holds the blob near 60 KB: still a
+/// sub-millisecond launch decode, still nowhere near a size UserDefaults minds.
 ///
 /// Recency is refreshed on READ (`touch`), not only on write. Evicting by insertion
 /// order instead would throw away the folder you open every day in favour of one you
@@ -930,7 +935,7 @@ struct ViewOptionsLRU: Codable, Equatable {
     /// appears in the other, which is what makes eviction a plain `order.last`.
     private(set) var order: [String] = []
     private(set) var byPath: [String: ViewOptions] = [:]
-    static let cap = 200
+    static let cap = 400
 
     init() {}
 
@@ -971,6 +976,153 @@ struct ViewOptionsLRU: Codable, Equatable {
     /// existed.
     func effective(for path: String, defaults: ViewOptions) -> ViewOptions {
         byPath[path] ?? defaults
+    }
+}
+
+// MARK: - Guessing what a folder is for (Windows-style folder-type detection)
+
+/// Extensions worth seeing as a picture. Here rather than beside `isImageFile` in
+/// main.swift so the folder classifier below — which the test bundle compiles, and
+/// main.swift cannot be imported into — judges from the SAME list the thumbnailer and
+/// the image viewer use, instead of a second copy that quietly drifts from it.
+let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp", "ico"]
+let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "flv", "mpg", "mpeg", "3gp", "m2ts", "mts", "m2v", "ts"]
+
+/// What a folder appears to BE, judged only from the names the listing already holds.
+///
+/// This is Explorer's folder-type detection, and it exists for one reason: a folder full
+/// of pictures is useless as a list of names. It runs on every folder load, including on
+/// an SMB share over VPN, so it may only look at what enumeration already returned — a
+/// name and an isDirectory flag. Never opens a file, never reads an image header, never
+/// asks for a thumbnail.
+enum FolderKind {
+    /// Mostly pictures or video: worth the screen space of big thumbnails.
+    case media
+    /// Subfolders, documents, code, or a genuine mix — nothing a thumbnail helps with,
+    /// so it stays with whatever the user's default view is (Details, out of the box).
+    case general
+
+    /// Countable entries needed before this will call a folder anything at all.
+    ///
+    /// Below this, "mostly images" is one or two files' worth of evidence: a folder
+    /// holding a README and two screenshots is not a photo library, and blowing it up to
+    /// giant icons on a 2-1 split is exactly the guess that sends people looking for the
+    /// off switch. Five is the smallest count where a 60% lean means at least three files
+    /// agreeing.
+    static let minimumEvidence = 5
+
+    /// Share of countable entries that must be media before the folder is called one.
+    ///
+    /// A plain majority tips on a single file in an even split, which makes the view mode
+    /// jitter as a working folder fills up. 60% needs a real lean. Deliberately not
+    /// higher: a photo folder with a few exports, a contact sheet and a notes file in it
+    /// is still a photo folder.
+    static let mediaShare = 0.6
+
+    static func isMediaName(_ name: String) -> Bool {
+        let ext = (name as NSString).pathExtension.lowercased()
+        return imageExtensions.contains(ext) || videoExtensions.contains(ext)
+    }
+
+    /// nil = not enough to go on; leave the folder with the user's default view.
+    ///
+    /// Two things get discounted before the ratio is taken, both because they describe
+    /// the folder's plumbing rather than its purpose:
+    ///
+    /// • Dotfiles (.DS_Store, .picasa.ini) — invisible in the listing unless Show Hidden
+    ///   is on, so they must not be able to swing what the user sees either way.
+    /// • Sidecars: a non-media file sharing its base name with a media file right beside
+    ///   it (IMG_0431.xmp next to IMG_0431.cr2, clip.mov next to clip.srt). A raw
+    ///   workflow writes one per shot, so counting them makes every raw folder exactly
+    ///   50/50 and no photo folder ever reaches the threshold — the single most likely
+    ///   way for this feature to look broken to the person who most wants it. The same
+    ///   rule collapses a RAW+JPEG pair back to one shot for free.
+    ///   ponytail: a raw-ONLY folder has no jpg to anchor that rule to and stays general.
+    ///   Fix by classifying against thumbnailExtensions instead, if anyone asks.
+    static func infer(_ entries: [(name: String, isDirectory: Bool)]) -> FolderKind? {
+        let visible = entries.filter { !$0.name.hasPrefix(".") }
+        func base(_ name: String) -> String { (name as NSString).deletingPathExtension.lowercased() }
+        var mediaBases = Set<String>()
+        for e in visible where !e.isDirectory && isMediaName(e.name) { mediaBases.insert(base(e.name)) }
+
+        var media = 0, counted = 0
+        for e in visible {
+            if !e.isDirectory, isMediaName(e.name) { media += 1; counted += 1; continue }
+            // A subfolder always counts — 25 project folders are the whole reason this
+            // can't just be "does it contain images".
+            if e.isDirectory || !mediaBases.contains(base(e.name)) { counted += 1 }
+        }
+        guard counted >= minimumEvidence else { return nil }
+        return Double(media) >= mediaShare * Double(counted) ? .media : .general
+    }
+}
+
+// MARK: - Remembering where you were in a folder
+
+/// Your place in one folder: the item that was at the top of the view, plus what was
+/// selected. Recorded when you leave a folder and replayed when you come back, so Back
+/// returns you to the row you were reading instead of the top of the listing.
+struct FolderPlace: Equatable {
+    /// The item that was at the top of the viewport when you left.
+    ///
+    /// An ITEM, deliberately, not a pixel offset. A scroll offset recorded before three
+    /// files were deleted (or before the sort order changed, or the icon size did) points
+    /// at whatever happens to live at that y now — which is how you come back to a folder
+    /// and land somewhere you have never been. The item you were looking at is still the
+    /// item you were looking at.
+    var anchorID: String?
+    /// Where `anchorID` sat in the visible order. Used ONLY when the anchor itself is
+    /// gone — deleted, renamed or filtered out while you were away. Coming back to the
+    /// same POSITION is the closest thing to "where I was" that survives losing the
+    /// anchor, and it is bounded by construction (see restoreAnchor).
+    var anchorIndex: Int = 0
+    var selection: Set<String> = []
+
+    /// The id to put back at the top of the view, or nil to leave the scroll alone.
+    ///
+    /// `settled == false` means the listing is still filling in — the network loader
+    /// commits partial batches while a slow share enumerates. A missing anchor then means
+    /// "not there YET", not "gone", so we decline instead of falling back to the index
+    /// and scrolling to a position computed from a tenth of the folder. The caller keeps
+    /// the record and asks again on the next batch.
+    func restoreAnchor(among ids: [String], settled: Bool) -> String? {
+        if let a = anchorID, ids.contains(a) { return a }
+        // anchorIndex 0 means you were already at the top: there is nothing to restore,
+        // and scrolling to ids[0] would fight a view that is already showing it.
+        guard settled, anchorIndex > 0, !ids.isEmpty else { return nil }
+        return ids[min(anchorIndex, ids.count - 1)]
+    }
+}
+
+/// Bounded, most-recently-used-first store of `FolderPlace` by folder path — the same
+/// shape, and the same reason, as ViewOptionsLRU: a session that walks a deep tree visits
+/// hundreds of folders, and an unbounded dictionary of them only ever grows.
+///
+/// Deliberately NOT Codable and never persisted, unlike ViewOptionsLRU: where you were
+/// scrolled to is worth remembering while you are working, not across a relaunch — and
+/// persisting it would mean paying a UserDefaults write on every single navigation.
+struct FolderPlaceLRU: Equatable {
+    /// Paths, most-recently-used FIRST, kept in step with `byPath` — same invariant as
+    /// ViewOptionsLRU, which is what makes eviction a plain `order.last`.
+    private(set) var order: [String] = []
+    private(set) var byPath: [String: FolderPlace] = [:]
+    /// Smaller than ViewOptionsLRU's 200 because nothing here is persisted or
+    /// user-visible: it only has to cover the folders you are actually moving between.
+    static let cap = 100
+
+    var count: Int { byPath.count }
+    func value(for path: String) -> FolderPlace? { byPath[path] }
+
+    /// Record (or replace) one folder's place, making it the most recently used. Recency
+    /// needs no separate `touch` here: you cannot return to a folder without having left
+    /// one, so every visit ends in a `set`.
+    mutating func set(_ place: FolderPlace, for path: String) {
+        byPath[path] = place
+        order.removeAll { $0 == path }
+        order.insert(path, at: 0)
+        while order.count > FolderPlaceLRU.cap, let victim = order.popLast() {
+            byPath[victim] = nil
+        }
     }
 }
 
@@ -1543,5 +1695,94 @@ enum TrashOrigins {
         guard var map = defaults.dictionary(forKey: key) as? [String: String], !map.isEmpty else { return }
         for p in trashedPaths { map[p] = nil }
         defaults.set(map, forKey: key)
+    }
+}
+
+// MARK: - Permissions (Setup Assistant + deny-at-use-time wording)
+
+/// The answer a capability probe gives about one macOS permission.
+///
+/// `.notAsked` is a distinct answer, not a flavour of "no": macOS decides a
+/// Files-&-Folders permission only at the moment an app first attempts the access, so
+/// before that there genuinely is nothing recorded. Folding it into `.denied` would cry
+/// wolf on every fresh install; folding it into `.granted` would hide the one row that
+/// is about to break. `.unknown` is for what a normal app simply cannot observe — a
+/// volume class with no such volume mounted — and the UI says "unknown" rather than
+/// guessing, because a confident wrong status is worse than no status.
+/// `.off` is kept apart from `.denied` for the same reason: a Finder extension nobody
+/// has ever ticked was not "denied" by anyone, and saying so would have the user hunting
+/// System Settings for a refusal that never happened.
+enum PermissionState: String, Equatable {
+    case granted, denied, notAsked, unknown, off
+
+    var label: String {
+        switch self {
+        case .granted:  return "Granted"
+        case .denied:   return "Denied"
+        case .notAsked: return "Not yet asked"
+        case .unknown:  return "Unknown"
+        case .off:      return "Off"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .granted:  return "checkmark.circle.fill"
+        case .denied:   return "exclamationmark.octagon.fill"
+        case .notAsked: return "circle.dashed"
+        case .unknown:  return "questionmark.circle"
+        case .off:      return "circle.slash"
+        }
+    }
+
+    /// Drives the assistant's one-line summary. `.unknown` is deliberately NOT counted:
+    /// we have no evidence anything is wrong, and sending someone to System Settings to
+    /// fix a permission that may well be fine is how a setup screen loses its credibility.
+    var needsAttention: Bool { self == .denied || self == .notAsked || self == .off }
+}
+
+enum PermissionDiagnosis {
+
+    /// Is this NSError macOS refusing on permission grounds, as opposed to the file
+    /// being missing, locked, or on a full disk?
+    ///
+    /// Both domains matter because the two engines Navigator copies with report
+    /// differently: FileManager raises NSCocoaErrorDomain 257/513, while the copyfile()
+    /// path builds its error straight from `errno` (EPERM/EACCES).
+    static func isDenial(domain: String, code: Int) -> Bool {
+        switch domain {
+        case NSCocoaErrorDomain: return code == 257 || code == 513   // NSFileRead/WriteNoPermissionError
+        case NSPOSIXErrorDomain: return code == 1 || code == 13      // EPERM / EACCES
+        default: return false
+        }
+    }
+
+    /// Same question, asked of a message rather than an error.
+    ///
+    /// Needed because the app funnels every file failure through one alert helper that
+    /// only ever receives `localizedDescription` — threading a structured error through
+    /// forty call sites to reach the same alert would be a far bigger change than the
+    /// problem deserves. Known ceiling: these are the English strings Cocoa and strerror
+    /// produce, so on a non-English system the alert falls back to the generic wording it
+    /// has always shown. Upgrade path if that ever matters: pass the NSError down and use
+    /// `isDenial` above, which is locale-proof.
+    static func looksLikeDenial(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t.contains("permission denied")
+            || t.contains("don't have permission") || t.contains("don\u{2019}t have permission")
+            || t.contains("not permitted")
+    }
+
+    /// Which macOS-protected folder a path sits in, so a denial can name the folder the
+    /// user was actually aiming at ("your Desktop") instead of lecturing about TCC.
+    ///
+    /// Only these three: they are exactly the home folders macOS gates behind their own
+    /// Files-&-Folders switches. Pictures/Music/Movies are NOT gated, and claiming they
+    /// were would send people looking for a switch that doesn't exist.
+    static func protectedFolder(for path: String, home: String) -> String? {
+        let h = URL(fileURLWithPath: home)
+        return ["Desktop", "Documents", "Downloads"].first {
+            PathRules.isSelfOrDescendant(URL(fileURLWithPath: path), of: h.appendingPathComponent($0))
+        }
     }
 }

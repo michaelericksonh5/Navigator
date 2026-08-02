@@ -1373,6 +1373,128 @@ final class ViewOptionsLRUTests: XCTestCase {
     }
 }
 
+// MARK: - Guessing what a folder is for (FolderKind)
+
+final class FolderKindTests: XCTestCase {
+
+    private func files(_ names: [String]) -> [(name: String, isDirectory: Bool)] {
+        names.map { ($0, false) }
+    }
+    private func dirs(_ n: Int) -> [(name: String, isDirectory: Bool)] {
+        (0..<n).map { ("project\($0)", true) }
+    }
+    private func images(_ n: Int, ext: String = "jpg") -> [(name: String, isDirectory: Bool)] {
+        files((0..<n).map { "IMG_\(1000 + $0).\(ext)" })
+    }
+
+    func testAllImagesIsMedia() {
+        XCTAssertEqual(FolderKind.infer(images(30)), .media)
+    }
+
+    // Extension matching must be case-insensitive: cameras write .JPG, .CR2, .MOV.
+    func testUppercaseExtensionsStillCount() {
+        XCTAssertEqual(FolderKind.infer(images(12, ext: "JPG")), .media)
+    }
+
+    // The user's own counter-example: an artSource folder of ~25 project folders must
+    // NOT become a wall of giant icons.
+    func testFolderOfSubfoldersIsGeneral() {
+        XCTAssertEqual(FolderKind.infer(dirs(25)), .general)
+    }
+
+    func testDocumentsAreGeneral() {
+        XCTAssertEqual(FolderKind.infer(files(["a.swift", "b.swift", "notes.md", "Makefile", "readme.txt", "x.json"])), .general)
+    }
+
+    // An even split is not "mostly" anything, and a single added file must not be able to
+    // flip the whole folder's view mode.
+    func testFiftyFiftyIsGeneral() {
+        XCTAssertEqual(FolderKind.infer(images(10) + files((0..<10).map { "doc\($0).pdf" })), .general)
+    }
+
+    func testAFewImagesAmongManyDocumentsIsGeneral() {
+        XCTAssertEqual(FolderKind.infer(images(3) + files((0..<40).map { "doc\($0).pdf" })), .general)
+    }
+
+    func testEmptyFolderInfersNothing() {
+        XCTAssertNil(FolderKind.infer([]))
+    }
+
+    // Three images is not evidence of a photo library — thin folders keep the default.
+    func testThreeItemsInfersNothing() {
+        XCTAssertNil(FolderKind.infer(images(3)))
+        XCTAssertNil(FolderKind.infer(dirs(3)))
+    }
+
+    func testFiveIsTheSmallestFolderWorthClassifying() {
+        XCTAssertNil(FolderKind.infer(images(4)))
+        XCTAssertEqual(FolderKind.infer(images(5)), .media)
+    }
+
+    // A raw workflow writes one sidecar per shot. Counting them makes every photo folder
+    // exactly 50/50 — i.e. never a photo folder, which is the whole feature failing for
+    // the people who most want it.
+    func testSidecarsDoNotCountAgainstTheirImages() {
+        let jpgs = images(20)
+        let xmp = files((0..<20).map { "IMG_\(1000 + $0).xmp" })
+        XCTAssertEqual(FolderKind.infer(jpgs + xmp), .media)
+        // Shot RAW+JPEG, with a sidecar each: three files per photo, two of which the
+        // classifier has never heard of. The base-name rule collapses them back to one
+        // shot, which is the only reason a working photo folder clears 60%.
+        let raws = files((0..<20).map { "IMG_\(1000 + $0).cr2" })
+        XCTAssertEqual(FolderKind.infer(jpgs + raws + xmp), .media)
+    }
+
+    // The known ceiling: raw files are not in imageExtensions, so a folder shot raw-ONLY
+    // has nothing to anchor the base-name rule to and stays in Details. Deliberate — the
+    // classifier judges by the same list isImageFile uses, and a second list of "things
+    // that are sort of images" is exactly the drift that list exists to prevent.
+    func testRawOnlyFolderIsGeneral() {
+        XCTAssertEqual(FolderKind.infer(files((0..<20).map { "IMG_\(1000 + $0).cr2" })), .general)
+    }
+
+    func testSidecarMatchIsCaseInsensitive() {
+        XCTAssertEqual(FolderKind.infer(images(6) + files((0..<6).map { "img_\(1000 + $0).XMP" })), .media)
+    }
+
+    // A sidecar with no media file of the same name is just a file.
+    func testUnmatchedSidecarStillCounts() {
+        XCTAssertEqual(FolderKind.infer(images(5) + files((0..<10).map { "orphan\($0).xmp" })), .general)
+    }
+
+    // Dotfiles are invisible in the listing unless Show Hidden is on, so they must not be
+    // able to swing what the user sees either way.
+    func testDotfilesAreIgnored() {
+        XCTAssertEqual(FolderKind.infer(images(6) + files([".DS_Store", ".picasa.ini", ".thumbs"])), .media)
+        XCTAssertNil(FolderKind.infer(images(4) + files([".DS_Store"])))
+    }
+
+    // Video deserves thumbnails for the same reason images do.
+    func testVideoFolderIsMedia() {
+        XCTAssertEqual(FolderKind.infer(files((0..<8).map { "clip\($0).mov" })), .media)
+    }
+
+    func testMixedImagesAndVideoIsMedia() {
+        XCTAssertEqual(FolderKind.infer(images(5) + files((0..<5).map { "clip\($0).mp4" })), .media)
+    }
+
+    // Photos with their subfolders: still a photo folder while the images clearly lead.
+    func testImagesWithAFewSubfoldersIsMedia() {
+        XCTAssertEqual(FolderKind.infer(images(18) + dirs(2)), .media)
+    }
+
+    // …and the threshold really is 60%, not a bare majority.
+    func testJustUnderThresholdIsGeneral() {
+        XCTAssertEqual(FolderKind.infer(images(11) + dirs(9)), .general)   // 55%
+        XCTAssertEqual(FolderKind.infer(images(12) + dirs(8)), .media)     // 60%
+    }
+
+    // A file with no extension can't be media and must not crash the base-name logic.
+    func testExtensionlessFiles() {
+        XCTAssertEqual(FolderKind.infer(files(["Makefile", "LICENSE", "README", "Dockerfile", "notes"])), .general)
+    }
+}
+
 // MARK: - Sorting the lazily-loaded media columns (Time, Dimensions)
 
 final class MediaSortKeyTests: XCTestCase {
@@ -1960,5 +2082,173 @@ final class DSStoreRobustnessTests: XCTestCase {
         XCTAssertEqual(DSStore.normalize("/System/Volumes/Data/Users/me"), "/Users/me")
         XCTAssertEqual(DSStore.normalize("/System/Volumes/Data"), "/")
         XCTAssertEqual(DSStore.normalize("/Users/me/"), "/Users/me")
+    }
+}
+
+// MARK: - Coming back to where you were (FolderPlace / FolderPlaceLRU)
+
+final class FolderPlaceTests: XCTestCase {
+    private let ids = ["a", "b", "c", "d", "e"]
+
+    func testAnchorStillPresentWins() {
+        let p = FolderPlace(anchorID: "c", anchorIndex: 2, selection: [])
+        XCTAssertEqual(p.restoreAnchor(among: ids, settled: true), "c")
+    }
+
+    /// The anchor moved because files were added above it — we follow the ITEM, not the
+    /// index, which is the whole reason the anchor is an id.
+    func testAnchorFollowsTheItemNotTheIndex() {
+        let p = FolderPlace(anchorID: "c", anchorIndex: 2, selection: [])
+        XCTAssertEqual(p.restoreAnchor(among: ["x", "y", "a", "b", "c"], settled: true), "c")
+    }
+
+    /// Deleted while we were away: land at the same position instead of the top.
+    func testMissingAnchorFallsBackToIndex() {
+        let p = FolderPlace(anchorID: "c", anchorIndex: 2, selection: [])
+        XCTAssertEqual(p.restoreAnchor(among: ["a", "b", "d", "e"], settled: true), "d")
+    }
+
+    /// The folder got much shorter — the stored index must not walk off the end.
+    func testMissingAnchorClampsToLastItem() {
+        let p = FolderPlace(anchorID: "z", anchorIndex: 400, selection: [])
+        XCTAssertEqual(p.restoreAnchor(among: ["a", "b"], settled: true), "b")
+    }
+
+    func testEmptyFolderRestoresNothing() {
+        let p = FolderPlace(anchorID: "c", anchorIndex: 2, selection: [])
+        XCTAssertNil(p.restoreAnchor(among: [], settled: true))
+    }
+
+    /// Already at the top when we left: there is nothing to restore, and scrolling to
+    /// ids[0] would fight a view that is already showing it.
+    func testTopOfFolderRestoresNothing() {
+        let p = FolderPlace(anchorID: "a", anchorIndex: 0, selection: [])
+        XCTAssertNil(p.restoreAnchor(among: ["b", "c"], settled: true))
+        XCTAssertNil(FolderPlace().restoreAnchor(among: ids, settled: true))
+    }
+
+    /// A listing still filling in must not trigger the index fallback: "not here yet" is
+    /// not "gone", and the position would be computed from a fraction of the folder.
+    func testUnsettledListingDeclinesRatherThanGuessing() {
+        let p = FolderPlace(anchorID: "c", anchorIndex: 2, selection: [])
+        XCTAssertNil(p.restoreAnchor(among: ["a", "b"], settled: false))
+        // ...but an anchor that IS present is answerable immediately.
+        XCTAssertEqual(p.restoreAnchor(among: ["a", "b", "c"], settled: false), "c")
+    }
+}
+
+final class FolderPlaceLRUTests: XCTestCase {
+    private func place(_ id: String) -> FolderPlace { FolderPlace(anchorID: id, anchorIndex: 1, selection: [id]) }
+
+    func testStoresAndReadsBack() {
+        var lru = FolderPlaceLRU()
+        lru.set(place("f1"), for: "/tmp/a")
+        XCTAssertEqual(lru.value(for: "/tmp/a")?.anchorID, "f1")
+        XCTAssertNil(lru.value(for: "/tmp/b"))
+    }
+
+    func testReplacingAFolderDoesNotDuplicateTheOrderEntry() {
+        var lru = FolderPlaceLRU()
+        lru.set(place("f1"), for: "/tmp/a")
+        lru.set(place("f2"), for: "/tmp/a")
+        XCTAssertEqual(lru.count, 1)
+        XCTAssertEqual(lru.order, ["/tmp/a"])
+        XCTAssertEqual(lru.value(for: "/tmp/a")?.anchorID, "f2")
+    }
+
+    func testEvictsLeastRecentlyUsedAtTheCap() {
+        var lru = FolderPlaceLRU()
+        for i in 0..<(FolderPlaceLRU.cap + 10) { lru.set(place("f"), for: "/tmp/\(i)") }
+        XCTAssertEqual(lru.count, FolderPlaceLRU.cap)
+        XCTAssertEqual(lru.order.count, FolderPlaceLRU.cap)
+        XCTAssertNil(lru.value(for: "/tmp/0"))                                   // oldest gone
+        XCTAssertNotNil(lru.value(for: "/tmp/\(FolderPlaceLRU.cap + 9)"))        // newest kept
+    }
+
+    /// Re-recording a folder makes it recent again, so the folder you keep coming back to
+    /// outlives the hundred you passed through once.
+    func testRevisitingSavesAFolderFromEviction() {
+        var lru = FolderPlaceLRU()
+        lru.set(place("f"), for: "/tmp/keep")
+        for i in 0..<(FolderPlaceLRU.cap - 1) { lru.set(place("f"), for: "/tmp/\(i)") }
+        lru.set(place("again"), for: "/tmp/keep")
+        for i in 100..<(100 + FolderPlaceLRU.cap - 1) { lru.set(place("f"), for: "/tmp/\(i)") }
+        XCTAssertEqual(lru.value(for: "/tmp/keep")?.anchorID, "again")
+    }
+}
+
+// The bug these pin down: Send To ▸ Desktop on an install whose Desktop permission had
+// been dismissed failed with a generic "couldn't be copied" and an unrelated Full Disk
+// Access paragraph. Nothing told the user macOS was the one saying no.
+final class PermissionDiagnosisTests: XCTestCase {
+
+    func testRecognisesTheTwoCocoaPermissionErrors() {
+        XCTAssertTrue(PermissionDiagnosis.isDenial(domain: NSCocoaErrorDomain, code: 257))
+        XCTAssertTrue(PermissionDiagnosis.isDenial(domain: NSCocoaErrorDomain, code: 513))
+    }
+
+    // copyfile() builds its error from errno, so the POSIX codes have to count too —
+    // the byte-progress copy path is the one Send To actually uses for plain files.
+    func testRecognisesThePosixPermissionErrors() {
+        XCTAssertTrue(PermissionDiagnosis.isDenial(domain: NSPOSIXErrorDomain, code: 1))
+        XCTAssertTrue(PermissionDiagnosis.isDenial(domain: NSPOSIXErrorDomain, code: 13))
+    }
+
+    /// "No such file" and "disk full" must NOT be dressed up as permission problems:
+    /// pointing someone at System Settings for a missing file wastes their afternoon.
+    func testDoesNotClaimEveryFailureIsAPermission() {
+        XCTAssertFalse(PermissionDiagnosis.isDenial(domain: NSCocoaErrorDomain, code: 260))   // no such file
+        XCTAssertFalse(PermissionDiagnosis.isDenial(domain: NSPOSIXErrorDomain, code: 28))    // ENOSPC
+        XCTAssertFalse(PermissionDiagnosis.isDenial(domain: "SomeOtherDomain", code: 13))
+    }
+
+    func testMatchesTheMessagesCocoaAndStrerrorActuallyProduce() {
+        XCTAssertTrue(PermissionDiagnosis.looksLikeDenial("Permission denied"))
+        XCTAssertTrue(PermissionDiagnosis.looksLikeDenial("Operation not permitted"))
+        // Cocoa uses a curly apostrophe; a straight-quote-only check missed every
+        // FileManager failure, which is the common case.
+        XCTAssertTrue(PermissionDiagnosis.looksLikeDenial("You don\u{2019}t have permission to save the file “a” in the folder “Desktop”."))
+        XCTAssertTrue(PermissionDiagnosis.looksLikeDenial("You don't have permission to save the file."))
+    }
+
+    func testLeavesOrdinaryFailuresAlone() {
+        XCTAssertFalse(PermissionDiagnosis.looksLikeDenial("The file “a.png” doesn’t exist."))
+        XCTAssertFalse(PermissionDiagnosis.looksLikeDenial("There isn’t enough space on the disk."))
+    }
+
+    func testNamesTheProtectedFolderAPathIsIn() {
+        let home = "/Users/nobody"
+        XCTAssertEqual(PermissionDiagnosis.protectedFolder(for: "/Users/nobody/Desktop", home: home), "Desktop")
+        XCTAssertEqual(PermissionDiagnosis.protectedFolder(for: "/Users/nobody/Documents/Work/x", home: home), "Documents")
+        XCTAssertEqual(PermissionDiagnosis.protectedFolder(for: "/Users/nobody/Downloads", home: home), "Downloads")
+    }
+
+    /// Pictures is not gated by a Files-&-Folders switch, and neither is a plain folder
+    /// whose name merely starts the same way — "Desktop Backup" is not the Desktop.
+    func testDoesNotInventAPermissionForUnprotectedFolders() {
+        let home = "/Users/nobody"
+        XCTAssertNil(PermissionDiagnosis.protectedFolder(for: "/Users/nobody/Pictures", home: home))
+        XCTAssertNil(PermissionDiagnosis.protectedFolder(for: "/Users/nobody/Desktop Backup", home: home))
+        XCTAssertNil(PermissionDiagnosis.protectedFolder(for: "/Volumes/Share/art", home: home))
+    }
+}
+
+final class PermissionStateTests: XCTestCase {
+
+    /// The whole point of the assistant is that a half-set-up install looks wrong at a
+    /// glance. "Not yet asked" counts as unfinished; "unknown" — a volume class with no
+    /// such volume mounted — is not evidence of a problem and must not raise an alarm.
+    func testOnlyActionableStatesAskForAttention() {
+        XCTAssertTrue(PermissionState.denied.needsAttention)
+        XCTAssertTrue(PermissionState.notAsked.needsAttention)
+        XCTAssertTrue(PermissionState.off.needsAttention)
+        XCTAssertFalse(PermissionState.granted.needsAttention)
+        XCTAssertFalse(PermissionState.unknown.needsAttention)
+    }
+
+    func testEveryStateHasItsOwnWordAndBadge() {
+        let all: [PermissionState] = [.granted, .denied, .notAsked, .unknown, .off]
+        XCTAssertEqual(Set(all.map(\.label)).count, all.count)
+        XCTAssertEqual(Set(all.map(\.symbol)).count, all.count)
     }
 }
