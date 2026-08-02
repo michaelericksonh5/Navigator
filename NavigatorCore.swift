@@ -1951,3 +1951,115 @@ enum PermissionDiagnosis {
         }
     }
 }
+
+// MARK: - Open/Save dialog bridge
+
+/// The decisions behind "put my location where another app's Open/Save panel can reach
+/// it". Pure, so the four selection cases and the chord table are pinned by tests — the
+/// hotkey itself fires while Navigator is in the background, where a wrong answer is
+/// invisible until it has already sent someone's dialog to the wrong folder.
+///
+/// Why a clipboard at all: macOS has no picker role. An Open/Save panel is always
+/// NSOpenPanel/NSSavePanel (drawn by Powerbox for sandboxed apps), LaunchServices only
+/// knows Viewer/Editor/Shell, and nothing in macOS 26 changed that — so a third-party
+/// browser cannot be substituted for the panel. What every one of those panels DOES
+/// accept is a POSIX path pasted into ⌘⇧G, which is the supported bridge this builds on.
+enum PickerBridgeRules {
+
+    /// The one path to hand a dialog's ⌘⇧G.
+    ///
+    /// A single selected FILE is deliberately returned as the file itself, not its
+    /// folder: an Open panel's ⌘⇧G navigates to it *and* preselects it, so the user is
+    /// one Return from done. A single folder is likewise itself — for a Save panel that
+    /// is the destination, and for an Open panel it is where you wanted to look.
+    static func pathToCopy(folder: String, selection: [String]) -> String {
+        if selection.count == 1, !selection[0].isEmpty { return selection[0] }
+        // Several items: a dialog can only go one place, so it goes to the folder they
+        // live in. Taken from the items themselves rather than assumed to be `folder`,
+        // because in search results the hits come from anywhere below it — and the
+        // folder they share is a far better answer than the search root. Falls back to
+        // `folder` when they genuinely don't share one.
+        let parents = Set(selection.map { ($0 as NSString).deletingLastPathComponent })
+        if parents.count == 1, let only = parents.first, !only.isEmpty { return only }
+        return folder
+    }
+
+    /// A global hot key, described in the two forms both consumers need: Carbon's
+    /// (keyCode, modifiers) pair for RegisterEventHotKey, and glyphs for the menu.
+    struct Chord: Equatable {
+        /// Stored in UserDefaults, so it must never change for an existing chord.
+        let id: String
+        /// The printable key, both for `display` and for the menu item's key equivalent.
+        let key: String
+        /// Carbon virtual key code (kVK_ANSI_*). Spelled numerically because this file
+        /// deliberately imports nothing but Foundation.
+        let keyCode: UInt32
+        /// Carbon modifier mask: controlKey 0x1000, optionKey 0x800, shiftKey 0x200,
+        /// cmdKey 0x100.
+        let carbonModifiers: UInt32
+        var display: String { PickerBridgeRules.glyphs(carbonModifiers) + key }
+    }
+
+    static let controlKeyMask: UInt32 = 0x1000
+    static let optionKeyMask: UInt32  = 0x0800
+    static let shiftKeyMask: UInt32   = 0x0200
+    static let commandKeyMask: UInt32 = 0x0100
+
+    /// The offered chords, rather than a free-form key recorder: every one of these is
+    /// ⌃⌥⌘ + a letter, which no shipping macOS shortcut and nothing in Navigator's own
+    /// menus uses, so picking one can't quietly shadow a chord the user relies on.
+    ///
+    /// None of them include Shift, and that is load-bearing: `teleportChord` derives the
+    /// second hot key by ADDING Shift, so a Shift-bearing choice here would make the two
+    /// chords identical.
+    static let chords: [Chord] = [
+        // ⌃⌥⌘G — G as in the ⌘⇧G it feeds. kVK_ANSI_G.
+        Chord(id: "ctrl-opt-cmd-g", key: "G", keyCode: 5,
+              carbonModifiers: controlKeyMask | optionKeyMask | commandKeyMask),
+        // kVK_ANSI_P
+        Chord(id: "ctrl-opt-cmd-p", key: "P", keyCode: 35,
+              carbonModifiers: controlKeyMask | optionKeyMask | commandKeyMask),
+        // kVK_ANSI_K
+        Chord(id: "ctrl-opt-cmd-k", key: "K", keyCode: 40,
+              carbonModifiers: controlKeyMask | optionKeyMask | commandKeyMask)
+    ]
+
+    /// Falls back to the first chord for an unknown or absent id, so a pref written by a
+    /// later version (or a hand-edited plist) leaves the feature working rather than off.
+    static func chord(id: String?) -> Chord {
+        chords.first { $0.id == id } ?? chords[0]
+    }
+
+    /// The one-keystroke variant is always the copy chord plus Shift: one pref to set,
+    /// and the pair stays memorable ("the same thing, harder").
+    static func teleportChord(for c: Chord) -> Chord {
+        Chord(id: c.id + "-shift", key: c.key, keyCode: c.keyCode,
+              carbonModifiers: c.carbonModifiers | shiftKeyMask)
+    }
+
+    /// Modifier glyphs in Apple's canonical ⌃⌥⇧⌘ order — any other order reads as a
+    /// typo next to the system's own menus.
+    static func glyphs(_ carbonModifiers: UInt32) -> String {
+        var s = ""
+        if carbonModifiers & controlKeyMask != 0 { s += "\u{2303}" }
+        if carbonModifiers & optionKeyMask  != 0 { s += "\u{2325}" }
+        if carbonModifiers & shiftKeyMask   != 0 { s += "\u{21E7}" }
+        if carbonModifiers & commandKeyMask != 0 { s += "\u{2318}" }
+        return s
+    }
+
+    /// Path shortened for the confirmation HUD, from the LEFT: the tail names the file
+    /// or folder the user just aimed at, and that is the part they need to recognise.
+    static func hudLabel(_ path: String, max: Int = 56) -> String {
+        guard path.count > max else { return path }
+        var parts = path.split(separator: "/").map(String.init)
+        while parts.count > 1 {
+            parts.removeFirst()
+            let candidate = "\u{2026}/" + parts.joined(separator: "/")
+            if candidate.count <= max { return candidate }
+        }
+        // One component longer than the whole budget (a very long file name): keep its
+        // end, since that is where the extension and any numbering live.
+        return "\u{2026}" + String(path.suffix(max - 1))
+    }
+}
