@@ -2287,7 +2287,7 @@ final class SetupAuditTests: XCTestCase {
     /// Full Disk Access says nothing about Automation or the Finder extension, so those
     /// rows must survive it — the original bug in mirror image.
     func testCoverageStopsAtTheRowsFullDiskAccessActuallyCovers() {
-        for id in ["automation", "finderext", "fda"] {
+        for id in ["automation", "finderext", "fda", "accessibility"] {
             XCTAssertEqual(SetupAudit.effectiveState(id: id, probed: .off, fullDisk: .granted), .off)
         }
         for id in files {
@@ -2317,6 +2317,21 @@ final class SetupAuditTests: XCTestCase {
             ("Downloads", .denied, false), ("removable", .unknown, false), ("finderext", .off, false)
         ]
         XCTAssertEqual(SetupAudit.attentionCount(rows, fullDisk: .denied), 3)
+    }
+
+    /// Accessibility buys exactly one keystroke — ⌃⌥⇧⌘G — and the ⌃⌥⌘G copy path works
+    /// without it. An unlit switch there is a working install, so it must never appear in
+    /// the footer's number; a checklist that nags about a feature you aren't using is the
+    /// checklist people stop opening. It also always has somewhere to send you: unlike
+    /// Files & Folders, macOS lists every app in the Accessibility pane's + panel whether
+    /// or not it has ever asked.
+    func testAccessibilityIsOptionalAndAlwaysActionable() {
+        let rows: [(id: String, probed: PermissionState, optional: Bool)] = [
+            ("fda", .granted, true), ("automation", .granted, false), ("accessibility", .off, true)
+        ]
+        XCTAssertEqual(SetupAudit.attentionCount(rows, fullDisk: .granted), 0)
+        XCTAssertTrue(SetupAudit.buttons(state: .off, canAsk: false, listedOnlyAfterRequest: false).settings)
+        XCTAssertFalse(SetupAudit.buttons(state: .off, canAsk: false, listedOnlyAfterRequest: false).ask)
     }
 
     /// A button is a promise that pressing it does something.

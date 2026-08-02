@@ -4,10 +4,16 @@ Everything macOS will ask Navigator for, what each one actually buys you, and ho
 to check whether it stuck. Written against **macOS 26 (Tahoe)**; the System
 Settings paths differ on earlier versions.
 
-Navigator's built-in **Setup Assistant** (Help ▸ Setup Assistant) walks through
-most of this and shows live status. This document is the reference behind it —
-useful when handing Navigator to someone new, or when something isn't working and
-you want to know which switch is responsible.
+Navigator's built-in checklist (**Navigator ▸ Permissions Checklist…**, or
+Help ▸ Setup Assistant — same window) walks through most of this, shows live
+status, and has a button per row that opens the exact System Settings pane.
+**Prefer the buttons to this document.** Two of these panes are genuinely hard to
+find by name, and one of them (Accessibility, §4) shares its name with an
+unrelated pane — a click cannot land in the wrong place, a written path can.
+
+This document is the reference behind that window — useful when handing Navigator
+to someone new, or when something isn't working and you want to know which switch
+is responsible.
 
 ---
 
@@ -23,7 +29,7 @@ either optional or granted on demand the first time you use the feature.
 | Automation ▸ Finder | Saving comments in Get Info | Optional |
 | Automation ▸ Photoshop | Remove BG, Chroma Key, Quick Export as PNG | Only for those features |
 | Automation ▸ After Effects | Chroma Key | Only for that feature |
-| Accessibility | The **one-keystroke** Open/Save dialog jump (⌃⌥⇧⌘G) | Optional |
+| Accessibility *(Privacy & Security — not the sidebar one, see §4)* | The **one-keystroke** Open/Save dialog jump (⌃⌥⇧⌘G) | Optional |
 | Finder extension | Navigator's submenu in Finder's right-click menu | Optional |
 | Local Network | Discovering file servers for the sidebar | Optional |
 | Screen Recording | **Nothing.** Navigator never asks. | Never |
@@ -113,8 +119,32 @@ no Team ID, so **rebuilding or updating Navigator can drop this grant** and you'
 have to re-enable it. That's the tradeoff for a self-distributed app; nothing in
 Navigator can work around it.
 
-**How:**  ▸ System Settings ▸ Privacy & Security ▸ **Accessibility** ▸ enable
-**Navigator**. Quit and reopen the app afterwards.
+### There are two panes called "Accessibility". Read this before you go looking.
+
+This is the one thing in this document that has actually cost someone an evening,
+so it gets its own heading.
+
+* **System Settings ▸ Accessibility** — the item in the **left sidebar**, with the
+  blue figure icon. This is VoiceOver, Zoom, Hover Text, Captions. It is about
+  *using* your Mac. **It contains no list of apps and no Navigator switch.** If
+  you are looking at Display / Spoken Content / Motor, you are in the wrong pane.
+* **System Settings ▸ Privacy & Security ▸ Accessibility** — a completely
+  separate pane that happens to have the identical name. It is headed **"Allow the
+  applications below to control your computer"** and is a list of apps with
+  on/off switches. **This is the one you want.** Navigator is in that list.
+
+That header sentence is the reliable way to tell them apart. Same name, same
+spelling, different pane.
+
+**How, without the hunt:** open Navigator ▸ **Permissions Checklist…**, scroll to
+**Accessibility (one-key dialog jump)** and press its **Open Settings** button. It
+opens the right pane directly. (The Settings window's dialog-bridge section and
+Navigator's own "needs Accessibility" alert have the same button.)
+
+**How, by hand:**  ▸ System Settings ▸ **Privacy & Security** ▸ scroll down to
+**Accessibility** ▸ find **Navigator** in the list ▸ switch it on. If Navigator
+isn't listed, click **+**, press ⇧⌘G, type `/Applications/Navigator.app`. Quit and
+reopen the app afterwards.
 
 ---
 
@@ -162,7 +192,8 @@ Navigator's sidebar automatically. Without it you can still connect manually wit
 
 ## Verifying what's actually granted
 
-The Setup Assistant (**Help ▸ Setup Assistant**) is the easy answer — it probes
+The checklist (**Navigator ▸ Permissions Checklist…**, or Help ▸ Setup
+Assistant — the same window) is the easy answer — it probes
 what Navigator can genuinely *do* rather than reading a list, which is more
 truthful than the System Settings panes in a few cases.
 
