@@ -10,6 +10,7 @@ import CoreServices
 import NetFS
 import FinderSync   // detect / offer to enable the Finder menu extension
 import Carbon.HIToolbox   // RegisterEventHotKey — the ONLY permission-free global hotkey
+import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
 import os
 
 // Perf logging — view in Console.app (or `log stream`) filtered by
@@ -1259,6 +1260,91 @@ func googleDrivePortablePath(_ url: URL) -> String? {
     let rel = after[after.index(after: slash)...]
     return rel.isEmpty ? "Google Drive" : "Google Drive/\(rel)"
 }
+// Where Drive for desktop mounts THIS Mac's account. The one thing about a Drive
+// path that no pure rule can work out, and the anchor every resolved form lands on.
+func googleDriveAccountRoot() -> String? {
+    let cs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")
+    guard let accounts = try? FileManager.default.contentsOfDirectory(atPath: cs.path),
+          let local = accounts.first(where: { $0.hasPrefix("GoogleDrive-") }) else { return nil }
+    return cs.appendingPathComponent(local).path
+}
+
+/// The reverse of `googleDriveURL`: a drive.google.com link → where that item actually
+/// lives on this Mac, so a link someone pasted into Slack can be handed to an Open/Save
+/// dialog, which understands POSIX paths and nothing else.
+///
+/// Reads Drive for desktop's own metadata index. The obvious alternative — walk the
+/// mount reading the item-id xattr off every file — is one stat per file across a
+/// network-backed filesystem holding hundreds of thousands of them, which is not
+/// something a keystroke is allowed to do; this is a single indexed lookup plus a
+/// parent walk, measured at 15 ms against the 1 GB index on this machine. Opened
+/// read-only with `immutable=1` because Drive keeps the database open: that skips
+/// locking and the write-ahead log, so the worst case is a slightly stale row — and a
+/// stale row names a path that either still exists or fails the existence check below.
+///
+/// ponytail: the schema is Google's, private and undocumented. Every failure path
+/// returns nil, and the one caller falls back to Navigator's own folder — so a schema
+/// change quietly retires the feature instead of misaiming someone's dialog. If that
+/// day comes there is nothing to maintain but this one query.
+func googleDriveLocalPath(webURL: String) -> String? {
+    guard let id = PathRules.googleDriveItemID(webURL: webURL) else { return nil }
+    let fs = NSHomeDirectory() + "/Library/Application Support/Google/DriveFS"
+    // The account folder is Drive's numeric obfuscated account id; with one signed-in
+    // account there is exactly one, and with several we have no way to tell which owns
+    // the link, so trying each in turn and letting the existence check decide is both
+    // the simplest and the only correct thing available.
+    let accounts = (try? FileManager.default.contentsOfDirectory(atPath: fs))?
+        .filter { $0.allSatisfy(\.isNumber) } ?? []
+    for account in accounts {
+        if let p = driveIndexLookup(id: id, db: "\(fs)/\(account)/metadata_sqlite_db") { return p }
+    }
+    return nil
+}
+
+private func driveIndexLookup(id: String, db path: String) -> String? {
+    guard let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else { return nil }
+    var db: OpaquePointer?
+    guard sqlite3_open_v2("file:" + encoded + "?immutable=1", &db,
+                          SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+        sqlite3_close(db); return nil
+    }
+    defer { sqlite3_close(db) }
+    // Walk from the item to its root collecting titles. The depth cap is a cycle guard:
+    // this is somebody else's database and a parent loop in it would hang the walk, not
+    // just return a wrong answer. `stable_parents` is many-to-many for items that were
+    // in two folders at once (Drive stopped allowing that in 2020) — such a walk fans
+    // out and we take whichever branch the rows arrive in, backstopped by the existence
+    // check in the caller.
+    let sql = """
+        WITH RECURSIVE up(sid, depth) AS (
+          SELECT stable_id, 0 FROM items WHERE id = ?1 AND trashed = 0 AND is_tombstone = 0
+          UNION ALL
+          SELECT p.parent_stable_id, up.depth + 1 FROM stable_parents p, up
+           WHERE p.item_stable_id = up.sid AND up.depth < 32)
+        SELECT i.local_title, i.stable_id = i.team_drive_stable_id
+          FROM up JOIN items i ON i.stable_id = up.sid ORDER BY up.depth LIMIT 64
+        """
+    var stmt: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+    defer { sqlite3_finalize(stmt) }
+    // SQLITE_TRANSIENT: `id` is a Swift String whose C buffer dies with this call, so
+    // SQLite has to take its own copy.
+    sqlite3_bind_text(stmt, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+    var titles: [String] = []
+    var isSharedDrive = false
+    while sqlite3_step(stmt) == SQLITE_ROW {
+        guard let t = sqlite3_column_text(stmt, 0) else { return nil }
+        titles.append(String(cString: t))
+        // The last row is the root; a shared drive's root is the drive itself, which
+        // Drive marks by pointing team_drive_stable_id at its own row.
+        isSharedDrive = sqlite3_column_int(stmt, 1) != 0
+    }
+    guard let rel = PathRules.driveRelativePath(leafFirst: titles, isSharedDrive: isSharedDrive),
+          let local = Browser.resolveGoogleDrivePath(rel),
+          FileManager.default.fileExists(atPath: local) else { return nil }
+    return local
+}
+
 // The installed Google Drive app's own icon, for the Drive context-menu items
 // (mirrors how Finder badges its Quick Actions). Loaded once.
 /// An app icon shrunk to menu-row height.
@@ -4907,26 +4993,14 @@ final class Browser: ObservableObject, Identifiable {
         guard !text.isEmpty else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
     }
-    // Resolve any Google Drive path form typed/pasted into the address bar onto
-    // THIS Mac's Drive account: a full cross-user path from another Mac
-    // (/Users/them/…/GoogleDrive-them@…/Shared drives/…), the portable
-    // "Google Drive/…" form, or a bare "Shared drives/…" / "My Drive/…".
+    // Resolve any Google Drive path form typed/pasted into the address bar — or found
+    // on the clipboard by the Open/Save dialog bridge — onto THIS Mac's Drive account.
+    // The forms and the reasoning are in PathRules.googleDrivePath; the only thing this
+    // adds is finding the local account folder, which no pure rule can know.
     // Returns nil if it isn't a Drive path.
     static func resolveGoogleDrivePath(_ input: String) -> String? {
-        let cs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")
-        guard let accounts = try? FileManager.default.contentsOfDirectory(atPath: cs.path),
-              let local = accounts.first(where: { $0.hasPrefix("GoogleDrive-") }) else { return nil }
-        var rel: String?
-        if let r = input.range(of: "/CloudStorage/GoogleDrive-") {          // full path from another Mac
-            let after = input[r.upperBound...]
-            if let slash = after.firstIndex(of: "/") { rel = String(after[after.index(after: slash)...]) }
-        } else if input.hasPrefix("Google Drive/") {                        // portable form
-            rel = String(input.dropFirst("Google Drive/".count))
-        } else if input.hasPrefix("Shared drives") || input.hasPrefix("My Drive") {   // drive-relative
-            rel = input
-        }
-        guard let rel, !rel.isEmpty else { return nil }
-        return cs.appendingPathComponent(local).appendingPathComponent(rel).path
+        guard let root = googleDriveAccountRoot() else { return nil }
+        return PathRules.googleDrivePath(input, accountRoot: root)
     }
     func copyName(_ ids: Set<String>) {
         let names = items.filter { ids.contains($0.id) }.map { $0.name }
@@ -11552,14 +11626,44 @@ final class PickerBridge {
         // Read BEFORE we overwrite it: only the teleport path can put it back (it pastes
         // for the user), and only if it's plain text — see Settings for that admission.
         let previousText = NSPasteboard.general.string(forType: .string)
-        let path = currentPath()
+        let rescued = Self.rescuedFromClipboard(previousText)
+        let path = rescued ?? currentPath()
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(path, forType: .string)
         if id == Self.teleportID {
-            teleport(to: path, restoring: previousText)
+            teleport(to: path, restoring: previousText, rescued: rescued != nil)
         } else {
-            PathHUD.show("Copied \(PickerBridgeRules.hudLabel(path))   ·   ⌘⇧G then ⌘V in the dialog")
+            PathHUD.show((rescued != nil ? "Resolved " : "Copied ") + PickerBridgeRules.hudLabel(path)
+                         + "   ·   ⌘⇧G then ⌘V in the dialog")
         }
+    }
+
+    /// A Drive location already sitting on the clipboard that NO dialog could open, turned
+    /// into this Mac's real path for it. nil — the normal case — means "use Navigator's
+    /// folder", which stays this feature's primary job.
+    ///
+    /// The rule, deliberately narrow, is: the clipboard wins only over a string that is
+    /// unmistakably a Google Drive location, is useless to a dialog exactly as it stands,
+    /// and names something that really exists here once resolved. That is the trap this
+    /// closes — a coworker's Slack link or portable "Google Drive/…" path, or Navigator's
+    /// own username-free Copy Local Path, none of which ⌘⇧G can open. A clipboard already
+    /// holding a working path is left alone and Navigator's folder wins, because a working
+    /// path needs no bridge and the user pressed Navigator's shortcut rather than ⌘V.
+    ///
+    /// Not gated on "Navigator has no selection": a background window virtually always has
+    /// a leftover highlighted row, so that gate would mean this never fires — and "it
+    /// depends on what is selected in a window you can't see" is the more surprising rule,
+    /// not the safer one. What keeps it honest is that the HUD names which source it used
+    /// every single time.
+    private static func rescuedFromClipboard(_ clipboard: String?) -> String? {
+        guard let s = clipboard?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
+        // Parse first, stat second: the cheap string test bounds the two filesystem hits
+        // below to strings already shaped like a Drive path, so an SMB path on the
+        // clipboard can't block this keystroke handler on a network stat.
+        let resolved = Browser.resolveGoogleDrivePath(s) ?? googleDriveLocalPath(webURL: s)
+        guard let resolved, !FileManager.default.fileExists(atPath: s),
+              FileManager.default.fileExists(atPath: resolved) else { return nil }
+        return resolved
     }
 
     /// Resolved through `appModel`, the same window every menu command acts on, so the
@@ -11571,7 +11675,7 @@ final class PickerBridge {
                                             selection: b.urls(b.selection).map { $0.path })
     }
 
-    private func teleport(to path: String, restoring previousText: String?) {
+    private func teleport(to path: String, restoring previousText: String?, rescued: Bool) {
         let label = PickerBridgeRules.hudLabel(path)
         // Posting keystrokes into another process IS input control, and macOS gates it
         // behind Accessibility. Degrade to exactly what the other hotkey does rather than
@@ -11590,21 +11694,46 @@ final class PickerBridge {
             PathHUD.show("Copied \(label)   ·   no other app’s dialog is in front")
             return
         }
-        PathHUD.show("Sending \(label) to \(front?.localizedName ?? "the frontmost app")")
-        // Off the main thread: the panel needs a beat to raise its Go-to-Folder sheet
-        // between keystrokes, and sleeping on main would freeze our UI (and this HUD)
-        // mid-send.
+        let appName = front?.localizedName ?? "the frontmost app"
+        // Off the main thread: this waits on another process's Accessibility tree between
+        // keystrokes, and blocking main would freeze our UI (and the HUD) mid-send. The
+        // HUD is deliberately shown at the END now — the three outcomes below differ, and
+        // an up-front "Sending…" would have to lie about two of them.
         DispatchQueue.global(qos: .userInitiated).async {
+            // Read BEFORE ⌘⇧G, while the panel itself still owns focus: once the
+            // Go-to-Folder sheet is up, the save/open panel is no longer on the focused
+            // element's ancestor path and this answer is unrecoverable.
+            let kind = Self.focusedPanelKind()
             Self.post(key: 5, flags: [.maskCommand, .maskShift])   // ⌘⇧G  (kVK_ANSI_G)
-            usleep(250_000)
-            Self.post(key: 9, flags: .maskCommand)                 // ⌘V   (kVK_ANSI_V)
-            usleep(150_000)
-            Self.post(key: 36, flags: [])                          // ⏎    (kVK_Return)
+            // See PickerBridgeRules "the Save-panel escape": the fixed 250 ms sleep this
+            // replaces was a guess, and when the guess was wrong the ⌘V landed in a Save
+            // panel's FILENAME field, where an absolute path is a destination and one
+            // Return writes the file. Nothing is pasted until the field is really there.
+            let ready = Self.waitForGoToFolderFocus()
+            let sendReturn = ready && PickerBridgeRules.mayPostReturn(kind)
+            if ready {
+                Self.post(key: 9, flags: .maskCommand)             // ⌘V   (kVK_ANSI_V)
+                usleep(150_000)
+                // NEVER unconditionally: in a Save panel — or in anything we could not
+                // positively identify as an Open panel — this Return is what created
+                // `Untitled copy.rtf` in someone's Google Drive. The user presses it.
+                if sendReturn { Self.post(key: 36, flags: []) }    // ⏎    (kVK_Return)
+            }
+            let outcome: PickerBridgeRules.TeleportOutcome =
+                !ready ? .noGoToFolder : (sendReturn ? .jumped : .pastedAwaitingReturn)
+            DispatchQueue.main.async {
+                PathHUD.show(PickerBridgeRules.teleportHUD(label: label, app: appName,
+                                                           rescued: rescued, outcome: outcome))
+            }
             // Only plain text is ever restored. A pasteboard can promise its data lazily
             // (Photoshop does exactly that for images), and there is no way to snapshot
             // such a promise without forcing the producer to render it — so anything that
             // isn't text is left alone and Settings says so outright.
-            guard let previousText else { return }
+            //
+            // `ready` gates it too: with nothing pasted, the path on the clipboard is the
+            // only way left for the user to finish by hand, and taking it back would
+            // leave them with neither.
+            guard ready, let previousText else { return }
             usleep(400_000)
             DispatchQueue.main.async {
                 // Only while OUR path is still what's on the clipboard: if anything else
@@ -11615,6 +11744,90 @@ final class PickerBridge {
                 NSPasteboard.general.setString(previousText, forType: .string)
             }
         }
+    }
+
+    // MARK: Reading the dialog before we type at it
+    //
+    // All of this exists for one reason: PickerBridgeRules' "Save-panel escape" note.
+    // Navigator has to know what it is about to press Return in, and has to know the
+    // Go-to-Folder field is really there before it pastes a path at it.
+
+    /// Every AX read goes through the SYSTEM-WIDE element, never the frontmost
+    /// application's: a sandboxed app's Open/Save panel is drawn by a separate Powerbox
+    /// process — Chrome's upload picker is exactly that — so Chrome's own AX tree
+    /// contains no panel at all and we would answer "unknown" for the commonest Open
+    /// panel there is. The system-wide focused element crosses that boundary.
+    private static func systemWideFocus() -> AXUIElement? {
+        let system = AXUIElementCreateSystemWide()
+        // Bounded on purpose: this runs between two synthesized keystrokes, and a wedged
+        // app must not be able to stall the sequence with the ⌘⇧G already delivered.
+        AXUIElementSetMessagingTimeout(system, 0.5)
+        return axElement(system, kAXFocusedUIElementAttribute)
+    }
+
+    private static func axElement(_ el: AXUIElement, _ attr: String) -> AXUIElement? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success,
+              let v, CFGetTypeID(v) == AXUIElementGetTypeID() else { return nil }
+        return (v as! AXUIElement)
+    }
+
+    private static func axIdentifier(_ el: AXUIElement) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXIdentifierAttribute as CFString, &v) == .success
+        else { return nil }
+        return v as? String
+    }
+
+    private static func axChildren(_ el: AXUIElement) -> [AXUIElement] {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXChildrenAttribute as CFString, &v) == .success
+        else { return [] }
+        return v as? [AXUIElement] ?? []
+    }
+
+    /// Walks OUT from the focused element to the panel that contains it. Outward rather
+    /// than down from the window, because in a Save panel the focused element is the
+    /// filename field and the panel is two hops up — a couple of AX round trips instead
+    /// of a whole tree.
+    private static func focusedPanelKind() -> PickerBridgeRules.PanelKind {
+        guard var node = systemWideFocus() else { return .unknown }
+        for _ in 0..<12 {
+            if let id = axIdentifier(node), id == "save-panel" || id == "open-panel" {
+                return PickerBridgeRules.panelKind(identifier: id,
+                                                   hasFilenameField: hasFilenameField(node, depth: 4))
+            }
+            guard let up = axElement(node, kAXParentAttribute) else { break }
+            node = up
+        }
+        return .unknown
+    }
+
+    /// Depth-bounded: `saveAsNameTextField` sits two levels inside the panel, while an
+    /// Open panel's column view below this is thousands of rows we must not walk.
+    private static func hasFilenameField(_ el: AXUIElement, depth: Int) -> Bool {
+        if axIdentifier(el) == "saveAsNameTextField" { return true }
+        guard depth > 0 else { return false }
+        return axChildren(el).contains { hasFilenameField($0, depth: depth - 1) }
+    }
+
+    /// Polls instead of sleeping a fixed guess, and reports honestly when the field never
+    /// arrives — an app that doesn't honour ⌘⇧G must end with nothing pasted, not with a
+    /// path in its filename field.
+    private static func waitForGoToFolderFocus(timeout: TimeInterval = 1.5) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            var chain: [String] = []
+            var node = systemWideFocus()
+            for _ in 0..<6 {
+                guard let n = node else { break }
+                if let id = axIdentifier(n) { chain.append(id) }
+                node = axElement(n, kAXParentAttribute)
+            }
+            if PickerBridgeRules.isGoToFolderFocused(chain) { return true }
+            usleep(50_000)
+        } while Date() < deadline
+        return false
     }
 
     /// Carbon mask → Cocoa mask, so the menu item can advertise the very chord that was
@@ -11709,6 +11922,8 @@ struct SettingsView: View {
                 .disabled(!pickerHotkeyEnabled)
                 Text("Press it in any app — Navigator needn’t be in front — then ⌘⇧G, ⌘V, Return in the Open or Save dialog. One selected item copies that item; several copy their folder; none copies the folder you’re browsing.")
                     .font(.callout).foregroundStyle(.secondary)
+                Text("A Google Drive path or link already on the clipboard — a coworker’s “Google Drive/Shared drives/…”, a path from their Mac, or a drive.google.com link — is converted to this Mac’s Drive folder and used instead, since a dialog can’t open any of those as they stand.")
+                    .font(.callout).foregroundStyle(.secondary)
                 Toggle("One keystroke: also send ⌘⇧G, paste and Return to the frontmost app",
                        isOn: $pickerTeleportEnabled)
                     .disabled(!pickerHotkeyEnabled)
@@ -11748,7 +11963,10 @@ struct SettingsView: View {
         let chord = PickerBridgeRules.teleportChord(for: PickerBridgeRules.chord(id: pickerHotkeyChord)).display
         let ax = AXIsProcessTrusted() ? "Needs Accessibility — granted."
                                       : "Needs Accessibility — not granted, so it only copies."
-        return "\(chord) does it in one press. \(ax) macOS drops that grant whenever Navigator is rebuilt or updated (signed locally, no Team ID). Only a plain-text clipboard is put back; anything else keeps the path."
+        // This used to warn that a Save dialog's Return also saved the file. It did, and
+        // it wrote one into a real shared drive — so the behaviour was fixed rather than
+        // documented, and the note now describes the split it was replaced with.
+        return "\(chord) does it in one press. \(ax) macOS drops that grant whenever Navigator is rebuilt or updated (signed locally, no Team ID). Only a plain-text clipboard is put back; anything else keeps the path. In an Open dialog it goes all the way. In a Save dialog — or any dialog Navigator can’t identify — it stops after pasting and you press Return yourself, so this shortcut can never save a file."
     }
 }
 
@@ -12914,7 +13132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let cpd = goMenu.addItem(withTitle: "Copy Path for Open/Save Dialog",
                                  action: #selector(copyPathForDialogAction(_:)), keyEquivalent: "")
         cpd.target = self
-        cpd.toolTip = "Copies this folder (or the selected item) so any app's Open/Save dialog can jump to it with ⌘⇧G, ⌘V. Works while Navigator is in the background."
+        cpd.toolTip = "Copies this folder (or the selected item) so any app's Open/Save dialog can jump to it with ⌘⇧G, ⌘V. Works while Navigator is in the background. A Google Drive path or drive.google.com link already on the clipboard is converted to this Mac's Drive folder and used instead."
 
         // Window menu: standard Minimize/Zoom/Bring All to Front. Deliberately NOT set
         // as NSApp.windowsMenu — confirmed live that doing so makes the Dock's
