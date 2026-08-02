@@ -11463,7 +11463,6 @@ final class PickerBridge {
     private static let signature = OSType(0x4E415650)
     private static let copyID: UInt32 = 1
     private static let teleportID: UInt32 = 2
-    static let accessibilityPane = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
     private var refs: [EventHotKeyRef] = []
     private var handler: EventHandlerRef?
@@ -11652,7 +11651,7 @@ final class PickerBridge {
         a.addButton(withTitle: "Open Accessibility Settings…")
         a.addButton(withTitle: "Later")
         if a.runModal() == .alertFirstButtonReturn {
-            PermissionProbe.openPane(Self.accessibilityPane)
+            PermissionProbe.openPane(PermissionProbe.accessibilityPane)
         }
     }
 }
@@ -11721,7 +11720,7 @@ struct SettingsView: View {
                     Text(teleportNote)
                     if !AXIsProcessTrusted() {
                         Button("Open Accessibility Settings…") {
-                            PermissionProbe.openPane(PickerBridge.accessibilityPane)
+                            PermissionProbe.openPane(PermissionProbe.accessibilityPane)
                         }
                         .buttonStyle(.link)
                     }
@@ -11769,6 +11768,14 @@ enum PermissionProbe {
     static let filesAndFoldersPane = "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"
     static let fullDiskPane        = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
     static let automationPane      = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+    /// The single most important string in this file. System Settings has TWO panes called
+    /// "Accessibility": the one in the sidebar (VoiceOver, Zoom, Hover Text, Captions) and
+    /// this one, the permission list under Privacy & Security. The app's owner clicked the
+    /// sidebar one, found no app list, and concluded the permission didn't exist — which is
+    /// why every place that mentions Accessibility now offers this button instead of prose.
+    /// Opened and screenshotted on macOS 26.6: lands on "Allow the applications below to
+    /// control your computer", the list with Navigator's switch in it.
+    static let accessibilityPane   = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
     static func openPane(_ url: String) { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }
 
@@ -11868,15 +11875,23 @@ struct SetupItem: Identifiable {
     /// Never counted in the footer — see SetupAudit.attentionCount.
     var optional = false
     var settingsLabel = "Open Settings"
+    /// The half of the job the button can't do. macOS opens these panes scrolled to the
+    /// top with nothing highlighted, so "we opened it" leaves the user hunting an app
+    /// name in a list of forty. Shown only alongside the button it describes.
+    var afterOpening: String?
     let openSettings: () -> Void
 
     static func all() -> [SetupItem] {
         let home = FileManager.default.homeDirectoryForCurrentUser
         func files() { PermissionProbe.openPane(PermissionProbe.filesAndFoldersPane) }
+        // Every Files & Folders row lands on the same pane and needs the same last step,
+        // so the sentence is written once — five copies would drift.
+        let inFilesPane = "Then: find Navigator in that list, expand it, and switch this on. The pane opens at the top and doesn’t highlight us."
         func homeFolder(_ name: String, _ why: String) -> SetupItem {
             SetupItem(id: name, title: name, why: why,
                       probe: { _ in PermissionProbe.folder(home.appendingPathComponent(name)) },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      afterOpening: inFilesPane,
                       openSettings: files)
         }
         return [
@@ -11888,6 +11903,7 @@ struct SetupItem: Identifiable {
                       why: "Optional, and it changes what the rows below mean: with it on, macOS grants Navigator every file permission listed here and REPLACES their individual switches in Files & Folders with a single greyed “Full Disk Access” line — so there is nothing left to turn on there. It reaches what those switches don’t, too: other apps’ Library folders, another user’s home, some system folders. It does NOT override a file’s own owner or read-only flag, everyday browsing works without it, and macOS never asks — you turn it on yourself.",
                       probe: { _ in PermissionProbe.fullDisk() },
                       probeMayPrompt: false, canAsk: false, optional: true,
+                      afterOpening: "Then: find Navigator in that list and switch it on. If it isn’t listed, click +, press ⇧⌘G, type /Applications/Navigator.app. Quit and reopen Navigator afterwards.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.fullDiskPane) }),
             homeFolder("Desktop", "Browse your Desktop, and drop files onto it with Send To."),
             homeFolder("Documents", "Browse, rename and organise everything in Documents."),
@@ -11903,25 +11919,41 @@ struct SetupItem: Identifiable {
                       why: "Open shared drives you connect to (⌘K), and copy files to and from them. With none mounted there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: true) },
                       probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
+                      afterOpening: inFilesPane,
                       openSettings: files),
             SetupItem(id: "removable", title: "USB & external drives",
                       why: "Browse sticks and external disks, and use them as a Send To target. With none plugged in there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: false) },
                       probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
+                      afterOpening: inFilesPane,
                       openSettings: files),
             SetupItem(id: "automation", title: "Control Finder",
                       why: "Used for one thing: saving the Comment field in Get Info. Finder owns Finder comments, so Finder has to be the one to write them. Automation only lists Navigator once it has asked, so use the button — the pane is empty of us until then.",
                       probe: { _ in PermissionProbe.finderAutomation() },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      afterOpening: "Then: find Navigator in that list and switch Finder on underneath it.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
             SetupItem(id: "finderext", title: "Navigator’s Finder menu",
                       why: "Adds Navigator’s submenu — Remove BG, Chroma Key, the AI upscalers — to Finder’s own right-click menu. macOS makes you tick this one yourself, in \(finderExtensionSectionName).",
                       probe: { _ in FIFinderSyncController.isExtensionEnabled ? .granted : .off },
                       probeMayPrompt: false, canAsk: false,
                       settingsLabel: "Open Extensions",
+                      afterOpening: "Then: tick Navigator in the “File Providers” sheet that opens on top, and click Done.",
                       // The SAME call the AI ▸ Finder Menu… item and the once-per-version
                       // nudge already use — one path to that pane, not two.
-                      openSettings: { FIFinderSyncController.showExtensionManagementInterface() })
+                      openSettings: { FIFinderSyncController.showExtensionManagementInterface() }),
+            // The row this whole window was missing. It is LAST and optional because it
+            // buys exactly one keystroke, but its `why` is the longest here on purpose:
+            // the owner of this app went looking for this switch, clicked the pane named
+            // "Accessibility" in the sidebar, found VoiceOver and Zoom, and concluded the
+            // permission wasn't there. Naming the trap is the row's main job; the button
+            // is what makes the naming unnecessary.
+            SetupItem(id: "accessibility", title: "Accessibility (one-key dialog jump)",
+                      why: "Needed for one thing only: ⌃⌥⇧⌘G, which types ⇧⌘G, pastes and presses Return in another app’s Open or Save dialog. Driving another app’s keyboard is what macOS gates here. Without it ⌃⌥⌘G still copies the path and you paste it yourself, so nothing is broken — that is why this row never counts as needing attention.\n\nThe button goes to Privacy & Security ▸ Accessibility. That is NOT the Accessibility item in the System Settings sidebar, which is VoiceOver, Zoom and Hover Text and has no list of apps in it at all — two different panes, same name.\n\nExpect to redo this: macOS keys the grant to Navigator’s code signature, and Navigator is signed locally, so rebuilding or updating the app drops it.",
+                      probe: { _ in AXIsProcessTrusted() ? .granted : .off },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      afterOpening: "Then: find Navigator in that list and switch it on. If it isn’t listed, click +, press ⇧⌘G, type /Applications/Navigator.app.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.accessibilityPane) })
         ]
     }
 }
@@ -11937,6 +11969,8 @@ struct SetupAssistantView: View {
     @AppStorage("inferFolderView") private var inferFolderView = true
 
     private let items = SetupItem.all()
+    /// Rows that aren't about reading files. Full Disk Access can't cover any of them.
+    private static let extras: Set<String> = ["automation", "finderext", "accessibility"]
 
     var body: some View {
         Form {
@@ -11946,9 +11980,10 @@ struct SetupAssistantView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             // Split by id rather than by count: the sections used to be prefix(5)/dropFirst(5)
-            // and reordering the list silently moved a row into the wrong one.
-            Section("Files & folders") { ForEach(items.filter { $0.id != "automation" && $0.id != "finderext" }) { row($0) } }
-            Section("Extras") { ForEach(items.filter { $0.id == "automation" || $0.id == "finderext" }) { row($0) } }
+            // and reordering the list silently moved a row into the wrong one. One membership
+            // set, negated for the other section, so no row can land in both or in neither.
+            Section("Files & folders") { ForEach(items.filter { !Self.extras.contains($0.id) }) { row($0) } }
+            Section("Extras") { ForEach(items.filter { Self.extras.contains($0.id) }) { row($0) } }
             Section("How folders open") {
                 Picker("New windows and tabs", selection: $viewMode) {
                     Text("Details").tag("list"); Text("Icons").tag("icon"); Text("Gallery").tag("gallery")
@@ -12028,6 +12063,13 @@ struct SetupAssistantView: View {
                 }
                 Text(item.why).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                // Only next to the button it is about: with no button there is no "then",
+                // and a "find Navigator in the list" on a row we just told the user needs
+                // nothing would send them to a pane for no reason.
+                if buttons.settings, let next = item.afterOpening {
+                    Text(next).font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 4) {
@@ -12712,6 +12754,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         dfb.target = self
         let div = appMenu.addItem(withTitle: "Set as Default Image Viewer…", action: #selector(setDefaultImageViewerAction(_:)), keyEquivalent: "")
         div.target = self
+        // The app menu is where the owner went looking, so this is where the checklist
+        // lives — Help ▸ Setup Assistant… stays too, and both open the SAME window.
+        //
+        // "Grant Full Disk Access…" survives underneath it, and the labels say why: one
+        // audits every permission, the other walks one switch a user is usually sent to
+        // by name (the denial alerts and PERMISSIONS.md both cite it) and adds the two
+        // things the checklist row can't — the +/⇧⌘G recipe and Reveal in Finder.
+        let checklist = appMenu.addItem(withTitle: "Permissions Checklist…", action: #selector(showSetupAssistantAction(_:)), keyEquivalent: "")
+        checklist.target = self
         let fda = appMenu.addItem(withTitle: "Grant Full Disk Access…", action: #selector(openFullDiskAccessAction(_:)), keyEquivalent: "")
         fda.target = self
         appMenu.addItem(.separator())
