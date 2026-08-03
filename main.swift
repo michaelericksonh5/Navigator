@@ -431,8 +431,15 @@ enum Prefs {
         get { d.string(forKey: "pickerHotkeyChord") ?? PickerBridgeRules.chords[0].id }
         set { d.set(newValue, forKey: "pickerHotkeyChord") }
     }
+    // Defaults ON, and that is load-bearing. When this is off the teleport chord is not
+    // even REGISTERED, so someone who follows the Permissions Checklist, grants
+    // Accessibility for "one-key dialog jump", and then presses the chord gets silence —
+    // the checklist would have talked them through a permission for a feature that is
+    // switched off behind their back. Defaulting on is safe because the chord degrades by
+    // itself: without Accessibility it copies the path and says so, and it never posts
+    // Return into a Save panel. So Accessibility is the only switch anyone has to find.
     static var pickerTeleportEnabled: Bool {
-        get { d.bool(forKey: "pickerTeleportEnabled") }
+        get { d.object(forKey: "pickerTeleportEnabled") == nil ? true : d.bool(forKey: "pickerTeleportEnabled") }
         set { d.set(newValue, forKey: "pickerTeleportEnabled") }
     }
     static var warnImageDelete: Bool { get { d.object(forKey: "warnImageDelete") == nil ? true : d.bool(forKey: "warnImageDelete") } set { d.set(newValue, forKey: "warnImageDelete") } }
@@ -11884,7 +11891,9 @@ struct SettingsView: View {
     @AppStorage("inferFolderView") private var inferFolderView = true
     @AppStorage("pickerHotkeyEnabled") private var pickerHotkeyEnabled = true
     @AppStorage("pickerHotkeyChord") private var pickerHotkeyChord = PickerBridgeRules.chords[0].id
-    @AppStorage("pickerTeleportEnabled") private var pickerTeleportEnabled = false
+    // Must match Prefs.pickerTeleportEnabled's default, or the checkbox shown here and the
+    // hot key actually registered disagree about whether the feature is on.
+    @AppStorage("pickerTeleportEnabled") private var pickerTeleportEnabled = true
     var body: some View {
         Form {
             Section("Defaults for new windows & tabs") {
