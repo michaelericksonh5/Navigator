@@ -6315,19 +6315,40 @@ final class MouseUpWatch {
     /// True across the post-mouse-up grace delay, when `timer` is already nil but this
     /// watch has not run its body yet.
     private var settling = false
+    /// Bumped by `cancel`, so a body already queued on the grace delay can tell it has been
+    /// superseded. Without it a cancelled watch's asyncAfter would still run its body, and
+    /// would clear `settling` out from under the watch that replaced it.
+    private var epoch = 0
     var isRunning: Bool { timer != nil || settling }
+
+    /// Stops watching, body and all. Needed by DragSessionTracker, which re-arms per
+    /// session: `start` refuses while a watch is running, so a leftover watch from the
+    /// PREVIOUS drag would leave the new one with no end at all — and "a drag start with no
+    /// end" is the evidence the wedge bug is diagnosed from, so it has to stay unambiguous.
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+        settling = false
+        epoch += 1
+    }
 
     func start(grace: TimeInterval = 0.25, _ body: @escaping () -> Void) {
         guard !isRunning else { return }   // already watching this same drag
+        let mine = epoch
         // Gating on `timer == nil` alone left the door open for the whole grace window,
         // so a second drag begun within 0.25s armed a SECOND watch on top of the first.
         // `settling` closes it — see isRunning.
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] t in
+            guard let self, self.epoch == mine else { t.invalidate(); return }
             guard NSEvent.pressedMouseButtons & 1 == 0 else { return }
             t.invalidate()
-            self?.timer = nil
-            self?.settling = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + grace) { self?.settling = false; body() }
+            self.timer = nil
+            self.settling = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + grace) { [weak self] in
+                guard let self, self.epoch == mine else { return }
+                self.settling = false
+                body()
+            }
         }
         // .common, NOT Timer.scheduledTimer: a drag that STARTED in this app runs the
         // main run loop in NSEventTrackingRunLoopMode, and a .default-mode timer does
@@ -6335,6 +6356,232 @@ final class MouseUpWatch {
         // user-visible half of this bug.
         RunLoop.main.add(t, forMode: .common)
         timer = t
+    }
+}
+
+// MARK: - Drag session bookkeeping
+
+/// One process-wide record of "a dragging session we started is still in flight", and the
+/// named end of every drag source in the app.
+///
+/// THE BUG: "drag and drop stops working; restarting Navigator fixes it." Established with
+/// a standalone AppKit probe rather than inferred — while AppKit still believes a dragging
+/// session is in flight, `beginDraggingSession(with:event:source:)` returns **nil**. Swift
+/// imports that return as non-optional, so the nil arrives as a bogus reference, no error is
+/// raised, and absolutely nothing happens: no `willBeginAt`, no drop, no `endedAt`. That is
+/// the exact signature of the wedged process this was diagnosed from — `icon drag start`
+/// logged with nothing whatsoever after it, and the list view (whose `drag start` line comes
+/// from `willBeginAt`) logging nothing at all. Because AppKit's session belief is
+/// process-wide, ONE leaked session refuses every subsequent drag in every view, which is
+/// why a relaunch is the only cure the user finds.
+///
+/// What this does:
+///   • gives EVERY drag source a definite, uniformly-prefixed end line, so "a start with no
+///     end" becomes unambiguous evidence instead of a thing that also happens to look like
+///     a normal drag-out to another app;
+///   • detects the refusal itself at the one place the app calls `beginDraggingSession`,
+///     which is a zero-inference signal — a nil session IS the wedge, not a symptom of it;
+///   • clears our own bookkeeping at the next mouseDown, the only boundary that PROVES no
+///     session is running (see `DragStateRules.isDragSessionOrphaned`).
+///
+/// What this deliberately does NOT claim: it cannot un-wedge AppKit. There is no public API
+/// to end a session this process did not start, and the probe could not reproduce a
+/// PERMANENT leak to test a repair against — a modal alert, a blocked main thread, the
+/// source view being pulled out of the window, the source window closing, app activation and
+/// a second nested session all stalled the end but every one of them recovered. So the
+/// honest guarantee is narrower and still worth having: the next occurrence names itself in
+/// the log, with the source that leaked, instead of being silent.
+final class DragSessionTracker {
+    static let shared = DragSessionTracker()
+
+    /// Arbitrates the two ends of each session so whichever lands first wins and the other
+    /// is silent — see DragSessionLedger for why this is a ticket and not a flag.
+    private var ledger = DragSessionLedger()
+    /// Belt for `endedAt`, which AppKit skips on paths this code cannot enumerate — and
+    /// which the list view measured it never sending at all. Polled for the same reason
+    /// MouseUpWatch exists; see there for why the timer must run in `.common` mode.
+    private let endWatch = MouseUpWatch()
+
+    /// Refusals since the last drag that demonstrably started. This is what "once per
+    /// wedge" counts, and `noteStarted` is what resets it.
+    private var refusals = 0
+    private var recoveryAttempted = false
+    private var userNotified = false
+
+    /// `endsItself` is true only for sources AppKit really does call
+    /// `draggingSession(_:endedAt:operation:)` on — the icon cells and the filmstrip. For
+    /// the file list (measured: no end callback of any kind) and for SwiftUI `.onDrag`
+    /// sources (no end hook exists) the polled end is the NORMAL end, and claiming "no
+    /// endedAt callback arrived" there made the one line that should mean "something leaked"
+    /// fire on every healthy sidebar reorder. Diagnostics that cry wolf are not diagnostics.
+    func began(_ source: String, endsItself: Bool = false) {
+        // Re-arm per session. `start` refuses while a watch is running, and at the new
+        // watchdog interval the previous drag's watch is often still armed — without this
+        // the new session would get no end line at all.
+        endWatch.cancel()
+        let ticket = ledger.begin(source)
+        endWatch.start(grace: DragStateRules.endWatchdogGrace) { [weak self] in
+            // A no-op whenever the authoritative end did its job, or whenever a newer drag
+            // has since opened — being a no-op in both cases is the point.
+            guard let self, let src = self.ledger.closeIfCurrent(ticket: ticket) else { return }
+            navLog(endsItself
+                   ? "drag session end: \(src) — mouse released, no endedAt callback arrived"
+                   : "drag session end: \(src) — mouse released (polled; this source gets no AppKit end callback)")
+        }
+    }
+
+    /// Returns whether THIS call is the one that ended the session, so a caller with its own
+    /// log line or teardown can be quiet when it has been beaten to it — same arbitration,
+    /// one decision. (The list view is the caller that needs it: it has two ends of its own.)
+    @discardableResult
+    func ended(_ source: String, _ detail: String) -> Bool {
+        // Idempotent by arbitration, not by luck: if the watchdog already spoke for this
+        // session, this end is a duplicate and stays quiet. THE BUG's second half was these
+        // two paths both running, watchdog first, on every healthy drag.
+        guard ledger.closeAuthoritatively() != nil else { return false }
+        endWatch.cancel()
+        navLog("drag session end: \(source) — \(detail)")
+        return true
+    }
+
+    /// A dragging session demonstrably started, so whatever wedge preceded it is over.
+    /// Called only where a START IS PROVEN — a non-nil session, or `willBeginAt`, which
+    /// AppKit only sends for a session it actually began.
+    func noteStarted() {
+        guard refusals > 0 else { return }
+        navLog("drag recovery: CLEARED — a drag started normally again after \(refusals) refusal(s); drag and drop is working")
+        refusals = 0
+        recoveryAttempted = false
+        userNotified = false
+    }
+
+    /// Call from a fresh mouseDown, before the click is acted on.
+    func noteMouseDown() {
+        guard let src = ledger.inFlightSource,
+              DragStateRules.isDragSessionOrphaned(sessionInFlight: true, isFreshMouseDown: true,
+                                                   endWatchStillArmed: endWatch.isRunning) else { return }
+        _ = ledger.closeAuthoritatively()
+        navLog("drag session ORPHANED: \(src) never ended, yet a mouseDown was delivered — THIS LINE IS THE BUG REPORT. If the next drag logs 'REFUSED', AppKit is holding that session and dragging stays broken until relaunch.")
+    }
+
+    /// The refusal itself — `beginDraggingSession` handed back no session — and the recovery
+    /// ladder for it. `retry` re-attempts the SAME drag and reports whether AppKit accepted
+    /// it; it is called at most once per wedge, and never on this call stack (see below).
+    func noteRefused(_ source: String, retry: @escaping () -> Bool) {
+        refusals += 1
+        navLog("drag session REFUSED (#\(refusals)): \(source) — beginDraggingSession returned no session, so AppKit still believes an earlier drag is in flight. Drag and drop is wedged for this process. THIS LINE IS THE BUG REPORT.")
+        NSSound.beep()   // silence is what made this look like "the app randomly ignores me"
+        switch DragWedgeRules.action(refused: true, recoveryAttempted: recoveryAttempted,
+                                     userNotified: userNotified) {
+        case .recoverAndRetry:
+            recoveryAttempted = true
+            // THE BUG: there is deliberately NO synthetic mouse-up here any more, and that is a
+            // measurement rather than a simplification. The old remediation posted one with
+            // `NSApp.postEvent` and logged FAILED every time. Tested against a live wedged
+            // process: a REAL HID-level `CGEvent` left mouse-up — posted to `.cghidEventTap`,
+            // singly and three times over, and again as the tail of a full synthetic drag
+            // gesture — did not clear the phantom either. Three further drags after it were
+            // still refused. An in-process `NSApp.postEvent` cannot beat an event that WindowServer
+            // itself delivered, so the nudge was strictly weaker than something already proven
+            // useless. Posting synthetic mouse events into a live gesture has its own risks and
+            // bought nothing, so it is gone.
+            //
+            // The retry stays: it costs one call, cannot recurse (see the call site), and its
+            // WORKED/FAILED line is the only evidence that would tell us AppKit refusals are
+            // sometimes transient.
+            DispatchQueue.main.async { [weak self] in self?.retryOnce(retry) }
+        case .notifyUser:
+            userNotified = true
+            navLog("drag recovery: EXHAUSTED — recovery did not take, telling the user Navigator needs restarting")
+            DragWedgeNotice.show()
+        case .none:
+            navLog("drag recovery: still wedged, and the user has already been told — staying quiet rather than nagging")
+        }
+    }
+
+    private func retryOnce(_ retry: () -> Bool) {
+        // ONLY while the button is still physically down. Beginning a dragging session
+        // after the user has let go would leave a drag image chasing the cursor with no
+        // mouse-up coming to end it — i.e. it would MANUFACTURE the very leak this repairs.
+        guard DragStateRules.leftButtonIsDown(NSEvent.pressedMouseButtons) else {
+            navLog("drag recovery: retry skipped — the button was already up. The next drag's line says whether it worked.")
+            return
+        }
+        if retry() {
+            navLog("drag recovery: WORKED — the retried drag started")
+            noteStarted()
+            return
+        }
+        navLog("drag recovery: FAILED — AppKit refused the retry too. No in-process remedy exists for this (a real HID mouse-up was measured not to clear it); a relaunch is the only fix.")
+        guard case .notifyUser = DragWedgeRules.action(refused: true, recoveryAttempted: recoveryAttempted,
+                                                      userNotified: userNotified) else { return }
+        userNotified = true
+        DragWedgeNotice.show()
+    }
+
+    /// True when `beginDraggingSession` refused. `unsafeBitCast` and not `== nil` because
+    /// the return type is imported non-optional: Swift folds an optional comparison away as
+    /// statically-always-true, so the pointer has to be looked at directly. Verified against
+    /// a real refused session in the probe (nil there, non-nil for every healthy drag).
+    static func sessionWasRefused(_ session: NSDraggingSession) -> Bool {
+        unsafeBitCast(session, to: UInt.self) == 0
+    }
+}
+
+/// The last rung of THE BUG's recovery ladder: when the wedge cannot be repaired, say so
+/// instead of leaving a dead feature that looks alive. "The app randomly ignores me" is what
+/// this bug cost the user before it had a name.
+///
+/// A sheet, not `runModal`: a background Photoshop or Imagen batch may be mid-run and must
+/// not be gated behind a dialog. Shown at most once per wedge — DragWedgeRules owns that
+/// counting, and never nagging is a requirement here, not a nicety.
+enum DragWedgeNotice {
+    private static let waitForMouseUp = MouseUpWatch()
+
+    /// Never presented from inside a mouse-tracking loop. The refusal is observed from
+    /// `mouseDragged`, with the button still down, and putting up a dialog mid-gesture is its
+    /// own way to confuse AppKit's event handling — the exact class of bug being fixed here.
+    /// MouseUpWatch is the primitive this app already has for "once the button is up".
+    static func show() {
+        waitForMouseUp.start { present() }
+    }
+
+    private static func present() {
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Drag and drop needs Navigator restarted"
+        a.informativeText = """
+        macOS is still holding on to a drag that never finished, so Navigator can’t start a \
+        new one. Everything else keeps working, and restarting clears it.
+
+        Your open tabs come back on relaunch.
+        """
+        a.addButton(withTitle: "Restart Navigator")
+        a.addButton(withTitle: "Later")
+        guard let win = NSApp.keyWindow ?? NSApp.mainWindow else {
+            // No window to hang a sheet on. Worth one modal rather than losing the notice.
+            if a.runModal() == .alertFirstButtonReturn { relaunch() }
+            return
+        }
+        a.beginSheetModal(for: win) { r in
+            let restart = r == .alertFirstButtonReturn
+            navLog("drag recovery: user chose \(restart ? "Restart Navigator" : "Later")")
+            if restart { relaunch() }
+        }
+    }
+
+    /// Same shape as the updater's helper, and for the same reason: a process cannot relaunch
+    /// itself, so a detached shell waits for this one to exit and then reopens the bundle.
+    private static func relaunch() {
+        let app = Bundle.main.bundleURL.path.replacingOccurrences(of: "'", with: "'\\''")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", "for i in $(seq 1 120); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done; /usr/bin/open '\(app)'"]
+        do { try p.run() } catch {
+            navLog("drag recovery: relaunch helper failed to start — \(error.localizedDescription)")
+            return
+        }
+        NSApp.terminate(nil)
     }
 }
 
@@ -6414,7 +6661,13 @@ final class SpringLoader {
     /// A drop landed somewhere. Suppresses spring-back: the user finished their drag, and
     /// yanking the view back to where they started would hide the file they just moved.
     func noteDrop() {
-        didDrop = true
+        // `didDrop` exists ONLY to suppress a spring-back that `finish` is about to run, so
+        // it is meaningless unless a watch is actually pending — and setting it anyway
+        // leaked it: a drop with no preceding folder hover (dropping into the current
+        // folder, where validateDrop calls cancel() and never starts a watch) left it true
+        // forever, and the next drag that really did spring somewhere then refused to
+        // spring back. Assigning rather than OR-ing is what makes it self-correcting.
+        didDrop = watch.isRunning
         // Cancels the countdown too. A drop can land while the dwell is still running —
         // measured: drop a file onto a folder row and the spring fired 0.3s LATER, moving
         // the window into that folder after the user had already let go. That is the
@@ -6491,38 +6744,48 @@ enum TabDragToken {
 /// instead of surprising the user with a new window.
 final class TabDrag {
     static let shared = TabDrag()
-    /// ~1.5 tab heights. Big enough that no reorder along the strip trips it.
-    private static let pullOut: CGFloat = 40
 
     private weak var model: AppModel?
     private var index = 0
     private var startPoint = CGPoint.zero
-    private var handled = false
+    /// Arbitrates the two ends of a tab drag — a drop taken by a tab, and the polled mouse
+    /// release — for exactly the reason DragSessionTracker does it for a dragging session:
+    /// whichever lands first wins, the other is a no-op, and a ticket from an EARLIER drag
+    /// can never complete the one now under way. That last case is not theoretical here: the
+    /// watch below refuses to re-arm while it is settling, so before this ledger a tab
+    /// dragged twice inside one grace window had the FIRST drag's release tear off the
+    /// SECOND drag's tab. See TabTearOffRules for the bug class.
+    private var ledger = DragSessionLedger()
     private let watch = MouseUpWatch()
 
     func begin(model: AppModel, index: Int) {
         self.model = model
         self.index = index
         startPoint = NSEvent.mouseLocation
-        handled = false
-        watch.start { [weak self] in self?.end() }
+        // Re-arm per drag, same as DragSessionTracker.began: `start` refuses while a watch
+        // is running, so a leftover watch would leave this drag with no completion of its
+        // own — and would complete it against the previous drag's start point.
+        watch.cancel()
+        let ticket = ledger.begin("tab")
+        watch.start { [weak self] in self?.end(ticket: ticket) }
     }
 
     /// A tab in the strip took this drop (a reorder, or a release back on the tab itself),
-    /// so it was never a tear-off however far the pointer wandered on the way.
-    func noteHandled() { handled = true }
-
-    private func end() {
-        let m = model
+    /// so it was never a tear-off however far the pointer wandered on the way. Authoritative:
+    /// it closes the drag outright, so the release poll that follows can only be silent.
+    func noteHandled() {
+        guard ledger.closeAuthoritatively() != nil else { return }
         model = nil
-        guard !handled, let m else { return }
-        // The SAME rule the context-menu item is enabled by, checked here too so the log
-        // below never claims a tear-off that moveTabToNewWindow is about to refuse. Its
-        // refusal to move the ONLY tab out is what keeps this from leaving an empty ghost
-        // window behind — dragging a lone tab anywhere simply does nothing.
-        guard TabMenuRules.canMoveToNewWindow(index: index, count: m.tabs.count) else { return }
+    }
+
+    /// The last resort, and only that. Presenting the ticket is what keeps it one: it is a
+    /// no-op once a drop has spoken for this drag, and a no-op when a newer drag is open.
+    private func end(ticket: Int) {
+        guard ledger.closeIfCurrent(ticket: ticket) != nil, let m = model else { return }
+        model = nil
         let p = NSEvent.mouseLocation
-        guard abs(p.y - startPoint.y) > Self.pullOut else { return }
+        guard TabTearOffRules.shouldTearOff(verticalTravel: p.y - startPoint.y,
+                                           index: index, tabCount: m.tabs.count) else { return }
         navLog("tab tear-off: index \(index) at \(Int(p.x)),\(Int(p.y))")
         m.moveTabToNewWindow(index, at: p)
     }
@@ -6693,7 +6956,24 @@ struct SidebarView: View {
         let path: String
         let enabled: Bool
         @ViewBuilder func body(content: Content) -> some View {
-            if enabled { content.onDrag { ReorderToken.provider(path) } } else { content }
+            // The itemProvider closure is SwiftUI's only drag-start hook — `.onDrag` gives no
+            // end callback at all, so this source could previously leak a session with no
+            // trace in the log whatsoever. DragSessionTracker's polled watch supplies the end.
+            //
+            // It stays `.onDrag` rather than becoming a real NSDraggingSource, and that is a
+            // decision rather than an omission: the row's content is a full-width Button, an
+            // AppKit mouse-handling overlay on top of it would take the mouseDown the Button
+            // needs, and a SwiftUI gesture plus an AppKit mouseDown on one click double-fires.
+            // What the source needs instead is for its leaked state to be IMPOSSIBLE rather
+            // than watched, and it now is: this source holds no per-drag state of its own, its
+            // one entry in the ledger is ticketed so a stale poll cannot touch a later drag,
+            // and NavWindow.sendEvent gives it the exact mouseDown boundary it never had.
+            if enabled {
+                content.onDrag {
+                    DragSessionTracker.shared.began("sidebar reorder")
+                    return ReorderToken.provider(path)
+                }
+            } else { content }
         }
     }
 
@@ -7875,10 +8155,107 @@ enum ColumnMenu {
 // timing check. This is the whole reason for this rewrite: a nested SwiftUI
 // gesture recognizer or drop destination competes with Table's native click
 // handling for the same event; sequencing after super.mouseDown cannot.
+/// THE BUG (phantom AppKit drag session), watched directly instead of inferred.
+///
+/// Every other diagnostic in this app can only see the wedge AFTER it has already broken
+/// dragging — the refusal line is a post-mortem. This asks the ONE question that defines the
+/// wedge, on a healthy process, right after each drag: does AppKit still have this session
+/// registered as in flight?
+///
+/// It asks AppKit rather than inferring, and that is a correction of a previous version of
+/// this watch, which reported a leak whenever the NSDraggingSession OBJECT was still alive
+/// with no `endedAt` seen. Both halves of that test were wrong. NSTableView never sends
+/// `draggingSession(_:endedAt:operation:)` while it is also a registered drop destination
+/// (measured against a minimal control app: registering dragged types is what silences it),
+/// and a retired session object routinely stays alive for ten seconds and more in a perfectly
+/// healthy process. So that version fired on every single list-view drag. A diagnostic that
+/// cries wolf on the happy path is worse than none — it is what made the real signal
+/// unreadable while this bug was being chased.
+///
+/// Holds the drag SOURCE alive for as long as AppKit might still need to talk to it.
+///
+/// THE WEDGE. AppKit does not retain an `NSDraggingSource` — it is an unowned back-pointer.
+/// The icon grid's source is an `NSView` living inside a SwiftUI cell, and a drop that MOVES
+/// a file reloads the folder *synchronously, while the session is still finishing*: SwiftUI
+/// rebuilds the row, the cell is released, and the source is deallocated BEFORE AppKit
+/// delivers `draggingSession(_:endedAt:operation:)`. AppKit is then holding a session whose
+/// source no longer exists, never retires it, and every later `beginDraggingSession` in the
+/// process returns nil — drag and drop is dead until relaunch.
+///
+/// This is why the leak tracked exactly which drops changed the folder: a CANCELLED drag
+/// (folder untouched, no reload, source survives) got its callback and cleaned up, while
+/// every drop that moved a file leaked. Finder is immune because its drag source is a
+/// long-lived view its own refresh never destroys — ours was a recycled cell.
+///
+/// A strong reference for the life of the session is the whole fix: the object stays
+/// allocated even after SwiftUI pulls it out of the view hierarchy, so the callback is
+/// deliverable and AppKit retires the session. Do NOT "simplify" this away.
+///
+/// The timeout is a memory backstop only, never the mechanism — if a callback genuinely
+/// never arrives we must not pin a view forever.
+final class DragSourceKeepAlive {
+    static let shared = DragSourceKeepAlive()
+    private var held: [ObjectIdentifier: AnyObject] = [:]
+    private let backstop: TimeInterval = 120
+
+    func retain(_ obj: AnyObject) {
+        let key = ObjectIdentifier(obj)
+        held[key] = obj
+        // .common so it still fires while the main run loop is in event-tracking mode for
+        // the drag — a .default timer would not tick until the drag was already over.
+        let t = Timer(timeInterval: backstop, repeats: false) { [weak self] _ in
+            self?.held.removeValue(forKey: key)
+        }
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    func release(_ obj: AnyObject) { held.removeValue(forKey: ObjectIdentifier(obj)) }
+}
+
+/// `NSCoreDragManager` is the process-wide registry `beginDraggingSession` consults, and an
+/// entry it never removes IS the wedge — nothing else about it is visible from public API.
+/// Read-only, fully guarded, and diagnostics-only: if any of it is missing on a future macOS
+/// this reports "cannot tell" and stays quiet rather than guessing.
+enum DragLeakWatch {
+    /// Whether AppKit still lists `seq` as an in-flight drag. nil when it cannot be asked.
+    private static func stillRegistered(_ seq: Int) -> Bool? {
+        guard let cls = NSClassFromString("NSCoreDragManager") as? NSObject.Type,
+              cls.responds(to: NSSelectorFromString("sharedDragManager")),
+              let mgr = cls.perform(NSSelectorFromString("sharedDragManager"))?
+                  .takeUnretainedValue() as? NSObject
+        else { return nil }
+        let sel = NSSelectorFromString("draggingSessionWithSequenceNumber:")
+        guard mgr.responds(to: sel),
+              let imp = class_getMethodImplementation(type(of: mgr), sel)
+        else { return nil }
+        typealias Lookup = @convention(c) (AnyObject, Selector, Int) -> AnyObject?
+        return unsafeBitCast(imp, to: Lookup.self)(mgr, sel, seq) != nil
+    }
+
+    static func watch(_ session: NSDraggingSession, source: String) {
+        let seq = session.draggingSequenceNumber
+        DispatchQueue.main.asyncAfter(deadline: .now() + DragLeakRules.retirementGrace) {
+            guard let registered = stillRegistered(seq) else { return }
+            guard DragLeakRules.isLeaked(stillRegisteredWithAppKit: registered,
+                                         secondsSinceDragEnd: DragLeakRules.retirementGrace) else { return }
+            navLog("drag session LEAKED: \(source) — AppKit still has drag \(seq) registered as in flight \(Int(DragLeakRules.retirementGrace))s after it ended, so it never retired it. Every further beginDraggingSession in this process will be REFUSED until relaunch. THIS LINE IS THE BUG REPORT.")
+        }
+    }
+}
+
 private final class ClickTimingTableView: NSTableView {
     var onNameClickCandidate: ((Int) -> Void)?
     var onContextMenuRequest: ((Int) -> NSMenu?)?
     var onDragTargeted: ((Bool) -> Void)?
+    /// The same enter/exit edges as `onDragTargeted`, but reported SYNCHRONOUSLY — see the
+    /// two-callback split above draggingEntered for why the deferred one cannot be trusted
+    /// to say "a drag started".
+    var onDragActive: ((Bool) -> Void)?
+    /// Fired at the very top of every mouseDown, before anything acts on the click. The
+    /// coordinator uses it as a safety-net boundary: an ordinary mouseDown can only be
+    /// delivered when no drag session is running, so it is a free proof that any drag
+    /// state still set is stale.
+    var onMouseDown: (() -> Void)?
     /// Clicking a group header collapses/expands it. Reported from here rather than from a
     /// button or a SwiftUI gesture inside the header cell so there is exactly ONE handler
     /// for the click — the failure mode when two exist is a toggle that fires twice and
@@ -7887,6 +8264,7 @@ private final class ClickTimingTableView: NSTableView {
     var isGroupRowAt: ((Int) -> Bool)?
 
     override func mouseDown(with event: NSEvent) {
+        onMouseDown?()
         // Parity with icon view (whose clicks route through Browser.click): clicking
         // the file list takes keyboard focus away from the address/search fields, so
         // typing afterwards is type-to-select — not characters silently appended to a
@@ -7914,25 +8292,61 @@ private final class ClickTimingTableView: NSTableView {
     override func menu(for event: NSEvent) -> NSMenu? {
         onContextMenuRequest?(row(at: convert(event.locationInWindow, from: nil)))
     }
-    // The highlight flag is published ASYNCHRONOUSLY, never synchronously inside these
-    // callbacks. Writing SwiftUI @State from here re-enters the view update on the spot,
-    // and that update path can call reloadData()/selectRowIndexes() on this very table
-    // WHILE a drag is in flight — which throws away the drag's drop targeting and makes
-    // every drop silently do nothing. (That's what broke dragging files onto a folder
-    // row after this view was rewritten on NSTableView.) The coordinator also refuses to
-    // touch the table at all while `isDragActive`; both halves are needed, because a
-    // deferred update can still land mid-drag.
+    // TWO callbacks per edge, and the split is the fix for a real wedge — do not merge them.
+    //
+    // The SwiftUI HIGHLIGHT flag is published ASYNCHRONOUSLY, never synchronously inside
+    // these callbacks. Writing SwiftUI @State from here re-enters the view update on the
+    // spot, and that update path can call reloadData()/selectRowIndexes() on this very
+    // table WHILE a drag is in flight — which throws away the drag's drop targeting and
+    // makes every drop silently do nothing. (That's what broke dragging files onto a
+    // folder row after this view was rewritten on NSTableView.)
+    //
+    // The coordinator's `isDragActive` LOCK, however, must be set and cleared on the spot.
+    // It used to ride the same deferred hop, and that made the lock's own ordering
+    // unsound: `acceptDrop` and the drag source's session-end clear it SYNCHRONOUSLY, so
+    // an enter-hop that had not drained yet — one busy main thread away, and a Photoshop
+    // batch job blocking the main queue is exactly that — landed its `true` AFTER the drag
+    // was already over. Nothing further was coming to clear it, so the lock stuck for the
+    // rest of the process: reload() then refused to touch the table in every folder, drops
+    // targeted rows that no longer existed, and only relaunching fixed it. It is a plain
+    // Bool that no view observes, so setting it synchronously costs nothing and puts every
+    // set and clear back in AppKit's own callback order.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         let op = super.draggingEntered(sender)
+        onDragActive?(true)
         DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(true) }
         return op
     }
     override func draggingExited(_ sender: NSDraggingInfo?) {
         super.draggingExited(sender)
+        onDragActive?(false)
         DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(false) }
     }
+    /// THE BUG — "drag and drop stops working until Navigator is relaunched" — was one word
+    /// on the line below this comment: `super`. DO NOT PUT IT BACK.
+    ///
+    /// `draggingEnded:` is an OPTIONAL NSDraggingDestination method and NSTableView does not
+    /// implement it (unlike `draggingEntered:`/`draggingExited:`/`concludeDragOperation:`
+    /// above, which it does — which is why those supers are correct and this one was not).
+    /// So `super.draggingEnded(sender)` raised NSInvalidArgumentException, unrecognized
+    /// selector, and it did so from inside AppKit's own `NSCoreDragCompletionProc` — the
+    /// function CoreDrag calls to retire a finished drag. AppKit runs drags inside
+    /// `_tryCatchDragUntilMouseUp:`, so the exception was SWALLOWED: no crash, no log, the
+    /// app stayed fully responsive. But the unwind skipped `_unregisterDragSession:`, so the
+    /// session stayed in `NSCoreDragManager`'s `_dragSessions` dictionary forever, and while
+    /// AppKit believes a drag is in flight `beginDraggingSession` returns nil for the WHOLE
+    /// PROCESS. Every drag in every window, dead, until relaunch.
+    ///
+    /// Measured: the completion proc only runs this path once a drag has reached another
+    /// application, which is why the repro was "drag a row out to Finder" and why drags that
+    /// stayed inside Navigator looked fine. Verified with `objc_setExceptionPreprocessor`
+    /// (the exception and its AppKit stack), and with `_dragSessions` read before and after:
+    /// count 1 and stuck with `super`, back to 0 without it.
+    ///
+    /// Nothing is lost by not calling super: a method the superclass does not implement has
+    /// no behaviour to inherit.
     override func draggingEnded(_ sender: NSDraggingInfo) {
-        super.draggingEnded(sender)
+        onDragActive?(false)
         DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(false) }
     }
 
@@ -7947,18 +8361,59 @@ private final class ClickTimingTableView: NSTableView {
     // selected: that single comparison distinguishes "the table only put one row in the
     // drag" from "all rows were dragged but the drop only took one".
     var onDragSessionBegin: ((_ selectedRows: Int, _ pasteboardItems: Int) -> Void)?
-    var onDragSessionEnd: (() -> Void)?
 
     override func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
         super.draggingSession(session, willBeginAt: screenPoint)
+        DragLeakWatch.watch(session, source: "list view")
         onDragSessionBegin?(selectedRowIndexes.count,
                             session.draggingPasteboard.pasteboardItems?.count ?? -1)
     }
+
+    /// THE BUG: the VIEW-side source end, kept because it is the authoritative end this table
+    /// otherwise has none of — and because it is now MEASURED rather than assumed.
+    ///
+    /// Measured, here and against a minimal control app: AppKit does not send this to a table
+    /// that is ALSO a registered drop destination (`registerForDraggedTypes`), which this one
+    /// has to be. Removing the registration brings it back — so this is a documented AppKit
+    /// trade-off and not a wiring mistake. It stays wired because it costs three lines, cannot
+    /// misfire, and on any system that does send it this becomes the real end and the polled
+    /// release goes quiet on its own — the ledger arbitrates, so both cannot speak.
     override func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint,
-                                 operation: NSDragOperation) {
+                                  operation: NSDragOperation) {
+        onViewDragEnd?(operation)
         super.draggingSession(session, endedAt: screenPoint, operation: operation)
-        onDragSessionEnd?()
     }
+
+    /// Routed into the coordinator's ONE arbitrated end (endListDrag), never into a second
+    /// teardown path of its own — two ends both running is exactly what THE BUG's second half
+    /// was.
+    var onViewDragEnd: ((NSDragOperation) -> Void)?
+
+    // NO end-of-session hook here, and that is a finding rather than an omission. For THIS
+    // table, nothing AppKit offers on the source side reports the end of a row drag:
+    //
+    //  • overriding `draggingSession(_:endedAt:operation:)` compiles (NSTableView declares
+    //    it) and is never called — even though the willBeginAt override right above it is
+    //    called on every single drag.
+    //  • the documented data-source hook,
+    //    `tableView(_:draggingSession:endedAtPoint:operation:)`, is never called either.
+    //    Not a signature typo: `responds(to:)` for that exact selector returns true.
+    //
+    // Both were measured by instrumenting all six callbacks and dragging for real: a drag
+    // that dropped on a folder logged willBeginAt → draggingEntered → drop, and a drag
+    // released on nothing logged willBeginAt → draggingEntered → draggingExited. No
+    // end-of-session callback in either.
+    //
+    // The data-source one is nevertheless wired now, on the coordinator — see
+    // `tableView(_:draggingSession:endedAt:operation:)` there. Not because the measurement is
+    // doubted, but because it routes into the SAME arbitrated end as the poll, so it is four
+    // lines that cannot misfire and that would silently take over as the authoritative end on
+    // any system where AppKit does send it. A view-side override here would be the dead copy:
+    // there is nothing for it to do that the data-source hook does not already do.
+    //
+    // What the source side actually gets today is MouseUpWatch — the class written for
+    // precisely this, because "a drag session consumes its own mouse-up". See the
+    // coordinator's onDragSessionBegin.
 }
 
 // A reusable NSTableCellView holding one NSHostingView, whose rootView is
@@ -8121,6 +8576,21 @@ private struct NativeFileTable: NSViewRepresentable {
 /// panel existed, and it does so for EVERY window that could steal key — not just ⌘J.
 private final class FirstMouseTableHeaderView: NSTableHeaderView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// true as a header click starts tracking, false the instant tracking is over.
+    var onTracking: ((Bool) -> Void)?
+
+    /// The column-header drag's authoritative end, and it needs no callback from AppKit
+    /// because NSTableHeaderView runs the WHOLE interaction — sort click, column resize,
+    /// column reorder — inside this one call, as a synchronous mouse-tracking loop. `super`
+    /// returning therefore IS "the column drag is over", exactly, with nothing to race and
+    /// nothing to poll. That is the point: this source is the one that must not acquire a
+    /// watchdog (see FileTableCoordinator.tableViewColumnDidMove for the bug class).
+    override func mouseDown(with event: NSEvent) {
+        onTracking?(true)
+        defer { onTracking?(false) }
+        super.mouseDown(with: event)
+    }
 }
 
 private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
@@ -8140,10 +8610,32 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     /// `reload()` refuses to touch the table: reloadData() or selectRowIndexes() during a
     /// live drag discards the drag's drop targeting, and the visible symptom is a drop
     /// that "does nothing" — no error, no move, no feedback.
-    fileprivate var isDragActive = false
+    /// Every write timestamps itself, rather than the individual callbacks remembering to.
+    /// The safety net's whole soundness rests on that timestamp being fresh whenever a drag
+    /// is live, so a set-site added later must not be able to forget to stamp — and the
+    /// only way to guarantee that is to hang it off the assignment itself. Clears stamp too:
+    /// they are equally good evidence that AppKit was just talking to us about a drag.
+    fileprivate var isDragActive: Bool {
+        get { dragActive }
+        set { dragActive = newValue; lastDragCallback = .now }
+    }
+    private var dragActive = false
     /// The folder the last reload was built from — the one thing `isDragActive` lets
     /// through, so a spring-loaded folder actually appears while the drag continues.
     private var lastReloadPath: String?
+    /// When AppKit last told us anything about a drag. Read only by the safety net, as its
+    /// evidence that a session is still live — see DragStateRules.quietPeriod. Monotonic,
+    /// so a clock change cannot make a live drag look long finished.
+    private var lastDragCallback = ContinuousClock.now
+    /// Watches for the mouse-up that ends a drag STARTED on this table. Its own instance,
+    /// not SpringLoader's: that one is armed only while the pointer dwells over a folder,
+    /// and a drag that never hovers a folder is exactly the case this has to cover.
+    private let dragEndWatch = MouseUpWatch()
+    /// Whether `acceptDrop` ran during the current drag, so the drag-end log line can say
+    /// which kind of ending it was. Without the distinction a drag-out to another app and a
+    /// drag that wedged produce identical logs — which is what made the last set of log
+    /// lines unreadable as evidence.
+    private var dropLandedThisDrag = false
 
     init(model: AppModel, browser: Browser, open: @escaping (Set<String>) -> Void, contextMenu: @escaping (Set<FileItem.ID>) -> AnyView) {
         self.model = model; self.browser = browser; self.open = open; self.contextMenu = contextMenu
@@ -8174,17 +8666,36 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
             guard let self, self.rows.indices.contains(row), case .header(let title) = self.rows[row] else { return }
             self.browser.toggleGroupCollapsed(title)
         }
-        // Clearing isDragActive here (not only in acceptDrop) matters: a drag that leaves
-        // the table or is cancelled never reaches acceptDrop, and a stuck isDragActive
-        // would freeze the table's updates for the rest of the session.
+        // The lock, on the spot. Clearing it here (not only in acceptDrop) matters: a drag
+        // that leaves the table or is cancelled never reaches acceptDrop, and a stuck
+        // isDragActive would freeze the table's updates for the rest of the session.
+        table.onDragActive = { [weak self] active in self?.isDragActive = active }
         table.onDragTargeted = { [weak self] t in
             guard let self else { return }
             // The drag left this table (or ended): a dwell timer that outlived it would
             // navigate the window after the user had already let go.
             if !t { SpringLoader.shared.cancel() }
+            // Deliberately clears but never SETS the lock — a late `true` from this
+            // deferred hop is the leak onDragActive exists to avoid (see draggingEntered).
+            // A late `false` can only ever unstick something, so it stays.
             if !t { self.isDragActive = false }
             self.isTargetedBinding?.wrappedValue = t
             if !t { self.reload() }   // catch up on anything skipped during the drag
+        }
+        // The safety net's two WEAK boundaries. Neither is the drag-free moment it looks
+        // like — hovering the Dock icon mid-drag activates the app, and an alert opening
+        // mid-drag makes a new window key — so both defer entirely to DragStateRules, which
+        // additionally requires the drag callbacks to have gone quiet before it will act
+        // here. `mouseDown` below is the boundary that is actually exact.
+        for name in [NSApplication.didBecomeActiveNotification, NSWindow.didBecomeKeyNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(dragSafetyNet(_:)),
+                                                   name: name, object: nil)
+        }
+        table.onMouseDown = { [weak self] in
+            // Runs before the click is acted on, so the resync happens while the row
+            // indices this click is about to use are still being recomputed.
+            self?.clearStaleDragState(reason: "mouseDown", isFreshMouseDown: true)
+            DragSessionTracker.shared.noteMouseDown()   // same exact boundary, session bookkeeping
         }
         // Source side. Previously only the DESTINATION side set isDragActive, which left
         // a real gap: dragging OUT of Navigator (to Slack, to Finder) never enters this
@@ -8193,12 +8704,28 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         table.onDragSessionBegin = { [weak self] selectedRows, pbItems in
             guard let self else { return }
             self.isDragActive = true
+            self.dropLandedThisDrag = false
             navLog("drag start: \(selectedRows) row(s) selected, \(pbItems) pasteboard item(s), model selection \(self.browser.selection.count)")
+            // `willBeginAt` is only sent for a session AppKit actually began, so reaching
+            // here PROVES dragging works — which is what clears a previous wedge's
+            // one-notice-per-wedge state. See DragSessionTracker.noteStarted.
+            DragSessionTracker.shared.noteStarted()
+            DragSessionTracker.shared.began("list view")
+            // The source-side end of the drag, polled rather than delivered, because AppKit
+            // delivers no end-of-session callback for this table at all (measured — see the
+            // note in ClickTimingTableView). Every other clear is on the DESTINATION side,
+            // so every other clear needs the drag to have entered this table; this is the
+            // one that holds for a drag that begins on a row and dies without doing so.
+            self.dragEndWatch.start { [weak self] in
+                self?.endListDrag(via: "polled release")
+            }
         }
-        table.onDragSessionEnd = { [weak self] in
-            guard let self else { return }
-            self.isDragActive = false
-            self.reload()
+        // THE BUG: the view-side source end, routed into the SAME arbitrated end as the poll and
+        // the data-source hook. Measured not to fire for row drags on this system; wired so that
+        // if it ever does it wins and the poll goes silent, without a second teardown path.
+        table.onViewDragEnd = { [weak self] op in
+            self?.dragEndWatch.cancel()
+            self?.endListDrag(via: "AppKit view endedAt, mask \(op.rawValue)")
         }
         table.registerForDraggedTypes([.fileURL])
         // REQUIRED for dragging files OUT to other apps (Slack, Mail, Photoshop, Finder).
@@ -8231,6 +8758,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         // FirstMouseTableHeaderView for the regression this prevents.
         let header = FirstMouseTableHeaderView()
         header.frame = table.headerView?.frame ?? .zero
+        header.onTracking = { [weak self] active in self?.noteHeaderTracking(active) }
         table.headerView = header
         let headerMenu = NSMenu(); headerMenu.delegate = self
         table.headerView?.menu = headerMenu
@@ -8252,6 +8780,122 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
+
+    @objc private func dragSafetyNet(_ n: Notification) {
+        clearStaleDragState(reason: n.name.rawValue, isFreshMouseDown: false)
+    }
+
+    /// The list view's one end-of-drag path, whichever end reaches it.
+    ///
+    /// The LOG is arbitrated and the TEARDOWN is not, and that split is deliberate. Two ends
+    /// exist here (AppKit's `endedAt` and the polled release) and only one may speak, or the
+    /// log double-counts every drag — that was the shape of THE BUG's second half. But the
+    /// `isDragActive` lock must clear on every call unconditionally: gating it on the ledger
+    /// would let a session closed by some other path (an ORPHANED claim, say) leave the table
+    /// frozen for the rest of the process, which is the more expensive failure by far.
+    private func endListDrag(via: String) {
+        isDragActive = false
+        if DragSessionTracker.shared.ended("list view",
+                                           (dropLandedThisDrag ? "dropped" : "cancelled or taken by another app")
+                                           + " (\(via))") {
+            navLog(dropLandedThisDrag
+                   ? "drag end: dropped"
+                   : "drag end: no drop — cancelled, released on nothing, or taken by another app")
+        }
+        reload()
+    }
+
+    /// AppKit's own source-side end for a row drag — the authoritative end this source ought
+    /// to have, wired up so that if it ever arrives it WINS and the polled release above goes
+    /// silent (the ledger decides; see endListDrag).
+    ///
+    /// Measured NOT to fire on this system, along with every other source-side end hook
+    /// NSTableView offers — see the note in ClickTimingTableView, which is where that
+    /// measurement is written down. It is wired anyway because it costs four lines and cannot
+    /// misfire, and because the alternative is a source whose only end is a poll. If the log
+    /// starts showing `(AppKit endedAt)` on list drags, this table has stopped needing its
+    /// watchdog and the `endsItself` flag in `began` below should be flipped to match.
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                   endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        dragEndWatch.cancel()
+        endListDrag(via: "AppKit endedAt, mask \(operation.rawValue)")
+    }
+
+    /// Whether a header click is inside its tracking loop, and whether a column has actually
+    /// moved during it. Two Bools rather than one: the tracking loop covers sort clicks and
+    /// column resizes too, and neither of those is a drag to bracket.
+    private var headerIsTracking = false
+    private var columnMovedWhileTracking = false
+
+    /// The COLUMN HEADER reorder's lifecycle — the last drag source that had none. It has no
+    /// `began`, no pasteboard and no `endedAt`, and alone among the sources it never took the
+    /// `isDragActive` lock, so it was the one drag during which a SwiftUI re-render could
+    /// still call reloadData() on the table mid-gesture.
+    ///
+    /// Bracketed off AppKit's own facts rather than a watchdog, which is the bug class this
+    /// whole area is being cleaned of: the FIRST columnDidMove inside a header tracking loop
+    /// is the drag's start, and the tracking loop returning is its end (see
+    /// FirstMouseTableHeaderView.mouseDown). Both are exact and synchronous, so there is
+    /// nothing here for a poll to win a race against.
+    ///
+    /// Gated on `headerIsTracking` so a plain SORT click never takes the lock: sorting
+    /// republishes browser state from inside that same tracking loop, and a lock held across
+    /// it would make reload() skip the re-sort — the header click would look like it did
+    /// nothing. Programmatic moves (autosave restoring the saved column order at launch) are
+    /// not dragging sessions and cannot wedge anything, so they are left alone entirely.
+    func tableViewColumnDidMove(_ notification: Notification) {
+        guard headerIsTracking else {
+            // Keeps this source's diagnostics honest without a GUI to check them against.
+            // Expected at launch, where autosave restores the saved column order with
+            // moveColumn() — not a drag, nothing to bracket. But if it appears right after
+            // someone DRAGS a header, the bracket above is not wrapping the interaction and
+            // that assumption (NSTableHeaderView tracks the whole gesture inside mouseDown)
+            // is what needs revisiting.
+            navLog("column move: no header tracking bracket was open — programmatic, or the header does not track inside mouseDown")
+            return
+        }
+        if !columnMovedWhileTracking {
+            columnMovedWhileTracking = true
+            navLog("column drag start: a header reorder is under way")
+        }
+        isDragActive = true
+    }
+
+    private func noteHeaderTracking(_ active: Bool) {
+        headerIsTracking = active
+        guard !active, columnMovedWhileTracking else { return }
+        columnMovedWhileTracking = false
+        isDragActive = false
+        navLog("column drag end: header reorder finished — the tracking loop returned, so this end is exact")
+        reload()   // catch up on anything the lock held back during the drag
+    }
+
+    /// Defence in depth for `isDragActive`, and the reason it exists is that the flag's
+    /// failure mode is silent and un-reproducible: the app stays fully responsive, only
+    /// drag and drop stops working, and a relaunch "fixes" it. The ordering leak that
+    /// caused it is fixed at the source (see draggingEntered), but AppKit has drag paths
+    /// this code cannot enumerate — a view pulled out of the window mid-drag, a modal
+    /// appearing over a live session — and any of them skipping every clear costs the user
+    /// their whole session. So the invariant gets re-asserted at boundaries instead of
+    /// trusted: DragStateRules decides, and it only ever says yes when no drag session can
+    /// possibly be running.
+    ///
+    /// The log line is the point as much as the repair is. If it ever appears in a user's
+    /// log, that IS the bug report: a path still leaks, and this names when it was caught.
+    private func clearStaleDragState(reason: String, isFreshMouseDown: Bool) {
+        let quiet = (ContinuousClock.now - lastDragCallback) / .seconds(1)
+        guard DragStateRules.shouldClearStaleDragState(dragStateSet: isDragActive,
+                                                      pressedMouseButtons: NSEvent.pressedMouseButtons,
+                                                      isFreshMouseDown: isFreshMouseDown,
+                                                      secondsSinceDragCallback: quiet) else { return }
+        navLog("drag state: cleared STALE isDragActive at \(reason) after \(String(format: "%.1f", quiet))s quiet — the file list had stopped reloading; a drag ended without clearing its lock")
+        isDragActive = false
+        SpringLoader.shared.cancel()
+        reload()
+        // The highlight is SwiftUI state, so it keeps the deferred hop every other writer
+        // of it uses — the repair above is what actually unwedges the table.
+        DispatchQueue.main.async { [weak self] in self?.isTargetedBinding?.wrappedValue = false }
+    }
 
     @objc private func didScroll(_ n: Notification) { browser.topVisibleID = topVisibleItemID() }
 
@@ -8538,6 +9182,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         return item.url as NSURL
     }
 
+
     /// The folder row under the cursor, hit-tested from the drag's own location.
     ///
     /// Deliberately does NOT trust the `proposedRow`/`proposedDropOperation` AppKit hands
@@ -8578,6 +9223,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int,
                    dropOperation: NSTableView.DropOperation) -> Bool {
         isDragActive = false
+        dropLandedThisDrag = true
         guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
               !urls.isEmpty else { return false }
         // Re-hit-test rather than trusting `row`: validateDrop already retargeted, but
@@ -8703,6 +9349,11 @@ struct IconCellMouseHandler: NSViewRepresentable {
     /// when the drag actually starts.
     let urlsForDrag: () -> [URL]
     let dragIcon: () -> NSImage?
+    /// Names this surface in every drag log line. Two views share this handler — the icon
+    /// grid and the gallery filmstrip — and while both said "icon cell" the log could not
+    /// say WHICH one leaked a session, which is the first thing you need to know about
+    /// THE BUG (drag and drop wedges until relaunch).
+    var sourceLabel = "icon"
 
     func makeNSView(context: Context) -> Handler {
         let v = Handler(); apply(to: v); return v
@@ -8712,9 +9363,11 @@ struct IconCellMouseHandler: NSViewRepresentable {
         v.select = select; v.isSelected = isSelected; v.open = open
         v.plainClickCompleted = plainClickCompleted
         v.urlsForDrag = urlsForDrag; v.dragIcon = dragIcon
+        v.sourceLabel = sourceLabel
     }
 
     final class Handler: NSView, NSDraggingSource {
+        var sourceLabel = "icon"
         var select: ((NSEvent) -> Void)?
         var isSelected: (() -> Bool)?
         var open: (() -> Void)?
@@ -8733,6 +9386,9 @@ struct IconCellMouseHandler: NSViewRepresentable {
             // only commits when it loses first responder, and nothing else would take
             // it — this handler deliberately never becomes first responder itself.
             if let w = window, isEditingText(in: w) { w.makeFirstResponder(nil) }
+            // Exact boundary: this mouseDown could not have been delivered while a session
+            // of ours was tracking, so anything still marked in-flight leaked.
+            DragSessionTracker.shared.noteMouseDown()
             downPoint = convert(event.locationInWindow, from: nil)
             didDrag = false
             deferredSelection = (isSelected?() == true)
@@ -8775,8 +9431,67 @@ struct IconCellMouseHandler: NSViewRepresentable {
                                     contents: fallbackIcon ?? NSWorkspace.shared.icon(forFile: url.path))
                 return di
             }
-            navLog("icon drag start: \(items.count) file(s)")
-            beginDraggingSession(with: items, event: event, source: self)
+            navLog("\(sourceLabel) drag start: \(items.count) file(s)")
+            DragSessionTracker.shared.began(sourceLabel, endsItself: true)
+            // Before the session exists, because the drop that ends it can reload the folder
+            // and release this very view while AppKit still needs to call us back. See
+            // DragSourceKeepAlive — this is the fix for the process-wide drag wedge.
+            DragSourceKeepAlive.shared.retain(self)
+            let session = beginDraggingSession(with: items, event: event, source: self)
+            // The wedge, caught at the only moment it is visible. See DragSessionTracker:
+            // a refused session returns nil and then does nothing at all, so without this
+            // check the whole failure is one log line with no successor.
+            guard DragSessionTracker.sessionWasRefused(session) else {
+                DragLeakWatch.watch(session, source: sourceLabel)
+                DragSessionTracker.shared.noteStarted()   // a real session: any wedge is over
+                return
+            }
+            DragSessionTracker.shared.ended(sourceLabel, "never started")
+            // The PRECONDITIONS, and this is what makes a recurrence self-explaining. The
+            // refusal has exactly two candidate causes and this line separates them, which
+            // the message below cannot do on its own:
+            //
+            //   • a phantom session AppKit still believes is in flight — everything here
+            //     looks healthy (button down, a real leftMouseDragged, a window, items > 0);
+            //   • a bad call on our side — the button already up, a stale or wrong-type
+            //     event, or the view already pulled out of its window. That would be OUR
+            //     bug, not AppKit's, and the fix would be a different one entirely.
+            //
+            // Age is measured against the event's own timestamp: a `downPoint` surviving from
+            // an earlier interaction would show up here as an event seconds old.
+            let age = ProcessInfo.processInfo.systemUptime - event.timestamp
+            navLog("drag refusal preconditions: buttons=\(NSEvent.pressedMouseButtons) leftDown=\(DragStateRules.leftButtonIsDown(NSEvent.pressedMouseButtons)) eventType=\(event.type.rawValue) eventAge=\(String(format: "%.3f", age))s hasWindow=\(window != nil) inLiveResize=\(inLiveResize) items=\(items.count)")
+            // THE BUG's recovery rung. The retry deliberately calls beginDraggingSession
+            // directly rather than re-entering beginFileDrag, so a second refusal cannot
+            // recurse through the ladder — the tracker escalates from the Bool instead.
+            DragSessionTracker.shared.noteRefused(sourceLabel) { [weak self] in
+                guard let self else { return false }
+                navLog("drag recovery: re-attempting the \(self.sourceLabel) drag")
+                // Opened and closed around the retry like any other drag, so a retry that
+                // SUCCEEDS still has its end reported. Otherwise the one drag most worth
+                // reading about in the log would be the one with a start and no end.
+                DragSessionTracker.shared.began(self.sourceLabel, endsItself: true)
+                let again = self.beginDraggingSession(with: items, event: event, source: self)
+                guard DragSessionTracker.sessionWasRefused(again) else { return true }
+                DragSessionTracker.shared.ended(self.sourceLabel, "retry never started either")
+                return false
+            }
+        }
+
+        /// Log-only, and the log is the reason: "icon drag start:" with no "drop:" after it
+        /// is the normal shape of dragging a file OUT to another app, so without an end
+        /// line every drag-out is indistinguishable from a drag that wedged. Same rule as
+        /// the list view's onDragSessionEnd.
+        func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint,
+                             operation: NSDragOperation) {
+            navLog(operation.isEmpty ? "\(sourceLabel) drag end: no drop — cancelled, or released on nothing"
+                                     : "\(sourceLabel) drag end: taken, operation mask \(operation.rawValue)")
+            DragSessionTracker.shared.ended(sourceLabel,
+                                            operation.isEmpty ? "cancelled" : "operation mask \(operation.rawValue)")
+            // AppKit is done with us; reaching this line at all is what the keep-alive
+            // exists to guarantee. Released here rather than on the backstop so a long
+            // session of many drags never accumulates views.
+            DragSourceKeepAlive.shared.release(self)
         }
 
         func draggingSession(_ session: NSDraggingSession,
@@ -9312,7 +10027,8 @@ struct GalleryView: View {
                                             }
                                             return [it.url]
                                         },
-                                        dragIcon: { browser.icon(for: it) }
+                                        dragIcon: { browser.icon(for: it) },
+                                        sourceLabel: "filmstrip"
                                     )
                                 }
                                 .appKitContextMenu { fileContextMenu(model: model, browser: browser, ids: contextIDs(for: it.id)) }
@@ -9435,6 +10151,11 @@ struct TabItemView: View {
         // moves ~12pt before releasing IS a drag, in this strip exactly as in Chrome's.
         .onDrag {
             TabDrag.shared.begin(model: model, index: index)
+            // Same missing-end-callback gap as the sidebar, and the same answer: still
+            // `.onDrag` (an AppKit mouse overlay here would fight the .onTapGesture below for
+            // the click), with the leak made impossible instead of watched — a ticketed ledger
+            // in TabDrag, and the mouseDown boundary from NavWindow.sendEvent.
+            DragSessionTracker.shared.began("tab")
             return TabDragToken.provider(model: model, index: index)
         }
         // Safe to attach here, unlike on a file cell: a tab carries no
@@ -11212,6 +11933,19 @@ final class NavWindow: NSWindow {
     // isn't reliable because AppKit's responsive scrolling can still deliver the
     // wheel event to the list, making it scroll while zooming.
     override func sendEvent(_ event: NSEvent) {
+        // The one EXACT boundary for stale drag-session state, given to every surface in the
+        // window at once: a dragging session runs its own event-tracking loop and swallows
+        // the events it tracks, so an ordinary left mouseDown arriving here PROVES no session
+        // of ours is running. The file list and the icon cells already had this from their own
+        // AppKit mouseDown; the sidebar reorder and the tab strip are SwiftUI `.onDrag` and
+        // had no boundary at all, so their leaked sessions could only be found by a poll.
+        //
+        // Deliberately HERE and not in an overlay view: an AppKit view that takes mouseDown
+        // over a SwiftUI gesture double-fires the click, which has caused several regressions
+        // in this app (see the right-click-only overlay's hitTest for the one place it is
+        // safe). sendEvent observes and forwards — it cannot consume the event or compete for
+        // it, so no gesture, tap or drop handler sees any change.
+        if event.type == .leftMouseDown { DragSessionTracker.shared.noteMouseDown() }
         // Tab / ⇧Tab cycles the file selection, Finder-style — handled HERE rather
         // than in AppDelegate's key monitor for the same reason ⌘-scroll is: the
         // monitor cannot make the keystroke go away. Measured live: with the monitor
