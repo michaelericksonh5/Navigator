@@ -1219,6 +1219,78 @@ final class TabMoveRulesTests: XCTestCase {
     }
 }
 
+// MARK: - Tab tear-off
+
+/// BUG CLASS: a polled watchdog as the PRIMARY mechanism. The tear-off was decided and
+/// applied straight from a 0.25s mouse-release poll, so it could complete a drag other than
+/// the one that armed it. These pin the geometry rule, and then the ledger composition that
+/// makes a stale release harmless.
+final class TabTearOffRulesTests: XCTestCase {
+
+    /// Pulled well clear of the strip, either way — the tear-off is symmetric because the
+    /// strip can sit at the top of the window with the only room below it.
+    func testAReleaseWellClearOfTheStripTearsOff() {
+        for dy in [TabTearOffRules.pullOut + 1, -(TabTearOffRules.pullOut + 1), 500, -500] {
+            XCTAssertTrue(TabTearOffRules.shouldTearOff(verticalTravel: dy, index: 1, tabCount: 3), "\(dy)")
+        }
+    }
+
+    /// Sideways travel is a REORDER however far it goes: dragging a tab along the strip must
+    /// never spawn a window, and releasing in the 6pt gap between two tabs must do nothing.
+    /// Vertical travel is the only input, so "any distance along the strip" is covered by
+    /// pinning that a zero-to-threshold dy never tears off.
+    func testTravelAlongTheStripIsNeverATearOff() {
+        for dy in [0, 1, 12, TabTearOffRules.pullOut - 1, TabTearOffRules.pullOut, -TabTearOffRules.pullOut] {
+            XCTAssertFalse(TabTearOffRules.shouldTearOff(verticalTravel: dy, index: 1, tabCount: 3), "\(dy)")
+        }
+    }
+
+    /// Tearing off the ONLY tab would close the window's last tab and leave an empty ghost
+    /// window, so dragging a lone tab anywhere simply does nothing.
+    func testTheOnlyTabCannotBeTornOff() {
+        XCTAssertFalse(TabTearOffRules.shouldTearOff(verticalTravel: 300, index: 0, tabCount: 1))
+    }
+
+    /// A stale index — the tab was closed while the drag was in flight — must not move some
+    /// other tab out. Same guard the context menu is disabled by, so the two cannot disagree.
+    func testAnIndexThatNoLongerExistsIsRefused() {
+        for index in [-1, 3, 99] {
+            XCTAssertFalse(TabTearOffRules.shouldTearOff(verticalTravel: 300, index: index, tabCount: 3), "\(index)")
+        }
+    }
+
+    /// The composition TabDrag actually performs, and the case that was broken: the mouse-up
+    /// watch refuses to re-arm while it is settling, so drag N's release used to run against
+    /// drag N+1's tab. The ledger ticket is what makes the stale release a no-op — pinned here
+    /// because the failure is silent (a window tears off from a drag still in progress) and
+    /// cannot be reproduced without a GUI.
+    func testAStaleReleaseNeverTearsOffTheTabOfALaterDrag() {
+        var ledger = DragSessionLedger()
+        var tornOff: [Int] = []
+        func release(ticket: Int, index: Int, dy: CGFloat, tabCount: Int) {
+            guard ledger.closeIfCurrent(ticket: ticket) != nil else { return }
+            if TabTearOffRules.shouldTearOff(verticalTravel: dy, index: index, tabCount: tabCount) {
+                tornOff.append(index)
+            }
+        }
+        let stale = ledger.begin("tab")     // drag on tab 0, release still pending
+        let live = ledger.begin("tab")      // user grabs tab 2 within the grace window
+        release(ticket: stale, index: 0, dy: 300, tabCount: 3)
+        XCTAssertEqual(tornOff, [], "a superseded release must not tear off anything")
+        release(ticket: live, index: 2, dy: 300, tabCount: 3)
+        XCTAssertEqual(tornOff, [2], "the live drag still gets its own tear-off")
+    }
+
+    /// A tab took the drop, so it was a reorder: the authoritative close makes the release
+    /// poll that follows silent, and the tab must NOT also fly out into a new window.
+    func testADropTakenByATabSuppressesTheTearOff() {
+        var ledger = DragSessionLedger()
+        let ticket = ledger.begin("tab")
+        XCTAssertNotNil(ledger.closeAuthoritatively(), "the drop is the authoritative end")
+        XCTAssertNil(ledger.closeIfCurrent(ticket: ticket), "the release must stay silent")
+    }
+}
+
 // MARK: - Spring-loaded folders
 
 final class SpringRulesTests: XCTestCase {
@@ -2786,5 +2858,292 @@ final class GoogleDrivePathTests: XCTestCase {
                   "https://drive.google.com/file/d/view", "/Users/me/Pictures", "Shared drives/Content"] {
             XCTAssertNil(PathRules.googleDriveItemID(webURL: s), s)
         }
+    }
+
+    // MARK: DragStateRules
+
+    /// Long enough that the quiet-period test passes, for the cases that are not about it.
+    private let longQuiet = DragStateRules.quietPeriod * 10
+
+    /// The one thing this must never do: clear state while a real drag is running. A
+    /// safety net that fires mid-drag turns an intermittent wedge into a constant one.
+    func testDragSafetyNetNeverFiresDuringALiveDrag() {
+        for buttons in [1, 3, 5, 1 << 3] where DragStateRules.leftButtonIsDown(buttons) {
+            XCTAssertFalse(DragStateRules.shouldClearStaleDragState(
+                dragStateSet: true, pressedMouseButtons: buttons, isFreshMouseDown: false,
+                secondsSinceDragCallback: longQuiet), "\(buttons)")
+        }
+    }
+
+    /// Three-finger drag and Drag Lock run a REAL drag with no button pressed, so the
+    /// button mask alone says "no drag" and would fire straight into a live session. The
+    /// boundaries that rely on it — app-activation, window-became-key — genuinely do occur
+    /// mid-drag (Dock-icon hover activates the app; an alert opening makes a window key),
+    /// so ongoing drag callbacks have to be able to veto them.
+    func testDragSafetyNetWaitsOutALiveButtonlessDrag() {
+        XCTAssertFalse(DragStateRules.shouldClearStaleDragState(
+            dragStateSet: true, pressedMouseButtons: 0, isFreshMouseDown: false,
+            secondsSinceDragCallback: 0))
+        XCTAssertFalse(DragStateRules.shouldClearStaleDragState(
+            dragStateSet: true, pressedMouseButtons: 0, isFreshMouseDown: false,
+            secondsSinceDragCallback: DragStateRules.quietPeriod / 2))
+    }
+
+    func testDragSafetyNetClearsWhenNoButtonIsDown() {
+        XCTAssertTrue(DragStateRules.shouldClearStaleDragState(
+            dragStateSet: true, pressedMouseButtons: 0, isFreshMouseDown: false,
+            secondsSinceDragCallback: longQuiet))
+        // A right-button-only mask means no LEFT drag, which is the only kind that can
+        // have set the flag — bit 0 is the only bit a left-drag sets.
+        XCTAssertTrue(DragStateRules.shouldClearStaleDragState(
+            dragStateSet: true, pressedMouseButtons: 2, isFreshMouseDown: false,
+            secondsSinceDragCallback: longQuiet))
+    }
+
+    // MARK: Orphaned dragging session
+
+    /// The whole risk of the orphan guard is firing DURING a real drag, which would convert
+    /// an occasional bug into a constant one. These pin every way it must stay silent.
+    func testOrphanGuardNeverFiresWithoutTheExactMouseDownProof() {
+        // Nothing in flight — nothing to claim.
+        XCTAssertFalse(DragStateRules.isDragSessionOrphaned(
+            sessionInFlight: false, isFreshMouseDown: true, endWatchStillArmed: false))
+        // A live drag: no mouseDown is delivered while a session tracks, so this is the
+        // shape of every moment of a real drag. Must never fire, armed watch or not.
+        for armed in [false, true] {
+            XCTAssertFalse(DragStateRules.isDragSessionOrphaned(
+                sessionInFlight: true, isFreshMouseDown: false, endWatchStillArmed: armed), "\(armed)")
+        }
+        // Clicked again while the polled end-of-session watch is still settling: that
+        // session's end is legitimately pending, not leaked.
+        XCTAssertFalse(DragStateRules.isDragSessionOrphaned(
+            sessionInFlight: true, isFreshMouseDown: true, endWatchStillArmed: true))
+    }
+
+    func testOrphanGuardFiresOnlyOnMouseDownWithNoPendingEnd() {
+        XCTAssertTrue(DragStateRules.isDragSessionOrphaned(
+            sessionInFlight: true, isFreshMouseDown: true, endWatchStillArmed: false))
+    }
+
+    // MARK: Leaked dragging session (THE BUG's actual signature)
+
+    /// The signature that means the process is wedged: AppKit still lists the finished drag.
+    func testLeakReportedWhenAppKitStillHasTheFinishedDragRegistered() {
+        XCTAssertTrue(DragLeakRules.isLeaked(stillRegisteredWithAppKit: true,
+                                             secondsSinceDragEnd: DragLeakRules.retirementGrace))
+        XCTAssertTrue(DragLeakRules.isLeaked(stillRegisteredWithAppKit: true,
+                                             secondsSinceDragEnd: DragLeakRules.retirementGrace * 4))
+    }
+
+    /// The two ways it must stay quiet. A diagnostic that cries wolf is not a diagnostic — and
+    /// the version of this rule that keyed off "the session object is still alive" / "no
+    /// endedAt arrived" fired on EVERY healthy list-view drag, which is what hid the real bug.
+    func testLeakNeverReportedOnceAppKitHasRetiredTheDragOrIsStillRetiringIt() {
+        // Retired. However long the session OBJECT lingers afterwards is not news: measured,
+        // a retired session routinely stays alive well past ten seconds in a healthy process.
+        XCTAssertFalse(DragLeakRules.isLeaked(stillRegisteredWithAppKit: false,
+                                              secondsSinceDragEnd: DragLeakRules.retirementGrace * 10))
+        // Still inside the grace: a cancelled drag's slide-back animation legitimately keeps
+        // the registration for a few hundred ms.
+        XCTAssertFalse(DragLeakRules.isLeaked(stillRegisteredWithAppKit: true,
+                                              secondsSinceDragEnd: DragLeakRules.retirementGrace / 2))
+        XCTAssertFalse(DragLeakRules.isLeaked(stillRegisteredWithAppKit: false,
+                                              secondsSinceDragEnd: 0))
+    }
+
+    /// The boundary is what a refactor gets wrong: at exactly the grace it must already fire,
+    /// so the watch's own `asyncAfter(retirementGrace)` cannot land one float short and go quiet.
+    func testLeakGraceBoundaryIsInclusive() {
+        XCTAssertFalse(DragLeakRules.isLeaked(stillRegisteredWithAppKit: true,
+                                              secondsSinceDragEnd: DragLeakRules.retirementGrace - 0.01))
+        XCTAssertTrue(DragLeakRules.isLeaked(stillRegisteredWithAppKit: true,
+                                             secondsSinceDragEnd: DragLeakRules.retirementGrace))
+    }
+
+    /// A fresh mouseDown proves no session is running even though the button is down: a
+    /// drag session runs its own tracking loop and swallows the events it tracks, so an
+    /// ordinary mouseDown could not have been delivered. Exact rather than inferred, so it
+    /// answers regardless of the quiet period — which is what makes it the boundary that
+    /// unwedges a buttonless drag's leftovers on the user's very next click.
+    func testFreshMouseDownClearsImmediatelyDespiteButtonDown() {
+        for quiet in [0, longQuiet] {
+            XCTAssertTrue(DragStateRules.shouldClearStaleDragState(
+                dragStateSet: true, pressedMouseButtons: 1, isFreshMouseDown: true,
+                secondsSinceDragCallback: quiet), "\(quiet)")
+        }
+    }
+
+    /// Nothing set, nothing to clear — so the safety net never logs on a healthy app.
+    func testDragSafetyNetIsSilentWhenNothingIsSet() {
+        for buttons in [0, 1] {
+            for down in [true, false] {
+                XCTAssertFalse(DragStateRules.shouldClearStaleDragState(
+                    dragStateSet: false, pressedMouseButtons: buttons, isFreshMouseDown: down,
+                    secondsSinceDragCallback: longQuiet))
+            }
+        }
+    }
+
+    /// The watchdog was beating AppKit's real end callback on every healthy drag at 0.25s.
+    /// Pinning the interval as "seconds, not milliseconds" is the regression guard against
+    /// someone shortening it back and quietly restoring the double-teardown.
+    func testEndWatchdogWaitsLongEnoughToActuallyLoseTheRace() {
+        XCTAssertGreaterThanOrEqual(DragStateRules.endWatchdogGrace, 1)
+    }
+}
+
+// MARK: - Idempotent end of a dragging session
+
+/// THE BUG (drag and drop wedges until Navigator is relaunched), second half: the polled
+/// watchdog and AppKit's real `endedAt` both ran, watchdog first, on every healthy drag.
+final class DragSessionLedgerTests: XCTestCase {
+
+    /// The normal healthy drag: AppKit's own callback lands first, and the watchdog that
+    /// fires afterwards must be completely silent.
+    func testAuthoritativeEndWinsAndTheLateWatchdogIsSilent() {
+        var l = DragSessionLedger()
+        let ticket = l.begin("icon")
+        XCTAssertEqual(l.closeAuthoritatively(), "icon")
+        XCTAssertNil(l.closeIfCurrent(ticket: ticket))
+        XCTAssertNil(l.inFlightSource)
+    }
+
+    /// The leak the watchdog exists for: no authoritative end ever arrives, so the watchdog
+    /// is the end — and it reports the right source.
+    func testWatchdogEndsASessionNothingElseClosed() {
+        var l = DragSessionLedger()
+        let ticket = l.begin("list view")
+        XCTAssertEqual(l.inFlightSource, "list view")
+        XCTAssertEqual(l.closeIfCurrent(ticket: ticket), "list view")
+        XCTAssertNil(l.inFlightSource)
+    }
+
+    /// The reason this is a ticket and not a Bool, and the single most dangerous case in the
+    /// whole fix: drag N's watchdog is still armed when drag N+1 starts. Closing there would
+    /// tear down a drag the user is STILL PERFORMING — an intermittent bug turned constant.
+    func testAStaleWatchdogCanNeverEndALaterLiveDrag() {
+        var l = DragSessionLedger()
+        let stale = l.begin("icon")
+        let live = l.begin("filmstrip")
+        XCTAssertNil(l.closeIfCurrent(ticket: stale))
+        XCTAssertEqual(l.inFlightSource, "filmstrip", "the live drag must still be open")
+        XCTAssertEqual(l.closeIfCurrent(ticket: live), "filmstrip")
+    }
+
+    /// Whichever end lands first wins; every later end for that session is a no-op. Both
+    /// orderings, and repeated calls, because AppKit's paths here are not enumerable.
+    func testEveryEndIsIdempotentInBothOrderings() {
+        var l = DragSessionLedger()
+        let t1 = l.begin("icon")
+        XCTAssertEqual(l.closeIfCurrent(ticket: t1), "icon")      // watchdog first
+        XCTAssertNil(l.closeAuthoritatively())
+        XCTAssertNil(l.closeAuthoritatively())
+        XCTAssertNil(l.closeIfCurrent(ticket: t1))
+
+        let t2 = l.begin("icon")
+        XCTAssertEqual(l.closeAuthoritatively(), "icon")          // real callback first
+        XCTAssertNil(l.closeIfCurrent(ticket: t2))
+        XCTAssertNil(l.closeAuthoritatively())
+    }
+
+    /// An idle ledger has no end to give, so neither path can log a phantom drag.
+    func testAnIdleLedgerNeverReportsAnEnd() {
+        var l = DragSessionLedger()
+        XCTAssertNil(l.inFlightSource)
+        XCTAssertNil(l.closeAuthoritatively())
+        XCTAssertNil(l.closeIfCurrent(ticket: 1))
+        XCTAssertNil(l.closeIfCurrent(ticket: 0))
+    }
+
+    /// Tickets are never recycled: a value that once named a session must not come back and
+    /// start matching a different one after enough drags.
+    func testTicketsAreUniqueAcrossManySessions() {
+        var l = DragSessionLedger()
+        var seen = Set<Int>()
+        for _ in 0..<500 {
+            let t = l.begin("icon")
+            XCTAssertTrue(seen.insert(t).inserted, "ticket \(t) reused")
+            _ = l.closeAuthoritatively()
+        }
+    }
+
+    /// Sessions that leak one after another still each get exactly one end line — "a start
+    /// with no end" has to stay unambiguous evidence, so a lost end is not acceptable either.
+    func testBackToBackLeakedSessionsEachGetTheirOwnEnd() {
+        var l = DragSessionLedger()
+        let a = l.begin("sidebar reorder")
+        XCTAssertEqual(l.closeIfCurrent(ticket: a), "sidebar reorder")
+        let b = l.begin("tab")
+        XCTAssertEqual(l.closeIfCurrent(ticket: b), "tab")
+    }
+}
+
+// MARK: - Wedge recovery decision
+
+/// THE BUG's recovery ladder: try once, then tell the user once, then never again.
+final class DragWedgeRulesTests: XCTestCase {
+
+    /// A healthy app must never take any of these actions, whatever the leftover state.
+    func testNothingHappensWithoutARefusal() {
+        for attempted in [false, true] {
+            for notified in [false, true] {
+                XCTAssertEqual(DragWedgeRules.action(refused: false, recoveryAttempted: attempted,
+                                                     userNotified: notified),
+                               .none, "\(attempted)/\(notified)")
+            }
+        }
+    }
+
+    func testFirstRefusalRecoversAndRetries() {
+        XCTAssertEqual(DragWedgeRules.action(refused: true, recoveryAttempted: false,
+                                             userNotified: false),
+                       .recoverAndRetry)
+    }
+
+    /// Recovery is attempted exactly ONCE per wedge — posting synthetic mouse events on
+    /// every failed drag would be its own kind of misbehaviour.
+    func testRecoveryIsNeverAttemptedTwiceForOneWedge() {
+        for notified in [false, true] {
+            XCTAssertNotEqual(DragWedgeRules.action(refused: true, recoveryAttempted: true,
+                                                     userNotified: notified),
+                              .recoverAndRetry, "\(notified)")
+        }
+    }
+
+    func testUserIsToldOnceRecoveryHasFailed() {
+        XCTAssertEqual(DragWedgeRules.action(refused: true, recoveryAttempted: true,
+                                             userNotified: false),
+                       .notifyUser)
+    }
+
+    /// Never nag. Every subsequent refused drag in the same wedge stays silent — the user
+    /// has the notice and a broken feature they have been told about beats a dialog loop.
+    func testTheUserIsNeverToldTwiceInOneWedge() {
+        XCTAssertEqual(DragWedgeRules.action(refused: true, recoveryAttempted: true,
+                                             userNotified: true),
+                       .none)
+    }
+
+    /// The whole ladder walked in order, then re-walked after the wedge clears — because the
+    /// counters reset on a drag that demonstrably starts, a SECOND wedge later in the same
+    /// session must get its own attempt and its own notice rather than being swallowed.
+    func testTheLadderIsWalkedOncePerWedgeNotOncePerProcess() {
+        var attempted = false, notified = false
+        func step() -> DragWedgeRules.Action {
+            let a = DragWedgeRules.action(refused: true, recoveryAttempted: attempted,
+                                          userNotified: notified)
+            if a == .recoverAndRetry { attempted = true }
+            if a == .notifyUser { notified = true }
+            return a
+        }
+        XCTAssertEqual(step(), .recoverAndRetry)
+        XCTAssertEqual(step(), .notifyUser)
+        XCTAssertEqual(step(), .none)
+        XCTAssertEqual(step(), .none)
+
+        attempted = false; notified = false      // a drag started again: wedge over
+        XCTAssertEqual(step(), .recoverAndRetry)
+        XCTAssertEqual(step(), .notifyUser)
+        XCTAssertEqual(step(), .none)
     }
 }
