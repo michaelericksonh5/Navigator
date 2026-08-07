@@ -22,6 +22,9 @@ extension Notification.Name {
     static let navigatorDidNavigate = Notification.Name("navigatorDidNavigate")
     static let navigatorFocusSearch = Notification.Name("navigatorFocusSearch")
     static let navigatorResignFields = Notification.Name("navigatorResignFields")   // drop address/search focus so typing → type-to-select
+    /// Navigator ▸ Reset Drag & Drop, broadcast to every live file-list coordinator so each one
+    /// clears its own `isDragActive` lock. See DragReset.
+    static let navigatorResetDragState = Notification.Name("navigatorResetDragState")
 }
 
 enum ViewMode: String { case list, icon, gallery }
@@ -353,7 +356,17 @@ struct TagsCell: View {
 
 enum APIKeys {
     private static let service = "com.merickson.navigator.apikeys"
-    static func get(_ account: String) -> String? {
+    static func get(_ account: String) -> String? { lookup(account).key }
+
+    /// Separates "no key stored" from "a key IS stored, the keychain just refused to hand it
+    /// over". They are not the same problem and the old code reported both as the first one.
+    ///
+    /// Rebuilding Navigator re-signs it, which invalidates the keychain ACL for anything it
+    /// saved earlier — so the first AI action after any update prompts for the login-keychain
+    /// password, and dismissing that prompt used to produce "Add your fal.ai API key first"
+    /// about a key sitting right there. Self-signed apps hit this on every update, the same
+    /// way the Accessibility grant gets dropped (see PERMISSIONS.md §4).
+    static func lookup(_ account: String) -> (key: String?, accessDenied: Bool) {
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -362,9 +375,17 @@ enum APIKeys {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let d = out as? Data, let s = String(data: d, encoding: .utf8) else { return nil }
-        return s.isEmpty ? nil : s
+        let status = SecItemCopyMatching(q as CFDictionary, &out)
+        if status == errSecSuccess, let d = out as? Data,
+           let s = String(data: d, encoding: .utf8), !s.isEmpty {
+            return (s, false)
+        }
+        // Cancelled the password prompt, failed auth, or no UI available to ask: the item
+        // exists, we just can't read it right now.
+        let denied = status == errSecUserCanceled || status == errSecAuthFailed
+            || status == errSecInteractionNotAllowed || status == errSecInteractionRequired
+        if denied { navLog("keychain: “\(account)” exists but access was denied (OSStatus \(status)) — re-signed build, ACL no longer matches") }
+        return (nil, denied)
     }
     static func set(_ value: String, _ account: String) {
         let base: [String: Any] = [
@@ -908,7 +929,13 @@ func isDatalessFile(_ url: URL) -> Bool {
 // small list-view thumbnail and the large preview don't clobber each other.
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
-    private let cache = NSCache<NSString, NSImage>()
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        // Content-keyed entries pile up one per version of a file, so bound the count rather
+        // than relying on memory pressure alone.
+        c.countLimit = 3000
+        return c
+    }()
     // Generation runs on a bounded queue. Measured: for ordinary PNG/JPG the bound
     // makes no difference (40 cold Drive images filled in ~1.2s either way), so this
     // is a safety valve, not a speed-up — it stops a 300-image folder from queueing
@@ -932,8 +959,24 @@ final class ThumbnailCache {
     // re-request on every scroll tick) while letting transients heal on the next pass.
     private var failed: [String: Date] = [:]
     private let failureRetryAfter: TimeInterval = 20
+
+    /// (mtime, length) for the cache key. One stat per request — the same cost `isDatalessFile`
+    /// already pays, and microseconds against generating a thumbnail. Deliberately NOT cached:
+    /// caching the stamp would recreate the very staleness it exists to prevent.
+    private func contentStamp(_ url: URL) -> (mtime: TimeInterval?, bytes: Int64?) {
+        var st = stat()
+        guard stat(url.path, &st) == 0 else { return (nil, nil) }
+        let m = TimeInterval(st.st_mtimespec.tv_sec) + TimeInterval(st.st_mtimespec.tv_nsec) / 1_000_000_000
+        return (m, Int64(st.st_size))
+    }
+
     func thumbnail(for url: URL, size: CGFloat = 256, completion: @escaping (NSImage?) -> Void) {
-        let key = "\(url.path)@\(Int(size))" as NSString
+        // Keyed by CONTENT, not just path: a file re-exported over itself must not keep serving
+        // its old thumbnail. See ThumbnailKeyRules.
+        let stamp = contentStamp(url)
+        let keyString = ThumbnailKeyRules.key(path: url.path, size: Int(size),
+                                              mtime: stamp.mtime, bytes: stamp.bytes)
+        let key = keyString as NSString
         if let c = cache.object(forKey: key) { completion(c); return }
         // Settings → Thumbnails: off = type icons only (fastest on slow shares);
         // images = skip the pricey PSD/PDF/RAW/video generators. The image viewer
@@ -1018,9 +1061,23 @@ final class ThumbnailCache {
     // Row scrolled out of view — drop its pending request so the queue stays
     // focused on what's actually on screen.
     func cancel(for url: URL, size: CGFloat = 256) {
-        let key = "\(url.path)@\(Int(size))"
-        lock.lock(); let op = ops.removeValue(forKey: key); lock.unlock()
-        op?.cancel()
+        // Match on the path+size PREFIX, not an exact key: the file may have been rewritten
+        // since the request was queued, and a cancel that missed would leave the old
+        // generation running and its `ops` entry blocking the next request for that file.
+        let prefix = ThumbnailKeyRules.prefix(path: url.path, size: Int(size))
+        lock.lock()
+        let hits = ops.keys.filter { $0.hasPrefix(prefix) }
+        let cancelled = hits.compactMap { ops.removeValue(forKey: $0) }
+        lock.unlock()
+        cancelled.forEach { $0.cancel() }
+    }
+
+    /// ⌘R. Content-keyed entries make this unnecessary for the ordinary "file changed" case,
+    /// but QuickLook keeps its OWN on-disk thumbnail cache that we do not control, so refresh
+    /// still needs to be able to throw everything away and ask again.
+    func purge() {
+        cache.removeAllObjects()
+        lock.lock(); failed.removeAll(); lock.unlock()
     }
 }
 
@@ -1485,7 +1542,11 @@ enum ServiceIcon {
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {
     ForEach(aiPrepColors) { c in
         Button { action(c, ratio) } label: {
-            Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(c.color)) }
+            if let col = c.color {
+                Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(col)) }
+            } else {
+                Label(c.name, systemImage: "eyedropper.halffull")
+            }
         }
     }
 }
@@ -1501,8 +1562,15 @@ func rmbgOutputURL(_ src: URL) -> URL {
 // The background-fill colors offered in the "Prep for AI" menu. The screen
 // colors match the chroma keyer's expected values for later Chroma Key use.
 // `suffix` becomes the filename tag: "<base>_BG<suffix>.png" (e.g. _BGgreen).
-struct AIPrepColor: Identifiable { let name: String; let suffix: String; let color: NSColor; var id: String { name } }
+/// `color == nil` is the adaptive choice — worked out from the image by KeyColorRules
+/// instead of picked from this list.
+struct AIPrepColor: Identifiable { let name: String; let suffix: String; let color: NSColor?; var id: String { name } }
 let aiPrepColors: [AIPrepColor] = [
+    // First, and the one to reach for: the fixed colours below can collide with the art.
+    // Measured on real assets — HP4_Tortoise.png contains pure white (ΔE 0.0 from "White"),
+    // and the frames sheet contains near-black (ΔE 4.6 from "Black"). Filling with a colour
+    // the subject also contains means a later chroma key removes part of the subject.
+    .init(name: "Adaptive (from image)", suffix: "auto", color: nil),
     .init(name: "White",         suffix: "white",   color: NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)),
     .init(name: "Black",         suffix: "black",   color: NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 1)),
     .init(name: "Greenscreen",   suffix: "green",   color: NSColor(srgbRed: 0, green: 1, blue: 0, alpha: 1)),
@@ -1561,23 +1629,42 @@ func bgfillOutputURL(_ src: URL, suffix: String) -> URL {
 // `ratio` is nil), pad by 20% (space on all sides), fill the background with
 // `color`, and write "<base>_BG<suffix>.png". The image is centered at its
 // native size — never scaled or cropped, never overwrites the original.
-func fillBackgroundForImage(_ src: URL, color: NSColor, suffix: String, ratio: Double?,
-                            dest explicitDest: URL? = nil) -> URL? {
+/// `color == nil` means ADAPTIVE: pick the fill from the image itself via KeyColorRules —
+/// extend an existing flat field, or choose the colour furthest from every colour in the art.
+/// The fixed palette collided with real assets (HP4_Tortoise contains pure white, ΔE 0.0 from
+/// the "White" option), and filling with a colour the subject also contains means a later
+/// chroma key eats part of the subject.
+///
+/// `pad` 1.0 pads only as far as the ratio needs (the auto-prep path); 1.2 is the manual
+/// default that leaves the model breathing room.
+func fillBackgroundForImage(_ src: URL, color: NSColor?, suffix: String, ratio: Double?,
+                            pad: Double = 1.2, dest explicitDest: URL? = nil) -> URL? {
     guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
           let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
     let w = CGFloat(cg.width), h = CGFloat(cg.height)
     guard w > 0, h > 0 else { return nil }
+    var fill = color
+    if fill == nil {
+        switch KeyColorRules.choose(subject: subjectColours(cg), flatField: flatFieldColour(cg)) {
+        case .extendField(let c):
+            fill = nsColor(c)
+            navLog("prep: \(src.lastPathComponent) already on a flat field — extending rgb(\(c.r),\(c.g),\(c.b)) so the pad is invisible and the canvas stays one keyable colour")
+        case .keyColour(let c, let margin):
+            fill = nsColor(c)
+            navLog("prep: \(src.lastPathComponent) adaptive key rgb(\(c.r),\(c.g),\(c.b)), ΔE \(String(format: "%.1f", margin)) from the nearest colour in the art")
+        }
+    }
+    guard let solid = fill else { return nil }
     let rt = CGFloat(ratio ?? nearestNB2Ratio(w: Double(w), h: Double(h)))
-    // Smallest target-ratio box that contains the image, then +20% padding.
-    var tightW = w, tightH = h
-    if w / h > rt { tightW = w; tightH = w / rt } else { tightH = h; tightW = h * rt }
-    let canvasW = Int((tightW * 1.2).rounded())
-    let canvasH = Int((tightH * 1.2).rounded())
+    // Smallest target-ratio box that contains the image, times `pad`. Scaling BOTH sides
+    // keeps the ratio, so padding never undoes the fit just computed.
+    let box = AspectPrepRules.canvas(width: cg.width, height: cg.height, ratio: Double(rt), pad: pad)
+    let canvasW = box.w, canvasH = box.h
     guard canvasW > 0, canvasH > 0,
           let ctx = CGContext(data: nil, width: canvasW, height: canvasH, bitsPerComponent: 8,
                               bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
                               bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-    ctx.setFillColor((color.usingColorSpace(.deviceRGB) ?? color).cgColor)
+    ctx.setFillColor((solid.usingColorSpace(.deviceRGB) ?? solid).cgColor)
     ctx.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
     let x = (CGFloat(canvasW) - w) / 2, y = (CGFloat(canvasH) - h) / 2
     ctx.draw(cg, in: CGRect(x: x, y: y, width: w, height: h))   // native size, centered
@@ -1589,9 +1676,28 @@ func fillBackgroundForImage(_ src: URL, color: NSColor, suffix: String, ratio: D
     return dst
 }
 
+/// Pads to an exact canvas with the adaptive backing colour, in memory — the auto-prep path
+/// for restyle/edit calls, which must not litter the user's folder with intermediates.
+func paddedToCanvas(_ url: URL, canvas: (w: Int, h: Int)) -> Data? {
+    guard let cg = loadCGImage(url), canvas.w >= cg.width, canvas.h >= cg.height else { return nil }
+    let c: RGB8
+    switch KeyColorRules.choose(subject: subjectColours(cg), flatField: flatFieldColour(cg)) {
+    case .extendField(let f): c = f
+    case .keyColour(let k, _): c = k
+    }
+    guard let ctx = CGContext(data: nil, width: canvas.w, height: canvas.h, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.setFillColor(nsColor(c).cgColor)
+    ctx.fill(CGRect(x: 0, y: 0, width: canvas.w, height: canvas.h))
+    let o = AspectPrepRules.subjectOrigin(width: cg.width, height: cg.height, canvas: canvas)
+    ctx.draw(cg, in: CGRect(x: o.x, y: o.y, width: cg.width, height: cg.height))
+    return ctx.makeImage().flatMap(encodePNG)
+}
+
 // Fill backgrounds for one or many images (native — no Adobe app). Shows the
 // non-blocking progress bar + end-of-run summary for multi-image runs.
-func fillBackgroundForImages(_ srcs: [URL], color: NSColor, suffix: String, ratio: Double?, onDone: (([URL]) -> Void)? = nil) {
+func fillBackgroundForImages(_ srcs: [URL], color: NSColor?, suffix: String, ratio: Double?, onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); return }
     let showProgress = imgs.count > 1
@@ -1613,12 +1719,55 @@ func fillBackgroundForImages(_ srcs: [URL], color: NSColor, suffix: String, rati
 
 // ===== AI Upscale (fal.ai / Topaz Gigapixel) =====
 
-struct UpscaleOption: Identifiable { let label: String; let model: String; let factor: Int; var id: String { label } }
-// Only the low-quality fal/Topaz preset remains — the Art/Photoreal presets were
-// replaced by Imagen 4 (better results). Imagen options live in upscaleMenu.
+/// `endpoint` empty means LOCAL — no API call, no cost.
+struct UpscaleOption: Identifiable {
+    let label: String
+    let endpoint: String
+    let factor: Int
+    /// Extra request fields; `image_url` is added by the caller.
+    let body: [String: Any]
+    var id: String { label }
+    var isLocal: Bool { endpoint.isEmpty }
+}
+
+/// Ordered by a measured round-trip test, not by vendor claims: a real 2048 frame was
+/// downscaled to 512, upscaled ×4, and compared against the true original.
+///
+///   model            PSNR    SSIM    edge-vs-original
+///   Crystal          28.43   0.9554  1.01x   <- best structural fidelity
+///   AuraSR v2        28.59   0.9379  1.25x   over-sharpens (invents edges)
+///   Lanczos (free)   28.17   0.9203  0.75x   soft, but beats two PAID models
+///   Topaz            25.50   0.9051  1.01x   was the default here; near worst
+///
+/// Edge energy 1.01x means Crystal reproduced the original's detail level rather than
+/// softening it or inventing it — exactly "not melty, not fake-crisp" for flat gold linework.
+/// Caveat: n=1 on graphic art; the generative models would score better on photographs.
+/// Crystal MUST be pinned to PNG — it defaults to JPEG, and JPEG ringing on a chroma edge
+/// destroys keying.
 let upscaleOptions: [UpscaleOption] = [
-    .init(label: "Upscale Low Quality ×4", model: "Wonder 3", factor: 4),
+    .init(label: "Upscale ×4 — Crystal (best fidelity)", endpoint: "clarityai/crystal-upscaler",
+          factor: 4, body: ["scale_factor": 4, "creativity": 0, "output_format": "png"]),
+    .init(label: "Upscale ×4 — AuraSR (non-generative)", endpoint: "fal-ai/aura-sr",
+          factor: 4, body: ["upscale_factor": 4, "overlapping_tiles": true, "checkpoint": "v2"]),
+    .init(label: "Upscale ×4 — Topaz", endpoint: "fal-ai/topaz/upscale/image",
+          factor: 4, body: ["model": "Standard V2", "upscale_factor": 4, "output_format": "png"]),
+    // Free, instant, offline, and measurably better than Topaz and Creative on this art.
+    // Worth trying before paying for anything.
+    .init(label: "Upscale ×4 — local resample (free)", endpoint: "", factor: 4, body: [:]),
 ]
+
+/// High-quality local resample — no network, no cost. CoreGraphics' `.high` interpolation is
+/// a Lanczos-class filter; measured above at SSIM 0.9203, ahead of two paid endpoints.
+func localResample(_ cg: CGImage, factor: Int) -> CGImage? {
+    let w = cg.width * factor, h = cg.height * factor
+    guard w > 0, h > 0,
+          let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.interpolationQuality = .high
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return ctx.makeImage()
+}
 
 func upscaleOutputURL(_ src: URL) -> URL {
     let base = src.deletingPathExtension().lastPathComponent
@@ -1667,6 +1816,18 @@ func imageHasTransparency(_ url: URL) -> Bool {
     var i = 3
     while i < w * h * 4 { if px[i] < 250 { return true }; i += 4 }
     return false
+}
+
+// ===== Adaptive backing colour: the pixel side of KeyColorRules =====
+
+/// The adaptive backing choice for an image on disk.
+func adaptiveBacking(_ url: URL) -> BackingChoice? {
+    guard let cg = loadCGImage(url) else { return nil }
+    return KeyColorRules.choose(subject: subjectColours(cg), flatField: flatFieldColour(cg))
+}
+
+func nsColor(_ c: RGB8) -> NSColor {
+    NSColor(srgbRed: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
 }
 
 // Composite the image over an opaque solid color (a full backing layer) at
@@ -1745,16 +1906,32 @@ private func recombineUpscaledAlpha(source: URL, upscaledOpaque: Data) -> Data? 
     return encodePNG(outCG)
 }
 
-// One synchronous fal Topaz upscale call → (result PNG bytes, error message).
-private func falUpscale(pngData input: Data, model: String, factor: Int, key: String) -> (data: Data?, error: String?) {
+/// First `url` string found anywhere in the response. The four fal upscalers each nest the
+/// result slightly differently (`image.url` vs `images[0].url`), and hardcoding one shape
+/// meant adding an endpoint silently returned "unexpected fal response".
+private func firstURL(in any: Any) -> String? {
+    if let d = any as? [String: Any] {
+        if let u = d["url"] as? String { return u }
+        for v in d.values { if let u = firstURL(in: v) { return u } }
+    }
+    if let a = any as? [Any] {
+        for v in a { if let u = firstURL(in: v) { return u } }
+    }
+    return nil
+}
+
+// One synchronous fal upscale call → (result PNG bytes, error message).
+private func falUpscale(pngData input: Data, option: UpscaleOption, key: String) -> (data: Data?, error: String?) {
     let dataURI = "data:image/png;base64," + input.base64EncodedString()
-    guard let url = URL(string: "https://fal.run/fal-ai/topaz/upscale/image") else { return (nil, "bad URL") }
+    guard let url = URL(string: "https://fal.run/\(option.endpoint)") else { return (nil, "bad URL") }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.timeoutInterval = 600
-    req.httpBody = try? JSONSerialization.data(withJSONObject: ["image_url": dataURI, "model": model, "upscale_factor": factor, "output_format": "png"])
+    var body = option.body
+    body["image_url"] = dataURI
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
     var out: (Data?, String?) = (nil, "no response")
     let sem = DispatchSemaphore(value: 0)
     URLSession.shared.dataTask(with: req) { data, resp, err in
@@ -1764,9 +1941,10 @@ private func falUpscale(pngData input: Data, model: String, factor: Int, key: St
         guard http.statusCode == 200 else {
             out = (nil, "fal HTTP \(http.statusCode): \(String(data: data, encoding: .utf8)?.prefix(300) ?? "")"); return
         }
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let img = json["image"] as? [String: Any], let outStr = img["url"] as? String,
-              let outURL = URL(string: outStr) else { out = (nil, "unexpected fal response"); return }
+        guard let json = try? JSONSerialization.jsonObject(with: data),
+              let outStr = firstURL(in: json), let outURL = URL(string: outStr) else {
+            out = (nil, "unexpected fal response"); return
+        }
         if let outData = try? Data(contentsOf: outURL) { out = (outData, nil) }
         else { out = (nil, "couldn’t download the upscaled result") }
     }.resume()
@@ -1774,10 +1952,220 @@ private func falUpscale(pngData input: Data, model: String, factor: Int, key: St
     return out
 }
 
-func promptAddFalKey() {
+// ===== Seedream 5.0 Pro Layerize (fal.ai) =====
+
+struct LayerizeLayer {
+    let zIndex: Int
+    let name: String?
+    let detail: String?
+    let boundingBox: [String: Any]?
+    let url: String
+}
+
+/// `<Original>_Layers/` beside the source.
+func layerizeOutputDir(_ src: URL) -> URL {
+    src.deletingLastPathComponent()
+        .appendingPathComponent(src.deletingPathExtension().lastPathComponent + "_Layers")
+}
+
+/// One synchronous layerize call. Takes 50–180s against the live endpoint, so every caller
+/// runs it off the main thread.
+private func falLayerize(pngData: Data, tier: String, key: String) -> (layers: [LayerizeLayer], error: String?) {
+    guard let url = URL(string: "https://fal.run/bytedance/seedream/v5/pro/layerize") else { return ([], "bad URL") }
+    var req = URLRequest(url: url)
+    req.httpMethod = "POST"
+    req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 900          // measured 50–180s; a big image plus queueing needs room
+    let body: [String: Any] = [
+        "image_url": "data:image/png;base64," + pngData.base64EncodedString(),
+        "image_size": tier,
+        // Names/descriptions come back regardless, but in CHINESE unless asked otherwise —
+        // this line is what makes them English, and the filenames depend on it.
+        "prompt": "Return name and description in english.",
+        "enhance_prompt_mode": "standard",
+    ]
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    var out: ([LayerizeLayer], String?) = ([], "no response")
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, err in
+        defer { sem.signal() }
+        if let err { out = ([], err.localizedDescription); return }
+        guard let data, let http = resp as? HTTPURLResponse else { out = ([], "no data"); return }
+        guard http.statusCode == 200 else {
+            // 422 is what the endpoint returns when the resolution tier doesn't suit the input
+            // — worth naming, because the message itself says only "check input parameters".
+            let raw = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            let hint = http.statusCode == 422
+                ? " — Layerize refused this image at the \(tier) tier. It rejects a tier that overshoots the input, and also anything below its ~1K output floor."
+                : ""
+            out = ([], "fal HTTP \(http.statusCode)\(hint) \(raw)")
+            return
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = json["layers"] as? [[String: Any]] else { out = ([], "unexpected response shape"); return }
+        var parsed: [LayerizeLayer] = []
+        for (i, l) in arr.enumerated() {
+            guard let img = l["image"] as? [String: Any], let u = img["url"] as? String else { continue }
+            parsed.append(LayerizeLayer(zIndex: l["z_index"] as? Int ?? i,
+                                        name: l["name"] as? String,
+                                        detail: l["description"] as? String,
+                                        boundingBox: l["bounding_box"] as? [String: Any],
+                                        url: u))
+        }
+        out = parsed.isEmpty ? ([], "the model returned no layers") : (parsed, nil)
+    }.resume()
+    sem.wait()
+    return out
+}
+
+/// Fraction of fully-transparent pixels — decides whether the base layer is worth keeping.
+private func transparentFraction(_ url: URL) -> Double {
+    guard let cg = loadCGImage(url), let s = rgbaSample(cg, cap: 256) else { return 0 }
+    var clear = 0, total = 0
+    var i = 3
+    while i < s.px.count { if s.px[i] < 16 { clear += 1 }; total += 1; i += 4 }
+    return total > 0 ? Double(clear) / Double(total) : 0
+}
+
+/// Split image(s) into transparent layers. Non-blocking: one long cloud call per image, so
+/// everything runs off the main thread behind the shared progress bar.
+func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_Layers") }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    let look = APIKeys.lookup("fal.ai")
+    guard let key = look.key else {
+        DispatchQueue.main.async { promptAddFalKey(accessDenied: look.accessDenied) }
+        return
+    }
+
+    // Preflight EVERYTHING on the main thread first, so a batch asks at most one question
+    // instead of interrupting repeatedly once work is already under way.
+    var plan: [(url: URL, resizeTo: (w: Int, h: Int)?)] = []
+    var refusals: [String] = []
+    var resizes: [String] = []
+    for src in imgs {
+        guard let sz = imagePixelSize(src) else { refusals.append("\(src.lastPathComponent): can’t read"); continue }
+        let bytes = ((try? FileManager.default.attributesOfItem(atPath: src.path))?[.size] as? Int) ?? 0
+        switch LayerizeRules.check(width: sz.w, height: sz.h, bytes: bytes) {
+        case .ok:
+            plan.append((src, nil))
+        case .reject(let why):
+            refusals.append("\(src.lastPathComponent): \(why)")
+        case .needsResize(let why, let to):
+            plan.append((src, to))
+            resizes.append("• \(src.lastPathComponent) — \(why)\n   Navigator will send a \(to.w)×\(to.h) copy. Your original is not touched.")
+        }
+    }
+    guard !plan.isEmpty else {
+        DispatchQueue.main.async {
+            reportFileError("Nothing can be layerized", refusals.joined(separator: "\n"))
+        }
+        return
+    }
+    if !resizes.isEmpty {
+        let a = NSAlert()
+        a.messageText = resizes.count == 1 ? "Resize before layerizing?" : "Resize \(resizes.count) images before layerizing?"
+        a.informativeText = resizes.joined(separator: "\n\n") + "\n\nLayerize refuses images outside its limits, so these can’t be sent as they are."
+        a.addButton(withTitle: "Resize & Continue"); a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+    }
+
+    navLog("layerize: \(plan.count) image(s)\(refusals.isEmpty ? "" : ", \(refusals.count) refused")")
+    DispatchQueue.main.async { BGJobProgress.shared.start("Layerizing", total: 0) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var produced: [URL] = []
+        var errors: [String] = refusals
+        for (idx, item) in plan.enumerated() {
+            let src = item.url
+            DispatchQueue.main.async {
+                BGJobProgress.shared.label = plan.count == 1
+                    ? "Layerizing \(src.lastPathComponent) — this takes a minute or two"
+                    : "Layerizing \(idx + 1) of \(plan.count) — \(src.lastPathComponent)"
+            }
+            guard var cg = loadCGImage(src) else { errors.append("\(src.lastPathComponent): can’t read"); continue }
+            if let to = item.resizeTo, let r = resampleCG(cg, to: to) { cg = r }
+            guard let png = encodePNG(cg) else { errors.append("\(src.lastPathComponent): encode failed"); continue }
+
+            let tier = LayerizeRules.tier(width: cg.width, height: cg.height)
+            let keepBase = LayerizeRules.shouldKeepBase(transparentFraction: transparentFraction(src))
+            navLog("  \(src.lastPathComponent) \(cg.width)×\(cg.height) tier=\(tier) keepBase=\(keepBase) (worst case $\(String(format: "%.2f", LayerizeRules.worstCaseCost(tier: tier))))")
+
+            let (layers, err) = falLayerize(pngData: png, tier: tier, key: key)
+            guard err == nil else {
+                navLog("  RESULT: error — \(err ?? "")")
+                errors.append("\(src.lastPathComponent): \(err ?? "layerize failed")")
+                continue
+            }
+
+            let dir = layerizeOutputDir(src)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let stem = src.deletingPathExtension().lastPathComponent
+            var meta: [[String: Any]] = []
+            var saved = 0
+            for l in layers {
+                // A mostly-transparent input gets a flat INVENTED colour as its base rather
+                // than an inpainted background — junk, so it's skipped.
+                if l.zIndex == 0 && l.name == nil && !keepBase { continue }
+                guard let u = URL(string: l.url), let d = try? Data(contentsOf: u) else {
+                    errors.append("\(src.lastPathComponent): couldn’t download layer \(l.zIndex)"); continue
+                }
+                let fn = LayerizeRules.fileName(stem: stem, zIndex: l.zIndex, name: l.name)
+                let dst = dir.appendingPathComponent(fn)
+                do { try d.write(to: dst); produced.append(dst); saved += 1 }
+                catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
+                var m: [String: Any] = ["z_index": l.zIndex, "file": fn]
+                if let n = l.name { m["name"] = n }
+                if let de = l.detail { m["description"] = de }
+                if let bb = l.boundingBox { m["bounding_box"] = bb }
+                meta.append(m)
+            }
+            // bounding boxes and descriptions are the only way to re-composite later, so they
+            // are written alongside rather than discarded with the response.
+            if let j = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .withoutEscapingSlashes]) {
+                try? j.write(to: dir.appendingPathComponent("_layers.json"))
+            }
+            navLog("  RESULT: \(saved) layer(s) → \(dir.path)")
+            if saved == 0 { errors.append("\(src.lastPathComponent): no layers were saved") }
+        }
+        DispatchQueue.main.async {
+            BGJobProgress.shared.finish("Layerized \(produced.count) layer\(produced.count == 1 ? "" : "s")")
+            if !errors.isEmpty {
+                showBGSummary(app: "Layerize", done: produced.count, total: plan.count, errors: errors, verb: "layerized")
+            }
+            onDone?(produced)
+        }
+    }
+}
+
+/// Straight resample to an exact size, used only when the user approves a preflight resize.
+private func resampleCG(_ cg: CGImage, to size: (w: Int, h: Int)) -> CGImage? {
+    guard size.w > 0, size.h > 0,
+          let ctx = CGContext(data: nil, width: size.w, height: size.h, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.interpolationQuality = .high
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: size.w, height: size.h))
+    return ctx.makeImage()
+}
+
+func promptAddFalKey(accessDenied: Bool = false) {
     let a = NSAlert(); a.alertStyle = .warning
-    a.messageText = "Add your fal.ai API key first"
-    a.informativeText = "AI upscaling runs through fal.ai. Add your key from the menu bar: AI → API Keys…"
+    if accessDenied {
+        // Don't send someone off to re-enter a key that is already stored.
+        a.messageText = "macOS blocked access to your saved fal.ai key"
+        a.informativeText = """
+            Your key is still in the keychain — macOS just wouldn't hand it over. Updating \
+            Navigator re-signs the app, which invalidates the keychain's saved permission, so \
+            the next AI action asks for your login-keychain password once.
+
+            Try the upscale again and choose Always Allow at the prompt. You do NOT need to \
+            re-enter the key.
+            """
+    } else {
+        a.messageText = "Add your fal.ai API key first"
+        a.informativeText = "AI upscaling runs through fal.ai. Add your key from the menu bar: AI → API Keys…"
+    }
     a.addButton(withTitle: "OK"); a.runModal()
 }
 
@@ -1786,8 +2174,17 @@ func promptAddFalKey() {
 func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); return }
-    guard let key = APIKeys.fal else { DispatchQueue.main.async { promptAddFalKey() }; return }
-    guard confirmUpscale(count: imgs.count, label: option.label, perImage: nil) else { return }
+    // The local option needs no key and costs nothing, so it must not be gated on either.
+    var falKey: String? = nil
+    if !option.isLocal {
+        let look = APIKeys.lookup("fal.ai")
+        guard let k = look.key else {
+            DispatchQueue.main.async { promptAddFalKey(accessDenied: look.accessDenied) }
+            return
+        }
+        falKey = k
+        guard confirmUpscale(count: imgs.count, label: option.label, perImage: nil) else { return }
+    }
     // total:0 → an animated INDETERMINATE bar (an upscale is one long opaque
     // network call with no sub-progress, so a static "0 of 1" looked frozen).
     // The label names the current file/model; the whole thing is off the main
@@ -1798,16 +2195,39 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
         for (idx, src) in imgs.enumerated() {
             DispatchQueue.main.async {
                 BGJobProgress.shared.label = imgs.count == 1
-                    ? "Upscaling \(src.lastPathComponent) — \(option.model)"
-                    : "Upscaling \(idx + 1) of \(imgs.count) — \(option.model)"
+                    ? "Upscaling \(src.lastPathComponent) — \(option.label)"
+                    : "Upscaling \(idx + 1) of \(imgs.count) — \(option.label)"
             }
             guard let cg = loadCGImage(src) else { errors.append("\(src.lastPathComponent): can’t read"); continue }
             let transparent = imageHasTransparency(src)
-            let inputCG = transparent ? (compositeOnGreen(cg) ?? cg) : cg
-            guard let inputPNG = encodePNG(inputCG) else { errors.append("\(src.lastPathComponent): encode failed"); continue }
-            let (outData, err) = falUpscale(pngData: inputPNG, model: option.model, factor: option.factor, key: key)
+            // Transparent art gets an opaque backing so the upscaler sees gradual edges rather
+            // than a hard alpha cliff. The colour is chosen from the image (KeyColorRules) —
+            // this used to be hardcoded green, which collides with green subjects. Alpha is
+            // then rebuilt from the ORIGINAL alpha channel, so no colour ever has to be keyed
+            // back out and a collision cannot corrupt the cutout.
+            var inputCG = cg
+            if transparent {
+                let choice = KeyColorRules.choose(subject: subjectColours(cg), flatField: nil)
+                let c: RGB8
+                switch choice {
+                case .extendField(let f): c = f
+                case .keyColour(let k, let margin):
+                    c = k
+                    navLog("upscale backing: \(src.lastPathComponent) rgb(\(k.r),\(k.g),\(k.b)), ΔE \(String(format: "%.1f", margin)) from the art")
+                }
+                inputCG = compositeOnColor(cg, nsColor(c).cgColor) ?? cg
+            }
+            var outData: Data?
+            var err: String?
+            if option.isLocal {
+                if let up = localResample(inputCG, factor: option.factor), let d = encodePNG(up) { outData = d }
+                else { err = "local resample failed" }
+            } else {
+                guard let inputPNG = encodePNG(inputCG) else { errors.append("\(src.lastPathComponent): encode failed"); continue }
+                (outData, err) = falUpscale(pngData: inputPNG, option: option, key: falKey ?? "")
+            }
             if let outData {
-                let finalData = transparent ? (stripGreen(outData) ?? outData) : outData
+                let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: outData) ?? outData) : outData
                 let dst = upscaleOutputURL(src)
                 do { try finalData.write(to: dst); outs.append(dst) }
                 catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
@@ -1884,7 +2304,14 @@ let navLogURL = URL(fileURLWithPath: (NSHomeDirectory() as NSString).appendingPa
 /// enough that the whole of a long Imagen batch or a day of drags is still in the live
 /// file when someone comes to read it, which is the only reason this log exists.
 private let navLogMaxBytes: UInt64 = 4 << 20
+/// One writer at a time. `seekToEnd` then `write` is two syscalls, so two threads can
+/// resolve the same offset and overwrite each other's bytes — and this is called from drag
+/// paths, from background subprocess pipe reads, and from the exception preprocessor
+/// (which runs on whatever thread raised). Those genuinely overlap; a torn log line is
+/// worst exactly when the log is all you have.
+private let navLogLock = NSLock()
 func navLog(_ msg: String) {
+    navLogLock.lock(); defer { navLogLock.unlock() }
     let stamp = ISO8601DateFormatter().string(from: Date())
     guard let data = "[\(stamp)] \(msg)\n".data(using: .utf8) else { return }
     guard let fh = try? FileHandle(forWritingTo: navLogURL) else {
@@ -1904,6 +2331,89 @@ func navLog(_ msg: String) {
     let previous = navLogURL.appendingPathExtension("1")
     try? fm.removeItem(at: previous)
     try? fm.moveItem(at: navLogURL, to: previous)
+}
+
+/// Flattens a multi-line blob (a subprocess dump, a JSON error body) onto one line, so one
+/// failure stays one grep hit. A pretty-printed Vertex 500 was costing 8 lines each and
+/// burying the drag history it sat between.
+func navLogFlat(_ s: String, limit: Int = 600) -> String {
+    let flat = s.split(whereSeparator: \.isNewline)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+        .joined(separator: " ⏎ ")
+    return flat.count > limit ? flat.prefix(limit) + "…(+\(flat.count - limit) chars)" : flat
+}
+
+/// Logs every Objective-C exception this process raises — *including* ones a framework
+/// catches and swallows — then returns it untouched so behaviour is completely unchanged.
+///
+/// This exists because of the drag wedge (see `draggingEnded` and its comment further down).
+/// That was an NSInvalidArgumentException raised inside AppKit's drag completion proc and
+/// caught by `_tryCatchDragUntilMouseUp:`. No crash, no console output, nothing in this log —
+/// the app stayed fully responsive while drag and drop was dead process-wide. It took weeks
+/// to find, and the reason it was invisible is worth stating precisely:
+/// `NSSetUncaughtExceptionHandler` would NOT have caught it, because the exception was
+/// *caught*, not uncaught. An exception **preprocessor** runs at raise time, before any
+/// `@catch` gets a look, and is the only hook that sees a swallowed exception at all.
+///
+/// So this is the tripwire for that entire class of bug: silent breakage inside a framework
+/// callback. If it ever happens again, in drag or anywhere else, the log will name it.
+enum ExceptionLog {
+    private typealias Preprocessor = @convention(c) (AnyObject) -> AnyObject
+    private static var previous: Preprocessor?
+    private static var seen: [String: Int] = [:]
+    private static let lock = NSLock()
+
+    static func install() {
+        // Not exposed in Swift's ObjectiveC overlay, so resolve it at runtime.
+        // RTLD_DEFAULT is (void *)-2 on Darwin.
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "objc_setExceptionPreprocessor") else {
+            navLog("diag: objc_setExceptionPreprocessor unavailable — swallowed exceptions will NOT be logged")
+            return
+        }
+        typealias Setter = @convention(c) (Preprocessor) -> Preprocessor?
+        let setPreprocessor = unsafeBitCast(sym, to: Setter.self)
+        previous = setPreprocessor({ raised in
+            ExceptionLog.record(raised)
+            // Chain rather than replace, so we neither shadow another preprocessor nor
+            // change which object gets thrown.
+            if let p = ExceptionLog.previous { return p(raised) }
+            return raised
+        })
+        navLog("diag: exception logging armed (catches framework-swallowed exceptions too)")
+    }
+
+    /// Runs on whatever thread raised, mid-unwind, possibly inside a framework's own
+    /// try/catch. Must never raise itself, so it does nothing that can throw.
+    private static func record(_ raised: AnyObject) {
+        guard let e = raised as? NSException else { return }
+        let name = e.name.rawValue
+        let signature = "\(name)|\(e.reason ?? "")"
+        lock.lock()
+        let count = (seen[signature] ?? 0) + 1
+        seen[signature] = count
+        lock.unlock()
+        // Full detail for the first few of any given exception, then a tally. Some AppKit
+        // paths raise routinely in a loop; without this cap one of those would flood the
+        // log and push out the drag history that made this log worth keeping.
+        guard count <= 3 else {
+            if count == 4 {
+                navLog("EXCEPTION \(name) — now repeating; further occurrences counted, not logged")
+            } else if count % 100 == 0 {
+                navLog("EXCEPTION \(name) — \(count) occurrences so far")
+            }
+            return
+        }
+        // e.callStackSymbols is usually still empty at preprocess time (it's populated on
+        // raise), so fall back to the live stack, which is the raising stack right now.
+        let stack = e.callStackSymbols.isEmpty ? Thread.callStackSymbols : e.callStackSymbols
+        navLog("""
+            EXCEPTION \(name) (#\(count)): \(e.reason ?? "no reason given")
+              A framework may have caught this and carried on — if some feature silently \
+            stopped working around this timestamp, start here.
+              \(stack.prefix(18).joined(separator: "\n  "))
+            """)
+    }
 }
 
 // GUI apps launched from Finder/Dock have a minimal PATH (no nvm/homebrew), so
@@ -1962,7 +2472,7 @@ func runH5GClient(_ args: [String]) -> H5GResult {
     let ed = e.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
     let out = String(data: od, encoding: .utf8) ?? "", err = String(data: ed, encoding: .utf8) ?? ""
-    navLog("exit \(p.terminationStatus)\n  out: \(out.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1500))\n  err: \(err.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1500))")
+    navLog("exit \(p.terminationStatus)  out: \(navLogFlat(out, limit: 900))  err: \(navLogFlat(err, limit: 900))")
     return H5GResult(out: out, err: err, code: p.terminationStatus)
 }
 
@@ -4131,9 +4641,11 @@ final class Browser: ObservableObject, Identifiable {
     // re-read from disk/network and show a clean "Loading…" instead of stale cache.
     func refresh() {
         Browser.invalidateCache(currentURL.path)
-        // ⌘R is the natural "these thumbnails look wrong" gesture — forget throttled
-        // thumbnail failures so the reload really does try again immediately.
-        ThumbnailCache.shared.forgetFailures()
+        // ⌘R is the natural "these thumbnails look wrong" gesture, so it throws away the
+        // whole thumbnail cache, not just throttled failures. Content-keyed entries already
+        // handle a rewritten file on their own, but QuickLook keeps its own on-disk cache
+        // that Navigator doesn't control — this is the escape hatch for that.
+        ThumbnailCache.shared.purge()
         if isSearching { runSearch() } else { load() }
     }
 
@@ -4790,6 +5302,13 @@ final class Browser: ObservableObject, Identifiable {
         fillBackgroundForImages(urls, color: c.color, suffix: c.suffix, ratio: ratio) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
+    // Split the selected image(s) into transparent layers → "<name>_Layers/".
+    func layerize(_ ids: Set<String>) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        layerizeImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
     // Upscale the selected image(s) via fal.ai (Topaz) → "<name>_upscaled.png".
     func upscale(_ ids: Set<String>, _ option: UpscaleOption) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
@@ -4849,10 +5368,10 @@ final class Browser: ObservableObject, Identifiable {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(addressString(for: currentURL), forType: .string)
     }
-    // The two selected images (in on-screen order) for Swipe Compare, else nil.
-    func imagePair(_ ids: Set<String>) -> (URL, URL)? {
-        let imgs = orderedVisibleItems().filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
-        return imgs.count == 2 ? (imgs[0], imgs[1]) : nil
+    // Selected images in on-screen order, for Swipe Compare. Two is the classic case; more
+    // than two turns compare into a bake-off judge (first = reference, ← / → for the rest).
+    func compareImages(_ ids: Set<String>) -> [URL] {
+        orderedVisibleItems().filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
     }
     // True when the selection lives inside Google Drive (has a Drive item ID).
     func isGoogleDriveSelection(_ ids: Set<String>) -> Bool {
@@ -5263,7 +5782,13 @@ final class Browser: ObservableObject, Identifiable {
     // already live in is a no-op (cancel), NOT a self-copy.
     func copyURLs(_ urls: [URL], move: Bool) {
         let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
-        guard !sources.isEmpty else { return }
+        guard !sources.isEmpty else {
+            // Same invisible no-op as importURLs, on the paste / drop-into-this-folder path.
+            navLog(DropLogLine.text(surface: "copy into current folder", types: DropLog.pasteboardTypes(),
+                                    items: urls.count, fileURLs: urls.count, target: currentURL.path,
+                                    outcome: .acceptedButInert(.nothingToDo("all \(urls.count) item(s) are already in this folder"))))
+            return
+        }
         performTransfer(sources, into: currentURL, move: move, resetCut: true)
     }
 
@@ -5307,13 +5832,28 @@ final class Browser: ObservableObject, Identifiable {
     /// nothing at all — which is what a missed aim should do.
     func dropIntoCurrentFolder(_ incoming: [URL]) {
         let urls = incoming.filter { $0.isFileURL }
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty else {
+            // The filter that made a mis-aimed sidebar/tab token harmless also made it silent.
+            // Logged here, at the door, so it is reported once however many surfaces route in.
+            navLog(DropLogLine.text(surface: "drop into current folder", types: DropLog.pasteboardTypes(),
+                                    items: incoming.count, fileURLs: 0, target: currentURL.path,
+                                    outcome: .acceptedButInert(.noFileURLs(tokens: incoming.count))))
+            return
+        }
         SpringLoader.shared.noteDrop()
         let dest = currentURL
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let same = Browser.shouldMove(urls, into: dest)
             DispatchQueue.main.async {
-                guard let self, self.currentURL == dest else { return }   // navigated away
+                guard let self else { return }
+                guard self.currentURL == dest else {
+                    // A real, invisible loss: the volume check is a stat per item (a round trip
+                    // each over SMB), and a spring-load or a click during it changes the folder
+                    // out from under the drop. Nothing was moved and nothing said so.
+                    navLog("drop ABANDONED: the folder changed from \(dest.path) to \(self.currentURL.path) while the move-or-copy decision was being made — \(urls.count) item(s) were not transferred")
+                    return
+                }
+                navLog("drop resolved: \(same ? "MOVE" : "COPY") \(urls.count) item(s) → \(dest.path) (same volume: \(same))")
                 self.copyURLs(urls, move: same)
             }
         }
@@ -5325,11 +5865,19 @@ final class Browser: ObservableObject, Identifiable {
     // Google Drive onto a local folder deleted the original — Finder copies.
     func dropInto(_ incoming: [URL], folder: URL) {
         let urls = incoming.filter { $0.isFileURL }   // see dropIntoCurrentFolder
-        guard !urls.isEmpty else { return }
+        guard !urls.isEmpty else {
+            navLog(DropLogLine.text(surface: "drop into folder", types: DropLog.pasteboardTypes(),
+                                    items: incoming.count, fileURLs: 0, target: folder.path,
+                                    outcome: .acceptedButInert(.noFileURLs(tokens: incoming.count))))
+            return
+        }
         SpringLoader.shared.noteDrop()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let same = Browser.shouldMove(urls, into: folder)
-            DispatchQueue.main.async { self?.importURLs(urls, into: folder, move: same) }
+            DispatchQueue.main.async {
+                navLog("drop resolved: \(same ? "MOVE" : "COPY") \(urls.count) item(s) → \(folder.path) (same volume: \(same))")
+                self?.importURLs(urls, into: folder, move: same)
+            }
         }
     }
 
@@ -5346,7 +5894,18 @@ final class Browser: ObservableObject, Identifiable {
     // Import (move or copy) dropped items into a target directory (a folder row or another tab).
     func importURLs(_ urls: [URL], into dir: URL, move: Bool) {
         let sources = urls.filter { $0.deletingLastPathComponent().path != dir.path && $0.path != dir.path }
-        guard !sources.isEmpty else { return }
+        guard !sources.isEmpty else {
+            // "It already lives there." A drop onto the folder a file is already in does
+            // nothing, correctly — and looks exactly like drag and drop being broken, which is
+            // the complaint this whole investigation started from.
+            // No pasteboard types on this one: `importURLs` also serves Send To…, which is a menu
+            // command with no drag behind it, and reporting the LAST drag's types there would be
+            // a plausible-looking lie. The surface line above already carries them for real drops.
+            navLog(DropLogLine.text(surface: "import into folder", types: [],
+                                    items: urls.count, fileURLs: urls.count, target: dir.path,
+                                    outcome: .acceptedButInert(.nothingToDo("all \(urls.count) item(s) are already in this folder"))))
+            return
+        }
         performTransfer(sources, into: dir, move: move, resetCut: false)
     }
 
@@ -5405,6 +5964,7 @@ final class Browser: ObservableObject, Identifiable {
         let recursive = sources.filter { Browser.isSelfOrDescendant(dir, of: $0) }
         if !recursive.isEmpty {
             let names = recursive.map { "“\($0.lastPathComponent)”" }.joined(separator: ", ")
+            navLog("transfer REFUSED: \(DropRejection.selfOrDescendant(count: recursive.count).reason) — \(names) → \(dir.path)")
             reportFileError(recursive.count == 1 ? "\(names) can’t be \(move ? "moved" : "copied") into itself"
                                                 : "\(recursive.count) folders can’t be \(move ? "moved" : "copied") into themselves",
                             "A folder can’t be \(move ? "moved" : "copied") into itself or into one of its own subfolders. Pick a destination outside \(names).",
@@ -5452,6 +6012,7 @@ final class Browser: ObservableObject, Identifiable {
                 }
                 sem.wait()
                 if cancel {
+                    navLog("transfer CANCELLED at the name-conflict prompt: nothing was \(move ? "moved" : "copied") → \(dir.path)")
                     DispatchQueue.main.async {
                         slowHint.cancel(); TransferProgressController.shared.hide()
                         self.busy = false; self.busyText = ""; self.slowNetwork = false
@@ -5462,6 +6023,10 @@ final class Browser: ObservableObject, Identifiable {
             var moved: [(from: URL, to: URL)] = []
             var copied: [URL] = []
             var failures: [(name: String, reason: String)] = []
+            /// Counted rather than derived, so the summary line can tell "the user chose Skip
+            /// for all three" apart from "three transfers silently failed" — the alert cannot,
+            /// and those two look identical in the destination folder.
+            var skipped = 0
             let total = sources.count
             DispatchQueue.main.async { progress.total = total }
             let step = max(1, total / 50)
@@ -5483,7 +6048,7 @@ final class Browser: ObservableObject, Identifiable {
                     dest = self.numberedCopyDest(dir, src.lastPathComponent)
                 } else if conflictNames.contains(src.lastPathComponent) {
                     switch policy {
-                    case .skip: base += sizes[i]; continue
+                    case .skip: base += sizes[i]; skipped += 1; continue
                     case .replace: try? fm.removeItem(at: target)
                     case .keepBoth: dest = self.uniqueDest(dir, src.lastPathComponent)
                     }
@@ -5514,6 +6079,13 @@ final class Browser: ObservableObject, Identifiable {
                         if move { try? fm.removeItem(at: src); moved.append((src, dest)) }
                         else { copied.append(dest) }
                     } catch let e {
+                        // Per-file and with the UNDERLYING error, because the alert shows at
+                        // most five failures and only when there are any — so a drop that moved
+                        // two of three files reported complete success. `error` here is the
+                        // second failure (the fallback copy); the first is named too, since a
+                        // cross-volume move failing and then the copy failing are different
+                        // stories with different fixes (permissions vs. disk full vs. SMB).
+                        navLog("transfer FAILED: “\(src.lastPathComponent)” → \(dest.path) — \(e.localizedDescription) (first attempt: \(error.localizedDescription))")
                         failures.append((src.lastPathComponent, e.localizedDescription))
                     }
                 }
@@ -5527,6 +6099,9 @@ final class Browser: ObservableObject, Identifiable {
                     DispatchQueue.main.async { progress.done = d }
                 }
             }
+            navLog(TransferLogLine.summary(move: move, moved: moved.count, copied: copied.count,
+                                          failed: failures.count, skipped: skipped, total: total,
+                                          cancelled: progress.cancelled, target: dir.path))
             DispatchQueue.main.async {
                 slowHint.cancel()
                 TransferProgressController.shared.hide()
@@ -6419,6 +6994,7 @@ final class DragSessionTracker {
         // watchdog interval the previous drag's watch is often still armed — without this
         // the new session would get no end line at all.
         endWatch.cancel()
+        lastActivity = .now   // see secondsSinceActivity: the reset command's freshness guard
         let ticket = ledger.begin(source)
         endWatch.start(grace: DragStateRules.endWatchdogGrace) { [weak self] in
             // A no-op whenever the authoritative end did its job, or whenever a newer drag
@@ -6438,6 +7014,7 @@ final class DragSessionTracker {
         // Idempotent by arbitration, not by luck: if the watchdog already spoke for this
         // session, this end is a duplicate and stays quiet. THE BUG's second half was these
         // two paths both running, watchdog first, on every healthy drag.
+        lastActivity = .now
         guard ledger.closeAuthoritatively() != nil else { return false }
         endWatch.cancel()
         navLog("drag session end: \(source) — \(detail)")
@@ -6519,6 +7096,37 @@ final class DragSessionTracker {
         DragWedgeNotice.show()
     }
 
+    // MARK: Diagnostics and manual reset
+    //
+    // Read-only accessors plus one reset. They exist so the diagnostics dump and the reset
+    // command do not need this class's internals published — every field below stays private,
+    // which is what keeps the arbitration honest.
+
+    var inFlightSource: String? { ledger.inFlightSource }
+    var sessionsOpened: Int { ledger.sessionsOpened }
+    var refusalCount: Int { refusals }
+    var endWatchArmed: Bool { endWatch.isRunning }
+    /// How long since this tracker last saw anything happen. The reset command's only guard
+    /// against firing into a live drag that holds no mouse button (Drag Lock, three-finger
+    /// drag) — see DragResetRules.
+    var secondsSinceActivity: TimeInterval { (ContinuousClock.now - lastActivity) / .seconds(1) }
+    private var lastActivity = ContinuousClock.now
+
+    var stateSummary: String {
+        "in flight: \(ledger.inFlightSource ?? "none"), opened: \(ledger.sessionsOpened), refusals: \(refusals), end watch armed: \(endWatch.isRunning), recovery attempted: \(recoveryAttempted), user notified: \(userNotified)"
+    }
+
+    /// Drops everything this tracker owns. Only the manual command calls it, and it deliberately
+    /// makes no claim about AppKit's own registry — DragResetRules.outcome does that, honestly.
+    func resetForRecovery() {
+        _ = ledger.abandon()
+        endWatch.cancel()
+        refusals = 0
+        recoveryAttempted = false
+        userNotified = false
+        lastActivity = .now
+    }
+
     /// True when `beginDraggingSession` refused. `unsafeBitCast` and not `== nil` because
     /// the return type is imported non-optional: Swift folds an optional comparison away as
     /// statically-always-true, so the pointer has to be looked at directly. Verified against
@@ -6560,28 +7168,305 @@ enum DragWedgeNotice {
         a.addButton(withTitle: "Later")
         guard let win = NSApp.keyWindow ?? NSApp.mainWindow else {
             // No window to hang a sheet on. Worth one modal rather than losing the notice.
-            if a.runModal() == .alertFirstButtonReturn { relaunch() }
+            if a.runModal() == .alertFirstButtonReturn { relaunchNavigator() }
             return
         }
         a.beginSheetModal(for: win) { r in
             let restart = r == .alertFirstButtonReturn
             navLog("drag recovery: user chose \(restart ? "Restart Navigator" : "Later")")
-            if restart { relaunch() }
+            if restart { relaunchNavigator() }
         }
     }
+}
 
-    /// Same shape as the updater's helper, and for the same reason: a process cannot relaunch
-    /// itself, so a detached shell waits for this one to exit and then reopens the bundle.
-    private static func relaunch() {
-        let app = Bundle.main.bundleURL.path.replacingOccurrences(of: "'", with: "'\\''")
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = ["-c", "for i in $(seq 1 120); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done; /usr/bin/open '\(app)'"]
-        do { try p.run() } catch {
-            navLog("drag recovery: relaunch helper failed to start — \(error.localizedDescription)")
+/// Same shape as the updater's helper, and for the same reason: a process cannot relaunch
+/// itself, so a detached shell waits for this one to exit and then reopens the bundle.
+///
+/// At file scope because there are now two unrelated reasons to offer a relaunch — a wedged
+/// drag subsystem and a build sitting unused on disk — and a second copy of this would be a
+/// second place for the pgrep timeout to drift.
+func relaunchNavigator() {
+    let app = Bundle.main.bundleURL.path.replacingOccurrences(of: "'", with: "'\\''")
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/bash")
+    p.arguments = ["-c", "for i in $(seq 1 120); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done; /usr/bin/open '\(app)'"]
+    do { try p.run() } catch {
+        navLog("relaunch: helper failed to start — \(error.localizedDescription)")
+        return
+    }
+    NSApp.terminate(nil)
+}
+
+/// Which binary is actually executing, versus the one installed at the same path.
+///
+/// THE PROBLEM, and it is a measured one rather than a tidiness concern: `rebuild.sh` deletes
+/// and recreates `/Applications/Navigator.app` while the running process keeps executing the
+/// image it already mapped. The in-app updater compares the INSTALLED bundle's version string
+/// against GitHub, so after a local rebuild both read the same number and Check for Updates…
+/// answers "up to date" — while the process is running code from hours earlier. That is exactly
+/// how a drag-and-drop fix went on "not working" for an afternoon: the log showed behaviour the
+/// source no longer contained, because the source was not what was running.
+///
+/// The executable's modification date is the observable, NOT the version string, because during
+/// development the version deliberately does not change between builds. See RunningBuildRules
+/// for why a stat and not a hash.
+enum RunningBuild {
+    /// The stamp of the binary this process is actually executing.
+    ///
+    /// Captured by an explicit call at the top of launch rather than a lazy `static let`: a
+    /// lazy static is evaluated on FIRST ACCESS, and the first access is the stale-build check
+    /// itself — which would read the new binary's date as its own and never report anything.
+    private(set) static var runningStamp: Date?
+    /// The on-disk stamp the user has already been told about, so the notice is once per build
+    /// and not once per app activation. Deliberately in memory only: after a relaunch the
+    /// running binary IS the new one, so there is nothing left to remember.
+    private static var noticed: Date?
+
+    static func captureAtLaunch() {
+        runningStamp = installedStamp()
+        navLog("build: running executable stamped \(runningStamp.map(RunningBuildRules.stamp) ?? "unknown")")
+    }
+
+    /// The stamp of whatever is at our executable path right now — which after a rebuild is a
+    /// different file than the one we are executing.
+    static func installedStamp() -> Date? {
+        guard let exe = Bundle.main.executableURL else { return nil }
+        return (try? exe.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
+    static var isStale: Bool {
+        guard let running = runningStamp, let disk = installedStamp() else { return false }
+        return RunningBuildRules.isStale(runningBuiltAt: running, onDiskBuiltAt: disk)
+    }
+
+    /// One phrase shared by the log, Check for Updates…, About and the diagnostics dump, so
+    /// four places can never disagree about which build is running.
+    static var comparison: String {
+        guard let running = runningStamp, let disk = installedStamp() else {
+            return "cannot tell — the executable's modification date is unreadable"
+        }
+        return RunningBuildRules.describe(runningBuiltAt: running, onDiskBuiltAt: disk)
+    }
+
+    /// Cheap enough for every app activation: one stat, no read of the 19 MB binary.
+    static func checkAndNotify() {
+        guard let running = runningStamp, let disk = installedStamp(),
+              RunningBuildRules.shouldNotify(runningBuiltAt: running, onDiskBuiltAt: disk,
+                                             alreadyNoticed: noticed) else { return }
+        noticed = disk
+        navLog("build: STALE RUNNING BUILD — \(comparison). Everything logged from here describes code that is no longer on disk.")
+        notice()
+    }
+
+    /// Unobtrusive and non-blocking, for the same reason the drag-wedge notice is: a Photoshop
+    /// or Imagen batch may be mid-run behind this window and must not be gated on a dialog.
+    /// A sheet when there is a window to hang it on, and nothing louder anywhere.
+    static func notice() {
+        let a = NSAlert()
+        a.alertStyle = .informational
+        a.messageText = "Navigator was updated"
+        a.informativeText = """
+        A newer build is installed, but this window is still running the older one. Relaunch to \
+        use the new version.
+
+        Your open tabs come back on relaunch.
+        """
+        a.addButton(withTitle: "Relaunch")
+        a.addButton(withTitle: "Later")
+        guard let win = NSApp.keyWindow ?? NSApp.mainWindow else {
+            if a.runModal() == .alertFirstButtonReturn { relaunchNavigator() }
             return
         }
-        NSApp.terminate(nil)
+        a.beginSheetModal(for: win) { r in
+            let relaunch = r == .alertFirstButtonReturn
+            navLog("build: user chose \(relaunch ? "Relaunch" : "Later")")
+            if relaunch { relaunchNavigator() }
+        }
+    }
+}
+
+// MARK: - Manual reset and diagnostics dump
+
+/// Navigator ▸ Reset Drag & Drop, and Navigator ▸ Copy Drag Diagnostics.
+///
+/// Why these exist: the wedge's cure has always been "relaunch", which costs the user their
+/// session, and its diagnosis has always been "let me look at your machine", which is not always
+/// possible. These two commands are the substitutes — one tries the cheap repair and is honest
+/// when it cannot work, the other puts everything an absent diagnostician needs on the clipboard.
+///
+/// INERT UNLESS INVOKED. Nothing in here runs on any drag path; the only entry points are the two
+/// menu items. That is a requirement rather than an implementation detail — code that can clear
+/// drag state is code that can destroy a live drag, and this subsystem has been broken by exactly
+/// that class of accident more than once.
+enum DragReset {
+
+    /// Everything Navigator owns about the in-flight state of dragging, in one place. Also the
+    /// before/after snapshot the reset logs, which is what makes "the reset did nothing" a
+    /// readable outcome rather than a guess.
+    static func ownedStateSummary() -> String {
+        "tracker { \(DragSessionTracker.shared.stateSummary) } | spring { \(SpringLoader.shared.stateSummary) } | tabDrag { \(TabDrag.shared.stateSummary) } | keep-alive holding \(DragSourceKeepAlive.shared.heldCount) | buttons \(NSEvent.pressedMouseButtons)"
+    }
+
+    static func run() {
+        let before = ownedStateSummary()
+        // The guard, and it is the important part of this command. A reset fired into a live drag
+        // would tear down the drag the user is performing — turning a subsystem that sometimes
+        // fails into one that fails on demand. DragResetRules owns the decision (and its tests).
+        guard DragResetRules.mayReset(leftButtonDown: DragStateRules.leftButtonIsDown(NSEvent.pressedMouseButtons),
+                                      sessionInFlight: DragSessionTracker.shared.inFlightSource != nil,
+                                      secondsSinceDragActivity: DragSessionTracker.shared.secondsSinceActivity) else {
+            navLog("drag reset: REFUSED — a drag looks live right now (\(before))")
+            inform("A drag is in progress",
+                   "Let go of the drag first, then try Reset Drag & Drop again. Resetting mid-drag would cancel it.")
+            return
+        }
+        navLog("drag reset: BEFORE — \(before)")
+        // Ours, all of it: the session ledger and its watchdog, the spring loader's dwell timer
+        // and its own mouse-up watch, the tab-drag ledger and watch, every view pinned for a
+        // callback, and (via the notification) each file list's isDragActive lock plus the reload
+        // that lock was holding back.
+        DragSessionTracker.shared.resetForRecovery()
+        SpringLoader.shared.reset()
+        TabDrag.shared.reset()
+        DragSourceKeepAlive.shared.releaseAll()
+        NotificationCenter.default.post(name: .navigatorResetDragState, object: nil)
+        navLog("drag reset: AFTER — \(ownedStateSummary())")
+
+        // The honest part. Our reset cannot touch NSCoreDragManager's registry — there is no API
+        // to end a session this process did not start, and a real HID mouse-up was measured not
+        // to clear one either (see DragSessionTracker). So the message is decided by what AppKit
+        // says, not by what we just cleared.
+        let outcome = DragResetRules.outcome(appKitStillHoldsSession: DragLeakWatch.lastSessionStillRegistered())
+        navLog("drag reset: outcome \(outcome) — AppKit registry says \(DragLeakWatch.lastSessionStillRegistered().map(String.init(describing:)) ?? "cannot tell") for session \(DragLeakWatch.lastSequence.map(String.init) ?? "none")")
+        guard outcome == .relaunchRequired else {
+            inform("Drag and drop reset", DragResetRules.message(outcome))
+            return
+        }
+        // A relaunch is genuinely the only fix here, so offer it rather than describing it.
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = "Relaunch needed to fix dragging"
+        a.informativeText = DragResetRules.message(outcome) + "\n\nYour open tabs come back on relaunch."
+        a.addButton(withTitle: "Relaunch")
+        a.addButton(withTitle: "Later")
+        present(a) { if $0 { relaunchNavigator() } }
+    }
+
+    static func copyDiagnostics() {
+        let text = report()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        navLog("drag diagnostics: copied \(text.count) characters to the clipboard")
+        inform("Drag diagnostics copied",
+               "Paste them into a message. They describe Navigator's drag state, whether macOS is still holding a drag, and the last \(DragDiagnosticsReport.logTailLimit) drag-related log lines.")
+    }
+
+    /// Assembles the snapshot. Reads only — nothing here changes a single piece of drag state, so
+    /// it is safe to invoke at any moment, including mid-drag, which is exactly when the owner
+    /// will want it.
+    private static func report() -> String {
+        var s = DragDiagnosticsSnapshot()
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        s.appVersion = "\(version) (build \(build))"
+        s.buildComparison = RunningBuild.comparison
+        s.buildIsStale = RunningBuild.isStale
+        s.sessionInFlight = DragSessionTracker.shared.inFlightSource
+        s.sessionsOpened = DragSessionTracker.shared.sessionsOpened
+        s.refusals = DragSessionTracker.shared.refusalCount
+        s.leaksReported = DragLeakWatch.leaksReported
+        // The real lock value, read from the mirror the setter maintains — see
+        // FileTableCoordinator.lastLockWrite for why a mirror and not a live coordinator.
+        s.isDragActive = FileTableCoordinator.lastLockWrite?.value ?? false
+        s.isDragActiveAge = FileTableCoordinator.lastLockWrite.map { Date().timeIntervalSince($0.at) }
+        s.springState = SpringLoader.shared.stateSummary
+        s.mouseUpWatches = "tracker end watch: \(DragSessionTracker.shared.endWatchArmed), \(TabDrag.shared.stateSummary)"
+        s.keepAliveHeld = DragSourceKeepAlive.shared.heldCount
+        s.lastSessionSequence = DragLeakWatch.lastSequence
+        s.appKitHoldsLastSession = DragLeakWatch.lastSessionStillRegistered()
+        s.pressedMouseButtons = NSEvent.pressedMouseButtons
+        s.logTail = DragDiagnosticsReport.dragLines(from: (try? String(contentsOf: navLogURL, encoding: .utf8)) ?? "")
+        return DragDiagnosticsReport.text(s)
+    }
+
+    /// A sheet where there is a window, a modal only as a fallback — the same rule the drag-wedge
+    /// notice follows, for the same reason: a Photoshop or Imagen batch may be running behind this
+    /// window and must not be gated on a dialog.
+    private static func inform(_ title: String, _ body: String) {
+        let a = NSAlert()
+        a.alertStyle = .informational
+        a.messageText = title
+        a.informativeText = body
+        a.addButton(withTitle: "OK")
+        present(a) { _ in }
+    }
+
+    private static func present(_ a: NSAlert, _ done: @escaping (Bool) -> Void) {
+        guard let win = NSApp.keyWindow ?? NSApp.mainWindow else {
+            done(a.runModal() == .alertFirstButtonReturn)
+            return
+        }
+        a.beginSheetModal(for: win) { done($0 == .alertFirstButtonReturn) }
+    }
+}
+
+// MARK: - Drop destination diagnostics
+
+/// The DESTINATION side's one log call, for every drop surface in the app.
+///
+/// THE BLIND SPOT this closes. Every drag line the log had was source-side: "drag start",
+/// "drag session end", "REFUSED", "LEAKED". So a session that started and ended cleanly counted
+/// as a healthy drag even when the drop it ended in was silently declined — which is how a log
+/// showing twelve clean sessions and a user reporting "drag and drop is broken" were both
+/// correct at once. Drops INTO Navigator from Photoshop and Chrome are the traffic this owner
+/// actually cares about, and until now they left no trace of any kind unless they succeeded.
+///
+/// Strictly observational: every call site logs what it already decided and returns exactly
+/// what it returned before. Nothing here reads or writes drag state, consumes an event, or
+/// touches an operation mask — the pasteboard is only ever asked for its type list.
+enum DropLog {
+    /// What the in-flight drag is advertising. Read from the drag pasteboard rather than
+    /// tracked, for the same reason SpringLoader.draggedFiles is: a SwiftUI `dropDestination`
+    /// closure is handed decoded URLs and nothing else, and drags from other apps were never
+    /// ours to track. `types` is a read; it cannot disturb the drag.
+    static func pasteboardTypes() -> [String] {
+        (NSPasteboard(name: .drag).types ?? []).map(\.rawValue)
+    }
+
+    /// The count that matters at every surface: how many of the dropped items are things this
+    /// app can actually put somewhere. `dropInto`/`dropIntoCurrentFolder` filter on exactly
+    /// this, so a zero here IS the reason a drop did nothing.
+    static func usable(_ urls: [URL]) -> Int { urls.filter(\.isFileURL).count }
+
+    static func log(_ surface: String, _ urls: [URL], target: URL?, _ outcome: DropLogLine.Outcome) {
+        navLog(DropLogLine.text(surface: surface, types: pasteboardTypes(),
+                                items: urls.count, fileURLs: usable(urls),
+                                target: target?.path, outcome: outcome))
+    }
+
+    static func accepted(_ surface: String, _ urls: [URL], target: URL?, _ what: String) {
+        log(surface, urls, target: target, .accepted(what))
+    }
+    static func refused(_ surface: String, _ urls: [URL], target: URL?, _ why: DropRejection) {
+        log(surface, urls, target: target, .refused(why))
+    }
+    static func inert(_ surface: String, _ urls: [URL], target: URL?, _ why: DropRejection) {
+        log(surface, urls, target: target, .acceptedButInert(why))
+    }
+
+    /// A file-only surface's accept-or-explain decision, made once instead of eight times.
+    /// Returns true when the caller should proceed — the caller's own behaviour is unchanged,
+    /// this only decides which line gets logged.
+    @discardableResult
+    static func fileDrop(_ surface: String, _ urls: [URL], target: URL?, _ what: String) -> Bool {
+        guard let why = DropRejection.forFileDrop(items: urls.count, fileURLs: usable(urls)) else {
+            accepted(surface, urls, target: target, what)
+            return true
+        }
+        // Inert rather than refused: these surfaces return true to AppKit regardless, so the
+        // user saw the drop succeed. That gap is the whole point of the distinction.
+        inert(surface, urls, target: target, why)
+        return false
     }
 }
 
@@ -6692,6 +7577,21 @@ final class SpringLoader {
         didDrop = false
     }
 
+    var stateSummary: String {
+        "armed on: \(armed?.lastPathComponent ?? "nothing"), dwell timer: \(dwell != nil ? "running" : "idle"), spring-back origin: \(origin?.lastPathComponent ?? "none"), watch armed: \(watch.isRunning), drop seen: \(didDrop)"
+    }
+
+    /// Everything torn down, and DELIBERATELY without the spring-back navigation `finish` does.
+    /// The reset command runs when the user believes dragging is broken; navigating their window
+    /// somewhere else at that moment would be a second surprise on top of the first.
+    func reset() {
+        cancel()
+        watch.cancel()
+        origin = nil
+        sprung = nil
+        didDrop = false
+    }
+
     /// What the in-flight drag is actually carrying, read from the drag pasteboard.
     ///
     /// Read from the pasteboard rather than tracked from our own drag sources, because
@@ -6757,6 +7657,19 @@ final class TabDrag {
     /// SECOND drag's tab. See TabTearOffRules for the bug class.
     private var ledger = DragSessionLedger()
     private let watch = MouseUpWatch()
+
+    var stateSummary: String {
+        "in flight: \(ledger.inFlightSource ?? "none"), tab drags opened: \(ledger.sessionsOpened), watch armed: \(watch.isRunning)"
+    }
+
+    /// The reset command's share. Abandoning the ledger entry is what makes the pending release
+    /// poll a no-op, so no tab can be torn off by a watch left over from a drag the user has
+    /// already given up on.
+    func reset() {
+        _ = ledger.abandon()
+        watch.cancel()
+        model = nil
+    }
 
     func begin(model: AppModel, index: Int) {
         self.model = model
@@ -6919,9 +7832,21 @@ struct SidebarView: View {
                         .fill(Color.accentColor.opacity(targeted ? 0.35 : 0))
                 )
                 .dropDestination(for: URL.self) { urls, _ in
-                    guard let first = urls.first else { return false }
+                    // Every `return false` below used to be silent, and a silently-declined
+                    // drop on a sidebar row is indistinguishable from a drop that missed the
+                    // row entirely. The logging is observational only: each branch returns
+                    // exactly what it returned before.
+                    let surface = "sidebar row “\(folder.lastPathComponent)”"
+                    guard let first = urls.first else {
+                        DropLog.refused(surface, urls, target: folder, .noReadableTypes)
+                        return false
+                    }
                     if let src = ReorderToken.path(of: first) {
-                        guard let onto = reorderOnto else { return false }
+                        guard let onto = reorderOnto else {
+                            DropLog.refused(surface, urls, target: folder, .notAReorderTarget)
+                            return false
+                        }
+                        DropLog.accepted(surface, urls, target: folder, "favorite reorder onto \(onto)")
                         FavoritesStore.shared.reorder(from: src, onto: onto)
                         return true
                     }
@@ -6929,7 +7854,14 @@ struct SidebarView: View {
                     // is nothing sane to do — dropInto would alert about copying a
                     // folder into itself for what was obviously just a missed aim.
                     let safe = urls.filter { !PathRules.isSelfOrDescendant(folder, of: $0) }
-                    guard !safe.isEmpty else { return false }
+                    guard !safe.isEmpty else {
+                        DropLog.refused(surface, urls, target: folder,
+                                        DropRejection.forFileDrop(items: urls.count, fileURLs: DropLog.usable(urls))
+                                        ?? .selfOrDescendant(count: urls.count))
+                        return false
+                    }
+                    DropLog.accepted(surface, urls, target: folder,
+                                     "into folder (\(safe.count) of \(urls.count) item(s) usable)")
                     browser.dropInto(safe, folder: folder)
                     return true
                 } isTargeted: { t in
@@ -6970,6 +7902,11 @@ struct SidebarView: View {
             // and NavWindow.sendEvent gives it the exact mouseDown boundary it never had.
             if enabled {
                 content.onDrag {
+                    // The start line this source never had. Its END was already logged (the
+                    // tracker's polled watch supplies it), which made the log strictly
+                    // misleading: an end with no start reads like a session that leaked from
+                    // nowhere. One line per drag, matching the icon grid's wording.
+                    navLog("sidebar reorder drag start: “\((path as NSString).lastPathComponent)” — carries a navreorder token, not a file")
                     DragSessionTracker.shared.began("sidebar reorder")
                     return ReorderToken.provider(path)
                 }
@@ -7048,6 +7985,7 @@ struct SidebarView: View {
                     // file surfaces, these two sidebar handlers call neither.
                     SpringLoader.shared.noteDrop()
                     if let src = urls.first.flatMap(ReorderToken.path(of:)) {
+                        DropLog.accepted("sidebar Recents row", urls, target: nil, "move favorite “\(src)” to the top")
                         favStore.moveToTop(path: src)
                         return true
                     }
@@ -7056,6 +7994,14 @@ struct SidebarView: View {
                     // always beats its section's), so it has to do that job itself
                     // rather than swallow the drop.
                     let dirs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+                    guard !dirs.isEmpty else {
+                        // Dropping FILES here has always done nothing (only folders can be
+                        // pinned) and never said so — this row sits directly above the first
+                        // favorite, so it collects a lot of near-misses.
+                        DropLog.refused("sidebar Recents row", urls, target: nil, .wrongKind("folders to pin"))
+                        return false
+                    }
+                    DropLog.accepted("sidebar Recents row", urls, target: nil, "pinned \(dirs.count) folder(s)")
                     dirs.forEach { favStore.add($0) }
                     return !dirs.isEmpty
                 } isTargeted: { recentsTargeted = $0 }
@@ -7070,7 +8016,13 @@ struct SidebarView: View {
             }
             .dropDestination(for: URL.self) { urls, _ in
                 SpringLoader.shared.noteDrop()   // see the Recents row above
-                for u in urls where (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { favStore.add(u) }
+                let dirs = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+                // Returns true either way (unchanged), so a drop of files onto the section
+                // background looked like it pinned something and did not. That is the NO-OP
+                // category, not a refusal.
+                if dirs.isEmpty { DropLog.inert("sidebar Favorites section", urls, target: nil, .wrongKind("folders to pin")) }
+                else { DropLog.accepted("sidebar Favorites section", urls, target: nil, "pinned \(dirs.count) folder(s)") }
+                dirs.forEach { favStore.add($0) }
                 return true
             }
             if !recents.urls.isEmpty {
@@ -7937,8 +8889,11 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 Button("Open in New Tab") { model.newTab(at: it.url) }
                 Button("Open in Second Pane") { model.openInSecondPane(it.url) }
             }
-            if let pair = browser.imagePair(ids) {
-                Button("Swipe Compare") { CompareController.show(left: pair.0, right: pair.1) }
+            let cmp = browser.compareImages(ids)
+            if CompareCycle.isAvailable(imageCount: cmp.count) {
+                Button(cmp.count > 2 ? "Swipe Compare (\(cmp.count) images)" : "Swipe Compare") {
+                    CompareController.show(images: cmp)
+                }
             }
             let selURLs = browser.items.filter { ids.contains($0.id) }.map { $0.url }
             if selURLs.contains(where: { !$0.hasDirectoryPath }) { OpenWithMenu(urls: selURLs.filter { !$0.hasDirectoryPath }) }
@@ -7982,6 +8937,11 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                             imagen: { f in browser.upscaleImagen(ids, factor: f) })
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
                     browser.refreshAndReveal([out])
+                }
+                let layerCount = browser.items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.count
+                Button { browser.layerize(ids) } label: {
+                    serviceLabel(layerCount == 1 ? "Layerize (AI)…" : "Layerize (AI)… (\(layerCount) images)",
+                                 ServiceIcon.fal)
                 }
             } else if browser.items.filter({ ids.contains($0.id) }).count == 1,
                       browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
@@ -8198,6 +9158,13 @@ final class DragSourceKeepAlive {
     private var held: [ObjectIdentifier: AnyObject] = [:]
     private let backstop: TimeInterval = 120
 
+    var heldCount: Int { held.count }
+
+    /// The reset command's share of the work. Safe because the retained objects are only pinned
+    /// so AppKit can call back into them: dropping the last reference cannot break a callback
+    /// that is no longer coming, and the 120s backstop would have done this anyway.
+    func releaseAll() { held.removeAll() }
+
     func retain(_ obj: AnyObject) {
         let key = ObjectIdentifier(obj)
         held[key] = obj
@@ -8232,12 +9199,36 @@ enum DragLeakWatch {
         return unsafeBitCast(imp, to: Lookup.self)(mgr, sel, seq) != nil
     }
 
+    /// The most recent session this app started, and the only handle it has on AppKit's registry
+    /// after the fact: `draggingSessionWithSequenceNumber:` can only be asked about a sequence
+    /// number we know. Kept so the diagnostics dump and the reset command can answer the ONE
+    /// question that decides whether a relaunch is required, at the moment they are asked rather
+    /// than only on the retirement-grace timer.
+    private(set) static var lastSequence: Int?
+    /// Leaks reported this process. A wedge is a one-way door, so any number above zero means
+    /// dragging has been dead since that line was written.
+    private(set) static var leaksReported = 0
+
+    /// Whether AppKit still lists our last session as in flight — nil when the private registry
+    /// cannot be read at all, which is a genuinely different answer from "no" and is reported as
+    /// such everywhere it is used.
+    /// Deliberately "cannot tell" and not "clear" when no sequence number has been recorded: the
+    /// registry can only be asked about a session we know the number of, and the two SwiftUI
+    /// `.onDrag` sources (sidebar rows, tabs) never hand us an NSDraggingSession at all. Reporting
+    /// their absence as health is exactly the kind of false negative that lost this bug twice.
+    static func lastSessionStillRegistered() -> Bool? {
+        guard let seq = lastSequence else { return nil }
+        return stillRegistered(seq)
+    }
+
     static func watch(_ session: NSDraggingSession, source: String) {
         let seq = session.draggingSequenceNumber
+        lastSequence = seq
         DispatchQueue.main.asyncAfter(deadline: .now() + DragLeakRules.retirementGrace) {
             guard let registered = stillRegistered(seq) else { return }
             guard DragLeakRules.isLeaked(stillRegisteredWithAppKit: registered,
                                          secondsSinceDragEnd: DragLeakRules.retirementGrace) else { return }
+            leaksReported += 1
             navLog("drag session LEAKED: \(source) — AppKit still has drag \(seq) registered as in flight \(Int(DragLeakRules.retirementGrace))s after it ended, so it never retired it. Every further beginDraggingSession in this process will be REFUSED until relaunch. THIS LINE IS THE BUG REPORT.")
         }
     }
@@ -8314,6 +9305,14 @@ private final class ClickTimingTableView: NSTableView {
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         let op = super.draggingEntered(sender)
         onDragActive?(true)
+        // The arrival line for the app's busiest drop surface, and the ONE place a drag from
+        // Photoshop or Chrome announces itself before any accept/reject decision exists. An
+        // enter/exit edge, not a mouse move — draggingEntered fires once per crossing, unlike
+        // validateDrop. `op` is logged, never altered: what AppKit decided is the fact worth
+        // recording, because a `[]` here means the drop was over before we saw the payload.
+        let types = (sender.draggingPasteboard.types ?? []).map(\.rawValue)
+        let urls = (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL]) ?? []
+        navLog("drag entered: file list — \(sender.numberOfValidItemsForDrop) valid item(s), \(urls.filter(\.isFileURL).count) usable file URL(s), types [\(types.joined(separator: ", "))], AppKit proposed mask \(op.rawValue)")
         DispatchQueue.main.async { [weak self] in self?.onDragTargeted?(true) }
         return op
     }
@@ -8617,8 +9616,14 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     /// they are equally good evidence that AppKit was just talking to us about a drag.
     fileprivate var isDragActive: Bool {
         get { dragActive }
-        set { dragActive = newValue; lastDragCallback = .now }
+        set { dragActive = newValue; lastDragCallback = .now; Self.lastLockWrite = (newValue, .now) }
     }
+    /// Diagnostics-only mirror of the most recent write to ANY pane's lock, so the drag
+    /// diagnostics dump can report the real value instead of a proxy for it. There is one
+    /// coordinator per pane per window and they come and go with SwiftUI's view lifetime, so
+    /// last-writer-wins with a timestamp is the honest summary — and it is exactly what a reader
+    /// wants anyway: whether the lock a drag just set is still set.
+    fileprivate static var lastLockWrite: (value: Bool, at: Date)?
     private var dragActive = false
     /// The folder the last reload was built from — the one thing `isDragActive` lets
     /// through, so a spring-loaded folder actually appears while the drag continues.
@@ -8691,6 +9696,8 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
             NotificationCenter.default.addObserver(self, selector: #selector(dragSafetyNet(_:)),
                                                    name: name, object: nil)
         }
+        NotificationCenter.default.addObserver(self, selector: #selector(resetDragStateOnDemand(_:)),
+                                               name: .navigatorResetDragState, object: nil)
         table.onMouseDown = { [weak self] in
             // Runs before the click is acted on, so the resync happens while the row
             // indices this click is about to use are still being recomputed.
@@ -8795,6 +9802,8 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
     /// frozen for the rest of the process, which is the more expensive failure by far.
     private func endListDrag(via: String) {
         isDragActive = false
+        // So the NEXT drag logs its aim rather than being suppressed as an unchanged repeat.
+        lastValidatedTarget = nil
         if DragSessionTracker.shared.ended("list view",
                                            (dropLandedThisDrag ? "dropped" : "cancelled or taken by another app")
                                            + " (\(via))") {
@@ -8889,12 +9898,34 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
                                                       isFreshMouseDown: isFreshMouseDown,
                                                       secondsSinceDragCallback: quiet) else { return }
         navLog("drag state: cleared STALE isDragActive at \(reason) after \(String(format: "%.1f", quiet))s quiet — the file list had stopped reloading; a drag ended without clearing its lock")
+        forceClearDragState()
+    }
+
+    /// The repair itself, with no decision in it. Two callers: the safety net above (which owns
+    /// the decision) and the manual Reset Drag & Drop command (where the user has made it). One
+    /// body rather than two, because the thing that makes the table usable again is the `reload()`
+    /// below and a second copy is a second place to forget it.
+    private func forceClearDragState() {
         isDragActive = false
+        lastValidatedTarget = nil
         SpringLoader.shared.cancel()
+        // The deferred refresh: `reload()` refuses to touch the table while the lock is held, so
+        // whatever the drag held back is still pending. With the lock now clear, this is it.
         reload()
         // The highlight is SwiftUI state, so it keeps the deferred hop every other writer
         // of it uses — the repair above is what actually unwedges the table.
         DispatchQueue.main.async { [weak self] in self?.isTargetedBinding?.wrappedValue = false }
+    }
+
+    /// Manual reset, from Navigator ▸ Reset Drag & Drop. A notification rather than a registry of
+    /// live coordinators: there is one of these per pane per window, they come and go with
+    /// SwiftUI's view lifetime, and this class already observes two other app-wide notifications
+    /// for the safety net. Unconditional by design — the command's own guard (DragResetRules) has
+    /// already established that no drag can be in flight, and a coordinator that second-guessed
+    /// it could leave exactly one pane frozen.
+    @objc private func resetDragStateOnDemand(_ n: Notification) {
+        navLog("drag reset: file list lock was \(isDragActive), reload path \(lastReloadPath ?? "none") — clearing")
+        forceClearDragState()
     }
 
     @objc private func didScroll(_ n: Notification) { browser.topVisibleID = topVisibleItemID() }
@@ -9199,44 +10230,92 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         return (hovered, item.url)
     }
 
+    /// The last drop target `validateDrop` logged, so that callback logs state CHANGES only.
+    ///
+    /// Load-bearing restraint: validateDrop fires on every mouse move for the whole duration of
+    /// a drag, so a line per call would bury every other line in the log and make the file the
+    /// bug report is read from useless. What is worth knowing is where the drop was AIMED as it
+    /// moved — and, above all, the first refusal, which was previously an invisible `return []`.
+    private var lastValidatedTarget: String?
+
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int,
                    proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
-        guard info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) else { return [] }
+        guard info.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: nil) else {
+            // The silent refusal. Nothing in the app said a word about it, and from the outside
+            // it is identical to a drag that never arrived: no highlight, no drop, no error.
+            noteValidated("REFUSED: \(DropRejection.noReadableTypes.reason) — types [\((info.draggingPasteboard.types ?? []).map(\.rawValue).joined(separator: ", "))]",
+                          alwaysWorthLogging: true)
+            return []
+        }
         isDragActive = true
         if let hit = folderRow(under: info, in: tableView) {
             // Spring-loading hangs off validateDrop because it is already the one place
             // that knows which folder row the pointer is over, and AppKit calls it on
             // every mouse move — exactly the signal a dwell timer needs.
             SpringLoader.shared.hover(folder: hit.url, browser: browser)
+            noteValidated("folder row “\(hit.url.lastPathComponent)”")
             // Retarget explicitly so acceptDrop is guaranteed to see this exact row with
             // .on, no matter what was proposed.
             tableView.setDropRow(hit.row, dropOperation: .on)
             return .copy
         }
         SpringLoader.shared.cancel()   // over empty space or a file: nothing to spring into
+        noteValidated("current folder “\(browser.currentURL.lastPathComponent)”")
         // Empty space, a file row, or between rows → the current folder, which is what
         // Finder does for a drop that isn't aimed at a specific folder.
         tableView.setDropRow(-1, dropOperation: .on)
         return .copy
     }
 
+    /// Log gate for validateDrop. Purely a gate: the caller's return value is decided before this
+    /// is called and is never influenced by it.
+    ///
+    /// ONE accepted-aim line per drag, not one per target change, and that restraint is
+    /// deliberate. validateDrop fires on every mouse move, so a drag swept across a folder-heavy
+    /// listing would emit a line per row crossed — dozens of file writes, and worse, it would push
+    /// the lines that matter out of the diagnostics dump's 40-line tail. The final target is
+    /// already logged by acceptDrop, and the intermediate ones by the spring loader when they
+    /// matter. A REFUSAL is different: it is the thing that was previously invisible, it means the
+    /// drag cannot be dropped here at all, and it can only change when the payload does.
+    private func noteValidated(_ target: String, alwaysWorthLogging: Bool = false) {
+        defer { lastValidatedTarget = target }
+        guard lastValidatedTarget != target else { return }
+        guard alwaysWorthLogging || lastValidatedTarget == nil else { return }
+        navLog("drag over file list: aimed at \(target)")
+    }
+
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int,
                    dropOperation: NSTableView.DropOperation) -> Bool {
         isDragActive = false
         dropLandedThisDrag = true
+        lastValidatedTarget = nil
         guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
-              !urls.isEmpty else { return false }
+              !urls.isEmpty else {
+            // A drop AppKit offered us and we then declined, with nothing logged either side of
+            // it. Reachable whenever validateDrop's `canReadObject` said yes and the actual read
+            // came back empty — a promised file the source never wrote, for instance.
+            DropLog.refused("file list", [], target: browser.currentURL, .noReadableTypes)
+            return false
+        }
         // Re-hit-test rather than trusting `row`: validateDrop already retargeted, but
         // this keeps the two paths deciding the same way from the same input.
         if let hit = folderRow(under: info, in: tableView) {
             // Never drop a folder into itself or its own subtree — FileManager will
             // happily recurse into the copy it's creating. PathRules has the rule.
             let safe = urls.filter { !PathRules.isSelfOrDescendant(hit.url, of: $0) }
-            guard !safe.isEmpty else { NSSound.beep(); return false }
-            navLog("drop: \(safe.count) item(s) onto folder \(hit.url.lastPathComponent)")
+            guard !safe.isEmpty else {
+                // The beep was the only feedback this ever gave, and a beep does not say which
+                // of the two possible reasons it was.
+                DropLog.refused("file list folder row “\(hit.url.lastPathComponent)”", urls, target: hit.url,
+                                DropRejection.forFileDrop(items: urls.count, fileURLs: DropLog.usable(urls))
+                                ?? .selfOrDescendant(count: urls.count))
+                NSSound.beep(); return false
+            }
+            DropLog.accepted("file list folder row “\(hit.url.lastPathComponent)”", urls, target: hit.url,
+                             "into folder (\(safe.count) of \(urls.count) item(s) usable)")
             browser.dropInto(safe, folder: hit.url)
         } else {
-            navLog("drop: \(urls.count) item(s) into current folder")
+            DropLog.fileDrop("file list", urls, target: browser.currentURL, "into current folder")
             browser.dropIntoCurrentFolder(urls)
         }
         return true
@@ -9764,6 +10843,12 @@ struct IconGridView: View {
             // "it selects it and deselects it". Confirmed live. Selection, open, and
             // rename arming all live in IconCellMouseHandler alone.
             .dropDestination(for: URL.self) { urls, _ in
+                // Always returned true, and still does — so a payload the Browser then filters
+                // away (a stray sidebar/tab token) presented as a successful drop and moved
+                // nothing. DropLog.fileDrop only chooses which line describes that.
+                DropLog.fileDrop("icon cell “\(item.name)”", urls,
+                                 target: item.isDirectory ? item.url : browser.currentURL,
+                                 item.isDirectory ? "into folder" : "into current folder")
                 if item.isDirectory { browser.dropInto(urls, folder: item.url) }
                 else { browser.dropIntoCurrentFolder(urls) }
                 return true
@@ -10001,6 +11086,9 @@ struct GalleryView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 6))
                                 .id(it.id)
                                 .dropDestination(for: URL.self) { urls, _ in
+                                    DropLog.fileDrop("filmstrip cell “\(it.name)”", urls,
+                                                     target: it.isDirectory ? it.url : browser.currentURL,
+                                                     it.isDirectory ? "into folder" : "into current folder")
                                     if it.isDirectory { browser.dropInto(urls, folder: it.url) }
                                     else { browser.dropIntoCurrentFolder(urls) }
                                     return true
@@ -10131,7 +11219,9 @@ struct TabItemView: View {
         // bug that broke sidebar favorite reordering. Told apart by what they are, like the
         // sidebar does (TabDragToken / ReorderToken). Do NOT add a second drop modifier.
         .dropDestination(for: URL.self) { urls, _ in
+            let surface = "tab \(index + 1) of \(model.tabs.count)"
             if let src = urls.first.flatMap({ TabDragToken.index(of: $0, model: model) }) {
+                DropLog.accepted(surface, urls, target: nil, "tab reorder \(src) → \(index)")
                 // Released ON a tab, so this was a reorder however far the pointer roamed —
                 // including a release back on the source tab, which does nothing. Either
                 // way it must not also tear the tab off into a new window.
@@ -10139,6 +11229,10 @@ struct TabItemView: View {
                 model.moveTab(from: src, to: index)
                 return true
             }
+            // A tab from ANOTHER window's strip lands here: its token is a URL but not one this
+            // model recognises, so it fell through to a file drop that then filtered it away.
+            // Unchanged behaviour, now with a line saying the drop did nothing.
+            DropLog.fileDrop(surface, urls, target: browser.currentURL, "into this tab's folder")
             browser.dropInto(urls, folder: browser.currentURL)
             onSelect(); return true
         } isTargeted: { dropTargeted = $0 }
@@ -10155,6 +11249,9 @@ struct TabItemView: View {
             // `.onDrag` (an AppKit mouse overlay here would fight the .onTapGesture below for
             // the click), with the leak made impossible instead of watched — a ticketed ledger
             // in TabDrag, and the mouseDown boundary from NavWindow.sendEvent.
+            //
+            // Same gap as the sidebar's: this source's end was logged and its start was not.
+            navLog("tab drag start: tab \(index + 1) of \(model.tabs.count) (\(browser.currentURL.lastPathComponent)) — carries a navtab token, not a file")
             DragSessionTracker.shared.began("tab")
             return TabDragToken.provider(model: model, index: index)
         }
@@ -10228,6 +11325,11 @@ struct BrowserContent: View {
                 }
             }
             .dropDestination(for: URL.self) { urls, _ in
+                // The whole-content-area fallback: this is what catches a drop from Photoshop
+                // or Chrome that lands between rows, on empty space, or on a surface with no
+                // handler of its own. Being the fallback makes it the one most worth naming in
+                // the log — "which surface actually took it" is otherwise a guess.
+                DropLog.fileDrop("file view background", urls, target: browser.currentURL, "into current folder")
                 browser.dropIntoCurrentFolder(urls); return true
             }
             Divider()
@@ -11137,36 +12239,86 @@ struct SwipeCompare: NSViewRepresentable {
     func updateNSView(_ v: CompareView, context: Context) { v.leftImage = left; v.rightImage = right; v.needsDisplay = true }
 }
 
+/// Swipe Compare over N images: the LEFT side stays fixed as the reference and the right side
+/// steps through every other selected image with ← / →. Judging a bake-off of upscalers means
+/// comparing each candidate against the same baseline; with only two images this behaves
+/// exactly as it always did.
 struct SwipeCompareView: View {
-    let leftURL: URL, rightURL: URL
-    @State private var leftImg: NSImage?
-    @State private var rightImg: NSImage?
+    let urls: [URL]
+    @State private var leftIndex: Int
+    @State private var rightSlot: Int = 0          // index INTO `candidates`
+    @State private var cache: [URL: NSImage] = [:]
+
+    init(urls: [URL], leftIndex: Int = 0) {
+        self.urls = urls
+        _leftIndex = State(initialValue: min(max(0, leftIndex), max(0, urls.count - 1)))
+    }
+
+    private var candidates: [Int] { CompareCycle.candidates(total: urls.count, leftIndex: leftIndex) }
+    private var leftURL: URL { urls[min(leftIndex, urls.count - 1)] }
+    private var rightURL: URL {
+        let c = candidates
+        return c.isEmpty ? leftURL : urls[c[min(rightSlot, c.count - 1)]]
+    }
+
     var body: some View {
         ZStack {
             BackdropView()
-            SwipeCompare(left: leftImg, right: rightImg)
+            SwipeCompare(left: cache[leftURL], right: cache[rightURL])
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .onAppear {
-                    // Decode off the main thread so opening compare on large
-                    // images doesn't freeze the UI.
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        let l = NSImage(contentsOf: leftURL), r = NSImage(contentsOf: rightURL)
-                        DispatchQueue.main.async { leftImg = l; rightImg = r }
-                    }
-                }
             VStack {
-                HStack { tag(leftURL.lastPathComponent); Spacer(); tag(rightURL.lastPathComponent) }.padding(12)
+                HStack {
+                    tag("REF · " + leftURL.lastPathComponent)
+                    Spacer()
+                    tag(candidates.count > 1
+                        ? "\(rightSlot + 1)/\(candidates.count) · \(rightURL.lastPathComponent)"
+                        : rightURL.lastPathComponent)
+                }.padding(12)
                 Spacer()
                 HStack(spacing: 10) {
+                    if candidates.count > 1 {
+                        Button { step(-1) } label: { Image(systemName: "chevron.left") }
+                        Button { step(1) } label: { Image(systemName: "chevron.right") }
+                        Button("Make this the reference") { leftIndex = candidates[rightSlot]; rightSlot = 0 }
+                            .font(.caption)
+                    }
                     BackdropPicker().foregroundStyle(.white)
-                    Text("Drag the divider to swipe  ·  scroll to zoom  ·  drag to pan  ·  double-click to reset")
+                    Text(candidates.count > 1
+                         ? "← / → to change the right image  ·  drag the divider  ·  scroll to zoom  ·  double-click to reset"
+                         : "Drag the divider to swipe  ·  scroll to zoom  ·  drag to pan  ·  double-click to reset")
                         .font(.caption).foregroundStyle(.white.opacity(0.75))
                 }
                 .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(.black.opacity(0.5)).clipShape(Capsule()).padding(.bottom, 12)
             }
-        }.frame(minWidth: 560, minHeight: 440)
+            // Invisible key catchers: SwiftUI needs real buttons for ← / → to be reachable
+            // without stealing focus from the compare view's own drag handling.
+            HStack {
+                Button("") { step(-1) }.keyboardShortcut(.leftArrow, modifiers: [])
+                Button("") { step(1) }.keyboardShortcut(.rightArrow, modifiers: [])
+            }.opacity(0).frame(width: 0, height: 0)
+        }
+        .frame(minWidth: 560, minHeight: 440)
+        .onAppear { warm() }
     }
+
+    private func step(_ d: Int) {
+        rightSlot = CompareCycle.step(index: rightSlot, by: d, count: candidates.count)
+        warm()
+    }
+
+    /// Decodes off the main thread and keeps results, so stepping through a bake-off is
+    /// instant after the first pass instead of re-decoding a 4 MP PNG every keypress.
+    private func warm() {
+        let wanted = [leftURL, rightURL]
+        let missing = wanted.filter { cache[$0] == nil }
+        guard !missing.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let loaded = missing.compactMap { u in NSImage(contentsOf: u).map { (u, $0) } }
+            DispatchQueue.main.async { for (u, i) in loaded { cache[u] = i } }
+        }
+    }
+
     private func tag(_ t: String) -> some View {
         Text(t).font(.callout).foregroundStyle(.white).lineLimit(1)
             .padding(.horizontal, 10).padding(.vertical, 5)
@@ -11176,12 +12328,18 @@ struct SwipeCompareView: View {
 
 final class CompareController {
     private static var windows: [NSWindow] = []
-    static func show(left: URL, right: URL) {
+    static func show(left: URL, right: URL) { show(images: [left, right]) }
+
+    /// The first image is the reference; the rest are candidates the right side steps through.
+    static func show(images: [URL]) {
+        guard CompareCycle.isAvailable(imageCount: images.count) else { NSSound.beep(); return }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1040, height: 740),
                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
-        w.title = "Compare — \(left.lastPathComponent)  ↔  \(right.lastPathComponent)"
-        w.contentView = NSHostingView(rootView: SwipeCompareView(leftURL: left, rightURL: right))
+        w.title = images.count > 2
+            ? "Compare — \(images[0].lastPathComponent) vs \(images.count - 1) others"
+            : "Compare — \(images[0].lastPathComponent)  ↔  \(images[1].lastPathComponent)"
+        w.contentView = NSHostingView(rootView: SwipeCompareView(urls: images))
         w.center(); windows.append(w)
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
             windows.removeAll { $0 === w }
@@ -11773,6 +12931,12 @@ enum Updater {
                     if !userInitiated, Prefs.skipUpdateVersion == remote { return }
                     presentUpdate(version: remote, notes: notes, page: page, zip: zip, userInitiated: userInitiated)
                 } else if userInitiated {
+                    // "Up to date" was a lie in the one case that matters most during
+                    // development: a local rebuild leaves a NEWER binary installed under the
+                    // SAME version number, so the GitHub comparison above cannot see it and
+                    // reported the running process as current. The version string is not the
+                    // thing to compare here — see RunningBuild.
+                    if RunningBuild.isStale { RunningBuild.notice(); return }
                     alert("You're up to date", "Navigator \(currentVersion) is the latest version.")
                 }
             }
@@ -13137,6 +14301,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // Before anything else that could raise: this is the only hook that sees an
+        // exception a framework catches and swallows, which is the shape the drag wedge had.
+        ExceptionLog.install()
+        // Then, before any code path can replace the bundle underneath us: this stamps the
+        // binary we are executing, and it is only the truth while it is still the one on disk.
+        RunningBuild.captureAtLaunch()
         isFirstRun = !Prefs.didRunSetup
         Prefs.didRunSetup = true
         // The undo stack is pure logic in NavigatorCore (so it can be unit-tested and
@@ -13293,10 +14463,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func upscalePreset(_ model: String) -> UpscaleOption {
-        upscaleOptions.first { $0.model == model } ?? upscaleOptions[0]
-    }
-
     // A Finder Quick Action fired: navigatoraction://<action>?hex=<hex of newline-
     // joined file paths>. Decode and run the matching action on the images.
     private func handleActionURL(_ url: URL) {
@@ -13324,8 +14490,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             folders.forEach { batchChromaKeyFolder($0) }
             if !images.isEmpty { chromaKeyForImages(images) }
         case "upscale-lowq":
-            folders.forEach { batchUpscaleFolderViaFal($0, option: upscalePreset("Wonder 3")) }
-            if !images.isEmpty { upscaleImagesViaFal(images, option: upscalePreset("Wonder 3")) }
+            folders.forEach { batchUpscaleFolderViaFal($0, option: upscaleOptions[0]) }
+            if !images.isEmpty { upscaleImagesViaFal(images, option: upscaleOptions[0]) }
+        case "layerize":
+            if !images.isEmpty { layerizeImages(images) }
         case "upscale-imagen2":
             folders.forEach { batchUpscaleFolderViaImagen($0, factor: 2) }
             if !images.isEmpty { upscaleImagesViaImagen(images, factor: 2) }
@@ -13618,6 +14786,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
+    /// The rebuild-while-running check, hung off activation because that is when it happens:
+    /// the owner builds in a terminal and switches back. One stat per activation, and the
+    /// notice itself is once per detected build — see RunningBuildRules.shouldNotify.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        RunningBuild.checkAndNotify()
+    }
+
     // Clicking the Dock icon (or reopening) with no window visible brings the
     // browser up — important since an image-only launch keeps it hidden.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -13706,7 +14881,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
         let appItem = NSMenuItem(); mainMenu.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
-        appMenu.addItem(withTitle: "About Navigator", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let about = appMenu.addItem(withTitle: "About Navigator", action: #selector(showAboutAction(_:)), keyEquivalent: "")
+        about.target = self
         let cfu = appMenu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdatesAction(_:)), keyEquivalent: ""); cfu.target = self
         appMenu.addItem(.separator())
         let set = appMenu.addItem(withTitle: "Settings…", action: #selector(showSettingsAction(_:)), keyEquivalent: ","); set.target = self
@@ -13726,6 +14902,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         checklist.target = self
         let fda = appMenu.addItem(withTitle: "Grant Full Disk Access…", action: #selector(openFullDiskAccessAction(_:)), keyEquivalent: "")
         fda.target = self
+        appMenu.addItem(.separator())
+        // The drag-and-drop maintenance pair, next to the other "something is wrong, help me
+        // fix it" items. No key equivalents on purpose: both are for a broken session, not for
+        // daily use, and a chord that resets drag state is a chord waiting to be hit by accident.
+        let rdd = appMenu.addItem(withTitle: "Reset Drag & Drop", action: #selector(resetDragAndDropAction(_:)), keyEquivalent: "")
+        rdd.target = self
+        let cdd = appMenu.addItem(withTitle: "Copy Drag Diagnostics", action: #selector(copyDragDiagnosticsAction(_:)), keyEquivalent: "")
+        cdd.target = self
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Navigator", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
@@ -14042,8 +15226,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // it — the user loses a tab they could still see while the window they aimed
         // at stays open. `appModel` deliberately falls back to the last key browser
         // window, which is what let it find a tab to close from any window at all.
-        guard NSApp.keyWindow is NavWindow else { NSApp.keyWindow?.performClose(nil); return }
-        if appModel.tabs.count > 1 { appModel.closeTab(appModel.selected) } else { NSApp.keyWindow?.performClose(nil) }
+        // `NSApp.keyWindow` can be nil: the app can be frontmost with NO key window at all
+        // (dismissing an alert or a non-activating panel leaves it that way). The old
+        // `guard NSApp.keyWindow is NavWindow` turned that into `nil?.performClose(nil)`, so
+        // ⌘W and File ▸ Close Tab did *nothing*, silently, while both stayed enabled.
+        // CloseTabRules is tested for exactly that case; `target` reuses the same fallback
+        // chain `appModel` already trusts, so there is always a window to act on.
+        let target: NavWindow = (NSApp.keyWindow as? NavWindow) ?? lastKeyNavWindow ?? window
+        switch CloseTabRules.outcome(hasKeyWindow: NSApp.keyWindow != nil,
+                                     keyWindowIsBrowser: NSApp.keyWindow is NavWindow,
+                                     tabCount: target.model.tabs.count) {
+        case .closeKeyWindow:     NSApp.keyWindow?.performClose(nil)
+        case .closeTab:           target.model.closeTab(target.model.selected)
+        case .closeBrowserWindow: target.performClose(nil)
+        }
     }
     @objc func closeWindowAction(_ sender: Any?) { (NSApp.keyWindow ?? window)?.performClose(nil) }
     @objc func makeAliasAction(_ sender: Any?) { appModel.active.makeAlias(appModel.active.selection) }
@@ -14314,6 +15510,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func showSetupAssistantAction(_ sender: Any?) { SetupAssistantController.shared.show() }
 
     @objc func checkForUpdatesAction(_ sender: Any?) { Updater.check(userInitiated: true) }
+
+    /// The standard About panel, with one addition: the version it shows is the INSTALLED
+    /// bundle's, which after a local rebuild is not the version of the code running. Saying so
+    /// in the credits area costs nothing and stops the panel from quietly confirming a wrong
+    /// belief; when nothing is stale the panel is byte-for-byte the stock one.
+    @objc func showAboutAction(_ sender: Any?) {
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [:]
+        if RunningBuild.isStale {
+            options[.credits] = NSAttributedString(
+                string: "A newer build is installed than the one running — relaunch to use it.",
+                attributes: [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize)])
+        }
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
+
+    /// Navigator ▸ Reset Drag & Drop — clears the drag state this app owns, and says plainly
+    /// when that is not enough. See DragReset.
+    @objc func resetDragAndDropAction(_ sender: Any?) { DragReset.run() }
+
+    /// Navigator ▸ Copy Drag Diagnostics — the whole subsystem's state on the clipboard, so a
+    /// failure can be diagnosed from a paste instead of from someone else's machine.
+    @objc func copyDragDiagnosticsAction(_ sender: Any?) { DragReset.copyDiagnostics() }
     private var settingsWindow: NSWindow?
     @objc func showSettingsAction(_ sender: Any?) {
         if settingsWindow == nil {
@@ -14816,16 +16034,46 @@ func runRestyle(source: URL, prompt: String, modelFlag: String, aspect: String, 
     // what generatePromptStyleImage labels it as ("the attached image is a STYLE
     // reference ONLY") — so the label still matches the payload.
     var inputs: [Data] = []
+    // AUTO-PREP. Measured: a 5:1 sheet sent straight to NB2 came back with two of its five
+    // symbols DELETED and the rest distorted 16.7%; padded to exactly 21:9 first, all five
+    // survived to within 0.2%. So when the user asked to keep the image's own shape ("auto"),
+    // pad to the nearest supported ratio, ask for that ratio, and crop the padding off the
+    // result. An explicitly chosen aspect is left alone — that's a request to REFRAME, and
+    // padding then cropping back would defeat it.
+    var cropBack: (canvas: (w: Int, h: Int), subject: (w: Int, h: Int))?
+    var effectiveAspect = aspect
     if sendSourceImage {
-        guard let sourcePNG = try? Data(contentsOf: source) else {
+        guard var payload = try? Data(contentsOf: source) else {
             return (nil, nil, "Couldn’t read \(source.lastPathComponent).")
         }
-        inputs.append(sourcePNG)
+        if aspect == "auto", let sz = imagePixelSize(source),
+           AspectPrepRules.mismatch(width: sz.w, height: sz.h) > 0.01 {
+            let near = AspectPrepRules.nearest(width: sz.w, height: sz.h)
+            let canvas = AspectPrepRules.canvas(width: sz.w, height: sz.h, ratio: near.ratio, pad: 1.0)
+            if let padded = paddedToCanvas(source, canvas: canvas) {
+                payload = padded
+                cropBack = (canvas, (sz.w, sz.h))
+                effectiveAspect = near.name
+                navLog("restyle prep: \(source.lastPathComponent) \(sz.w)×\(sz.h) is \(String(format: "%.0f", AspectPrepRules.mismatch(width: sz.w, height: sz.h) * 100))% off any supported ratio — padded to \(canvas.w)×\(canvas.h) (\(near.name)) so the model can't crop or stretch it")
+            }
+        }
+        inputs.append(payload)
     }
     if let styleReferencePNG { inputs.append(styleReferencePNG) }
     let r = H5GService.image(prompt: prompt, modelID: model.id, inputPNGs: inputs,
-                            aspect: aspect, size: size)
-    guard let out = r.png else { return (nil, nil, r.error ?? "Restyle failed.") }
+                            aspect: effectiveAspect, size: size)
+    guard var out = r.png else { return (nil, nil, r.error ?? "Restyle failed.") }
+    // Crop the padding back off, scaled to whatever resolution the model returned. This is a
+    // crop, never a resize, so it costs no sharpness.
+    if let cb = cropBack, let cg = loadCGImage(data: out) {
+        let b = AspectPrepRules.cropBack(canvas: cb.canvas, subject: cb.subject, result: (cg.width, cg.height))
+        if b.w > 0, b.h > 0,
+           let cropped = cg.cropping(to: CGRect(x: b.x, y: b.y, width: b.w, height: b.h)),
+           let d = encodePNG(cropped) {
+            out = d
+            navLog("restyle prep: cropped the padding back off — \(cg.width)×\(cg.height) → \(b.w)×\(b.h)")
+        }
+    }
     let dest = PathRules.uniqueDest(named.deletingLastPathComponent(),
                                     named.deletingPathExtension().lastPathComponent + "_restyled.png",
                                     exists: { FileManager.default.fileExists(atPath: $0) })
@@ -15105,6 +16353,7 @@ struct RestyleSheet: View {
         .contentShape(Rectangle())
         .dropDestination(for: URL.self) { urls, _ in
             SpringLoader.shared.noteDrop()   // a completed drag must not spring back — see the sidebar
+            DropLog.fileDrop("restyle queue", urls, target: nil, "added \(urls.count) item(s) to the batch")
             addURLs(urls)
             return true
         } isTargeted: { listTargeted = $0 }
@@ -15180,7 +16429,11 @@ struct RestyleSheet: View {
                     if padOn {
                         Picker("Background", selection: $padColor) {
                             ForEach(aiPrepColors) { c in
-                                Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(c.color)) }.tag(c.name)
+                                if let col = c.color {
+                                    Label { Text(c.name) } icon: { Image(nsImage: circleSwatch(col)) }.tag(c.name)
+                                } else {
+                                    Label(c.name, systemImage: "eyedropper.halffull").tag(c.name)
+                                }
                             }
                         }
                     }
@@ -15377,7 +16630,11 @@ struct RestyleSheet: View {
         // onDrop API silently accepts nothing.
         .dropDestination(for: URL.self) { urls, _ in
             SpringLoader.shared.noteDrop()   // a completed drag must not spring back — see the sidebar
-            guard let url = urls.first(where: { isImageFile($0) }) else { return false }
+            guard let url = urls.first(where: { isImageFile($0) }) else {
+                DropLog.refused("style reference well", urls, target: nil, .wrongKind("image files"))
+                return false
+            }
+            DropLog.accepted("style reference well", urls, target: url, "style reference set")
             reference = url
             analyzeReferenceStyle()
             return true

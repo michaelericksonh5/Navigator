@@ -7,6 +7,9 @@
 // real use, so they're the ones worth pinning down with tests.
 
 import Foundation
+// CoreGraphics only — no AppKit. The pixel sampling behind the adaptive backing colour
+// lives here so `swift test` exercises the SHIPPED code rather than a copy of it.
+import CoreGraphics
 
 enum PathRules {
 
@@ -946,6 +949,561 @@ enum TabMenuRules {
     /// rather than silently producing one.
     static func canMoveToNewWindow(index: Int, count: Int) -> Bool {
         count > 1 && (0..<count).contains(index)
+    }
+}
+
+/// What ⌘W / File ▸ Close Tab should actually do.
+enum CloseTabOutcome: Equatable {
+    /// Something that isn't a browser window (Settings, Get Info, a viewer) holds key and
+    /// owns ⌘W — closing a tab behind it would take a tab the user can still see.
+    case closeKeyWindow
+    case closeTab
+    /// Last tab: closing it would leave an empty window, so close the window instead.
+    case closeBrowserWindow
+}
+
+/// Extracted and tested because the inline version had a silent-no-op hole: it gated on
+/// `NSApp.keyWindow is NavWindow`, so when there was NO key window at all (the app can be
+/// frontmost with none — dismissing an alert or a non-activating panel leaves it that way)
+/// the guard failed and the fallback ran `nil?.performClose(nil)`. ⌘W and File ▸ Close Tab
+/// did nothing whatsoever, silently, while both stayed enabled.
+///
+/// `hasKeyWindow == false` must therefore still act on the front browser window, which is
+/// what the caller's `lastKeyNavWindow` fallback resolves.
+enum CloseTabRules {
+    static func outcome(hasKeyWindow: Bool, keyWindowIsBrowser: Bool, tabCount: Int) -> CloseTabOutcome {
+        if hasKeyWindow && !keyWindowIsBrowser { return .closeKeyWindow }
+        return tabCount > 1 ? .closeTab : .closeBrowserWindow
+    }
+}
+
+// MARK: - Seedream 5.0 Pro Layerize
+
+enum LayerizeCheck: Equatable {
+    case ok
+    /// Outside the endpoint's limits but fixable by resampling. Never done silently.
+    case needsResize(reason: String, to: (w: Int, h: Int))
+    case reject(reason: String)
+
+    static func == (a: LayerizeCheck, b: LayerizeCheck) -> Bool {
+        switch (a, b) {
+        case (.ok, .ok): return true
+        case let (.needsResize(r1, t1), .needsResize(r2, t2)): return r1 == r2 && t1 == t2
+        case let (.reject(r1), .reject(r2)): return r1 == r2
+        default: return false
+        }
+    }
+}
+
+/// Rules for `bytedance/seedream/v5/pro/layerize`, all established by measurement against the
+/// live endpoint rather than assumed.
+enum LayerizeRules {
+    // Documented input limits.
+    static let minSide = 512, maxSide = 6000
+    static let minPixels = 512 * 512, maxPixels = 6000 * 6000
+    static let maxBytes = 30 * 1024 * 1024
+    static let minAspect = 1.0 / 16, maxAspect = 16.0
+    /// base + up to 16 layers.
+    static let maxLayers = 17
+
+    /// MEASURED, and the reason a naive "always auto_2K" default is wrong: a 750x709 input
+    /// returned HTTP 422 at `auto_2K` AND at `auto`, but 200 at `auto_1K`. So the tier may not
+    /// outrun the input by much, and there is also a FLOOR — `auto` (native ~750px) was refused
+    /// for being too small, while `auto_1K` upscaling that same input was fine.
+    ///
+    /// Largest tier whose output area the input can support, never below the 1K floor.
+    static func tier(width: Int, height: Int) -> String {
+        let px = width * height
+        if px >= 2048 * 2048 { return "auto_2K" }
+        if px >= 1536 * 1536 { return "auto_1.5K" }
+        return "auto_1K"
+    }
+
+    static func check(width w: Int, height h: Int, bytes: Int) -> LayerizeCheck {
+        guard w > 0, h > 0 else { return .reject(reason: "not a readable image") }
+        let ar = Double(w) / Double(h)
+        if ar < minAspect || ar > maxAspect {
+            return .reject(reason: "aspect ratio \(String(format: "%.2f", ar)):1 is outside the supported 1:16–16:1 range")
+        }
+        // Too big: scale down to fit both the per-side and total-pixel caps.
+        if w > maxSide || h > maxSide || w * h > maxPixels {
+            let s = min(Double(maxSide) / Double(max(w, h)),
+                        (Double(maxPixels) / Double(w * h)).squareRoot())
+            let t = (max(1, Int(Double(w) * s)), max(1, Int(Double(h) * s)))
+            return .needsResize(reason: "\(w)×\(h) exceeds Layerize's limit of 6000px per side / 36 MP total", to: t)
+        }
+        // Too small: it cannot be split at all below the floor.
+        if min(w, h) < minSide || w * h < minPixels {
+            let s = max(Double(minSide) / Double(min(w, h)),
+                        (Double(minPixels) / Double(w * h)).squareRoot())
+            let t = (Int((Double(w) * s).rounded(.up)), Int((Double(h) * s).rounded(.up)))
+            return .needsResize(reason: "\(w)×\(h) is below Layerize's 512px / 0.26 MP minimum", to: t)
+        }
+        if bytes > maxBytes {
+            // Re-encoding usually fixes this without touching dimensions, so keep them.
+            return .needsResize(reason: "file is \(String(format: "%.1f", Double(bytes) / 1_048_576)) MB, over the 30 MB limit", to: (w, h))
+        }
+        return .ok
+    }
+
+    /// MEASURED: a mostly-transparent input gets a flat INVENTED colour as its base (a cutout
+    /// came back with a solid rgb(37,135,139) teal base), which is junk. A composed artwork
+    /// with a real background gets an excellent inpainted base worth keeping.
+    static func shouldKeepBase(transparentFraction: Double) -> Bool { transparentFraction < 0.20 }
+
+    /// Filesystem-safe WITHOUT destroying non-ASCII.
+    ///
+    /// Layerize returns Chinese names unless the prompt asks for English, and an ASCII-only
+    /// sanitiser turned every one of them into an empty string — twelve layers all landed as
+    /// "unnamed", distinguished only by index. Keep the characters; strip only what a
+    /// filesystem genuinely cannot take.
+    static func safeName(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "" }
+        let illegal = Set("/:\\<>\"|?*")
+        var out = String(raw.unicodeScalars.filter { !illegal.contains(Character($0)) && !CharacterSet.controlCharacters.contains($0) })
+        out = out.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).joined(separator: "_")
+        out = out.trimmingCharacters(in: CharacterSet(charactersIn: "_. "))
+        return String(out.prefix(60))
+    }
+
+    /// `<Original>_L03_Left_Dragon_Frame.png`. Index is included because layer NAMES can repeat
+    /// and z_index ordering is NOT stable between runs — the same image ordered its layers
+    /// differently on two separate calls, so the index alone can't identify a layer either.
+    static func fileName(stem: String, zIndex: Int, name: String?) -> String {
+        let label = safeName(name)
+        let suffix = label.isEmpty ? (zIndex == 0 ? "base" : "layer") : label
+        return String(format: "%@_L%02d_%@.png", stem, zIndex, suffix)
+    }
+
+    /// Worst-case spend, the only figure knowable BEFORE the call — the layer count is not.
+    static func worstCaseCost(tier: String) -> Double {
+        let perLayer = (tier == "auto_1K" || tier == "auto_1.5K") ? 0.03375 : 0.0675
+        return perLayer * Double(maxLayers)
+    }
+}
+
+// MARK: - Thumbnail cache keys
+
+/// Builds the thumbnail cache key.
+///
+/// This used to be just `path@size`, which meant a file REWRITTEN AT THE SAME PATH kept its old
+/// thumbnail forever — the cache had no way to know the bytes had changed. That is the normal
+/// case in this workflow, not an edge case: art gets re-exported over itself constantly, and a
+/// dragon whose green cloud background had been removed still showed the cloud in Navigator
+/// while opening the file showed it correctly gone. Refresh couldn't fix it either, because
+/// refresh only cleared the FAILURE cache.
+///
+/// Including a content stamp fixes it everywhere at once — scroll, folder re-entry, background
+/// change, ⌘R — instead of only where someone remembered to purge.
+enum ThumbnailKeyRules {
+    /// `mtime`/`bytes` come from a stat. Both are used, not just mtime: a file rewritten inside
+    /// the same mtime tick (or on a filesystem with coarse timestamps — network shares and some
+    /// cloud providers round to the second) still changes length in almost every real case.
+    static func key(path: String, size: Int, mtime: TimeInterval?, bytes: Int64?) -> String {
+        guard let m = mtime, let b = bytes else {
+            // stat failed. Fall back to the old form rather than inventing a key that can never
+            // hit — an unreadable file is about to fail thumbnailing anyway.
+            return "\(path)@\(size)"
+        }
+        return "\(path)@\(size)#\(Int64((m * 1000).rounded())).\(b)"
+    }
+
+    /// Everything for one path+size regardless of content stamp — used to cancel in-flight work,
+    /// which must not miss just because the file changed while a thumbnail was being generated.
+    static func prefix(path: String, size: Int) -> String { "\(path)@\(size)" }
+}
+
+// MARK: - Photoshop Generative Upscale (Firefly / Gigapixel / Bloom) preflight
+
+/// What to do with one image before handing it to Generative Upscale.
+enum FireflyUpscalePlan: Equatable {
+    /// Ready as-is at this scale.
+    case upscale(scale: Int)
+    /// Aspect is outside 1:4–4:1, so pad the short side first (adaptive backing), upscale,
+    /// then crop the padding back off.
+    case padThenUpscale(scale: Int, padTo: (w: Int, h: Int))
+    /// No scale fits the output cap. `maxSide` is what the long edge would have to be.
+    case tooLargeForAnyScale(longEdge: Int, maxInputLongEdge: Int)
+    case notAnImage
+
+    static func == (a: FireflyUpscalePlan, b: FireflyUpscalePlan) -> Bool {
+        switch (a, b) {
+        case let (.upscale(x), .upscale(y)): return x == y
+        case let (.padThenUpscale(s1, p1), .padThenUpscale(s2, p2)): return s1 == s2 && p1 == p2
+        case let (.tooLargeForAnyScale(l1, m1), .tooLargeForAnyScale(l2, m2)): return l1 == l2 && m1 == m2
+        case (.notAnImage, .notAnImage): return true
+        default: return false
+        }
+    }
+}
+
+/// Constraints read straight out of Photoshop 2026's own Generative Upscale dialog, which is
+/// more authoritative than the docs:
+///
+///   "Output too large. Width or height exceeds 6144px. Try a smaller scale or reduce the
+///    image size."
+///   "Aspect ratio not supported. Please crop the image to be tall or wide, between 1:4 and 4:1."
+///
+/// Both were triggered by a real 2224×355 sheet (6.26:1), which fails aspect at ×2 and fails
+/// the size cap at ×4. Note the cap moved between versions — it was 4096 in the 2025 beta —
+/// so it is deliberately one constant here.
+enum FireflyUpscaleRules {
+    static let maxOutputSide = 6144
+    static let aspectMin = 0.25          // 1:4
+    static let aspectMax = 4.0           // 4:1
+    static let scales = [4, 2]           // preferred first
+
+    /// Largest input long edge that still fits the output cap at a given scale.
+    static func maxInputLongEdge(scale: Int) -> Int { maxOutputSide / max(scale, 1) }
+
+    static func aspectOK(width w: Int, height h: Int) -> Bool {
+        guard w > 0, h > 0 else { return false }
+        let r = Double(w) / Double(h)
+        return r >= aspectMin && r <= aspectMax
+    }
+
+    /// Smallest canvas containing the image whose aspect is inside the allowed band. Only the
+    /// SHORT side grows, so the long edge — and therefore which scales fit — never changes.
+    static func aspectPadCanvas(width w: Int, height h: Int) -> (w: Int, h: Int) {
+        guard w > 0, h > 0 else { return (max(w, 1), max(h, 1)) }
+        let r = Double(w) / Double(h)
+        if r > aspectMax { return (w, Int((Double(w) / aspectMax).rounded(.up))) }
+        if r < aspectMin { return (Int((Double(h) * aspectMin).rounded(.up)), h) }
+        return (w, h)
+    }
+
+    static func plan(width w: Int, height h: Int, preferred: Int? = nil) -> FireflyUpscalePlan {
+        guard w > 0, h > 0 else { return .notAnImage }
+        let longEdge = max(w, h)
+        let wanted = preferred.map { [$0] } ?? scales
+        guard let scale = wanted.first(where: { longEdge * $0 <= maxOutputSide }) else {
+            let smallest = scales.min() ?? 2
+            return .tooLargeForAnyScale(longEdge: longEdge, maxInputLongEdge: maxInputLongEdge(scale: smallest))
+        }
+        if aspectOK(width: w, height: h) { return .upscale(scale: scale) }
+        return .padThenUpscale(scale: scale, padTo: aspectPadCanvas(width: w, height: h))
+    }
+
+    /// Plain-language reason, for the batch preflight dialog and the log.
+    static func explain(_ plan: FireflyUpscalePlan, width w: Int, height h: Int) -> String {
+        switch plan {
+        case .notAnImage:
+            return "not a readable image"
+        case .upscale(let s):
+            return "×\(s) → \(w * s)×\(h * s)"
+        case .padThenUpscale(let s, let p):
+            let r = Double(w) / Double(max(h, 1))
+            return "\(w)×\(h) is \(String(format: "%.2f", r)):1, outside Generative Upscale's 1:4–4:1 range — pad to \(p.w)×\(p.h) first, then ×\(s) → \(p.w * s)×\(p.h * s), then crop the padding off"
+        case .tooLargeForAnyScale(let long, let maxIn):
+            return "\(w)×\(h) is already too big: even ×2 would exceed the 6144px output cap (long edge \(long) → \(long * 2)). The largest input that fits ×2 is \(maxIn)px on the long edge — split it or reduce it first"
+        }
+    }
+}
+
+// MARK: - Swipe Compare across N images
+
+/// Which image the right-hand side of Swipe Compare is showing.
+///
+/// Compare used to be strictly two images. Judging a bake-off means holding ONE reference on
+/// the left and stepping the right side through every candidate, so the eye compares each one
+/// against the same baseline instead of against whichever file happened to be next to it.
+enum CompareCycle {
+    /// Wraps, so stepping past the end returns to the first candidate rather than dead-ending.
+    static func step(index: Int, by delta: Int, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        return ((index + delta) % count + count) % count
+    }
+
+    /// Right-hand candidates are every image except the fixed left one. With exactly two
+    /// images that degenerates to the old behaviour: one candidate, nothing to cycle.
+    static func candidates(total: Int, leftIndex: Int) -> [Int] {
+        guard total > 0, leftIndex >= 0, leftIndex < total else { return [] }
+        return (0..<total).filter { $0 != leftIndex }
+    }
+
+    /// Compare needs a reference plus at least one candidate.
+    static func isAvailable(imageCount: Int) -> Bool { imageCount >= 2 }
+}
+
+// MARK: - Adaptive backing colour (Prep for AI)
+
+struct RGB8: Equatable, Hashable {
+    let r: UInt8, g: UInt8, b: UInt8
+    init(_ r: UInt8, _ g: UInt8, _ b: UInt8) { self.r = r; self.g = g; self.b = b }
+}
+
+enum BackingChoice: Equatable {
+    /// The image ALREADY sits on a flat field (an LP sheet on magenta). Extend that exact
+    /// colour: the pad becomes invisible and the whole canvas stays ONE keyable colour.
+    /// Choosing a "maximally distant" colour here would be actively wrong — it would leave
+    /// two different colours to key.
+    case extendField(RGB8)
+    /// A cutout (alpha) or a busy border. Pick the colour furthest from every colour in the
+    /// subject, so keying can never eat part of the art.
+    case keyColour(RGB8, marginDeltaE: Double)
+}
+
+/// Picks the background colour "Prep for AI" fills with.
+///
+/// The old fixed 7-colour menu could collide with the art: measured on real assets,
+/// `HP4_Tortoise.png` contains pure white (ΔE 0.0 from the "White" option) and the frames
+/// sheet contains near-black (ΔE 4.6 from "Black"). Filling with a colour the subject also
+/// contains means a later chroma key removes part of the subject.
+enum KeyColorRules {
+    /// A border this uniform means the image is already on a flat field.
+    static let flatFieldFraction = 0.90
+
+    static func lab(_ c: RGB8) -> (L: Double, a: Double, b: Double) {
+        func lin(_ v: UInt8) -> Double {
+            let s = Double(v) / 255
+            return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4)
+        }
+        let r = lin(c.r), g = lin(c.g), b = lin(c.b)
+        // sRGB -> XYZ (D65), then XYZ -> L*a*b*
+        let x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047
+        let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+        let z = (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883
+        let d = 6.0 / 29.0
+        func f(_ t: Double) -> Double { t > d * d * d ? cbrt(t) : t / (3 * d * d) + 4.0 / 29.0 }
+        let fx = f(x), fy = f(y), fz = f(z)
+        return (116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz))
+    }
+
+    static func deltaE(_ a: RGB8, _ b: RGB8) -> Double {
+        let l1 = lab(a), l2 = lab(b)
+        let dL = l1.L - l2.L, da = l1.a - l2.a, db = l1.b - l2.b
+        return (dL * dL + da * da + db * db).squareRoot()
+    }
+
+    /// Saturated hues around the wheel plus the classic keys. Saturated colours key far more
+    /// reliably than near-neutrals, which is why the score below rewards saturation.
+    static let candidates: [RGB8] = {
+        var out: [RGB8] = []
+        for step in stride(from: 0, to: 360, by: 12) {
+            for (s, v) in [(1.0, 1.0), (1.0, 0.75), (1.0, 0.5), (0.85, 1.0)] {
+                out.append(hsv(Double(step) / 360, s, v))
+            }
+        }
+        out += [RGB8(0, 255, 0), RGB8(255, 0, 255), RGB8(0, 0, 255),
+                RGB8(255, 255, 0), RGB8(255, 255, 255), RGB8(0, 0, 0)]
+        return out
+    }()
+
+    static func hsv(_ h: Double, _ s: Double, _ v: Double) -> RGB8 {
+        let i = Int(h * 6) % 6
+        let f = h * 6 - Double(Int(h * 6))
+        let p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s)
+        let (r, g, b): (Double, Double, Double)
+        switch i {
+        case 0: (r, g, b) = (v, t, p)
+        case 1: (r, g, b) = (q, v, p)
+        case 2: (r, g, b) = (p, v, t)
+        case 3: (r, g, b) = (p, q, v)
+        case 4: (r, g, b) = (t, p, v)
+        default: (r, g, b) = (v, p, q)
+        }
+        return RGB8(UInt8((r * 255).rounded()), UInt8((g * 255).rounded()), UInt8((b * 255).rounded()))
+    }
+
+    static func saturation(_ c: RGB8) -> Double {
+        let r = Double(c.r), g = Double(c.g), b = Double(c.b)
+        let mx = max(r, g, b), mn = min(r, g, b)
+        return mx == 0 ? 0 : (mx - mn) / mx
+    }
+
+    /// `subject` is the colours actually present in the art (transparent pixels excluded —
+    /// they are what we're about to fill, so they must not count as "present").
+    static func choose(subject: [RGB8], flatField: (colour: RGB8, fraction: Double)?) -> BackingChoice {
+        if let f = flatField, f.fraction >= flatFieldFraction { return .extendField(f.colour) }
+        guard !subject.isEmpty else { return .keyColour(RGB8(0, 255, 0), marginDeltaE: .infinity) }
+        let subjectLab = subject.map(lab)
+        var best = candidates[0], bestScore = -Double.infinity, bestMargin = 0.0
+        for cand in candidates {
+            let cl = lab(cand)
+            var margin = Double.infinity
+            for s in subjectLab {
+                let dL = cl.L - s.L, da = cl.a - s.a, db = cl.b - s.b
+                margin = min(margin, (dL * dL + da * da + db * db).squareRoot())
+                if margin <= bestMargin - 12 { break }   // can't win even with a full sat bonus
+            }
+            let score = margin + 12 * saturation(cand)
+            if score > bestScore { bestScore = score; best = cand; bestMargin = margin }
+        }
+        return .keyColour(best, marginDeltaE: bestMargin)
+    }
+}
+
+/// Draws into RGBA8 at up to `cap` on the long edge and hands back the buffer.
+///
+/// `interpolationQuality = .none` is REQUIRED, not a performance choice. With smoothing on,
+/// the downscale AVERAGES neighbouring pixels: small saturated regions get washed out and
+/// blended in-between colours appear that exist nowhere in the art. Both errors push the
+/// computed margin UP, which is the dangerous direction — it would let the picker choose a
+/// colour that a small element actually contains and key that element away. Caught by
+/// cross-checking against a reference implementation: pure green measured ΔE 102 against a
+/// sheet that really only stands 80 away from it.
+///
+/// The cap is 4096 for the same reason: at 2048 a 2224px-wide sheet still lost ~8% of its
+/// pixels and over-stated the margin by 3.4 ΔE against ground truth, because the colour that
+/// decides it is a one-pixel fringe. At 4096 essentially no real asset is subsampled at all.
+/// Worst case is a transient 67 MB buffer on a background thread; `subjectColours` scores it
+/// with a flat occupancy grid rather than millions of hash inserts.
+func rgbaSample(_ cg: CGImage, cap: Int = 4096) -> (px: [UInt8], w: Int, h: Int)? {
+    let scale = max(1.0, Double(max(cg.width, cg.height)) / Double(cap))
+    let w = max(1, Int(Double(cg.width) / scale)), h = max(1, Int(Double(cg.height) / scale))
+    var buf = [UInt8](repeating: 0, count: w * h * 4)
+    let ok: Bool = buf.withUnsafeMutableBytes { raw -> Bool in
+        guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        ctx.interpolationQuality = .none    // see the note above — averaging hides colours
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return true
+    }
+    return ok ? (buf, w, h) : nil
+}
+
+/// Colours actually present in the art. Transparent pixels are EXCLUDED — they are exactly
+/// what we're about to fill, so counting them would make the fill avoid itself.
+/// An occupancy grid over the quantised colour cube, not a Set.
+///
+/// The colour that decides the margin is often a 1–2px anti-aliased FRINGE (measured: the
+/// closest colour to pure blue on one real sheet was `rgb(178,15,125)`, residual magenta
+/// fringe one pixel wide). Subsampling skips exactly those pixels and over-states the
+/// margin, so every pixel has to be looked at — and a flat 80k-entry grid makes that cheap,
+/// where millions of Set inserts would not be.
+func subjectColours(_ cg: CGImage) -> [RGB8] {
+    guard let s = rgbaSample(cg) else { return [] }
+    // q = 2 keeps the quantisation error under ~1 ΔE, which matters because the reported
+    // margin must not be OPTIMISTIC — an over-stated margin is what would let the picker
+    // choose a colour some thin fringe actually contains. Coarser bins (q = 6) over-stated it
+    // by 3–5 against ground truth; keeping one arbitrary real colour per coarse bin was worse
+    // still, because scan order keeps the bulk colour and throws the fringe away.
+    // 129³ bins is a 2 MB flag array — cheaper than the alternative it replaced.
+    let q = 2, side = 256 / q + 1
+    let n = side * side * side
+    var present = [Bool](repeating: false, count: n)
+    var i = 0
+    while i + 3 < s.px.count {
+        let a = Int(s.px[i + 3])
+        if a > 16 {
+            var r = Int(s.px[i]), g = Int(s.px[i + 1]), b = Int(s.px[i + 2])
+            // CG bitmap contexts only do PREMULTIPLIED alpha, so a semi-transparent fringe
+            // pixel arrives darkened by its own alpha. Un-premultiply to recover the colour
+            // the artwork actually is: that's the hue a key must stay away from, and counting
+            // the darkened version instead over-stated one real asset's margin by 3.4 ΔE.
+            if a < 255 {
+                r = min(255, r * 255 / a); g = min(255, g * 255 / a); b = min(255, b * 255 / a)
+            }
+            present[(r / q * side + g / q) * side + b / q] = true
+        }
+        i += 4
+    }
+    var out: [RGB8] = []
+    out.reserveCapacity(4096)
+    for k in 0..<n where present[k] {
+        let b = k % side, g = (k / side) % side, r = k / (side * side)
+        out.append(RGB8(UInt8(min(255, r * q + q / 2)),
+                        UInt8(min(255, g * q + q / 2)),
+                        UInt8(min(255, b * q + q / 2))))
+    }
+    return out
+}
+
+/// The modal 1px-border colour and what fraction of the border matches it. A high fraction
+/// means the image already sits on a flat field, which KeyColorRules extends rather than
+/// contrasts against.
+func flatFieldColour(_ cg: CGImage, tolerance: Int = 8) -> (colour: RGB8, fraction: Double)? {
+    guard let s = rgbaSample(cg), s.w > 2, s.h > 2 else { return nil }
+    func at(_ x: Int, _ y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+        let i = (y * s.w + x) * 4
+        return (s.px[i], s.px[i + 1], s.px[i + 2], s.px[i + 3])
+    }
+    var edge: [(UInt8, UInt8, UInt8)] = []
+    for x in 0..<s.w {
+        for y in [0, s.h - 1] { let p = at(x, y); if p.3 > 250 { edge.append((p.0, p.1, p.2)) } }
+    }
+    for y in 0..<s.h {
+        for x in [0, s.w - 1] { let p = at(x, y); if p.3 > 250 { edge.append((p.0, p.1, p.2)) } }
+    }
+    guard !edge.isEmpty else { return nil }
+    var counts: [RGB8: Int] = [:]
+    for e in edge { counts[RGB8(e.0 / 8 * 8, e.1 / 8 * 8, e.2 / 8 * 8), default: 0] += 1 }
+    guard let modal = counts.max(by: { $0.value < $1.value })?.key else { return nil }
+    // refine to the mean of the pixels in that bucket, so we extend the true field colour
+    var sum = (0, 0, 0), n = 0
+    for e in edge where abs(Int(e.0) - Int(modal.r)) <= 8 && abs(Int(e.1) - Int(modal.g)) <= 8 && abs(Int(e.2) - Int(modal.b)) <= 8 {
+        sum = (sum.0 + Int(e.0), sum.1 + Int(e.1), sum.2 + Int(e.2)); n += 1
+    }
+    guard n > 0 else { return nil }
+    let mean = RGB8(UInt8(sum.0 / n), UInt8(sum.1 / n), UInt8(sum.2 / n))
+    let matching = edge.filter {
+        abs(Int($0.0) - Int(mean.r)) <= tolerance && abs(Int($0.1) - Int(mean.g)) <= tolerance
+            && abs(Int($0.2) - Int(mean.b)) <= tolerance
+    }.count
+    return (mean, Double(matching) / Double(edge.count))
+}
+
+// MARK: - Aspect-ratio prep for the Gemini image models
+
+/// Measured, not assumed: a 5:1 sheet sent straight to NB2 with `--aspect 21:9` came back
+/// with TWO OF FIVE symbols deleted and the survivors distorted 16.7%. The same sheet padded
+/// to exactly 21:9 first kept all five to within 0.2% of the original. So anything whose
+/// ratio isn't a supported one has to be padded, never sent raw.
+enum AspectPrepRules {
+    /// Supported width/height ratios for the Gemini image models.
+    static let supported: [(name: String, ratio: Double)] = [
+        ("21:9", 21.0/9), ("16:9", 16.0/9), ("3:2", 1.5), ("5:4", 1.25), ("4:3", 4.0/3),
+        ("1:1", 1), ("4:5", 0.8), ("3:4", 0.75), ("2:3", 2.0/3), ("9:16", 9.0/16), ("9:21", 9.0/21),
+    ]
+
+    /// Nearest by log-distance, which is symmetric for ratios (2× too wide and 2× too tall
+    /// are equally wrong — plain subtraction would not say that).
+    static func nearest(width: Int, height: Int) -> (name: String, ratio: Double) {
+        let r = Double(width) / Double(max(height, 1))
+        return supported.min { abs(log($0.ratio) - log(r)) < abs(log($1.ratio) - log(r)) }!
+    }
+
+    /// The canvas to pad into: the smallest box of the target ratio that CONTAINS the image,
+    /// times `pad`. The subject is never scaled or cropped — only centred.
+    ///
+    /// `pad` 1.0 = pad only as far as the ratio demands (the auto-prep path, where fidelity is
+    /// the whole point). 1.2 = the manual "Prep for AI" default, which deliberately leaves the
+    /// model breathing room. Scaling BOTH sides preserves the ratio, so padding never undoes
+    /// the fit it just computed.
+    static func canvas(width w: Int, height h: Int, ratio rt: Double, pad: Double = 1.0) -> (w: Int, h: Int) {
+        guard w > 0, h > 0, rt > 0 else { return (max(w, 1), max(h, 1)) }
+        let tight: (Double, Double) = Double(w) / Double(h) > rt
+            ? (Double(w), Double(w) / rt)
+            : (Double(h) * rt, Double(h))
+        return (max(1, Int((tight.0 * pad).rounded())), max(1, Int((tight.1 * pad).rounded())))
+    }
+
+    /// How far off a supported ratio this image is, as a fraction (0 = already exact).
+    /// Padding is nearly free, so the caller pads whenever this is non-zero; at 0 the pad is
+    /// 0px and the whole step is a no-op.
+    static func mismatch(width w: Int, height h: Int) -> Double {
+        guard w > 0, h > 0 else { return 0 }
+        let r = Double(w) / Double(h)
+        return abs(r / nearest(width: w, height: h).ratio - 1)
+    }
+
+    /// Where the subject sits inside the padded canvas, in that canvas's own pixels.
+    static func subjectOrigin(width w: Int, height h: Int, canvas c: (w: Int, h: Int)) -> (x: Int, y: Int) {
+        ((c.w - w) / 2, (c.h - h) / 2)
+    }
+
+    /// The subject's rect inside a RESULT of a different resolution than the padded canvas —
+    /// the model returns its own size, so the crop-back has to scale proportionally. Doing it
+    /// this way means no resample: we crop, we never stretch.
+    static func cropBack(canvas c: (w: Int, h: Int), subject s: (w: Int, h: Int),
+                         result r: (w: Int, h: Int)) -> (x: Int, y: Int, w: Int, h: Int) {
+        guard c.w > 0, c.h > 0 else { return (0, 0, r.w, r.h) }
+        let sx = Double(r.w) / Double(c.w), sy = Double(r.h) / Double(c.h)
+        let o = subjectOrigin(width: s.w, height: s.h, canvas: c)
+        let x = Int((Double(o.x) * sx).rounded()), y = Int((Double(o.y) * sy).rounded())
+        let w = Int((Double(s.w) * sx).rounded()), h = Int((Double(s.h) * sy).rounded())
+        return (max(0, x), max(0, y), min(w, r.w - max(0, x)), min(h, r.h - max(0, y)))
     }
 }
 
@@ -2378,6 +2936,20 @@ struct DragSessionLedger {
     /// What started the session believed to still be running; nil means idle.
     var inFlightSource: String? { open?.source }
 
+    /// How many sessions this ledger has ever opened. Diagnostics only: "12 drags this session,
+    /// none in flight" and "12 drags, one in flight since the third" are the same log with
+    /// completely different meanings, and the count is what separates them.
+    var sessionsOpened: Int { issued }
+
+    /// Drops the open session without logging or arbitration — the manual "Reset Drag & Drop"
+    /// command, and nothing else. Deliberately NOT one of the two ends: neither end may be
+    /// silent about a session it closes, and this one has to be, because the command logs its
+    /// own before/after snapshot instead.
+    mutating func abandon() -> String? {
+        defer { open = nil }
+        return open?.source
+    }
+
     /// Opens a session and returns the ticket its watchdog must present to close it.
     mutating func begin(_ source: String) -> Int {
         issued += 1
@@ -2461,5 +3033,313 @@ enum DragLeakRules {
     static func isLeaked(stillRegisteredWithAppKit: Bool,
                          secondsSinceDragEnd: TimeInterval) -> Bool {
         stillRegisteredWithAppKit && secondsSinceDragEnd >= retirementGrace
+    }
+}
+
+// MARK: - Running build vs installed build
+
+/// `rebuild.sh` deletes and recreates `/Applications/Navigator.app` while the old process
+/// keeps running the binary it already mapped. Nothing in the app noticed: the in-app updater
+/// compares the INSTALLED bundle's version against GitHub, so both read the same number and it
+/// answers "up to date" while the process is executing hours-old code. That is not a
+/// hypothetical — it is how a fixed drag-and-drop bug went on reproducing for an afternoon,
+/// with the log showing behaviour the source no longer contained.
+///
+/// The executable's modification date rather than the version string, because during
+/// development the version does NOT change between builds — the whole failure mode is two
+/// different binaries claiming the same version. A hash would be equally sound and costs a
+/// full read of a 19 MB fat binary on every app activation; a stat costs nothing.
+enum RunningBuildRules {
+    /// Filesystem timestamps and the copy that installs the bundle are not atomic with the
+    /// launch that reads them, so an equal-or-barely-newer stamp must not count as a new
+    /// build. Anything shorter than this reported the CURRENT build as stale on some launches.
+    static let tolerance: TimeInterval = 2
+
+    static func isStale(runningBuiltAt: Date, onDiskBuiltAt: Date) -> Bool {
+        onDiskBuiltAt.timeIntervalSince(runningBuiltAt) > tolerance
+    }
+
+    /// Once per DETECTED BUILD, never once per activation. `alreadyNoticed` is the on-disk
+    /// stamp the user was last told about, so a second rebuild while the notice is still
+    /// pending gets its own notice and a hundred app switches get none.
+    static func shouldNotify(runningBuiltAt: Date, onDiskBuiltAt: Date, alreadyNoticed: Date?) -> Bool {
+        guard isStale(runningBuiltAt: runningBuiltAt, onDiskBuiltAt: onDiskBuiltAt) else { return false }
+        guard let alreadyNoticed else { return true }
+        return abs(onDiskBuiltAt.timeIntervalSince(alreadyNoticed)) > tolerance
+    }
+
+    /// Coarse, human units. A build age is read to answer "is that the one I just made?", and
+    /// seconds of precision get in the way of that.
+    static func age(_ seconds: TimeInterval) -> String {
+        let s = Int(max(0, seconds.rounded()))
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        if s < 86_400 { return "\(s / 3600)h \((s % 3600) / 60)m" }
+        return "\(s / 86_400)d \((s % 86_400) / 3600)h"
+    }
+
+    static func stamp(_ d: Date) -> String { ISO8601DateFormatter().string(from: d) }
+
+    /// The one line that says which of two same-numbered builds is actually running. Used by
+    /// the log, by Check for Updates… and by the diagnostics dump, so all three agree.
+    static func describe(runningBuiltAt: Date, onDiskBuiltAt: Date) -> String {
+        let running = "running \(stamp(runningBuiltAt)), installed \(stamp(onDiskBuiltAt))"
+        guard isStale(runningBuiltAt: runningBuiltAt, onDiskBuiltAt: onDiskBuiltAt) else {
+            return running + " — same build"
+        }
+        return running + " — the installed build is \(age(onDiskBuiltAt.timeIntervalSince(runningBuiltAt))) NEWER than the one running"
+    }
+}
+
+// MARK: - Drop diagnostics
+
+/// Why a drop that ARRIVED at a surface was not acted on.
+///
+/// The blind spot this closes: a drop Navigator silently declines and a drop that never
+/// reached Navigator at all produced identical logs — nothing. The owner's report was "drag
+/// and drop is broken again" against a log showing twelve clean drag sessions, because every
+/// one of those lines is the SOURCE side. Destination-side refusals are where the silence was.
+///
+/// A closed set rather than free-text at each call site, so every surface names the same cause
+/// the same way and the reasons can be asserted in tests instead of eyeballed in a log.
+enum DropRejection: Equatable {
+    /// The pasteboard offered nothing this surface can read at all.
+    case noReadableTypes
+    /// Only Navigator's own private drag tokens (`navreorder:` / `navtab:`) — a sidebar row or
+    /// a tab released somewhere that only accepts files. Counted, because "1 token" is a
+    /// mis-aimed reorder and "8 tokens" would mean something quite different.
+    case noFileURLs(tokens: Int)
+    /// A reorder token landed on a row that is not an entry in the favorites store, so there
+    /// is nothing to reorder it against (Locations, Recents, Cloud, expanded subfolders).
+    case notAReorderTarget
+    /// Every item was the destination folder itself or lived inside it.
+    case selfOrDescendant(count: Int)
+    /// The drop resolved to no destination — the surface had no folder to hand.
+    case missingTarget
+    /// The surface takes files, but not THESE files (the style reference well wants an image).
+    case wrongKind(String)
+    /// Accepted, then found to have nothing left to do. The most deceptive failure of all:
+    /// the drop "worked" and moved nothing.
+    case nothingToDo(String)
+
+    var reason: String {
+        switch self {
+        case .noReadableTypes:
+            return "the pasteboard offered no types this surface can read"
+        case .noFileURLs(let tokens):
+            return "no file URLs on the pasteboard — \(tokens) private drag token(s) only (a sidebar row or a tab, released on a surface that only takes files)"
+        case .notAReorderTarget:
+            return "a reorder token landed on a row that is not a reorderable favorite"
+        case .selfOrDescendant(let count):
+            return "\(count) item(s) are the destination itself or live inside it"
+        case .missingTarget:
+            return "no destination folder resolved for this drop"
+        case .wrongKind(let what):
+            return "this surface accepts \(what) and none of the dropped items are"
+        case .nothingToDo(let why):
+            return "accepted but nothing to transfer — \(why)"
+        }
+    }
+
+    /// The reason a surface that only takes files must decline, or nil when it can proceed.
+    /// One rule for every such surface: the alternative was each of eight call sites deciding
+    /// for itself what "unusable" means, which is how they came to disagree.
+    static func forFileDrop(items: Int, fileURLs: Int) -> DropRejection? {
+        if items == 0 { return .noReadableTypes }
+        if fileURLs == 0 { return .noFileURLs(tokens: items) }
+        return nil
+    }
+}
+
+/// One dense line per drop event, in the style of the refusal-preconditions line: everything
+/// needed to tell an arrival from a refusal from a no-op, and nothing that has to be
+/// correlated across lines to be useful. A skimmable log, not a trace.
+enum DropLogLine {
+    enum Outcome: Equatable {
+        /// Handled. The string says what was done with it ("into folder", "favorite reorder").
+        case accepted(String)
+        case refused(DropRejection)
+        /// The drop was ACCEPTED — the handler returned true, the drag animation showed
+        /// success — and then nothing happened. Its own category, because it is the failure the
+        /// owner cannot see from the outside and the one a plain accept/reject log would hide:
+        /// "drag and drop is broken" with a log full of clean drags is exactly this shape.
+        case acceptedButInert(DropRejection)
+    }
+
+    static func text(surface: String, types: [String], items: Int, fileURLs: Int,
+                     target: String?, outcome: Outcome) -> String {
+        let head: String
+        switch outcome {
+        case .accepted:         head = "drop received: \(surface)"
+        case .refused:          head = "drop REFUSED: \(surface)"
+        case .acceptedButInert: head = "drop NO-OP: \(surface)"
+        }
+        // Types are the first thing to check when a drop from Photoshop or Chrome behaves
+        // differently from the same drag out of Finder, so they are always present — even on
+        // the accepted line, where they are the record of what a WORKING drop looked like.
+        let payload = "\(items) item(s), \(fileURLs) usable file URL(s), types [\(types.joined(separator: ", "))]"
+        let where_ = target.map { " → \($0)" } ?? " → (no target)"
+        switch outcome {
+        case .accepted(let what):                        return "\(head) — \(payload)\(where_) — \(what)"
+        case .refused(let r), .acceptedButInert(let r):   return "\(head) — \(payload)\(where_) — \(r.reason)"
+        }
+    }
+}
+
+/// The transfer's own reporting, which the user-facing alert cannot replace: the alert shows
+/// at most five failures and only when there are any, so a drop that moved two of three files
+/// looked like a complete success. Per-file failures are logged with the underlying error at
+/// the point they happen; this is the closing summary.
+enum TransferLogLine {
+    static func summary(move: Bool, moved: Int, copied: Int, failed: Int, skipped: Int,
+                        total: Int, cancelled: Bool, target: String) -> String {
+        let settled = move ? moved : copied
+        var s = "transfer done: \(move ? "move" : "copy") \(settled)/\(total) → \(target)"
+        if failed > 0 { s += ", \(failed) FAILED" }
+        if skipped > 0 { s += ", \(skipped) skipped (name conflict)" }
+        if cancelled { s += ", CANCELLED by the user" }
+        // The line that makes a silent no-op visible. Everything else about such a drop looks
+        // exactly like a success: a progress sheet appeared, no error was raised, nothing moved.
+        if settled == 0, failed == 0, !cancelled { s += " — NOTHING WAS TRANSFERRED" }
+        return s
+    }
+}
+
+// MARK: - Reset Drag & Drop
+
+/// What the manual "Reset Drag & Drop" command is allowed to do, and what it must not claim.
+///
+/// Two honesty constraints, both of which the command is worthless without:
+///   • it must be INERT during a live drag. Clearing the ledger and the spring state mid-drag
+///     is precisely the failure this whole subsystem has been bitten by (a reload during a
+///     drag discards its drop targeting), so a reset fired by accident would MANUFACTURE the
+///     bug it is meant to relieve;
+///   • it must not report success it cannot deliver. Our reset clears only state this app
+///     owns. If AppKit's own registry is still holding a session, dragging stays broken no
+///     matter what we clear, and saying "fixed" would send the owner back to a dead feature.
+enum DragResetRules {
+    /// Same asymmetry `DragStateRules` documents: the button being up is NOT proof no drag is
+    /// running (Drag Lock and three-finger drag continue a session with no button pressed), so
+    /// an open session whose callbacks are still fresh blocks the reset as well.
+    static func mayReset(leftButtonDown: Bool, sessionInFlight: Bool,
+                         secondsSinceDragActivity: TimeInterval) -> Bool {
+        if leftButtonDown { return false }
+        if sessionInFlight, secondsSinceDragActivity < DragStateRules.quietPeriod { return false }
+        return true
+    }
+
+    enum Outcome: Equatable {
+        /// Nothing is holding a session: dragging should work again.
+        case cleared
+        /// AppKit still lists the last session as in flight. Nothing this process can do fixes
+        /// that — see DragSessionTracker for the measurements behind that claim.
+        case relaunchRequired
+        /// The private AppKit registry could not be read on this system, so the one observable
+        /// that distinguishes the two cases above is unavailable. Say so rather than guess.
+        case cannotTell
+    }
+
+    static func outcome(appKitStillHoldsSession: Bool?) -> Outcome {
+        switch appKitStillHoldsSession {
+        case .some(true):  return .relaunchRequired
+        case .some(false): return .cleared
+        case nil:          return .cannotTell
+        }
+    }
+
+    static func message(_ o: Outcome) -> String {
+        switch o {
+        case .cleared:
+            return "Navigator’s drag state has been cleared and macOS is not holding a drag, so dragging should work again. If it still doesn’t, the log now says why — send Drag Diagnostics."
+        case .relaunchRequired:
+            return "Navigator’s own drag state is cleared, but macOS still has a finished drag registered as in flight. Nothing Navigator can do clears that, so dragging will keep failing until Navigator is relaunched."
+        case .cannotTell:
+            return "Navigator’s drag state has been cleared. Whether macOS is still holding a drag of its own can’t be read on this version of macOS, so if dragging is still broken, relaunching is the fix."
+        }
+    }
+}
+
+// MARK: - Drag diagnostics dump
+
+/// Everything about the drag subsystem's live state, in one clipboard-sized report.
+///
+/// Written to be pasted into a conversation with someone who cannot touch the machine — which
+/// is the actual constraint this exists under. So: no interactive follow-up, no "check whether
+/// X"; every observable that the last three rounds of this bug turned on is in here, including
+/// the ones whose value is "cannot tell".
+struct DragDiagnosticsSnapshot {
+    var appVersion = ""
+    /// The running-vs-installed comparison in full (see RunningBuildRules.describe) — first,
+    /// because a report from a stale binary describes code that no longer exists.
+    var buildComparison = ""
+    var buildIsStale = false
+    /// The source of a session the ledger still believes is open; nil when idle.
+    var sessionInFlight: String?
+    var sessionsOpened = 0
+    var refusals = 0
+    var leaksReported = 0
+    var isDragActive = false
+    /// How long ago that lock was last written, when it is known. A `true` written seconds ago is
+    /// a live drag; the same `true` written twenty minutes ago is a stuck lock, and the whole
+    /// value of the field is telling those two apart.
+    var isDragActiveAge: TimeInterval?
+    var springState = ""
+    var mouseUpWatches = ""
+    var keepAliveHeld = 0
+    var lastSessionSequence: Int?
+    /// nil means the private AppKit registry could not be read — a real and distinct answer.
+    var appKitHoldsLastSession: Bool?
+    var pressedMouseButtons = 0
+    var logTail: [String] = []
+}
+
+enum DragDiagnosticsReport {
+    /// Enough lines to hold a whole failed drag and the healthy ones before it, few enough to
+    /// paste into a message without being trimmed.
+    static let logTailLimit = 40
+
+    /// The drag-relevant tail of the dev log. Filtered rather than dumped whole because the
+    /// same log carries Imagen batches and network polling, and a report that has to be
+    /// scrolled past is a report that gets skimmed.
+    static func dragLines(from log: String, limit: Int = logTailLimit) -> [String] {
+        let keys = ["drag", "drop", "spring", "tear-off", "transfer", "build"]
+        let hits = log.split(separator: "\n", omittingEmptySubsequences: true).filter { line in
+            let l = line.lowercased()
+            return keys.contains { l.contains($0) }
+        }
+        return hits.suffix(limit).map(String.init)
+    }
+
+    static func text(_ s: DragDiagnosticsSnapshot) -> String {
+        var out = ["Navigator drag & drop diagnostics"]
+        out.append("app version: \(s.appVersion)")
+        out.append("build: \(s.buildComparison)")
+        if s.buildIsStale {
+            // Stated as a warning and not just a fact: every other line below describes a
+            // binary that is not the one on disk, and a diagnosis made against the wrong
+            // source is worse than no diagnosis.
+            out.append("WARNING: this report comes from a STALE running build — relaunch and reproduce before trusting anything below")
+        }
+        out.append("session in flight: \(s.sessionInFlight ?? "none")")
+        out.append("sessions opened this process: \(s.sessionsOpened), refusals: \(s.refusals), leaks reported: \(s.leaksReported)")
+        let lockAge = s.isDragActiveAge.map { ", last written \(RunningBuildRules.age($0)) ago" } ?? ""
+        out.append("isDragActive (file list lock): \(s.isDragActive)\(lockAge)")
+        out.append("spring loader: \(s.springState)")
+        out.append("mouse-up watches: \(s.mouseUpWatches)")
+        out.append("drag source keep-alive holding: \(s.keepAliveHeld) view(s)")
+        out.append("pressed mouse buttons: \(s.pressedMouseButtons)")
+        let seq = s.lastSessionSequence.map(String.init) ?? "none"
+        switch s.appKitHoldsLastSession {
+        case .some(true):
+            out.append("AppKit registry: STILL HOLDS drag \(seq) as in flight — this process is wedged, relaunch is the only fix")
+        case .some(false):
+            out.append("AppKit registry: no in-flight drag (last session \(seq) was retired normally)")
+        case nil:
+            out.append("AppKit registry: cannot tell — NSCoreDragManager could not be read on this macOS (last session \(seq))")
+        }
+        out.append("")
+        out.append("last \(s.logTail.count) drag-related log line(s):")
+        out.append(contentsOf: s.logTail)
+        return out.joined(separator: "\n") + "\n"
     }
 }

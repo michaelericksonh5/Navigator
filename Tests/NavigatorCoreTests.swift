@@ -1181,6 +1181,539 @@ final class TabMenuRulesTests: XCTestCase {
     }
 }
 
+// MARK: - ⌘W / File ▸ Close Tab
+
+final class CloseTabRulesTests: XCTestCase {
+    /// THE REGRESSION. Navigator can be frontmost with no key window at all, and in that
+    /// state ⌘W and File ▸ Close Tab silently did nothing while both looked enabled. The
+    /// only wrong answer here is "do nothing", so this asserts a real tab gets closed.
+    func testNoKeyWindowStillClosesATab() {
+        XCTAssertEqual(CloseTabRules.outcome(hasKeyWindow: false, keyWindowIsBrowser: false, tabCount: 5),
+                       .closeTab)
+    }
+
+    func testNoKeyWindowOnLastTabClosesTheWindow() {
+        XCTAssertEqual(CloseTabRules.outcome(hasKeyWindow: false, keyWindowIsBrowser: false, tabCount: 1),
+                       .closeBrowserWindow)
+    }
+
+    /// A Settings / Get Info / viewer window in front owns ⌘W, however many tabs are behind.
+    func testNonBrowserKeyWindowWinsOverTabs() {
+        XCTAssertEqual(CloseTabRules.outcome(hasKeyWindow: true, keyWindowIsBrowser: false, tabCount: 9),
+                       .closeKeyWindow)
+    }
+
+    func testBrowserKeyWindowClosesTabThenWindow() {
+        XCTAssertEqual(CloseTabRules.outcome(hasKeyWindow: true, keyWindowIsBrowser: true, tabCount: 3),
+                       .closeTab)
+        XCTAssertEqual(CloseTabRules.outcome(hasKeyWindow: true, keyWindowIsBrowser: true, tabCount: 1),
+                       .closeBrowserWindow)
+    }
+
+    /// Whatever the inputs, the answer is never "nothing" — that was the bug.
+    func testEveryCombinationDoesSomething() {
+        for hasKey in [true, false] {
+            for isBrowser in [true, false] {
+                for count in [0, 1, 2, 40] {
+                    let o = CloseTabRules.outcome(hasKeyWindow: hasKey,
+                                                  keyWindowIsBrowser: isBrowser, tabCount: count)
+                    XCTAssertTrue([.closeKeyWindow, .closeTab, .closeBrowserWindow].contains(o))
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Layerize
+
+final class LayerizeRulesTests: XCTestCase {
+    /// MEASURED against the live endpoint: 750x709 returned 422 at auto_2K and at auto, but
+    /// 200 at auto_1K. Key Art (3072x3924) returned 200 at auto_2K.
+    func testTierMatchesWhatTheEndpointActuallyAccepted() {
+        XCTAssertEqual(LayerizeRules.tier(width: 750, height: 709), "auto_1K")
+        XCTAssertEqual(LayerizeRules.tier(width: 3072, height: 3924), "auto_2K")
+        XCTAssertEqual(LayerizeRules.tier(width: 2048, height: 2048), "auto_2K")
+        XCTAssertEqual(LayerizeRules.tier(width: 1600, height: 1600), "auto_1.5K")
+        XCTAssertEqual(LayerizeRules.tier(width: 600, height: 600), "auto_1K", "1K is the floor")
+    }
+
+    func testKeyArtPasses() {
+        XCTAssertEqual(LayerizeRules.check(width: 3072, height: 3924, bytes: 17_400_000), .ok)
+    }
+
+    func testOversizeSuggestsAResizeThatActuallyFits() {
+        guard case let .needsResize(_, to) = LayerizeRules.check(width: 9000, height: 4000, bytes: 1000) else {
+            return XCTFail("9000px wide must be flagged")
+        }
+        XCTAssertLessThanOrEqual(max(to.w, to.h), LayerizeRules.maxSide)
+        XCTAssertLessThanOrEqual(to.w * to.h, LayerizeRules.maxPixels)
+        XCTAssertEqual(Double(to.w) / Double(to.h), 9000.0 / 4000.0, accuracy: 0.01, "aspect must be preserved")
+    }
+
+    func testUndersizeSuggestsAResizeThatActuallyFits() {
+        guard case let .needsResize(_, to) = LayerizeRules.check(width: 200, height: 200, bytes: 1000) else {
+            return XCTFail("200px must be flagged")
+        }
+        XCTAssertGreaterThanOrEqual(min(to.w, to.h), LayerizeRules.minSide)
+        XCTAssertGreaterThanOrEqual(to.w * to.h, LayerizeRules.minPixels)
+    }
+
+    /// Over 30 MB is fixable by re-encoding, so dimensions must be left alone.
+    func testOversizeBytesKeepsDimensions() {
+        guard case let .needsResize(reason, to) = LayerizeRules.check(width: 3000, height: 3000, bytes: 40 * 1024 * 1024) else {
+            return XCTFail("40 MB must be flagged")
+        }
+        XCTAssertTrue(reason.contains("MB"))
+        XCTAssertEqual(to.w, 3000); XCTAssertEqual(to.h, 3000)
+    }
+
+    /// An extreme strip can't be fixed by resampling — refuse rather than suggest nonsense.
+    func testAspectOutOfRangeIsRejectedNotResized() {
+        guard case .reject = LayerizeRules.check(width: 8000, height: 100, bytes: 1000) else {
+            return XCTFail("80:1 must be rejected")
+        }
+        XCTAssertEqual(LayerizeRules.check(width: 0, height: 0, bytes: 0), .reject(reason: "not a readable image"))
+    }
+
+    /// MEASURED: a 52.7%-transparent cutout produced a flat invented teal base; Key Art
+    /// (opaque) produced a properly inpainted one worth keeping.
+    func testBaseKeptOnlyWhenTheInputHasARealBackground() {
+        XCTAssertTrue(LayerizeRules.shouldKeepBase(transparentFraction: 0.0))
+        XCTAssertTrue(LayerizeRules.shouldKeepBase(transparentFraction: 0.05))
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(transparentFraction: 0.527))
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(transparentFraction: 0.95))
+    }
+
+    /// THE NAMING BUG: an ASCII-only sanitiser mapped every Chinese name to "" and collapsed
+    /// twelve distinct layers to "unnamed".
+    func testChineseNamesSurviveSanitising() {
+        XCTAssertEqual(LayerizeRules.safeName("竖格锦鲤图标"), "竖格锦鲤图标")
+        XCTAssertFalse(LayerizeRules.safeName("左侧边框金龙").isEmpty)
+        XCTAssertEqual(LayerizeRules.safeName("Left Dragon Frame"), "Left_Dragon_Frame")
+    }
+
+    func testSanitiserStripsOnlyWhatAFilesystemCannotTake() {
+        XCTAssertFalse(LayerizeRules.safeName("a/b:c*d?").contains("/"))
+        XCTAssertFalse(LayerizeRules.safeName("a/b:c*d?").contains(":"))
+        XCTAssertEqual(LayerizeRules.safeName(nil), "")
+        XCTAssertEqual(LayerizeRules.safeName(""), "")
+        XCTAssertLessThanOrEqual(LayerizeRules.safeName(String(repeating: "x", count: 300)).count, 60)
+    }
+
+    func testFileNamesAreUniquePerLayerEvenWhenNamesRepeat() {
+        let a = LayerizeRules.fileName(stem: "KeyArt", zIndex: 3, name: "Dragon")
+        let b = LayerizeRules.fileName(stem: "KeyArt", zIndex: 7, name: "Dragon")
+        XCTAssertNotEqual(a, b, "duplicate names must not overwrite each other")
+        XCTAssertEqual(a, "KeyArt_L03_Dragon.png")
+        XCTAssertEqual(LayerizeRules.fileName(stem: "KeyArt", zIndex: 0, name: nil), "KeyArt_L00_base.png")
+        // the Chinese case that used to collapse
+        XCTAssertNotEqual(LayerizeRules.fileName(stem: "K", zIndex: 1, name: "老虎机面板"),
+                          LayerizeRules.fileName(stem: "K", zIndex: 2, name: "左侧边框金龙"))
+    }
+
+    func testWorstCaseCostUsesTheRightTierRate() {
+        XCTAssertEqual(LayerizeRules.worstCaseCost(tier: "auto_1K"), 0.03375 * 17, accuracy: 1e-9)
+        XCTAssertEqual(LayerizeRules.worstCaseCost(tier: "auto_2K"), 0.0675 * 17, accuracy: 1e-9)
+    }
+}
+
+// MARK: - Thumbnail cache keys
+
+final class ThumbnailKeyRulesTests: XCTestCase {
+    /// THE BUG: same path, same size, new bytes — the key MUST change or the old thumbnail is
+    /// served forever. This is what left a removed green-cloud background still showing.
+    func testRewriteAtSamePathChangesTheKey() {
+        let before = ThumbnailKeyRules.key(path: "/art/HP1.png", size: 256, mtime: 1_000_000, bytes: 4_771_312)
+        let after  = ThumbnailKeyRules.key(path: "/art/HP1.png", size: 256, mtime: 1_000_060, bytes: 3_991_004)
+        XCTAssertNotEqual(before, after)
+    }
+
+    /// Coarse-timestamp filesystems round to the second, so length alone must still separate.
+    func testSameMtimeDifferentLengthStillDiffers() {
+        let a = ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: 1_000_000, bytes: 100)
+        let b = ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: 1_000_000, bytes: 101)
+        XCTAssertNotEqual(a, b)
+    }
+
+    func testSameLengthDifferentMtimeStillDiffers() {
+        let a = ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: 1_000_000, bytes: 100)
+        let b = ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: 1_000_001, bytes: 100)
+        XCTAssertNotEqual(a, b)
+    }
+
+    /// Caching still has to WORK — an unchanged file must hit, or every scroll regenerates.
+    func testUnchangedFileIsStable() {
+        let a = ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: 1_722_000_000.123, bytes: 4_771_312)
+        let b = ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: 1_722_000_000.123, bytes: 4_771_312)
+        XCTAssertEqual(a, b)
+    }
+
+    /// The list thumbnail and the big preview must not clobber each other.
+    func testSizeStillSeparatesEntries() {
+        let small = ThumbnailKeyRules.key(path: "/art/x.png", size: 64, mtime: 1, bytes: 2)
+        let large = ThumbnailKeyRules.key(path: "/art/x.png", size: 512, mtime: 1, bytes: 2)
+        XCTAssertNotEqual(small, large)
+    }
+
+    func testStatFailureFallsBackButKeepsPathAndSize() {
+        XCTAssertEqual(ThumbnailKeyRules.key(path: "/a.png", size: 256, mtime: nil, bytes: nil), "/a.png@256")
+        XCTAssertNotEqual(ThumbnailKeyRules.key(path: "/a.png", size: 256, mtime: nil, bytes: nil),
+                          ThumbnailKeyRules.key(path: "/b.png", size: 256, mtime: nil, bytes: nil))
+        XCTAssertNotEqual(ThumbnailKeyRules.key(path: "/a.png", size: 256, mtime: nil, bytes: nil),
+                          ThumbnailKeyRules.key(path: "/a.png", size: 512, mtime: nil, bytes: nil))
+    }
+
+    /// Cancelling in-flight work must match whatever stamp the request used, so it has to key
+    /// off the prefix rather than a stamp that may have moved on.
+    func testPrefixMatchesEveryStampForThatPathAndSize() {
+        let p = ThumbnailKeyRules.prefix(path: "/art/x.png", size: 256)
+        for (m, b) in [(1.0, Int64(10)), (2.0, 20), (3.5, 30)] {
+            XCTAssertTrue(ThumbnailKeyRules.key(path: "/art/x.png", size: 256, mtime: m, bytes: b).hasPrefix(p))
+        }
+        XCTAssertFalse(ThumbnailKeyRules.key(path: "/art/x.png", size: 512, mtime: 1, bytes: 1).hasPrefix(p + "#"))
+    }
+}
+
+// MARK: - Photoshop Generative Upscale preflight
+
+final class FireflyUpscaleRulesTests: XCTestCase {
+    /// The exact image that produced BOTH of Photoshop's error dialogs: 6.26:1 fails the
+    /// aspect band, and ×4 (8896px) fails the 6144 output cap.
+    func testTheSheetThatFailedBothWays() {
+        XCTAssertFalse(FireflyUpscaleRules.aspectOK(width: 2224, height: 355))
+        // ×4 would be 8896 on the long edge, over the cap, so ×2 is the best available
+        guard case let .padThenUpscale(scale, padTo) = FireflyUpscaleRules.plan(width: 2224, height: 355) else {
+            return XCTFail("expected pad-then-upscale, got \(FireflyUpscaleRules.plan(width: 2224, height: 355))")
+        }
+        XCTAssertEqual(scale, 2)
+        XCTAssertEqual(padTo.w, 2224, "padding must not touch the long edge")
+        XCTAssertEqual(padTo.h, 556, "short edge padded to long/4 = 556")
+        XCTAssertTrue(FireflyUpscaleRules.aspectOK(width: padTo.w, height: padTo.h))
+        XCTAssertLessThanOrEqual(max(padTo.w, padTo.h) * scale, FireflyUpscaleRules.maxOutputSide)
+    }
+
+    /// Padding for aspect must never change which scales fit — it only grows the SHORT side.
+    func testAspectPadNeverChangesTheLongEdge() {
+        for (w, h) in [(2224, 355), (355, 2224), (5977, 1460), (1000, 100), (100, 1000)] {
+            let p = FireflyUpscaleRules.aspectPadCanvas(width: w, height: h)
+            XCTAssertEqual(max(p.w, p.h), max(w, h))
+            XCTAssertGreaterThanOrEqual(p.w, w)
+            XCTAssertGreaterThanOrEqual(p.h, h)
+            XCTAssertTrue(FireflyUpscaleRules.aspectOK(width: p.w, height: p.h),
+                          "\(w)x\(h) padded to \(p.w)x\(p.h) is still out of band")
+        }
+    }
+
+    func testAlreadyValidAspectIsUntouched() {
+        let p = FireflyUpscaleRules.aspectPadCanvas(width: 2048, height: 2048)
+        XCTAssertEqual(p.w, 2048); XCTAssertEqual(p.h, 2048)
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1024, height: 1024), .upscale(scale: 4))
+    }
+
+    /// The output cap is what actually rules out ×4 for most real slot art.
+    func testScaleIsPickedByTheOutputCap() {
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1536, height: 1536), .upscale(scale: 4))  // 6144 exactly
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1537, height: 1537), .upscale(scale: 2))  // 6148 > cap
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: 2048, height: 2048), .upscale(scale: 2))
+        XCTAssertEqual(FireflyUpscaleRules.maxInputLongEdge(scale: 4), 1536)
+        XCTAssertEqual(FireflyUpscaleRules.maxInputLongEdge(scale: 2), 3072)
+    }
+
+    /// Real assets that Generative Upscale simply cannot take, at any scale.
+    func testTooLargeIsReportedNotAttempted() {
+        for (w, h) in [(5977, 1460), (3072, 3924), (4000, 4000)] {
+            guard case let .tooLargeForAnyScale(longEdge, maxIn) = FireflyUpscaleRules.plan(width: w, height: h) else {
+                return XCTFail("\(w)x\(h) should be refused, got \(FireflyUpscaleRules.plan(width: w, height: h))")
+            }
+            XCTAssertEqual(longEdge, max(w, h))
+            XCTAssertEqual(maxIn, 3072)
+        }
+    }
+
+    /// An explicitly requested scale is honoured or refused — never silently swapped.
+    func testPreferredScaleIsNotSilentlyDowngraded() {
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1024, height: 1024, preferred: 2), .upscale(scale: 2))
+        guard case .tooLargeForAnyScale = FireflyUpscaleRules.plan(width: 2048, height: 2048, preferred: 4) else {
+            return XCTFail("×4 on a 2048 image exceeds the cap and must be refused, not downgraded")
+        }
+    }
+
+    func testDegenerateInputs() {
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: 0, height: 0), .notAnImage)
+        XCTAssertEqual(FireflyUpscaleRules.plan(width: -5, height: 10), .notAnImage)
+        XCTAssertFalse(FireflyUpscaleRules.aspectOK(width: 0, height: 10))
+    }
+
+    func testEveryPlanExplainsItself() {
+        for (w, h) in [(2224, 355), (1024, 1024), (5977, 1460), (0, 0)] {
+            let p = FireflyUpscaleRules.plan(width: w, height: h)
+            XCTAssertFalse(FireflyUpscaleRules.explain(p, width: w, height: h).isEmpty)
+        }
+    }
+}
+
+// MARK: - Swipe Compare across N images
+
+final class CompareCycleTests: XCTestCase {
+    func testStepWrapsBothWays() {
+        XCTAssertEqual(CompareCycle.step(index: 0, by: -1, count: 5), 4)
+        XCTAssertEqual(CompareCycle.step(index: 4, by: 1, count: 5), 0)
+        XCTAssertEqual(CompareCycle.step(index: 2, by: 1, count: 5), 3)
+        XCTAssertEqual(CompareCycle.step(index: 0, by: -7, count: 5), 3)
+    }
+
+    /// Never divide by zero or return an out-of-range index for a degenerate list.
+    func testStepIsSafeWhenEmpty() {
+        XCTAssertEqual(CompareCycle.step(index: 3, by: 1, count: 0), 0)
+        for c in 1...6 {
+            for d in [-9, -1, 0, 1, 9] {
+                let i = CompareCycle.step(index: 0, by: d, count: c)
+                XCTAssertTrue((0..<c).contains(i))
+            }
+        }
+    }
+
+    func testCandidatesExcludeTheReference() {
+        XCTAssertEqual(CompareCycle.candidates(total: 4, leftIndex: 0), [1, 2, 3])
+        XCTAssertEqual(CompareCycle.candidates(total: 4, leftIndex: 2), [0, 1, 3])
+        // the old two-image behaviour still falls out of this
+        XCTAssertEqual(CompareCycle.candidates(total: 2, leftIndex: 0), [1])
+        XCTAssertEqual(CompareCycle.candidates(total: 0, leftIndex: 0), [])
+        XCTAssertEqual(CompareCycle.candidates(total: 3, leftIndex: 9), [])
+    }
+
+    func testAvailabilityStillNeedsTwo() {
+        XCTAssertFalse(CompareCycle.isAvailable(imageCount: 1))
+        XCTAssertTrue(CompareCycle.isAvailable(imageCount: 2))
+        XCTAssertTrue(CompareCycle.isAvailable(imageCount: 7))
+    }
+}
+
+// MARK: - Adaptive backing colour
+
+final class KeyColorRulesTests: XCTestCase {
+    func testLabAnchors() {
+        let white = KeyColorRules.lab(RGB8(255, 255, 255))
+        XCTAssertEqual(white.L, 100, accuracy: 0.5)
+        XCTAssertEqual(white.a, 0, accuracy: 0.5)
+        XCTAssertEqual(white.b, 0, accuracy: 0.5)
+        XCTAssertEqual(KeyColorRules.lab(RGB8(0, 0, 0)).L, 0, accuracy: 0.5)
+        XCTAssertEqual(KeyColorRules.deltaE(RGB8(10, 20, 30), RGB8(10, 20, 30)), 0, accuracy: 1e-9)
+    }
+
+    /// A flat field wins outright — extending it keeps ONE keyable colour on the canvas.
+    func testFlatFieldIsExtended() {
+        let magenta = RGB8(212, 19, 149)
+        XCTAssertEqual(KeyColorRules.choose(subject: [RGB8(255, 215, 0)],
+                                            flatField: (magenta, 1.0)),
+                       .extendField(magenta))
+    }
+
+    /// Below the threshold it is NOT a flat field, so fall through to a key colour.
+    func testPartialBorderIsNotAField() {
+        let c = KeyColorRules.choose(subject: [RGB8(255, 215, 0)], flatField: (RGB8(212, 19, 149), 0.4))
+        guard case .keyColour = c else { return XCTFail("expected a key colour, got \(c)") }
+    }
+
+    /// THE REGRESSION THE FIXED LIST ALLOWED: HP4_Tortoise.png contains pure white, so the
+    /// menu's "White" sat at ΔE 0.0 from the art and a later key would eat the subject.
+    func testNeverPicksAColourTheSubjectContains() {
+        let subject = [RGB8(255, 255, 255), RGB8(0, 0, 0), RGB8(0, 255, 0), RGB8(255, 0, 255)]
+        guard case let .keyColour(picked, margin) = KeyColorRules.choose(subject: subject, flatField: nil) else {
+            return XCTFail("expected a key colour")
+        }
+        XCTAssertFalse(subject.contains(picked), "picked \(picked), which is in the art")
+        XCTAssertGreaterThan(margin, 20, "margin too small to key safely")
+        for s in subject {
+            XCTAssertGreaterThan(KeyColorRules.deltaE(picked, s), 20)
+        }
+    }
+
+    /// The whole point: beat the worst thing the fixed menu could have done.
+    func testBeatsTheWorstFixedChoice() {
+        let subject = [RGB8(255, 255, 255), RGB8(250, 250, 245), RGB8(20, 18, 22)]
+        guard case let .keyColour(_, margin) = KeyColorRules.choose(subject: subject, flatField: nil) else {
+            return XCTFail("expected a key colour")
+        }
+        let fixed = [RGB8(255, 255, 255), RGB8(0, 0, 0), RGB8(0, 255, 0),
+                     RGB8(255, 0, 255), RGB8(0, 0, 255), RGB8(255, 255, 0)]
+        let worst = fixed.map { f in subject.map { KeyColorRules.deltaE(f, $0) }.min()! }.min()!
+        XCTAssertGreaterThan(margin, worst)
+    }
+
+    func testPrefersSaturatedAndIsDeterministic() {
+        let subject = [RGB8(128, 128, 128)]
+        guard case let .keyColour(a, _) = KeyColorRules.choose(subject: subject, flatField: nil),
+              case let .keyColour(b, _) = KeyColorRules.choose(subject: subject, flatField: nil) else {
+            return XCTFail("expected key colours")
+        }
+        XCTAssertEqual(a, b, "must be deterministic")
+        XCTAssertGreaterThan(KeyColorRules.saturation(a), 0.5, "a near-neutral key does not key well")
+    }
+
+    func testEmptySubjectStillAnswers() {
+        guard case .keyColour = KeyColorRules.choose(subject: [], flatField: nil) else {
+            return XCTFail("must still return something")
+        }
+    }
+}
+
+// MARK: - Pixel sampling behind the adaptive backing colour
+
+final class BackingSamplingTests: XCTestCase {
+    /// Builds an RGBA8 CGImage: `border` all round, `subject` filling the middle, and an
+    /// optional fully-transparent margin instead of a border.
+    private func image(w: Int, h: Int, border: (UInt8, UInt8, UInt8, UInt8),
+                       subject: (UInt8, UInt8, UInt8, UInt8), inset: Int = 4) -> CGImage {
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 4
+                let inner = x >= inset && x < w - inset && y >= inset && y < h - inset
+                let c = inner ? subject : border
+                px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = c.3
+            }
+        }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(data: &px, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        return ctx.makeImage()!
+    }
+
+    /// A chroma sheet: flat magenta all round. Must be detected as a field and EXTENDED.
+    func testFlatMagentaFieldIsDetectedAndExtended() {
+        let cg = image(w: 120, h: 60, border: (212, 19, 149, 255), subject: (255, 215, 0, 255), inset: 10)
+        guard let f = flatFieldColour(cg) else { return XCTFail("no field detected") }
+        XCTAssertGreaterThan(f.fraction, 0.9, "border is uniform, should read as a field")
+        XCTAssertEqual(Int(f.colour.r), 212, accuracy: 10)
+        XCTAssertEqual(Int(f.colour.g), 19, accuracy: 10)
+        XCTAssertEqual(Int(f.colour.b), 149, accuracy: 10)
+        guard case .extendField = KeyColorRules.choose(subject: subjectColours(cg), flatField: f) else {
+            return XCTFail("a flat field must be extended, not contrasted against")
+        }
+    }
+
+    /// Transparent pixels are what we're about to FILL, so they must not count as present —
+    /// otherwise the fill ends up avoiding itself.
+    func testTransparentPixelsAreExcluded() {
+        let cg = image(w: 80, h: 80, border: (0, 0, 0, 0), subject: (0, 200, 40, 255), inset: 20)
+        let cols = subjectColours(cg)
+        XCTAssertFalse(cols.isEmpty)
+        // every sampled colour should be the green subject, never the transparent black
+        for c in cols {
+            XCTAssertGreaterThan(Int(c.g), Int(c.r), "sampled a transparent pixel as if it were art")
+        }
+    }
+
+    func testFullyTransparentImageSamplesNothing() {
+        let cg = image(w: 40, h: 40, border: (0, 0, 0, 0), subject: (0, 0, 0, 0), inset: 5)
+        XCTAssertTrue(subjectColours(cg).isEmpty)
+    }
+
+    /// THE CASE THAT BREAKS HARDCODED GREEN: a green subject on transparency. The old upscale
+    /// path composited on green then keyed green back out, which eats a green subject.
+    func testGreenSubjectNeverGetsAGreenBacking() {
+        let cg = image(w: 80, h: 80, border: (0, 0, 0, 0), subject: (0, 200, 40, 255), inset: 15)
+        guard case let .keyColour(picked, margin) = KeyColorRules.choose(subject: subjectColours(cg),
+                                                                        flatField: nil) else {
+            return XCTFail("expected a key colour")
+        }
+        XCTAssertGreaterThan(KeyColorRules.deltaE(picked, RGB8(0, 200, 40)), 40,
+                             "picked \(picked), too close to the green subject")
+        XCTAssertGreaterThan(margin, 20)
+    }
+
+    /// A noisy border is not a field, so it must fall through to a contrasting key colour.
+    func testNoisyBorderIsNotAField() {
+        var px = [UInt8](repeating: 0, count: 60 * 60 * 4)
+        for y in 0..<60 {
+            for x in 0..<60 {
+                let i = (y * 60 + x) * 4
+                px[i] = UInt8((x * 4) % 256); px[i + 1] = UInt8((y * 4) % 256)
+                px[i + 2] = UInt8((x * y) % 256); px[i + 3] = 255
+            }
+        }
+        let ctx = CGContext(data: &px, width: 60, height: 60, bitsPerComponent: 8, bytesPerRow: 240,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let cg = ctx.makeImage()!
+        if let f = flatFieldColour(cg) {
+            XCTAssertLessThan(f.fraction, KeyColorRules.flatFieldFraction)
+        }
+    }
+}
+
+// MARK: - Aspect-ratio prep
+
+final class AspectPrepRulesTests: XCTestCase {
+    func testNearestIsLogSymmetric() {
+        XCTAssertEqual(AspectPrepRules.nearest(width: 2350, height: 470).name, "21:9")
+        XCTAssertEqual(AspectPrepRules.nearest(width: 1820, height: 1820).name, "1:1")
+        XCTAssertEqual(AspectPrepRules.nearest(width: 470, height: 2350).name, "9:21")
+        // 3072x3924 = 0.7829, which really is nearer 4:5 (0.80) than 3:4 (0.75) —
+        // log-distance 0.022 vs 0.043. Asserted the wrong one here by eye first.
+        XCTAssertEqual(AspectPrepRules.nearest(width: 3072, height: 3924).name, "4:5")
+        XCTAssertEqual(AspectPrepRules.nearest(width: 3000, height: 4000).name, "3:4")
+    }
+
+    /// Padding scales BOTH sides, so it must not undo the ratio fit. This is the claim I got
+    /// wrong by inspection and had to measure: error is pure Int rounding.
+    func testPaddingPreservesTheRatio() {
+        for (w, h) in [(2350, 470), (1820, 1820), (5977, 1460), (3072, 3924)] {
+            let rt = AspectPrepRules.nearest(width: w, height: h).ratio
+            for pad in [1.0, 1.2, 2.0] {
+                let c = AspectPrepRules.canvas(width: w, height: h, ratio: rt, pad: pad)
+                XCTAssertEqual(Double(c.w) / Double(c.h), rt, accuracy: rt * 0.002)
+            }
+        }
+    }
+
+    /// The canvas must CONTAIN the image — never crop it. Cropping is what NB2 did on its own.
+    func testCanvasAlwaysContainsTheSubject() {
+        for (w, h) in [(2350, 470), (1000, 1000), (100, 4000), (4000, 100), (1, 1)] {
+            let rt = AspectPrepRules.nearest(width: w, height: h).ratio
+            let c = AspectPrepRules.canvas(width: w, height: h, ratio: rt, pad: 1.0)
+            XCTAssertGreaterThanOrEqual(c.w, w)
+            XCTAssertGreaterThanOrEqual(c.h, h)
+        }
+    }
+
+    /// At an exact supported ratio the pad is zero, so auto-prep needs no threshold —
+    /// running it unconditionally is a no-op for already-correct images.
+    func testExactRatioIsANoOp() {
+        XCTAssertEqual(AspectPrepRules.mismatch(width: 1024, height: 1024), 0, accuracy: 1e-9)
+        let c = AspectPrepRules.canvas(width: 1024, height: 1024, ratio: 1.0, pad: 1.0)
+        XCTAssertEqual(c.w, 1024); XCTAssertEqual(c.h, 1024)
+        XCTAssertEqual(AspectPrepRules.subjectOrigin(width: 1024, height: 1024, canvas: c).x, 0)
+    }
+
+    func testMismatchFlagsTheRealOffender() {
+        XCTAssertGreaterThan(AspectPrepRules.mismatch(width: 2350, height: 470), 1.0)  // 5:1 vs 21:9
+        XCTAssertLessThan(AspectPrepRules.mismatch(width: 1600, height: 900), 0.01)    // already 16:9
+    }
+
+    /// Crop-back has to scale to the model's own output size, which differs from the canvas.
+    func testCropBackScalesToResultResolution() {
+        let c = AspectPrepRules.canvas(width: 2350, height: 470, ratio: 21.0/9, pad: 1.0)
+        let box = AspectPrepRules.cropBack(canvas: c, subject: (2350, 470), result: (3168, 1344))
+        // recovered region keeps the subject's 5:1 shape
+        XCTAssertEqual(Double(box.w) / Double(box.h), 5.0, accuracy: 0.06)
+        XCTAssertGreaterThan(box.y, 0, "subject is centred, so there is padding above it")
+        XCTAssertLessThanOrEqual(box.x + box.w, 3168)
+        XCTAssertLessThanOrEqual(box.y + box.h, 1344)
+    }
+
+    func testCropBackStaysInBoundsForOddSizes() {
+        for result in [(100, 100), (3168, 1344), (1, 1), (4096, 1755)] {
+            let c = AspectPrepRules.canvas(width: 999, height: 333, ratio: 21.0/9, pad: 1.2)
+            let b = AspectPrepRules.cropBack(canvas: c, subject: (999, 333), result: result)
+            XCTAssertGreaterThanOrEqual(b.x, 0); XCTAssertGreaterThanOrEqual(b.y, 0)
+            XCTAssertLessThanOrEqual(b.x + b.w, result.0)
+            XCTAssertLessThanOrEqual(b.y + b.h, result.1)
+        }
+    }
+}
+
 // MARK: - Tab reordering by drag
 
 final class TabMoveRulesTests: XCTestCase {
@@ -3145,5 +3678,459 @@ final class DragWedgeRulesTests: XCTestCase {
         XCTAssertEqual(step(), .recoverAndRetry)
         XCTAssertEqual(step(), .notifyUser)
         XCTAssertEqual(step(), .none)
+    }
+}
+
+// MARK: - Running build vs installed build
+
+/// The bug: `rebuild.sh` swaps /Applications/Navigator.app under the running process, the
+/// updater compares the INSTALLED version against GitHub, both read the same number, and the
+/// app reports "up to date" while executing hours-old code. That happened, for an afternoon,
+/// while a fixed bug went on reproducing.
+final class RunningBuildRulesTests: XCTestCase {
+    private let base = Date(timeIntervalSince1970: 1_000_000)
+
+    func testANewerBinaryOnDiskIsStale() {
+        XCTAssertTrue(RunningBuildRules.isStale(runningBuiltAt: base, onDiskBuiltAt: base.addingTimeInterval(60)))
+    }
+
+    func testTheSameBinaryIsNotStale() {
+        XCTAssertFalse(RunningBuildRules.isStale(runningBuiltAt: base, onDiskBuiltAt: base))
+    }
+
+    /// The install copy and the launch that stats it are not atomic, so a sub-tolerance
+    /// difference must not accuse the CURRENT build of being stale — a false notice teaches the
+    /// owner to dismiss the true one.
+    func testASubSecondDifferenceIsNotANewBuild() {
+        XCTAssertFalse(RunningBuildRules.isStale(runningBuiltAt: base, onDiskBuiltAt: base.addingTimeInterval(0.4)))
+        XCTAssertFalse(RunningBuildRules.isStale(runningBuiltAt: base, onDiskBuiltAt: base.addingTimeInterval(1.9)))
+    }
+
+    /// An OLDER binary on disk is not a new build. Reachable in practice: running a build from
+    /// the source folder while /Applications holds yesterday's install.
+    func testAnOlderBinaryOnDiskIsNotStale() {
+        XCTAssertFalse(RunningBuildRules.isStale(runningBuiltAt: base, onDiskBuiltAt: base.addingTimeInterval(-3600)))
+    }
+
+    func testNotifiesOnceForANewBuild() {
+        let onDisk = base.addingTimeInterval(300)
+        XCTAssertTrue(RunningBuildRules.shouldNotify(runningBuiltAt: base, onDiskBuiltAt: onDisk, alreadyNoticed: nil))
+        XCTAssertFalse(RunningBuildRules.shouldNotify(runningBuiltAt: base, onDiskBuiltAt: onDisk, alreadyNoticed: onDisk),
+                       "a notice already given for this exact build must never repeat — this is the never-nag requirement")
+    }
+
+    /// Never nag, but never go silent either: a SECOND rebuild after the user chose Later is a
+    /// different build and gets its own notice.
+    func testASecondRebuildGetsItsOwnNotice() {
+        let first = base.addingTimeInterval(300), second = base.addingTimeInterval(900)
+        XCTAssertTrue(RunningBuildRules.shouldNotify(runningBuiltAt: base, onDiskBuiltAt: second, alreadyNoticed: first))
+    }
+
+    /// A hundred app activations with nothing rebuilt in between must produce exactly one
+    /// notice, because `applicationDidBecomeActive` is what drives the check.
+    func testRepeatedActivationsWithNoRebuildNotifyOnce() {
+        let onDisk = base.addingTimeInterval(300)
+        var noticed: Date?
+        var notices = 0
+        for _ in 0..<100 {
+            if RunningBuildRules.shouldNotify(runningBuiltAt: base, onDiskBuiltAt: onDisk, alreadyNoticed: noticed) {
+                notices += 1
+                noticed = onDisk
+            }
+        }
+        XCTAssertEqual(notices, 1)
+    }
+
+    func testAgeReadsInHumanUnits() {
+        XCTAssertEqual(RunningBuildRules.age(0), "0s")
+        XCTAssertEqual(RunningBuildRules.age(45), "45s")
+        XCTAssertEqual(RunningBuildRules.age(90), "1m")
+        XCTAssertEqual(RunningBuildRules.age(3600), "1h 0m")
+        XCTAssertEqual(RunningBuildRules.age(12_240), "3h 24m")
+        XCTAssertEqual(RunningBuildRules.age(90_000), "1d 1h")
+    }
+
+    /// A negative interval can only come from an older binary on disk, and must not render as
+    /// a nonsense age.
+    func testAgeNeverGoesNegative() {
+        XCTAssertEqual(RunningBuildRules.age(-500), "0s")
+    }
+
+    func testDescribeNamesWhichBuildIsActuallyRunning() {
+        let d = RunningBuildRules.describe(runningBuiltAt: base, onDiskBuiltAt: base.addingTimeInterval(12_240))
+        XCTAssertTrue(d.contains("the installed build is 3h 24m NEWER than the one running"), d)
+        XCTAssertTrue(d.contains(RunningBuildRules.stamp(base)), d)
+    }
+
+    func testDescribeSaysSoWhenNothingIsStale() {
+        XCTAssertTrue(RunningBuildRules.describe(runningBuiltAt: base, onDiskBuiltAt: base).hasSuffix("same build"))
+    }
+}
+
+// MARK: - Drop rejection classification
+
+/// The blind spot these cover: a drop Navigator silently declined and a drop that never
+/// arrived produced identical logs (nothing at all), which is why "12 clean drag sessions" and
+/// "drag and drop is broken" were both true at the same time.
+final class DropRejectionTests: XCTestCase {
+
+    func testAnEmptyPasteboardIsUnreadable() {
+        XCTAssertEqual(DropRejection.forFileDrop(items: 0, fileURLs: 0), .noReadableTypes)
+    }
+
+    /// The mis-aimed sidebar reorder / tab drag: one private token, no files. Before this the
+    /// drop returned false and said nothing.
+    func testATokenOnlyPayloadNamesTheTokens() {
+        XCTAssertEqual(DropRejection.forFileDrop(items: 1, fileURLs: 0), .noFileURLs(tokens: 1))
+    }
+
+    func testAFileDropIsNotRejected() {
+        XCTAssertNil(DropRejection.forFileDrop(items: 3, fileURLs: 3))
+    }
+
+    /// A mixed payload proceeds on the files it does have — refusing the lot would be a
+    /// behaviour change, and the drop paths have always filtered rather than refused.
+    func testAMixedPayloadProceeds() {
+        XCTAssertNil(DropRejection.forFileDrop(items: 4, fileURLs: 3))
+    }
+
+    func testEveryReasonSaysSomethingSpecific() {
+        let all: [DropRejection] = [.noReadableTypes, .noFileURLs(tokens: 2), .notAReorderTarget,
+                                    .selfOrDescendant(count: 3), .missingTarget,
+                                    .wrongKind("images"), .nothingToDo("already in the destination")]
+        for r in all {
+            XCTAssertFalse(r.reason.isEmpty, "\(r)")
+            XCTAssertFalse(r.reason.contains("Optional"), "\(r)")
+        }
+        XCTAssertTrue(DropRejection.selfOrDescendant(count: 3).reason.contains("3"))
+        XCTAssertTrue(DropRejection.noFileURLs(tokens: 2).reason.contains("2"))
+        XCTAssertTrue(DropRejection.wrongKind("images").reason.contains("images"))
+        XCTAssertTrue(DropRejection.nothingToDo("already in the destination").reason.contains("already in the destination"))
+    }
+}
+
+final class DropLogLineTests: XCTestCase {
+
+    /// One line has to answer all of: which surface, what was on the pasteboard, how much of it
+    /// was usable, where it was aimed, and what happened. Correlating lines is what made the
+    /// previous logs unreadable.
+    func testAnAcceptedDropReportsSurfacePayloadTargetAndAction() {
+        let l = DropLogLine.text(surface: "sidebar row “Photos”",
+                                 types: ["public.file-url"], items: 3, fileURLs: 3,
+                                 target: "/Users/x/Photos", outcome: .accepted("into folder"))
+        XCTAssertTrue(l.hasPrefix("drop received: sidebar row “Photos”"), l)
+        XCTAssertTrue(l.contains("3 item(s), 3 usable file URL(s)"), l)
+        XCTAssertTrue(l.contains("types [public.file-url]"), l)
+        XCTAssertTrue(l.contains("→ /Users/x/Photos"), l)
+        XCTAssertTrue(l.contains("into folder"), l)
+    }
+
+    /// REFUSED in capitals and greppable, because "find every silently refused drop" is the
+    /// question this log has to answer in one search.
+    func testARefusedDropIsGreppableAndCarriesTheReason() {
+        let l = DropLogLine.text(surface: "tab 2", types: ["navtab"], items: 1, fileURLs: 0,
+                                 target: nil, outcome: .refused(.noFileURLs(tokens: 1)))
+        XCTAssertTrue(l.hasPrefix("drop REFUSED: tab 2"), l)
+        XCTAssertTrue(l.contains("(no target)"), l)
+        XCTAssertTrue(l.contains(DropRejection.noFileURLs(tokens: 1).reason), l)
+    }
+
+    /// A drop from Photoshop or Chrome that behaves differently from the same drag out of
+    /// Finder differs in exactly one visible way — its pasteboard types — so they are on the
+    /// SUCCESS line too, as the record of what a working drop looked like.
+    func testTypesAreLoggedEvenWhenTheDropSucceeds() {
+        let l = DropLogLine.text(surface: "file list", types: ["public.file-url", "public.tiff"],
+                                 items: 1, fileURLs: 1, target: "/tmp", outcome: .accepted("into current folder"))
+        XCTAssertTrue(l.contains("public.tiff"), l)
+    }
+
+    func testNoTypesAtAllStillProducesAReadableLine() {
+        let l = DropLogLine.text(surface: "file list", types: [], items: 0, fileURLs: 0,
+                                 target: "/tmp", outcome: .refused(.noReadableTypes))
+        XCTAssertTrue(l.contains("types []"), l)
+    }
+}
+
+final class TransferLogLineTests: XCTestCase {
+
+    func testASuccessfulMoveReportsCountAndDestination() {
+        let l = TransferLogLine.summary(move: true, moved: 3, copied: 0, failed: 0, skipped: 0,
+                                        total: 3, cancelled: false, target: "/tmp/dest")
+        XCTAssertEqual(l, "transfer done: move 3/3 → /tmp/dest")
+    }
+
+    /// THE line that matters. A drop that moved nothing looks exactly like a success from the
+    /// outside: progress sheet, no error, empty folder.
+    func testADropThatTransferredNothingSaysSoLoudly() {
+        let l = TransferLogLine.summary(move: true, moved: 0, copied: 0, failed: 0, skipped: 0,
+                                        total: 2, cancelled: false, target: "/tmp/dest")
+        XCTAssertTrue(l.contains("NOTHING WAS TRANSFERRED"), l)
+    }
+
+    /// Not a silent no-op: failures and cancellation each have their own explanation, so the
+    /// alarming phrase stays reserved for the case nobody can otherwise see.
+    func testFailuresAndCancellationAreNotReportedAsNothingTransferred() {
+        let failed = TransferLogLine.summary(move: false, moved: 0, copied: 0, failed: 2, skipped: 0,
+                                             total: 2, cancelled: false, target: "/tmp")
+        XCTAssertTrue(failed.contains("2 FAILED"), failed)
+        XCTAssertFalse(failed.contains("NOTHING WAS TRANSFERRED"), failed)
+        let cancelled = TransferLogLine.summary(move: false, moved: 0, copied: 0, failed: 0, skipped: 0,
+                                                total: 5, cancelled: true, target: "/tmp")
+        XCTAssertTrue(cancelled.contains("CANCELLED"), cancelled)
+        XCTAssertFalse(cancelled.contains("NOTHING WAS TRANSFERRED"), cancelled)
+    }
+
+    /// Everything skipped at the conflict prompt is a deliberate no-op, and the count is what
+    /// distinguishes it from a broken transfer.
+    func testSkippedItemsAreCounted() {
+        let l = TransferLogLine.summary(move: false, moved: 0, copied: 1, failed: 0, skipped: 2,
+                                        total: 3, cancelled: false, target: "/tmp")
+        XCTAssertTrue(l.contains("2 skipped"), l)
+        XCTAssertTrue(l.contains("copy 1/3"), l)
+    }
+}
+
+// MARK: - Reset Drag & Drop
+
+final class DragResetRulesTests: XCTestCase {
+
+    func testResetIsAllowedWhenNothingIsHappening() {
+        XCTAssertTrue(DragResetRules.mayReset(leftButtonDown: false, sessionInFlight: false,
+                                              secondsSinceDragActivity: 0))
+    }
+
+    /// The one unacceptable outcome: a reset that tears down a drag the user is performing.
+    /// Clearing the ledger and the spring state mid-drag manufactures the exact bug this
+    /// command exists to relieve.
+    func testResetIsRefusedWhileTheButtonIsDown() {
+        XCTAssertFalse(DragResetRules.mayReset(leftButtonDown: true, sessionInFlight: false,
+                                               secondsSinceDragActivity: 99))
+    }
+
+    /// Drag Lock and three-finger drag continue a live session with NO button pressed, so a
+    /// fresh open session blocks the reset on its own — same asymmetry DragStateRules documents.
+    func testResetIsRefusedForAFreshSessionWithNoButtonDown() {
+        XCTAssertFalse(DragResetRules.mayReset(leftButtonDown: false, sessionInFlight: true,
+                                               secondsSinceDragActivity: 0.2))
+    }
+
+    /// A session that has been silent past the quiet period is exactly the leak this command is
+    /// for — refusing there would make it useless in the only case it is invoked.
+    func testAStaleSessionIsResettable() {
+        XCTAssertTrue(DragResetRules.mayReset(leftButtonDown: false, sessionInFlight: true,
+                                              secondsSinceDragActivity: DragStateRules.quietPeriod + 0.1))
+    }
+
+    func testOutcomeIsHonestAboutAppKitHoldingASession() {
+        XCTAssertEqual(DragResetRules.outcome(appKitStillHoldsSession: true), .relaunchRequired)
+        XCTAssertEqual(DragResetRules.outcome(appKitStillHoldsSession: false), .cleared)
+        XCTAssertEqual(DragResetRules.outcome(appKitStillHoldsSession: nil), .cannotTell)
+    }
+
+    /// Claiming success we cannot deliver sends the owner back to a dead feature. Only the
+    /// genuinely-clear outcome may sound like a fix, and both other outcomes must name relaunch.
+    func testOnlyTheClearedOutcomeImpliesADragWillNowWork() {
+        XCTAssertTrue(DragResetRules.message(.cleared).contains("should work again"))
+        for o in [DragResetRules.Outcome.relaunchRequired, .cannotTell] {
+            let m = DragResetRules.message(o)
+            XCTAssertFalse(m.contains("should work again"), m)
+            XCTAssertTrue(m.lowercased().contains("relaunch"), m)
+        }
+    }
+}
+
+// MARK: - Drag diagnostics dump
+
+final class DragDiagnosticsReportTests: XCTestCase {
+
+    private func snapshot() -> DragDiagnosticsSnapshot {
+        var s = DragDiagnosticsSnapshot()
+        s.appVersion = "2.4.00 (131)"
+        s.buildComparison = "running A, installed B — same build"
+        s.sessionsOpened = 12
+        s.springState = "idle"
+        s.mouseUpWatches = "none armed"
+        return s
+    }
+
+    func testReportCarriesEveryObservableTheBugTurnsOn() {
+        var s = snapshot()
+        s.sessionInFlight = "icon"
+        s.refusals = 2
+        s.leaksReported = 1
+        s.isDragActive = true
+        s.keepAliveHeld = 3
+        s.lastSessionSequence = 4242
+        s.appKitHoldsLastSession = true
+        s.logTail = ["[t] drag start: 1 file(s)"]
+        let t = DragDiagnosticsReport.text(s)
+        for needle in ["2.4.00 (131)", "session in flight: icon", "refusals: 2", "leaks reported: 1",
+                       "isDragActive (file list lock): true", "keep-alive holding: 3",
+                       "4242", "drag start: 1 file(s)"] {
+            XCTAssertTrue(t.contains(needle), "missing \(needle) in:\n\(t)")
+        }
+    }
+
+    /// The wedge, spelled out. This is the line that tells me a relaunch is the only fix
+    /// without my ever touching the machine.
+    func testAWedgedProcessIsNamedAsWedged() {
+        var s = snapshot()
+        s.appKitHoldsLastSession = true
+        s.lastSessionSequence = 7
+        let t = DragDiagnosticsReport.text(s)
+        XCTAssertTrue(t.contains("STILL HOLDS drag 7"), t)
+        XCTAssertTrue(t.contains("relaunch"), t)
+    }
+
+    func testAHealthyProcessSaysTheRegistryIsClear() {
+        var s = snapshot()
+        s.appKitHoldsLastSession = false
+        let t = DragDiagnosticsReport.text(s)
+        XCTAssertTrue(t.contains("no in-flight drag"), t)
+        XCTAssertFalse(t.contains("STILL HOLDS"), t)
+    }
+
+    /// "Cannot tell" is a distinct answer from "clear". Reporting an unreadable registry as
+    /// healthy is how a wedge would get diagnosed as something else entirely.
+    func testAnUnreadableRegistryIsReportedAsUnknownNotHealthy() {
+        let t = DragDiagnosticsReport.text(snapshot())   // appKitHoldsLastSession left nil
+        XCTAssertTrue(t.contains("cannot tell"), t)
+        XCTAssertFalse(t.contains("no in-flight drag"), t)
+    }
+
+    /// A report from a stale binary describes code that no longer exists — the exact trap that
+    /// cost an afternoon — so it must warn before anything else is believed.
+    func testAStaleBuildWarningLeadsTheReport() {
+        var s = snapshot()
+        s.buildIsStale = true
+        let t = DragDiagnosticsReport.text(s)
+        XCTAssertTrue(t.contains("STALE running build"), t)
+        let warn = t.range(of: "STALE running build")!
+        XCTAssertTrue(t.range(of: "session in flight")!.lowerBound > warn.lowerBound,
+                      "the warning has to come before the state it invalidates")
+    }
+
+    func testAnIdleSessionReadsAsNoneRatherThanEmpty() {
+        XCTAssertTrue(DragDiagnosticsReport.text(snapshot()).contains("session in flight: none"))
+    }
+
+    func testTheLogTailKeepsTheMostRecentLinesOnly() {
+        let log = (1...200).map { "[t] drag start: \($0)" }.joined(separator: "\n")
+        let tail = DragDiagnosticsReport.dragLines(from: log)
+        XCTAssertEqual(tail.count, DragDiagnosticsReport.logTailLimit)
+        XCTAssertEqual(tail.last, "[t] drag start: 200")
+        XCTAssertEqual(tail.first, "[t] drag start: 161")
+    }
+
+    /// The same log carries Imagen batches and network polling; a report that has to be
+    /// scrolled past is a report that gets skimmed.
+    func testUnrelatedLogLinesAreFilteredOut() {
+        let log = """
+        [t] imagen: batch started
+        [t] drag start: 1 file(s)
+        [t] network: poll finished
+        [t] drop REFUSED: tab 2 — no file URLs
+        [t] spring: opening Photos mid-drag
+        """
+        let tail = DragDiagnosticsReport.dragLines(from: log)
+        XCTAssertEqual(tail.count, 3)
+        XCTAssertFalse(tail.contains { $0.contains("imagen") })
+        XCTAssertFalse(tail.contains { $0.contains("network") })
+    }
+
+    /// A report from a session with no drags at all still has to be worth pasting — the state
+    /// above the tail is most of its value.
+    func testAnEmptyLogStillProducesAReport() {
+        var s = snapshot()
+        s.logTail = DragDiagnosticsReport.dragLines(from: "")
+        let t = DragDiagnosticsReport.text(s)
+        XCTAssertTrue(t.contains("last 0 drag-related log line(s):"), t)
+        XCTAssertTrue(t.hasSuffix("\n"))
+    }
+}
+
+/// The third outcome, and the one the owner's report was actually made of: a drop the handler
+/// ACCEPTED (so the drag animation showed success) which then did nothing at all.
+final class InertDropLogLineTests: XCTestCase {
+
+    func testAnInertDropIsNeitherReceivedNorRefused() {
+        let l = DropLogLine.text(surface: "icon cell “Photos”", types: ["navreorder"],
+                                 items: 1, fileURLs: 0, target: "/Users/x/Photos",
+                                 outcome: .acceptedButInert(.noFileURLs(tokens: 1)))
+        XCTAssertTrue(l.hasPrefix("drop NO-OP: icon cell “Photos”"), l)
+        XCTAssertFalse(l.contains("drop received"), l)
+        XCTAssertFalse(l.contains("drop REFUSED"), l)
+    }
+
+    /// The three heads have to be distinguishable by a single grep each, or the log cannot
+    /// answer "did my drop arrive, get refused, or quietly do nothing".
+    func testTheThreeOutcomesHaveDistinctGreppableHeads() {
+        func head(_ o: DropLogLine.Outcome) -> String {
+            String(DropLogLine.text(surface: "s", types: [], items: 1, fileURLs: 1,
+                                    target: nil, outcome: o).prefix(while: { $0 != ":" }))
+        }
+        let heads = [head(.accepted("x")), head(.refused(.missingTarget)),
+                     head(.acceptedButInert(.nothingToDo("y")))]
+        XCTAssertEqual(Set(heads).count, 3, "\(heads)")
+    }
+}
+
+/// The stuck-lock question, which is the whole reason the lock's age is reported: `true` written a
+/// second ago is a live drag, the same `true` from twenty minutes ago is the bug.
+final class DragDiagnosticsLockAgeTests: XCTestCase {
+
+    private func line(_ value: Bool, _ age: TimeInterval?) -> String {
+        var s = DragDiagnosticsSnapshot()
+        s.isDragActive = value
+        s.isDragActiveAge = age
+        let text = DragDiagnosticsReport.text(s)
+        return text.split(separator: "\n").first { $0.hasPrefix("isDragActive") }.map(String.init) ?? ""
+    }
+
+    func testAStuckLockShowsItsAge() {
+        XCTAssertEqual(line(true, 1_200), "isDragActive (file list lock): true, last written 20m ago")
+    }
+
+    /// A lock never written at all (no drag this session) must not claim an age of zero, which
+    /// would read as "a drag is happening right now".
+    func testAnUnwrittenLockReportsNoAge() {
+        XCTAssertEqual(line(false, nil), "isDragActive (file list lock): false")
+    }
+}
+
+/// The ledger's two diagnostics additions. `abandon` is the reset command's only way in, and it
+/// must not be mistakable for one of the two arbitrated ends.
+final class DragSessionLedgerResetTests: XCTestCase {
+
+    func testSessionsOpenedCountsEverySessionEverOpened() {
+        var l = DragSessionLedger()
+        XCTAssertEqual(l.sessionsOpened, 0)
+        _ = l.begin("icon"); _ = l.closeAuthoritatively()
+        _ = l.begin("list view")
+        XCTAssertEqual(l.sessionsOpened, 2, "the count is cumulative, not a live gauge")
+    }
+
+    func testAbandonClosesTheOpenSessionAndNamesIt() {
+        var l = DragSessionLedger()
+        _ = l.begin("sidebar reorder")
+        XCTAssertEqual(l.abandon(), "sidebar reorder")
+        XCTAssertNil(l.inFlightSource)
+    }
+
+    func testAbandonOnAnIdleLedgerIsANoOp() {
+        var l = DragSessionLedger()
+        XCTAssertNil(l.abandon())
+    }
+
+    /// After a reset, a watchdog still armed from the abandoned session must not be able to speak
+    /// for the NEXT drag — the ticketing that protects against a stale poll has to survive
+    /// abandonment too, or the reset command reintroduces the bug the ledger was written for.
+    func testAWatchdogFromAnAbandonedSessionCannotCloseTheNextOne() {
+        var l = DragSessionLedger()
+        let stale = l.begin("icon")
+        _ = l.abandon()
+        _ = l.begin("list view")
+        XCTAssertNil(l.closeIfCurrent(ticket: stale))
+        XCTAssertEqual(l.inFlightSource, "list view")
     }
 }
