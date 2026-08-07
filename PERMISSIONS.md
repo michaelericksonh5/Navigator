@@ -30,6 +30,7 @@ either optional or granted on demand the first time you use the feature.
 | Automation ▸ Photoshop | Remove BG, Chroma Key, Quick Export as PNG | Only for those features |
 | Automation ▸ After Effects | Chroma Key | Only for that feature |
 | Accessibility *(Privacy & Security — not the sidebar one, see §4)* | The **one-keystroke** Open/Save dialog jump (⌃⌥⇧⌘G) | Optional |
+| AI provider keys *(not a macOS permission — see §4b)* | Restyle, AI upscaling, Prep for AI | Only for those features |
 | Finder extension | Navigator's submenu in Finder's right-click menu | Optional |
 | Local Network | Discovering file servers for the sidebar | Optional |
 | Screen Recording | **Nothing.** Navigator never asks. | Never |
@@ -145,6 +146,58 @@ Navigator's own "needs Accessibility" alert have the same button.)
 **Accessibility** ▸ find **Navigator** in the list ▸ switch it on. If Navigator
 isn't listed, click **+**, press ⇧⌘G, type `/Applications/Navigator.app`. Quit and
 reopen the app afterwards.
+
+---
+
+## 4b. AI provider keys — not macOS permissions, but the same kind of blocker
+
+Navigator's AI features run through three providers. These aren't System Settings toggles,
+but they fail in the same "why isn't this working" way, so they belong on the checklist.
+
+| Provider | What it powers | How it's set up | Stored where |
+|---|---|---|---|
+| **Vertex** (Google, company-metered) | Restyle, Imagen upscale, Prep-for-AI models | Browser sign-in, **no key** — AI ▸ Sign in to Vertex (Imagen)… | `~/.h5g-ai-gen/token.json`, ~30 days |
+| **fal.ai** | AI upscaling (SeedVR2, Crystal, AuraSR, Topaz, Recraft) | AI ▸ API Keys… | your **login keychain** |
+| **OpenAI** | not wired up yet — reserved for gpt-image surfaces | AI ▸ API Keys… | your **login keychain** |
+
+**Vertex is a sign-in, not a key.** If something tells you to install `gcloud`, run
+`gcloud auth`, or set `GOOGLE_APPLICATION_CREDENTIALS`, that is the wrong path and it also
+breaks the fal/OpenAI paths. Sign-in lasts about 30 days, then asks once more.
+
+### The keychain prompt after every Navigator update
+
+This one is guaranteed to bite, so it gets stated plainly.
+
+Navigator is self-signed. **Updating it re-signs the app, which invalidates the keychain's
+saved permission for anything Navigator stored earlier.** So the first AI action after an
+update pops:
+
+> Navigator wants to access key "com.merickson.navigator.apikeys" in your keychain.
+
+That is normal and it is not a sign anything is wrong. Enter your **login keychain**
+password (the same one you log into the Mac with) and choose **Always Allow** so it stops
+asking for this build.
+
+**Your key is still there.** If you dismiss that prompt, Navigator now says so explicitly —
+"macOS blocked access to your saved fal.ai key" — rather than telling you to add a key you
+already added. If you ever see the older "Add your fal.ai API key first" wording, that one
+really does mean no key is stored.
+
+This is the same tradeoff as Accessibility in §4: both are keyed to the code signature, and
+nothing in Navigator can avoid it without a paid Developer ID.
+
+### Checking what's set
+
+```bash
+# Vertex: signed in as who?
+node ~/.claude/skills/h5g-ai-connect/client.mjs whoami
+
+# fal / OpenAI: configured, and from which source?
+node ~/.claude/skills/h5g-ai-connect/keys.mjs status
+```
+
+Never paste a key into a chat window or a support ticket. `keys.mjs set fal` prompts for it
+with the input masked.
 
 ---
 
