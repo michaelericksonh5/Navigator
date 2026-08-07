@@ -3779,3 +3779,93 @@ enum ShareURLRules {
         return c.string ?? raw
     }
 }
+
+// MARK: - Why a mount failed
+
+/// NetFSMountURLSync reports POSIX errno values. Telling a coworker "check the address and that
+/// you're on the VPN" for every failure is a guess that makes them doubt the part they got right —
+/// and on these shares the VPN is the usual culprit, so it's worth naming precisely.
+enum MountFailureRules {
+    enum Cause: Equatable { case unreachable, credentials, noSuchShare, cancelled, other }
+
+    static func cause(errno rc: Int32) -> Cause {
+        switch rc {
+        // The server never answered. Off-VPN, this is what you get.
+        case ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, ETIMEDOUT, ECONNREFUSED, ECONNABORTED:
+            return .unreachable
+        case EAUTH, EACCES, EPERM:                      return .credentials
+        case ENOENT, ENODEV:                            return .noSuchShare
+        case ECANCELED:                                 return .cancelled
+        default:                                        return .other
+        }
+    }
+
+    /// Headline and detail for the alert. `host` is shown so it's obvious which server is meant.
+    static func message(for cause: Cause, host: String) -> (title: String, detail: String)? {
+        switch cause {
+        case .unreachable:
+            return ("Can’t reach “\(host)”",
+                    "The server didn’t respond. If this share is only available over the VPN, "
+                    + "connect the VPN and try again — your address and password are probably fine.")
+        case .credentials:
+            return ("“\(host)” refused those credentials",
+                    "The server was reachable, so the VPN is working. Check the username and "
+                    + "password — use your normal work login, not a personal account.")
+        case .noSuchShare:
+            return ("“\(host)” has no share by that name",
+                    "The server answered but doesn’t recognise the share. Check the part of the "
+                    + "address after the server name.")
+        case .cancelled:
+            return nil          // the user closed the sheet on purpose; saying anything is noise
+        case .other:
+            return ("Couldn’t connect to “\(host)”",
+                    "Check the address, and that you’re on the VPN if this share needs it.")
+        }
+    }
+}
+
+// MARK: - Team drives, pasted as text
+
+/// Setting a coworker up used to mean opening Add Network Drive once per share and typing an
+/// address each time. This parses the whole list in one paste, so onboarding is: connect the VPN,
+/// paste, done.
+enum TeamDrivesRules {
+    struct Drive: Equatable { let label: String; let url: String }
+
+    /// Accepted per line, blanks and `#` comments ignored:
+    ///   smb://server/share
+    ///   G Drive = smb://server/share
+    /// Usernames are stripped (see ShareURLRules) so a list shared between people never tells
+    /// someone else's Mac to authenticate as the author.
+    static func parse(_ text: String) -> [Drive] {
+        var out: [Drive] = []
+        var seen = Set<String>()
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            var line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            var label: String?
+            // "Label = url" — split on the FIRST '=' only, so a '=' inside the URL survives.
+            if let eq = line.firstIndex(of: "="), line[line.startIndex..<eq].contains("://") == false {
+                let l = line[line.startIndex..<eq].trimmingCharacters(in: .whitespaces)
+                let r = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                if !l.isEmpty, !r.isEmpty { label = l; line = r }
+            }
+            let url = ShareURLRules.withoutUser(line)
+            guard let scheme = url.split(separator: ":").first?.lowercased(),
+                  ["smb", "afp", "cifs"].contains(String(scheme)),
+                  url.contains("://"),
+                  let u = URLComponents(string: url), (u.host?.isEmpty == false)
+            else { continue }
+            guard seen.insert(url.lowercased()).inserted else { continue }
+            out.append(Drive(label: label ?? shareName(from: url), url: url))
+        }
+        return out
+    }
+
+    /// Last path component of the share, which is what people call the drive ("Games", "data").
+    static func shareName(from url: String) -> String {
+        let afterScheme = url.components(separatedBy: "://").last ?? url
+        let parts = afterScheme.split(separator: "/").map(String.init)
+        return parts.count > 1 ? parts[parts.count - 1] : (parts.first ?? url)
+    }
+}

@@ -26,6 +26,10 @@ Step 3 alternatives if you prefer: System Settings ▸ Privacy & Security ▸ *"
 
 **Use the built-in window: Navigator ▸ Setup & Permissions…** (or Help ▸ Setup Assistant — same window). It shows **live status** for every permission, has a button per row that opens the exact System Settings pane, and explains the traps in place. That is far more reliable than following written paths, because two of these panes are genuinely hard to find and one of them shares its name with an unrelated pane.
 
+Handing Navigator to a coworker? [`ONBOARDING.md`](ONBOARDING.md) is a fill-in-the-blanks
+walkthrough — install, VPN, permissions, and pasting your team's share addresses in one go.
+Fill in the placeholders and share that copy internally; it lists your servers.
+
 [`PERMISSIONS.md`](PERMISSIONS.md) is the full reference behind that window — read it when handing Navigator to someone new, or when a feature isn't working and you want to know which switch is responsible.
 
 The short version:
