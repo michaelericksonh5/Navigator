@@ -2734,8 +2734,13 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
         }
         guard !isLast else { break }
         navLog("remove bg: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
-        if i == attempts - 2, !recovery.used, let psURL = PhotoshopIcon.url {
-            // Every plain retry failed too, so this is no longer "Photoshop was busy
+        if i == attempts - 2, !recovery.used, AdobeRecoveryRules.looksWedged(last.message),
+           let psURL = PhotoshopIcon.url {
+            // Every plain retry failed too AND the failure looks like an unresponsive app
+            // rather than a file Photoshop refused — a restart cannot fix a bad file, and
+            // its force-quit fallback can take unsaved work with it. (AdobeRecoveryRules)
+            //
+            // This is no longer "Photoshop was busy
             // for a moment" — a long-running hidden Photoshop can wedge into a state
             // where one call (app.open, live-confirmed) fails PERMANENTLY while the
             // rest of scripting still answers. Retrying into that process loses every
@@ -2817,10 +2822,11 @@ func chromaKeyOnce(cfgPath: String, src: URL, attempts: Int = 3,
         }
         guard !isLast else { break }
         navLog("chroma key: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
-        if i == attempts - 2, !recovery.used, let aeURL = AfterEffectsIcon.url {
-            // Same reasoning as removeBackgroundOnce: plain retries exhausted means the
-            // host app itself is likely wedged, and restarting it once per run is the
-            // only recovery that can save the remaining files.
+        if i == attempts - 2, !recovery.used, AdobeRecoveryRules.looksWedged(last.message),
+           let aeURL = AfterEffectsIcon.url {
+            // Plain retries exhausted AND the failure looks like an unresponsive app rather
+            // than a file After Effects refused. A restart cannot fix a bad file, and its
+            // force-quit fallback can take unsaved work with it. (AdobeRecoveryRules)
             recovery.markUsed()
             restartAdobeApp(bundleID: "com.adobe.AfterEffects", appURL: aeURL)
         } else {
@@ -2865,10 +2871,12 @@ func exportPSDsToPNG(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 }
                 guard !isLast else { break }
                 navLog("export png: \(src.lastPathComponent) attempt \(i + 1) failed — \(r.message); retrying")
-                if i == 1, !recovery.used, let psURL = PhotoshopIcon.url {
-                    // Same reasoning as removeBackgroundOnce: plain retries exhausted
-                    // means Photoshop itself is likely wedged; restarting it once per
-                    // run is the only recovery that can save the remaining files.
+                if i == 1, !recovery.used, AdobeRecoveryRules.looksWedged(r.message),
+                   let psURL = PhotoshopIcon.url {
+                    // Plain retries exhausted AND the failure looks like an unresponsive app
+                    // rather than a file Photoshop simply refused. Restarting cannot fix a
+                    // corrupt file, and its force-quit fallback can take unsaved work with
+                    // it — so a bad file must never trigger one. (AdobeRecoveryRules)
                     recovery.markUsed()
                     restartAdobeApp(bundleID: "com.adobe.Photoshop", appURL: psURL)
                 } else {
@@ -14480,7 +14488,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let all = paths.map { URL(fileURLWithPath: $0) }
         let folders = all.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
         let images = all.filter { !folders.contains($0) && isImageFile($0) }
-        guard !folders.isEmpty || !images.isEmpty else { return }
+        // PSD/PSB are not in `imageExtensions`, so a Quick Export selection is neither a
+        // folder nor an "image" — without this it bailed before ever reaching the action.
+        let psds = all.filter { isPhotoshopDocument($0) }
+        guard !folders.isEmpty || !images.isEmpty || !psds.isEmpty else { return }
         NSApp.activate(ignoringOtherApps: true)
         switch url.host {
         case "removebg":
@@ -14489,11 +14500,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "chromakey":
             folders.forEach { batchChromaKeyFolder($0) }
             if !images.isEmpty { chromaKeyForImages(images) }
-        case "upscale-lowq":
-            folders.forEach { batchUpscaleFolderViaFal($0, option: upscaleOptions[0]) }
-            if !images.isEmpty { upscaleImagesViaFal(images, option: upscaleOptions[0]) }
+        // Upscalers are addressed by INDEX into `upscaleOptions` rather than by a name
+        // string, so Finder's menu and Navigator's own can never drift apart: both are
+        // built from the same list. "upscale-lowq" is kept as an alias because older
+        // installed Quick Actions still send it.
+        case "upscale-lowq", "upscale-0", "upscale-1", "upscale-2", "upscale-3":
+            let idx = Int(url.host?.split(separator: "-").last ?? "0") ?? 0
+            let opt = upscaleOptions.indices.contains(idx) ? upscaleOptions[idx] : upscaleOptions[0]
+            folders.forEach { batchUpscaleFolderViaFal($0, option: opt) }
+            if !images.isEmpty { upscaleImagesViaFal(images, option: opt) }
         case "layerize":
             if !images.isEmpty { layerizeImages(images) }
+        case "prep-adaptive":
+            // The adaptive fill at the nearest supported ratio — the one combination worth
+            // a single click. Every other colour/ratio pairing stays in Navigator's own
+            // menu, where a submenu of submenus is affordable.
+            if !images.isEmpty {
+                fillBackgroundForImages(images, color: nil, suffix: "auto", ratio: nil)
+            }
+        case "restyle":
+            // Opens Navigator's Restyle window on the selection — it needs prompt/model UI,
+            // so there is nothing to fire and forget.
+            if !images.isEmpty {
+                DispatchQueue.main.async { RestyleController.show(sources: images) { _ in } }
+            }
+        case "exportpng":
+            if !psds.isEmpty { exportPSDsToPNG(psds) }
         case "upscale-imagen2":
             folders.forEach { batchUpscaleFolderViaImagen($0, factor: 2) }
             if !images.isEmpty { upscaleImagesViaImagen(images, factor: 2) }

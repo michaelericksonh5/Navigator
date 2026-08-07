@@ -1224,6 +1224,51 @@ final class CloseTabRulesTests: XCTestCase {
     }
 }
 
+// MARK: - Adobe wedge detection
+
+final class AdobeRecoveryRulesTests: XCTestCase {
+    /// THE BUG: one corrupt .psd made Navigator quit and relaunch Photoshop. The file was
+    /// invalid and the app was fine, and the restart's force-terminate fallback can take
+    /// unsaved work with it. This exact message was captured from a live run.
+    func testACorruptFileIsNotAWedge() {
+        XCTAssertFalse(AdobeRecoveryRules.looksWedged(
+            "ERROR: [open] Cannot open the file because the open options are incorrect"))
+    }
+
+    func testOtherBadFileMessagesAreNotWedges() {
+        for m in ["ERROR: [open] The file could not be found",
+                  "ERROR: [open] The file is not a valid Photoshop document",
+                  "ERROR: [open] The document is damaged",
+                  "ERROR: [open] Unsupported file format",
+                  "ERROR: [open] No such file or directory"] {
+            XCTAssertFalse(AdobeRecoveryRules.looksWedged(m), "should not restart for: \(m)")
+        }
+    }
+
+    /// The real wedge — Photoshop briefly cannot service scripting at all. A restart is the
+    /// only thing that recovers this, so it must still fire.
+    func testGenuineWedgesStillRestart() {
+        for m in ["ERROR: [activeLayer] The command “Get” is not currently available",
+                  "ERROR: [removeBackground] The command \"Get\" is not currently available",
+                  "AppleEvent timed out",
+                  "ERROR: [open] General Photoshop error occurred"] {
+            XCTAssertTrue(AdobeRecoveryRules.looksWedged(m), "should restart for: \(m)")
+        }
+    }
+
+    /// A bad-file signature must beat a wedge signature — Photoshop wraps file refusals in
+    /// the same generic error text, so the specific reason has to win.
+    func testBadFileBeatsGenericWrapper() {
+        XCTAssertFalse(AdobeRecoveryRules.looksWedged(
+            "ERROR: [open] General Photoshop error occurred - Cannot open the file because the open options are incorrect"))
+    }
+
+    func testCaseInsensitive() {
+        XCTAssertFalse(AdobeRecoveryRules.looksWedged("CANNOT OPEN THE FILE"))
+        XCTAssertTrue(AdobeRecoveryRules.looksWedged("The Command Get IS NOT CURRENTLY AVAILABLE"))
+    }
+}
+
 // MARK: - Layerize
 
 final class LayerizeRulesTests: XCTestCase {

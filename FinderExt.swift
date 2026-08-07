@@ -52,6 +52,7 @@ final class NavigatorFinderSync: FIFinderSync {
         let hasImage = urls.contains { Self.isImage($0) }
         let hasPNG = urls.contains { $0.pathExtension.lowercased() == "png" }
         let hasFolder = urls.contains { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let hasPSD = urls.contains { ["psd", "psb"].contains($0.pathExtension.lowercased()) }
 
         let root = NSMenu()
 
@@ -82,14 +83,43 @@ final class NavigatorFinderSync: FIFinderSync {
             if Self.installed("com.adobe.AfterEffects"), hasPNG || hasFolder {
                 add(sub, "Chroma Key BG", "chromakey", Self.aeIcon)
             }
+            // Prep for AI is a ratio submenu crossed with a colour submenu in Navigator,
+            // which is far too deep to reproduce here. Only the one combination worth a
+            // single click is offered: the adaptive fill at the nearest supported ratio.
+            // Anything more specific belongs in Navigator, where the depth is affordable.
+            add(sub, "Prep for AI (Adaptive)", "prep-adaptive",
+                Self.icon(systemSymbol: "wand.and.stars"))
+
             let up = NSMenuItem(title: "Upscale (AI)", action: nil, keyEquivalent: "")
             up.image = Self.icon(systemSymbol: "arrow.up.left.and.arrow.down.right")
             let upSub = NSMenu()
-            add(upSub, "Upscale Low Quality ×4", "upscale-lowq", Self.falIcon)
-            add(upSub, "Upscale (Imagen 4) ×2", "upscale-imagen2", Self.vertexIcon)
-            add(upSub, "Upscale (Imagen 4) ×4", "upscale-imagen4", Self.vertexIcon)
+            // Addressed by INDEX into Navigator's own `upscaleOptions`, so the two menus
+            // cannot drift: reorder that list and Finder follows. Titles are duplicated
+            // here because the extension is a separate target and can't import them.
+            add(upSub, "Crystal (best fidelity) ×4", "upscale-0", Self.falIcon)
+            add(upSub, "AuraSR (non-generative) ×4", "upscale-1", Self.falIcon)
+            add(upSub, "Topaz ×4", "upscale-2", Self.falIcon)
+            add(upSub, "Local resample ×4 (free)", "upscale-3",
+                Self.icon(systemSymbol: "desktopcomputer"))
+            upSub.addItem(.separator())
+            add(upSub, "Imagen 4 ×2", "upscale-imagen2", Self.vertexIcon)
+            add(upSub, "Imagen 4 ×4", "upscale-imagen4", Self.vertexIcon)
             up.submenu = upSub
             sub.addItem(up)
+
+            // Both open or drive Navigator itself rather than running silently, so they
+            // read as "…" commands exactly as they do in Navigator's own menu.
+            if hasImage {
+                add(sub, "Restyle (AI)…", "restyle", Self.icon(systemSymbol: "paintbrush.pointed"))
+                add(sub, "Layerize (AI)…", "layerize", Self.falIcon)
+            }
+        }
+
+        // Photoshop documents are not "images" by extension, so this sits outside the
+        // block above — a PSD-only selection reaches nothing else here.
+        if hasPSD, Self.installed("com.adobe.Photoshop") {
+            if !hasImage && !hasFolder { sub.addItem(.separator()) }
+            add(sub, "Quick Export as PNG", "exportpng", Self.psIcon)
         }
 
         parent.submenu = sub

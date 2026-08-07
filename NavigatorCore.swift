@@ -977,6 +977,51 @@ enum CloseTabRules {
     }
 }
 
+// MARK: - When an Adobe app is actually wedged (vs. just handed a bad file)
+
+/// Decides whether repeated Photoshop/After Effects failures mean the APP is wedged — the
+/// only condition a restart can fix.
+///
+/// The old rule was purely "two attempts failed, restart the app", which never asked why.
+/// Feeding it one corrupt .psd made it quit and relaunch Photoshop: the file was invalid, the
+/// app was perfectly healthy, and a restart could not possibly help. That matters beyond
+/// being useless — the restart escalates to `forceTerminate()` when a polite quit is blocked,
+/// and what blocks a polite quit is precisely an unsaved-changes dialog. So the old rule could
+/// destroy someone's unsaved work because one file in a batch was corrupt.
+enum AdobeRecoveryRules {
+    /// Signatures of a genuinely unresponsive app: it briefly cannot service scripting at all.
+    private static let wedgeSignatures = [
+        "is not currently available",          // 'The command "Get" is not currently available'
+        "timed out",
+        "connection is invalid",
+        "application isn’t running",
+        "application isn't running",
+        "no document open",
+    ]
+
+    /// Signatures of a file the app looked at and refused. Nothing to recover from.
+    private static let badFileSignatures = [
+        "cannot open the file",
+        "open options are incorrect",
+        "could not be found",
+        "is not a valid",
+        "damaged",
+        "unsupported",
+        "no such file",
+    ]
+
+    static func looksWedged(_ message: String) -> Bool {
+        let m = message.lowercased()
+        // A bad file wins outright: an [open]-step refusal naming the file is never a wedge,
+        // even though Photoshop dresses it up in the same "General Photoshop error" wrapper.
+        if badFileSignatures.contains(where: { m.contains($0) }) { return false }
+        if wedgeSignatures.contains(where: { m.contains($0) }) { return true }
+        // Failing at the very first step, repeatedly, with no file-specific reason given, is
+        // the shape of an app that cannot answer — treat that as wedged.
+        return m.contains("[open]") || m.contains("[activedocument]")
+    }
+}
+
 // MARK: - Seedream 5.0 Pro Layerize
 
 enum LayerizeCheck: Equatable {
