@@ -880,6 +880,13 @@ final class NetworkBrowser: NSObject, ObservableObject, NetServiceBrowserDelegat
     private var found: [String: URL] = [:]
     private var started = false
 
+    /// Discovering ANY service is proof the Local Network permission is working — there is no
+    /// API to read that setting back, so this is the only positive evidence available. Sticky
+    /// on purpose: a server going away later doesn't un-prove that the browse was allowed.
+    @Published private(set) var everFound = false
+    /// Set when macOS refuses the browse outright.
+    @Published private(set) var searchRefused = false
+
     func start() {
         guard !started else { return }
         started = true
@@ -887,7 +894,15 @@ final class NetworkBrowser: NSObject, ObservableObject, NetServiceBrowserDelegat
         browser.searchForServices(ofType: "_smb._tcp.", inDomain: "local.")
     }
 
+    /// Was missing entirely, which is why a refused browse looked identical to an empty
+    /// network — and why the checklist could only ever say "Unknown".
+    func netServiceBrowser(_ b: NetServiceBrowser, didNotSearch errorDict: [String: NSNumber]) {
+        searchRefused = true
+        navLog("bonjour: browse refused — \(errorDict). Local Network permission is the usual cause.")
+    }
+
     func netServiceBrowser(_ b: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
+        everFound = true
         service.delegate = self
         resolving.insert(service)
         service.resolve(withTimeout: 5)
@@ -13911,7 +13926,7 @@ enum PermissionProbe {
     /// Opened and screenshotted on macOS 26.6: lands on "Allow the applications below to
     /// control your computer", the list with Navigator's switch in it.
     static let accessibilityPane   = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-    static let localNetworkPane    = "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"
+    static let privacyRootPane     = "x-apple.systempreferences:com.apple.preference.security?Privacy"
     static let appManagementPane   = "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles"
 
     static func openPane(_ url: String) { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }
@@ -13986,6 +14001,39 @@ enum PermissionProbe {
         if code == -1743 { return .denied }        // user said no
         if code == -600 || code == -1728 { return .notAsked }   // not running / no such object
         return .unknown
+    }
+
+    /// Reads a TCC decision straight out of the user's own TCC database.
+    ///
+    /// Used only for permissions macOS exposes no API for — App Management is the one that
+    /// matters, because it fails INVISIBLY (an update downloads, doesn't install, and offers
+    /// itself again forever). Verified against the live database: the row reads
+    /// `kTCCServiceSystemPolicyAppBundles|2` when the switch is on.
+    ///
+    /// Reading it needs Full Disk Access, so this degrades to `.unknown` rather than guessing:
+    /// without FDA the file can't be opened at all, and reporting "Denied" for a permission
+    /// that is actually granted would be worse than admitting we can't tell.
+    static func tccDecision(service: String) -> PermissionState {
+        let path = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db")
+        guard FileManager.default.isReadableFile(atPath: path) else { return .unknown }
+        var db: OpaquePointer?
+        // immutable=1 so we never take a lock on a database the system owns.
+        guard sqlite3_open_v2("file:" + path + "?immutable=1", &db,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else {
+            return .unknown
+        }
+        defer { sqlite3_close(db) }
+        // `service` is a compile-time constant from the call sites below, never user input.
+        let sql = """
+            select auth_value from access
+             where client = 'com.merickson.navigator' and service = '\(service)' limit 1
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return .unknown }
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return .notAsked }
+        return sqlite3_column_int(stmt, 0) == 2 ? .granted : .denied
     }
 
     /// Whether a key EXISTS in the keychain, without decrypting it.
@@ -14085,7 +14133,7 @@ struct SetupItem: Identifiable {
             // the kind mounted there is nothing to attempt, so an "Ask macOS…" button would
             // be a button that provably does nothing. The wording carries that instead.
             SetupItem(id: "network", title: "Network volumes",
-                      why: "Open shared drives you connect to (⌘K), and copy files to and from them. With none mounted there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
+                      why: "Reading and writing FILES on a shared drive once it's mounted — you connect with ⌘K, this is what lets Navigator browse what's inside. Not the same as Local Network below, which is only about DISCOVERING servers so they appear in the sidebar by themselves; the two are separate switches in different panes. With none mounted there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: true) },
                       probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
                       afterOpening: inFilesPane,
@@ -14143,14 +14191,25 @@ struct SetupItem: Identifiable {
             // lead with what BREAKS when they're off. A row that can only say "Unknown" still
             // earns its place if it tells you the symptom you'd otherwise misdiagnose.
             SetupItem(id: "localnetwork", title: "Local Network",
-                      why: "Lets Navigator find SMB file servers on your network and list them in the sidebar automatically. Without it the sidebar simply won't discover them — you can still reach any server by hand with Go ▸ Connect to Server (⌘K), so nothing is truly lost. macOS gives apps no way to read this setting back, which is why this row can't show a status.",
-                      probe: { _ in .unknown },
+                      why: "Only about DISCOVERY: finding SMB servers on your network so they appear in the sidebar on their own. It is NOT what lets Navigator read files on them — that's Network volumes above. Without this the sidebar just won't find servers by itself; ⌘K still reaches any of them by name, so nothing is actually lost.\n\nmacOS provides no way to READ this setting — it is stored in none of the databases the other rows here use — so this row reports what Navigator can actually DO instead.\n\nGranted means it has genuinely discovered a server, which only a working permission allows. Denied means macOS refused the search outright. Unknown is the NORMAL result on most networks and does not mean anything is wrong: it means nothing has been found yet, and that is equally consistent with the permission being off and with there simply being no servers advertising themselves. Rather than guess between the two, this row says so.\n\nIf your shared drives are ones you mount by name or by address, they are not advertised on the network and will never appear here — that is the usual reason this stays Unknown even with the switch on.",
+                      probe: { _ in
+                          if NetworkBrowser.shared.everFound { return .granted }
+                          return NetworkBrowser.shared.searchRefused ? .denied : .unknown
+                      },
                       probeMayPrompt: false, canAsk: false, optional: true,
-                      afterOpening: "Then: find Navigator in that list and switch it on.",
-                      openSettings: { PermissionProbe.openPane(PermissionProbe.localNetworkPane) }),
+                      settingsLabel: "Open Privacy & Security",
+                      // There is NO URL anchor for this pane. Privacy_LocalNetwork,
+                      // Privacy_LocalNetworking, Privacy_Network, Privacy_LocalNetworkAccess,
+                      // Privacy_Bonjour, Privacy_Multicast, Privacy_LocalArea and Privacy_LAN
+                      // were all tried against macOS 26.6 and every one silently lands on the
+                      // Privacy & Security ROOT. So the button is honest about only getting
+                      // you to the list, and the text does the last step — pretending
+                      // otherwise is what made this row useless.
+                      afterOpening: "Then: scroll down that list to Local Network, open it, and switch Navigator on. macOS has no direct link to this particular pane, so the button can only get you as far as the list.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.privacyRootPane) }),
             SetupItem(id: "appmanagement", title: "App Management (for updates)",
-                      why: "How Navigator updates ITSELF. Installing an update replaces /Applications/Navigator.app, and macOS treats replacing an app bundle as App Management. If this is off the download succeeds and the swap silently doesn't — you stay on the old version and the only clue is that the update keeps reappearing. macOS gives apps no way to read this setting back, so this row can't show a status; check it here if an update won't stick.",
-                      probe: { _ in .unknown },
+                      why: "How Navigator updates ITSELF. Installing an update replaces /Applications/Navigator.app, and macOS treats replacing an app bundle as App Management. If this is off the download succeeds and the swap silently doesn't — you stay on the old version and the only clue is that the same update keeps reappearing.\n\nThere is no API for this one, so the status is read from macOS's own permission database. That needs Full Disk Access; without it this row honestly says Unknown rather than guessing.",
+                      probe: { _ in PermissionProbe.tccDecision(service: "kTCCServiceSystemPolicyAppBundles") },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch it on.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.appManagementPane) }),
