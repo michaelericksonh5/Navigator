@@ -4562,3 +4562,102 @@ final class ShareURLRulesTests: XCTestCase {
                        "smb://CORP-DC01.High5.local/50%20West")
     }
 }
+
+
+// MARK: - Why a mount failed
+
+final class MountFailureRulesTests: XCTestCase {
+
+    /// Off-VPN is the common case for a new coworker, and it looks like an unanswering server.
+    func testUnreachableCodes() {
+        for rc in [ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, ETIMEDOUT, ECONNREFUSED] {
+            XCTAssertEqual(MountFailureRules.cause(errno: rc), .unreachable, "errno \(rc)")
+        }
+    }
+
+    /// A reachable server that rejects you is the OPPOSITE advice — the VPN is fine, the login isn't.
+    func testCredentialCodes() {
+        for rc in [EAUTH, EACCES, EPERM] {
+            XCTAssertEqual(MountFailureRules.cause(errno: rc), .credentials, "errno \(rc)")
+        }
+        let m = MountFailureRules.message(for: .credentials, host: "fileserver-a")
+        XCTAssertTrue(m?.detail.contains("VPN is working") ?? false,
+                      "must not send someone to check the VPN when the VPN demonstrably worked")
+    }
+
+    /// Closing the auth sheet is a decision, not an error worth an alert.
+    func testCancelIsSilent() {
+        XCTAssertEqual(MountFailureRules.cause(errno: ECANCELED), .cancelled)
+        XCTAssertNil(MountFailureRules.message(for: .cancelled, host: "h"))
+    }
+
+    func testUnknownFallsBackToTheOldAdvice() {
+        XCTAssertEqual(MountFailureRules.cause(errno: 9999), .other)
+        XCTAssertNotNil(MountFailureRules.message(for: .other, host: "h"))
+    }
+
+    /// The host must appear, so it is obvious which server is being talked about.
+    func testHostIsNamed() {
+        for c in [MountFailureRules.Cause.unreachable, .credentials, .noSuchShare, .other] {
+            XCTAssertTrue(MountFailureRules.message(for: c, host: "fileserver-b")?.title
+                .contains("fileserver-b") ?? false, "\(c) should name the host")
+        }
+    }
+}
+
+
+// MARK: - Team drives, pasted as text
+
+final class TeamDrivesRulesTests: XCTestCase {
+
+    func testParsesPlainList() {
+        let d = TeamDrivesRules.parse("""
+        smb://fileserver-a/Games
+        smb://fileserver-b/data
+        """)
+        XCTAssertEqual(d.map(\.url), ["smb://fileserver-a/Games", "smb://fileserver-b/data"])
+        XCTAssertEqual(d.map(\.label), ["Games", "data"], "label defaults to the share name")
+    }
+
+    func testLabelsAndCommentsAndBlanks() {
+        let d = TeamDrivesRules.parse("""
+        # our drives
+        G Drive = smb://fileserver-a/Games
+
+        X Drive = smb://fileserver-b/data
+        """)
+        XCTAssertEqual(d.map(\.label), ["G Drive", "X Drive"])
+        XCTAssertEqual(d.count, 2, "comments and blank lines are ignored")
+    }
+
+    /// A pasted list gets shared onward, so it must not carry whose account it came from.
+    func testUsernamesAreStripped() {
+        let d = TeamDrivesRules.parse("smb://someone@fileserver-a/Games")
+        XCTAssertEqual(d.first?.url, "smb://fileserver-a/Games")
+    }
+
+    func testRejectsNonShareLines() {
+        XCTAssertTrue(TeamDrivesRules.parse("https://example.com/x").isEmpty, "not a file share")
+        XCTAssertTrue(TeamDrivesRules.parse("just some words").isEmpty)
+        XCTAssertTrue(TeamDrivesRules.parse("smb://").isEmpty, "no host")
+        XCTAssertTrue(TeamDrivesRules.parse("").isEmpty)
+    }
+
+    func testDedupesRegardlessOfCase() {
+        let d = TeamDrivesRules.parse("""
+        smb://fileserver-a/Games
+        smb://FILESERVER-A/Games
+        """)
+        XCTAssertEqual(d.count, 1)
+    }
+
+    func testAcceptsAfpAndCifs() {
+        XCTAssertEqual(TeamDrivesRules.parse("afp://host/vol").count, 1)
+        XCTAssertEqual(TeamDrivesRules.parse("cifs://host/vol").count, 1)
+    }
+
+    /// A share name containing a space or an escape still yields a sensible label.
+    func testEscapedShareNameLabel() {
+        XCTAssertEqual(TeamDrivesRules.parse("smb://host/50%20West").first?.label, "50%20West")
+    }
+}

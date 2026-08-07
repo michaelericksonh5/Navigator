@@ -5796,14 +5796,18 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             du.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
             du.arguments = ["unmount", "force", info.volume]
             try? du.run(); du.waitUntilExit()
-            let mp = Browser.mountShare(info.share)
+            let attempt = Browser.mountShareReporting(info.share)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.busy = false; self.busyText = ""; self.slowNetwork = false
-                guard let mp else {
-                    reportFileError("Couldn’t reconnect to “\(info.share.host ?? "the server")”",
-                                    "The share didn’t mount. Check your VPN connection and try again.",
-                                    permissionHint: false)
+                guard let mp = attempt.mountPoint else {
+                    // Name the actual cause rather than blaming the VPN unconditionally: a
+                    // reachable server that rejected the login needs the opposite advice.
+                    let cause = MountFailureRules.cause(errno: attempt.rc)
+                    if let msg = MountFailureRules.message(for: cause,
+                                                          host: info.share.host ?? "the server") {
+                        reportFileError(msg.title, msg.detail, permissionHint: false)
+                    }
                     return
                 }
                 // The share can come back under a different mountpoint (…-1) if a
@@ -5859,14 +5863,22 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         return (pts?.takeRetainedValue() as? [String])?.first
     }
 
-    static func mountShare(_ url: URL) -> String? {
+    static func mountShare(_ url: URL) -> String? { mountShareReporting(url).mountPoint }
+
+    /// Same mount, but hands back the failure code so callers can say WHY. Without this every
+    /// failure got the same "check the address and that you're on the VPN" guess, which tells a
+    /// coworker to doubt the thing they got right — see MountFailureRules.
+    static func mountShareReporting(_ url: URL) -> (mountPoint: String?, rc: Int32) {
         let openOpts = NSMutableDictionary()
         openOpts[kNAUIOptionKey] = kNAUIOptionAllowUI
         var pts: Unmanaged<CFArray>?
         let rc = NetFSMountURLSync(url as CFURL, nil, nil, nil,
                                    openOpts as CFMutableDictionary, nil, &pts)
-        guard rc == 0 else { return nil }
-        return (pts?.takeRetainedValue() as? [String])?.first
+        guard rc == 0 else {
+            navLog("mount: \(url.host ?? "?") failed rc=\(rc) (\(MountFailureRules.cause(errno: rc)))")
+            return (nil, rc)
+        }
+        return ((pts?.takeRetainedValue() as? [String])?.first, 0)
     }
 
     func goUp() {
@@ -14980,6 +14992,8 @@ struct SetupItem: Identifiable {
 // same kind of window and should not read as a bolted-on wizard.
 struct SetupAssistantView: View {
     @State private var states: [String: PermissionState] = [:]
+    @State private var drivesText = ""
+    @State private var drivesAdded: Int?
     @State private var checking = false
     @State private var checkedAt: Date?
     @AppStorage("viewMode") private var viewMode = "list"
@@ -15005,6 +15019,33 @@ struct SetupAssistantView: View {
             // set, negated for the other section, so no row can land in both or in neither.
             Section("Files & folders") { ForEach(items.filter { !Self.extras.contains($0.id) }) { row($0) } }
             Section("Extras") { ForEach(items.filter { Self.extras.contains($0.id) }) { row($0) } }
+            // Onboarding a coworker used to mean opening Add Network Drive once per share. One
+            // paste covers the lot. Nothing is mounted here on purpose: the addresses are saved as
+            // sidebar drives, and the first click mounts through NetFS with THEIR login, which is
+            // also the moment a missing VPN gets diagnosed properly (MountFailureRules).
+            Section("Network drives") {
+                Text("Paste the share addresses your team uses — one per line, optionally as “Label = address”. They’re saved as sidebar drives; clicking one connects with your own login. If these shares need the VPN, connect it first.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                // A vertical TextField rather than a TextEditor: it lays out predictably inside a
+                // Form, and brings its own placeholder instead of an overlay.
+                TextField("smb://server/share", text: $drivesText, axis: .vertical)
+                    .font(.system(.body, design: .monospaced))
+                    .lineLimit(3...8)
+                HStack {
+                    Button("Add Drives") { addPastedDrives() }
+                        .disabled(TeamDrivesRules.parse(drivesText).isEmpty)
+                    Button("Import from File…") {
+                        (NSApp.delegate as? AppDelegate)?.importFavoritesAction(nil)
+                    }
+                    Spacer()
+                    if let n = drivesAdded {
+                        Text(n == 0 ? "Already in your sidebar"
+                                    : "Added \(n) drive\(n == 1 ? "" : "s")")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+            }
             Section("How folders open") {
                 Picker("New windows and tabs", selection: $viewMode) {
                     Text("Details").tag("list"); Text("Icons").tag("icon"); Text("Gallery").tag("gallery")
@@ -15068,6 +15109,21 @@ struct SetupAssistantView: View {
         case .off, .notAsked: return .orange
         case .unknown: return .secondary
         }
+    }
+
+    /// Save each pasted address as a sidebar drive. The stored path is a best guess
+    /// (/Volumes/<share>); openFavorite re-anchors onto the real mountpoint if the share lands
+    /// somewhere else, which is what happens when a stale folder holds the name (…-1).
+    private func addPastedDrives() {
+        let existing = Set(FavoritesStore.shared.items.compactMap { $0.mountURL?.lowercased() })
+        var added = 0
+        for d in TeamDrivesRules.parse(drivesText) where !existing.contains(d.url.lowercased()) {
+            let guess = "/Volumes/" + TeamDrivesRules.shareName(from: d.url)
+            FavoritesStore.shared.add(URL(fileURLWithPath: guess), label: d.label, mountURL: d.url)
+            added += 1
+        }
+        drivesAdded = added
+        if added > 0 { drivesText = "" }
     }
 
     @ViewBuilder private func row(_ item: SetupItem) -> some View {
@@ -16575,10 +16631,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let s = addr.stringValue.trimmingCharacters(in: .whitespaces)
         guard !s.isEmpty, let url = URL(string: s) else { NSSound.beep(); return }
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let mp = Browser.mountShare(url) else {
+            let attempt = Browser.mountShareReporting(url)
+            guard let mp = attempt.mountPoint else {
+                let cause = MountFailureRules.cause(errno: attempt.rc)
+                guard let msg = MountFailureRules.message(for: cause, host: url.host ?? "the server") else { return }
                 DispatchQueue.main.async {
-                    let a = NSAlert(); a.messageText = "Couldn't connect to \(url.host ?? "the server")"
-                    a.informativeText = "Check the address and that you're on the VPN, then try again."
+                    let a = NSAlert()
+                    a.messageText = msg.title
+                    a.informativeText = msg.detail
                     a.runModal()
                 }
                 return
