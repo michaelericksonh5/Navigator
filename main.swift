@@ -2938,7 +2938,9 @@ func showBGSummary(app: String, done: Int, total: Int, errors: [String], verb: S
     a.alertStyle = .warning
     a.messageText = "\(app): \(verb) \(done) of \(total)"
     var msg = "\(errors.count) image\(errors.count == 1 ? "" : "s") could not be processed:\n\n"
-    msg += errors.prefix(15).joined(separator: "\n")
+    // Translated here, at the one place every caller funnels through, so no path can leak
+    // "ERROR: [open]" and Photoshop's internal phrasing into a dialog.
+    msg += errors.prefix(15).map(AdobeErrorText.friendly).joined(separator: "\n")
     if errors.count > 15 { msg += "\n… and \(errors.count - 15) more." }
     a.informativeText = msg
     a.addButton(withTitle: "OK")
