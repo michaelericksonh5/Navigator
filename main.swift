@@ -14036,6 +14036,13 @@ enum PermissionProbe {
         return sqlite3_column_int(stmt, 0) == 2 ? .granted : .denied
     }
 
+    /// Is Navigator the registered default handler for `type`?
+    static func isDefaultApp(for type: UTType) -> PermissionState {
+        guard let def = NSWorkspace.shared.urlForApplication(toOpen: type) else { return .off }
+        return def.standardizedFileURL.path == Bundle.main.bundleURL.standardizedFileURL.path
+            ? .granted : .off
+    }
+
     /// Whether a key EXISTS in the keychain, without decrypting it.
     ///
     /// `kSecReturnData: false` is the whole point: asking for the data is what makes macOS
@@ -14215,6 +14222,20 @@ struct SetupItem: Identifiable {
                       openSettings: { PermissionProbe.openPane(PermissionProbe.appManagementPane) }),
             // Not macOS permissions, but they fail the same way — a feature that just doesn't
             // work — and this window is where people come to find out why.
+            // Not permissions, but the same kind of setup step, and they were previously only
+            // reachable as their own menu items with no way to see whether they had taken.
+            SetupItem(id: "defaultimages", title: "Default image viewer",
+                      why: "Makes opening an image anywhere — Finder, Mail, Messages — open it in Navigator's viewer. Set per file type, so this reads Granted once PNG points at Navigator.\n\nTo undo: in Finder select an image ▸ Get Info ▸ “Open with” ▸ pick another app ▸ “Change All…”.",
+                      probe: { _ in PermissionProbe.isDefaultApp(for: .png) },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "Make Default",
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultImageViewerAction(_:)), to: nil, from: nil) }),
+            SetupItem(id: "defaultfolders", title: "Default folder handler",
+                      why: "macOS does NOT let any third-party app take folders from Finder — Apple locks that one, so this row will read Off however many times you press the button, and that is not a fault to fix.\n\nWhat does work, and what the button sets up: Navigator is registered as a folder app, so you can right-click a folder ▸ Open With ▸ Navigator, or Open With ▸ Other… and tick “Always Open With” to make one folder always open here. From Terminal, open -b com.merickson.navigator <folder>. Keeping Navigator in the Dock covers the rest.",
+                      probe: { _ in PermissionProbe.isDefaultApp(for: .folder) },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "Register & Explain",
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultBrowserAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "vertex", title: "Vertex sign-in (Google, company-metered)",
                       why: "Powers Restyle and the Imagen upscalers. A browser sign-in with your @high5games.com account — there is no key to paste, and no gcloud to install. Lasts about 30 days, then asks once more. Use AI ▸ Sign in to Vertex (Imagen)…",
                       probe: { _ in vertexSignedIn() ? .granted : .off },
@@ -14251,7 +14272,8 @@ struct SetupAssistantView: View {
     /// Rows that aren't about reading files. Full Disk Access can't cover any of them.
     private static let extras: Set<String> = ["automation", "automation-ps", "automation-ae",
                                               "finderext", "accessibility", "localnetwork",
-                                              "appmanagement", "vertex", "falkey", "openaikey"]
+                                              "appmanagement", "defaultimages", "defaultfolders",
+                                              "vertex", "falkey", "openaikey"]
 
     var body: some View {
         Form {
@@ -15067,18 +15089,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         appMenu.addItem(.separator())
         let set = appMenu.addItem(withTitle: "Settings…", action: #selector(showSettingsAction(_:)), keyEquivalent: ","); set.target = self
         appMenu.addItem(.separator())
-        let dfb = appMenu.addItem(withTitle: "Set as Default File Browser…", action: #selector(setDefaultBrowserAction(_:)), keyEquivalent: "")
-        dfb.target = self
-        let div = appMenu.addItem(withTitle: "Set as Default Image Viewer…", action: #selector(setDefaultImageViewerAction(_:)), keyEquivalent: "")
-        div.target = self
-        // The app menu is where the owner went looking, so this is where the checklist
-        // lives — Help ▸ Setup Assistant… stays too, and both open the SAME window.
+        // "Set as Default File Browser…" and "Set as Default Image Viewer…" used to sit here
+        // as their own items. They are setup steps, not commands, and as menu items they could
+        // only ever DO the thing — never tell you whether it had taken. Both are now rows in
+        // the setup window, where they show live status and explain themselves (including that
+        // macOS reserves folders for Finder no matter how often you press the button).
+        //
+        // The window is titled "Navigator Setup" and now covers defaults and provider keys as
+        // well as permissions, so the menu no longer calls it a permissions checklist.
         //
         // "Grant Full Disk Access…" survives underneath it, and the labels say why: one
         // audits every permission, the other walks one switch a user is usually sent to
         // by name (the denial alerts and PERMISSIONS.md both cite it) and adds the two
         // things the checklist row can't — the +/⇧⌘G recipe and Reveal in Finder.
-        let checklist = appMenu.addItem(withTitle: "Permissions Checklist…", action: #selector(showSetupAssistantAction(_:)), keyEquivalent: "")
+        let checklist = appMenu.addItem(withTitle: "Setup & Permissions…", action: #selector(showSetupAssistantAction(_:)), keyEquivalent: "")
         checklist.target = self
         let fda = appMenu.addItem(withTitle: "Grant Full Disk Access…", action: #selector(openFullDiskAccessAction(_:)), keyEquivalent: "")
         fda.target = self

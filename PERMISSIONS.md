@@ -4,9 +4,11 @@ Everything macOS will ask Navigator for, what each one actually buys you, and ho
 to check whether it stuck. Written against **macOS 26 (Tahoe)**; the System
 Settings paths differ on earlier versions.
 
-Navigator's built-in checklist (**Navigator ▸ Permissions Checklist…**, or
+Navigator's built-in checklist (**Navigator ▸ Setup & Permissions…**, or
 Help ▸ Setup Assistant — same window) walks through most of this, shows live
-status, and has a button per row that opens the exact System Settings pane.
+status, and has a button per row that opens the exact System Settings pane. It also
+covers two things that aren't macOS permissions at all but fail the same way: the AI
+provider credentials (§4b) and whether Navigator is your default image viewer.
 **Prefer the buttons to this document.** Two of these panes are genuinely hard to
 find by name, and one of them (Accessibility, §4) shares its name with an
 unrelated pane — a click cannot land in the wrong place, a written path can.
@@ -138,7 +140,7 @@ so it gets its own heading.
 That header sentence is the reliable way to tell them apart. Same name, same
 spelling, different pane.
 
-**How, without the hunt:** open Navigator ▸ **Permissions Checklist…**, scroll to
+**How, without the hunt:** open Navigator ▸ **Setup & Permissions…**, scroll to
 **Accessibility (one-key dialog jump)** and press its **Open Settings** button. It
 opens the right pane directly. (The Settings window's dialog-bridge section and
 Navigator's own "needs Accessibility" alert have the same button.)
@@ -263,7 +265,7 @@ status — it can point you at the pane, but only you can see the switch.
 
 ## Verifying what's actually granted
 
-The checklist (**Navigator ▸ Permissions Checklist…**, or Help ▸ Setup
+The checklist (**Navigator ▸ Setup & Permissions…**, or Help ▸ Setup
 Assistant — the same window) is the easy answer — it probes
 what Navigator can genuinely *do* rather than reading a list, which is more
 truthful than the System Settings panes in a few cases.
