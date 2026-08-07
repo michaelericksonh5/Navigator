@@ -27,12 +27,13 @@ either optional or granted on demand the first time you use the feature.
 | Full Disk Access | All file browsing, in one grant | **Strongly recommended** |
 | Files & Folders | Desktop / Documents / Downloads / network / USB — *individually* | Only if you skip Full Disk Access |
 | Automation ▸ Finder | Saving comments in Get Info | Optional |
+| App Management *(§8)* | **Navigator updating itself** | Recommended |
 | Automation ▸ Photoshop | Remove BG, Chroma Key, Quick Export as PNG | Only for those features |
 | Automation ▸ After Effects | Chroma Key | Only for that feature |
 | Accessibility *(Privacy & Security — not the sidebar one, see §4)* | The **one-keystroke** Open/Save dialog jump (⌃⌥⇧⌘G) | Optional |
 | AI provider keys *(not a macOS permission — see §4b)* | Restyle, AI upscaling, Prep for AI | Only for those features |
 | Finder extension | Navigator's submenu in Finder's right-click menu | Optional |
-| Local Network | Discovering file servers for the sidebar | Optional |
+| Local Network *(§6)* | Discovering SMB file servers for the sidebar | Optional |
 | Screen Recording | **Nothing.** Navigator never asks. | Never |
 
 ---
@@ -229,6 +230,23 @@ Navigator's sidebar automatically. Without it you can still connect manually wit
 
 **How:**  ▸ System Settings ▸ Privacy & Security ▸ **Local Network** ▸ enable
 **Navigator**.
+
+---
+
+## 8. App Management — how Navigator updates itself
+
+**What it's for:** installing an update. Navigator downloads the new build and replaces
+`/Applications/Navigator.app`, and macOS classes replacing an app bundle as App Management.
+
+**Why it's worth checking even though nothing prompts you:** if it's off, the download
+succeeds and the swap silently doesn't. You stay on the old version, no error appears, and
+the only symptom is that the same update keeps offering itself. That's a confusing failure
+to diagnose from the outside, which is the whole reason this section exists.
+
+**How:**  ▸ System Settings ▸ Privacy & Security ▸ **App Management** ▸ enable **Navigator**.
+
+macOS gives apps no way to read this setting back, so the Setup Assistant lists it without a
+status — it can point you at the pane, but only you can see the switch.
 
 ---
 
