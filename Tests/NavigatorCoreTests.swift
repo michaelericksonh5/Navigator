@@ -1403,6 +1403,89 @@ final class LayerizeRulesTests: XCTestCase {
     }
 }
 
+// MARK: - Search query parsing and matching
+
+final class SearchQueryRulesTests: XCTestCase {
+    /// THE BUG, with the real filename that exposed it. Measured against the live Spotlight
+    /// index: "phoenix v2" as one substring returned 0 files; as separate tokens, 17.
+    func testMultiWordSearchFindsTheFile() {
+        let name = "HP2_Phoenix_Direct_NB2_v2.png"
+        XCTAssertFalse(SearchQueryRules.fold(name).contains(SearchQueryRules.fold("phoenix v2")),
+                       "precondition: the old single-substring test really does fail")
+        XCTAssertTrue(SearchQueryRules.matches(name: name, tokens: SearchQueryRules.tokens("phoenix v2")))
+        XCTAssertTrue(SearchQueryRules.matches(name: name, tokens: SearchQueryRules.tokens("v2 phoenix")),
+                      "order must not matter")
+        XCTAssertTrue(SearchQueryRules.matches(name: name, tokens: SearchQueryRules.tokens("hp2 direct png")))
+    }
+
+    func testAllTokensAreRequiredNotAny() {
+        let name = "Dragon_Gold_v1.png"
+        XCTAssertTrue(SearchQueryRules.matches(name: name, tokens: SearchQueryRules.tokens("dragon gold")))
+        XCTAssertFalse(SearchQueryRules.matches(name: name, tokens: SearchQueryRules.tokens("dragon phoenix")),
+                       "a token that is absent must exclude the file")
+    }
+
+    /// A quoted phrase is the escape hatch for wanting the literal string back.
+    func testQuotedPhraseStaysOneToken() {
+        XCTAssertEqual(SearchQueryRules.tokens("\"red dragon\""), ["red dragon"])
+        XCTAssertEqual(SearchQueryRules.tokens("\"red dragon\" gold"), ["red dragon", "gold"])
+        XCTAssertTrue(SearchQueryRules.matches(name: "a red dragon.png", tokens: SearchQueryRules.tokens("\"red dragon\"")))
+        XCTAssertFalse(SearchQueryRules.matches(name: "dragon_red.png", tokens: SearchQueryRules.tokens("\"red dragon\"")),
+                       "quoted means literal, so a reordered name must NOT match")
+    }
+
+    /// The two backends disagreed here: the walk folded case only, Spotlight folded case AND
+    /// diacritics, so an accented name matched in one and not the other.
+    func testCaseAndDiacriticInsensitive() {
+        XCTAssertTrue(SearchQueryRules.matches(name: "Café_Sign.png", tokens: SearchQueryRules.tokens("cafe")))
+        XCTAssertTrue(SearchQueryRules.matches(name: "cafe_sign.png", tokens: SearchQueryRules.tokens("CAFÉ")))
+        XCTAssertTrue(SearchQueryRules.matches(name: "ÜBER.png", tokens: SearchQueryRules.tokens("uber")))
+    }
+
+    func testExtensionQueryStillWorks() {
+        XCTAssertEqual(SearchQueryRules.extensionQuery(SearchQueryRules.tokens("png")), "png")
+        XCTAssertEqual(SearchQueryRules.extensionQuery(SearchQueryRules.tokens(".png")), "png")
+        XCTAssertEqual(SearchQueryRules.extensionQuery(SearchQueryRules.tokens("*.PNG")), "png")
+        XCTAssertTrue(SearchQueryRules.matchesFile(name: "artwork_final", ext: "png",
+                                                  tokens: SearchQueryRules.tokens("png")),
+                      "a bare extension must find files whose NAME lacks it")
+        // Multi-token queries are names, not extensions
+        XCTAssertNil(SearchQueryRules.extensionQuery(SearchQueryRules.tokens("logo png")))
+        // Not everything short is an extension
+        XCTAssertNil(SearchQueryRules.extensionQuery(SearchQueryRules.tokens("dragonfly")))
+    }
+
+    func testEmptyAndWhitespaceQueries() {
+        XCTAssertTrue(SearchQueryRules.tokens("").isEmpty)
+        XCTAssertTrue(SearchQueryRules.tokens("   \t ").isEmpty)
+        // No tokens = filter-only search, so everything qualifies
+        XCTAssertTrue(SearchQueryRules.matches(name: "anything.png", tokens: []))
+    }
+
+    func testUnbalancedQuoteDoesNotLoseTheText() {
+        XCTAssertEqual(SearchQueryRules.tokens("\"red dragon"), ["red dragon"])
+        XCTAssertFalse(SearchQueryRules.tokens("\"").contains(where: { !$0.isEmpty }))
+    }
+}
+
+final class SearchTruncationTests: XCTestCase {
+    /// A capped list that reports a plain count reads as a complete answer, and someone then
+    /// concludes the file they were looking for doesn't exist.
+    func testCappedResultsSaySo() {
+        let t = SearchTruncation.of(shown: 500, cap: 500, hitCap: true)
+        XCTAssertEqual(t, .capped(shown: 500, cap: 500))
+        XCTAssertTrue(t.statusText.contains("more than"))
+        XCTAssertTrue(t.statusText.lowercased().contains("narrow"))
+    }
+
+    func testCompleteResultsReadNormally() {
+        let t = SearchTruncation.of(shown: 42, cap: 500, hitCap: false)
+        XCTAssertEqual(t, .complete(42))
+        XCTAssertEqual(t.statusText, "42 found")
+        XCTAssertFalse(t.statusText.contains("more than"))
+    }
+}
+
 // MARK: - Thumbnail cache keys
 
 final class ThumbnailKeyRulesTests: XCTestCase {

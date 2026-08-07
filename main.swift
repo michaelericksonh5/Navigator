@@ -439,6 +439,11 @@ enum Prefs {
         set { d.set(newValue, forKey: "confirmTrash") }
     }
     static var thumbnailMode: String { get { d.string(forKey: "thumbnailMode") ?? "all" } set { d.set(newValue, forKey: "thumbnailMode") } }  // all | images | off
+    /// Search inside file CONTENTS as well as names. Off by default, deliberately: it was
+    /// always on, and it made searching "png" return every document that merely mentions PNG
+    /// while nearly doubling the query time (372ms -> 673ms measured on 309k entries).
+    /// Explorer and Finder both treat contents as a separate, opt-in thing.
+    static var searchFileContents: Bool { get { d.bool(forKey: "searchFileContents") } set { d.set(newValue, forKey: "searchFileContents") } }
     static var didOfferDefaults: Bool { get { d.bool(forKey: "didOfferDefaults") } set { d.set(newValue, forKey: "didOfferDefaults") } }
     /// The Open/Save dialog bridge (PickerBridge). On by default: its chord is ⌃⌥⌘-based
     /// so it shadows nothing, and a global hotkey nobody knows about is a feature nobody
@@ -4407,7 +4412,7 @@ final class Browser: ObservableObject, Identifiable {
             result.append(makeItem(URL(fileURLWithPath: path)))
         }
         items = result
-        updateStatus()
+        updateStatus()   // Recents is a fixed-size list, not a search — no truncation notice
         q.stop()
         NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
         recentsQuery = nil
@@ -4427,13 +4432,23 @@ final class Browser: ObservableObject, Identifiable {
         status = "Searching…"
         searchQuery?.stop(); searchQuery = nil
         searchGen += 1
-        // Spotlight only for a true-local "This Mac" search — it doesn't index SMB
-        // shares or Google Drive (File Provider), so those need a real recursive
-        // walk. "This Folder" always walks (works everywhere, incl. cloud/SMB).
-        if searchThisMac && !currentIsNetwork && !isCloudProviderPath(currentURL) {
-            runSpotlight(query)
-        } else {
+        // MEASURED, because the old rule was wrong twice over.
+        //
+        // It sent Google Drive to the recursive walk on the belief that File Provider volumes
+        // aren't indexed. They are: a name-only Spotlight query inside Production_AI 2 (309k
+        // entries) returned the SAME 646 hits as `find`, in 211ms against 939ms — and
+        // Navigator's walk is heavier than `find` because it reads resourceValues per file.
+        // That folder is where the work lives, so the slow path was the common path.
+        //
+        // It also never used Spotlight for "This Folder" at all: runSpotlight was only reached
+        // when searchThisMac was true, which made its `[currentURL]` scope dead code. A folder
+        // search on an indexed tree walked hundreds of thousands of entries for no reason.
+        //
+        // SMB shares genuinely are not indexed, so those still walk.
+        if currentIsNetwork {
             walkSearch(query, root: currentURL, gen: searchGen)
+        } else {
+            runSpotlight(query)
         }
     }
     /// Combines metadata subpredicates, unwrapping the single-element case.
@@ -4446,6 +4461,11 @@ final class Browser: ObservableObject, Identifiable {
     /// commonest possible Spotlight search threw inside menu tracking and silently
     /// returned nothing. It only ever appeared to work when a second filter happened to
     /// be set.
+    /// One cap for BOTH backends. They used to differ — 500 for Spotlight, 10 000 for the
+    /// walk — so the same query returned a different number of results depending only on where
+    /// you happened to be searching.
+    static let searchResultCap = 5_000
+
     static func metadataCompound(_ subs: [NSPredicate], and: Bool) -> NSPredicate? {
         switch subs.count {
         case 0: return nil
@@ -4457,9 +4477,38 @@ final class Browser: ObservableObject, Identifiable {
     private func runSpotlight(_ query: String) {
         let q = NSMetadataQuery()
         q.searchScopes = searchThisMac ? [NSMetadataQueryLocalComputerScope] : [currentURL]
+        q.notificationBatchingInterval = 0.3
         var subs: [NSPredicate] = []
-        if !query.isEmpty {
-            subs.append(NSPredicate(format: "kMDItemDisplayName LIKE[cd] %@ OR kMDItemTextContent CONTAINS[cd] %@", "*\(query)*", query))
+        // kMDItemFSName CONTAINS, not kMDItemDisplayName LIKE "*x*". Measured on 309k entries:
+        // identical hits (646 = 646) in 94ms instead of 372ms — 4x faster — and FSName is the
+        // more correct attribute anyway, because DisplayName drops the extension when Finder is
+        // set to hide extensions, so searching ".png" silently depended on a Finder preference.
+        //
+        // One clause per token, AND-ed, so multi-word searches work at all. As a single
+        // substring, "phoenix v2" matched 0 files where the tokenised form matches 17.
+        let tokens = SearchQueryRules.tokens(query)
+        if !tokens.isEmpty {
+            var nameSubs: [NSPredicate] = tokens.map {
+                NSPredicate(format: "kMDItemFSName CONTAINS[cd] %@", $0)
+            }
+            // A lone extension-ish token ("png") should also match by type, since the name
+            // itself often doesn't contain it.
+            if let ext = SearchQueryRules.extensionQuery(tokens), nameSubs.count == 1 {
+                nameSubs = [NSCompoundPredicate(orPredicateWithSubpredicates: [
+                    nameSubs[0],
+                    NSPredicate(format: "kMDItemFSName ENDSWITH[cd] %@", "." + ext),
+                ])]
+            }
+            var nameClause = Browser.metadataCompound(nameSubs, and: true)
+            // Content search is OPT-IN. It was always on, and it costs: the same query went
+            // from 372ms to 673ms and pulled in 84 extra hits whose filenames don't match at
+            // all — so searching "png" returned every document that mentions PNG.
+            if Prefs.searchFileContents, !query.isEmpty, let n = nameClause {
+                nameClause = NSCompoundPredicate(orPredicateWithSubpredicates: [
+                    n, NSPredicate(format: "kMDItemTextContent CONTAINS[cd] %@", query),
+                ])
+            }
+            if let n = nameClause { subs.append(n) }
         }
         if let tree = searchKind.typeTree { subs.append(NSPredicate(format: "kMDItemContentTypeTree == %@", tree)) }
         // Date/Size go into the PREDICATE as well as the post-hoc check in
@@ -4500,8 +4549,10 @@ final class Browser: ObservableObject, Identifiable {
     // (so "png", ".png", or "logo" all work). Streams matches in as they're found,
     // on a background thread, cancellable via searchGen.
     private func walkSearch(_ raw: String, root: URL, gen: Int) {
-        let q = raw.lowercased()
-        let extQ = q.trimmingCharacters(in: CharacterSet(charactersIn: "*."))
+        // Same rules the Spotlight path uses, so the two backends can't disagree about what
+        // matches. They used to: this walk did a single `lowercased()` substring test while
+        // Spotlight folded diacritics too, and neither handled multiple words.
+        let tokens = SearchQueryRules.tokens(raw)
         let kindTree = searchKind.typeTree   // optional kind constraint (Images, etc.)
         let showHidden = self.showHidden
         // Snapshot the filters (and "now") once, off the main thread's back: a walk of a
@@ -4511,37 +4562,46 @@ final class Browser: ObservableObject, Identifiable {
         let now = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let keys = Browser.itemKeys
-            var opts: FileManager.DirectoryEnumerationOptions = []
+            // skipsPackageDescendants: without it the walk climbs inside every .app and
+            // .bundle it meets and reports their internals as results — searching anywhere near
+            // /Applications buried the real hits under thousands of framework files. Finder
+            // treats a package as one item; so does this now.
+            var opts: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
             if !showHidden { opts.insert(.skipsHiddenFiles) }
             let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: opts)
             var batch: [FileItem] = []
             var total = 0
+            var hitCap = false
             func flush(final: Bool) {
                 let snap = batch; batch.removeAll()
                 DispatchQueue.main.async { [weak self] in
                     guard let self, gen == self.searchGen else { return }
                     if !snap.isEmpty { self.items.append(contentsOf: snap) }
-                    self.status = final ? "\(self.items.count) found" : "Searching… \(self.items.count) found"
+                    // A capped list that reports a bare count reads as the complete answer, and
+                    // then a missing file looks like it doesn't exist.
+                    self.status = final
+                        ? SearchTruncation.of(shown: self.items.count,
+                                              cap: Browser.searchResultCap,
+                                              hitCap: hitCap).statusText
+                        : "Searching… \(self.items.count) found"
                 }
             }
             while let u = en?.nextObject() as? URL {
                 guard let self, gen == self.searchGen else { return }   // cancelled
-                let name = u.lastPathComponent.lowercased()
-                let ext = u.pathExtension.lowercased()
+                let name = u.lastPathComponent
+                let ext = u.pathExtension
                 if kindTree != nil {   // kind filter set → require a matching content type
-                    if !(UTType(filenameExtension: ext)?.conforms(to: UTType(kindTree!) ?? .data) ?? false) { continue }
+                    if !(UTType(filenameExtension: ext.lowercased())?.conforms(to: UTType(kindTree!) ?? .data) ?? false) { continue }
                 }
-                // Empty query = filter-only search, so every name qualifies.
-                if !q.isEmpty {
-                    guard name.contains(q) || (!extQ.isEmpty && ext == extQ) else { continue }
-                }
+                // Empty token list = filter-only search, so every name qualifies.
+                guard SearchQueryRules.matchesFile(name: name, ext: ext, tokens: tokens) else { continue }
                 let item = Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys)))
                 guard filters.matches(modified: item.modified, size: item.size,
                                       isDirectory: item.isDirectory, now: now) else { continue }
                 batch.append(item)
                 total += 1
                 if batch.count >= 40 { flush(final: false) }
-                if total >= 10_000 { break }   // sanity cap on huge trees
+                if total >= Browser.searchResultCap { hitCap = true; break }
             }
             flush(final: true)
         }
@@ -4556,7 +4616,8 @@ final class Browser: ObservableObject, Identifiable {
         guard let q = note.object as? NSMetadataQuery, q === searchQuery else { return }
         q.disableUpdates()
         var result: [FileItem] = []
-        let n = min(q.resultCount, 500)
+        let totalFound = q.resultCount
+        let n = min(totalFound, Browser.searchResultCap)
         let now = Date()
         for i in 0..<n {
             guard let mi = q.result(at: i) as? NSMetadataItem,
@@ -4571,7 +4632,11 @@ final class Browser: ObservableObject, Identifiable {
             result.append(item)
         }
         items = result
-        updateStatus()
+        // Say so when the list is cut short. "500 items" was indistinguishable from a complete
+        // answer, so a file that WAS found but fell past the cap looked like it didn't exist.
+        status = SearchTruncation.of(shown: result.count,
+                                     cap: Browser.searchResultCap,
+                                     hitCap: totalFound > Browser.searchResultCap).statusText
         q.stop()
         NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
         searchQuery = nil
@@ -13810,6 +13875,7 @@ struct SettingsView: View {
     @AppStorage("showHidden") private var showHidden = false
     @AppStorage("confirmTrash") private var confirmTrash = true
     @AppStorage("thumbnailMode") private var thumbnailMode = "all"
+    @AppStorage("searchFileContents") private var searchFileContents = false
     @AppStorage("warnExtensionChange") private var warnExtensionChange = true
     @AppStorage("inferFolderView") private var inferFolderView = true
     @AppStorage("pickerHotkeyEnabled") private var pickerHotkeyEnabled = true
@@ -13841,6 +13907,8 @@ struct SettingsView: View {
                     Text("Images only").tag("images")
                     Text("Off (fastest on slow drives)").tag("off")
                 }
+                Toggle("Search inside file contents", isOn: $searchFileContents)
+                    .help("Off: search matches file and folder NAMES, which is what Explorer does and what people usually mean. On: also matches text inside documents — useful, but it finds files whose names have nothing to do with what you typed, and roughly doubles how long a search takes.")
             }
             // Wordier than the rest of this window on purpose: this section reaches into
             // another app's dialog, replaces the clipboard, and optionally leans on a
