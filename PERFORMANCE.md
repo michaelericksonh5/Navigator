@@ -8,13 +8,13 @@ what we do that Finder doesn't, and what's genuinely out of our hands.
 > "metadata is not the bottleneck." Re-measured, it is the exact opposite. Two of the
 > levers below were built on that inverted premise, and one implementation bug
 > (see "The truncation guard", below) silently prevented the cache from ever holding
-> the large folders it existed for. Numbers here are from 2026-08-07 on GlobalProtect.
+> the large folders it existed for. Numbers here are from 2026-08-07 over a corporate VPN.
 
-## What we measured (High 5 shares, over GlobalProtect VPN)
+## What we measured (two SMB shares, over a corporate VPN)
 
-Ping RTT: **77–114 ms** to both `corp-pure02` and `CORP-DC01`.
+Ping RTT: **77–114 ms** to both file servers (`fileserver-a`, a DFS namespace, and `fileserver-b`).
 
-`/Volumes/Games-1/artSource`, 669 top-level entries:
+`share-a` (a DFS submount), 669 top-level entries:
 
 | Measurement | Result | Meaning |
 |---|---|---|
@@ -25,7 +25,7 @@ Ping RTT: **77–114 ms** to both `corp-pure02` and `CORP-DC01`.
 | `getattrlistbulk`, all 669 in **one** syscall | 71.1 s — 106 ms/entry | The bulk API is no better; slightly worse |
 | Any of the above, warm | ~0 ms | smbfs caches an entry once fetched |
 
-`/Volumes/data/Public`, 116–118 entries: `readdir` **0.24 s**; full metadata enumerate
+`share-b/Public`, 116–118 entries: `readdir` **0.24 s**; full metadata enumerate
 **10.8–13.1 s**.
 
 **Root cause:** ~89 ms per entry ≈ **one network round trip per entry**, and it is paid
@@ -64,7 +64,7 @@ Also measured: **Spotlight (`NSMetadataQuery`) does not index SMB shares** — s
    turn one on for a folder and you get it, and the slower load, and it is remembered.
    `NetworkColumnRules` owns this and is unit-tested.
 
-   (Size and Modified were briefly off by default too, when they cost 59 s for artSource. The
+   (Size and Modified were briefly off by default too, when they cost 59 s for share-a. The
    index changed that premise; they came back on once a folder answered in ~1 s.)
 2. **Skip the metadata pass entirely when nothing needs it.** If no visible column and no
    sort key requires per-file data, the names-only listing *is* the finished answer and
@@ -81,11 +81,11 @@ Also measured: **Spotlight (`NSMetadataQuery`) does not index SMB shares** — s
    folder changes so a batch fetched for the old folder can never land on the new one's rows.
 4. **Shared folder index on the share itself.** The answer is the same for everyone on the
    team, so one person's expensive listing is written back for the rest:
-   `<volume-root>/.navigator/<hash>.json`, 669 entries in 39 KB. Measured on artSource:
+   `<volume-root>/.navigator/<hash>.json`, 669 entries in 39 KB. Measured on share-a:
    **68 s → ~1 s.** Written only after a complete sweep and throttled (a write costs ~5 s),
    skipped for folders under 40 entries, and hashed on the path *relative to the volume root*
    so an index written by someone whose share is mounted at `/Volumes/Games` still resolves
-   for a colleague at `/Volumes/Games-1`.
+   for a colleague whose mount landed at `/Volumes/Games-1`.
 
    **The index never decides what exists.** Presence always comes from the live `readdir`,
    which is free; the index only supplies attributes for names that listing already confirmed.
@@ -130,7 +130,7 @@ Also measured: **Spotlight (`NSMetadataQuery`) does not index SMB shares** — s
 
    The scale rules it out on its own. `readdir` is cheap (666 names in 0.7 s) but attributes cost
    89 ms/entry at best and ~500 ms/entry on a degraded VPN, so a 50k-file tree is ~7 hours of
-   serialized traffic and a 200k-file tree ~28 hours. Merely *sampling* six of artSource's 671
+   serialized traffic and a 200k-file tree ~28 hours. Merely *sampling* six of share-a's 671
    top-level folders exceeded a 10-minute timeout.
 
    And a crawl is not a one-time payment, which is the subtler reason. Staleness is detected by
@@ -157,10 +157,10 @@ pass used to be discarded whenever it returned fewer rows than the names-only pa
 theory that a short result meant it had been aborted. But the two passes filter hidden
 files differently: names-only matches a leading dot, while `.skipsHiddenFiles` honours the
 **DOS hidden attribute**. On a Windows-authored share the metadata pass legitimately returns
-fewer rows (measured 116 vs 118 on `//corp-pure02/data` — `Thumbs.db` and friends), so a
+fewer rows (measured 116 vs 118 on `share-b` — `Thumbs.db` and friends), so a
 correct result was thrown away as if truncated, and the `DiskCache.put` below it was never
 reached. Two consequences: Size and Date Modified stayed blank *permanently* rather than
-just during loading, and the largest folders were never cached — `Public` and `artSource`
+just during loading, and the largest folders were never cached — both large shares
 were absent from `dircache.json` while 24 small folders sat in it happily. Completion is now
 tracked explicitly instead of inferred from row counts.
 
