@@ -977,6 +977,54 @@ enum CloseTabRules {
     }
 }
 
+/// Turns an Adobe script failure into something worth showing a person.
+///
+/// The raw strings are internal: `ERROR: [open]` is the .jsx's own step marker, and
+/// "the open options are incorrect" is Photoshop's way of saying a file isn't really a PSD.
+/// Shown verbatim in a summary dialog it reads as a Navigator malfunction rather than
+/// "this one file is broken", which is the opposite of the truth.
+enum AdobeErrorText {
+    /// Ordered: the first match wins, so specific phrases must precede generic ones.
+    private static let plain: [(needle: String, text: String)] = [
+        ("open options are incorrect",
+         "not a readable Photoshop file — it may be damaged, or another format renamed .psd"),
+        ("cannot open the file",
+         "Photoshop couldn’t open this file — it may be damaged or still copying"),
+        ("could not be found",       "the file wasn’t there when Photoshop looked for it"),
+        ("is not a valid",           "not a valid Photoshop document"),
+        ("damaged",                  "the file appears to be damaged"),
+        ("unsupported",              "Photoshop doesn’t support this file type"),
+        ("is not currently available",
+         "Photoshop was busy and never answered — try again in a moment"),
+        ("timed out",                "Photoshop took too long to respond"),
+        ("disk",                     "Photoshop ran out of scratch disk space"),
+    ]
+
+    /// `"stub.psd: ERROR: [open] Cannot open the file because…"`
+    ///   → `"stub.psd: not a readable Photoshop file — it may be damaged, or another…"`
+    /// An unrecognised message keeps its text, just without the internal step marker — never
+    /// swallowed, because an unexplained failure still has to be reportable.
+    static func friendly(_ line: String) -> String {
+        // Split "<file>: <message>" so the filename survives untouched.
+        let head: String, body: String
+        if let r = line.range(of: ": ") {
+            head = String(line[line.startIndex..<r.lowerBound]) + ": "
+            body = String(line[r.upperBound...])
+        } else {
+            head = ""; body = line
+        }
+        let lower = body.lowercased()
+        if let hit = plain.first(where: { lower.contains($0.needle) }) { return head + hit.text }
+        // Strip "ERROR: " and any "[step]" marker from anything we don't have wording for.
+        var rest = body
+        if let r = rest.range(of: "ERROR: ") { rest.removeSubrange(r) }
+        if rest.hasPrefix("["), let close = rest.firstIndex(of: "]") {
+            rest = String(rest[rest.index(after: close)...]).trimmingCharacters(in: .whitespaces)
+        }
+        return head + rest
+    }
+}
+
 // MARK: - When an Adobe app is actually wedged (vs. just handed a bad file)
 
 /// Decides whether repeated Photoshop/After Effects failures mean the APP is wedged — the

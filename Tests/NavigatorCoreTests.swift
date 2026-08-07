@@ -1224,6 +1224,47 @@ final class CloseTabRulesTests: XCTestCase {
     }
 }
 
+// MARK: - Adobe error wording
+
+final class AdobeErrorTextTests: XCTestCase {
+    /// The exact line that reached a user-facing dialog, jargon and all.
+    func testTheLineThatLeakedIntoADialog() {
+        let out = AdobeErrorText.friendly(
+            "stub.psd: ERROR: [open] Cannot open the file because the open options are incorrect")
+        XCTAssertTrue(out.hasPrefix("stub.psd: "), "the filename must survive")
+        XCTAssertFalse(out.contains("ERROR:"))
+        XCTAssertFalse(out.contains("[open]"))
+        XCTAssertFalse(out.lowercased().contains("open options"))
+        XCTAssertTrue(out.contains("damaged"), "should explain what's actually wrong: \(out)")
+    }
+
+    func testBusyPhotoshopReadsAsTransient() {
+        let out = AdobeErrorText.friendly("a.psd: ERROR: [activeLayer] The command “Get” is not currently available")
+        XCTAssertTrue(out.lowercased().contains("busy"), out)
+        XCTAssertFalse(out.contains("["))
+    }
+
+    /// An unknown failure must still be reportable — cleaned up, never swallowed.
+    func testUnknownMessageKeepsItsText() {
+        let out = AdobeErrorText.friendly("x.psd: ERROR: [saveAs] Something nobody has seen before")
+        XCTAssertTrue(out.contains("Something nobody has seen before"), out)
+        XCTAssertFalse(out.contains("ERROR:"))
+        XCTAssertFalse(out.contains("[saveAs]"))
+        XCTAssertTrue(out.hasPrefix("x.psd: "))
+    }
+
+    func testHandlesALineWithNoFilenamePrefix() {
+        XCTAssertFalse(AdobeErrorText.friendly("ERROR: [open] Cannot open the file").isEmpty)
+        XCTAssertFalse(AdobeErrorText.friendly("").contains("ERROR"))
+    }
+
+    /// Specific wording must beat the generic fallback when both could match.
+    func testMostSpecificWordingWins() {
+        let out = AdobeErrorText.friendly("a.psd: Cannot open the file because the open options are incorrect")
+        XCTAssertTrue(out.contains("renamed .psd"), out)
+    }
+}
+
 // MARK: - Adobe wedge detection
 
 final class AdobeRecoveryRulesTests: XCTestCase {
