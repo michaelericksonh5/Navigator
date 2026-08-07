@@ -1175,6 +1175,110 @@ enum LayerizeRules {
     }
 }
 
+// MARK: - Columns that are too expensive to show on a network volume
+
+/// Which Details columns are worth their cost on a slow volume.
+///
+/// Measured on two real SMB shares:
+///
+/// * **Owner** was the worst by a distance. `FileItem.owner` did a fresh `stat` per read, and
+///   the cell reads it on every SwiftUI render pass — 669 rows on //CORP-DC01/Games cost
+///   ~60 SECONDS per pass, repeatably, because the SMB client never cached it. Memoizing that
+///   fixed the repeat cost; not asking for it at all fixes the first pass too.
+/// * **Date Created / Last Opened / Added / Tags** need attributes beyond the ones the listing
+///   already fetches. On //corp-pure02/data those extras cost ~187 ms per entry on first
+///   fetch, even with name/size/date for the same folder already cached.
+///
+/// Everything left is genuinely free: Name and Ext come straight off the filename, Kind is
+/// derived from the extension by `localKind` with no I/O at all, and Size and Date Modified
+/// arrive with the directory listing whether asked for or not.
+enum NetworkColumnRules {
+    static let costlyOnNetwork: Set<String> = ["created", "accessed", "owner", "duration", "dimensions"]
+
+    /// Hidden on network volumes even when enabled globally — the point is that browsing a
+    /// share never pays for a column, not that the preference is edited behind the user's back.
+    /// Local folders always show exactly what was asked for.
+    /// The DEFAULT column set for a network folder nobody has arranged by hand.
+    ///
+    /// Name, Ext and Kind and nothing else, because these three are the only columns
+    /// that cost NOTHING: the name comes from readdir, and Ext and Kind are derived from
+    /// it with no I/O at all. Whether a row is a folder comes free too, from readdir's
+    /// d_type. So this set renders a complete, correct listing with zero per-file I/O —
+    /// measured at 429 ms for artSource's 669 files.
+    ///
+    /// Size and Date Modified are deliberately NOT here. An earlier version of this
+    /// comment claimed they were free because they "ride along in the same stat"; that
+    /// was wrong — they ARE the stat, at 89 ms PER ENTRY on //CORP-DC01/Games (a DFS
+    /// namespace). That is 59 s for artSource, and 10.9 s for a 116-item folder. The cost
+    /// is the server's, not the API's: resourceValues, raw lstat, 8/16/32-way concurrent
+    /// lstat, and getattrlistbulk (all 669 in a single syscall) all land within
+    /// 73-106 ms/entry cold. Concurrency buys nothing — the SMB client serializes them.
+    ///
+    /// None of them are forbidden. Turn Size on for a share and you get Size, and the
+    /// slow load that comes with it, and the choice is remembered for that folder.
+
+    /// Size and Date Modified are back on by default as of the shared index. When Size cost 89 ms
+    /// per row and 59 s for a folder, leaving it on was indefensible; with an index the same
+    /// folder answers in ~1 s, and rows render blank (not "0 bytes") until their real values
+    /// arrive, so nothing is ever wrong on screen and navigation is never held up. The five in
+    /// costlyOnNetwork stay off — Owner is a stat per cell render, Duration and Dimensions read
+    /// file headers, and no index covers those.
+    static let networkDefaults: Set<String> = ["name", "extension", "kind", "size", "modified"]
+
+    /// Columns that cannot be filled without a per-file attribute fetch. On a network
+    /// volume each one of these is what turns a 0.4 s listing into a 59 s one.
+    /// These are the real column ids from fileColumnDefs. "duration" and "dimensions" are
+    /// the worst of them by far: they read the file's HEADER, not just its stat, so on a
+    /// share they cost a transfer per row rather than a round trip per row.
+    static let attributeColumns: Set<String> =
+        ["size", "modified", "created", "accessed", "owner", "duration", "dimensions"]
+
+    /// Sort keys that need the same per-file data, whatever the columns say — sorting by
+    /// size with no Size column still has to know every size.
+    static let attributeSortKeys: Set<String> = ["size", "modified", "created", "accessed", "added"]
+
+    /// Whether the metadata pass has to run at all. False means the names-only listing IS
+    /// the finished answer and the expensive enumerate can be skipped outright.
+    static func needsAttributePass(columns: Set<String>, sortKey: String) -> Bool {
+        !columns.isDisjoint(with: attributeColumns) || attributeSortKeys.contains(sortKey)
+    }
+
+    /// Seed columns for a folder with nothing saved yet.
+    static func seed(isNetwork: Bool, localDefaults: Set<String>) -> Set<String> {
+        isNetwork ? networkDefaults : localDefaults
+    }
+
+    /// Strip the expensive columns (and an expensive sort) out of an arrangement that was
+    /// saved for a NETWORK folder. Run once, as a migration: most saved network arrangements
+    /// were never a deliberate choice — they got persisted as a side effect of visiting the
+    /// folder — and they are what keeps a share on the 89 ms-per-row path. Turning a column
+    /// back on afterwards is a deliberate act and is kept.
+    static func cleaned(columns: Set<String>) -> Set<String> {
+        // costlyOnNetwork, not all of attributeColumns: Size and Date Modified are affordable now
+        // that the shared index answers them in bulk, and they are the two people actually want.
+        // Owner, Duration and Dimensions are not indexable and stay off.
+        let kept = columns.subtracting(costlyOnNetwork)
+        // Never hand back something with no name column; that would render an empty table.
+        return kept.contains("name") ? kept : kept.union(["name"])
+    }
+
+    /// Seed sort for a folder with nothing saved yet. Cheap columns alone are not enough to
+    /// get an instant listing: sorting by size or date needs every file's attributes just
+    /// as much as showing them does, so an unarranged network folder sorts by name. A
+    /// folder sorted by size on purpose keeps it — this only fills in a default.
+    static func seedSortKey(isNetwork: Bool, localDefault: String) -> String {
+        isNetwork && attributeSortKeys.contains(localDefault) ? "name" : localDefault
+    }
+
+    /// Which of the user's columns are being withheld right now, so the UI can say so instead
+    /// of leaving someone wondering where their column went.
+    /// Which of the requested columns are the expensive ones — for a "this is why the
+    /// folder is slow" hint, not for hiding anything.
+    static func costly(in requested: Set<String>) -> Set<String> {
+        requested.intersection(costlyOnNetwork)
+    }
+}
+
 // MARK: - Search query parsing and matching
 
 /// Turns what someone typed into something that actually finds files.
@@ -1903,6 +2007,25 @@ struct ViewOptionsLRU: Codable, Equatable {
     /// and the more recently used of the pair wins — rebuilding least-recent-first means
     /// the later `set` both overwrites the value and lifts it to the front, which is the
     /// same answer the LRU would have given had the records never split.
+    /// One-time cleanup of arrangements saved for NETWORK folders: drop the columns that cost
+    /// a round trip per row, and downgrade a size/date sort to name (which needs the same data).
+    /// Most of these arrangements were never chosen deliberately — visiting a folder persists
+    /// one — and they are exactly what keeps a share off the fast path. Takes the network test
+    /// as a parameter so this stays pure and testable.
+    func strippingCostlyNetworkColumns(isNetwork: (String) -> Bool) -> ViewOptionsLRU {
+        var out = self
+        for (key, o) in byPath where isNetwork(key) {
+            let keep = NetworkColumnRules.cleaned(columns: Set(o.columns))
+            let sort = NetworkColumnRules.attributeSortKeys.contains(o.sortKey) ? "name" : o.sortKey
+            guard keep != Set(o.columns) || sort != o.sortKey else { continue }
+            out.byPath[key] = ViewOptions(viewMode: o.viewMode, iconSize: o.iconSize,
+                                         sortKey: sort, sortAscending: o.sortAscending,
+                                         groupBy: o.groupBy,
+                                         columns: o.columns.filter { keep.contains($0) })
+        }
+        return out
+    }
+
     func migratedToNormalizedKeys() -> ViewOptionsLRU {
         guard order.contains(where: { $0 != folderKey($0) }) else { return self }
         var out = ViewOptionsLRU()
@@ -3522,5 +3645,137 @@ enum DragDiagnosticsReport {
         out.append("last \(s.logTail.count) drag-related log line(s):")
         out.append(contentsOf: s.logTail)
         return out.joined(separator: "\n") + "\n"
+    }
+}
+
+// MARK: - Shared folder index (.navigator)
+//
+// A share costs ~89 ms per file for size/date — one network round trip each, and no macOS
+// API batches it (see PERFORMANCE.md). But the ANSWER is the same for everyone on the team,
+// so one person paying 59 s for artSource can spell it for everybody: 669 entries land in a
+// 56 KB file that reads back in 1.2 s. Measured 51x.
+//
+// The safety property that makes this usable on a drive full of Windows users who have never
+// heard of Navigator: THE INDEX NEVER DECIDES WHAT EXISTS. Presence always comes from a live
+// readdir, which is free. The index only supplies attributes for names that readdir already
+// confirmed. So a file someone added is simply unindexed and gets fetched; a file someone
+// deleted has an entry nobody ever looks up. A stale index cannot invent or hide anything.
+//
+// The residual gap is a file edited IN PLACE — same name, new size. maxAge bounds how long a
+// wrong size can survive, and visible-rows-first re-fetches whatever is actually on screen,
+// so anything you look at is corrected from the server regardless.
+enum ShareIndexRules {
+    static let version = 3   // v3 separates fullSweptAt from dirMtime; older files are rewritten
+    /// One hidden directory at the volume root rather than a file in every folder: the same
+    /// read cost, one place to exclude from Perforce or delete. (Thumbs.db, the convention
+    /// this follows, is 469 KB per folder; an index of 669 entries is 56 KB.)
+    static let directoryName = ".navigator"
+    /// How long an entry may be trusted for a file that still exists under the same name.
+    static let maxAge: TimeInterval = 7 * 24 * 3600
+    /// Never parse more than this from a shared location written by other machines.
+    static let maxBytes = 8 << 20
+    /// Below this an index isn't worth a round trip — readdir plus a few stats is cheaper.
+    static let minEntriesToWrite = 40
+
+    /// Stable filename for a folder, keyed on its path relative to the volume root so the
+    /// index survives the share being mounted at a different point (/Volumes/Games vs
+    /// Games-1, or a coworker's own mount name).
+    static func filename(forRelative rel: String) -> String {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325            // FNV-1a, 64-bit
+        for b in Array(rel.utf8) {
+            h = (h ^ UInt64(b)) &* 0x0000_0100_0000_01b3   // FNV-64 prime; grouped in 4s so the
+                                                           // digit count is checkable at a glance
+        }
+        // String(format: "%016llx", h) mangles the top bits of a Swift UInt64 passed as a C
+        // variadic — deterministic, so it still round-trips, but it threw away 24 bits of the
+        // hash and that much collision resistance. Format it directly instead.
+        let hex = String(h, radix: 16)
+        return String(repeating: "0", count: max(0, 16 - hex.count)) + hex + ".json"
+    }
+
+    /// Split a live listing against what the index knows. Names the index has are free; names it
+    /// doesn't are the only ones needing a round trip. This is what makes repair incremental:
+    /// readdir hands us the truth about which files exist at no cost, so a folder where someone
+    /// added three files costs three stats to repair, not 669.
+    ///
+    /// Names the index has but the listing doesn't are simply not carried forward — that is how
+    /// deletions leave the index, without needing to be detected.
+    static func repairPlan(liveNames: [String], indexedNames: Set<String>)
+        -> (carryForward: [String], mustStat: [String]) {
+        var carry: [String] = [], stat: [String] = []
+        for n in liveNames {
+            if indexedNames.contains(n) { carry.append(n) } else { stat.append(n) }
+        }
+        return (carry, stat)
+    }
+
+    /// An index is worth reading if we wrote the format and it isn't ancient.
+    /// `fullSweptAt` is when every entry was last read from the server, NOT when the file was last
+    /// touched. Incremental repairs deliberately do not advance it: carrying it forward is what
+    /// guarantees a full sweep eventually happens, which is the only thing that catches a file
+    /// edited IN PLACE (same name, same directory mtime, different size). Without that
+    /// distinction an actively-changing folder would be patched forever and never re-read.
+    static func isUsable(version v: Int, savedAt: Double, now: Double) -> Bool {
+        v == version && now - savedAt < maxAge && savedAt <= now + 60   // tolerate small clock skew
+    }
+
+    /// Split the live listing into "the index can answer this" and "must be fetched".
+    /// liveNames is the truth; indexedNames is whatever the file happened to contain.
+    static func partition(liveNames: [String], indexedNames: Set<String>)
+        -> (fromIndex: [String], mustFetch: [String]) {
+        var fromIndex: [String] = [], mustFetch: [String] = []
+        for n in liveNames {
+            if indexedNames.contains(n) { fromIndex.append(n) } else { mustFetch.append(n) }
+        }
+        return (fromIndex, mustFetch)
+    }
+
+    /// Is the index complete enough that fetching the few names it missed beats re-sweeping the
+    /// whole folder? A handful of new files is worth a handful of round trips; an index that only
+    /// knows a third of the folder is not worth 400 individual fetches.
+    static func coversEnoughToSkipSweep(fromIndex: Int, total: Int) -> Bool {
+        total > 0 && Double(fromIndex) / Double(total) >= 0.8
+    }
+
+    /// Rewrite when there is nothing there, when what's there is stale, or when the folder
+    /// changed. Not on every visit — that would put a 5 s write on the share per user per look.
+    static func shouldWrite(existingSavedAt: Double?, now: Double, dirChanged: Bool, entryCount: Int) -> Bool {
+        guard entryCount >= minEntriesToWrite else { return false }
+        guard let saved = existingSavedAt else { return true }
+        return dirChanged || (now - saved) > maxAge / 2
+    }
+
+    /// Does the index need rebuilding in the background after we've already shown its contents?
+    ///
+    /// The trigger is the folder's own mtime, and ONLY that: adding or removing a file bumps it,
+    /// so it detects exactly the changes an index can get wrong about which files exist.
+    ///
+    /// Deliberately NOT "the live listing had names the index lacks". That looks like a sensible
+    /// second trigger and is a trap: the index is written from the enumerator, which filters
+    /// DOS-hidden files, while the live listing comes from readdir, which only filters dot-names.
+    /// On a Windows-authored share those two never agree (measured 670 vs 672 on artSource —
+    /// Thumbs.db and desktop.ini), so that condition is permanently true and would rebuild the
+    /// whole folder in the background on EVERY visit, forever.
+    static func needsBackgroundRefresh(indexDirMtime: Double?, actualDirMtime: Double?) -> Bool {
+        guard let a = actualDirMtime, let i = indexDirMtime else { return false }
+        return abs(a - i) > 1     // whole-second resolution over SMB
+    }
+}
+
+// MARK: - Share URLs in shared files
+
+enum ShareURLRules {
+    /// Strip the user (and any password) from a share URL.
+    ///
+    /// The mount table reports `//merickson@CORP-DC01.High5.local/Games`, so a mount URL derived
+    /// from it carries whose account it was. Favorites get EXPORTED and handed to coworkers — a
+    /// file that tells their Mac to authenticate as someone else is both a small privacy leak and
+    /// a support call, because NetFS will try that account and fail. Sanitizing here makes it a
+    /// rule rather than an accident of which dialog happened to create the favorite.
+    static func withoutUser(_ raw: String) -> String {
+        guard var c = URLComponents(string: raw), c.user != nil || c.password != nil else { return raw }
+        c.user = nil
+        c.password = nil
+        return c.string ?? raw
     }
 }

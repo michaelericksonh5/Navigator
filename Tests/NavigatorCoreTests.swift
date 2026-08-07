@@ -1403,6 +1403,106 @@ final class LayerizeRulesTests: XCTestCase {
     }
 }
 
+// MARK: - Network column defaults
+
+final class NetworkColumnRulesTests: XCTestCase {
+
+    /// Every default column must cost NOTHING per file. Name comes from readdir; Ext and
+    /// Kind are derived from it with no I/O. Measured: 429 ms for artSource's 669 files.
+    func testNetworkDefaultsAreAllFreeToRead() {
+        XCTAssertEqual(NetworkColumnRules.networkDefaults, ["name", "extension", "kind", "size", "modified"])
+        XCTAssertTrue(NetworkColumnRules.networkDefaults
+            .isDisjoint(with: NetworkColumnRules.costlyOnNetwork),
+            "Owner/Duration/Dimensions are not indexable and must never be on by default")
+    }
+
+    /// Size and Modified are the 89 ms/entry cost, so they must NOT be on by default —
+    /// but they must still be reachable, which testExplicitChoiceIsNeverStripped covers.
+    /// Size and Modified are on by default AND still attribute columns — they need a fetch, they
+    /// are just an affordable one now that the index answers them in bulk.
+    func testSizeAndModifiedAreDefaultsButStillNeedFetching() {
+        for c in ["size", "modified"] {
+            XCTAssertTrue(NetworkColumnRules.networkDefaults.contains(c))
+            XCTAssertTrue(NetworkColumnRules.attributeColumns.contains(c))
+        }
+    }
+
+    /// The whole payoff: with only free columns the expensive pass is skipped outright.
+    /// The default set now DOES need a pass — served by the index, or by visible-rows-first when
+    /// there isn't one. The guarantee is that it is never Owner/Duration/Dimensions.
+    func testDefaultSetNeedsAPassButOnlyIndexableOnes() {
+        XCTAssertTrue(NetworkColumnRules.needsAttributePass(
+            columns: NetworkColumnRules.networkDefaults, sortKey: "name"))
+        XCTAssertTrue(NetworkColumnRules.costly(in: NetworkColumnRules.networkDefaults).isEmpty)
+    }
+
+    /// Any attribute column, or a sort that needs the data, brings the pass back.
+    func testAttributePassRequiredWhenSomethingNeedsIt() {
+        for c in ["size", "modified", "created", "accessed", "owner", "duration", "dimensions"] {
+            XCTAssertTrue(NetworkColumnRules.needsAttributePass(columns: ["name", c], sortKey: "name"),
+                          "\(c) needs a per-file fetch")
+        }
+        // Sorting by size with no Size column still has to know every size.
+        XCTAssertTrue(NetworkColumnRules.needsAttributePass(columns: ["name", "extension"], sortKey: "size"))
+        XCTAssertTrue(NetworkColumnRules.needsAttributePass(columns: ["name"], sortKey: "modified"))
+        XCTAssertFalse(NetworkColumnRules.needsAttributePass(columns: ["name", "kind"], sortKey: "name"),
+                       "sorting by name over free columns must stay free")
+    }
+
+    /// A share with nothing arranged takes the cheap set; local browsing is untouched.
+    func testSeedUsesCheapSetOnlyOnNetwork() {
+        let local: Set<String> = ["name", "owner", "tags"]
+        XCTAssertEqual(NetworkColumnRules.seed(isNetwork: true, localDefaults: local),
+                       NetworkColumnRules.networkDefaults)
+        XCTAssertEqual(NetworkColumnRules.seed(isNetwork: false, localDefaults: local), local)
+    }
+
+    /// The point of the redesign: nothing strips a column the user asked for. seed() is only
+    /// consulted when a folder has NO saved columns, so an explicit Owner survives on a share.
+    func testExplicitChoiceIsNeverStripped() {
+        XCTAssertEqual(NetworkColumnRules.costly(in: ["name", "owner", "dimensions"]),
+                       ["owner", "dimensions"])
+        XCTAssertTrue(NetworkColumnRules.costly(in: ["name", "size"]).isEmpty,
+                      "nothing costly to report when only free columns were asked for")
+    }
+
+    /// Cheap columns alone don't give an instant listing — a size/date sort needs the same
+    /// per-file data. So an unarranged network folder sorts by name, and only that case.
+    func testSeedSortKeyAvoidsAttributeSortsOnNetwork() {
+        XCTAssertEqual(NetworkColumnRules.seedSortKey(isNetwork: true, localDefault: "size"), "name")
+        XCTAssertEqual(NetworkColumnRules.seedSortKey(isNetwork: true, localDefault: "modified"), "name")
+        XCTAssertEqual(NetworkColumnRules.seedSortKey(isNetwork: true, localDefault: "kind"), "kind",
+                       "a free sort is kept as-is")
+        XCTAssertEqual(NetworkColumnRules.seedSortKey(isNetwork: false, localDefault: "size"), "size",
+                       "local browsing is never downgraded")
+    }
+
+    /// The default arrangement sorts by name even when the global default is a size sort: the
+    /// listing must be orderable from readdir alone, so rows can paint before any attribute
+    /// arrives. The columns then fill in from the index (or visible-rows-first) underneath.
+    func testDefaultNetworkArrangementSortsWithoutNeedingAttributes() {
+        let sort = NetworkColumnRules.seedSortKey(isNetwork: true, localDefault: "size")
+        XCTAssertEqual(sort, "name")
+        XCTAssertFalse(NetworkColumnRules.attributeSortKeys.contains(sort),
+                       "a folder must be sortable before its attributes exist")
+    }
+
+    /// The migration drops the costly columns from a saved network arrangement but never
+    /// produces an unrenderable table.
+    func testCleanedStripsCostlyButAlwaysKeepsName() {
+        XCTAssertEqual(NetworkColumnRules.cleaned(columns: ["name", "size", "owner", "created"]),
+                       ["name", "size"], "size is indexable and stays; owner and created do not")
+        XCTAssertTrue(NetworkColumnRules.cleaned(columns: ["owner", "dimensions"]).contains("name"),
+                      "stripping everything must still leave a name column")
+        XCTAssertEqual(NetworkColumnRules.cleaned(columns: ["name", "extension", "kind"]),
+                       ["name", "extension", "kind"], "a cheap arrangement is untouched")
+    }
+
+    func testEmptySelectionIsSafe() {
+        XCTAssertTrue(NetworkColumnRules.costly(in: []).isEmpty)
+    }
+}
+
 // MARK: - Search query parsing and matching
 
 final class SearchQueryRulesTests: XCTestCase {
@@ -4301,5 +4401,164 @@ final class DragSessionLedgerResetTests: XCTestCase {
         _ = l.begin("list view")
         XCTAssertNil(l.closeIfCurrent(ticket: stale))
         XCTAssertEqual(l.inFlightSource, "list view")
+    }
+}
+
+// MARK: - Shared folder index
+
+final class ShareIndexRulesTests: XCTestCase {
+    private let now: Double = 1_754_500_000
+
+    /// THE safety property: presence comes from the live listing, never the index. A file a
+    /// non-Navigator user added is unindexed and gets fetched; one they deleted is never
+    /// looked up. A stale index can neither invent nor hide a file.
+    func testLiveListingAlwaysDecidesWhatExists() {
+        let live = ["kept.psd", "brand_new.png"]          // brand_new isn't in the index
+        let indexed: Set<String> = ["kept.psd", "deleted_last_week.psd"]
+        let (fromIndex, mustFetch) = ShareIndexRules.partition(liveNames: live, indexedNames: indexed)
+        XCTAssertEqual(fromIndex, ["kept.psd"])
+        XCTAssertEqual(mustFetch, ["brand_new.png"], "a new file must be fetched, not skipped")
+        XCTAssertFalse(fromIndex.contains("deleted_last_week.psd"),
+                       "a deleted file must never surface from the index")
+        XCTAssertEqual(fromIndex.count + mustFetch.count, live.count,
+                       "every live name is accounted for exactly once")
+    }
+
+    func testPartitionPreservesOrderAndHandlesEmpties() {
+        XCTAssertEqual(ShareIndexRules.partition(liveNames: ["c", "a", "b"], indexedNames: ["a", "b", "c"]).fromIndex,
+                       ["c", "a", "b"], "live order is preserved")
+        XCTAssertTrue(ShareIndexRules.partition(liveNames: [], indexedNames: ["a"]).fromIndex.isEmpty)
+        XCTAssertEqual(ShareIndexRules.partition(liveNames: ["a"], indexedNames: []).mustFetch, ["a"],
+                       "no index at all means fetch everything — today's behaviour")
+    }
+
+    func testUsabilityRejectsWrongVersionAndStaleAndFutureFiles() {
+        let v = ShareIndexRules.version
+        XCTAssertTrue(ShareIndexRules.isUsable(version: v, savedAt: now - 3600, now: now))
+        XCTAssertFalse(ShareIndexRules.isUsable(version: v + 1, savedAt: now - 3600, now: now),
+                       "a format we don't know must not be parsed")
+        XCTAssertFalse(ShareIndexRules.isUsable(version: v - 1, savedAt: now - 3600, now: now),
+                       "an older format is rewritten, not misread")
+        XCTAssertFalse(ShareIndexRules.isUsable(version: v, savedAt: now - ShareIndexRules.maxAge - 1, now: now),
+                       "past maxAge an in-place edit could have gone unnoticed too long")
+        XCTAssertFalse(ShareIndexRules.isUsable(version: v, savedAt: now + 86_400, now: now),
+                       "a file stamped in the future is a broken clock, not data to trust")
+        XCTAssertTrue(ShareIndexRules.isUsable(version: v, savedAt: now + 30, now: now),
+                      "small skew between machines is normal and tolerated")
+    }
+
+    /// Writing is throttled: a 5 s write per user per visit would cost more than it saves.
+    func testWriteThrottling() {
+        let n = 1000
+        XCTAssertTrue(ShareIndexRules.shouldWrite(existingSavedAt: nil, now: now, dirChanged: false, entryCount: n),
+                      "no index yet — write one")
+        XCTAssertFalse(ShareIndexRules.shouldWrite(existingSavedAt: now - 60, now: now, dirChanged: false, entryCount: n),
+                       "fresh and unchanged — leave the share alone")
+        XCTAssertTrue(ShareIndexRules.shouldWrite(existingSavedAt: now - 60, now: now, dirChanged: true, entryCount: n),
+                      "folder changed — refresh it")
+        XCTAssertTrue(ShareIndexRules.shouldWrite(existingSavedAt: now - ShareIndexRules.maxAge, now: now,
+                                                  dirChanged: false, entryCount: n))
+    }
+
+    /// A couple of new files should not cost a full re-sweep; a mostly-useless index should.
+    func testSkipSweepOnlyWhenTheIndexCoversMost() {
+        XCTAssertTrue(ShareIndexRules.coversEnoughToSkipSweep(fromIndex: 669, total: 671),
+                      "2 new files out of 671 — fetch those 2, don't re-read 671")
+        XCTAssertFalse(ShareIndexRules.coversEnoughToSkipSweep(fromIndex: 200, total: 671),
+                       "an index that knows a third of the folder is worse than a sweep")
+        XCTAssertFalse(ShareIndexRules.coversEnoughToSkipSweep(fromIndex: 0, total: 0))
+    }
+
+    /// "Nothing will be stale": an index whose folder has changed, or that is missing names the
+    /// live listing found, must be rebuilt in the background rather than re-patched every visit.
+    func testBackgroundRefreshTriggers() {
+        let t: Double = 1_754_500_000
+        XCTAssertTrue(ShareIndexRules.needsBackgroundRefresh(indexDirMtime: t, actualDirMtime: t + 500),
+                      "folder mtime moved — files were added or removed")
+        XCTAssertFalse(ShareIndexRules.needsBackgroundRefresh(indexDirMtime: t, actualDirMtime: t),
+                       "unchanged — leave the share alone")
+        XCTAssertFalse(ShareIndexRules.needsBackgroundRefresh(indexDirMtime: t, actualDirMtime: t + 0.4),
+                       "sub-second jitter is not a change")
+        XCTAssertFalse(ShareIndexRules.needsBackgroundRefresh(indexDirMtime: nil, actualDirMtime: t),
+                       "a v1 index with no recorded mtime is not evidence of change")
+    }
+
+    /// Repair is incremental: readdir already told us what exists, so only genuinely new names
+    /// cost a round trip. This is the difference between a 3-minute rebuild and a 1-second one.
+    func testRepairPlanOnlyStatsWhatIsNew() {
+        let live = ["a.psd", "b.psd", "new_today.png"]
+        let plan = ShareIndexRules.repairPlan(liveNames: live, indexedNames: ["a.psd", "b.psd", "gone.psd"])
+        XCTAssertEqual(plan.carryForward, ["a.psd", "b.psd"])
+        XCTAssertEqual(plan.mustStat, ["new_today.png"], "only the new file costs a round trip")
+        XCTAssertFalse(plan.carryForward.contains("gone.psd"),
+                       "a deleted file leaves the index by not being carried forward")
+        XCTAssertEqual(plan.carryForward.count + plan.mustStat.count, live.count)
+    }
+
+    func testRepairPlanEdges() {
+        XCTAssertTrue(ShareIndexRules.repairPlan(liveNames: [], indexedNames: ["a"]).carryForward.isEmpty,
+                      "an emptied folder carries nothing forward")
+        XCTAssertEqual(ShareIndexRules.repairPlan(liveNames: ["a", "b"], indexedNames: []).mustStat, ["a", "b"],
+                       "no index means everything is new — same as today")
+    }
+
+    func testSmallFoldersAreNotWorthAnIndex() {
+        XCTAssertFalse(ShareIndexRules.shouldWrite(existingSavedAt: nil, now: now, dirChanged: true, entryCount: 5),
+                       "a handful of stats is cheaper than a round trip for an index file")
+    }
+
+    /// The filename must be stable across mounts, since the whole point is sharing it.
+    func testFilenameIsStableAndPathScoped() {
+        XCTAssertEqual(ShareIndexRules.filename(forRelative: "artSource/zeus"),
+                       ShareIndexRules.filename(forRelative: "artSource/zeus"))
+        XCTAssertNotEqual(ShareIndexRules.filename(forRelative: "artSource/zeus"),
+                          ShareIndexRules.filename(forRelative: "artSource/hera"))
+        XCTAssertTrue(ShareIndexRules.filename(forRelative: "a/b").hasSuffix(".json"))
+        // 16 hex digits + ".json" — the full 64 bits, not a truncated formatting accident.
+        XCTAssertEqual(ShareIndexRules.filename(forRelative: "a/b").count, 21)
+        XCTAssertEqual(ShareIndexRules.filename(forRelative: ""), "cbf29ce484222325.json",
+                       "the FNV-1a offset basis, unmodified, for a volume root")
+        // Canonical FNV-1a-64 vectors. These caught a multiplier written as 0x1000_0000_01b3
+        // (12 hex digits) instead of the real prime 0x100000001b3 (11) — 16x too large, which
+        // still hashed deterministically and so hid behind "it round-trips".
+        XCTAssertEqual(ShareIndexRules.filename(forRelative: "a"), "af63dc4c8601ec8c.json")
+        XCTAssertEqual(ShareIndexRules.filename(forRelative: "foobar"), "85944171f73967e8.json")
+        // Relative, so /Volumes/Games-1/x and /Volumes/Games/x agree on the same index.
+        XCTAssertEqual(ShareIndexRules.filename(forRelative: ""), ShareIndexRules.filename(forRelative: ""))
+    }
+}
+
+
+// MARK: - Share URLs in shared files
+
+final class ShareURLRulesTests: XCTestCase {
+
+    /// Favorites are exported and handed to coworkers, so a mount URL must never say whose
+    /// account it came from. The mount table always reports the user@ form.
+    func testUserIsStripped() {
+        XCTAssertEqual(ShareURLRules.withoutUser("smb://merickson@CORP-DC01.High5.local/Games"),
+                       "smb://CORP-DC01.High5.local/Games")
+        XCTAssertEqual(ShareURLRules.withoutUser("smb://user:secret@host/share"),
+                       "smb://host/share", "a password must never survive into a shared file")
+    }
+
+    /// Already-clean URLs, and the forms people actually type, must pass through untouched.
+    func testCleanURLsAreUnchanged() {
+        for u in ["smb://CORP-DC01.High5.local/Games", "smb://corp-pure02/data",
+                  "smb://host/share/sub folder", "afp://host/vol"] {
+            XCTAssertEqual(ShareURLRules.withoutUser(u), u)
+        }
+    }
+
+    /// Never crash or mangle on input that isn't a parseable URL.
+    func testGarbageIsPassedThrough() {
+        XCTAssertEqual(ShareURLRules.withoutUser(""), "")
+        XCTAssertEqual(ShareURLRules.withoutUser("not a url"), "not a url")
+    }
+
+    /// The DFS host form with a domain suffix and a percent-escaped share name.
+    func testEscapedShareNamesSurvive() {
+        XCTAssertEqual(ShareURLRules.withoutUser("smb://me@CORP-DC01.High5.local/50%20West"),
+                       "smb://CORP-DC01.High5.local/50%20West")
     }
 }

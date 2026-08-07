@@ -183,18 +183,46 @@ final class MetadataCache {
 /// path→name per directory load and clear it in Browser.load().
 enum FileOwner {
     private static var names: [uid_t: String] = [:]
+    /// Owner PER PATH, not just uid -> name.
+    ///
+    /// The uid map was cached but the `stat` was not, and `FileItem.owner` is a computed
+    /// property read by the Owner column's cell — which SwiftUI re-evaluates on every scroll
+    /// tick. So every visible row re-stat'd its file on every render pass. On a local disk
+    /// that is merely wasteful; on an SMB share measured at ~88 ms per entry it is the
+    /// difference between scrolling and not.
+    private static var byPath: [String: String] = [:]
     private static let lock = NSLock()
+    /// Bounded so a long session browsing huge folders can't grow this without limit. Dropping
+    /// the whole map is fine — it refills from stat on demand.
+    private static let pathCap = 20_000
 
     static func name(for url: URL) -> String {
+        let key = url.path
+        lock.lock()
+        if let hit = byPath[key] { lock.unlock(); return hit }
+        lock.unlock()
+
         var st = stat()
-        guard stat(url.path, &st) == 0 else { return "—" }
+        guard stat(key, &st) == 0 else { return "—" }
         let uid = st.st_uid
         lock.lock()
-        if let cached = names[uid] { lock.unlock(); return cached }
+        let resolved: String
+        if let cached = names[uid] {
+            resolved = cached
+        } else {
+            resolved = getpwuid(uid).flatMap { String(validatingUTF8: $0.pointee.pw_name) } ?? String(uid)
+            names[uid] = resolved
+        }
+        if byPath.count >= pathCap { byPath.removeAll() }
+        byPath[key] = resolved
         lock.unlock()
-        let resolved = getpwuid(uid).flatMap { String(validatingUTF8: $0.pointee.pw_name) } ?? String(uid)
-        lock.lock(); names[uid] = resolved; lock.unlock()
         return resolved
+    }
+
+    /// Called when a folder is re-read, so a chown or a replaced file isn't shown stale.
+    static func forget(_ paths: [String]) {
+        guard !paths.isEmpty else { return }
+        lock.lock(); for p in paths { byPath[p] = nil }; lock.unlock()
     }
 }
 
@@ -225,10 +253,11 @@ final class FolderSizeCache: ObservableObject {
     static func size(of url: URL) -> Int64 {
         var total: Int64 = 0
         let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey]
+        let wanted = Set(keys)   // hoisted: rebuilt per file on a RECURSIVE walk
         if let en = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys,
                                                    options: [], errorHandler: { _, _ in true }) {
             for case let f as URL in en {
-                let v = try? f.resourceValues(forKeys: Set(keys))
+                let v = try? f.resourceValues(forKeys: wanted)
                 if v?.isRegularFile == true {
                     total += Int64(v?.totalFileAllocatedSize ?? v?.fileAllocatedSize ?? 0)
                 }
@@ -449,6 +478,11 @@ enum Prefs {
     /// so it shadows nothing, and a global hotkey nobody knows about is a feature nobody
     /// finds. The teleport variant is off by default — it needs Accessibility, and asking
     /// for that unprompted is not something an app should do on its own.
+    /// Set once the saved network arrangements have had their expensive columns stripped.
+    static var networkColumnCleanupDone: Bool {
+        get { d.bool(forKey: "networkColumnCleanupDone") }
+        set { d.set(newValue, forKey: "networkColumnCleanupDone") }
+    }
     static var pickerHotkeyEnabled: Bool {
         get { d.object(forKey: "pickerHotkeyEnabled") == nil ? true : d.bool(forKey: "pickerHotkeyEnabled") }
         set { d.set(newValue, forKey: "pickerHotkeyEnabled") }
@@ -543,6 +577,18 @@ final class FolderViewOptionsStore: ObservableObject {
         lru.set(options, for: path)
         persist()
     }
+    /// Runs the one-time network-arrangement cleanup. Folders on volumes that aren't mounted
+    /// right now are left alone — they simply get cleaned the next time this runs with the
+    /// share available, and an unmounted path can't be classified without guessing.
+    /// Every folder path with a saved arrangement. Cheap — used to classify volumes off the
+    /// main thread before the mutation below is applied on it.
+    func savedPaths() -> [String] { Array(lru.byPath.keys) }
+
+    func cleanUpNetworkArrangements(networkPaths: Set<String>) {
+        lru = lru.strippingCostlyNetworkColumns { networkPaths.contains($0) }
+        persist()
+    }
+
     func forget(_ path: String) {
         guard lru.contains(path) else { return }
         lru.remove(path)
@@ -3486,7 +3532,16 @@ final class FavoritesStore: ObservableObject {
     func add(_ url: URL, label: String? = nil, mountURL: String? = nil) {
         let s = url.standardizedFileURL
         if label == nil, contains(s) { return }   // dedupe plain drag-adds; named drives may share a path
-        items.append(Favorite(label: label ?? favoriteName(s), path: s.path, mountURL: mountURL)); persist()
+        // Derive the mount URL when the caller didn't supply one and this is a network folder.
+        // Without it, "Pin to Sidebar" on a share produced a favorite with nothing to reconnect
+        // to: after a reboot the path is gone and clicking it could only beep. Done HERE rather
+        // than at each pin site so every caller — sidebar pin, multi-select pin, drag-add — gets
+        // it. Always sanitized: the mount table reports the user@ form and these get exported.
+        var mount = mountURL.map(ShareURLRules.withoutUser)
+        if mount == nil, let info = Browser.shareMountInfo(for: s) {
+            mount = ShareURLRules.withoutUser(info.share.absoluteString)
+        }
+        items.append(Favorite(label: label ?? favoriteName(s), path: s.path, mountURL: mount)); persist()
     }
     // Drag-to-reorder from the sidebar. Home always snaps back to the top so it
     // stays the fixed anchor, regardless of where it's dropped.
@@ -3931,6 +3986,8 @@ final class Browser: ObservableObject, Identifiable {
     }
     private var recentsQuery: NSMetadataQuery?
     private var searchQuery: NSMetadataQuery?
+    /// One fallback per search, so an unindexed folder can't ping-pong.
+    private var spotlightFellBack = false
     private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
@@ -4045,7 +4102,11 @@ final class Browser: ObservableObject, Identifiable {
     func applyFolderViewOptions() {
         let path = currentURL.path
         let store = FolderViewOptionsStore.shared
-        let o = store.options(for: path) ?? Browser.defaultViewOptions
+        // Whether this folder was ever ARRANGED BY HAND is the thing that matters for the
+        // network column default below — defaultViewOptions fills columns in from the global
+        // pref, so o.columns is never empty and can't answer that question.
+        let saved = store.options(for: path)
+        let o = saved ?? Browser.defaultViewOptions
         store.markUsed(path)              // recency by use, so the cap evicts the right folder
         viewWasInferred = false           // whatever we're about to apply, it isn't a guess
         applyingViewOptions = true
@@ -4054,8 +4115,19 @@ final class Browser: ObservableObject, Identifiable {
         viewMode = ViewMode(rawValue: o.viewMode) ?? .list
         iconSize = max(Browser.minIconSize, min(Browser.maxIconSize, CGFloat(o.iconSize)))
         groupBy = GroupBy(rawValue: o.groupBy) ?? .none
-        sortOrder = [Browser.comparator(forColumn: o.sortKey, ascending: o.sortAscending)]
-        visibleColumns = Set(o.columns.isEmpty ? defaultVisibleColumnIDs : o.columns)
+        let seedSort = saved == nil
+            ? NetworkColumnRules.seedSortKey(isNetwork: Browser.isNetworkURL(currentURL),
+                                             localDefault: o.sortKey)
+            : o.sortKey
+        sortOrder = [Browser.comparator(forColumn: seedSort, ascending: o.sortAscending)]
+        // A folder arranged by hand keeps exactly what was chosen, costly columns included.
+        // Only an unarranged folder takes a default, and on a network volume that default is
+        // the free-to-read set — so a share opens instantly and Size is one click away
+        // (NetworkColumnRules).
+        let fallbackColumns = Set(o.columns.isEmpty ? defaultVisibleColumnIDs : o.columns)
+        visibleColumns = saved == nil
+            ? NetworkColumnRules.seed(isNetwork: Browser.isNetworkURL(currentURL), localDefaults: fallbackColumns)
+            : fallbackColumns
         applyingViewOptions = false
     }
 
@@ -4211,6 +4283,245 @@ final class Browser: ObservableObject, Identifiable {
     }
 
     var currentIsNetwork = false
+
+    // MARK: Shared folder index (.navigator on the share)
+
+    /// One entry per file. Short keys because this crosses the network — 669 of these are 56 KB.
+    struct ShareIndexEntry: Codable { let n: String; let d: Bool; let s: Int64; let m: Double }
+    /// `savedAt` is the last FULL sweep — incremental repairs carry it forward unchanged so a full
+/// re-read still happens eventually (see ShareIndexRules.isUsable).
+struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: Double?; let items: [ShareIndexEntry] }
+
+    /// Which index files exist on a given volume, listed ONCE per volume with a single readdir
+    /// and reused for every folder after. Without this, every folder without an index would pay
+    /// a ~96 ms round trip to discover that — the exact cost this feature exists to remove.
+    private static var indexDirListing: [String: Set<String>] = [:]
+    private static let indexLock = NSLock()
+
+    /// Every network metadata sweep in the app runs on this ONE queue.
+    ///
+    /// Two tabs on the same share used to sweep concurrently, and measured worse than serial:
+    /// three browsers on a 126-entry folder took 99.5 / 99.9 / 100.2 s each, against ~11 s for
+    /// one. The SMB client serializes these requests regardless (8/16/32-way parallel lstat is
+    /// no faster than serial — see PERFORMANCE.md), so concurrency buys nothing and the extra
+    /// in-flight work just delays everyone. Serialized, the second sweep of the same folder is
+    /// also nearly free, because smbfs caches an entry once fetched.
+    ///
+    /// Deliberately NOT used for phase 1 (readdir) or for visible-row hydration: those are the
+    /// latency-critical paths and must never queue behind a long sweep.
+    static let sweepQueue = DispatchQueue(label: "com.merickson.navigator.network-sweep",
+                                          qos: .utility)
+
+    /// Folders with a background index rebuild in flight. Every open tab showing the same share
+    /// runs its own loadNetwork, so without this each one starts its own full sweep of the same
+    /// folder — three tabs measured as three concurrent sweeps competing for a connection that
+    /// serializes anyway, turning a 68 s rebuild into a 3-minute one.
+    private static var rebuildsInFlight: Set<String> = []
+    private static let rebuildLock = NSLock()
+
+    static func beginRebuild(_ path: String) -> Bool {
+        rebuildLock.lock(); defer { rebuildLock.unlock() }
+        return rebuildsInFlight.insert(path).inserted
+    }
+    static func endRebuild(_ path: String) {
+        rebuildLock.lock(); rebuildsInFlight.remove(path); rebuildLock.unlock()
+    }
+
+    static func volumeRoot(of url: URL) -> URL? {
+        (try? url.resourceValues(forKeys: [.volumeURLKey]))?.volume
+    }
+
+    /// Folder path relative to its volume root, so an index written by someone whose share is
+    /// mounted at /Volumes/Games still resolves for us at /Volumes/Games-1.
+    static func shareRelative(_ dir: URL, root: URL) -> String {
+        let d = dir.path, r = root.path
+        guard d.hasPrefix(r) else { return dir.lastPathComponent }
+        return String(d.dropFirst(r.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private static func indexNames(inVolume root: URL, refresh: Bool = false) -> Set<String> {
+        let key = root.path
+        indexLock.lock()
+        if !refresh, let cached = indexDirListing[key] { indexLock.unlock(); return cached }
+        indexLock.unlock()
+        let dir = root.appendingPathComponent(ShareIndexRules.directoryName)
+        let names = Set((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+        indexLock.lock(); indexDirListing[key] = names; indexLock.unlock()
+        return names
+    }
+
+    /// Attributes for a folder, from the shared index, or nil when there isn't a usable one.
+    /// Never used to decide what exists — see ShareIndexRules.
+    static func readShareIndex(for dir: URL) -> (byName: [String: ShareIndexEntry], savedAt: Double, dirMtime: Double?)? {
+        guard let root = volumeRoot(of: dir) else { return nil }
+        let rel = shareRelative(dir, root: root)
+        let file = ShareIndexRules.filename(forRelative: rel)
+        let known = indexNames(inVolume: root)
+        guard known.contains(file) else {
+            navLog("share index: MISS root=\(root.path) rel=\(rel) file=\(file) knownCount=\(known.count)")
+            return nil
+        }
+        let url = root.appendingPathComponent(ShareIndexRules.directoryName).appendingPathComponent(file)
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attrs[.size] as? Int, size <= ShareIndexRules.maxBytes,
+              let data = try? Data(contentsOf: url),
+              let parsed = try? JSONDecoder().decode(ShareIndexFile.self, from: data),
+              ShareIndexRules.isUsable(version: parsed.v, savedAt: parsed.savedAt,
+                                       now: Date().timeIntervalSince1970)
+        else { return nil }
+        return (Dictionary(parsed.items.map { ($0.n, $0) }, uniquingKeysWith: { a, _ in a }),
+                parsed.savedAt, parsed.dirMtime)
+    }
+
+    /// Publish what we learned so the next person doesn't pay for it. Written temp-then-rename so
+    /// a reader never sees half a file and two writers can't interleave.
+    static func writeShareIndex(_ items: [FileItem], for dir: URL, dirMtime: Double?, fullSweptAt: Double? = nil) {
+        guard let root = volumeRoot(of: dir) else { return }
+        let rel = shareRelative(dir, root: root)
+        let idxDir = root.appendingPathComponent(ShareIndexRules.directoryName)
+        let file = ShareIndexRules.filename(forRelative: rel)
+        let payload = ShareIndexFile(v: ShareIndexRules.version,
+                                     savedAt: fullSweptAt ?? Date().timeIntervalSince1970,
+                                     dirMtime: dirMtime,
+                                     items: items.map { ShareIndexEntry(n: $0.name, d: $0.isDirectory,
+                                                                        s: $0.size,
+                                                                        m: $0.modified.timeIntervalSince1970) })
+        guard let data = try? JSONEncoder().encode(payload) else { return }
+        let hadDir = FileManager.default.fileExists(atPath: idxDir.path)
+        try? FileManager.default.createDirectory(at: idxDir, withIntermediateDirectories: true)
+        if !hadDir {
+            // Creating a directory on SMB leaves an AppleDouble "._" twin for its xattrs. One
+            // hidden index directory is the deal; a second hidden file beside it is not.
+            try? FileManager.default.removeItem(at: root.appendingPathComponent("._" + ShareIndexRules.directoryName))
+        }
+        let dst = idxDir.appendingPathComponent(file)
+        // UUID, not getpid(): every thread in this process shares a pid, so a pid-based temp name
+        // let two concurrent writers interleave into ONE file and then publish the mangled result
+        // via rename. Observed as a 4031-byte index with valid JSON followed by trailing garbage.
+        let tmp = idxDir.appendingPathComponent(file + ".\(UUID().uuidString).tmp")
+        // Sweep up temp files an interrupted write left behind. Without this, quitting mid-write
+        // strands a "<index>.<uuid>.tmp" on the share forever, and they accumulate silently.
+        if let leftovers = try? FileManager.default.contentsOfDirectory(atPath: idxDir.path) {
+            for f in leftovers where f.hasSuffix(".tmp") && f != tmp.lastPathComponent {
+                try? FileManager.default.removeItem(at: idxDir.appendingPathComponent(f))
+            }
+        }
+        guard (try? data.write(to: tmp)) != nil else { return }
+        // POSIX rename, NOT FileManager.replaceItemAt: replaceItemAt preserves extended
+        // attributes, and an SMB volume stores those in AppleDouble "._" sidecars — so the
+        // tidy single index file arrived with a 4 KB "._" twin next to it. rename(2) moves the
+        // bytes and nothing else, and is still atomic for anyone reading concurrently.
+        guard Darwin.rename(tmp.path, dst.path) == 0 else {
+            try? FileManager.default.removeItem(at: tmp)
+            return
+        }
+        // Clear anything macOS may already have left beside an earlier write.
+        try? FileManager.default.removeItem(at: idxDir.appendingPathComponent("._" + file))
+        _ = indexNames(inVolume: root, refresh: true)
+        navLog("share index: wrote \(items.count) entries for \(dir.lastPathComponent) (\(data.count / 1024) KB)")
+    }
+
+    // MARK: Lazy attribute hydration for network folders
+    //
+    // On a share, size and date cost ~89 ms per row — one network round trip each, and
+    // concurrency does not help (measured: 8/16/32-way parallel lstat is no faster than
+    // serial). Fetching all 669 rows of artSource up front is 59 s. But you only ever LOOK
+    // at ~30 rows, and 30 x 89 ms is 2.7 s. So rows arrive from readdir with no attributes
+    // (modified == .distantPast marks that) and whatever is actually on screen gets filled
+    // in first, then more as you scroll.
+    //
+    // The full background pass still runs and still writes the cache, so the folder ends up
+    // complete on disk; this only decides what gets fetched FIRST. Double work is cheap
+    // because smbfs caches an entry once fetched — a row the hydrator already did makes the
+    // background pass instant for that row.
+    private var hydrateQueue: [String] = []
+    private var hydrating = false
+
+    // Progressive fills (hydration, the detail sweep, a background index rebuild) each reassign
+    // `items`, and every reassignment is a full reload of a table that may hold 669 rows. Left
+    // unchecked a single folder does that dozens of times in a few seconds, which reads as jitter
+    // and can jump the scroll position under the user's cursor. Updates are coalesced to a steady
+    // cadence instead: values still stream in, the table just repaints at a sane rate.
+    private var pendingDetails: [String: FileItem] = [:]
+    private var detailFlushScheduled = false
+    static let detailFlushInterval: TimeInterval = 0.20
+
+    /// Merge freshly-fetched rows into the list without repainting more than ~5x a second.
+    func mergeDetails(_ fetched: [FileItem]) {
+        for f in fetched { pendingDetails[f.id] = f }
+        guard !detailFlushScheduled else { return }
+        detailFlushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Browser.detailFlushInterval) { [weak self] in
+            guard let self else { return }
+            self.detailFlushScheduled = false
+            let batch = self.pendingDetails
+            self.pendingDetails = [:]
+            guard !batch.isEmpty else { return }
+            self.items = self.items.map { batch[$0.id] ?? $0 }
+            self.updateStatus()
+        }
+    }
+
+    /// Marks a row that came from readdir and has no attributes yet.
+    static func lacksDetails(_ it: FileItem) -> Bool { it.modified == .distantPast }
+
+    /// Ask for attributes for the rows currently on screen. Cheap to call on every scroll:
+    /// rows that already have details, or are already queued, are dropped.
+    /// Drop queued attribute work. Called when the folder changes: a batch fetched for the old
+    /// folder must never merge into the new one's rows.
+    func cancelPendingDetails() {
+        hydrateQueue.removeAll()
+        pendingDetails.removeAll()
+    }
+
+    func requestDetails(forVisible ids: [String]) {
+        // Only when something on screen actually displays per-file data. Without this the
+        // hydrator would happily spend a round trip per visible row on a folder showing
+        // Name/Ext/Kind, which is exactly the cost the cheap defaults exist to avoid.
+        guard currentIsNetwork,
+              NetworkColumnRules.needsAttributePass(columns: visibleColumns,
+                                                    sortKey: currentSortColumn)
+        else { return }
+        let byID = Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let wanted = ids.filter { id in
+            guard let it = byID[id] else { return false }
+            return Browser.lacksDetails(it) && !hydrateQueue.contains(id)
+        }
+        guard !wanted.isEmpty else { return }
+        // Visible rows go to the FRONT: a scroll means the previous queue is stale interest.
+        hydrateQueue = wanted + hydrateQueue.filter { !wanted.contains($0) }
+        pumpHydration()
+    }
+
+    private func pumpHydration() {
+        guard !hydrating, !hydrateQueue.isEmpty else { return }
+        let gen = loadGeneration
+        let batch = Array(hydrateQueue.prefix(12))
+        hydrateQueue.removeFirst(batch.count)
+        hydrating = true
+        let urls = items.filter { batch.contains($0.id) }.map(\.url)
+        let t0 = Date()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey,
+                                             .isSymbolicLinkKey, .isAliasFileKey]
+            let fetched = urls.map { Browser.item(from: $0, try? $0.resourceValues(forKeys: keys)) }
+            DispatchQueue.main.async {
+                guard let self, gen == self.loadGeneration else { return }
+                self.mergeDetails(fetched)
+                self.hydrating = false
+                navLog("hydrate: \(fetched.count) visible rows in \(Int(Date().timeIntervalSince(t0) * 1000))ms, \(self.hydrateQueue.count) queued")
+                self.pumpHydration()
+            }
+        }
+    }
+
+    /// Is this URL on a remote volume? Volume-level, so it is cached per mount rather than
+    /// costing a per-file round trip. Needed because currentIsNetwork is only assigned
+    /// partway through load(), which is AFTER applyFolderViewOptions has to pick the
+    /// column defaults for the folder being opened.
+    static func isNetworkURL(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false
+    }
     private static var typeIconCache: [String: NSImage] = [:]
     func icon(for item: FileItem) -> NSImage {
         // The Trash gets its proper can icon (icon(forFile:) returns a blank
@@ -4234,10 +4545,38 @@ final class Browser: ObservableObject, Identifiable {
                                              .creationDateKey, .contentAccessDateKey, .addedToDirectoryDateKey,
                                              .localizedTypeDescriptionKey, .tagNamesKey,
                                              .isSymbolicLinkKey, .isAliasFileKey]
-    // Minimal metadata for slow (network/SMB) volumes — just what the default
-    // columns need. Everything else is derived locally or falls back, so a
-    // 600-item network folder loads in a couple of round-trips, not hundreds.
-    static let fastItemKeys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+    /// What to ask a NETWORK volume for: the three attributes the default columns need, plus
+    /// only the extras a currently-visible column actually requires.
+    ///
+    /// Measured on two real SMB shares, and the answer differs by server — which is why this
+    /// asks for the minimum rather than assuming either way:
+    ///
+    /// * //corp-pure02/data — the seven extra attributes cost ~187 ms PER ENTRY on first fetch
+    ///   even when name/size/date for that same folder were already cached. Asking for three
+    ///   instead of ten was 2–3x faster cold.
+    /// * //CORP-DC01/Games — every key set cost the same ~88 ms/entry (669 entries, ~59 s), and
+    ///   nothing cached between runs. Attribute count was irrelevant; per-entry latency was
+    ///   the whole story.
+    ///
+    /// So: neutral at worst, 2–3x at best, and it never costs a column the user can see.
+    /// Kind is deliberately absent — `localKind` derives it from the extension with no I/O,
+    /// so the default Kind column stays populated for free.
+    static func networkKeys(visible: Set<String>) -> [URLResourceKey] {
+        // isDirectory is free (readdir's d_type). Size and modified date are NOT — each is
+        // ~89 ms/entry on a DFS share — so they are requested only when something on screen
+        // actually needs them. See NetworkColumnRules.
+        var keys: [URLResourceKey] = [.isDirectoryKey]
+        if visible.contains("size")     { keys.append(.fileSizeKey) }
+        if visible.contains("modified") { keys.append(.contentModificationDateKey) }
+        // Symlink/alias aren't columns — they change what double-clicking DOES — so they are
+        // not optional. Measured as no more expensive than the base set on both shares.
+        keys += [.isSymbolicLinkKey, .isAliasFileKey]
+        if visible.contains("created")  { keys.append(.creationDateKey) }
+        if visible.contains("accessed") { keys.append(.contentAccessDateKey) }
+        if visible.contains("added")    { keys.append(.addedToDirectoryDateKey) }
+        if visible.contains("tags")     { keys.append(.tagNamesKey) }
+        return keys
+    }
 
     // Localized "Kind" derived from the extension with no disk/network I/O.
     private static var kindCache: [String: String] = [:]
@@ -4296,7 +4635,16 @@ final class Browser: ObservableObject, Identifiable {
             }
             if name == "." || name == ".." { continue }
             if !showHidden && name.hasPrefix(".") { continue }
-            let isDir = ent.pointee.d_type == DT_DIR
+            // Most filesystems fill in d_type and this is free. Some SMB servers return
+            // DT_UNKNOWN, and trusting it then would render every folder as a FILE until the
+            // detail pass landed — wrong icons, wrong folders-first grouping. Measured 0
+            // DT_UNKNOWN on this machine's two SMB shares, so the stat below is a fallback for
+            // other people's servers, not a cost on this one.
+            var isDir = ent.pointee.d_type == DT_DIR
+            if ent.pointee.d_type == DT_UNKNOWN {
+                var st = stat()
+                if stat(dir.path + "/" + name, &st) == 0 { isDir = (st.st_mode & S_IFMT) == S_IFDIR }
+            }
             let u = dir.appendingPathComponent(name, isDirectory: isDir)
             out.append(FileItem(id: u.path, url: u, name: name, isDirectory: isDir,
                                 size: 0, modified: .distantPast, created: .distantPast,
@@ -4375,6 +4723,38 @@ final class Browser: ObservableObject, Identifiable {
     // navigated to, plus every folder you've created/saved/pasted/renamed a file
     // in (see RecentFolders.shared.record calls in the file operations). Shown
     // most-recent first — no Spotlight flood of every touched file.
+    /// Stops a live query and removes BOTH its observers. Restarting a query without this
+    /// left an observer registered against a dead query object for the rest of the session.
+    private func stopMetadataQuery(_ q: inout NSMetadataQuery?) {
+        guard let query = q else { return }
+        query.stop()
+        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: query)
+        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidUpdate, object: query)
+        q = nil
+    }
+
+    /// Reads up to `cap` USABLE rows out of a query.
+    ///
+    /// The cap used to be applied to the raw result index — `min(resultCount, 200)` — and rows
+    /// were then thrown away inside the loop for being folders or failing a filter. So a
+    /// Recents list whose newest 200 rows were mostly directories showed a fraction of 200,
+    /// and the same shape capped search results early too. Counting what is KEPT fixes both.
+    ///
+    /// Returns the rows plus whether it stopped early with more still to look at.
+    private func collect(from q: NSMetadataQuery, cap: Int,
+                         accept: (NSMetadataItem, URL) -> FileItem?) -> (rows: [FileItem], stoppedEarly: Bool) {
+        var rows: [FileItem] = []
+        let total = q.resultCount
+        var i = 0
+        while i < total, rows.count < cap {
+            defer { i += 1 }
+            guard let mi = q.result(at: i) as? NSMetadataItem,
+                  let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
+            if let row = accept(mi, URL(fileURLWithPath: path)) { rows.append(row) }
+        }
+        return (rows, rows.count >= cap && i < total)
+    }
+
     // "Recents" in Favorites works like Finder's: recently used / changed FILES
     // across your home folder, newest first. (The separate "Recent Folders" list
     // is the folders you've worked in — see RecentFolders.)
@@ -4387,35 +4767,43 @@ final class Browser: ObservableObject, Identifiable {
         items = []
         status = "Finding recent files…"
         sortOrder = [KeyPathComparator(\FileItem.modified, order: .reverse)]
-        recentsQuery?.stop()
+        stopMetadataQuery(&recentsQuery)
         let q = NSMetadataQuery()
         q.searchScopes = [NSMetadataQueryUserHomeScope]
         let since = Date().addingTimeInterval(-60 * 60 * 24 * 45) as NSDate
         q.predicate = NSPredicate(format: "kMDItemLastUsedDate >= %@ OR kMDItemFSContentChangeDate >= %@", since, since)
         q.sortDescriptors = [NSSortDescriptor(key: "kMDItemFSContentChangeDate", ascending: false)]
-        NotificationCenter.default.addObserver(self, selector: #selector(recentsGathered(_:)),
+        q.notificationBatchingInterval = 0.5
+        NotificationCenter.default.addObserver(self, selector: #selector(recentsChanged(_:)),
                                                name: .NSMetadataQueryDidFinishGathering, object: q)
+        // Live: "Recents" that doesn't notice the file you just saved isn't recent.
+        NotificationCenter.default.addObserver(self, selector: #selector(recentsChanged(_:)),
+                                               name: .NSMetadataQueryDidUpdate, object: q)
         recentsQuery = q
         q.start()
     }
 
-    @objc private func recentsGathered(_ note: Notification) {
-        guard let q = recentsQuery else { return }
+    /// Handles the first gather AND every live update, so a file that appears later goes
+    /// through exactly the same filtering as one that was there from the start.
+    @objc private func recentsChanged(_ note: Notification) {
+        // From the NOTIFICATION, not from `recentsQuery`. Reading the property was the same
+        // bug already fixed in the search handler: two Recents loads in quick succession (the
+        // sidebar button and Go ▸ Recents both call loadRecents) meant the FIRST query's
+        // notification read the SECOND query's still-empty results and published nothing.
+        guard let q = note.object as? NSMetadataQuery, q === recentsQuery, isRecents else { return }
         q.disableUpdates()
-        var result: [FileItem] = []
-        let n = min(q.resultCount, 200)
-        for i in 0..<n {
-            guard let mi = q.result(at: i) as? NSMetadataItem,
-                  let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
+        let fm = self.fm
+        let (rows, _) = collect(from: q, cap: 200) { [weak self] _, url in
             var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else { continue }
-            result.append(makeItem(URL(fileURLWithPath: path)))
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else { return nil }
+            return self?.makeItem(url)
         }
-        items = result
-        updateStatus()   // Recents is a fixed-size list, not a search — no truncation notice
-        q.stop()
-        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
-        recentsQuery = nil
+        let keep = selection
+        items = rows
+        // A live list that drops your selection every time it refreshes is unusable.
+        selection = keep.intersection(Set(rows.map(\.id)))
+        updateStatus()   // fixed-size list, not a search — no truncation notice
+        q.enableUpdates()
     }
 
     // Spotlight search within the current folder subtree (name + content).
@@ -4430,7 +4818,8 @@ final class Browser: ObservableObject, Identifiable {
         selection = []
         items = []
         status = "Searching…"
-        searchQuery?.stop(); searchQuery = nil
+        stopMetadataQuery(&searchQuery)
+        spotlightFellBack = false
         searchGen += 1
         // MEASURED, because the old rule was wrong twice over.
         //
@@ -4512,7 +4901,7 @@ final class Browser: ObservableObject, Identifiable {
         }
         if let tree = searchKind.typeTree { subs.append(NSPredicate(format: "kMDItemContentTypeTree == %@", tree)) }
         // Date/Size go into the PREDICATE as well as the post-hoc check in
-        // searchGathered, purely so the 500-result cap is spent on rows that can
+        // searchChanged, purely so the result cap is spent on rows that can
         // actually match — filtering after the cap would drop real hits. The post-hoc
         // check is still the authority (a stale Spotlight index can disagree with disk).
         let dates = searchFilters.dateRange()
@@ -4539,8 +4928,14 @@ final class Browser: ObservableObject, Identifiable {
         guard let predicate = Browser.metadataCompound(subs, and: true) else { return }
         q.predicate = predicate
         q.sortDescriptors = [NSSortDescriptor(key: "kMDItemFSName", ascending: true)]
-        NotificationCenter.default.addObserver(self, selector: #selector(searchGathered(_:)),
+        NotificationCenter.default.addObserver(self, selector: #selector(searchChanged(_:)),
                                                name: .NSMetadataQueryDidFinishGathering, object: q)
+        // Live results, like Finder: a file that starts matching while you're looking at the
+        // list appears, and one that stops matching (renamed, deleted, moved out of scope)
+        // disappears. Only the Spotlight path can do this — the recursive walk used for SMB is
+        // one-shot because SMB pushes no change notifications to build on.
+        NotificationCenter.default.addObserver(self, selector: #selector(searchChanged(_:)),
+                                               name: .NSMetadataQueryDidUpdate, object: q)
         searchQuery = q
         q.start()
     }
@@ -4562,6 +4957,7 @@ final class Browser: ObservableObject, Identifiable {
         let now = Date()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let keys = Browser.itemKeys
+            let wantedKeys = Set(keys)   // hoisted out of the per-file loop below
             // skipsPackageDescendants: without it the walk climbs inside every .app and
             // .bundle it meets and reports their internals as results — searching anywhere near
             // /Applications buried the real hits under thousands of framework files. Finder
@@ -4595,7 +4991,7 @@ final class Browser: ObservableObject, Identifiable {
                 }
                 // Empty token list = filter-only search, so every name qualifies.
                 guard SearchQueryRules.matchesFile(name: name, ext: ext, tokens: tokens) else { continue }
-                let item = Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys)))
+                let item = Browser.item(from: u, try? u.resourceValues(forKeys: wantedKeys))
                 guard filters.matches(modified: item.modified, size: item.size,
                                       isDirectory: item.isDirectory, now: now) else { continue }
                 batch.append(item)
@@ -4606,41 +5002,57 @@ final class Browser: ObservableObject, Identifiable {
             flush(final: true)
         }
     }
-    @objc private func searchGathered(_ note: Notification) {
+    /// Handles the first gather AND every live update.
+    @objc private func searchChanged(_ note: Notification) {
         // Take the query from the NOTIFICATION, and ignore it unless it is still the
         // current one. Reading `searchQuery` instead was a live bug: changing two
         // filters at once starts two queries in the same frame, and when the FIRST
         // one finished gathering this handler read results from the SECOND (which had
         // gathered nothing yet), published an empty list, and then stopped it — so the
         // real results never arrived and the search looked like it found nothing.
-        guard let q = note.object as? NSMetadataQuery, q === searchQuery else { return }
+        guard let q = note.object as? NSMetadataQuery, q === searchQuery, isSearching else { return }
         q.disableUpdates()
-        var result: [FileItem] = []
-        let totalFound = q.resultCount
-        let n = min(totalFound, Browser.searchResultCap)
         let now = Date()
-        for i in 0..<n {
-            guard let mi = q.result(at: i) as? NSMetadataItem,
-                  let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-            let item = makeItem(URL(fileURLWithPath: path))
+        let (rows, stoppedEarly) = collect(from: q, cap: Browser.searchResultCap) { [weak self] _, url in
+            guard let self else { return nil }
+            let item = self.makeItem(url)
             // Re-check against the SAME predicate walkSearch uses. Spotlight's index can
             // lag the disk (a file saved seconds ago still carries its old size there),
             // and a filter that means one thing on the Spotlight path and another on the
             // recursive path is worse than no filter at all.
-            guard searchFilters.matches(modified: item.modified, size: item.size,
-                                        isDirectory: item.isDirectory, now: now) else { continue }
-            result.append(item)
+            guard self.searchFilters.matches(modified: item.modified, size: item.size,
+                                             isDirectory: item.isDirectory, now: now) else { return nil }
+            return item
         }
-        items = result
-        // Say so when the list is cut short. "500 items" was indistinguishable from a complete
-        // answer, so a file that WAS found but fell past the cap looked like it didn't exist.
-        status = SearchTruncation.of(shown: result.count,
+        // NOT EVERY LOCAL PATH IS INDEXED. /private/tmp isn't, nor is a volume with indexing
+        // switched off, and a folder-scoped Spotlight query there returns zero rather than an
+        // error — which would silently look like "no such file" while a plain walk finds it.
+        // So an empty first gather on a FOLDER scope falls back to the recursive walk once.
+        // (This Mac scope is exempt: zero there really does mean zero.)
+        if rows.isEmpty, !searchThisMac, !spotlightFellBack,
+           note.name == .NSMetadataQueryDidFinishGathering {
+            spotlightFellBack = true
+            stopMetadataQuery(&searchQuery)
+            navLog("search: Spotlight returned nothing for \(currentURL.lastPathComponent) — falling back to a recursive walk (folder may not be indexed)")
+            searchGen += 1
+            walkSearch(searchText.trimmingCharacters(in: .whitespaces), root: currentURL, gen: searchGen)
+            return
+        }
+        let keep = selection
+        items = rows
+        // Preserve the selection across a live refresh — losing it every time a file changes
+        // somewhere else on disk would make the results unusable.
+        selection = keep.intersection(Set(rows.map(\.id)))
+        // Say so when the list is cut short. A bare "5000 items" is indistinguishable from a
+        // complete answer, so a file that WAS found but fell past the cap looks like it
+        // doesn't exist at all.
+        status = SearchTruncation.of(shown: rows.count,
                                      cap: Browser.searchResultCap,
-                                     hitCap: totalFound > Browser.searchResultCap).statusText
-        q.stop()
-        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: q)
-        searchQuery = nil
+                                     hitCap: stoppedEarly).statusText
+        // NOT stopped — enableUpdates keeps it live.
+        q.enableUpdates()
     }
+
     /// This tab's window is gone — stop everything that would otherwise keep running.
     ///
     /// A closed NavWindow does NOT deallocate: it is `isReleasedWhenClosed = false` (and
@@ -4652,14 +5064,14 @@ final class Browser: ObservableObject, Identifiable {
     /// signal — deliberately NOT on quit, where the process is going away anyway.
     func stopWatching() {
         dirWatcher.stop()
-        recentsQuery?.stop(); recentsQuery = nil
-        searchQuery?.stop(); searchQuery = nil
+        stopMetadataQuery(&recentsQuery)
+        stopMetadataQuery(&searchQuery)
         searchGen += 1   // cancel any in-flight recursive walk
-        loadGeneration += 1   // and any in-flight listing, so it can't restart the watcher
+        loadGeneration += 1; cancelPendingDetails()   // and any in-flight listing, so it can't restart the watcher
     }
 
     func clearSearch() {
-        searchQuery?.stop(); searchQuery = nil
+        stopMetadataQuery(&searchQuery)
         searchGen += 1   // cancel any in-flight recursive walk
         searchText = ""; isSearching = false
         // Filters go too. A filter left armed after the search is closed is invisible
@@ -4694,17 +5106,18 @@ final class Browser: ObservableObject, Identifiable {
         let dir = currentURL, sh = showHidden
         let isNet = currentIsNetwork
         let cacheKey = dir.path + (sh ? "\u{1}h" : "")
-        loadGeneration += 1
+        loadGeneration += 1; cancelPendingDetails()
         let gen = loadGeneration
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let keys = Browser.itemKeys
             var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
             if !sh { opts.insert(.skipsHiddenFiles) }
             let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
+            let wanted = Set(keys)   // hoisted out of the per-file loop
             var result: [FileItem] = []
             while let u = en?.nextObject() as? URL {
                 guard let self, gen == self.loadGeneration else { return }
-                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
             }
             let final = result
             // stat(), not resourceValues — a URL caches those, so the value stored
@@ -4736,6 +5149,10 @@ final class Browser: ObservableObject, Identifiable {
         // handle a rewritten file on their own, but QuickLook keeps its own on-disk cache
         // that Navigator doesn't control — this is the escape hatch for that.
         ThumbnailCache.shared.purge()
+        // Owners are memoized per path (a stat per cell render was crippling scrolling on SMB),
+        // so a refresh has to drop them or a chown would never show. Same reasoning as above:
+        // caching is only safe when something invalidates it.
+        FileOwner.forget(items.map(\.id))
         if isSearching { runSearch() } else { load() }
     }
 
@@ -4746,6 +5163,11 @@ final class Browser: ObservableObject, Identifiable {
     func load() {
         isRecents = false
         isSearching = false
+        // Both metadata queries are LIVE now (they keep pushing updates rather than firing
+        // once), so leaving one running here would let it overwrite the listing of whatever
+        // folder we just navigated to. They must not outlive the view they populated.
+        stopMetadataQuery(&searchQuery)
+        stopMetadataQuery(&recentsQuery)
         slowNetwork = false
         networkStalled = false
         pathText = addressString(for: currentURL)
@@ -4754,7 +5176,7 @@ final class Browser: ObservableObject, Identifiable {
         // where items trashed by other apps came from.
         if isTrash { loadTrashPutBack() }
         let dir = currentURL
-        loadGeneration += 1
+        loadGeneration += 1; cancelPendingDetails()
         let gen = loadGeneration
         let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
         // Seed instantly from cache — no stat needed (DiskCache only ever holds
@@ -4824,12 +5246,13 @@ final class Browser: ObservableObject, Identifiable {
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
+            let wanted = Set(keys)   // hoisted: this was rebuilt for every single entry
             var result: [FileItem] = []
             var sinceFlush = 0
             var lastFlush = ProcessInfo.processInfo.systemUptime
             while let u = en?.nextObject() as? URL {
                 guard let self, gen == self.loadGeneration else { return }
-                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
                 sinceFlush += 1
                 // Show what we have as it arrives. The old rule only flushed every
                 // 200 entries, so a folder with fewer than that (most folders) stayed
@@ -4866,6 +5289,8 @@ final class Browser: ObservableObject, Identifiable {
     // revisits. Finder blocks on phase 2 for the whole folder — hence the hang.
     private func loadNetwork(_ dir: URL, gen: Int, cacheKey: String, hadSeed: Bool = false, dirMtime: Date? = nil) {
         let showHidden = self.showHidden
+        // Ask a slow volume only for what is actually on screen — see Browser.networkKeys.
+        let netKeys = Browser.networkKeys(visible: visibleColumns)
         // Non-blocking hint if the enumeration stalls (slow/hiccuping SMB mount):
         // a quiet note in the breadcrumb bar, not a popup. Fires only if we're
         // still on this same load after a few seconds.
@@ -4881,7 +5306,10 @@ final class Browser: ObservableObject, Identifiable {
                 self.networkStalled = true
             }
         }
-        let keys = Browser.itemKeys
+        let keys = netKeys   // column-aware: see Browser.networkKeys
+        let needsDetails = NetworkColumnRules.needsAttributePass(columns: visibleColumns,
+                                                                sortKey: currentSortColumn)
+        navLog("network load \(currentURL.lastPathComponent): columns=\(visibleColumns.sorted().joined(separator: ",")) sort=\(currentSortColumn) needsDetails=\(needsDetails)")
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -4890,15 +5318,22 @@ final class Browser: ObservableObject, Identifiable {
             // share measured 429 ms for 669 names vs 38 s for 41 entries WITH
             // attributes). Skipped when a detailed seed is already on screen, so we
             // never replace real sizes/dates with blanks.
-            if !hadSeed {
+            var quickWasEmpty = true
+            // Normally phase 1 is skipped when a detailed seed is already on screen, so we
+            // never replace real sizes with blanks. But when nothing on screen needs
+            // per-file data, phase 1 is the whole job — and it must still run, seed or not,
+            // or a cached listing would never pick up added and deleted files.
+            if !hadSeed || !needsDetails {
                 let quick = Browser.namesOnlyItems(dir, showHidden: showHidden)
                 if !quick.isEmpty {
+                    quickWasEmpty = false
                     guard let self, gen == self.loadGeneration else { return }
                     let sorted = quick
                     DispatchQueue.main.async { [weak self] in
                         guard let self, gen == self.loadGeneration else { return }
                         self.items = sorted
-                        self.busy = true; self.busyText = "Loading details…"
+                        self.busy = needsDetails
+                        self.busyText = needsDetails ? "Loading details…" : ""
                         self.slowNetwork = false; self.networkStalled = false
                         self.updateStatus()
                     }
@@ -4906,36 +5341,193 @@ final class Browser: ObservableObject, Identifiable {
             }
             // PHASE 2 — the full metadata pass. Slow on some shares, but the list is
             // already usable while it runs, and it replaces phase 1 when it lands.
+            let phase2Start = Date()
+            // Whether the last enumerate() ran to the end, as opposed to bailing out because
+            // the folder changed under it. This USED to be inferred from "did it return fewer
+            // rows than phase 1", which is wrong: phase 1 filters hidden files by name while
+            // the enumerator honours the DOS hidden ATTRIBUTE, so on a Windows-authored share
+            // phase 2 legitimately returns fewer rows (measured 116 vs 118 on //corp-pure02/data
+            // — Thumbs.db and friends). That made a correct result look aborted, so the detail
+            // pass was thrown away and DiskCache.put below was never reached: sizes stayed
+            // blank forever and the folder re-listed from scratch on every single launch.
+            var enumerateCompleted = false
             func enumerate() -> [FileItem] {
+                enumerateCompleted = false
                 guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts) else { return [] }
+                let wanted = Set(keys)   // hoisted out of the loop
                 var out: [FileItem] = []
                 var sinceFlush = 0
                 while let u = en.nextObject() as? URL {
                     guard let self, gen == self.loadGeneration else { return out }
-                    out.append(Browser.item(from: u, try? u.resourceValues(forKeys: Set(keys))))
+                    out.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
                     sinceFlush += 1
-                    if !hadSeed, sinceFlush >= 100 {
+                    // 25, not 100: at 89 ms/entry on a DFS share the first batch of 100
+                    // lands at 15.2 s but 25 lands at 7.8 s (measured), and the flush is
+                    // a merge now, so more of them costs little.
+                    if !hadSeed, sinceFlush >= 25 {
                         sinceFlush = 0
                         let snap = out
                         DispatchQueue.main.async { [weak self] in
                             guard let self, gen == self.loadGeneration else { return }
-                            // Never let a partial detail pass SHRINK what's on screen:
-                            // phase 1 already listed the whole folder, so a 100-item
-                            // snapshot of a 669-item folder must not replace it.
-                            guard snap.count >= self.items.count else { return }
-                            self.items = snap; self.busy = false; self.busyText = ""; self.slowNetwork = false; self.networkStalled = false; self.updateStatus()
+                            // MERGE the batch into the phase-1 list instead of replacing it.
+                            // Replacing outright would shrink a 669-row folder to 100 rows,
+                            // so this used to wait for snap.count >= items.count — i.e. the
+                            // whole folder — which on a slow share left Size and Modified
+                            // blank for the entire pass (measured ~59 s on artSource). Merging
+                            // keeps phase 1's rows and order and fills the details in every
+                            // 100 files, so the columns populate from the first batch.
+                            if self.items.isEmpty { self.items = snap } else { self.mergeDetails(snap) }
+                            self.busy = true; self.busyText = "Loading details…"
+                            self.slowNetwork = false; self.networkStalled = false; self.updateStatus()
+                            navLog("network details: \(snap.count)/\(self.items.count) rows filled in \(Int(Date().timeIntervalSince(phase2Start) * 1000))ms — \(dir.lastPathComponent)")
                         }
                     }
                 }
+                enumerateCompleted = true
                 return out
             }
+            // The shared index. Presence has already been established by phase 1's readdir; this
+            // only fills in attributes for names that listing confirmed. Anything the index
+            // doesn't know about is fetched normally, so a file a coworker added since the index
+            // was written shows up with real data rather than being missed.
+            if needsDetails, !quickWasEmpty, let idx = Browser.readShareIndex(for: dir) {
+                let live = self?.items ?? []
+                let liveNames = live.map(\.name)
+                let (fromIndex, mustFetch) = ShareIndexRules.partition(liveNames: liveNames,
+                                                                      indexedNames: Set(idx.byName.keys))
+                if !fromIndex.isEmpty {
+                    let enriched = live.map { it -> FileItem in
+                        guard let e = idx.byName[it.name] else { return it }
+                        return FileItem(id: it.id, url: it.url, name: it.name, isDirectory: e.d,
+                                        size: e.s, modified: Date(timeIntervalSince1970: e.m),
+                                        created: it.created, accessed: it.accessed,
+                                        dateAdded: it.dateAdded, kind: it.kind, tags: it.tags)
+                    }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, gen == self.loadGeneration else { return }
+                        self.items = enriched
+                        self.busy = !mustFetch.isEmpty
+                        self.busyText = mustFetch.isEmpty ? "" : "Loading \(mustFetch.count) new item(s)…"
+                        self.slowNetwork = false; self.networkStalled = false; self.updateStatus()
+                        Browser.dirCache[cacheKey] = enriched
+                        DiskCache.put(cacheKey, enriched, dirModified: dirMtime)
+                    }
+                    navLog("share index: \(fromIndex.count) of \(liveNames.count) rows from the index, \(mustFetch.count) to fetch — \(dir.lastPathComponent)")
+                    // Covered well enough: fetch ONLY the names the index didn't know (files added
+                    // since it was written, and the DOS-hidden ones the enumerator filters but
+                    // readdir sees) and skip the sweep entirely. Rows actually on screen still get
+                    // re-fetched live by the hydrator, so an in-place edit the index missed is
+                    // corrected for whatever you are looking at.
+                    if ShareIndexRules.coversEnoughToSkipSweep(fromIndex: fromIndex.count,
+                                                               total: liveNames.count) {
+                        if !mustFetch.isEmpty {
+                            let missing = Set(mustFetch)
+                            let wanted = Set(keys)
+                            let fresh = enriched.filter { missing.contains($0.name) }
+                                .map { Browser.item(from: $0.url, try? $0.url.resourceValues(forKeys: wanted)) }
+                            let byID = Dictionary(fresh.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                            let finalRows = enriched.map { byID[$0.id] ?? $0 }
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, gen == self.loadGeneration else { return }
+                                self.items = finalRows
+                                self.busy = false; self.busyText = ""; self.updateStatus()
+                                Browser.dirCache[cacheKey] = finalRows
+                                DiskCache.put(cacheKey, finalRows, dirModified: dirMtime)
+                            }
+                            navLog("share index: fetched \(fresh.count) unindexed row(s) — sweep skipped")
+                        }
+                        // Keep it from rotting. The folder is already on screen and correct; if the
+                        // index no longer matches reality — the folder's mtime moved, or the live
+                        // listing had names it never heard of — rebuild it behind the user at low
+                        // priority. Without this the same unindexed names are re-fetched on EVERY
+                        // visit forever, and an in-place edit sits wrong until maxAge expires.
+                        navLog("share index: staleness check idx.dirMtime=\(idx.dirMtime.map { String($0) } ?? "nil") actual=\(dirMtime.map { String($0.timeIntervalSince1970) } ?? "nil")")
+                        if ShareIndexRules.needsBackgroundRefresh(indexDirMtime: idx.dirMtime,
+                                                                  actualDirMtime: dirMtime?.timeIntervalSince1970) {
+                            guard Browser.beginRebuild(dir.path) else {
+                                navLog("share index: rebuild of \(dir.lastPathComponent) already in flight — skipping")
+                                return
+                            }
+                            DispatchQueue.global(qos: .utility).async { [weak self] in
+                                defer { Browser.endRebuild(dir.path) }
+                                guard let self, gen == self.loadGeneration else { return }
+                                // INCREMENTAL repair, not a re-sweep. readdir already established
+                                // which files exist, for free, so the only rows costing a round
+                                // trip are the ones the index has never seen. A folder where a
+                                // colleague added three files repairs in three stats rather than
+                                // 669 — the difference between ~1 s and the 3 minutes a full
+                                // background sweep measured while competing with foreground work.
+                                let known = idx.byName
+                                let plan = ShareIndexRules.repairPlan(liveNames: liveNames,
+                                                                      indexedNames: Set(known.keys))
+                                let t0 = Date()
+                                let wanted = Set(keys)
+                                let byName = Dictionary(enriched.map { ($0.name, $0) },
+                                                        uniquingKeysWith: { a, _ in a })
+                                var repaired: [FileItem] = []
+                                repaired.reserveCapacity(liveNames.count)
+                                // Repair statting shares the sweep queue: it is background work
+                                // and must not compete with a foreground folder's listing.
+                                Browser.sweepQueue.sync {
+                                for n in liveNames {
+                                    guard let row = byName[n] else { continue }
+                                    if plan.mustStat.contains(n) {
+                                        repaired.append(Browser.item(from: row.url,
+                                                                     try? row.url.resourceValues(forKeys: wanted)))
+                                    } else {
+                                        repaired.append(row)
+                                    }
+                                }
+                                }
+                                guard gen == self.loadGeneration, !repaired.isEmpty else { return }
+                                // savedAt carried forward: this was a patch, not a full re-read.
+                                Browser.writeShareIndex(repaired, for: dir,
+                                                        dirMtime: dirMtime?.timeIntervalSince1970,
+                                                        fullSweptAt: idx.savedAt)
+                                navLog("share index: repaired \(dir.lastPathComponent) — \(plan.mustStat.count) new row(s) stat'd, \(plan.carryForward.count) carried, \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+                                DispatchQueue.main.async { [weak self] in
+                                    guard let self, gen == self.loadGeneration else { return }
+                                    self.mergeDetails(repaired)
+                                    Browser.dirCache[cacheKey] = self.items
+                                    DiskCache.put(cacheKey, self.items, dirModified: dirMtime)
+                                }
+                            }
+                        }
+                        return
+                    }
+                }
+            }
+
+            // When no visible column and no sort key needs per-file data, the names-only
+            // listing above IS the finished answer — so the metadata pass is skipped
+            // outright rather than spending 59 s filling columns nobody can see.
+            if !needsDetails, !quickWasEmpty {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, gen == self.loadGeneration else { return }
+                    self.busy = false; self.busyText = ""
+                    self.slowNetwork = false; self.networkStalled = false; self.updateStatus()
+                    // Cache it like any other listing. Skipping this would mean the fast path
+                    // re-reads the folder on every visit and has nothing to show offline —
+                    // and the rows are complete, just without the attribute columns.
+                    let names = self.items
+                    if !names.isEmpty {
+                        Browser.dirCache[cacheKey] = names
+                        DiskCache.put(cacheKey, names, dirModified: dirMtime)
+                    }
+                }
+                navLog("network: names-only listing is complete for \(dir.lastPathComponent) — no attribute pass needed")
+                return
+            }
             let t0 = DispatchTime.now()
-            var result = enumerate()
+            // Serialized across the whole app — see Browser.sweepQueue. Everything above this
+            // point (readdir, the index read, hydration) has already run and painted, so waiting
+            // here delays nothing the user is looking at.
+            var result = Browser.sweepQueue.sync { enumerate() }
             // DFS junctions auto-mount on first access and can read empty; retry once.
             if result.isEmpty {
                 Thread.sleep(forTimeInterval: 1.5)
                 guard let self, gen == self.loadGeneration else { return }
-                result = enumerate()
+                result = Browser.sweepQueue.sync { enumerate() }
             }
             let ms = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1_000_000
             navLog.log("network bulk enumerate \(result.count, privacy: .public) items in \(Int(ms), privacy: .public) ms — \(dir.lastPathComponent, privacy: .public)")
@@ -4949,12 +5541,25 @@ final class Browser: ObservableObject, Identifiable {
                 // Same protection for the final result: if the detail pass came back
                 // with fewer entries than phase 1 already showed (aborted, or a share
                 // that stopped answering mid-way), keep the fuller list.
-                if committed.count < self.items.count, !self.items.isEmpty {
+                if !enumerateCompleted, committed.count < self.items.count, !self.items.isEmpty {
                     self.busy = false; self.busyText = ""; self.slowNetwork = false
                     self.updateFreeSpace(); self.updateStatus(); return
                 }
                 Browser.dirCache[cacheKey] = committed
-                if !committed.isEmpty { DiskCache.put(cacheKey, committed, dirModified: dirMtime) }   // store folder mtime for conditional revalidation
+                if !committed.isEmpty { DiskCache.put(cacheKey, committed, dirModified: dirMtime) }
+                // Publish for everyone else. Only after a COMPLETE sweep — a partial listing
+                // would spread wrong data — and throttled, since the write costs ~5 s.
+                if enumerateCompleted, !committed.isEmpty {
+                    let existing = Browser.readShareIndex(for: dir)?.savedAt
+                    if ShareIndexRules.shouldWrite(existingSavedAt: existing,
+                                                   now: Date().timeIntervalSince1970,
+                                                   dirChanged: existing == nil,
+                                                   entryCount: committed.count) {
+                        DispatchQueue.global(qos: .utility).async {
+                            Browser.writeShareIndex(committed, for: dir, dirMtime: dirMtime?.timeIntervalSince1970)
+                        }
+                    }
+                }   // store folder mtime for conditional revalidation
                 self.items = committed
                 self.busy = false; self.busyText = ""; self.slowNetwork = false
                 self.updateFreeSpace(); self.updateStatus()
@@ -5099,13 +5704,32 @@ final class Browser: ObservableObject, Identifiable {
     func openFavorite(_ path: String, mountURL: String?) {
         // Clicking a drive is asking for it back, which cancels an earlier Disconnect.
         NetworkReconnector.shared.allowReconnect(mountURL: mountURL)
-        if fm.fileExists(atPath: path) { navigate(to: URL(fileURLWithPath: path)); return }
-        guard let m = mountURL, let smb = URL(string: m) else { NSSound.beep(); return }
+        // NOTE: the existence check is NOT done here on the main thread. A share that
+        // is still mounted but wedged (server gone, VPN dropped) makes fileExists
+        // block for the full SMB timeout — 60s+ of beachball on a sidebar click,
+        // which is exactly the "Finder is faster" feeling. Everything below runs off
+        // the main thread; the UI stays live and shows "Connecting to…" instead.
+        guard let m = mountURL, let smb = URL(string: m) else {
+            // Local favorite: no share to mount, so the stat is cheap and safe here.
+            if fm.fileExists(atPath: path) { navigate(to: URL(fileURLWithPath: path)) } else { NSSound.beep() }
+            return
+        }
         busy = true; busyText = "Connecting to \(smb.host ?? "server")…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            // Already there and answering? Go, without touching NetFS at all.
+            if self.fm.fileExists(atPath: path) {
+                navLog("favorite: \(path) already mounted — no mount needed")
+                DispatchQueue.main.async {
+                    self.busy = false; self.busyText = ""
+                    self.navigate(to: URL(fileURLWithPath: path))
+                }
+                return
+            }
+            let t0 = Date()
             let mounted = Browser.mountShare(smb)
+            navLog("favorite: NetFS mount \(smb.absoluteString) -> \(mounted ?? "FAILED") in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
             DispatchQueue.main.async {
-                guard let self else { return }
                 self.busy = false; self.busyText = ""
                 // 1) Stored path present (share mounted where we expected)? Go there.
                 if self.fm.fileExists(atPath: path) {
@@ -5165,7 +5789,7 @@ final class Browser: ObservableObject, Identifiable {
             : ""
         networkStalled = false
         busy = true; busyText = "Reconnecting to \(info.share.host ?? "server")…"
-        loadGeneration += 1                     // abandon the stalled enumeration
+        loadGeneration += 1; cancelPendingDetails()                     // abandon the stalled enumeration
         items = []
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let du = Process()
@@ -10018,7 +10642,27 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         forceClearDragState()
     }
 
-    @objc private func didScroll(_ n: Notification) { browser.topVisibleID = topVisibleItemID() }
+    @objc private func didScroll(_ n: Notification) {
+        browser.topVisibleID = topVisibleItemID()
+        // Whatever just came into view is what we want attributes for first. See
+        // Browser.requestDetails — a no-op off the network or when the rows already have them.
+        browser.requestDetails(forVisible: visibleItemIDs())
+    }
+
+    /// Every file row currently in the viewport, plus a screen's worth of runway either side
+    /// so a steady scroll stays ahead of the fetch instead of catching up to it.
+    private func visibleItemIDs() -> [String] {
+        guard let table = tableView else { return [] }
+        let r = table.visibleRect
+        let padded = r.insetBy(dx: 0, dy: -r.height)
+        let range = table.rows(in: padded)
+        guard range.length > 0 else { return [] }
+        var out: [String] = []
+        for idx in range.location..<(range.location + range.length) where rows.indices.contains(idx) {
+            if case .item(let it) = rows[idx] { out.append(it.id) }
+        }
+        return out
+    }
 
     /// The first FILE row fully or partly at the top of the viewport — group headers are
     /// skipped, because a header is not something you can navigate back to.
@@ -10088,6 +10732,12 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
             table.reloadData()
         }
         syncColumnVisibility()
+        // A freshly painted network folder has names but no attributes; fill the first
+        // screenful now rather than waiting for the background sweep to reach it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.browser.requestDetails(forVisible: self.visibleItemIDs())
+        }
         syncSortDescriptors()
         syncSelection()
         syncScrollTarget()
@@ -14550,6 +15200,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // Before anything else that could raise: this is the only hook that sees an
         // exception a framework catches and swallows, which is the shape the drag wedge had.
         ExceptionLog.install()
+        // One-time: strip the expensive columns out of arrangements saved for network folders.
+        // Deferred off the launch path — it stats each saved path to classify the volume, and a
+        // stalled share must not hold up the window appearing.
+        if !Prefs.networkColumnCleanupDone {
+            let saved = FolderViewOptionsStore.shared.savedPaths()
+            DispatchQueue.global(qos: .utility).async {
+                // Classifying a volume means stat-ing the path, which on a stalled share can
+                // block — so it happens here, off the launch path. Only the mutation goes back
+                // to main. Unmounted paths can't be classified and are left for a later run.
+                let netPaths = Set(saved.filter {
+                    FileManager.default.fileExists(atPath: $0)
+                        && Browser.isNetworkURL(URL(fileURLWithPath: $0))
+                })
+                DispatchQueue.main.async {
+                    FolderViewOptionsStore.shared.cleanUpNetworkArrangements(networkPaths: netPaths)
+                    Prefs.networkColumnCleanupDone = true
+                    navLog("network columns: cleaned \(netPaths.count) saved network arrangement(s) (one-time)")
+                }
+            }
+        }
         // Then, before any code path can replace the bundle underneath us: this stamps the
         // binary we are executing, and it is only the truth while it is still the one on disk.
         RunningBuild.captureAtLaunch()
