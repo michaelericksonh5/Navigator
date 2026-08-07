@@ -1175,6 +1175,94 @@ enum LayerizeRules {
     }
 }
 
+// MARK: - Search query parsing and matching
+
+/// Turns what someone typed into something that actually finds files.
+///
+/// The old behaviour was a single raw substring test, and it meant **multi-word searches
+/// returned nothing at all**. Measured against this project's own naming convention:
+/// "phoenix v2" matched 0 files, while requiring each word separately matched 17 — including
+/// `HP2_Phoenix_Direct_NB2_v2.png`, which is obviously what was wanted. Anyone whose files are
+/// named `Thing_Detail_v3.png` could never search for them with a space.
+///
+/// So: split on whitespace and require EVERY token, in any order, anywhere in the name — which
+/// is how Finder and Explorer both behave. A `"quoted phrase"` stays one token for the times
+/// you really do want the literal string.
+enum SearchQueryRules {
+    /// Case- and diacritic-folded, so the two search backends agree. The recursive walk used
+    /// plain `lowercased()` while Spotlight used `[cd]`, which meant "café" matched in one
+    /// place and not the other.
+    static func fold(_ s: String) -> String {
+        s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+    }
+
+    /// Splits on whitespace, keeping `"quoted phrases"` intact. Already folded.
+    static func tokens(_ raw: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var inQuotes = false
+        for ch in raw {
+            if ch == "\"" {
+                inQuotes.toggle()
+                continue
+            }
+            if !inQuotes, ch.isWhitespace {
+                if !current.isEmpty { out.append(current); current = "" }
+            } else {
+                current.append(ch)
+            }
+        }
+        if !current.isEmpty { out.append(current) }
+        return out.map(fold).filter { !$0.isEmpty }
+    }
+
+    /// Every token must appear somewhere in the name. Order doesn't matter.
+    static func matches(name: String, tokens: [String]) -> Bool {
+        guard !tokens.isEmpty else { return true }
+        let n = fold(name)
+        return tokens.allSatisfy { n.contains($0) }
+    }
+
+    /// A single bare token that looks like an extension ("png", ".png", "*.png") should also
+    /// match by extension, so `png` finds every PNG even when the name doesn't contain "png".
+    /// Only for a lone token — "logo png" already works by name.
+    static func extensionQuery(_ tokens: [String]) -> String? {
+        guard tokens.count == 1 else { return nil }
+        let t = tokens[0].trimmingCharacters(in: CharacterSet(charactersIn: "*."))
+        guard !t.isEmpty, t.count <= 5, t.allSatisfy({ $0.isLetter || $0.isNumber }) else { return nil }
+        return t
+    }
+
+    /// Does this file match, by name tokens or by an extension-style query?
+    static func matchesFile(name: String, ext: String, tokens: [String]) -> Bool {
+        if matches(name: name, tokens: tokens) { return true }
+        if let e = extensionQuery(tokens) { return fold(ext) == e }
+        return false
+    }
+}
+
+/// Why a result list stopped where it did — so a capped search can say so instead of quietly
+/// looking like a complete answer.
+enum SearchTruncation: Equatable {
+    case complete(Int)
+    case capped(shown: Int, cap: Int)
+
+    var statusText: String {
+        switch self {
+        case .complete(let n):
+            return "\(n) found"
+        case .capped(let shown, let cap):
+            // Naming the cap matters: "500 items" reads as the truth, and someone then
+            // concludes the file they wanted doesn't exist.
+            return "first \(shown) of more than \(cap) — narrow the search to see the rest"
+        }
+    }
+
+    static func of(shown: Int, cap: Int, hitCap: Bool) -> SearchTruncation {
+        hitCap ? .capped(shown: shown, cap: cap) : .complete(shown)
+    }
+}
+
 // MARK: - Thumbnail cache keys
 
 /// Builds the thumbnail cache key.
