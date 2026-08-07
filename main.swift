@@ -13911,6 +13911,8 @@ enum PermissionProbe {
     /// Opened and screenshotted on macOS 26.6: lands on "Allow the applications below to
     /// control your computer", the list with Navigator's switch in it.
     static let accessibilityPane   = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+    static let localNetworkPane    = "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork"
+    static let appManagementPane   = "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles"
 
     static func openPane(_ url: String) { if let u = URL(string: url) { NSWorkspace.shared.open(u) } }
 
@@ -13970,6 +13972,38 @@ enum PermissionProbe {
         NSAppleScript(source: "tell application \"Finder\" to return version")?.executeAndReturnError(&err)
         guard let err else { return .granted }
         return (err[NSAppleScript.errorNumber] as? Int) == -1743 ? .denied : .unknown
+    }
+
+    /// Automation for an app OTHER than Finder — Photoshop and After Effects each need their
+    /// own grant, and neither was on this checklist despite driving most of Navigator's AI
+    /// features. `version` is chosen because it answers without opening a document.
+    static func appAutomation(bundleID: String) -> PermissionState {
+        var err: NSDictionary?
+        NSAppleScript(source: "tell application id \"\(bundleID)\" to return version")?
+            .executeAndReturnError(&err)
+        guard let err else { return .granted }
+        let code = err[NSAppleScript.errorNumber] as? Int
+        if code == -1743 { return .denied }        // user said no
+        if code == -600 || code == -1728 { return .notAsked }   // not running / no such object
+        return .unknown
+    }
+
+    /// Whether a key EXISTS in the keychain, without decrypting it.
+    ///
+    /// `kSecReturnData: false` is the whole point: asking for the data is what makes macOS
+    /// pop the "Navigator wants to access key…" password prompt. A checklist that prompted
+    /// for a password just to draw a row would be worse than not having the row.
+    static func keyStored(account: String) -> PermissionState {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.merickson.navigator.apikeys",
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: false,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: CFTypeRef?
+        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess ? .granted : .off
     }
 }
 
@@ -14088,7 +14122,58 @@ struct SetupItem: Identifiable {
                       probe: { _ in AXIsProcessTrusted() ? .granted : .off },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch it on. If it isn’t listed, click +, press ⇧⌘G, type /Applications/Navigator.app.",
-                      openSettings: { PermissionProbe.openPane(PermissionProbe.accessibilityPane) })
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.accessibilityPane) }),
+            // Photoshop and After Effects are SEPARATE Automation grants from Finder, and
+            // this window listed only Finder — while Remove BG, Quick Export as PNG,
+            // Generative Upscale and Chroma Key all depend on these. Each row appears only
+            // when that app is installed, matching what Navigator's own menus show.
+            SetupItem(id: "automation-ps", title: "Control Photoshop",
+                      why: "Powers Remove BG, Quick Export as PNG, Generative Upscale, and the re-cut step after an AI upscale. Photoshop is a separate Automation grant from Finder — allowing one says nothing about the other. macOS only lists Navigator here once it has asked, so use the button.",
+                      probe: { _ in PermissionProbe.appAutomation(bundleID: "com.adobe.Photoshop") },
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      afterOpening: "Then: find Navigator in that list and switch Adobe Photoshop on underneath it.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
+            SetupItem(id: "automation-ae", title: "Control After Effects",
+                      why: "Used for Chroma Key BG. A separate Automation grant again — allowing Photoshop does not cover After Effects.",
+                      probe: { _ in PermissionProbe.appAutomation(bundleID: "com.adobe.AfterEffects") },
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true, optional: true,
+                      afterOpening: "Then: find Navigator in that list and switch Adobe After Effects on underneath it.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
+            // No API exists to query either of the two below, so both report Unknown and
+            // lead with what BREAKS when they're off. A row that can only say "Unknown" still
+            // earns its place if it tells you the symptom you'd otherwise misdiagnose.
+            SetupItem(id: "localnetwork", title: "Local Network",
+                      why: "Lets Navigator find SMB file servers on your network and list them in the sidebar automatically. Without it the sidebar simply won't discover them — you can still reach any server by hand with Go ▸ Connect to Server (⌘K), so nothing is truly lost. macOS gives apps no way to read this setting back, which is why this row can't show a status.",
+                      probe: { _ in .unknown },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      afterOpening: "Then: find Navigator in that list and switch it on.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.localNetworkPane) }),
+            SetupItem(id: "appmanagement", title: "App Management (for updates)",
+                      why: "How Navigator updates ITSELF. Installing an update replaces /Applications/Navigator.app, and macOS treats replacing an app bundle as App Management. If this is off the download succeeds and the swap silently doesn't — you stay on the old version and the only clue is that the update keeps reappearing. macOS gives apps no way to read this setting back, so this row can't show a status; check it here if an update won't stick.",
+                      probe: { _ in .unknown },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      afterOpening: "Then: find Navigator in that list and switch it on.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.appManagementPane) }),
+            // Not macOS permissions, but they fail the same way — a feature that just doesn't
+            // work — and this window is where people come to find out why.
+            SetupItem(id: "vertex", title: "Vertex sign-in (Google, company-metered)",
+                      why: "Powers Restyle and the Imagen upscalers. A browser sign-in with your @high5games.com account — there is no key to paste, and no gcloud to install. Lasts about 30 days, then asks once more. Use AI ▸ Sign in to Vertex (Imagen)…",
+                      probe: { _ in vertexSignedIn() ? .granted : .off },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "Sign in…",
+                      openSettings: { promptVertexSignin() }),
+            SetupItem(id: "falkey", title: "fal.ai API key",
+                      why: "Powers Layerize and the fal upscalers (Crystal, AuraSR, Topaz). Stored in your login keychain.\n\nExpect one prompt after each Navigator update: updating re-signs the app, which invalidates the keychain's saved permission. Choose Always Allow when it asks — the key itself is fine and never needs re-entering.",
+                      probe: { _ in PermissionProbe.keyStored(account: "fal.ai") },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "API Keys…",
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) }),
+            SetupItem(id: "openaikey", title: "OpenAI API key",
+                      why: "Not used by anything yet — reserved for future gpt-image surfaces. Nothing in Navigator needs it today, so an empty row here is expected.",
+                      probe: { _ in PermissionProbe.keyStored(account: "openai") },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "API Keys…",
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) })
         ]
     }
 }
@@ -14105,7 +14190,9 @@ struct SetupAssistantView: View {
 
     private let items = SetupItem.all()
     /// Rows that aren't about reading files. Full Disk Access can't cover any of them.
-    private static let extras: Set<String> = ["automation", "finderext", "accessibility"]
+    private static let extras: Set<String> = ["automation", "automation-ps", "automation-ae",
+                                              "finderext", "accessibility", "localnetwork",
+                                              "appmanagement", "vertex", "falkey", "openaikey"]
 
     var body: some View {
         Form {
