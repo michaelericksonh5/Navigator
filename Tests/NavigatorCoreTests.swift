@@ -4661,3 +4661,64 @@ final class TeamDrivesRulesTests: XCTestCase {
         XCTAssertEqual(TeamDrivesRules.parse("smb://host/50%20West").first?.label, "50%20West")
     }
 }
+
+
+// MARK: - Exporting a converted copy
+
+final class ExportRulesTests: XCTestCase {
+
+    /// THE safety property: a "save a copy" must never pre-fill the original's own name.
+    /// Exporting lures_r1.png as PNG used to suggest exactly "lures_r1.png".
+    func testSameFormatNeverSuggestsTheOriginalName() {
+        let n = ExportRules.suggestedName(sourceName: "lures_r1.png", format: .png,
+                                          taken: { $0 == "lures_r1.png" })
+        XCTAssertNotEqual(n, "lures_r1.png")
+        XCTAssertEqual(n, "lures_r1 2.png")
+    }
+
+    func testDifferentFormatKeepsTheCleanName() {
+        XCTAssertEqual(ExportRules.suggestedName(sourceName: "lures_r1.png", format: .webp,
+                                                 taken: { _ in false }), "lures_r1.webp")
+        XCTAssertEqual(ExportRules.suggestedName(sourceName: "lures_r1.png", format: .jpeg,
+                                                 taken: { _ in false }), "lures_r1.jpg")
+    }
+
+    func testWalksPastExistingCopies() {
+        let existing: Set<String> = ["a.webp", "a 2.webp", "a 3.webp"]
+        XCTAssertEqual(ExportRules.suggestedName(sourceName: "a.png", format: .webp,
+                                                 taken: { existing.contains($0) }), "a 4.webp")
+    }
+
+    /// Case-insensitivity and unicode normalisation both matter: a naive == would treat these as
+    /// different files and overwrite the original.
+    func testIsSameFileHandlesCaseAndUnicode() {
+        XCTAssertTrue(ExportRules.isSameFile("Lures_R1.PNG", "lures_r1.png"))
+        let composed = "Ü.png", decomposed = "U\u{0308}.png"
+        XCTAssertTrue(ExportRules.isSameFile(composed, decomposed),
+                      "APFS hands back decomposed unicode; a save panel gives composed")
+        XCTAssertFalse(ExportRules.isSameFile("a.png", "b.png"))
+    }
+
+    /// WebP has no ImageIO encoder on macOS, so it must be flagged as needing an external tool.
+    func testOnlyWebpLacksAnImageIOEncoder() {
+        XCTAssertNil(ExportRules.Format.webp.uti)
+        for f in ExportRules.Format.allCases where f != .webp {
+            XCTAssertNotNil(f.uti, "\(f) should encode through ImageIO")
+        }
+    }
+
+    /// JPEG is the only offered format that cannot carry alpha.
+    func testAlphaCapability() {
+        XCTAssertTrue(ExportRules.Format.jpeg.dropsAlpha)
+        for f in [ExportRules.Format.png, .webp, .tiff, .heic] {
+            XCTAssertFalse(f.dropsAlpha, "\(f) supports alpha and must not be flattened")
+        }
+    }
+
+    func testExtensionsAndTitles() {
+        XCTAssertEqual(ExportRules.Format.jpeg.ext, "jpg")
+        XCTAssertEqual(ExportRules.Format.jpeg.menuTitle, "JPEG")
+        XCTAssertEqual(ExportRules.Format.webp.ext, "webp")
+        XCTAssertEqual(ExportRules.Format.heic.menuTitle, "HEIC")
+    }
+}

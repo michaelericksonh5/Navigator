@@ -3869,3 +3869,56 @@ enum TeamDrivesRules {
         return parts.count > 1 ? parts[parts.count - 1] : (parts.first ?? url)
     }
 }
+
+// MARK: - Exporting a converted copy, without eating the original
+
+enum ExportRules {
+    /// Formats "Save a Copy As" offers. WebP is encoded by the external `cwebp` because
+    /// CGImageDestination on macOS can DECODE WebP but not write it (verified: it is absent from
+    /// CGImageDestinationCopyTypeIdentifiers()).
+    enum Format: String, CaseIterable {
+        case png, webp, jpeg, tiff, heic
+
+        var ext: String { self == .jpeg ? "jpg" : rawValue }
+        var menuTitle: String { self == .jpeg ? "JPEG" : rawValue.uppercased() }
+        /// Nil means there is no ImageIO encoder and an external tool is required.
+        var uti: String? {
+            switch self {
+            case .png:  return "public.png"
+            case .jpeg: return "public.jpeg"
+            case .tiff: return "public.tiff"
+            case .heic: return "public.heic"
+            case .webp: return nil
+            }
+        }
+        var isLossy: Bool { self == .jpeg || self == .heic || self == .webp }
+        /// JPEG is the only one here that cannot carry alpha at all.
+        var dropsAlpha: Bool { self == .jpeg }
+    }
+
+    /// Two paths pointing at the same file. Compared case-insensitively and in canonical
+    /// composed form, because macOS filesystems are usually case-insensitive and APFS/HFS hand
+    /// back decomposed unicode — "Ü" typed in a save panel is not the same bytes as the "Ü" in
+    /// a directory listing, and a naive == would call them different and happily overwrite.
+    static func isSameFile(_ a: String, _ b: String) -> Bool {
+        a.precomposedStringWithCanonicalMapping.lowercased()
+            == b.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    /// Default name for the copy. Never the source's own name: exporting a PNG as a PNG used to
+    /// pre-fill the original's exact filename, so one Return overwrote the original.
+    /// `taken` reports whether a candidate already exists in the destination folder.
+    static func suggestedName(sourceName: String, format: Format, taken: (String) -> Bool) -> String {
+        let base = (sourceName as NSString).deletingPathExtension
+        let first = "\(base).\(format.ext)"
+        // A different extension is already distinct from the source, so only guard the collision.
+        if !taken(first), !isSameFile(first, sourceName) { return first }
+        var i = 2
+        while true {
+            let candidate = "\(base) \(i).\(format.ext)"
+            if !taken(candidate), !isSameFile(candidate, sourceName) { return candidate }
+            i += 1
+            if i > 999 { return "\(base) copy.\(format.ext)" }   // pathological folder; still safe
+        }
+    }
+}

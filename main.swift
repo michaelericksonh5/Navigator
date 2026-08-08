@@ -12714,38 +12714,120 @@ struct ImageViewerView: View {
         })
     }
 
-    /// Write a converted copy. PNG/JPEG/TIFF only — the three NSBitmapImageRep encodes
-    /// natively and predictably.
-    private func saveCopyAs(_ type: NSBitmapImageRep.FileType, ext: String) {
-        guard let u = currentURL,
-              let src = NSImage(contentsOf: u),
-              let tiff = src.tiffRepresentation,
-              var rep = NSBitmapImageRep(data: tiff) else { NSSound.beep(); return }
-        // JPEG has no alpha. Compositing onto white first is the conventional result; without
-        // it, transparent areas come out black, which for artwork is a silent ruin.
-        if type == .jpeg, rep.hasAlpha {
-            let w = rep.pixelsWide, h = rep.pixelsHigh
-            let flat = NSImage(size: NSSize(width: w, height: h))
-            flat.lockFocus()
-            NSColor.white.setFill(); NSRect(x: 0, y: 0, width: w, height: h).fill()
-            src.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
-            flat.unlockFocus()
-            if let t2 = flat.tiffRepresentation, let r2 = NSBitmapImageRep(data: t2) { rep = r2 }
-        }
-        let props: [NSBitmapImageRep.PropertyKey: Any] = type == .jpeg ? [.compressionFactor: 0.9] : [:]
-        guard let data = rep.representation(using: type, properties: props) else {
-            reportFileError("Couldn’t convert “\(u.lastPathComponent)” to \(ext.uppercased()).", "")
+    /// Save a converted COPY. Three things this must never do: overwrite the original, write a
+    /// half-file if encoding fails, or silently flatten transparency.
+    ///
+    /// The original used to be genuinely at risk — exporting a PNG as a PNG pre-filled the
+    /// source's own filename, so one Return replaced it. ExportRules.suggestedName now guarantees
+    /// a distinct default, and the source path is refused outright even if it's typed by hand.
+    private func exportCopy(_ format: ExportRules.Format) {
+        guard let u = currentURL else { NSSound.beep(); return }
+        let dir = u.deletingLastPathComponent()
+        let fm = FileManager.default
+        let panel = NSSavePanel()
+        panel.directoryURL = dir
+        panel.nameFieldStringValue = ExportRules.suggestedName(
+            sourceName: u.lastPathComponent, format: format,
+            taken: { fm.fileExists(atPath: dir.appendingPathComponent($0).path) })
+        panel.message = "Save a \(format.menuTitle) copy — the original is left untouched"
+        guard panel.runModal() == .OK, let out = panel.url else { return }
+
+        // Belt and braces. The panel's default can't collide, but the name is editable, and the
+        // panel's own "replace?" prompt would happily let someone overwrite the source.
+        // Symlinks resolved first: the inode check below can't see through one (verified — it
+        // compares the LINK's identifier, not the target's), and the raw paths differ, so a save
+        // onto a symlink pointing at the original would have slipped past both checks.
+        if ExportRules.isSameFile(out.resolvingSymlinksInPath().path, u.resolvingSymlinksInPath().path)
+            || sameFileOnDisk(out, u) {
+            reportFileError("That would overwrite the original.",
+                            "Pick a different name — “Save a Copy” never replaces the file you're viewing.",
+                            permissionHint: false)
             return
         }
-        let panel = NSSavePanel()
-        panel.directoryURL = u.deletingLastPathComponent()
-        panel.nameFieldStringValue = (u.lastPathComponent as NSString).deletingPathExtension + "." + ext
-        panel.message = "Save a \(ext.uppercased()) copy"
-        guard panel.runModal() == .OK, let out = panel.url else { return }
-        do { try data.write(to: out) } catch {
-            reportFileError("Couldn’t save “\(out.lastPathComponent)”.", error.localizedDescription); return
+        if let err = writeConverted(u, to: out, format: format) {
+            reportFileError("Couldn’t save “\(out.lastPathComponent)”.", err)
+            return
         }
         revealNewImage(out)
+    }
+
+    /// Same file via a HARD link, which no amount of path resolution reveals — two real
+    /// directory entries, one inode. Symlinks are handled by resolving paths at the call site.
+    private func sameFileOnDisk(_ a: URL, _ b: URL) -> Bool {
+        let k: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+        guard let ra = try? a.resourceValues(forKeys: k).fileResourceIdentifier,
+              let rb = try? b.resourceValues(forKeys: k).fileResourceIdentifier
+        else { return false }        // destination usually doesn't exist yet; that's fine
+        return ra.isEqual(rb)
+    }
+
+    /// Encode to `out`. Returns nil on success, or a message to show.
+    ///
+    /// ImageIO for everything it can write; `cwebp` for WebP, which macOS can decode but NOT
+    /// encode (verified against CGImageDestinationCopyTypeIdentifiers()). Written to a temp file
+    /// first and moved into place, so a failure part-way through can't leave a truncated image
+    /// sitting next to the original looking like a real asset.
+    private func writeConverted(_ src: URL, to out: URL, format: ExportRules.Format) -> String? {
+        let tmp = out.deletingLastPathComponent()
+            .appendingPathComponent(".\(out.lastPathComponent).\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        if format == .webp {
+            guard let cwebp = ["/opt/homebrew/bin/cwebp", "/usr/local/bin/cwebp"]
+                    .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+                return "WebP needs Google's encoder, which isn't installed. Install it with:\n\n    brew install webp"
+            }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: cwebp)
+            // -q 90 to match the other lossy formats; -alpha_q 100 keeps the alpha channel
+            // lossless, which matters for cutouts headed into a game runtime.
+            p.arguments = ["-quiet", "-q", "90", "-alpha_q", "100", src.path, "-o", tmp.path]
+            let err = Pipe(); p.standardError = err
+            do { try p.run() } catch { return error.localizedDescription }
+            p.waitUntilExit()
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            guard p.terminationStatus == 0 else {
+                return msg.isEmpty ? "cwebp exited with status \(p.terminationStatus)." : msg
+            }
+        } else {
+            guard let uti = format.uti else { return "No encoder for \(format.menuTitle)." }
+            guard let srcRef = CGImageSourceCreateWithURL(src as CFURL, nil),
+                  var image = CGImageSourceCreateImageAtIndex(srcRef, 0, nil) else {
+                return "Couldn’t read “\(src.lastPathComponent)”."
+            }
+            // JPEG can't carry alpha, and ImageIO renders the transparent parts BLACK. White is
+            // the conventional result and the one that doesn't silently ruin a cutout.
+            if format.dropsAlpha, image.alphaInfo != .none, image.alphaInfo != .noneSkipLast,
+               image.alphaInfo != .noneSkipFirst {
+                image = flattenOntoWhite(image) ?? image
+            }
+            guard let dest = CGImageDestinationCreateWithURL(tmp as CFURL, uti as CFString, 1, nil) else {
+                return "Couldn’t create a \(format.menuTitle) encoder."
+            }
+            let opts: [CFString: Any] = format.isLossy ? [kCGImageDestinationLossyCompressionQuality: 0.9] : [:]
+            CGImageDestinationAddImage(dest, image, opts as CFDictionary)
+            guard CGImageDestinationFinalize(dest) else { return "Encoding \(format.menuTitle) failed." }
+        }
+
+        do {
+            if FileManager.default.fileExists(atPath: out.path) {
+                _ = try FileManager.default.replaceItemAt(out, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: out)
+            }
+        } catch { return error.localizedDescription }
+        return nil
+    }
+
+    private func flattenOntoWhite(_ image: CGImage) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
     }
 
     private func copyLocation() {
@@ -12876,11 +12958,10 @@ struct ImageViewerView: View {
                 Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
                 Button("Rename…") { renameCurrent() }
                 Menu("Save a Copy As") {
-                    // PNG/JPEG/TIFF only — the three NSBitmapImageRep encodes natively and
-                    // predictably. HEIC and WebP need CGImageDestination and are a separate job.
-                    Button("PNG") { saveCopyAs(.png, ext: "png") }
-                    Button("JPEG") { saveCopyAs(.jpeg, ext: "jpg") }
-                    Button("TIFF") { saveCopyAs(.tiff, ext: "tiff") }
+                    // Order deliberate: png and webp are the two formats in daily use here.
+                    ForEach(ExportRules.Format.allCases, id: \.self) { f in
+                        Button(f.menuTitle) { exportCopy(f) }
+                    }
                 }
                 Divider()
                 OpenWithMenu(urls: [u])
