@@ -12626,9 +12626,33 @@ struct ImageViewerView: View {
     }
     private var currentURL: URL? { urls.indices.contains(index) ? urls[index] : nil }
     // Put the decoded picture on the clipboard (paste into Photoshop, Slack, docs…).
+    /// Put the PICTURE on the clipboard, in the formats consumers actually read.
+    ///
+    /// This used to be `writeObjects([NSImage])`, which looks right and reports success — but
+    /// NSImage only ever offers `public.tiff`. Photoshop and Preview accept TIFF, so it seemed to
+    /// work, while browsers, Slack, Google Docs and Figma read `public.png` and silently got
+    /// nothing. PNG is declared FIRST because the pasteboard's type order is a preference list,
+    /// and it is the format everything understands.
+    ///
+    /// For a PNG source the file's own bytes ARE the PNG data, so they're used verbatim: no
+    /// re-encode, and nothing lost. Anything else is converted once.
     private func copyImageToClipboard() {
-        guard let u = currentURL, let img = NSImage(contentsOf: u) else { NSSound.beep(); return }
-        NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([img])
+        guard let u = currentURL else { NSSound.beep(); return }
+        let png: Data? = u.pathExtension.lowercased() == "png"
+            ? try? Data(contentsOf: u)
+            : NSImage(contentsOf: u)?.tiffRepresentation
+                .flatMap { NSBitmapImageRep(data: $0) }
+                .flatMap { $0.representation(using: .png, properties: [:]) }
+        let tiff = NSImage(contentsOf: u)?.tiffRepresentation
+        guard png != nil || tiff != nil else { NSSound.beep(); return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        var types: [NSPasteboard.PasteboardType] = []
+        if png != nil { types.append(.png) }
+        if tiff != nil { types.append(.tiff) }
+        pb.declareTypes(types, owner: nil)
+        if let png { pb.setData(png, forType: .png) }
+        if let tiff { pb.setData(tiff, forType: .tiff) }
     }
     // Put the file itself on the clipboard as a file reference, so ⌘V pastes the
     // actual file into any Navigator (or Finder) folder. Matches copyFiles().
@@ -12636,6 +12660,94 @@ struct ImageViewerView: View {
         guard let u = currentURL else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects([u as NSURL])
     }
+    /// Rename the picture you're looking at, without going back to the file list.
+    ///
+    /// Deliberately not promptRename(): that drives INLINE editing in the browser's table and
+    /// does nothing from a viewer window. The pieces that matter are reused though — the same
+    /// name validation, and the same undo stack, so ⌘Z works here exactly as it does in the list.
+    private func renameCurrent() {
+        guard let u = currentURL else { NSSound.beep(); return }
+        let a = NSAlert()
+        a.messageText = "Rename"
+        a.informativeText = "New name for “\(u.lastPathComponent)”:"
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        f.stringValue = u.lastPathComponent
+        // Select the base name only, so the extension survives unless it's changed on purpose.
+        a.accessoryView = f
+        a.addButton(withTitle: "Rename"); a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = f
+        DispatchQueue.main.async {
+            let base = (u.lastPathComponent as NSString).deletingPathExtension
+            f.currentEditor()?.selectedRange = NSRange(location: 0, length: base.count)
+        }
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let newName = f.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !newName.isEmpty, newName != u.lastPathComponent else { return }
+        if let why = PathRules.invalidNameReason(newName) {
+            reportFileError("The name “\(newName)” can’t be used.", why, permissionHint: false); return
+        }
+        let dest = u.deletingLastPathComponent().appendingPathComponent(newName)
+        guard !FileManager.default.fileExists(atPath: dest.path) else {
+            reportFileError("“\(newName)” already exists here.",
+                            "Pick a different name.", permissionHint: false); return
+        }
+        do {
+            try FileManager.default.moveItem(at: u, to: dest)
+        } catch {
+            reportFileError("Couldn’t rename “\(u.lastPathComponent)”.", error.localizedDescription); return
+        }
+        if let at = urls.firstIndex(of: u) { urls[at] = dest }
+        loadInfo()
+        // Captured values, not self: this is a struct, and these closures outlive the window
+        // anyway because the undo stack is app-wide. Same mechanism deleteCurrent uses.
+        let vid = viewerID
+        UndoStack.shared.push("Rename", undo: {
+            do { try FileManager.default.moveItem(at: dest, to: u) } catch { return error.localizedDescription }
+            NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
+                                            userInfo: ["viewer": vid, "url": dest, "replaceWith": u])
+            return nil
+        }, redo: {
+            do { try FileManager.default.moveItem(at: u, to: dest) } catch { return error.localizedDescription }
+            NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
+                                            userInfo: ["viewer": vid, "url": u, "replaceWith": dest])
+            return nil
+        })
+    }
+
+    /// Write a converted copy. PNG/JPEG/TIFF only — the three NSBitmapImageRep encodes
+    /// natively and predictably.
+    private func saveCopyAs(_ type: NSBitmapImageRep.FileType, ext: String) {
+        guard let u = currentURL,
+              let src = NSImage(contentsOf: u),
+              let tiff = src.tiffRepresentation,
+              var rep = NSBitmapImageRep(data: tiff) else { NSSound.beep(); return }
+        // JPEG has no alpha. Compositing onto white first is the conventional result; without
+        // it, transparent areas come out black, which for artwork is a silent ruin.
+        if type == .jpeg, rep.hasAlpha {
+            let w = rep.pixelsWide, h = rep.pixelsHigh
+            let flat = NSImage(size: NSSize(width: w, height: h))
+            flat.lockFocus()
+            NSColor.white.setFill(); NSRect(x: 0, y: 0, width: w, height: h).fill()
+            src.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+            flat.unlockFocus()
+            if let t2 = flat.tiffRepresentation, let r2 = NSBitmapImageRep(data: t2) { rep = r2 }
+        }
+        let props: [NSBitmapImageRep.PropertyKey: Any] = type == .jpeg ? [.compressionFactor: 0.9] : [:]
+        guard let data = rep.representation(using: type, properties: props) else {
+            reportFileError("Couldn’t convert “\(u.lastPathComponent)” to \(ext.uppercased()).", "")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.directoryURL = u.deletingLastPathComponent()
+        panel.nameFieldStringValue = (u.lastPathComponent as NSString).deletingPathExtension + "." + ext
+        panel.message = "Save a \(ext.uppercased()) copy"
+        guard panel.runModal() == .OK, let out = panel.url else { return }
+        do { try data.write(to: out) } catch {
+            reportFileError("Couldn’t save “\(out.lastPathComponent)”.", error.localizedDescription); return
+        }
+        revealNewImage(out)
+    }
+
     private func copyLocation() {
         guard let u = currentURL else { NSSound.beep(); return }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(u.path, forType: .string)
@@ -12715,6 +12827,11 @@ struct ImageViewerView: View {
                 Button("") { zoomCtl.zoomBy(1.25) }.keyboardShortcut("=", modifiers: .command)
                 Button("") { zoomCtl.zoomBy(0.8) }.keyboardShortcut("-", modifiers: .command)
                 Button("") { zoomCtl.fit() }.keyboardShortcut("0", modifiers: .command)
+                // ⌘C copies the PICTURE (see copyImageToClipboard), ⌥⌘C the file itself. Copy
+                // was previously reachable only from the context menu, which is the one thing
+                // everyone tries a keyboard shortcut for first.
+                Button("") { copyImageToClipboard() }.keyboardShortcut("c", modifiers: .command)
+                Button("") { copyFileToClipboard() }.keyboardShortcut("c", modifiers: [.command, .option])
                 Button("") { deleteCurrent() }.keyboardShortcut(.delete, modifiers: [])
                 Button("") { UndoStack.shared.undo() }.keyboardShortcut("z", modifiers: .command)
                 Button("") { UndoStack.shared.redo() }.keyboardShortcut("z", modifiers: [.command, .shift])
@@ -12736,6 +12853,10 @@ struct ImageViewerView: View {
                 let at = min(info["index"] as? Int ?? urls.count, urls.count)
                 urls.insert(u, at: at)
                 index = at
+            } else if let to = info["replaceWith"] as? URL {
+                // A rename undone or redone: same picture, new path. Swap in place so the
+                // window keeps showing it instead of going blank on a path that's gone.
+                if let at = urls.firstIndex(of: u) { urls[at] = to }
             } else if let at = urls.firstIndex(of: u) {
                 urls.remove(at: at)
                 if urls.isEmpty { NSApp.keyWindow?.close(); return }
@@ -12749,6 +12870,18 @@ struct ImageViewerView: View {
             Button("Copy Location") { copyLocation() }
             Button("Copy File Name") { copyFileName() }
             if let u = currentURL {
+                Divider()
+                // Present in six other menus but not this one, which is the one place you're
+                // most likely to want it — you're looking at the picture and want the file.
+                Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([u]) }
+                Button("Rename…") { renameCurrent() }
+                Menu("Save a Copy As") {
+                    // PNG/JPEG/TIFF only — the three NSBitmapImageRep encodes natively and
+                    // predictably. HEIC and WebP need CGImageDestination and are a separate job.
+                    Button("PNG") { saveCopyAs(.png, ext: "png") }
+                    Button("JPEG") { saveCopyAs(.jpeg, ext: "jpg") }
+                    Button("TIFF") { saveCopyAs(.tiff, ext: "tiff") }
+                }
                 Divider()
                 OpenWithMenu(urls: [u])
                 prepForAIMenu { c, ratio in
@@ -12769,6 +12902,13 @@ struct ImageViewerView: View {
                 if AfterEffectsIcon.image != nil, u.pathExtension.lowercased() == "png" {
                     Button { chromaKeyForImage(u) { out in revealNewImage(out) } } label: { aeLabel("Chroma Key BG") }
                 }
+            }
+            if currentURL != nil {
+                Divider()
+                // deleteCurrent() already moves to the Trash with Put Back and full undo, and
+                // has for a while — it was just bound to the Delete key and invisible here,
+                // which is no use while you're culling a folder of concepts with the mouse.
+                Button("Move to Trash") { deleteCurrent() }
             }
         }
     }
