@@ -4012,3 +4012,51 @@ enum LayerizeBatchRules {
         return s
     }
 }
+
+// MARK: - What a Layerize failure actually means
+
+enum LayerizeErrorRules {
+    /// Turn fal's 422 body into an honest explanation.
+    ///
+    /// The old text asserted one cause for every 422: "it rejects a tier that overshoots the input,
+    /// and also anything below its ~1K output floor". A real batch disproved that. Five images,
+    /// byte-for-byte comparable — all 632×791, all `auto_1K`, all 712–741 KB — and three produced
+    /// 5, 9 and 11 layers while two were refused. Same size, same tier, same everything
+    /// structural. The tier was never the problem, and saying so sent the user looking in the
+    /// wrong place.
+    ///
+    /// fal says which it is, in the body. When it reports that the image "could not be processed
+    /// for layer decomposition", that is the model declining THAT PICTURE — not a parameter fault
+    /// — and it is worth saying plainly, because the fix is to retry or use a different image, not
+    /// to fiddle with settings.
+    static func explain422(body: String, tier: String) -> String {
+        let b = body.lowercased()
+        if b.contains("could not be processed for layer decomposition") {
+            return " — the Layerize model couldn’t decompose this particular image. "
+                 + "Nothing is wrong with its size or format: images identical in size and tier "
+                 + "succeed alongside it. Retrying sometimes works; otherwise the picture itself "
+                 + "is one the model won’t split."
+        }
+        if b.contains("image_size") || b.contains("resolution") || b.contains("too small") || b.contains("too large") {
+            return " — Layerize refused the \(tier) tier for this input. It rejects a tier that "
+                 + "overshoots the image, and anything below its ~1K output floor."
+        }
+        if b.contains("safety") || b.contains("nsfw") || b.contains("flagged") {
+            return " — fal's safety checker flagged this image, which is a content decision on "
+                 + "their side rather than anything about the file."
+        }
+        return " — Layerize rejected the request. fal's own message follows."
+    }
+
+    /// Is this failure worth one automatic retry?
+    ///
+    /// A model that declines a picture may well accept it on a second pass — the refusal is not a
+    /// parameter error, so the same request can legitimately produce a different answer. A tier or
+    /// safety rejection will not change, and retrying those only spends money.
+    static func worthRetrying(body: String) -> Bool {
+        let b = body.lowercased()
+        if b.contains("safety") || b.contains("nsfw") || b.contains("flagged") { return false }
+        if b.contains("image_size") || b.contains("too small") || b.contains("too large") { return false }
+        return b.contains("could not be processed for layer decomposition")
+    }
+}
