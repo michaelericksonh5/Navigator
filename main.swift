@@ -2863,6 +2863,145 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
 // pre-copy (faster, especially on network/Drive), and the original is never
 // written. `onProgress` (main thread) fires after Photoshop finishes so callers
 // can refresh.
+/// The JavaScript that reads the balance off Adobe's account page.
+///
+/// Three things this has to do, each learned by testing against the live page:
+///  1. The account menu element does not EXIST until the avatar is clicked, so the avatar has to
+///     be found and clicked first — a fresh load has no balance anywhere in the document.
+///  2. The avatar is itself inside a shadow root, so it can't be found with a plain
+///     querySelector. It is identified by role="button" and an aria-label ending in "Account"
+///     ("Michael Erickson Account"), which survives a re-skin better than a generated class name.
+///  3. The balance is in ANOTHER shadow root, so the text walk must pierce shadow DOM.
+///     document.body.innerText returns 1,215 characters without it; the walk returns 13,398 with.
+///
+/// Returns the concatenated deep text, which AdobeCreditRules then parses. Returns "" if the
+/// avatar can't be found, which is what an expired session looks like.
+let adobeBalanceReadJS = """
+(function () {
+  function findDeep(pred, root, depth) {
+    if (depth > 8) return null;
+    var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (pred(el)) return el;
+      if (el.shadowRoot) { var f = findDeep(pred, el.shadowRoot, depth + 1); if (f) return f; }
+    }
+    return null;
+  }
+  function deepText(root, depth, acc) {
+    if (depth > 10) return;
+    acc.push(root === document ? (document.body.innerText || '') : (root.textContent || ''));
+    var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (var i = 0; i < els.length; i++) {
+      if (els[i].shadowRoot) deepText(els[i].shadowRoot, depth + 1, acc);
+    }
+  }
+  var avatar = findDeep(function (el) {
+    return el.getAttribute && el.getAttribute('role') === 'button' &&
+           /account\\s*$/i.test(el.getAttribute('aria-label') || '');
+  }, document, 0);
+  if (avatar) { try { avatar.click(); } catch (e) {} }
+  var parts = [];
+  deepText(document, 0, parts);
+  return parts.join('\\n');
+})()
+"""
+
+/// Reads the balance with no window and no user interaction.
+///
+/// The session cookie lives in the shared WKWebView data store, so once the user has signed in
+/// through AdobeAccountWindow this keeps working on its own. Deliberately bounded: it runs on
+/// demand (launch, and before a spend when the reading is more than a few minutes old), never on
+/// a timer. A failed read NEVER overwrites a good reading — an expired session must not look like
+/// a zero balance.
+final class AdobeCreditReader: NSObject, WKNavigationDelegate {
+    static let shared = AdobeCreditReader()
+    private var web: WKWebView?
+    /// The web view MUST live in a window. WebKit suspends layout for a view with no window, so
+    /// document.body.innerText came back EMPTY and the read failed with "no page text" every time.
+    /// This window is parked far off-screen and ordered to the back — never visible, but real
+    /// enough that the page lays out.
+    private var host: NSWindow?
+    private var finish: ((Bool) -> Void)?
+    private var timeoutItem: DispatchWorkItem?
+    private var attempts = 0
+
+    /// completion(true) only when a balance was actually parsed and stored.
+    func refresh(timeout: TimeInterval = 30, completion: @escaping (Bool) -> Void) {
+        guard web == nil else { completion(false); return }   // one at a time
+        finish = completion
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .default()                     // same session the window signed in with
+        let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 900), configuration: cfg)
+        w.navigationDelegate = self
+        web = w
+        let win = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 1280, height: 900),
+                           styleMask: [.borderless], backing: .buffered, defer: false)
+        win.contentView = w
+        win.alphaValue = 0
+        win.ignoresMouseEvents = true
+        win.orderBack(nil)
+        host = win
+        attempts = 0
+        let t = DispatchWorkItem { [weak self] in self?.complete(false, "timed out") }
+        timeoutItem = t
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: t)
+        w.load(URLRequest(url: URL(string: "https://account.adobe.com/")!))
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        tryRead(webView)
+    }
+
+    /// The account page is a JS app whose nav renders after load, and the account menu only exists
+    /// once the avatar is clicked. A single fixed delay is a guess; this retries until the text
+    /// actually contains a balance, or gives up.
+    private func tryRead(_ webView: WKWebView) {
+        guard finish != nil else { return }                  // already completed
+        attempts += 1
+        let waited = attempts == 1 ? 2.5 : 2.0
+        DispatchQueue.main.asyncAfter(deadline: .now() + waited) { [weak self] in
+            guard let self, self.finish != nil else { return }
+            webView.evaluateJavaScript(adobeBalanceReadJS) { value, _ in
+                let text = (value as? String) ?? ""
+                if let b = AdobeCreditRules.parseBalance(text) {
+                    AdobeCredits.record(remaining: b.remaining, total: b.total,
+                                        resetDate: AdobeCreditRules.parseResetDate(text))
+                    NotificationCenter.default.post(name: .navigatorAdobeCreditsChanged, object: nil)
+                    self.complete(true, nil)
+                    return
+                }
+                guard self.attempts < 6 else {
+                    // Out of attempts: an expired session looks exactly like this, so the previous
+                    // reading is kept rather than replaced with a wrong one.
+                    self.complete(false, text.isEmpty
+                                  ? "page produced no text after \(self.attempts) attempts"
+                                  : "no balance in \(text.count) chars (sign-in may have expired)")
+                    return
+                }
+                self.tryRead(webView)
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        complete(false, error.localizedDescription)
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        complete(false, error.localizedDescription)
+    }
+
+    private func complete(_ ok: Bool, _ why: String?) {
+        timeoutItem?.cancel(); timeoutItem = nil
+        guard let cb = finish else { return }        // already completed
+        finish = nil
+        web?.stopLoading(); web?.navigationDelegate = nil; web = nil
+        host?.orderOut(nil); host?.contentView = nil; host = nil
+        if !ok { navLog("adobe credits: read failed — \(why ?? "unknown")") }
+        cb(ok)
+    }
+}
+
 /// Sign in to Adobe and read the credit balance — by showing Adobe's own page.
 ///
 /// There is no API for this. Adobe publishes no endpoint for the generative credit balance
@@ -2939,34 +3078,13 @@ final class AdobeAccountWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func readBalance() {
-        // Must pierce SHADOW DOM. Verified against the live page: the balance lives inside
-        // <pandora-react-mini-app-account-menu>'s shadow root, so document.body.innerText returns
-        // 1,215 characters WITHOUT it, while walking shadow roots returns 13,398 characters WITH
-        // it. The first version of this read innerText and would have silently never found a
-        // balance.
-        //
-        // Text rather than CSS selectors: matching Adobe's WORDS ("0/25 credits left") survives a
-        // re-skin; matching their generated class names would not.
-        let js = """
-        (function () {
-          function deep(root, depth, acc) {
-            if (depth > 10) return;
-            acc.push(root === document ? (document.body.innerText || '') : (root.textContent || ''));
-            var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
-            for (var i = 0; i < els.length; i++) {
-              if (els[i].shadowRoot) deep(els[i].shadowRoot, depth + 1, acc);
-            }
-          }
-          var parts = [];
-          deep(document, 0, parts);
-          return parts.join('\\n');
-        })()
-        """
-        web?.evaluateJavaScript(js) { [weak self] value, _ in
+        // Same script the silent reader uses — see adobeBalanceReadJS for why it has to click
+        // the avatar and pierce two shadow roots.
+        web?.evaluateJavaScript(adobeBalanceReadJS) { [weak self] value, _ in
             guard let self else { return }
             let text = (value as? String) ?? ""
             guard let b = AdobeCreditRules.parseBalance(text) else {
-                self.status?.stringValue = "Couldn’t find a balance on this page — click your profile icon first."
+                self.status?.stringValue = "Couldn’t read a balance — sign in, then try again."
                 self.status?.textColor = .systemOrange
                 return
             }
@@ -3025,31 +3143,46 @@ enum AdobeCredits {
     /// Callers are SwiftUI menu actions, which already run on the main thread; NSAlert requires
     /// that anyway, so the invariant is real even without a @MainActor annotation (which the
     /// non-isolated menu closures can't satisfy).
-    static func confirmSpend(count: Int, cost: Int = AdobeCreditRules.fireflyUpscaleCost) -> Bool {
-        let msg = AdobeCreditRules.confirmation(count: count, cost: cost,
-                                                remaining: remaining, total: total,
-                                                spentThisSession: spentSinceReading)
-        let a = NSAlert()
-        a.alertStyle = .warning
-        a.messageText = msg.title
-        var detail = msg.detail
-        if let readAt {
-            let f = RelativeDateTimeFormatter()
-            detail += " Balance last read \(f.localizedString(for: readAt, relativeTo: Date()))."
-            if AdobeCreditRules.isStale(readAt: readAt, now: Date()) {
-                detail += " That reading is old — check it again to be sure."
+    /// Asynchronous because a stale balance is re-read from Adobe FIRST — the number in this
+    /// dialog is the entire point of it, so showing an old one would defeat the purpose.
+    static func confirmSpend(count: Int, cost: Int = AdobeCreditRules.fireflyUpscaleCost,
+                             then: @escaping (Bool) -> Void) {
+        func present() {
+            let msg = AdobeCreditRules.confirmation(count: count, cost: cost,
+                                                    remaining: remaining, total: total,
+                                                    spentThisSession: spentSinceReading)
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = msg.title
+            var detail = msg.detail
+            if let readAt {
+                let f = RelativeDateTimeFormatter()
+                detail += " Balance read \(f.localizedString(for: readAt, relativeTo: Date()))."
+                if AdobeCreditRules.isStale(readAt: readAt, now: Date()) {
+                    detail += " Navigator couldn’t refresh it — sign in again to be sure."
+                }
+            }
+            a.informativeText = detail
+            a.addButton(withTitle: "Use \(count * cost) Credit\(count * cost == 1 ? "" : "s")")
+            a.addButton(withTitle: "Cancel")
+            a.addButton(withTitle: "Check Balance…")
+            switch a.runModal() {
+            case .alertFirstButtonReturn: then(true)
+            case .alertThirdButtonReturn:
+                AdobeAccountWindow.show()
+                then(false)                   // never spend straight after sending them to look
+            default: then(false)
             }
         }
-        a.informativeText = detail
-        a.addButton(withTitle: "Use \(count * cost) Credit\(count * cost == 1 ? "" : "s")")
-        a.addButton(withTitle: "Cancel")
-        a.addButton(withTitle: "Check Balance…")
-        switch a.runModal() {
-        case .alertFirstButtonReturn: return true
-        case .alertThirdButtonReturn:
-            AdobeAccountWindow.show()
-            return false                      // never spend straight after sending them to look
-        default: return false
+        guard AdobeCreditRules.needsRefreshBeforeSpend(readAt: readAt, now: Date()) else {
+            present(); return
+        }
+        // Silent re-read. A failure leaves the previous reading intact and the dialog says so,
+        // rather than blocking the user out of a feature because Adobe didn't answer.
+        BGJobProgress.shared.start("Checking Adobe credits", total: 1)
+        AdobeCreditReader.shared.refresh { ok in
+            BGJobProgress.shared.finish(ok ? "" : "Couldn’t check Adobe credits")
+            present()
         }
     }
 }
@@ -9967,11 +10100,14 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                                 // Confirm ONCE for the whole selection, before anything runs —
                                 // a per-image prompt on a 20-image batch trains people to click
                                 // through, which defeats the point.
-                                guard !targets.isEmpty, AdobeCredits.confirmSpend(count: targets.count) else { return }
-                                // Then one at a time: each is a cloud round trip and Photoshop
-                                // serialises them anyway.
-                                for u in targets {
-                                    fireflyUpscaleForImage(u, scale: f) { out in browser.refreshAndReveal([out]) }
+                                guard !targets.isEmpty else { return }
+                                AdobeCredits.confirmSpend(count: targets.count) { go in
+                                    guard go else { return }
+                                    // Then one at a time: each is a cloud round trip and
+                                    // Photoshop serialises them anyway.
+                                    for u in targets {
+                                        fireflyUpscaleForImage(u, scale: f) { out in browser.refreshAndReveal([out]) }
+                                    }
                                 }
                             })
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
@@ -13307,8 +13443,10 @@ struct ImageViewerView: View {
                 }, imagen: { f in
                     upscaleImagesViaImagen([u], factor: f) { outs in if let o = outs.first { revealNewImage(o) } }
                 }, firefly: { f in
-                    guard AdobeCredits.confirmSpend(count: 1) else { return }
-                    fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
+                    AdobeCredits.confirmSpend(count: 1) { go in
+                        guard go else { return }
+                        fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
+                    }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
             }
@@ -15553,6 +15691,7 @@ struct SetupAssistantView: View {
     @State private var drivesText = ""
     /// Bumped to redraw after the credit reading changes (the store is plain prefs, not observable).
     @State private var adobeTick = 0
+    @State private var adobeRefreshing = false
     @State private var drivesAdded: Int?
     @State private var checking = false
     @State private var checkedAt: Date?
@@ -15592,6 +15731,14 @@ struct SetupAssistantView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("Sign In & Read Balance…") { AdobeAccountWindow.show() }
+                    if AdobeCredits.readAt != nil {
+                        Button(adobeRefreshing ? "Checking…" : "Refresh") {
+                            adobeRefreshing = true
+                            AdobeCreditReader.shared.refresh { _ in
+                                adobeRefreshing = false; adobeTick &+= 1
+                            }
+                        }.disabled(adobeRefreshing)
+                    }
                     if AdobeCredits.remaining != nil {
                         Button("Forget") {
                             Prefs.adobeCreditsRemaining = nil; Prefs.adobeCreditsTotal = nil
@@ -15863,6 +16010,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // One-time: strip the expensive columns out of arrangements saved for network folders.
         // Deferred off the launch path — it stats each saved path to classify the volume, and a
         // stalled share must not hold up the window appearing.
+        // Refresh the Adobe credit reading at launch, but ONLY if one exists — never open a
+        // session or nag someone who has not signed in. Deferred so it can't slow the window
+        // appearing, and it is the only unattended read: everything else is on demand.
+        if Prefs.adobeCreditsReadAt != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                AdobeCreditReader.shared.refresh { ok in
+                    navLog("adobe credits: launch refresh \(ok ? "succeeded" : "skipped/failed")")
+                }
+            }
+        }
         if !Prefs.networkColumnCleanupDone {
             let saved = FolderViewOptionsStore.shared.savedPaths()
             DispatchQueue.global(qos: .utility).async {

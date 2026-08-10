@@ -4788,6 +4788,15 @@ final class AdobeCreditRulesTests: XCTestCase {
         XCTAssertTrue(m.detail.contains("spent 3 credits"))
     }
 
+    /// The confirmation's number is the whole point, so anything older than a few minutes gets
+    /// re-read before spending, and a never-read balance always triggers a read.
+    func testRefreshBeforeSpend() {
+        let t = Date(timeIntervalSince1970: 1_786_000_000)
+        XCTAssertTrue(AdobeCreditRules.needsRefreshBeforeSpend(readAt: nil, now: t))
+        XCTAssertFalse(AdobeCreditRules.needsRefreshBeforeSpend(readAt: t, now: t.addingTimeInterval(60)))
+        XCTAssertTrue(AdobeCreditRules.needsRefreshBeforeSpend(readAt: t, now: t.addingTimeInterval(6 * 60)))
+    }
+
     func testStaleness() {
         let t = Date(timeIntervalSince1970: 1_786_000_000)
         XCTAssertFalse(AdobeCreditRules.isStale(readAt: t, now: t.addingTimeInterval(3600)))
