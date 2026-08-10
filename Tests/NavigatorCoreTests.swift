@@ -4768,3 +4768,58 @@ final class AdobeCreditRulesTests: XCTestCase {
     }
 }
 
+
+
+// MARK: - Layerize batches
+
+final class LayerizeBatchRulesTests: XCTestCase {
+
+    /// key.png and key.jpg in one folder both want "key_Layers". Serially that silently mixed two
+    /// images' layers together; in parallel it is two threads writing the same directory.
+    func testCollidingNamesGetDistinctFolders() {
+        let out = LayerizeBatchRules.dedupedOutputDirs(["/a/key_Layers", "/a/key_Layers"])
+        XCTAssertEqual(out, ["/a/key_Layers", "/a/key_Layers 2"])
+        XCTAssertEqual(Set(out).count, 2, "every source must get its own folder")
+    }
+
+    func testThreeWayCollision() {
+        let out = LayerizeBatchRules.dedupedOutputDirs(Array(repeating: "/a/k_Layers", count: 3))
+        XCTAssertEqual(out, ["/a/k_Layers", "/a/k_Layers 2", "/a/k_Layers 3"])
+    }
+
+    /// Same base name in DIFFERENT folders is not a collision and must not be renamed.
+    func testSameNameDifferentFoldersIsFine() {
+        let out = LayerizeBatchRules.dedupedOutputDirs(["/a/key_Layers", "/b/key_Layers"])
+        XCTAssertEqual(out, ["/a/key_Layers", "/b/key_Layers"])
+    }
+
+    /// An unrelated folder already on disk must not be written into.
+    func testAvoidsExistingFoldersOnDisk() {
+        let taken: Set<String> = ["/a/key_Layers", "/a/key_Layers 2"]
+        XCTAssertEqual(LayerizeBatchRules.dedupedOutputDirs(["/a/key_Layers"], exists: { taken.contains($0) }),
+                       ["/a/key_Layers 3"])
+    }
+
+    func testOrderIsPreservedAndEmptyIsSafe() {
+        XCTAssertEqual(LayerizeBatchRules.dedupedOutputDirs(["/z_Layers", "/a_Layers"]),
+                       ["/z_Layers", "/a_Layers"])
+        XCTAssertTrue(LayerizeBatchRules.dedupedOutputDirs([]).isEmpty)
+    }
+
+    /// "3 of 10" is misleading when three are in flight, so the label reports both.
+    func testProgressLabelDescribesParallelWork() {
+        let s = LayerizeBatchRules.progressLabel(done: 4, running: 3, total: 10, current: nil)
+        XCTAssertTrue(s.contains("4 of 10"))
+        XCTAssertTrue(s.contains("3 running"))
+        // A single image gets the plain wording, with no misleading counts.
+        let one = LayerizeBatchRules.progressLabel(done: 0, running: 1, total: 1, current: "a.png")
+        XCTAssertTrue(one.contains("a.png"))
+        XCTAssertFalse(one.contains("running"))
+    }
+
+    /// Conservative on purpose — fal.ai publishes no per-key concurrency limit.
+    func testConcurrencyIsBoundedAndSane() {
+        XCTAssertGreaterThan(LayerizeBatchRules.maxConcurrent, 1, "the point is to be faster than serial")
+        XCTAssertLessThanOrEqual(LayerizeBatchRules.maxConcurrent, 4, "not hammering an undocumented limit")
+    }
+}
