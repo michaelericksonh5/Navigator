@@ -2161,21 +2161,61 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
         guard a.runModal() == .alertFirstButtonReturn else { return }
     }
 
-    navLog("layerize: \(plan.count) image(s)\(refusals.isEmpty ? "" : ", \(refusals.count) refused")")
+    // Each image gets its OWN output folder, resolved up front. Two sources can want the same one
+    // (key.png and key.jpg both derive "key_Layers"), which serially mixed their layers together
+    // and in parallel is two threads writing one directory — so collisions are broken here, once,
+    // before any work starts. See LayerizeBatchRules.
+    let fm = FileManager.default
+    let proposedDirs = plan.map { layerizeOutputDir($0.url).path }
+    let outDirs = LayerizeBatchRules.dedupedOutputDirs(proposedDirs) { fm.fileExists(atPath: $0) }
+
+    navLog("layerize: \(plan.count) image(s)\(refusals.isEmpty ? "" : ", \(refusals.count) refused"), \(LayerizeBatchRules.maxConcurrent) at a time")
     DispatchQueue.main.async { BGJobProgress.shared.start("Layerizing", total: 0) }
-    DispatchQueue.global(qos: .userInitiated).async {
-        var produced: [URL] = []
-        var errors: [String] = refusals
-        for (idx, item) in plan.enumerated() {
-            let src = item.url
-            DispatchQueue.main.async {
-                BGJobProgress.shared.label = plan.count == 1
-                    ? "Layerizing \(src.lastPathComponent) — this takes a minute or two"
-                    : "Layerizing \(idx + 1) of \(plan.count) — \(src.lastPathComponent)"
+
+    // PARALLEL, bounded. Each call is 50-180s, so a serial batch of ten was 8-30 minutes.
+    // OperationQueue rather than concurrentPerform: it caps in-flight work at a documented
+    // number instead of fanning out to core count, and falLayerize is a blocking call that would
+    // otherwise tie up the whole cooperative pool.
+    let queue = OperationQueue()
+    queue.maxConcurrentOperationCount = LayerizeBatchRules.maxConcurrent
+    queue.qualityOfService = .userInitiated
+
+    // Every mutation below happens under this lock. Without it the appends race and the counts lie.
+    let lock = NSLock()
+    var produced: [URL] = []
+    var errors: [String] = refusals
+    var done = 0
+    var running = 0
+
+    func note(_ body: () -> Void) { lock.lock(); body(); lock.unlock() }
+    func publishProgress(current: String?) {
+        lock.lock()
+        let d = done, r = running
+        lock.unlock()
+        DispatchQueue.main.async {
+            BGJobProgress.shared.label = LayerizeBatchRules.progressLabel(
+                done: d, running: r, total: plan.count, current: current)
+        }
+    }
+
+    for (idx, item) in plan.enumerated() {
+        let src = item.url
+        let dir = URL(fileURLWithPath: outDirs[idx])
+        queue.addOperation {
+            note { running += 1 }
+            publishProgress(current: src.lastPathComponent)
+            defer {
+                note { running -= 1; done += 1 }
+                publishProgress(current: nil)
             }
-            guard var cg = loadCGImage(src) else { errors.append("\(src.lastPathComponent): can’t read"); continue }
+
+            guard var cg = loadCGImage(src) else {
+                note { errors.append("\(src.lastPathComponent): can’t read") }; return
+            }
             if let to = item.resizeTo, let r = resampleCG(cg, to: to) { cg = r }
-            guard let png = encodePNG(cg) else { errors.append("\(src.lastPathComponent): encode failed"); continue }
+            guard let png = encodePNG(cg) else {
+                note { errors.append("\(src.lastPathComponent): encode failed") }; return
+            }
 
             let tier = LayerizeRules.tier(width: cg.width, height: cg.height)
             let keepBase = LayerizeRules.shouldKeepBase(transparentFraction: transparentFraction(src))
@@ -2183,47 +2223,54 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
 
             let (layers, err) = falLayerize(pngData: png, tier: tier, key: key)
             guard err == nil else {
-                navLog("  RESULT: error — \(err ?? "")")
-                errors.append("\(src.lastPathComponent): \(err ?? "layerize failed")")
-                continue
+                navLog("  RESULT: error — \(err ?? "") [\(src.lastPathComponent)]")
+                note { errors.append("\(src.lastPathComponent): \(err ?? "layerize failed")") }
+                return
             }
 
-            let dir = layerizeOutputDir(src)
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
             let stem = src.deletingPathExtension().lastPathComponent
             var meta: [[String: Any]] = []
             var saved = 0
             for l in layers {
-                // A mostly-transparent input gets a flat INVENTED colour as its base rather
-                // than an inpainted background — junk, so it's skipped.
+                // A mostly-transparent input gets a flat INVENTED colour as its base rather than
+                // an inpainted background — junk, so it's skipped.
                 if l.zIndex == 0 && l.name == nil && !keepBase { continue }
                 guard let u = URL(string: l.url), let d = try? Data(contentsOf: u) else {
-                    errors.append("\(src.lastPathComponent): couldn’t download layer \(l.zIndex)"); continue
+                    note { errors.append("\(src.lastPathComponent): couldn’t download layer \(l.zIndex)") }
+                    continue
                 }
                 let fn = LayerizeRules.fileName(stem: stem, zIndex: l.zIndex, name: l.name)
                 let dst = dir.appendingPathComponent(fn)
-                do { try d.write(to: dst); produced.append(dst); saved += 1 }
-                catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
+                do { try d.write(to: dst); note { produced.append(dst) }; saved += 1 }
+                catch { note { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") } }
                 var m: [String: Any] = ["z_index": l.zIndex, "file": fn]
                 if let n = l.name { m["name"] = n }
                 if let de = l.detail { m["description"] = de }
                 if let bb = l.boundingBox { m["bounding_box"] = bb }
                 meta.append(m)
             }
-            // bounding boxes and descriptions are the only way to re-composite later, so they
-            // are written alongside rather than discarded with the response.
+            // Bounding boxes and descriptions are the only way to re-composite later, so they are
+            // written alongside rather than discarded with the response.
             if let j = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .withoutEscapingSlashes]) {
                 try? j.write(to: dir.appendingPathComponent("_layers.json"))
             }
             navLog("  RESULT: \(saved) layer(s) → \(dir.path)")
-            if saved == 0 { errors.append("\(src.lastPathComponent): no layers were saved") }
+            if saved == 0 { note { errors.append("\(src.lastPathComponent): no layers were saved") } }
         }
+    }
+
+    // Off the main thread: waitUntilAllOperationsAreFinished blocks, and blocking main would
+    // freeze the window for the whole batch.
+    DispatchQueue.global(qos: .userInitiated).async {
+        queue.waitUntilAllOperationsAreFinished()
+        lock.lock(); let outs = produced, errs = errors; lock.unlock()
         DispatchQueue.main.async {
-            BGJobProgress.shared.finish("Layerized \(produced.count) layer\(produced.count == 1 ? "" : "s")")
-            if !errors.isEmpty {
-                showBGSummary(app: "Layerize", done: produced.count, total: plan.count, errors: errors, verb: "layerized")
+            BGJobProgress.shared.finish("Layerized \(outs.count) layer\(outs.count == 1 ? "" : "s")")
+            if !errs.isEmpty {
+                showBGSummary(app: "Layerize", done: outs.count, total: plan.count, errors: errs, verb: "layerized")
             }
-            onDone?(produced)
+            onDone?(outs)
         }
     }
 }

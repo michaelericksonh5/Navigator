@@ -3962,3 +3962,53 @@ enum AdobeCreditRules {
         return (title, lines.joined(separator: " "))
     }
 }
+
+// MARK: - Layerize batches
+
+enum LayerizeBatchRules {
+    /// How many layerize calls run at once.
+    ///
+    /// Each call takes 50–180 s, so a serial batch of ten is 8–30 minutes. fal.ai does not
+    /// document a per-key concurrency limit, so this is deliberately conservative: three is a
+    /// 3x speed-up while staying well clear of anything that looks like hammering, and a 429
+    /// would cost a paid generation to discover. Raise it only with evidence.
+    static let maxConcurrent = 3
+
+    /// Output folder names for a batch, with collisions broken.
+    ///
+    /// The folder is derived from the file's base name, so `key.png` and `key.jpg` in the SAME
+    /// directory both want `key_Layers`. Serially that silently mixed two images' layers into one
+    /// folder; in parallel it is a race — two threads creating the same directory and writing
+    /// files whose names can collide. Both get a distinct folder instead.
+    ///
+    /// `exists` reports whether a candidate is already taken on disk, so a re-run beside an
+    /// unrelated folder of the same name doesn't clobber it. Input order is preserved.
+    static func dedupedOutputDirs(_ proposed: [String], exists: (String) -> Bool = { _ in false }) -> [String] {
+        var used = Set<String>()
+        var out: [String] = []
+        for p in proposed {
+            if !used.contains(p), !exists(p) {
+                used.insert(p); out.append(p); continue
+            }
+            // "…_Layers" -> "…_Layers 2", " 3", … Matches the Keep Both convention elsewhere.
+            var i = 2
+            var candidate = "\(p) \(i)"
+            while used.contains(candidate) || exists(candidate) {
+                i += 1
+                candidate = "\(p) \(i)"
+            }
+            used.insert(candidate); out.append(candidate)
+        }
+        return out
+    }
+
+    /// Progress text for a parallel run. "3 of 10" is a lie when three are in flight at once.
+    static func progressLabel(done: Int, running: Int, total: Int, current: String?) -> String {
+        if total == 1 {
+            return "Layerizing \(current ?? "image") — this takes a minute or two"
+        }
+        var s = "Layerizing \(done) of \(total) done"
+        if running > 0 { s += ", \(running) running" }
+        return s
+    }
+}
