@@ -102,8 +102,6 @@ final class NavigatorFinderSync: FIFinderSync {
             add(upSub, "Local resample ×4 (free)", "upscale-3",
                 Self.icon(systemSymbol: "desktopcomputer"))
             upSub.addItem(.separator())
-            add(upSub, "Imagen 4 ×2", "upscale-imagen2", Self.vertexIcon)
-            add(upSub, "Imagen 4 ×4", "upscale-imagen4", Self.vertexIcon)
             up.submenu = upSub
             sub.addItem(up)
 
