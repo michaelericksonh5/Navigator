@@ -1590,18 +1590,19 @@ enum ServiceIcon {
     }.labelStyle(.titleAndIcon)
 }
 
-// "Upscale (AI)" submenu — the low-quality fal preset plus Vertex/Imagen 4 ×2/×4.
+// "Upscale (AI)" submenu — the fal.ai presets, plus Photoshop's Firefly upscaler.
 @ViewBuilder func upscaleMenu(label: String = "Upscale (AI)",
                               fal: @escaping (UpscaleOption) -> Void,
-                              imagen: @escaping (Int) -> Void,
                               firefly: ((Int) -> Void)? = nil) -> some View {
     Menu {
         ForEach(upscaleOptions) { o in
             Button { fal(o) } label: { serviceLabel(o.label, ServiceIcon.fal) }
         }
-        Divider()
-        Button { imagen(2) } label: { serviceLabel("Upscale (Imagen 4) ×2", ServiceIcon.vertex) }
-        Button { imagen(4) } label: { serviceLabel("Upscale (Imagen 4) ×4", ServiceIcon.vertex) }
+        // NOTE: "Upscale (Imagen 4) ×2/×4" used to sit here. Google RETIRED the model —
+        // imagen-4.0-upscale-preview returns 404 NOT_FOUND from Vertex, and Google's own
+        // documentation page for it is a 404 as well. It was a preview model, and preview models
+        // do not come back. Removed rather than left in place: a menu item that always errors is
+        // worse than one that isn't there.
         // Only with Photoshop installed — it IS the engine here, unlike the two above.
         if let firefly, PhotoshopIcon.image != nil {
             Divider()
@@ -2588,13 +2589,13 @@ private func cleanH5GError(_ r: H5GResult) -> String {
 func promptVertexSetup() {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = "Vertex (Imagen) isn’t set up on this Mac"
-    a.informativeText = "Imagen upscaling needs Node.js and the H5G ai-connect plugin installed. Ask Michael for the h5g-ai-connect setup, then try again."
+    a.informativeText = "Navigator's Vertex features need Node.js and the H5G ai-connect plugin installed. Ask Michael for the h5g-ai-connect setup, then try again."
     a.addButton(withTitle: "OK"); a.runModal()
 }
 func promptVertexSignin() {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = "Sign in to Vertex first"
-    a.informativeText = "Imagen upscaling runs through your High 5 Games Vertex account. Sign in from the menu bar: AI → Sign in to Vertex (Imagen)…"
+    a.informativeText = "Navigator's Vertex features run through your High 5 Games account. Sign in from the menu bar: AI → Sign in to Vertex…"
     a.addButton(withTitle: "OK"); a.runModal()
 }
 
@@ -2603,105 +2604,6 @@ func promptVertexSignin() {
 // Photoshop present we back it on WHITE, upscale, then re-cut with Photoshop's
 // Remove BG (best edges). Without Photoshop we back on GREEN and rebuild the
 // cutout from the original matte. Non-blocking progress + summary.
-func upscaleImagesViaImagen(_ srcs: [URL], factor: Int, onDone: (([URL]) -> Void)? = nil) {
-    let imgs = srcs.filter { isImageFile($0) }
-    guard !imgs.isEmpty else { NSSound.beep(); return }
-    guard resolveNode() != nil, resolveH5GClient() != nil else { DispatchQueue.main.async { promptVertexSetup() }; return }
-    guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
-    guard confirmUpscale(count: imgs.count, label: "Imagen 4 ×\(factor)", perImage: 0.06) else { return }
-    let psAvail = PhotoshopIcon.url != nil
-    navLog("Imagen upscale ×\(factor): \(imgs.count) image(s)  photoshop=\(psAvail)  node=\(resolveNode() ?? "?")  client=\(resolveH5GClient() ?? "?")")
-    DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling", total: 0) }
-    DispatchQueue.global(qos: .userInitiated).async {
-        var outs: [URL] = []; var errors: [String] = []; var usedPS = false
-        for (idx, src) in imgs.enumerated() {
-            DispatchQueue.main.async {
-                BGJobProgress.shared.label = imgs.count == 1
-                    ? "Upscaling \(src.lastPathComponent) — Imagen ×\(factor)"
-                    : "Upscaling \(idx + 1) of \(imgs.count) — Imagen ×\(factor)"
-            }
-            // Preflight against Imagen's documented limits (17 MP output, 10 MB
-            // input) so we fail clearly and cancel instead of spending a call.
-            guard let (w, h) = imagePixelSize(src) else {
-                navLog("  SKIP: can’t read dimensions"); errors.append("\(src.lastPathComponent): can’t read the image"); continue
-            }
-            let outMP = Double(w * factor) * Double(h * factor) / 1_000_000
-            if outMP > 17 {
-                let x2fits = Double(w * 2) * Double(h * 2) / 1_000_000 <= 17
-                let hint = (factor == 4 && x2fits) ? " ×2 (\(String(format: "%.1f", outMP / 4)) MP) would fit." : " Use a smaller source or a lower factor."
-                let m = "can’t upscale \(w)×\(h) at ×\(factor) — that’s \(String(format: "%.1f", outMP)) MP, over Imagen’s 17 MP limit.\(hint)"
-                navLog("  SKIP: \(m)"); errors.append("\(src.lastPathComponent): \(m)"); continue
-            }
-            let transparent = imageHasTransparency(src)
-            navLog("[\(idx + 1)/\(imgs.count)] \(src.lastPathComponent) \(w)×\(h) transparent=\(transparent) → \(String(format: "%.1f", outMP)) MP")
-            var inputPath = src.path
-            var tmpInput: URL? = nil
-            // Transparent → composite on a full solid backing (white if we'll re-cut
-            // with Photoshop, green if we'll rebuild from the matte).
-            if transparent, let cg = loadCGImage(src) {
-                let backing: CGColor = psAvail ? CGColor(red: 1, green: 1, blue: 1, alpha: 1) : CGColor(red: 0, green: 1, blue: 0, alpha: 1)
-                if let g = compositeOnColor(cg, backing), let png = encodePNG(g) {
-                    let t = FileManager.default.temporaryDirectory.appendingPathComponent("nav_imagen_in_\(idx).png")
-                    if (try? png.write(to: t)) != nil { inputPath = t.path; tmpInput = t }
-                    else { navLog("  backing composite temp write FAILED — sending original transparent PNG") }
-                }
-            }
-            let inBytes = ((try? FileManager.default.attributesOfItem(atPath: inputPath))?[.size] as? Int) ?? 0
-            if inBytes > 10 * 1024 * 1024 {
-                if let t = tmpInput { try? FileManager.default.removeItem(at: t) }
-                let m = "can’t upscale — the input is \(String(format: "%.1f", Double(inBytes) / 1_048_576)) MB, over Imagen’s 10 MB limit. Flatten or downsize the source first."
-                navLog("  SKIP: \(m)"); errors.append("\(src.lastPathComponent): \(m)"); continue
-            }
-            let args = ["imagen-upscale", inputPath, "--factor", "x\(factor)", "--out", FileManager.default.temporaryDirectory.path]
-            var r = runH5GClient(args)
-            // Imagen's diffusion upscaler blips transiently ("no image returned"),
-            // which doesn't bill — one retry kills most spurious failures.
-            if r.code != 0 || parseSavedPath(r.out) == nil { navLog("  attempt 1 failed — retrying once"); r = runH5GClient(args) }
-            if let t = tmpInput { try? FileManager.default.removeItem(at: t) }
-            guard r.code == 0, let saved = parseSavedPath(r.out) else {
-                let msg = cleanH5GError(r)
-                navLog("  RESULT: error — \(msg)")
-                errors.append("\(src.lastPathComponent): \(msg)"); continue
-            }
-            let savedURL = URL(fileURLWithPath: saved)   // opaque upscaled result
-            let dst = upscaleOutputURL(src)
-            if transparent && psAvail {
-                // Re-cut the white-backed upscale with Photoshop's Remove BG → clean
-                // high-res transparent PNG (the tool that's best at it).
-                usedPS = true
-                let r2 = removeBackgroundOnce(src: savedURL, out: dst, reportFinalError: false)
-                try? FileManager.default.removeItem(at: savedURL)
-                if r2.ok {
-                    outs.append(dst); navLog("  RESULT: ok (Photoshop re-cut) → \(dst.lastPathComponent)")
-                } else {
-                    navLog("  RESULT: Photoshop re-cut failed — \(r2.message)")
-                    errors.append("\(src.lastPathComponent): upscaled, but Photoshop Remove BG failed — \(r2.message)")
-                }
-            } else {
-                do {
-                    let data = try Data(contentsOf: savedURL)
-                    // No Photoshop: rebuild transparency from the original matte
-                    // (green backing); direct copy for opaque sources.
-                    let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: data) ?? stripGreen(data) ?? data) : data
-                    try finalData.write(to: dst)
-                    try? FileManager.default.removeItem(at: savedURL)
-                    outs.append(dst)
-                    navLog("  RESULT: ok\(transparent ? " (matte re-cut)" : "") → \(dst.lastPathComponent)")
-                } catch {
-                    navLog("  RESULT: save failed — \(error.localizedDescription)")
-                    errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)")
-                }
-            }
-        }
-        navLog("Imagen upscale done: \(outs.count) ok, \(errors.count) error(s)")
-        DispatchQueue.main.async {
-            if usedPS { hideApp(bundleID: "com.adobe.Photoshop") }
-            BGJobProgress.shared.finish("Upscaled \(outs.count) of \(imgs.count)")
-            if !errors.isEmpty { showBGSummary(app: "Upscale (Imagen 4)", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
-            if !outs.isEmpty { onDone?(outs) }
-        }
-    }
-}
 
 // Batch Remove BG on a FOLDER (Photoshop) — shared by Navigator's menu and Finder.
 // Images under a folder for a batch AI op: recurse, skip "EN"/"en" subfolders
@@ -2775,14 +2677,6 @@ func batchUpscaleFolderViaFal(_ folder: URL, option: UpscaleOption, onDone: (() 
         onDone?(); return
     }
     upscaleImagesViaFal(imgs, option: option) { _ in onDone?() }
-}
-func batchUpscaleFolderViaImagen(_ folder: URL, factor: Int, onDone: (() -> Void)? = nil) {
-    let imgs = batchImageURLs(in: folder, skipSuffix: "_upscaled")
-    guard !imgs.isEmpty else {
-        DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
-        onDone?(); return
-    }
-    upscaleImagesViaImagen(imgs, factor: factor) { _ in onDone?() }
 }
 
 // Remove BG for ONE file, retrying a failure before giving up.
@@ -6189,11 +6083,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     // Upscale the selected image(s) via Vertex/Imagen 4 → "<name>_upscaled.png".
-    func upscaleImagen(_ ids: Set<String>, factor: Int) {
-        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
-        guard !urls.isEmpty else { NSSound.beep(); return }
-        upscaleImagesViaImagen(urls, factor: factor) { [weak self] outs in self?.refreshAndReveal(outs) }
-    }
 
     // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
@@ -6226,10 +6115,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func batchUpscale(_ ids: Set<String>, _ option: UpscaleOption) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
         batchUpscaleFolderViaFal(it.url, option: option) { [weak self] in self?.refresh() }
-    }
-    func batchUpscaleImagen(_ ids: Set<String>, factor: Int) {
-        guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
-        batchUpscaleFolderViaImagen(it.url, factor: factor) { [weak self] in self?.refresh() }
     }
     // What the address bar shows: inside Google Drive, the clean username-free
     // "Google Drive/Shared drives/…" form (directly shareable — a coworker pastes
@@ -9806,7 +9691,6 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
                 upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
-                            imagen: { f in browser.upscaleImagen(ids, factor: f) },
                             firefly: { f in
                                 let targets = browser.items.filter {
                                     ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url)
@@ -9833,8 +9717,7 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             } else if browser.items.filter({ ids.contains($0.id) }).count == 1,
                       browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
                 upscaleMenu(label: "Batch Upscale (AI)",
-                            fal: { opt in browser.batchUpscale(ids, opt) },
-                            imagen: { f in browser.batchUpscaleImagen(ids, factor: f) })
+                            fal: { opt in browser.batchUpscale(ids, opt) })
             }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
@@ -13152,8 +13035,6 @@ struct ImageViewerView: View {
                 }
                 upscaleMenu(fal: { opt in
                     upscaleImagesViaFal([u], option: opt) { outs in if let o = outs.first { revealNewImage(o) } }
-                }, imagen: { f in
-                    upscaleImagesViaImagen([u], factor: f) { outs in if let o = outs.first { revealNewImage(o) } }
                 }, firefly: { f in
                     guard AdobeCredits.confirmSpend(count: 1) else { return }
                     fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
@@ -15373,7 +15254,7 @@ struct SetupItem: Identifiable {
                       settingsLabel: "Register & Explain",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultBrowserAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "vertex", title: "Vertex sign-in (Google, company-metered)",
-                      why: "Powers Restyle and the Imagen upscalers. A browser sign-in with your @high5games.com account — there is no key to paste, and no gcloud to install. Lasts about 30 days, then asks once more. Use AI ▸ Sign in to Vertex (Imagen)…",
+                      why: "Powers Restyle. A browser sign-in with your @high5games.com account — there is no key to paste, and no gcloud to install. Lasts about 30 days, then asks once more. Use AI ▸ Sign in to Vertex…",
                       probe: { _ in vertexSignedIn() ? .granted : .off },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Sign in…",
@@ -15944,12 +15825,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             }
         case "exportpng":
             if !psds.isEmpty { exportPSDsToPNG(psds) }
-        case "upscale-imagen2":
-            folders.forEach { batchUpscaleFolderViaImagen($0, factor: 2) }
-            if !images.isEmpty { upscaleImagesViaImagen(images, factor: 2) }
-        case "upscale-imagen4":
-            folders.forEach { batchUpscaleFolderViaImagen($0, factor: 4) }
-            if !images.isEmpty { upscaleImagesViaImagen(images, factor: 4) }
         default: break
         }
     }
@@ -15962,8 +15837,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
         .init(title: "Chroma Key BG",          action: "chromakey",    requires: "com.adobe.AfterEffects", acceptsFolders: true),
         .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: true),
-        .init(title: "Upscale (Imagen 4) ×2",  action: "upscale-imagen2", requires: nil,                   acceptsFolders: true),
-        .init(title: "Upscale (Imagen 4) ×4",  action: "upscale-imagen4", requires: nil,                   acceptsFolders: true),
     ]
     // Older names to clean up so we don't leave stale duplicates behind (includes
     // the retired Art/Photoreal upscalers now replaced by Imagen).
@@ -16535,7 +16408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let qaItem = aiMenu.addItem(withTitle: "Install Finder Quick Actions", action: #selector(installFinderQuickActions(_:)), keyEquivalent: "")
         qaItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
-        let vSignIn = aiMenu.addItem(withTitle: "Sign in to Vertex (Imagen)…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
+        let vSignIn = aiMenu.addItem(withTitle: "Sign in to Vertex…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
         vSignIn.target = self
         let vStatus = aiMenu.addItem(withTitle: "Vertex Status…", action: #selector(vertexStatusAction(_:)), keyEquivalent: "")
         vStatus.target = self
