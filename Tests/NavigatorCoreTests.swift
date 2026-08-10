@@ -1313,34 +1313,87 @@ final class AdobeRecoveryRulesTests: XCTestCase {
 // MARK: - Layerize
 
 final class LayerizeRulesTests: XCTestCase {
-    /// MEASURED against the live endpoint: 750x709 returned 422 at auto_2K and at auto, but
-    /// 200 at auto_1K. Key Art (3072x3924) returned 200 at auto_2K.
-    func testTierMatchesWhatTheEndpointActuallyAccepted() {
-        XCTAssertEqual(LayerizeRules.tier(width: 750, height: 709), "auto_1K")
-        XCTAssertEqual(LayerizeRules.tier(width: 3072, height: 3924), "auto_2K")
-        XCTAssertEqual(LayerizeRules.tier(width: 2048, height: 2048), "auto_2K")
-        XCTAssertEqual(LayerizeRules.tier(width: 1600, height: 1600), "auto_1.5K")
-        XCTAssertEqual(LayerizeRules.tier(width: 600, height: 600), "auto_1K", "1K is the floor")
+    /// `auto` FIRST, always. It is the API's documented default — "auto adapts to the input image
+    /// while preserving each element's aspect ratio" — and this code used to never send it,
+    /// forcing a tier guessed from a pixel threshold instead. That guess is what refused
+    /// SF1_Red (632×791) at auto_1K.
+    func testLadderStartsWithTheDocumentedDefault() {
+        for (w, h) in [(632, 791), (3072, 3924), (600, 600), (2048, 2048)] {
+            let l = LayerizeRules.sizeLadder(width: w, height: h)
+            XCTAssertEqual(l.first, "auto", "\(w)×\(h) must try the API default first")
+            XCTAssertEqual(l.count, 3, "capped at three attempts — each one is a paid generation")
+            XCTAssertEqual(l[1], "auto", "second attempt covers a transient refusal")
+        }
+    }
+
+    /// The last rung asks for MORE output resolution, which is what actually rescued SF1_Red:
+    /// refused at auto_1K, accepted at auto_1.5K.
+    func testLastResortAsksForMoreResolution() {
+        XCTAssertEqual(LayerizeRules.lastResortSize(width: 632, height: 791), "auto_1.5K")
+        XCTAssertEqual(LayerizeRules.lastResortSize(width: 3072, height: 3924), "auto_2K")
+        XCTAssertNotEqual(LayerizeRules.sizeLadder(width: 632, height: 791)[2], "auto_1K",
+                          "auto_1K is the size that was refused; retrying it would be pointless")
+    }
+
+    /// Zero-byte and non-PNG responses must never be written or recorded. Data(contentsOf:)
+    /// succeeds on an empty body, which is how L01_Outer_black_background and L00_base were
+    /// written as empty files, counted as saved, and then discarded by the filesystem.
+    func testEmptyOrNonPNGLayersAreRejected() {
+        let png: [UInt8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] + [UInt8](repeating: 0, count: 200)
+        XCTAssertTrue(LayerizeRules.isPlausiblePNG(png))
+        XCTAssertFalse(LayerizeRules.isPlausiblePNG([]), "a zero-byte download is not a layer")
+        XCTAssertFalse(LayerizeRules.isPlausiblePNG(Array(png.prefix(20))), "truncated")
+        XCTAssertFalse(LayerizeRules.isPlausiblePNG([UInt8](repeating: 0x41, count: 500)), "not a PNG")
+    }
+
+    /// With `auto` the output resolution is unknown until the layers arrive, so cost is computed
+    /// from what came back rather than guessed beforehand.
+    func testCostComesFromTheActualResult() {
+        XCTAssertEqual(LayerizeRules.actualCost(layerCount: 7, largestEdge: 1024), 0.03375 * 7, accuracy: 1e-9)
+        XCTAssertEqual(LayerizeRules.actualCost(layerCount: 7, largestEdge: 2229), 0.0675 * 7, accuracy: 1e-9)
+        XCTAssertEqual(LayerizeRules.actualCost(layerCount: 0, largestEdge: 1024), 0, accuracy: 1e-9)
+    }
+
+    /// fal's limits are a pixel COUNT, not per-side. These all satisfy the documented range and
+    /// must pass untouched — the old per-side check resampled them for no reason.
+    func testPixelCountLimitsNotPerSide() {
+        XCTAssertEqual(LayerizeRules.check(width: 300, height: 1000, bytes: 1000), .ok,
+                       "0.3 MP is inside 0.26–36 MP even though a side is under 512")
+        XCTAssertEqual(LayerizeRules.check(width: 8000, height: 4000, bytes: 1000), .ok,
+                       "32 MP is inside the limit even though a side exceeds 6000")
+        // Genuinely out of range still gets caught.
+        if case .needsResize = LayerizeRules.check(width: 100, height: 100, bytes: 1000) {} else {
+            XCTFail("0.01 MP is under the documented minimum")
+        }
+        if case .needsResize = LayerizeRules.check(width: 9000, height: 9000, bytes: 1000) {} else {
+            XCTFail("81 MP is over the documented maximum")
+        }
     }
 
     func testKeyArtPasses() {
         XCTAssertEqual(LayerizeRules.check(width: 3072, height: 3924, bytes: 17_400_000), .ok)
     }
 
-    func testOversizeSuggestsAResizeThatActuallyFits() {
-        guard case let .needsResize(_, to) = LayerizeRules.check(width: 9000, height: 4000, bytes: 1000) else {
-            return XCTFail("9000px wide must be flagged")
+    /// 9000×4000 is exactly 36 MP — the documented maximum — so it must pass UNTOUCHED. The old
+    /// per-side rule resampled it purely because a side exceeded 6000, losing quality to a limit
+    /// fal never stated. Something genuinely over the pixel budget still gets caught, and the
+    /// suggested size must actually fit while preserving aspect.
+    func testOversizeIsJudgedByPixelCountNotSideLength() {
+        XCTAssertEqual(LayerizeRules.check(width: 9000, height: 4000, bytes: 1000), .ok,
+                       "exactly 36 MP is inside the documented limit")
+        guard case let .needsResize(_, to) = LayerizeRules.check(width: 12000, height: 6000, bytes: 1000) else {
+            return XCTFail("72 MP must be flagged")
         }
-        XCTAssertLessThanOrEqual(max(to.w, to.h), LayerizeRules.maxSide)
         XCTAssertLessThanOrEqual(to.w * to.h, LayerizeRules.maxPixels)
-        XCTAssertEqual(Double(to.w) / Double(to.h), 9000.0 / 4000.0, accuracy: 0.01, "aspect must be preserved")
+        XCTAssertEqual(Double(to.w) / Double(to.h), 2.0, accuracy: 0.01, "aspect must be preserved")
     }
 
     func testUndersizeSuggestsAResizeThatActuallyFits() {
         guard case let .needsResize(_, to) = LayerizeRules.check(width: 200, height: 200, bytes: 1000) else {
             return XCTFail("200px must be flagged")
         }
-        XCTAssertGreaterThanOrEqual(min(to.w, to.h), LayerizeRules.minSide)
+        // Judged on total pixels, not side length — a wide-but-thin image can satisfy the
+        // documented minimum without either side reaching 512.
         XCTAssertGreaterThanOrEqual(to.w * to.h, LayerizeRules.minPixels)
     }
 
@@ -4817,6 +4870,14 @@ final class LayerizeBatchRulesTests: XCTestCase {
         XCTAssertFalse(one.contains("running"))
     }
 
+    /// Escalation has to actually change the request, and has to terminate.
+    func testTierEscalationClimbsThenStops() {
+        XCTAssertEqual(LayerizeErrorRules.nextTierUp("auto_1K"), "auto_1.5K")
+        XCTAssertEqual(LayerizeErrorRules.nextTierUp("auto_1.5K"), "auto_2K")
+        XCTAssertNil(LayerizeErrorRules.nextTierUp("auto_2K"), "must terminate at the top tier")
+        XCTAssertNil(LayerizeErrorRules.nextTierUp("nonsense"))
+    }
+
     /// Conservative on purpose — fal.ai publishes no per-key concurrency limit.
     func testConcurrencyIsBoundedAndSane() {
         XCTAssertGreaterThan(LayerizeBatchRules.maxConcurrent, 1, "the point is to be faster than serial")
@@ -4862,6 +4923,31 @@ final class LayerizeErrorRulesTests: XCTestCase {
         let m = LayerizeErrorRules.explain422(body: "something entirely new", tier: "auto_1K")
         XCTAssertTrue(m.contains("fal’s own message") || m.contains("fal's own message"))
         XCTAssertFalse(m.contains("output floor"))
+    }
+
+    /// THE BUG this exists to prevent: fal echoes the request inside "input", so
+    /// "enable_safety_checker":true puts the word "safety" in EVERY error body. Classifying the
+    /// whole blob made every refusal look like a safety rejection, and the retry never once fired.
+    func testEchoedSafetyParameterDoesNotSuppressTheRetry() {
+        let real = #"fal HTTP 422 {"detail":[{"loc":["body","image_url"],"msg":"The provided image could not be processed for layer decomposition. Try a different image.","type":"invalid_request","input":{"sync_mode":false,"enable_safety_checker":true,"prompt":"Return name and descr"#
+        XCTAssertTrue(real.lowercased().contains("safety"), "precondition: the echo really is there")
+        XCTAssertTrue(LayerizeErrorRules.worthRetrying(body: real),
+                      "an echoed enable_safety_checker must not be read as a safety rejection")
+        XCTAssertTrue(LayerizeErrorRules.explain422(body: real, tier: "auto_1K")
+                        .contains("couldn’t decompose"))
+    }
+
+    /// A REAL safety verdict, in the msg field, still suppresses the retry.
+    func testGenuineSafetyVerdictStillSuppressesRetry() {
+        let flagged = #"{"detail":[{"msg":"Request flagged by the safety checker.","type":"invalid_request"}]}"#
+        XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: flagged))
+        XCTAssertTrue(LayerizeErrorRules.explain422(body: flagged, tier: "auto_1K").contains("safety checker"))
+    }
+
+    /// With no msg field, the echoed request is stripped before classifying.
+    func testFallbackStripsTheEchoedRequest() {
+        let odd = #"fal HTTP 422 something odd {"input":{"enable_safety_checker":true}}"#
+        XCTAssertFalse(LayerizeErrorRules.falMessage(in: odd).lowercased().contains("safety"))
     }
 
     /// Retry only what can plausibly change. A tier or safety refusal is deterministic, so
