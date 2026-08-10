@@ -11,7 +11,6 @@ import NetFS
 import FinderSync   // detect / offer to enable the Finder menu extension
 import Carbon.HIToolbox   // RegisterEventHotKey — the ONLY permission-free global hotkey
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
-import WebKit     // AdobeAccountWindow — shows Adobe's OWN signed-in page; we never see the login
 import os
 
 // Perf logging — view in Console.app (or `log stream`) filtered by
@@ -482,24 +481,14 @@ enum Prefs {
     // Adobe generative credits. NOT secret — "0 of 25, read at 14:32" is not a credential, so
     // this lives in prefs rather than the keychain. No token is ever stored: reading the balance
     // means showing the user Adobe's own signed-in page, never holding their session.
-    static var adobeCreditsRemaining: Int? {
-        get { d.object(forKey: "adobeCreditsRemaining") as? Int }
-        set { d.set(newValue, forKey: "adobeCreditsRemaining") }
+    /// The monthly allowance, entered by the user — 25 on an enterprise plan without premium
+    /// access. Navigator counts down from this using only its OWN spending.
+    static var adobeAllowance: Int {
+        get { d.object(forKey: "adobeAllowance") as? Int ?? 25 }
+        set { d.set(newValue, forKey: "adobeAllowance") }
     }
-    static var adobeCreditsTotal: Int? {
-        get { d.object(forKey: "adobeCreditsTotal") as? Int }
-        set { d.set(newValue, forKey: "adobeCreditsTotal") }
-    }
-    static var adobeCreditsResetDate: String? {
-        get { d.string(forKey: "adobeCreditsResetDate") }
-        set { d.set(newValue, forKey: "adobeCreditsResetDate") }
-    }
-    static var adobeCreditsReadAt: Date? {
-        get { d.object(forKey: "adobeCreditsReadAt") as? Date }
-        set { d.set(newValue, forKey: "adobeCreditsReadAt") }
-    }
-    /// Credits Navigator itself has spent since that reading. The reading is a snapshot; this is
-    /// the part Navigator knows exactly, because it issued the calls.
+    /// Credits Navigator itself has spent this cycle. The one number here that is exact, because
+    /// Navigator issued every one of those calls.
     static var adobeCreditsSpentSinceReading: Int {
         get { d.integer(forKey: "adobeCreditsSpentSinceReading") }
         set { d.set(newValue, forKey: "adobeCreditsSpentSinceReading") }
@@ -2863,248 +2852,6 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
 // pre-copy (faster, especially on network/Drive), and the original is never
 // written. `onProgress` (main thread) fires after Photoshop finishes so callers
 // can refresh.
-/// The JavaScript that reads the balance off Adobe's account page.
-///
-/// Three things this has to do, each learned by testing against the live page:
-///  1. The account menu element does not EXIST until the avatar is clicked, so the avatar has to
-///     be found and clicked first — a fresh load has no balance anywhere in the document.
-///  2. The avatar is itself inside a shadow root, so it can't be found with a plain
-///     querySelector. It is identified by role="button" and an aria-label ending in "Account"
-///     ("Michael Erickson Account"), which survives a re-skin better than a generated class name.
-///  3. The balance is in ANOTHER shadow root, so the text walk must pierce shadow DOM.
-///     document.body.innerText returns 1,215 characters without it; the walk returns 13,398 with.
-///
-/// Returns the concatenated deep text, which AdobeCreditRules then parses. Returns "" if the
-/// avatar can't be found, which is what an expired session looks like.
-let adobeBalanceReadJS = """
-(function () {
-  function findDeep(pred, root, depth) {
-    if (depth > 8) return null;
-    var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      if (pred(el)) return el;
-      if (el.shadowRoot) { var f = findDeep(pred, el.shadowRoot, depth + 1); if (f) return f; }
-    }
-    return null;
-  }
-  function deepText(root, depth, acc) {
-    if (depth > 10) return;
-    acc.push(root === document ? (document.body.innerText || '') : (root.textContent || ''));
-    var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
-    for (var i = 0; i < els.length; i++) {
-      if (els[i].shadowRoot) deepText(els[i].shadowRoot, depth + 1, acc);
-    }
-  }
-  var avatar = findDeep(function (el) {
-    return el.getAttribute && el.getAttribute('role') === 'button' &&
-           /account\\s*$/i.test(el.getAttribute('aria-label') || '');
-  }, document, 0);
-  if (avatar) { try { avatar.click(); } catch (e) {} }
-  var parts = [];
-  deepText(document, 0, parts);
-  return parts.join('\\n');
-})()
-"""
-
-/// Reads the balance with no window and no user interaction.
-///
-/// The session cookie lives in the shared WKWebView data store, so once the user has signed in
-/// through AdobeAccountWindow this keeps working on its own. Deliberately bounded: it runs on
-/// demand (launch, and before a spend when the reading is more than a few minutes old), never on
-/// a timer. A failed read NEVER overwrites a good reading — an expired session must not look like
-/// a zero balance.
-final class AdobeCreditReader: NSObject, WKNavigationDelegate {
-    static let shared = AdobeCreditReader()
-    private var web: WKWebView?
-    /// The web view MUST live in a window. WebKit suspends layout for a view with no window, so
-    /// document.body.innerText came back EMPTY and the read failed with "no page text" every time.
-    /// This window is parked far off-screen and ordered to the back — never visible, but real
-    /// enough that the page lays out.
-    private var host: NSWindow?
-    private var finish: ((Bool) -> Void)?
-    private var timeoutItem: DispatchWorkItem?
-    private var attempts = 0
-
-    /// completion(true) only when a balance was actually parsed and stored.
-    func refresh(timeout: TimeInterval = 30, completion: @escaping (Bool) -> Void) {
-        guard web == nil else { completion(false); return }   // one at a time
-        finish = completion
-        let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .default()                     // same session the window signed in with
-        let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 900), configuration: cfg)
-        w.navigationDelegate = self
-        web = w
-        let win = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 1280, height: 900),
-                           styleMask: [.borderless], backing: .buffered, defer: false)
-        win.contentView = w
-        win.alphaValue = 0
-        win.ignoresMouseEvents = true
-        win.orderBack(nil)
-        host = win
-        attempts = 0
-        let t = DispatchWorkItem { [weak self] in self?.complete(false, "timed out") }
-        timeoutItem = t
-        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: t)
-        w.load(URLRequest(url: URL(string: "https://account.adobe.com/")!))
-    }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        tryRead(webView)
-    }
-
-    /// The account page is a JS app whose nav renders after load, and the account menu only exists
-    /// once the avatar is clicked. A single fixed delay is a guess; this retries until the text
-    /// actually contains a balance, or gives up.
-    private func tryRead(_ webView: WKWebView) {
-        guard finish != nil else { return }                  // already completed
-        attempts += 1
-        let waited = attempts == 1 ? 2.5 : 2.0
-        DispatchQueue.main.asyncAfter(deadline: .now() + waited) { [weak self] in
-            guard let self, self.finish != nil else { return }
-            webView.evaluateJavaScript(adobeBalanceReadJS) { value, _ in
-                let text = (value as? String) ?? ""
-                if let b = AdobeCreditRules.parseBalance(text) {
-                    AdobeCredits.record(remaining: b.remaining, total: b.total,
-                                        resetDate: AdobeCreditRules.parseResetDate(text))
-                    NotificationCenter.default.post(name: .navigatorAdobeCreditsChanged, object: nil)
-                    self.complete(true, nil)
-                    return
-                }
-                guard self.attempts < 6 else {
-                    // Out of attempts: an expired session looks exactly like this, so the previous
-                    // reading is kept rather than replaced with a wrong one.
-                    self.complete(false, text.isEmpty
-                                  ? "page produced no text after \(self.attempts) attempts"
-                                  : "no balance in \(text.count) chars (sign-in may have expired)")
-                    return
-                }
-                self.tryRead(webView)
-            }
-        }
-    }
-
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        complete(false, error.localizedDescription)
-    }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        complete(false, error.localizedDescription)
-    }
-
-    private func complete(_ ok: Bool, _ why: String?) {
-        timeoutItem?.cancel(); timeoutItem = nil
-        guard let cb = finish else { return }        // already completed
-        finish = nil
-        web?.stopLoading(); web?.navigationDelegate = nil; web = nil
-        host?.orderOut(nil); host?.contentView = nil; host = nil
-        if !ok { navLog("adobe credits: read failed — \(why ?? "unknown")") }
-        cb(ok)
-    }
-}
-
-/// Sign in to Adobe and read the credit balance — by showing Adobe's own page.
-///
-/// There is no API for this. Adobe publishes no endpoint for the generative credit balance
-/// (checked against their developer docs), the account page renders it client-side, and the
-/// request that fetches it could not be captured. The only supported place the number exists is
-/// the page itself.
-///
-/// So this window IS that page. The user signs in to Adobe, in Adobe's own form, in a web view —
-/// Navigator never sees the password and stores no token. "Read Balance" then scrapes the one
-/// number off the rendered page. That is the whole mechanism, and its honesty matters more than
-/// its cleverness: if Adobe redesigns the page the parse returns nil and the window says so,
-/// rather than inventing a balance.
-///
-/// Deliberately NOT automatic and NOT polled. Adobe's own terms warn that "automatic scripting"
-/// can get generative access restricted, so this loads only when the user opens the window and
-/// reads only when they click the button.
-final class AdobeAccountWindow: NSObject, NSWindowDelegate {
-    static let shared = AdobeAccountWindow()
-    private var window: NSWindow?
-    private var web: WKWebView?
-    private var status: NSTextField?
-
-    static func show() { shared.present() }
-
-    private func present() {
-        if let window { window.makeKeyAndOrderFront(nil); return }
-        // A persistent data store so the Adobe session survives between openings, exactly as a
-        // browser would. Cookies only — no token is read out of it or written anywhere by us.
-        let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .default()
-        let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 980, height: 700), configuration: cfg)
-        web = w
-
-        let label = NSTextField(labelWithString: currentSummary())
-        label.font = .systemFont(ofSize: 12)
-        label.textColor = .secondaryLabelColor
-        label.lineBreakMode = .byTruncatingTail
-        status = label
-
-        let read = NSButton(title: "Read Balance", target: self, action: #selector(readBalance))
-        read.bezelStyle = .rounded
-        let help = NSTextField(labelWithString: "Sign in, click your profile icon (top right), then Read Balance.")
-        help.font = .systemFont(ofSize: 11)
-        help.textColor = .tertiaryLabelColor
-
-        let bar = NSStackView(views: [label, NSView(), help, read])
-        bar.orientation = .horizontal
-        bar.spacing = 10
-        bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-        let stack = NSStackView(views: [bar, w])
-        stack.orientation = .vertical
-        stack.spacing = 0
-        stack.setHuggingPriority(.defaultHigh, for: .vertical)
-
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 760),
-                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        win.title = "Adobe Account — Generative Credits"
-        win.contentView = stack
-        win.center()
-        win.delegate = self
-        window = win
-        win.makeKeyAndOrderFront(nil)
-        w.load(URLRequest(url: URL(string: "https://account.adobe.com/")!))
-    }
-
-    private func currentSummary() -> String {
-        guard let r = AdobeCredits.remaining, let t = AdobeCredits.total else {
-            return "Balance not read yet."
-        }
-        var s = "\(r) of \(t) credits left"
-        if let d = AdobeCredits.resetDate { s += " · resets \(d)" }
-        if AdobeCredits.spentSinceReading > 0 { s += " · \(AdobeCredits.spentSinceReading) spent since" }
-        return s
-    }
-
-    @objc private func readBalance() {
-        // Same script the silent reader uses — see adobeBalanceReadJS for why it has to click
-        // the avatar and pierce two shadow roots.
-        web?.evaluateJavaScript(adobeBalanceReadJS) { [weak self] value, _ in
-            guard let self else { return }
-            let text = (value as? String) ?? ""
-            guard let b = AdobeCreditRules.parseBalance(text) else {
-                self.status?.stringValue = "Couldn’t read a balance — sign in, then try again."
-                self.status?.textColor = .systemOrange
-                return
-            }
-            AdobeCredits.record(remaining: b.remaining, total: b.total,
-                                resetDate: AdobeCreditRules.parseResetDate(text))
-            self.status?.stringValue = self.currentSummary()
-            self.status?.textColor = .secondaryLabelColor
-            NotificationCenter.default.post(name: .navigatorAdobeCreditsChanged, object: nil)
-        }
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        window = nil; web = nil; status = nil
-    }
-}
-
-extension Notification.Name {
-    static let navigatorAdobeCreditsChanged = Notification.Name("navigatorAdobeCreditsChanged")
-}
-
 /// Adobe generative credit bookkeeping.
 ///
 /// Navigator can spend these — Firefly Generative Upscale is a standard feature at 1 credit, and
@@ -3112,77 +2859,44 @@ extension Notification.Name {
 /// on exploratory calls without asking, so nothing generative runs now without a confirmation
 /// that states the cost and what has already been spent.
 enum AdobeCredits {
-    static var remaining: Int? { Prefs.adobeCreditsRemaining }
-    static var total: Int? { Prefs.adobeCreditsTotal }
-    static var resetDate: String? { Prefs.adobeCreditsResetDate }
-    static var readAt: Date? { Prefs.adobeCreditsReadAt }
     static var spentSinceReading: Int { Prefs.adobeCreditsSpentSinceReading }
 
-    /// A fresh reading from Adobe's own page resets the local spend counter — the reading already
-    /// accounts for everything spent before it.
-    static func record(remaining: Int, total: Int, resetDate: String?) {
-        Prefs.adobeCreditsRemaining = remaining
-        Prefs.adobeCreditsTotal = total
-        Prefs.adobeCreditsResetDate = resetDate
-        Prefs.adobeCreditsReadAt = Date()
-        Prefs.adobeCreditsSpentSinceReading = 0
-        navLog("adobe credits: read \(remaining)/\(total)\(resetDate.map { ", resets \($0)" } ?? "")")
-    }
-
-    /// Called after a generative call actually succeeded. Decrements the cached balance too, so
-    /// the next confirmation is right even without re-reading Adobe.
+    /// Called after a generative call actually succeeded.
     static func recordSpend(_ credits: Int) {
         guard credits > 0 else { return }
         Prefs.adobeCreditsSpentSinceReading += credits
-        if let r = Prefs.adobeCreditsRemaining { Prefs.adobeCreditsRemaining = max(0, r - credits) }
-        navLog("adobe credits: spent \(credits); \(Prefs.adobeCreditsRemaining.map(String.init) ?? "?") left by our count")
+        navLog("adobe credits: spent \(credits); \(Prefs.adobeCreditsSpentSinceReading) by our count this cycle")
     }
 
-    /// The gate. Returns false if the user declines, so the caller must not proceed.
-    /// Modal on purpose — this spends real money and must not be dismissable by accident.
-    /// Callers are SwiftUI menu actions, which already run on the main thread; NSAlert requires
-    /// that anyway, so the invariant is real even without a @MainActor annotation (which the
-    /// non-isolated menu closures can't satisfy).
-    /// Asynchronous because a stale balance is re-read from Adobe FIRST — the number in this
-    /// dialog is the entire point of it, so showing an old one would defeat the purpose.
-    static func confirmSpend(count: Int, cost: Int = AdobeCreditRules.fireflyUpscaleCost,
-                             then: @escaping (Bool) -> Void) {
-        func present() {
-            let msg = AdobeCreditRules.confirmation(count: count, cost: cost,
-                                                    remaining: remaining, total: total,
-                                                    spentThisSession: spentSinceReading)
-            let a = NSAlert()
-            a.alertStyle = .warning
-            a.messageText = msg.title
-            var detail = msg.detail
-            if let readAt {
-                let f = RelativeDateTimeFormatter()
-                detail += " Balance read \(f.localizedString(for: readAt, relativeTo: Date()))."
-                if AdobeCreditRules.isStale(readAt: readAt, now: Date()) {
-                    detail += " Navigator couldn’t refresh it — sign in again to be sure."
-                }
-            }
-            a.informativeText = detail
-            a.addButton(withTitle: "Use \(count * cost) Credit\(count * cost == 1 ? "" : "s")")
-            a.addButton(withTitle: "Cancel")
-            a.addButton(withTitle: "Check Balance…")
-            switch a.runModal() {
-            case .alertFirstButtonReturn: then(true)
-            case .alertThirdButtonReturn:
-                AdobeAccountWindow.show()
-                then(false)                   // never spend straight after sending them to look
-            default: then(false)
-            }
-        }
-        guard AdobeCreditRules.needsRefreshBeforeSpend(readAt: readAt, now: Date()) else {
-            present(); return
-        }
-        // Silent re-read. A failure leaves the previous reading intact and the dialog says so,
-        // rather than blocking the user out of a feature because Adobe didn't answer.
-        BGJobProgress.shared.start("Checking Adobe credits", total: 1)
-        AdobeCreditReader.shared.refresh { ok in
-            BGJobProgress.shared.finish(ok ? "" : "Couldn’t check Adobe credits")
-            present()
+    /// The gate, and the only protection that matters here. Modal on purpose: this spends real
+    /// money and must not be dismissable by accident.
+    ///
+    /// Deliberately has NO dependency on Adobe. It states the cost and what Navigator has spent,
+    /// both known locally and exactly, because Navigator issues the calls. An earlier version
+    /// scraped the live balance out of Adobe's account page — clicking a hidden avatar through two
+    /// shadow roots in an off-screen WKWebView, behind a retry loop. Seven fragile links for one
+    /// integer; it broke once during development and would have failed silently the next time
+    /// Adobe reskinned their nav. The number was never the protection. This dialog is.
+    ///
+    /// Callers are SwiftUI menu actions, already on the main thread, which NSAlert requires anyway.
+    static func confirmSpend(count: Int, cost: Int = AdobeCreditRules.fireflyUpscaleCost) -> Bool {
+        let msg = AdobeCreditRules.confirmation(count: count, cost: cost,
+                                                spentThisCycle: spentSinceReading,
+                                                allowance: Prefs.adobeAllowance)
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = msg.title
+        a.informativeText = msg.detail
+        a.addButton(withTitle: "Use \(count * cost) Credit\(count * cost == 1 ? "" : "s")")
+        a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "Check Balance…")
+        switch a.runModal() {
+        case .alertFirstButtonReturn: return true
+        case .alertThirdButtonReturn:
+            // Adobe's page in the user's own browser. No scraping, nothing to break.
+            NSWorkspace.shared.open(URL(string: "https://account.adobe.com/")!)
+            return false                      // never spend straight after sending them to look
+        default: return false
         }
     }
 }
@@ -10100,14 +9814,12 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                                 // Confirm ONCE for the whole selection, before anything runs —
                                 // a per-image prompt on a 20-image batch trains people to click
                                 // through, which defeats the point.
-                                guard !targets.isEmpty else { return }
-                                AdobeCredits.confirmSpend(count: targets.count) { go in
-                                    guard go else { return }
-                                    // Then one at a time: each is a cloud round trip and
-                                    // Photoshop serialises them anyway.
-                                    for u in targets {
-                                        fireflyUpscaleForImage(u, scale: f) { out in browser.refreshAndReveal([out]) }
-                                    }
+                                guard !targets.isEmpty,
+                                      AdobeCredits.confirmSpend(count: targets.count) else { return }
+                                // Then one at a time: each is a cloud round trip and Photoshop
+                                // serialises them anyway.
+                                for u in targets {
+                                    fireflyUpscaleForImage(u, scale: f) { out in browser.refreshAndReveal([out]) }
                                 }
                             })
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
@@ -13443,10 +13155,8 @@ struct ImageViewerView: View {
                 }, imagen: { f in
                     upscaleImagesViaImagen([u], factor: f) { outs in if let o = outs.first { revealNewImage(o) } }
                 }, firefly: { f in
-                    AdobeCredits.confirmSpend(count: 1) { go in
-                        guard go else { return }
-                        fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
-                    }
+                    guard AdobeCredits.confirmSpend(count: 1) else { return }
+                    fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
             }
@@ -15691,7 +15401,7 @@ struct SetupAssistantView: View {
     @State private var drivesText = ""
     /// Bumped to redraw after the credit reading changes (the store is plain prefs, not observable).
     @State private var adobeTick = 0
-    @State private var adobeRefreshing = false
+    @AppStorage("adobeAllowance") private var adobeAllowance = 25
     @State private var drivesAdded: Int?
     @State private var checking = false
     @State private var checkedAt: Date?
@@ -15722,30 +15432,30 @@ struct SetupAssistantView: View {
             // paste covers the lot. Nothing is mounted here on purpose: the addresses are saved as
             // sidebar drives, and the first click mounts through NetFS with THEIR login, which is
             // also the moment a missing VPN gets diagnosed properly (MountFailureRules).
-            // Adobe credits sit next to the other account-ish setup. No key to paste and no
-            // token stored: the button opens Adobe's own signed-in page in a web view and reads
-            // the one number off it. There is no API for this — see AdobeAccountWindow.
+            // Adobe credits. No sign-in and no scraping: Navigator counts what IT spends, which
+            // it knows exactly, and you tell it the allowance once. An earlier version read the
+            // balance off Adobe's account page through two shadow roots in a hidden web view —
+            // clever, and one Adobe redesign away from failing silently.
             Section("Adobe generative credits") {
                 Text(adobeCreditSummary)
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
-                    Button("Sign In & Read Balance…") { AdobeAccountWindow.show() }
-                    if AdobeCredits.readAt != nil {
-                        Button(adobeRefreshing ? "Checking…" : "Refresh") {
-                            adobeRefreshing = true
-                            AdobeCreditReader.shared.refresh { _ in
-                                adobeRefreshing = false; adobeTick &+= 1
-                            }
-                        }.disabled(adobeRefreshing)
+                    Text("Monthly allowance")
+                    TextField("25", value: $adobeAllowance, format: .number)
+                        .frame(width: 70)
+                    Text("credits")
+                    Spacer()
+                }
+                HStack {
+                    Button("Check Balance in Browser…") {
+                        NSWorkspace.shared.open(URL(string: "https://account.adobe.com/")!)
                     }
-                    if AdobeCredits.remaining != nil {
-                        Button("Forget") {
-                            Prefs.adobeCreditsRemaining = nil; Prefs.adobeCreditsTotal = nil
-                            Prefs.adobeCreditsResetDate = nil; Prefs.adobeCreditsReadAt = nil
+                    if Prefs.adobeCreditsSpentSinceReading > 0 {
+                        Button("Reset Count") {
                             Prefs.adobeCreditsSpentSinceReading = 0
                             adobeTick &+= 1
-                        }
+                        }.help("Do this after your monthly reset, or after checking the real balance.")
                     }
                     Spacer()
                 }
@@ -15804,9 +15514,6 @@ struct SetupAssistantView: View {
         .formStyle(.grouped)
         .frame(width: 560, height: 660)
         .onAppear { refresh() }
-        .onReceive(NotificationCenter.default.publisher(for: .navigatorAdobeCreditsChanged)) { _ in
-            adobeTick &+= 1
-        }
         // Returning from System Settings re-activates Navigator, which is the only
         // signal we get that a switch may have moved. Re-probing here is what stops
         // this window from showing yesterday's answer until the app is restarted.
@@ -15841,24 +15548,20 @@ struct SetupAssistantView: View {
         }
     }
 
-    /// Plain-language state of the Adobe credit reading, including how much Navigator has spent
-    /// since it was taken — the reading is a snapshot, that part is exact.
+    /// What Navigator knows for certain — what it has spent — against the allowance you told it.
+    /// Never claims to know Adobe's live balance, because it doesn't.
     private var adobeCreditSummary: String {
         _ = adobeTick                        // redraw dependency
-        guard let r = AdobeCredits.remaining, let t = AdobeCredits.total else {
-            return "Navigator hasn’t read your balance. Firefly Generative Upscale costs 1 credit per image, so without this it can only warn you that a run costs something — not how much you have left."
+        let spent = Prefs.adobeCreditsSpentSinceReading
+        let allowance = Prefs.adobeAllowance
+        var s = "Firefly Generative Upscale costs 1 credit per image. "
+        if spent == 0 {
+            s += "Navigator hasn’t spent any this cycle."
+        } else {
+            s += "Navigator has spent \(spent) this cycle"
+            s += allowance > 0 ? " of your \(allowance)." : "."
         }
-        var s = "\(r) of \(t) credits left"
-        if let d = AdobeCredits.resetDate { s += ", resets \(d)" }
-        s += "."
-        if AdobeCredits.spentSinceReading > 0 {
-            s += " Navigator has spent \(AdobeCredits.spentSinceReading) since that reading."
-        }
-        if let at = AdobeCredits.readAt {
-            let f = RelativeDateTimeFormatter()
-            s += " Read \(f.localizedString(for: at, relativeTo: Date()))"
-            s += AdobeCreditRules.isStale(readAt: at, now: Date()) ? " — worth checking again." : "."
-        }
+        s += " Navigator only counts its own spending — anything you use directly in Photoshop or on the web isn’t included, so check the real balance when it matters."
         return s
     }
 
@@ -16010,16 +15713,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // One-time: strip the expensive columns out of arrangements saved for network folders.
         // Deferred off the launch path — it stats each saved path to classify the volume, and a
         // stalled share must not hold up the window appearing.
-        // Refresh the Adobe credit reading at launch, but ONLY if one exists — never open a
-        // session or nag someone who has not signed in. Deferred so it can't slow the window
-        // appearing, and it is the only unattended read: everything else is on demand.
-        if Prefs.adobeCreditsReadAt != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                AdobeCreditReader.shared.refresh { ok in
-                    navLog("adobe credits: launch refresh \(ok ? "succeeded" : "skipped/failed")")
-                }
-            }
-        }
         if !Prefs.networkColumnCleanupDone {
             let saved = FolderViewOptionsStore.shared.savedPaths()
             DispatchQueue.global(qos: .utility).async {
