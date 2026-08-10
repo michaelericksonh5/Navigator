@@ -2050,6 +2050,10 @@ struct LayerizeLayer {
     let detail: String?
     let boundingBox: [String: Any]?
     let url: String
+    /// From fal's own response (`image.width`/`height`). Kept because with `image_size: auto` the
+    /// output resolution isn't known until the layers arrive, and it is what reveals the rate the
+    /// call was billed at — see LayerizeRules.actualCost.
+    let width: Int?
 }
 
 /// `<Original>_Layers/` beside the source.
@@ -2101,7 +2105,10 @@ private func falLayerize(pngData: Data, tier: String, key: String) -> (layers: [
                                         name: l["name"] as? String,
                                         detail: l["description"] as? String,
                                         boundingBox: l["bounding_box"] as? [String: Any],
-                                        url: u))
+                                        url: u,
+                                        width: (img["width"] as? Int).map { w in
+                                            max(w, img["height"] as? Int ?? 0)
+                                        }))
         }
         out = parsed.isEmpty ? ([], "the model returned no layers") : (parsed, nil)
     }.resume()
@@ -2220,22 +2227,27 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 note { errors.append("\(src.lastPathComponent): encode failed") }; return
             }
 
-            let tier = LayerizeRules.tier(width: cg.width, height: cg.height)
             let keepBase = LayerizeRules.shouldKeepBase(transparentFraction: transparentFraction(src))
-            navLog("  \(src.lastPathComponent) \(cg.width)×\(cg.height) tier=\(tier) keepBase=\(keepBase) (worst case $\(String(format: "%.2f", LayerizeRules.worstCaseCost(tier: tier))))")
+            let ladder = LayerizeRules.sizeLadder(width: cg.width, height: cg.height)
 
-            var (layers, err) = falLayerize(pngData: png, tier: tier, key: key)
-            // ONE retry, and only for the model declining the picture. That refusal is not a
-            // parameter error, so the identical request can legitimately come back differently —
-            // a real batch had 2 of 5 refused with images indistinguishable from the 3 that
-            // worked. A tier or safety rejection is deterministic, so retrying those would only
-            // spend money (see LayerizeErrorRules.worthRetrying).
-            if let e = err, LayerizeErrorRules.worthRetrying(body: e) {
-                navLog("  \(src.lastPathComponent): model declined it; retrying once")
-                let second = falLayerize(pngData: png, tier: tier, key: key)
-                if second.error == nil { layers = second.layers; err = nil }
-                else { navLog("  \(src.lastPathComponent): retry also declined") }
+            // Walk the ladder: `auto` (the API's documented default, which adapts to the input),
+            // `auto` again for a transient refusal, then one explicit tier as a last resort.
+            // Stops at the first success, and stops immediately on any refusal that retrying
+            // cannot change — a tier complaint or a safety verdict. Three calls worst case.
+            var layers: [LayerizeLayer] = []
+            var err: String? = nil
+            var usedSize = ladder[0]
+            var attemptsUsed = 0
+            for (attempt, size) in ladder.enumerated() {
+                attemptsUsed += 1
+                if attempt > 0 { navLog("  \(src.lastPathComponent): retrying at \(size)") }
+                let r = falLayerize(pngData: png, tier: size, key: key)
+                usedSize = size
+                if r.error == nil { layers = r.layers; err = nil; break }
+                err = r.error
+                guard LayerizeErrorRules.worthRetrying(body: r.error ?? "") else { break }
             }
+            navLog("  \(src.lastPathComponent) \(cg.width)×\(cg.height) size=\(usedSize) keepBase=\(keepBase) attempts=\(attemptsUsed)")
             guard err == nil else {
                 navLog("  RESULT: error — \(err ?? "") [\(src.lastPathComponent)]")
                 note { errors.append("\(src.lastPathComponent): \(err ?? "layerize failed")") }
@@ -2254,10 +2266,23 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                     note { errors.append("\(src.lastPathComponent): couldn’t download layer \(l.zIndex)") }
                     continue
                 }
+                // Data(contentsOf:) succeeds on a ZERO-BYTE response, so an empty download was
+                // being written, counted, and listed in _layers.json while the filesystem
+                // discarded the empty file — two real layers vanished that way.
+                guard LayerizeRules.isPlausiblePNG([UInt8](d)) else {
+                    note { errors.append("\(src.lastPathComponent): layer \(l.zIndex) came back empty or not a PNG (\(d.count) bytes)") }
+                    continue
+                }
                 let fn = LayerizeRules.fileName(stem: stem, zIndex: l.zIndex, name: l.name)
                 let dst = dir.appendingPathComponent(fn)
-                do { try d.write(to: dst); note { produced.append(dst) }; saved += 1 }
-                catch { note { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") } }
+                do { try d.write(to: dst) } catch {
+                    note { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
+                    continue    // do NOT record a file that isn't there
+                }
+                note { produced.append(dst) }
+                saved += 1
+                // Only reached when the bytes are on disk, so _layers.json can never describe a
+                // file that doesn't exist.
                 var m: [String: Any] = ["z_index": l.zIndex, "file": fn]
                 if let n = l.name { m["name"] = n }
                 if let de = l.detail { m["description"] = de }
@@ -2269,7 +2294,9 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             if let j = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .withoutEscapingSlashes]) {
                 try? j.write(to: dir.appendingPathComponent("_layers.json"))
             }
-            navLog("  RESULT: \(saved) layer(s) → \(dir.path)")
+            let largest = layers.compactMap { $0.width }.max() ?? 0
+            let cost = LayerizeRules.actualCost(layerCount: saved, largestEdge: largest)
+            navLog("  RESULT: \(saved) layer(s), ~$\(String(format: "%.2f", cost)) at \(usedSize) in \(attemptsUsed) call(s) → \(dir.path)")
             if saved == 0 { note { errors.append("\(src.lastPathComponent): no layers were saved") } }
             else { note { succeeded += 1 } }
         }

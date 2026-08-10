@@ -1099,49 +1099,75 @@ enum LayerizeRules {
     /// base + up to 16 layers.
     static let maxLayers = 17
 
-    /// MEASURED, and the reason a naive "always auto_2K" default is wrong: a 750x709 input
-    /// returned HTTP 422 at `auto_2K` AND at `auto`, but 200 at `auto_1K`. So the tier may not
-    /// outrun the input by much, and there is also a FLOOR — `auto` (native ~750px) was refused
-    /// for being too small, while `auto_1K` upscaling that same input was fine.
+    /// Output sizes to try, in order.
     ///
-    /// Largest tier whose output area the input can support, never below the 1K floor.
-    static func tier(width: Int, height: Int) -> String {
-        let px = width * height
-        if px >= 2048 * 2048 { return "auto_2K" }
-        if px >= 1536 * 1536 { return "auto_1.5K" }
-        return "auto_1K"
+    /// `auto` FIRST, because that is the API's own default and its documented behaviour is exactly
+    /// what we want: "auto adapts to the input image while preserving each element's aspect ratio."
+    ///
+    /// This code used to never send it. It computed an explicit tier from a pixel-count threshold
+    /// because an earlier session saw one 422 at `auto` and concluded there was a resolution
+    /// "floor" — a mechanism that appears nowhere in fal's schema. We now know refusals are
+    /// sometimes TRANSIENT: SF2_Pearl was declined once and then accepted on a byte-identical
+    /// request. So that single 422 was most likely transient, and an entire tier system was built
+    /// to work around it, which then produced its own refusals and inconsistent output sizes.
+    ///
+    /// Second attempt is `auto` again — the cheap fix for a transient refusal.
+    ///
+    /// Third is ONE explicit tier, and only as a last resort. Capped at three attempts because
+    /// each one is a paid generation.
+    static func sizeLadder(width: Int, height: Int) -> [String] {
+        ["auto", "auto", lastResortSize(width: width, height: height)]
     }
 
+    /// The explicit tier to fall back to when `auto` will not play.
+    ///
+    /// Empirical, and narrow: SF1_Red (632×791) was refused at `auto_1K` and accepted at
+    /// `auto_1.5K`, so for a stubborn image asking for MORE output resolution is what worked.
+    /// Hence one step above whatever the input would naturally suggest.
+    static func lastResortSize(width: Int, height: Int) -> String {
+        (width * height >= 1536 * 1536) ? "auto_2K" : "auto_1.5K"
+    }
+
+    /// Preflight against fal's DOCUMENTED limits, which are a pixel COUNT, not a per-side one:
+    /// "The image must contain between 512x512 and 6000x6000 total pixels, have an aspect ratio
+    /// between 1/16 and 16, and be no larger than 30 MB."
+    ///
+    /// The old version enforced 512 and 6000 as per-SIDE bounds, which is stricter than the API.
+    /// A 300×1000 image (300,000 px) or an 8000×4000 one (32 MP) both satisfy the real limits and
+    /// were being resampled for no reason — losing quality to a rule fal never stated.
     static func check(width w: Int, height h: Int, bytes: Int) -> LayerizeCheck {
         guard w > 0, h > 0 else { return .reject(reason: "not a readable image") }
         let ar = Double(w) / Double(h)
-        if ar < minAspect || ar > maxAspect {
+        guard ar >= minAspect, ar <= maxAspect else {
             return .reject(reason: "aspect ratio \(String(format: "%.2f", ar)):1 is outside the supported 1:16–16:1 range")
         }
-        // Too big: scale down to fit both the per-side and total-pixel caps.
-        if w > maxSide || h > maxSide || w * h > maxPixels {
-            let s = min(Double(maxSide) / Double(max(w, h)),
-                        (Double(maxPixels) / Double(w * h)).squareRoot())
-            let t = (max(1, Int(Double(w) * s)), max(1, Int(Double(h) * s)))
-            return .needsResize(reason: "\(w)×\(h) exceeds Layerize's limit of 6000px per side / 36 MP total", to: t)
+        let px = w * h
+        if px > maxPixels {
+            let s = (Double(maxPixels) / Double(px)).squareRoot()
+            let t = (max(1, Int((Double(w) * s).rounded(.down))), max(1, Int((Double(h) * s).rounded(.down))))
+            return .needsResize(reason: "\(w)×\(h) is \(String(format: "%.1f", Double(px) / 1e6)) MP, over Layerize's 36 MP total", to: t)
         }
-        // Too small: it cannot be split at all below the floor.
-        if min(w, h) < minSide || w * h < minPixels {
-            let s = max(Double(minSide) / Double(min(w, h)),
-                        (Double(minPixels) / Double(w * h)).squareRoot())
-            let t = (Int((Double(w) * s).rounded(.up)), Int((Double(h) * s).rounded(.up)))
-            return .needsResize(reason: "\(w)×\(h) is below Layerize's 512px / 0.26 MP minimum", to: t)
+        if px < minPixels {
+            let s = (Double(minPixels) / Double(px)).squareRoot()
+            let t = (max(1, Int((Double(w) * s).rounded(.up))), max(1, Int((Double(h) * s).rounded(.up))))
+            return .needsResize(reason: "\(w)×\(h) is \(String(format: "%.2f", Double(px) / 1e6)) MP, under Layerize's 0.26 MP total", to: t)
         }
         if bytes > maxBytes {
-            // Re-encoding usually fixes this without touching dimensions, so keep them.
             return .needsResize(reason: "file is \(String(format: "%.1f", Double(bytes) / 1_048_576)) MB, over the 30 MB limit", to: (w, h))
         }
         return .ok
     }
 
-    /// MEASURED: a mostly-transparent input gets a flat INVENTED colour as its base (a cutout
-    /// came back with a solid rgb(37,135,139) teal base), which is junk. A composed artwork
-    /// with a real background gets an excellent inpainted base worth keeping.
+    /// A layer that came back empty or isn't a PNG must never be written or recorded.
+    ///
+    /// `Data(contentsOf:)` succeeds on a ZERO-BYTE response, so a failed download was being
+    /// written as an empty file, counted as saved, and listed in _layers.json — while the
+    /// filesystem (Google Drive, in the observed case) quietly discarded it. Two real layers went
+    /// missing that way: L01_Outer_black_background and L00_base.
+    static func isPlausiblePNG(_ bytes: [UInt8]) -> Bool {
+        bytes.count >= 100 && Array(bytes.prefix(8)) == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    }
+
     static func shouldKeepBase(transparentFraction: Double) -> Bool { transparentFraction < 0.20 }
 
     /// Filesystem-safe WITHOUT destroying non-ASCII.
@@ -1168,7 +1194,18 @@ enum LayerizeRules {
         return String(format: "%@_L%02d_%@.png", stem, zIndex, suffix)
     }
 
-    /// Worst-case spend, the only figure knowable BEFORE the call — the layer count is not.
+    /// What a COMPLETED call actually cost, from what came back.
+    ///
+    /// More honest than a worst case now that `auto` is the default: the output resolution isn't
+    /// known until the layers arrive, so neither is the per-layer rate. The largest returned edge
+    /// reveals which tier the model settled on.
+    static func actualCost(layerCount: Int, largestEdge: Int) -> Double {
+        let perLayer = largestEdge > 1536 ? 0.0675 : 0.03375
+        return perLayer * Double(max(0, layerCount))
+    }
+
+    /// Worst-case spend for an EXPLICIT tier. Still meaningful for the last-resort rung, where the
+    /// size is pinned; for `auto` there is no such figure, which is why actualCost exists.
     static func worstCaseCost(tier: String) -> Double {
         let perLayer = (tier == "auto_1K" || tier == "auto_1.5K") ? 0.03375 : 0.0675
         return perLayer * Double(maxLayers)
@@ -4029,8 +4066,26 @@ enum LayerizeErrorRules {
     /// for layer decomposition", that is the model declining THAT PICTURE — not a parameter fault
     /// — and it is worth saying plainly, because the fix is to retry or use a different image, not
     /// to fiddle with settings.
+    /// fal's OWN message, extracted from the error body.
+    ///
+    /// Classifying on the whole body is a trap: fal echoes the request back inside `"input"`, so
+    /// `"enable_safety_checker":true` puts the word "safety" in every single error — which made
+    /// worthRetrying() treat every refusal as a safety rejection and skip the retry entirely.
+    /// Only the `msg` field carries fal's verdict, so only that is classified.
+    static func falMessage(in body: String) -> String {
+        guard let r = body.range(of: #""msg"\s*:\s*"(([^"\\]|\\.)*)""#, options: .regularExpression) else {
+            // No msg field — fall back to the body with the echoed request removed, so the same
+            // trap can't reappear through a different key.
+            if let inputAt = body.range(of: #""input"\s*:"#, options: .regularExpression) {
+                return String(body[body.startIndex..<inputAt.lowerBound])
+            }
+            return body
+        }
+        return String(body[r])
+    }
+
     static func explain422(body: String, tier: String) -> String {
-        let b = body.lowercased()
+        let b = falMessage(in: body).lowercased()
         if b.contains("could not be processed for layer decomposition") {
             return " — the Layerize model couldn’t decompose this particular image. "
                  + "Nothing is wrong with its size or format: images identical in size and tier "
@@ -4048,13 +4103,27 @@ enum LayerizeErrorRules {
         return " — Layerize rejected the request. fal's own message follows."
     }
 
+    /// The next resolution tier up, for escalating a stubborn refusal.
+    ///
+    /// Repeating an identical request catches a TRANSIENT refusal — SF2_Pearl was declined once and
+    /// then succeeded unchanged. It cannot help a DETERMINISTIC one, so a second retry asks for a
+    /// different output size instead, which changes what the model is being asked to do. Returns
+    /// nil at the top tier, where there is nothing left to escalate to.
+    static func nextTierUp(_ tier: String) -> String? {
+        switch tier {
+        case "auto_1K":   return "auto_1.5K"
+        case "auto_1.5K": return "auto_2K"
+        default:          return nil
+        }
+    }
+
     /// Is this failure worth one automatic retry?
     ///
     /// A model that declines a picture may well accept it on a second pass — the refusal is not a
     /// parameter error, so the same request can legitimately produce a different answer. A tier or
     /// safety rejection will not change, and retrying those only spends money.
     static func worthRetrying(body: String) -> Bool {
-        let b = body.lowercased()
+        let b = falMessage(in: body).lowercased()
         if b.contains("safety") || b.contains("nsfw") || b.contains("flagged") { return false }
         if b.contains("image_size") || b.contains("too small") || b.contains("too large") { return false }
         return b.contains("could not be processed for layer decomposition")
