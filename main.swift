@@ -2083,11 +2083,11 @@ private func falLayerize(pngData: Data, tier: String, key: String) -> (layers: [
         if let err { out = ([], err.localizedDescription); return }
         guard let data, let http = resp as? HTTPURLResponse else { out = ([], "no data"); return }
         guard http.statusCode == 200 else {
-            // 422 is what the endpoint returns when the resolution tier doesn't suit the input
-            // — worth naming, because the message itself says only "check input parameters".
             let raw = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            // What the 422 MEANS is read out of fal's body rather than assumed — see
+            // LayerizeErrorRules.explain422 for the batch that disproved the old single answer.
             let hint = http.statusCode == 422
-                ? " — Layerize refused this image at the \(tier) tier. It rejects a tier that overshoots the input, and also anything below its ~1K output floor."
+                ? LayerizeErrorRules.explain422(body: String(raw), tier: tier)
                 : ""
             out = ([], "fal HTTP \(http.statusCode)\(hint) \(raw)")
             return
@@ -2186,6 +2186,9 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     var errors: [String] = refusals
     var done = 0
     var running = 0
+    // Images that saved at least one layer. NOT the same as produced.count: one image yields many
+    // layers, which is how the summary came to read "layerized 25 of 5" — 25 layers, 5 images.
+    var succeeded = 0
 
     func note(_ body: () -> Void) { lock.lock(); body(); lock.unlock() }
     func publishProgress(current: String?) {
@@ -2221,7 +2224,18 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             let keepBase = LayerizeRules.shouldKeepBase(transparentFraction: transparentFraction(src))
             navLog("  \(src.lastPathComponent) \(cg.width)×\(cg.height) tier=\(tier) keepBase=\(keepBase) (worst case $\(String(format: "%.2f", LayerizeRules.worstCaseCost(tier: tier))))")
 
-            let (layers, err) = falLayerize(pngData: png, tier: tier, key: key)
+            var (layers, err) = falLayerize(pngData: png, tier: tier, key: key)
+            // ONE retry, and only for the model declining the picture. That refusal is not a
+            // parameter error, so the identical request can legitimately come back differently —
+            // a real batch had 2 of 5 refused with images indistinguishable from the 3 that
+            // worked. A tier or safety rejection is deterministic, so retrying those would only
+            // spend money (see LayerizeErrorRules.worthRetrying).
+            if let e = err, LayerizeErrorRules.worthRetrying(body: e) {
+                navLog("  \(src.lastPathComponent): model declined it; retrying once")
+                let second = falLayerize(pngData: png, tier: tier, key: key)
+                if second.error == nil { layers = second.layers; err = nil }
+                else { navLog("  \(src.lastPathComponent): retry also declined") }
+            }
             guard err == nil else {
                 navLog("  RESULT: error — \(err ?? "") [\(src.lastPathComponent)]")
                 note { errors.append("\(src.lastPathComponent): \(err ?? "layerize failed")") }
@@ -2257,6 +2271,7 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             }
             navLog("  RESULT: \(saved) layer(s) → \(dir.path)")
             if saved == 0 { note { errors.append("\(src.lastPathComponent): no layers were saved") } }
+            else { note { succeeded += 1 } }
         }
     }
 
@@ -2264,11 +2279,14 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     // freeze the window for the whole batch.
     DispatchQueue.global(qos: .userInitiated).async {
         queue.waitUntilAllOperationsAreFinished()
-        lock.lock(); let outs = produced, errs = errors; lock.unlock()
+        lock.lock(); let outs = produced, errs = errors, ok = succeeded; lock.unlock()
         DispatchQueue.main.async {
-            BGJobProgress.shared.finish("Layerized \(outs.count) layer\(outs.count == 1 ? "" : "s")")
+            BGJobProgress.shared.finish(plan.count == 1
+                ? "Layerized \(outs.count) layer\(outs.count == 1 ? "" : "s")"
+                : "Layerized \(ok) of \(plan.count) image\(plan.count == 1 ? "" : "s") — \(outs.count) layers")
             if !errs.isEmpty {
-                showBGSummary(app: "Layerize", done: outs.count, total: plan.count, errors: errs, verb: "layerized")
+                // `ok`, not outs.count: the summary counts IMAGES against IMAGES.
+                showBGSummary(app: "Layerize", done: ok, total: plan.count, errors: errs, verb: "layerized")
             }
             onDone?(outs)
         }

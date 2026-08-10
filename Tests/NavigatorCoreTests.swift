@@ -4823,3 +4823,53 @@ final class LayerizeBatchRulesTests: XCTestCase {
         XCTAssertLessThanOrEqual(LayerizeBatchRules.maxConcurrent, 4, "not hammering an undocumented limit")
     }
 }
+
+
+// MARK: - What a Layerize failure actually means
+
+final class LayerizeErrorRulesTests: XCTestCase {
+    /// The exact body fal returned on a real batch.
+    private let decompose = """
+        {"detail":[{"loc":["body","image_url"],"msg":"The provided image could not be processed \
+        for layer decomposition. Try a different image.","type":"invalid_request"}]}
+        """
+
+    /// Five images identical in size and tier; three succeeded, two got this. So the message must
+    /// NOT blame the tier — that is what sent the user looking in the wrong place.
+    func testDecompositionFailureDoesNotBlameTheTier() {
+        let m = LayerizeErrorRules.explain422(body: decompose, tier: "auto_1K")
+        XCTAssertTrue(m.contains("couldn’t decompose this particular image"))
+        XCTAssertFalse(m.lowercased().contains("output floor"),
+                       "must not assert a tier cause the evidence contradicts")
+        XCTAssertFalse(m.contains("auto_1K"), "the tier is irrelevant to this failure")
+    }
+
+    /// A genuine size/tier complaint should still get the tier explanation.
+    func testSizeComplaintStillNamesTheTier() {
+        let m = LayerizeErrorRules.explain422(body: "image_size is too small for this model",
+                                              tier: "auto_2K")
+        XCTAssertTrue(m.contains("auto_2K"))
+        XCTAssertTrue(m.contains("output floor"))
+    }
+
+    func testSafetyIsNamedAsContent() {
+        let m = LayerizeErrorRules.explain422(body: "request flagged by safety checker (nsfw)",
+                                              tier: "auto_1K")
+        XCTAssertTrue(m.contains("safety checker"))
+    }
+
+    func testUnknownBodyMakesNoClaims() {
+        let m = LayerizeErrorRules.explain422(body: "something entirely new", tier: "auto_1K")
+        XCTAssertTrue(m.contains("fal’s own message") || m.contains("fal's own message"))
+        XCTAssertFalse(m.contains("output floor"))
+    }
+
+    /// Retry only what can plausibly change. A tier or safety refusal is deterministic, so
+    /// retrying it just spends money.
+    func testRetryOnlyForTheModelDeclining() {
+        XCTAssertTrue(LayerizeErrorRules.worthRetrying(body: decompose))
+        XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: "image_size too small"))
+        XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: "flagged by safety checker"))
+        XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: "gateway timeout"))
+    }
+}
