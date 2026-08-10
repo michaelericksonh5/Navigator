@@ -3961,6 +3961,15 @@ enum AdobeCreditRules {
                                                     options: .regularExpression)
     }
 
+    /// Before spending, a reading older than this is refreshed first. Short, because the number in
+    /// the confirmation is the whole point — a stale one is worse than none.
+    static let refreshBeforeSpendAfter: TimeInterval = 5 * 60
+
+    static func needsRefreshBeforeSpend(readAt: Date?, now: Date) -> Bool {
+        guard let readAt else { return true }               // never read → always try
+        return now.timeIntervalSince(readAt) > refreshBeforeSpendAfter
+    }
+
     /// A reading older than this is shown as "as of …" rather than as the current truth. Adobe is
     /// the only authority; anything cached is a hint.
     static let readingGoesStaleAfter: TimeInterval = 60 * 60 * 6
