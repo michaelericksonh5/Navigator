@@ -11,9 +11,13 @@
  * typeID→stringID table was walked backwards (`typeIDToStringID(1…120000)`) and searched, which
  * turned up the real names:
  *
- *     547  generativeUpscale          3196  upscaleScale
- *    3195  upscaleCreativity          3198  upscaleModelId
- *    3197  upscaleFaceRecovery        3199  upscaleModelVersion
+ *     generativeUpscale   upscaleScale   upscaleCreativity
+ *     upscaleModelId      upscaleFaceRecovery   upscaleModelVersion
+ *
+ * The numeric ids are deliberately NOT recorded here. They are assigned per install and MOVE:
+ * generativeUpscale was 547 when this was written and is 568 today, upscaleScale 3196 -> 3220.
+ * Everything below resolves names through stringIDToTypeID at runtime, which is why that churn
+ * is harmless — but a reader who copied the old numbers into a descriptor would ship a bug.
  *
  * The earlier failure was passing an EMPTY ActionDescriptor: the event needs `upscaleScale`.
  * With it, the call succeeds — and Generative Upscale delivers its result as a **NEW document**
@@ -35,6 +39,20 @@
  * just produced three real results began failing with it, on both new and opened documents and
  * at both scales. Treat it as "check Photoshop's generative credits", never as a code fault —
  * retrying cannot fix it and each retry would spend another generation if it could.
+ *
+ * COST — settled against Adobe's own documentation, not a blog: the Firefly Upscaler is a
+ * **STANDARD** feature and costs **1 credit per generation**. It is absent from Adobe's premium
+ * feature table (which lists only "Generative Upscale ... using Partner Models") AND absent from
+ * their "features that do not use generative credits" list, and standard features "use 1 credit
+ * per generation".
+ *
+ * It is free ONLY on plans with "unlimited access to standard generations" — Creative Cloud Pro,
+ * enterprise Edition 4 or above, Firefly and credit plans. Third-party write-ups calling it free
+ * were describing those plans. On an enterprise plan without premium access the allowance is 25 a
+ * month total, which is why this event returns "Unauthorized to perform request" once spent.
+ *
+ * Navigator therefore treats every run as costing a credit and confirms before spending — see
+ * AdobeCreditRules / AdobeCredits in main.swift.
  *
  * WHY PADDING IS DONE HERE:
  * Photoshop refuses anything outside 1:4–4:1 ("Aspect ratio not supported. Please crop the
