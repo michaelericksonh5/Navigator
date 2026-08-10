@@ -4722,3 +4722,82 @@ final class ExportRulesTests: XCTestCase {
         XCTAssertEqual(ExportRules.Format.heic.menuTitle, "HEIC")
     }
 }
+
+
+// MARK: - Adobe generative credits
+
+final class AdobeCreditRulesTests: XCTestCase {
+
+    /// The exact string Adobe's account page renders.
+    func testParsesTheRealBalanceString() {
+        let page = "Generative AI Standard features 0/25 credits left Next reset: August 30, 2026"
+        let b = AdobeCreditRules.parseBalance(page)
+        XCTAssertEqual(b?.remaining, 0)
+        XCTAssertEqual(b?.total, 25)
+        XCTAssertEqual(AdobeCreditRules.parseResetDate(page), "August 30, 2026")
+    }
+
+    /// The genuine string, captured from the live account page via a shadow-DOM walk. Node text
+    /// is concatenated without whitespace, hence "features0/25".
+    func testParsesTheRealConcatenatedPageText() {
+        let real = "Manage accountAccountHigh 5 GamesSwitch profileAdobe AccountGenerative AI" +
+                   "Standard features0/25 credits leftNext reset: August 30, 2026Premium features" +
+                   "You get complimentary generations"
+        let b = AdobeCreditRules.parseBalance(real)
+        XCTAssertEqual(b?.remaining, 0)
+        XCTAssertEqual(b?.total, 25)
+        XCTAssertEqual(AdobeCreditRules.parseResetDate(real), "August 30, 2026")
+    }
+
+    func testParsesSpacingVariants() {
+        for s in ["12/25 credits left", "12 / 25 credits left", "1/1 credit left",
+                  "features0/25credits left"] {
+            XCTAssertNotNil(AdobeCreditRules.parseBalance(s), s)
+        }
+    }
+
+    /// A redesigned page must yield nil, never a confident wrong number.
+    func testRejectsNonsenseRatherThanGuessing() {
+        for s in ["credits left", "25 credits", "", "you have plenty of credits left",
+                  "30/25 credits left", "5/0 credits left"] {
+            XCTAssertNil(AdobeCreditRules.parseBalance(s), "should not parse: \(s)")
+        }
+    }
+
+    /// Never let "unknown" read like "plenty" — this is the failure that drained a real account.
+    func testUnknownBalanceSaysSoExplicitly() {
+        let m = AdobeCreditRules.confirmation(count: 1, cost: 1, remaining: nil, total: nil,
+                                              spentThisSession: 0)
+        XCTAssertTrue(m.detail.contains("never read your balance"))
+        XCTAssertFalse(m.detail.contains("left this cycle"))
+    }
+
+    func testWarnsWhenTheRunCannotFit() {
+        let m = AdobeCreditRules.confirmation(count: 5, cost: 1, remaining: 2, total: 25,
+                                              spentThisSession: 0)
+        XCTAssertTrue(m.title.contains("5 Adobe credits"))
+        XCTAssertTrue(m.detail.contains("more than you have left"))
+        XCTAssertFalse(AdobeCreditRules.canAfford(remaining: 2, count: 5, cost: 1))
+        XCTAssertTrue(AdobeCreditRules.canAfford(remaining: 5, count: 5, cost: 1))
+    }
+
+    /// Credits spent since the last reading have to be surfaced, or the number goes quietly wrong.
+    func testCountsSpendSinceTheLastReading() {
+        let m = AdobeCreditRules.confirmation(count: 1, cost: 1, remaining: 10, total: 25,
+                                              spentThisSession: 3)
+        XCTAssertTrue(m.detail.contains("spent 3 credits"))
+    }
+
+    func testStaleness() {
+        let t = Date(timeIntervalSince1970: 1_786_000_000)
+        XCTAssertFalse(AdobeCreditRules.isStale(readAt: t, now: t.addingTimeInterval(3600)))
+        XCTAssertTrue(AdobeCreditRules.isStale(readAt: t, now: t.addingTimeInterval(60 * 60 * 7)))
+    }
+
+    func testSingularPlural() {
+        XCTAssertTrue(AdobeCreditRules.confirmation(count: 1, cost: 1, remaining: 9, total: 25,
+                                                    spentThisSession: 1).title.contains("1 Adobe credit."))
+        XCTAssertTrue(AdobeCreditRules.confirmation(count: 2, cost: 1, remaining: 9, total: 25,
+                                                    spentThisSession: 0).title.contains("2 Adobe credits."))
+    }
+}
