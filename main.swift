@@ -11,6 +11,7 @@ import NetFS
 import FinderSync   // detect / offer to enable the Finder menu extension
 import Carbon.HIToolbox   // RegisterEventHotKey — the ONLY permission-free global hotkey
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
+import WebKit     // AdobeAccountWindow — shows Adobe's OWN signed-in page; we never see the login
 import os
 
 // Perf logging — view in Console.app (or `log stream`) filtered by
@@ -478,6 +479,32 @@ enum Prefs {
     /// so it shadows nothing, and a global hotkey nobody knows about is a feature nobody
     /// finds. The teleport variant is off by default — it needs Accessibility, and asking
     /// for that unprompted is not something an app should do on its own.
+    // Adobe generative credits. NOT secret — "0 of 25, read at 14:32" is not a credential, so
+    // this lives in prefs rather than the keychain. No token is ever stored: reading the balance
+    // means showing the user Adobe's own signed-in page, never holding their session.
+    static var adobeCreditsRemaining: Int? {
+        get { d.object(forKey: "adobeCreditsRemaining") as? Int }
+        set { d.set(newValue, forKey: "adobeCreditsRemaining") }
+    }
+    static var adobeCreditsTotal: Int? {
+        get { d.object(forKey: "adobeCreditsTotal") as? Int }
+        set { d.set(newValue, forKey: "adobeCreditsTotal") }
+    }
+    static var adobeCreditsResetDate: String? {
+        get { d.string(forKey: "adobeCreditsResetDate") }
+        set { d.set(newValue, forKey: "adobeCreditsResetDate") }
+    }
+    static var adobeCreditsReadAt: Date? {
+        get { d.object(forKey: "adobeCreditsReadAt") as? Date }
+        set { d.set(newValue, forKey: "adobeCreditsReadAt") }
+    }
+    /// Credits Navigator itself has spent since that reading. The reading is a snapshot; this is
+    /// the part Navigator knows exactly, because it issued the calls.
+    static var adobeCreditsSpentSinceReading: Int {
+        get { d.integer(forKey: "adobeCreditsSpentSinceReading") }
+        set { d.set(newValue, forKey: "adobeCreditsSpentSinceReading") }
+    }
+
     /// Set once the saved network arrangements have had their expensive columns stripped.
     static var networkColumnCleanupDone: Bool {
         get { d.bool(forKey: "networkColumnCleanupDone") }
@@ -1577,7 +1604,8 @@ enum ServiceIcon {
 // "Upscale (AI)" submenu — the low-quality fal preset plus Vertex/Imagen 4 ×2/×4.
 @ViewBuilder func upscaleMenu(label: String = "Upscale (AI)",
                               fal: @escaping (UpscaleOption) -> Void,
-                              imagen: @escaping (Int) -> Void) -> some View {
+                              imagen: @escaping (Int) -> Void,
+                              firefly: ((Int) -> Void)? = nil) -> some View {
     Menu {
         ForEach(upscaleOptions) { o in
             Button { fal(o) } label: { serviceLabel(o.label, ServiceIcon.fal) }
@@ -1585,6 +1613,12 @@ enum ServiceIcon {
         Divider()
         Button { imagen(2) } label: { serviceLabel("Upscale (Imagen 4) ×2", ServiceIcon.vertex) }
         Button { imagen(4) } label: { serviceLabel("Upscale (Imagen 4) ×4", ServiceIcon.vertex) }
+        // Only with Photoshop installed — it IS the engine here, unlike the two above.
+        if let firefly, PhotoshopIcon.image != nil {
+            Divider()
+            Button { firefly(2) } label: { psLabel("Upscale (Firefly) ×2") }
+            Button { firefly(4) } label: { psLabel("Upscale (Firefly) ×4") }
+        }
     } label: { Label(label, systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
 /// "Restyle (AI)…" — one image or a whole selection.
@@ -2829,6 +2863,271 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
 // pre-copy (faster, especially on network/Drive), and the original is never
 // written. `onProgress` (main thread) fires after Photoshop finishes so callers
 // can refresh.
+/// Sign in to Adobe and read the credit balance — by showing Adobe's own page.
+///
+/// There is no API for this. Adobe publishes no endpoint for the generative credit balance
+/// (checked against their developer docs), the account page renders it client-side, and the
+/// request that fetches it could not be captured. The only supported place the number exists is
+/// the page itself.
+///
+/// So this window IS that page. The user signs in to Adobe, in Adobe's own form, in a web view —
+/// Navigator never sees the password and stores no token. "Read Balance" then scrapes the one
+/// number off the rendered page. That is the whole mechanism, and its honesty matters more than
+/// its cleverness: if Adobe redesigns the page the parse returns nil and the window says so,
+/// rather than inventing a balance.
+///
+/// Deliberately NOT automatic and NOT polled. Adobe's own terms warn that "automatic scripting"
+/// can get generative access restricted, so this loads only when the user opens the window and
+/// reads only when they click the button.
+final class AdobeAccountWindow: NSObject, NSWindowDelegate {
+    static let shared = AdobeAccountWindow()
+    private var window: NSWindow?
+    private var web: WKWebView?
+    private var status: NSTextField?
+
+    static func show() { shared.present() }
+
+    private func present() {
+        if let window { window.makeKeyAndOrderFront(nil); return }
+        // A persistent data store so the Adobe session survives between openings, exactly as a
+        // browser would. Cookies only — no token is read out of it or written anywhere by us.
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .default()
+        let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 980, height: 700), configuration: cfg)
+        web = w
+
+        let label = NSTextField(labelWithString: currentSummary())
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        status = label
+
+        let read = NSButton(title: "Read Balance", target: self, action: #selector(readBalance))
+        read.bezelStyle = .rounded
+        let help = NSTextField(labelWithString: "Sign in, click your profile icon (top right), then Read Balance.")
+        help.font = .systemFont(ofSize: 11)
+        help.textColor = .tertiaryLabelColor
+
+        let bar = NSStackView(views: [label, NSView(), help, read])
+        bar.orientation = .horizontal
+        bar.spacing = 10
+        bar.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+        let stack = NSStackView(views: [bar, w])
+        stack.orientation = .vertical
+        stack.spacing = 0
+        stack.setHuggingPriority(.defaultHigh, for: .vertical)
+
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 760),
+                           styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        win.title = "Adobe Account — Generative Credits"
+        win.contentView = stack
+        win.center()
+        win.delegate = self
+        window = win
+        win.makeKeyAndOrderFront(nil)
+        w.load(URLRequest(url: URL(string: "https://account.adobe.com/")!))
+    }
+
+    private func currentSummary() -> String {
+        guard let r = AdobeCredits.remaining, let t = AdobeCredits.total else {
+            return "Balance not read yet."
+        }
+        var s = "\(r) of \(t) credits left"
+        if let d = AdobeCredits.resetDate { s += " · resets \(d)" }
+        if AdobeCredits.spentSinceReading > 0 { s += " · \(AdobeCredits.spentSinceReading) spent since" }
+        return s
+    }
+
+    @objc private func readBalance() {
+        // Must pierce SHADOW DOM. Verified against the live page: the balance lives inside
+        // <pandora-react-mini-app-account-menu>'s shadow root, so document.body.innerText returns
+        // 1,215 characters WITHOUT it, while walking shadow roots returns 13,398 characters WITH
+        // it. The first version of this read innerText and would have silently never found a
+        // balance.
+        //
+        // Text rather than CSS selectors: matching Adobe's WORDS ("0/25 credits left") survives a
+        // re-skin; matching their generated class names would not.
+        let js = """
+        (function () {
+          function deep(root, depth, acc) {
+            if (depth > 10) return;
+            acc.push(root === document ? (document.body.innerText || '') : (root.textContent || ''));
+            var els = root.querySelectorAll ? root.querySelectorAll('*') : [];
+            for (var i = 0; i < els.length; i++) {
+              if (els[i].shadowRoot) deep(els[i].shadowRoot, depth + 1, acc);
+            }
+          }
+          var parts = [];
+          deep(document, 0, parts);
+          return parts.join('\\n');
+        })()
+        """
+        web?.evaluateJavaScript(js) { [weak self] value, _ in
+            guard let self else { return }
+            let text = (value as? String) ?? ""
+            guard let b = AdobeCreditRules.parseBalance(text) else {
+                self.status?.stringValue = "Couldn’t find a balance on this page — click your profile icon first."
+                self.status?.textColor = .systemOrange
+                return
+            }
+            AdobeCredits.record(remaining: b.remaining, total: b.total,
+                                resetDate: AdobeCreditRules.parseResetDate(text))
+            self.status?.stringValue = self.currentSummary()
+            self.status?.textColor = .secondaryLabelColor
+            NotificationCenter.default.post(name: .navigatorAdobeCreditsChanged, object: nil)
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        window = nil; web = nil; status = nil
+    }
+}
+
+extension Notification.Name {
+    static let navigatorAdobeCreditsChanged = Notification.Name("navigatorAdobeCreditsChanged")
+}
+
+/// Adobe generative credit bookkeeping.
+///
+/// Navigator can spend these — Firefly Generative Upscale is a standard feature at 1 credit, and
+/// on this account the whole monthly allowance is 25. This app once burned a user's entire month
+/// on exploratory calls without asking, so nothing generative runs now without a confirmation
+/// that states the cost and what has already been spent.
+enum AdobeCredits {
+    static var remaining: Int? { Prefs.adobeCreditsRemaining }
+    static var total: Int? { Prefs.adobeCreditsTotal }
+    static var resetDate: String? { Prefs.adobeCreditsResetDate }
+    static var readAt: Date? { Prefs.adobeCreditsReadAt }
+    static var spentSinceReading: Int { Prefs.adobeCreditsSpentSinceReading }
+
+    /// A fresh reading from Adobe's own page resets the local spend counter — the reading already
+    /// accounts for everything spent before it.
+    static func record(remaining: Int, total: Int, resetDate: String?) {
+        Prefs.adobeCreditsRemaining = remaining
+        Prefs.adobeCreditsTotal = total
+        Prefs.adobeCreditsResetDate = resetDate
+        Prefs.adobeCreditsReadAt = Date()
+        Prefs.adobeCreditsSpentSinceReading = 0
+        navLog("adobe credits: read \(remaining)/\(total)\(resetDate.map { ", resets \($0)" } ?? "")")
+    }
+
+    /// Called after a generative call actually succeeded. Decrements the cached balance too, so
+    /// the next confirmation is right even without re-reading Adobe.
+    static func recordSpend(_ credits: Int) {
+        guard credits > 0 else { return }
+        Prefs.adobeCreditsSpentSinceReading += credits
+        if let r = Prefs.adobeCreditsRemaining { Prefs.adobeCreditsRemaining = max(0, r - credits) }
+        navLog("adobe credits: spent \(credits); \(Prefs.adobeCreditsRemaining.map(String.init) ?? "?") left by our count")
+    }
+
+    /// The gate. Returns false if the user declines, so the caller must not proceed.
+    /// Modal on purpose — this spends real money and must not be dismissable by accident.
+    /// Callers are SwiftUI menu actions, which already run on the main thread; NSAlert requires
+    /// that anyway, so the invariant is real even without a @MainActor annotation (which the
+    /// non-isolated menu closures can't satisfy).
+    static func confirmSpend(count: Int, cost: Int = AdobeCreditRules.fireflyUpscaleCost) -> Bool {
+        let msg = AdobeCreditRules.confirmation(count: count, cost: cost,
+                                                remaining: remaining, total: total,
+                                                spentThisSession: spentSinceReading)
+        let a = NSAlert()
+        a.alertStyle = .warning
+        a.messageText = msg.title
+        var detail = msg.detail
+        if let readAt {
+            let f = RelativeDateTimeFormatter()
+            detail += " Balance last read \(f.localizedString(for: readAt, relativeTo: Date()))."
+            if AdobeCreditRules.isStale(readAt: readAt, now: Date()) {
+                detail += " That reading is old — check it again to be sure."
+            }
+        }
+        a.informativeText = detail
+        a.addButton(withTitle: "Use \(count * cost) Credit\(count * cost == 1 ? "" : "s")")
+        a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "Check Balance…")
+        switch a.runModal() {
+        case .alertFirstButtonReturn: return true
+        case .alertThirdButtonReturn:
+            AdobeAccountWindow.show()
+            return false                      // never spend straight after sending them to look
+        default: return false
+        }
+    }
+}
+
+/// Photoshop's Generative Upscale, Firefly engine only.
+///
+/// The script has existed since the typeID walk found `generativeUpscale`, but nothing ever
+/// called it — it was bundled into the app and unreachable, so the feature may as well not have
+/// been built. This is the missing half.
+///
+/// Firefly's upscaler consumes NO generative credits; the Topaz engines in the same dropdown do
+/// (10–35 depending on model and megapixels). The script sends no `upscaleModelId`, so Photoshop
+/// uses its Firefly default, and it verifies the result document's name contains "Firefly" before
+/// saving — a changed default fails the run instead of quietly billing an unlicensed engine.
+func fireflyUpscaleForImage(_ src: URL, scale: Int? = nil, onDone: ((URL) -> Void)? = nil) {
+    guard isImageFile(src) else { NSSound.beep(); return }
+    guard let size = imagePixelSize(src) else {
+        reportFileError("Couldn’t read “\(src.lastPathComponent)”.", "", permissionHint: false); return
+    }
+    // Preflight rather than let Photoshop refuse mid-run: it rejects aspects outside 1:4–4:1 and
+    // any output over 6144px a side. FireflyUpscaleRules works out whether padding is needed.
+    let plan = FireflyUpscaleRules.plan(width: size.w, height: size.h, preferred: scale)
+    let chosen: Int
+    var padTo = ""
+    switch plan {
+    case .upscale(let s):
+        chosen = s
+    case .padThenUpscale(let s, let pad):
+        chosen = s
+        padTo = "\(pad.w)x\(pad.h)"
+    case .notAnImage, .tooLargeForAnyScale:
+        reportFileError("Can’t upscale “\(src.lastPathComponent)”.",
+                        FireflyUpscaleRules.explain(plan, width: size.w, height: size.h),
+                        permissionHint: false)
+        return
+    }
+    // Padding colour picked so it can't collide with a colour in the art — the same choice the
+    // chroma paths make, so the crop-back afterwards is unambiguous.
+    // Backing colour picked from the art itself, so the padding can't collide with a colour in
+    // the image and the crop-back afterwards is unambiguous. Falls back to green only if the
+    // image can't be sampled.
+    var padHex = "00FF00"
+    if !padTo.isEmpty, let choice = adaptiveBacking(src) {
+        let c: RGB8
+        switch choice {
+        case .extendField(let rgb): c = rgb
+        case .keyColour(let rgb, _): c = rgb
+        }
+        padHex = String(format: "%02X%02X%02X", c.r, c.g, c.b)
+    }
+    let out = upscaleOutputURL(src)
+    BGJobProgress.shared.start("Upscaling (Firefly)", total: 1)
+    DispatchQueue.global(qos: .userInitiated).async {
+        let r = runPhotoshopScript(resource: "NavigatorGenerativeUpscale",
+                                   arguments: [src.path, out.path, String(chosen), padTo, padHex],
+                                   reportError: true)
+        DispatchQueue.main.async {
+            BGJobProgress.shared.finish(r.ok ? "Upscaled \(src.lastPathComponent) ×\(chosen)"
+                                             : "Upscale failed")
+            if r.ok { AdobeCredits.recordSpend(AdobeCreditRules.fireflyUpscaleCost) }
+            guard r.ok else {
+                // Adobe refusing the request is not a Navigator fault and retrying can't fix it.
+                // Say so plainly rather than surfacing "Unauthorized to perform request", which
+                // reads like a bug in us.
+                if r.message.contains("Unauthorized to perform request") {
+                    reportFileError("Photoshop wouldn’t run Generative Upscale.",
+                                    "Adobe refused the request, which is what it returns when the account has no generative credits left. Check your credit balance in Photoshop — Navigator can't work around this, and retrying won't help.",
+                                    permissionHint: false)
+                }
+                return
+            }
+            navLog("firefly upscale: \(src.lastPathComponent) x\(chosen) -> \(out.lastPathComponent)")
+            hideApp(bundleID: "com.adobe.Photoshop")
+            onDone?(out)
+        }
+    }
+}
+
 func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
     let out = rmbgOutputURL(src)
@@ -9660,7 +9959,21 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
                 upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
-                            imagen: { f in browser.upscaleImagen(ids, factor: f) })
+                            imagen: { f in browser.upscaleImagen(ids, factor: f) },
+                            firefly: { f in
+                                let targets = browser.items.filter {
+                                    ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url)
+                                }.map(\.url)
+                                // Confirm ONCE for the whole selection, before anything runs —
+                                // a per-image prompt on a 20-image batch trains people to click
+                                // through, which defeats the point.
+                                guard !targets.isEmpty, AdobeCredits.confirmSpend(count: targets.count) else { return }
+                                // Then one at a time: each is a cloud round trip and Photoshop
+                                // serialises them anyway.
+                                for u in targets {
+                                    fireflyUpscaleForImage(u, scale: f) { out in browser.refreshAndReveal([out]) }
+                                }
+                            })
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
                     browser.refreshAndReveal([out])
                 }
@@ -12993,6 +13306,9 @@ struct ImageViewerView: View {
                     upscaleImagesViaFal([u], option: opt) { outs in if let o = outs.first { revealNewImage(o) } }
                 }, imagen: { f in
                     upscaleImagesViaImagen([u], factor: f) { outs in if let o = outs.first { revealNewImage(o) } }
+                }, firefly: { f in
+                    guard AdobeCredits.confirmSpend(count: 1) else { return }
+                    fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
             }
@@ -15235,6 +15551,8 @@ struct SetupItem: Identifiable {
 struct SetupAssistantView: View {
     @State private var states: [String: PermissionState] = [:]
     @State private var drivesText = ""
+    /// Bumped to redraw after the credit reading changes (the store is plain prefs, not observable).
+    @State private var adobeTick = 0
     @State private var drivesAdded: Int?
     @State private var checking = false
     @State private var checkedAt: Date?
@@ -15265,6 +15583,26 @@ struct SetupAssistantView: View {
             // paste covers the lot. Nothing is mounted here on purpose: the addresses are saved as
             // sidebar drives, and the first click mounts through NetFS with THEIR login, which is
             // also the moment a missing VPN gets diagnosed properly (MountFailureRules).
+            // Adobe credits sit next to the other account-ish setup. No key to paste and no
+            // token stored: the button opens Adobe's own signed-in page in a web view and reads
+            // the one number off it. There is no API for this — see AdobeAccountWindow.
+            Section("Adobe generative credits") {
+                Text(adobeCreditSummary)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Sign In & Read Balance…") { AdobeAccountWindow.show() }
+                    if AdobeCredits.remaining != nil {
+                        Button("Forget") {
+                            Prefs.adobeCreditsRemaining = nil; Prefs.adobeCreditsTotal = nil
+                            Prefs.adobeCreditsResetDate = nil; Prefs.adobeCreditsReadAt = nil
+                            Prefs.adobeCreditsSpentSinceReading = 0
+                            adobeTick &+= 1
+                        }
+                    }
+                    Spacer()
+                }
+            }
             Section("Network drives") {
                 Text("Paste the share addresses your team uses — one per line, optionally as “Label = address”. They’re saved as sidebar drives; clicking one connects with your own login. If these shares need the VPN, connect it first.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -15319,6 +15657,9 @@ struct SetupAssistantView: View {
         .formStyle(.grouped)
         .frame(width: 560, height: 660)
         .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: .navigatorAdobeCreditsChanged)) { _ in
+            adobeTick &+= 1
+        }
         // Returning from System Settings re-activates Navigator, which is the only
         // signal we get that a switch may have moved. Re-probing here is what stops
         // this window from showing yesterday's answer until the app is restarted.
@@ -15351,6 +15692,27 @@ struct SetupAssistantView: View {
         case .off, .notAsked: return .orange
         case .unknown: return .secondary
         }
+    }
+
+    /// Plain-language state of the Adobe credit reading, including how much Navigator has spent
+    /// since it was taken — the reading is a snapshot, that part is exact.
+    private var adobeCreditSummary: String {
+        _ = adobeTick                        // redraw dependency
+        guard let r = AdobeCredits.remaining, let t = AdobeCredits.total else {
+            return "Navigator hasn’t read your balance. Firefly Generative Upscale costs 1 credit per image, so without this it can only warn you that a run costs something — not how much you have left."
+        }
+        var s = "\(r) of \(t) credits left"
+        if let d = AdobeCredits.resetDate { s += ", resets \(d)" }
+        s += "."
+        if AdobeCredits.spentSinceReading > 0 {
+            s += " Navigator has spent \(AdobeCredits.spentSinceReading) since that reading."
+        }
+        if let at = AdobeCredits.readAt {
+            let f = RelativeDateTimeFormatter()
+            s += " Read \(f.localizedString(for: at, relativeTo: Date()))"
+            s += AdobeCreditRules.isStale(readAt: at, now: Date()) ? " — worth checking again." : "."
+        }
+        return s
     }
 
     /// Save each pasted address as a sidebar drive. The stored path is a best guess

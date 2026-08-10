@@ -3922,3 +3922,79 @@ enum ExportRules {
         }
     }
 }
+
+// MARK: - Adobe generative credits
+
+/// Navigator can spend Adobe generative credits (Firefly Generative Upscale is a *standard*
+/// feature at 1 credit each). On an enterprise plan without premium access that allowance is
+/// **25 a month** — measured, not assumed: the account page read "0/25 credits left, next reset
+/// August 30, 2026". Three exploratory calls is over a tenth of a month, which is how this app
+/// once drained a user's entire allowance without asking.
+///
+/// So: count every generative call Navigator issues, and never issue one without saying what it
+/// costs and what has already been spent.
+enum AdobeCreditRules {
+    /// What Adobe charges for the things Navigator can trigger. Firefly Generative Upscale is
+    /// absent from Adobe's premium table and from its "does not use credits" list, which makes it
+    /// a standard feature — "1 credit per generation".
+    static let fireflyUpscaleCost = 1
+
+    /// Parse the balance out of the account page's own words: "0/25 credits left".
+    /// Returns (remaining, total). Deliberately tolerant of spacing and surrounding text, strict
+    /// about the shape, so a page redesign yields nil rather than a confident wrong number.
+    static func parseBalance(_ text: String) -> (remaining: Int, total: Int)? {
+        // \s* before "credits", not \s+: the page's textContent concatenates nodes without
+        // whitespace, so a re-skin could yield "0/25credits left". Verified real form is
+        // "...Standard features0/25 credits leftNext reset: August 30, 2026".
+        guard let m = text.range(of: #"(\d+)\s*/\s*(\d+)\s*credits?\s+left"#,
+                                 options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let nums = text[m].split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        guard nums.count == 2, nums[1] > 0, nums[0] <= nums[1] else { return nil }
+        return (nums[0], nums[1])
+    }
+
+    /// "Next reset: August 30, 2026" — shown so a stale reading is obviously stale.
+    static func parseResetDate(_ text: String) -> String? {
+        guard let m = text.range(of: #"next\s*reset:?\s*([A-Za-z]+\s+\d{1,2},?\s*\d{4})"#,
+                                 options: [.regularExpression, .caseInsensitive]) else { return nil }
+        return String(text[m]).replacingOccurrences(of: "(?i)next\\s+reset:\\s*", with: "",
+                                                    options: .regularExpression)
+    }
+
+    /// A reading older than this is shown as "as of …" rather than as the current truth. Adobe is
+    /// the only authority; anything cached is a hint.
+    static let readingGoesStaleAfter: TimeInterval = 60 * 60 * 6
+
+    static func isStale(readAt: Date, now: Date) -> Bool {
+        now.timeIntervalSince(readAt) > readingGoesStaleAfter
+    }
+
+    /// Enough left to run `count` operations at `cost` each?
+    static func canAfford(remaining: Int, count: Int, cost: Int) -> Bool {
+        count > 0 && cost > 0 && remaining >= count * cost
+    }
+
+    /// The line shown before spending. `remaining` is nil when no balance has ever been read —
+    /// which must read as "unknown", never as "plenty".
+    static func confirmation(count: Int, cost: Int, remaining: Int?, total: Int?,
+                             spentThisSession: Int) -> (title: String, detail: String) {
+        let credits = count * cost
+        let unit = credits == 1 ? "credit" : "credits"
+        let title = count == 1
+            ? "Upscaling this image uses \(credits) Adobe \(unit)."
+            : "Upscaling \(count) images uses \(credits) Adobe \(unit)."
+        var lines: [String] = []
+        if let remaining, let total {
+            lines.append("You have \(remaining) of \(total) left this cycle.")
+            if !canAfford(remaining: remaining, count: count, cost: cost) {
+                lines.append("That is more than you have left, so Adobe will refuse it.")
+            }
+        } else {
+            lines.append("Navigator has never read your balance, so it doesn’t know how many you have left.")
+        }
+        if spentThisSession > 0 {
+            lines.append("Navigator has spent \(spentThisSession) \(spentThisSession == 1 ? "credit" : "credits") since it last read your balance.")
+        }
+        return (title, lines.joined(separator: " "))
+    }
+}
