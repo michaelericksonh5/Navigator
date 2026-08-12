@@ -4977,10 +4977,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     /// Measured on two real SMB shares, and the answer differs by server — which is why this
     /// asks for the minimum rather than assuming either way:
     ///
-    /// * //corp-pure02/data — the seven extra attributes cost ~187 ms PER ENTRY on first fetch
+    /// * //fileserver-b/data — the seven extra attributes cost ~187 ms PER ENTRY on first fetch
     ///   even when name/size/date for that same folder were already cached. Asking for three
     ///   instead of ten was 2–3x faster cold.
-    /// * //CORP-DC01/Games — every key set cost the same ~88 ms/entry (669 entries, ~59 s), and
+    /// * //fileserver-a/Games — every key set cost the same ~88 ms/entry (669 entries, ~59 s), and
     ///   nothing cached between runs. Attribute count was irrelevant; per-entry latency was
     ///   the whole story.
     ///
@@ -5772,7 +5772,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             // the folder changed under it. This USED to be inferred from "did it return fewer
             // rows than phase 1", which is wrong: phase 1 filters hidden files by name while
             // the enumerator honours the DOS hidden ATTRIBUTE, so on a Windows-authored share
-            // phase 2 legitimately returns fewer rows (measured 116 vs 118 on //corp-pure02/data
+            // phase 2 legitimately returns fewer rows (measured 116 vs 118 on //fileserver-b/data
             // — Thumbs.db and friends). That made a correct result look aborted, so the detail
             // pass was thrown away and DiskCache.put below was never reached: sizes stayed
             // blank forever and the folder re-listed from scratch on every single launch.
