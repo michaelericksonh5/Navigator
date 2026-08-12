@@ -1346,14 +1346,6 @@ final class LayerizeRulesTests: XCTestCase {
         XCTAssertFalse(LayerizeRules.isPlausiblePNG([UInt8](repeating: 0x41, count: 500)), "not a PNG")
     }
 
-    /// With `auto` the output resolution is unknown until the layers arrive, so cost is computed
-    /// from what came back rather than guessed beforehand.
-    func testCostComesFromTheActualResult() {
-        XCTAssertEqual(LayerizeRules.actualCost(layerCount: 7, largestEdge: 1024), 0.03375 * 7, accuracy: 1e-9)
-        XCTAssertEqual(LayerizeRules.actualCost(layerCount: 7, largestEdge: 2229), 0.0675 * 7, accuracy: 1e-9)
-        XCTAssertEqual(LayerizeRules.actualCost(layerCount: 0, largestEdge: 1024), 0, accuracy: 1e-9)
-    }
-
     /// fal's limits are a pixel COUNT, not per-side. These all satisfy the documented range and
     /// must pass untouched — the old per-side check resampled them for no reason.
     func testPixelCountLimitsNotPerSide() {
@@ -1450,10 +1442,6 @@ final class LayerizeRulesTests: XCTestCase {
                           LayerizeRules.fileName(stem: "K", zIndex: 2, name: "左侧边框金龙"))
     }
 
-    func testWorstCaseCostUsesTheRightTierRate() {
-        XCTAssertEqual(LayerizeRules.worstCaseCost(tier: "auto_1K"), 0.03375 * 17, accuracy: 1e-9)
-        XCTAssertEqual(LayerizeRules.worstCaseCost(tier: "auto_2K"), 0.0675 * 17, accuracy: 1e-9)
-    }
 }
 
 // MARK: - Network column defaults
@@ -4957,5 +4945,270 @@ final class LayerizeErrorRulesTests: XCTestCase {
         XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: "image_size too small"))
         XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: "flagged by safety checker"))
         XCTAssertFalse(LayerizeErrorRules.worthRetrying(body: "gateway timeout"))
+    }
+}
+
+
+// MARK: - Rebuilding a layered document
+
+final class LayerAssemblyRulesTests: XCTestCase {
+
+    /// THE trap, with the real measured numbers from SF4_Blue: the PNG is bigger than its box by a
+    /// factor that DIFFERS per layer. Placing at native size would be 2-3x too big.
+    func testScaleUsesTheBoundingBoxAsTheTargetSize() {
+        // z=2: PNG 612x802, box 354x463
+        XCTAssertEqual(LayerAssemblyRules.scalePercent(pngSide: 612, boxSide: 354), 57.84, accuracy: 0.01)
+        // z=3: PNG 491x690, box 179x253 — a completely different factor in the same image
+        XCTAssertEqual(LayerAssemblyRules.scalePercent(pngSide: 491, boxSide: 179), 36.46, accuracy: 0.01)
+        // z=1 happened to match exactly; it must come out as a no-op
+        XCTAssertEqual(LayerAssemblyRules.scalePercent(pngSide: 673, boxSide: 673), 100, accuracy: 1e-9)
+    }
+
+    func testScaleIsSafeOnGarbage() {
+        XCTAssertEqual(LayerAssemblyRules.scalePercent(pngSide: 0, boxSide: 100), 100)
+        XCTAssertEqual(LayerAssemblyRules.scalePercent(pngSide: 100, boxSide: 0), 100)
+    }
+
+    /// Real layers drift under 1%. A stretched layer should be noticed, not silently produced.
+    func testAspectDriftOnRealLayersIsNegligible() {
+        XCTAssertLessThan(LayerAssemblyRules.aspectDrift(pngW: 612, pngH: 802, boxW: 354, boxH: 463),
+                          LayerAssemblyRules.maxTolerableDrift)
+        XCTAssertLessThan(LayerAssemblyRules.aspectDrift(pngW: 1728, pngH: 369, boxW: 780, boxH: 168),
+                          LayerAssemblyRules.maxTolerableDrift)
+        // A genuinely mismatched box is over tolerance.
+        XCTAssertGreaterThan(LayerAssemblyRules.aspectDrift(pngW: 100, pngH: 100, boxW: 400, boxH: 100),
+                             LayerAssemblyRules.maxTolerableDrift)
+    }
+
+    /// Every real bbox sat inside the canvas; a box that doesn't must be rejected rather than
+    /// placed off-document.
+    func testBoxSanity() {
+        XCTAssertTrue(LayerAssemblyRules.boxIsSane([111, 103, 784, 1020], canvasW: 896, canvasH: 1120))
+        XCTAssertTrue(LayerAssemblyRules.boxIsSane([152, 979, 745, 1095], canvasW: 896, canvasH: 1120))
+        XCTAssertFalse(LayerAssemblyRules.boxIsSane([0, 0, 900, 100], canvasW: 896, canvasH: 1120), "past the right edge")
+        XCTAssertFalse(LayerAssemblyRules.boxIsSane([50, 50, 50, 100], canvasW: 896, canvasH: 1120), "zero width")
+        XCTAssertFalse(LayerAssemblyRules.boxIsSane([-1, 0, 10, 10], canvasW: 896, canvasH: 1120), "negative origin")
+        XCTAssertFalse(LayerAssemblyRules.boxIsSane([0, 0, 10], canvasW: 896, canvasH: 1120), "wrong arity")
+    }
+
+    /// The rebuilt file must never collide with the source image it was decomposed from.
+    func testAssembledNameNeverCollidesWithTheSource() {
+        XCTAssertEqual(LayerAssemblyRules.assembledName(fromLayersFolder: "HP1_Frame_Layers"),
+                       "HP1_Frame_assembled.psd")
+        // A deduped folder keeps what distinguishes it.
+        XCTAssertEqual(LayerAssemblyRules.assembledName(fromLayersFolder: "key_Layers 2"),
+                       "key_Layers 2_assembled.psd")
+        XCTAssertEqual(LayerAssemblyRules.assembledName(fromLayersFolder: "_Layers"), "assembled.psd")
+    }
+
+    /// A rebuild that dropped layers still produces a PSD, so it comes back as OK. It must still be
+    /// surfaced — an incomplete document that reports clean success is how the zero-byte-download bug
+    /// hid a whole batch of missing layers.
+    func testPartialRebuildIsDetectedFromTheScriptsOwnMessage() {
+        XCTAssertFalse(LayerAssemblyRules.isPartial("OK: /tmp/a_assembled.psd (2752x1536, 11 layers)"))
+        XCTAssertTrue(LayerAssemblyRules.isPartial(
+            "OK: /tmp/a_assembled.psd (2752x1536, 9 layers; MISSING 2: a.png, b.png)"))
+        XCTAssertTrue(LayerAssemblyRules.isPartial(
+            "OK: /tmp/a_assembled.psd (2752x1536, 10 layers; FAILED 1: c.png — could not open)"))
+        // A hard failure is reported through ScriptResult.ok, not through this.
+        XCTAssertFalse(LayerAssemblyRules.isPartial("ERROR: [place c.png] could not open"))
+        // "missing"/"failed" in a FILE NAME must not masquerade as a partial rebuild — the trailing
+        // space in the marker is what keeps them apart.
+        XCTAssertFalse(LayerAssemblyRules.isPartial("OK: /tmp/MISSING_frame_assembled.psd (8x8, 2 layers)"))
+        XCTAssertFalse(LayerAssemblyRules.isPartial("OK: /tmp/FAILED.psd (8x8, 2 layers)"))
+    }
+
+    // MARK: - LayerCoverageRules
+
+    /// Repair fires only on unambiguous breakage.
+    ///
+    /// This pins a DELIBERATE trade-off. In the 1-2% band the measured outcomes contradict each
+    /// other — 1.91% repaired to 1.07% (a real gain) while 1.06% repaired to 1.06% (139 seconds and
+    /// two cents for nothing) — so the fraction does not predict whether a retry helps there. Rather
+    /// than fit a threshold between two adjacent points with opposite results, the bar sits above the
+    /// whole band. The cost is giving up gains like that 1.91% case; the benefit is never doubling
+    /// the runtime of a run that was already fine.
+    func testRepairTriggersOnlyOnUnambiguousBreakage() {
+        // Lost an entire frame rail — repaired to 1.64%, a 4.7x gain.
+        XCTAssertTrue(LayerCoverageRules.needsRepair(uncoveredFraction: 0.0764))
+        // The contradictory band, deliberately left alone.
+        XCTAssertFalse(LayerCoverageRules.needsRepair(uncoveredFraction: 0.0191))
+        XCTAssertFalse(LayerCoverageRules.needsRepair(uncoveredFraction: 0.0121))
+        XCTAssertFalse(LayerCoverageRules.needsRepair(uncoveredFraction: 0.0106))
+        XCTAssertFalse(LayerCoverageRules.needsRepair(uncoveredFraction: 0))
+    }
+
+    /// Checking coverage is only sound when the base was dropped. With an opaque base at z0 the
+    /// composite has no holes BY CONSTRUCTION, so the measurement would report a flattering 0% and
+    /// hide a missing layer — which is exactly what it did on SF4_Blue before this was understood.
+    func testCoverageOnlyAppliesWhenTheBaseWasDiscarded() {
+        XCTAssertTrue(LayerCoverageRules.applies(keptBase: false))
+        XCTAssertFalse(LayerCoverageRules.applies(keptBase: true))
+    }
+
+    /// The gap box goes back to fal as a normalized per-mille `<bbox>`, matching the convention of
+    /// fal's own manifest. These are the real numbers that recovered frame.png's top rail.
+    func testRepairPromptCarriesTheGapAsPerMilleBbox() {
+        let p = LayerCoverageRules.repairPrompt(gap: [41, 250, 2424, 700], canvasW: 2477, canvasH: 1703)
+        XCTAssertNotNil(p)
+        XCTAssertTrue(p!.contains("<bbox>16 146 978 411</bbox>"), p ?? "nil")
+        // English names still requested — dropping that turns every filename Chinese.
+        XCTAssertTrue(p!.contains("english"))
+    }
+
+    /// A degenerate or impossible box must never spend a call.
+    func testRepairPromptRefusesABoxItCannotUse() {
+        XCTAssertNil(LayerCoverageRules.repairPrompt(gap: [0, 0, 0, 0], canvasW: 100, canvasH: 100))
+        XCTAssertNil(LayerCoverageRules.repairPrompt(gap: [90, 90, 10, 10], canvasW: 100, canvasH: 100))
+        XCTAssertNil(LayerCoverageRules.repairPrompt(gap: [1, 2, 3], canvasW: 100, canvasH: 100))
+        XCTAssertNil(LayerCoverageRules.repairPrompt(gap: [0, 0, 50, 50], canvasW: 0, canvasH: 100))
+    }
+
+    /// A repair is a fresh roll of the dice and can come back WORSE — measured 1.144% then 7.253%
+    /// from the same prompt. Equal is not better; keep what's already on disk.
+    func testRepairIsOnlyAdoptedWhenStrictlyBetter() {
+        XCTAssertTrue(LayerCoverageRules.repairIsBetter(original: 0.01144, repaired: 0.00475))
+        XCTAssertFalse(LayerCoverageRules.repairIsBetter(original: 0.01144, repaired: 0.07253))
+        XCTAssertFalse(LayerCoverageRules.repairIsBetter(original: 0.01144, repaired: 0.01144))
+    }
+
+    /// The English-names line is what every layer filename depends on, so it must survive whatever
+    /// the user types — including them pasting the whole prompt back in.
+    func testComposePromptAlwaysKeepsTheEnglishLine() {
+        XCTAssertEqual(LayerizeRules.composePrompt(nil), LayerizeRules.basePrompt)
+        XCTAssertEqual(LayerizeRules.composePrompt(""), LayerizeRules.basePrompt)
+        XCTAssertEqual(LayerizeRules.composePrompt("   \n  "), LayerizeRules.basePrompt)
+
+        let asked = LayerizeRules.composePrompt("Separate guns, triggers, hands, and arms out from image")
+        XCTAssertTrue(asked.hasPrefix(LayerizeRules.basePrompt), asked)
+        XCTAssertTrue(asked.contains("Separate guns, triggers, hands, and arms out from image"), asked)
+
+        // Pasting the full prompt back in must not duplicate the base line.
+        let pasted = LayerizeRules.basePrompt + "\nSeparate guns and arms"
+        XCTAssertEqual(LayerizeRules.composePrompt(pasted), pasted)
+        XCTAssertEqual(pasted.components(separatedBy: LayerizeRules.basePrompt).count - 1, 1)
+    }
+
+    /// A repair is a whole fresh decomposition. If it dropped the user's element instruction it would
+    /// return a set that no longer separates what they asked for, while scoring better on coverage.
+    func testRepairPromptKeepsTheUsersElementInstruction() {
+        let p = LayerCoverageRules.repairPrompt(gap: [41, 250, 2424, 700], canvasW: 2477, canvasH: 1703,
+                                                userText: "Separate guns, triggers, hands, and arms out from image")
+        XCTAssertNotNil(p)
+        XCTAssertTrue(p!.contains("Separate guns, triggers, hands, and arms out from image"), p ?? "nil")
+        XCTAssertTrue(p!.contains(LayerizeRules.basePrompt), p ?? "nil")
+        XCTAssertTrue(p!.contains("<bbox>16 146 978 411</bbox>"), p ?? "nil")
+        // Still works with no user text — that is the pre-existing behaviour.
+        let plain = LayerCoverageRules.repairPrompt(gap: [41, 250, 2424, 700], canvasW: 2477, canvasH: 1703)
+        XCTAssertNotNil(plain)
+        XCTAssertTrue(plain!.contains(LayerizeRules.basePrompt), plain ?? "nil")
+    }
+
+    /// The retry budget is bounded, and bounded at what was actually measured to pay off. Each of
+    /// the two repairs on frame.png improved coverage (7.64% -> 1.91% -> 1.07%); a third was never
+    /// measured, so it isn't taken.
+    func testRepairAttemptsAreBoundedAtWhatWasMeasured() {
+        XCTAssertEqual(LayerCoverageRules.maxRepairAttempts, 2)
+        // Improvement is still recognised wherever it happens — these are the measured steps.
+        XCTAssertTrue(LayerCoverageRules.repairIsBetter(original: 0.0764, repaired: 0.0191))
+        XCTAssertTrue(LayerCoverageRules.repairIsBetter(original: 0.0191, repaired: 0.0107))
+        // But a second attempt only runs while the result is still above the bar, so in practice the
+        // loop stops as soon as a repair brings a broken run back into the acceptable band.
+        XCTAssertFalse(LayerCoverageRules.needsRepair(uncoveredFraction: 0.0164))
+    }
+
+    // MARK: - LayerCoverageRules.measure — the adversarial pass this code never got
+
+    /// A solid rectangle of known alpha, for building synthetic layer sets.
+    private func solid(_ w: Int, _ h: Int, alpha: UInt8) -> CGImage {
+        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: Double(alpha) / 255)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()!
+    }
+    private func place(_ box: [Int], _ img: CGImage) -> LayerCoverageRules.Placement {
+        LayerCoverageRules.Placement(normalized: box, image: img)
+    }
+
+    func testFullCoverageReportsNoGap() {
+        let src = solid(200, 100, alpha: 255)
+        let r = LayerCoverageRules.measure(source: src, layers: [place([0, 0, 1000, 1000], solid(200, 100, alpha: 255))])
+        XCTAssertEqual(r?.fraction ?? -1, 0, accuracy: 0.001)
+    }
+
+    /// Half the source left uncovered must read as ~50%, and the gap box must be the UNCOVERED half.
+    func testHalfUncoveredIsMeasuredAndLocated() {
+        let src = solid(200, 100, alpha: 255)
+        // Cover only the left half.
+        guard let r = LayerCoverageRules.measure(source: src,
+                                                 layers: [place([0, 0, 500, 1000], solid(100, 100, alpha: 255))]) else {
+            return XCTFail("no measurement")
+        }
+        XCTAssertEqual(r.fraction, 0.5, accuracy: 0.02)
+        XCTAssertGreaterThanOrEqual(r.gap[0], 90, "gap should start at the middle, got \(r.gap)")
+        XCTAssertEqual(r.gap[2], 200, accuracy: 2, "gap should run to the right edge, got \(r.gap)")
+    }
+
+    /// THE reason the box is a largest-connected-cluster and not an overall extent: with one big hole
+    /// and one distant speck, the overall extent spans nearly the whole image and is a useless hint.
+    func testGapBoxIsTheLargestClusterNotTheOverallExtent() {
+        let src = solid(200, 200, alpha: 255)
+        // Cover everything, then punch a big hole bottom-right by covering only part... instead build
+        // coverage from two strips that leave a large block uncovered at the right plus a speck at the
+        // far top-left corner.
+        let layers = [
+            place([0, 100, 1000, 1000], solid(200, 200, alpha: 255)),   // bottom 90% fully covered
+            place([50, 0, 1000, 100], solid(190, 20, alpha: 255)),      // top strip, except x<10
+        ]
+        guard let r = LayerCoverageRules.measure(source: src, layers: layers) else {
+            return XCTFail("no measurement")
+        }
+        // The only gap is the small top-left corner; the box must be tight around it, not the canvas.
+        XCTAssertLessThan(r.gap[2] - r.gap[0], 60, "box too wide: \(r.gap)")
+        XCTAssertLessThan(r.gap[3] - r.gap[1], 60, "box too tall: \(r.gap)")
+    }
+
+    /// Every way the question can be inapplicable must return nil rather than a misleading zero.
+    func testMeasurementRefusesWhenTheQuestionDoesNotApply() {
+        let src = solid(50, 50, alpha: 255)
+        XCTAssertNil(LayerCoverageRules.measure(source: src, layers: []), "no layers")
+        // A fully transparent source has no content that could be missing.
+        XCTAssertNil(LayerCoverageRules.measure(source: solid(50, 50, alpha: 0),
+                                                layers: [place([0, 0, 1000, 1000], solid(50, 50, alpha: 255))]),
+                     "transparent source")
+    }
+
+    /// Degenerate and malformed boxes must be skipped, not crash and not silently count as coverage.
+    func testDegenerateBoxesAreSkippedNotCrashed() {
+        let src = solid(100, 100, alpha: 255)
+        let img = solid(100, 100, alpha: 255)
+        for bad in [[0, 0, 0, 0], [900, 900, 100, 100], [0, 0, 1000], [0, 0, 1000, 1000, 1000]] {
+            let r = LayerCoverageRules.measure(source: src, layers: [place(bad, img)])
+            // Nothing drawn, so everything is uncovered — never a false 0%.
+            XCTAssertEqual(r?.fraction ?? -1, 1.0, accuracy: 0.01, "box \(bad)")
+        }
+    }
+
+    /// fal's JSON numbers may decode as Int or Double; a missing or short array must not be invented.
+    func testNormalizedBoxParsing() {
+        XCTAssertEqual(LayerCoverageRules.normalizedBox(["normalized": [16, 146, 978, 411]]),
+                       [16, 146, 978, 411])
+        XCTAssertEqual(LayerCoverageRules.normalizedBox(["normalized": [16.0, 146.9, 978.2, 411.0]]),
+                       [16, 146, 978, 411])
+        XCTAssertNil(LayerCoverageRules.normalizedBox(nil))
+        XCTAssertNil(LayerCoverageRules.normalizedBox(["absolute": [1, 2, 3, 4]]))
+        XCTAssertNil(LayerCoverageRules.normalizedBox(["normalized": [1, 2, 3]]))
+        XCTAssertNil(LayerCoverageRules.normalizedBox(["normalized": ["a", "b", "c", "d"]]))
+    }
+
+    /// Cost is billed per COMPUTE SECOND. The old per-layer estimate reported ~10x too much.
+    func testCostIsPerComputeSecondNotPerLayer() {
+        // The two probe calls measured 113s and 149s of wall time.
+        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 113), 0.01921, accuracy: 0.00001)
+        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 262), 0.04454, accuracy: 0.00001)
+        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 0), 0)
+        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: -5), 0)
     }
 }

@@ -2064,19 +2064,134 @@ func layerizeOutputDir(_ src: URL) -> URL {
 
 /// One synchronous layerize call. Takes 50–180s against the live endpoint, so every caller
 /// runs it off the main thread.
-private func falLayerize(pngData: Data, tier: String, key: String) -> (layers: [LayerizeLayer], error: String?) {
-    guard let url = URL(string: "https://fal.run/bytedance/seedream/v5/pro/layerize") else { return ([], "bad URL") }
+/// Upload bytes to fal's CDN and return a URL usable as `image_url`.
+///
+/// Inlining the image as a base64 data URI turns a 21 MB PNG into a ~28 MB JSON body, and that is what
+/// killed ReelEmIn_01_Dawn.png (5504x3072) with "The network connection was lost" — the request never
+/// reached the model. fal's own client and CLI upload instead of inlining; these are the endpoints the
+/// CLI uses, verified by hand: POST initiate -> PUT the bytes to `upload_url` -> pass `file_url`.
+/// The PUT is to a pre-signed URL and must NOT carry the API key.
+private func falUpload(data: Data, contentType: String, fileName: String, key: String)
+    -> (url: String?, error: String?) {
+    guard let initURL = URL(string: "https://rest.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3") else {
+        return (nil, "bad initiate URL")
+    }
+    var initReq = URLRequest(url: initURL)
+    initReq.httpMethod = "POST"
+    initReq.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
+    initReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    initReq.timeoutInterval = 120
+    initReq.httpBody = try? JSONSerialization.data(withJSONObject: [
+        "content_type": contentType, "file_name": fileName,
+    ])
+
+    var uploadURL: String?, fileURL: String?, failure: String?
+    let sem = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: initReq) { d, resp, err in
+        defer { sem.signal() }
+        if let err { failure = err.localizedDescription; return }
+        guard let d, let http = resp as? HTTPURLResponse else { failure = "no response"; return }
+        guard http.statusCode == 200 else {
+            failure = "initiate HTTP \(http.statusCode) \(String(data: d, encoding: .utf8)?.prefix(200) ?? "")"
+            return
+        }
+        guard let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let u = j["upload_url"] as? String, let f = j["file_url"] as? String else {
+            failure = "initiate response missing upload_url/file_url"; return
+        }
+        uploadURL = u; fileURL = f
+    }.resume()
+    sem.wait()
+    if let failure { return (nil, failure) }
+    guard let uploadURL, let fileURL, let put = URL(string: uploadURL) else {
+        return (nil, "no upload URL")
+    }
+
+    var putReq = URLRequest(url: put)
+    putReq.httpMethod = "PUT"
+    putReq.setValue(contentType, forHTTPHeaderField: "Content-Type")
+    putReq.timeoutInterval = 600          // a 20 MB body on a VPN needs room
+    let sem2 = DispatchSemaphore(value: 0)
+    // uploadTask(with:from:) streams the body instead of holding a second copy in memory.
+    URLSession.shared.uploadTask(with: putReq, from: data) { _, resp, err in
+        defer { sem2.signal() }
+        if let err { failure = err.localizedDescription; return }
+        guard let http = resp as? HTTPURLResponse else { failure = "no upload response"; return }
+        guard (200...299).contains(http.statusCode) else {
+            failure = "upload HTTP \(http.statusCode)"; return
+        }
+    }.resume()
+    sem2.wait()
+    if let failure { return (nil, failure) }
+    return (fileURL, nil)
+}
+
+/// `prompt` is the API's element-selection field, not decoration: fal documents it as "instructions
+/// describing which elements to separate", and normalized `<bbox>left top right bottom</bbox>` tags
+/// target a specific region. The default only asks for English names — a generic
+/// "separate everything" instruction was measured and made no difference (1.378% vs 1.144%
+/// uncovered), so it isn't sent. A measured gap fed back as a `<bbox>` DID work, which is what
+/// LayerCoverageRules.repairPrompt builds.
+///
+/// `seconds` comes back because fal bills by compute second, so elapsed time is the only basis
+/// Navigator has for reporting a cost at all.
+/// Ask what should be separated, once for the whole batch.
+///
+/// fal's `prompt` is documented as "instructions describing which elements to separate", and it is
+/// the difference between three blobs and a rigged character: "Separate guns, triggers, hands, and
+/// arms out from image" returns left and right revolvers and both arms as their own layers, where an
+/// empty prompt returns "the major elements". Left blank this behaves exactly as before.
+///
+/// Returns nil if the user cancels. The text is remembered so a repeat run is one Return away.
+func askLayerizeElements(imageCount: Int) -> String? {
+    let key = "layerizeElementPrompt"
+    let a = NSAlert()
+    a.messageText = imageCount == 1 ? "What should be separated?"
+                                    : "What should be separated? (\(imageCount) images)"
+    a.informativeText = """
+        Optional. Name the parts you want as their own layers — the more specific, the better.
+
+        e.g.  Separate guns, triggers, hands, and arms out from image
+
+        Leave it blank to let the model pick out the major elements by itself. Names and \
+        descriptions always come back in English.
+        """
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 44))
+    field.placeholderString = "Separate guns, triggers, hands, and arms out from image"
+    field.stringValue = UserDefaults.standard.string(forKey: key) ?? ""
+    field.usesSingleLineMode = false
+    field.cell?.wraps = true
+    field.cell?.isScrollable = false
+    a.accessoryView = field
+    a.addButton(withTitle: "Layerize")
+    a.addButton(withTitle: "Cancel")
+    a.window.initialFirstResponder = field
+    guard a.runModal() == .alertFirstButtonReturn else { return nil }
+    let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    UserDefaults.standard.set(text, forKey: key)
+    return text
+}
+
+/// `imageRef` is whatever goes in `image_url` — a CDN URL from falUpload, or a base64 data URI. It is
+/// resolved ONCE by the caller and reused: it used to be built inside this function, which meant every
+/// ladder rung and every coverage repair re-uploaded the same bytes. On a 20 MB source that was 20 MB
+/// per retry for no reason.
+private func falLayerize(imageRef: String, tier: String, key: String,
+                         prompt: String = LayerizeRules.basePrompt)
+    -> (layers: [LayerizeLayer], error: String?, seconds: Double) {
+    let started = Date()
+    guard let url = URL(string: "https://fal.run/bytedance/seedream/v5/pro/layerize") else { return ([], "bad URL", 0) }
     var req = URLRequest(url: url)
     req.httpMethod = "POST"
     req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     req.timeoutInterval = 900          // measured 50–180s; a big image plus queueing needs room
     let body: [String: Any] = [
-        "image_url": "data:image/png;base64," + pngData.base64EncodedString(),
+        "image_url": imageRef,
         "image_size": tier,
         // Names/descriptions come back regardless, but in CHINESE unless asked otherwise —
         // this line is what makes them English, and the filenames depend on it.
-        "prompt": "Return name and description in english.",
+        "prompt": prompt,
         "enhance_prompt_mode": "standard",
     ]
     req.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -2113,8 +2228,13 @@ private func falLayerize(pngData: Data, tier: String, key: String) -> (layers: [
         out = parsed.isEmpty ? ([], "the model returned no layers") : (parsed, nil)
     }.resume()
     sem.wait()
-    return out
+    return (out.0, out.1, Date().timeIntervalSince(started))
 }
+
+// The coverage measurement itself now lives in NavigatorCore as LayerCoverageRules.measure, so it can
+// be unit-tested against synthetic images. It sat here as a private function and was consequently the
+// only genuinely risky new code in this feature with no adversarial test at all — while the assembly
+// script next to it got an eight-case injection matrix.
 
 /// Fraction of fully-transparent pixels — decides whether the base layer is worth keeping.
 private func transparentFraction(_ url: URL) -> Double {
@@ -2125,8 +2245,9 @@ private func transparentFraction(_ url: URL) -> Double {
     return total > 0 ? Double(clear) / Double(total) : 0
 }
 
-/// Split image(s) into transparent layers. Non-blocking: one long cloud call per image, so
-/// everything runs off the main thread behind the shared progress bar.
+/// Split image(s) into transparent layers, then assemble each folder into a layered PSD.
+/// Non-blocking: one long cloud call per image, so everything runs off the main thread behind
+/// the shared progress bar, with the Photoshop pass chained on at the end.
 func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_Layers") }
     guard !imgs.isEmpty else { NSSound.beep(); return }
@@ -2167,6 +2288,11 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
         a.addButton(withTitle: "Resize & Continue"); a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
     }
+
+    // Asked here, with the other preflight questions, so the batch still interrupts at most once and
+    // nothing has been spent by the time Cancel is available.
+    guard let elements = askLayerizeElements(imageCount: plan.count) else { return }
+    let userPrompt = LayerizeRules.composePrompt(elements)
 
     // Each image gets its OWN output folder, resolved up front. Two sources can want the same one
     // (key.png and key.jpg both derive "key_Layers"), which serially mixed their layers together
@@ -2230,6 +2356,22 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             let keepBase = LayerizeRules.shouldKeepBase(transparentFraction: transparentFraction(src))
             let ladder = LayerizeRules.sizeLadder(width: cg.width, height: cg.height)
 
+            // Upload ONCE, before the ladder, and reuse the URL for every attempt and repair.
+            // Inlining as a base64 data URI inflates the body by ~4/3 and a 21 MB source reliably
+            // dropped the connection before the request ever landed. Inlining stays as the fallback
+            // because that is what small images did successfully before.
+            var imageRef = ""
+            let up = falUpload(data: png, contentType: "image/png",
+                               fileName: src.lastPathComponent, key: key)
+            if let u = up.url {
+                imageRef = u
+            } else {
+                // Only encode on the fallback path: base64 of a 20 MB image is a ~28 MB string, and
+                // building it unconditionally would waste that on every successful upload.
+                navLog("  \(src.lastPathComponent): upload failed (\(up.error ?? "")) — inlining \(png.count / 1_048_576) MB instead")
+                imageRef = "data:image/png;base64," + png.base64EncodedString()
+            }
+
             // Walk the ladder: `auto` (the API's documented default, which adapts to the input),
             // `auto` again for a transient refusal, then one explicit tier as a last resort.
             // Stops at the first success, and stops immediately on any refusal that retrying
@@ -2238,11 +2380,13 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             var err: String? = nil
             var usedSize = ladder[0]
             var attemptsUsed = 0
+            var secondsUsed = 0.0
             for (attempt, size) in ladder.enumerated() {
                 attemptsUsed += 1
                 if attempt > 0 { navLog("  \(src.lastPathComponent): retrying at \(size)") }
-                let r = falLayerize(pngData: png, tier: size, key: key)
+                let r = falLayerize(imageRef: imageRef, tier: size, key: key, prompt: userPrompt)
                 usedSize = size
+                secondsUsed += r.seconds
                 if r.error == nil { layers = r.layers; err = nil; break }
                 err = r.error
                 guard LayerizeErrorRules.worthRetrying(body: r.error ?? "") else { break }
@@ -2254,25 +2398,91 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 return
             }
 
+            // Download to MEMORY first, so completeness can be measured before anything is written
+            // and a repair attempt never leaves two decompositions mixed together on disk.
+            func fetchSet(_ ls: [LayerizeLayer], quiet: Bool) -> [(layer: LayerizeLayer, data: Data)] {
+                var got: [(LayerizeLayer, Data)] = []
+                for l in ls {
+                    // A mostly-transparent input's base is a blank plate — VERIFIED, see
+                    // LayerizeRules.shouldKeepBase — so it is skipped rather than saved.
+                    if l.zIndex == 0 && l.name == nil && !keepBase { continue }
+                    guard let u = URL(string: l.url), let d = try? Data(contentsOf: u) else {
+                        if !quiet { note { errors.append("\(src.lastPathComponent): couldn’t download layer \(l.zIndex)") } }
+                        continue
+                    }
+                    // Data(contentsOf:) succeeds on a ZERO-BYTE response, so an empty download was
+                    // being written, counted, and listed in _layers.json while the filesystem
+                    // discarded the empty file — two real layers vanished that way.
+                    guard LayerizeRules.isPlausiblePNG([UInt8](d)) else {
+                        if !quiet { note { errors.append("\(src.lastPathComponent): layer \(l.zIndex) came back empty or not a PNG (\(d.count) bytes)") } }
+                        continue
+                    }
+                    got.append((l, d))
+                }
+                return got
+            }
+
+            /// Uncovered fraction for a candidate set, or nil when the measurement doesn't apply.
+            func measure(_ set: [(layer: LayerizeLayer, data: Data)]) -> (fraction: Double, gap: [Int])? {
+                guard LayerCoverageRules.applies(keptBase: keepBase) else { return nil }
+                let placed: [LayerCoverageRules.Placement] = set.compactMap {
+                    guard let n = LayerCoverageRules.normalizedBox($0.layer.boundingBox),
+                          let img = loadCGImage(data: $0.data) else { return nil }
+                    return LayerCoverageRules.Placement(normalized: n, image: img)
+                }
+                guard !placed.isEmpty else { return nil }
+                return LayerCoverageRules.measure(source: cg, layers: placed)
+            }
+
+            var chosen = fetchSet(layers, quiet: false)
+            var coverageNote = ""
+            if var current = measure(chosen) {
+                let firstFraction = current.fraction
+                var repairs = 0
+                // fal guarantees nothing about coverage and measurably varies run to run — the same
+                // prompt on this image gave 1.14% and 7.64% — so a bad roll gets targeted retries
+                // naming the region it left out. Each retry is a whole fresh decomposition and is
+                // adopted only if it covers STRICTLY more, so a worse roll costs the call and nothing
+                // else. Stops as soon as coverage is acceptable, at the attempt cap, or on the first
+                // retry that fails to improve.
+                while LayerCoverageRules.needsRepair(uncoveredFraction: current.fraction),
+                      repairs < LayerCoverageRules.maxRepairAttempts,
+                      let rp = LayerCoverageRules.repairPrompt(gap: current.gap,
+                                                              canvasW: cg.width, canvasH: cg.height,
+                                                              userText: elements) {
+                    repairs += 1
+                    navLog("  \(src.lastPathComponent): "
+                           + LayerCoverageRules.summary(uncoveredFraction: current.fraction)
+                           + " — repair \(repairs) targeting \(current.gap)")
+                    let r = falLayerize(imageRef: imageRef, tier: usedSize, key: key, prompt: rp)
+                    secondsUsed += r.seconds
+                    attemptsUsed += 1
+                    guard r.error == nil else {
+                        navLog("  \(src.lastPathComponent): repair \(repairs) call failed — \(r.error ?? "")")
+                        break
+                    }
+                    let candidate = fetchSet(r.layers, quiet: true)
+                    guard !candidate.isEmpty, let next = measure(candidate),
+                          LayerCoverageRules.repairIsBetter(original: current.fraction,
+                                                            repaired: next.fraction) else {
+                        navLog("  \(src.lastPathComponent): repair \(repairs) was no better — keeping what we had")
+                        break
+                    }
+                    chosen = candidate
+                    current = next
+                }
+                coverageNote = LayerCoverageRules.summary(uncoveredFraction: current.fraction)
+                if current.fraction < firstFraction {
+                    coverageNote += String(format: " (from %.2f%% in %d repair(s))",
+                                          firstFraction * 100, repairs)
+                }
+            }
+
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
             let stem = src.deletingPathExtension().lastPathComponent
             var meta: [[String: Any]] = []
             var saved = 0
-            for l in layers {
-                // A mostly-transparent input gets a flat INVENTED colour as its base rather than
-                // an inpainted background — junk, so it's skipped.
-                if l.zIndex == 0 && l.name == nil && !keepBase { continue }
-                guard let u = URL(string: l.url), let d = try? Data(contentsOf: u) else {
-                    note { errors.append("\(src.lastPathComponent): couldn’t download layer \(l.zIndex)") }
-                    continue
-                }
-                // Data(contentsOf:) succeeds on a ZERO-BYTE response, so an empty download was
-                // being written, counted, and listed in _layers.json while the filesystem
-                // discarded the empty file — two real layers vanished that way.
-                guard LayerizeRules.isPlausiblePNG([UInt8](d)) else {
-                    note { errors.append("\(src.lastPathComponent): layer \(l.zIndex) came back empty or not a PNG (\(d.count) bytes)") }
-                    continue
-                }
+            for (l, d) in chosen {
                 let fn = LayerizeRules.fileName(stem: stem, zIndex: l.zIndex, name: l.name)
                 let dst = dir.appendingPathComponent(fn)
                 do { try d.write(to: dst) } catch {
@@ -2294,9 +2504,12 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             if let j = try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .withoutEscapingSlashes]) {
                 try? j.write(to: dir.appendingPathComponent("_layers.json"))
             }
-            let largest = layers.compactMap { $0.width }.max() ?? 0
-            let cost = LayerizeRules.actualCost(layerCount: saved, largestEdge: largest)
-            navLog("  RESULT: \(saved) layer(s), ~$\(String(format: "%.2f", cost)) at \(usedSize) in \(attemptsUsed) call(s) → \(dir.path)")
+            // Cost is billed per COMPUTE second, and elapsed wall time is all Navigator can see —
+            // it includes queueing, so this is an upper bound and is shown as one.
+            let cost = LayerizeRules.estimatedCost(seconds: secondsUsed)
+            navLog("  RESULT: \(saved) layer(s), ≤$\(String(format: "%.3f", cost)) "
+                   + "(\(Int(secondsUsed))s at \(usedSize), \(attemptsUsed) call(s))"
+                   + (coverageNote.isEmpty ? "" : ", \(coverageNote)") + " → \(dir.path)")
             if saved == 0 { note { errors.append("\(src.lastPathComponent): no layers were saved") } }
             else { note { succeeded += 1 } }
         }
@@ -2316,6 +2529,18 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 showBGSummary(app: "Layerize", done: ok, total: plan.count, errors: errs, verb: "layerized")
             }
             onDone?(outs)
+
+            // A folder of PNGs is rarely the thing you actually wanted — the layered PSD is. So
+            // Photoshop assembles every folder that produced layers, right after they land. The
+            // folders derive from the files that were really written, not from the plan, so a
+            // folder whose layers all failed is never handed to Photoshop.
+            // Skipped without Photoshop: the layer PNGs are still there, and the folder's
+            // right-click "Assemble Layers into PSD" runs this later on any machine that has it.
+            guard PhotoshopIcon.url != nil, !outs.isEmpty else { return }
+            var seen = Set<String>()
+            let dirs = outs.map { $0.deletingLastPathComponent() }
+                           .filter { seen.insert($0.path).inserted }
+            assembleLayerFolders(dirs) { psds in onDone?(psds) }
         }
     }
 }
@@ -3088,6 +3313,75 @@ func exportPSDsToPNG(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             hideApp(bundleID: "com.adobe.Photoshop")
             BGJobProgress.shared.finish("Exported \(outs.count) of \(psds.count) PNG\(psds.count == 1 ? "" : "s")")
             if !errors.isEmpty { showBGSummary(app: "Photoshop", done: outs.count, total: psds.count, errors: errors, verb: "exported") }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
+// Rebuild layered PSDs from Layerize "_Layers" folders. Each folder's `_layers.json`
+// carries every layer's bounding box, which is both its position AND its size — the
+// PNGs are rendered at their own resolutions (measured 1.03x-3.36x their boxes within
+// a single image), so the script scales each one into its box. Output is
+// "<name>_assembled.psd" NEXT TO the folder, uniqued: a rebuild never overwrites an
+// earlier one, and the layer PNGs are only ever read.
+// Retried, because a single attempt measurably wasn't enough. Chained straight after layerize this
+// fires in the same second Photoshop is still being launched hidden, and Photoshop answers a DOM Get
+// with "The command Get is not currently available" until it is ready — a whole 11-layer decomposition
+// was reported as a failure for that reason alone, then assembled perfectly on a manual retry. This is
+// the same bounded loop exportPSDsToPNG uses: plain retries first, at most one app restart for the
+// whole run, and never a restart for a failure that looks like a bad folder rather than a wedged app.
+func assembleLayerFolders(_ dirs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    guard !dirs.isEmpty else { NSSound.beep(); return }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Assembling layers", total: dirs.count) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []
+        var errors: [String] = []
+        // No AdobeRecovery here on purpose — see the retry loop below for why this path must not
+        // restart Photoshop.
+        for dir in dirs {
+            let out = PathRules.uniqueDest(dir.deletingLastPathComponent(),
+                                           LayerAssemblyRules.assembledName(fromLayersFolder: dir.lastPathComponent)) {
+                FileManager.default.fileExists(atPath: $0)
+            }
+            var r = ScriptResult(ok: false, message: "not attempted")
+            for i in 0..<4 {
+                r = runPhotoshopScript(resource: "NavigatorAssembleLayers",
+                                       arguments: [dir.path, out.path], reportError: false)
+                if r.ok {
+                    if i > 0 { navLog("assemble: \(dir.lastPathComponent) succeeded on attempt \(i + 1)") }
+                    break
+                }
+                guard i < 3 else { break }
+                navLog("assemble: \(dir.lastPathComponent) attempt \(i + 1) failed — \(r.message); retrying")
+                // Backoff only — NO app restart on this path, deliberately diverging from
+                // exportPSDsToPNG. The failure this retry exists for is a startup race: assembly is
+                // chained immediately after layerize, so Photoshop is still launching and answers a
+                // DOM Get with "The command Get is not currently available". That phrase is in
+                // AdobeRecoveryRules.wedgeSignatures, so the shared recovery loop would call this a
+                // wedge and restart the app — and restartAdobeApp force-quits when a polite quit is
+                // blocked, which is precisely when unsaved work is open. Restarting cannot help an app
+                // that is merely still starting, so it is not worth risking someone's work to do it.
+                // Four attempts with growing pauses covers ~7s of startup, which is what it needs.
+                Thread.sleep(forTimeInterval: 1.0 + Double(i) * 1.5)
+            }
+            if r.ok {
+                navLog("assemble: \(r.message)")
+                outs.append(out)
+                // The PSD exists, so this is not a failure — but an incomplete rebuild has to be
+                // said out loud rather than left in the log.
+                if LayerAssemblyRules.isPartial(r.message) {
+                    errors.append("\(dir.lastPathComponent): \(r.message)")
+                }
+            } else {
+                navLog("assemble: \(dir.lastPathComponent) failed — \(r.message)")
+                errors.append("\(dir.lastPathComponent): \(r.message)")
+            }
+            DispatchQueue.main.async { BGJobProgress.shared.advance() }
+        }
+        DispatchQueue.main.async {
+            hideApp(bundleID: "com.adobe.Photoshop")
+            BGJobProgress.shared.finish("Assembled \(outs.count) of \(dirs.count) PSD\(dirs.count == 1 ? "" : "s")")
+            if !errors.isEmpty { showBGSummary(app: "Photoshop", done: outs.count, total: dirs.count, errors: errors, verb: "assembled") }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
@@ -6160,11 +6454,17 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         fillBackgroundForImages(urls, color: c.color, suffix: c.suffix, ratio: ratio) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
-    // Split the selected image(s) into transparent layers → "<name>_Layers/".
+    // Split the selected image(s) into transparent layers → "<name>_Layers/", then have
+    // Photoshop rebuild each folder into "<name>_assembled.psd" alongside it.
     func layerize(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
         layerizeImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
+    // Rebuild the selected "_Layers" folder(s) into layered PSDs alongside them.
+    func assembleLayers(_ dirs: [URL]) {
+        assembleLayerFolders(dirs) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
     // Upscale the selected image(s) via fal.ai (Topaz) → "<name>_upscaled.png".
@@ -6173,8 +6473,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard !urls.isEmpty else { NSSound.beep(); return }
         upscaleImagesViaFal(urls, option: option) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
-
-    // Upscale the selected image(s) via Vertex/Imagen 4 → "<name>_upscaled.png".
 
     // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
@@ -9810,6 +10108,20 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                       browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
                 upscaleMenu(label: "Batch Upscale (AI)",
                             fal: { opt in browser.batchUpscale(ids, opt) })
+            }
+            // A Layerize output folder can be rebuilt into a real layered PSD. Detected by its
+            // manifest rather than by the "_Layers" name, so a renamed folder still works and a
+            // folder that merely looks like one doesn't offer a menu item that would fail. One
+            // stat per selected folder, only when the menu opens.
+            let layerDirs = browser.items.filter {
+                ids.contains($0.id) && $0.isDirectory &&
+                FileManager.default.fileExists(atPath: $0.url.appendingPathComponent("_layers.json").path)
+            }.map(\.url)
+            if !layerDirs.isEmpty, PhotoshopIcon.url != nil {
+                Button { browser.assembleLayers(layerDirs) } label: {
+                    psLabel(layerDirs.count == 1 ? "Assemble Layers into PSD"
+                                                 : "Assemble Layers into PSD (\(layerDirs.count) folders)")
+                }
             }
             if browser.items.contains(where: { ids.contains($0.id) && $0.isDirectory }) {
                 Button("Calculate Size") {
