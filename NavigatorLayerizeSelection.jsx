@@ -27,8 +27,13 @@
  * roughly 2-3 minutes, so about 2-3 cents. Photoshop is frozen while curl runs — that is unavoidable
  * in ExtendScript, which is single-threaded.
  *
- * KEY: read from ~/.claude/settings.json -> env.FAL_KEY, or the FAL_KEY environment variable. Never
- * typed into this file.
+ * KEY: looked for in a FAL_KEY environment variable, then ~/.claude/settings.json -> env.FAL_KEY
+ * (present on machines with the H5G plugins), then this script's own prefs file. If none of those
+ * has one, it asks and remembers the answer. The key is NEVER written into this file — the script is
+ * meant to be passed around, and the key must not travel with it.
+ *
+ * TO SHARE THIS: send the .jsx on its own. The recipient runs it, is asked for a fal.ai key once,
+ * and it is saved to their own machine at Folder.userData/Navigator/fal_key.txt.
  */
 
 #target photoshop
@@ -135,21 +140,107 @@ function curl(args) {
     return txt;
 }
 
-function falKey() {
-    var fromEnv = $.getenv("FAL_KEY");
-    if (fromEnv) { return fromEnv; }
+// ---------------------------------------------------------------- the fal.ai key
+//
+// Looked for in three places, in order, so an H5G machine that already has one needs no setup and
+// anyone else is asked once:
+//   1. a FAL_KEY environment variable
+//   2. ~/.claude/settings.json -> env.FAL_KEY   (shared by the H5G plugins; absent without them)
+//   3. this script's own prefs file, written by the setup dialog below
+//
+// The key is NEVER written into this .jsx. The script gets passed around; the key must not travel
+// with it.
+
+function keyPrefsFile() {
+    var folder = new Folder(Folder.userData.fsName + "/Navigator");
+    if (!folder.exists) { folder.create(); }
+    return new File(folder.fsName + "/fal_key.txt");
+}
+
+function readStoredKey() {
+    try {
+        var f = keyPrefsFile();
+        if (!f.exists) { return null; }
+        f.encoding = "UTF-8"; f.open("r");
+        var t = f.read(); f.close();
+        t = String(t).replace(/^\s+|\s+$/g, "");
+        return t.length ? t : null;
+    } catch (e) { return null; }
+}
+
+function storeKey(k) {
+    try {
+        var f = keyPrefsFile();
+        f.encoding = "UTF-8"; f.open("w"); f.write(k); f.close();
+        return true;
+    } catch (e) { return false; }
+}
+
+function readClaudeSettingsKey() {
     var home = IS_WINDOWS ? $.getenv("USERPROFILE") : $.getenv("HOME");
     if (!home) { return null; }
     var f = new File(home + "/.claude/settings.json");
     if (!f.exists) { return null; }
-    f.encoding = "UTF-8";
-    f.open("r");
-    var txt = f.read();
-    f.close();
     try {
+        f.encoding = "UTF-8"; f.open("r");
+        var txt = f.read(); f.close();
         var obj = JSON.parse(txt);
         return (obj && obj.env && obj.env.FAL_KEY) ? obj.env.FAL_KEY : null;
     } catch (e) { return null; }
+}
+
+/// Ask for a key and remember it. Returns the key, or null if cancelled.
+function askForKey() {
+    var w = new Window("dialog", "fal.ai key needed");
+    w.alignChildren = "fill";
+    w.margins = 16;
+    w.add("statictext", undefined, "This script uses fal.ai to separate the image into layers.");
+    var how = w.add("statictext", undefined,
+        "1.  Sign in at  fal.ai/dashboard/keys\n" +
+        "2.  Create an API key and copy it\n" +
+        "3.  Paste it below — it is saved on this Mac only, in\n" +
+        "     " + Folder.userData.fsName + "/Navigator/fal_key.txt\n\n" +
+        "It is never written into this script, so the script is safe to share.",
+        { multiline: true });
+    how.preferredSize = [430, 96];
+    // noecho so the key is not left on screen in a screen-share.
+    var field = w.add("edittext", undefined, "", { noecho: true });
+    field.preferredSize = [430, 24];
+    var note = w.add("statictext", undefined,
+        "At High 5, a key may already be set up for you — Cancel and ask, rather than making a second one.");
+    note.graphics.font = ScriptUI.newFont(note.graphics.font.name, "italic", 10);
+
+    var row = w.add("group"); row.alignment = "right";
+    var cancel = row.add("button", undefined, "Cancel", { name: "cancel" });
+    var save = row.add("button", undefined, "Save & Continue", { name: "ok" });
+    var out = null;
+    save.onClick = function () {
+        var k = String(field.text).replace(/^\s+|\s+$/g, "");
+        if (!k.length) { alert("Paste a key, or press Cancel."); return; }
+        if (!storeKey(k)) { alert("Couldn't save the key — it will be used for this run only."); }
+        out = k;
+        w.close();
+    };
+    cancel.onClick = function () { out = null; w.close(); };
+    w.show();
+    return out;
+}
+
+/// The key, from whichever source has one. Prompts as a last resort.
+function falKey() {
+    var k = $.getenv("FAL_KEY");
+    if (k) { return k; }
+    k = readClaudeSettingsKey();
+    if (k) { return k; }
+    k = readStoredKey();
+    if (k) { return k; }
+    return askForKey();
+}
+
+/// Wipe a stored key that the server rejected, so the next run asks again instead of failing the
+/// same way forever.
+function forgetStoredKey() {
+    try { var f = keyPrefsFile(); if (f.exists) { f.remove(); } } catch (e) {}
 }
 
 // The line that must be in EVERY prompt: without it fal returns names and descriptions in Chinese,
@@ -331,8 +422,14 @@ function requestLayerize(imageRef, key, promptText) {
     if (j.detail) {
         // fal reports refusals under `detail`, sometimes as an array of field errors.
         var d = j.detail;
-        if (d instanceof Array && d.length && d[0].msg) { throw new Error(d[0].msg); }
-        throw new Error(String(d));
+        var msg = (d instanceof Array && d.length && d[0].msg) ? d[0].msg : String(d);
+        // A rejected key must not be kept, or every future run fails the same way with no way out.
+        if (/unauthor|forbidden|invalid.*key|authentication/i.test(msg)) {
+            forgetStoredKey();
+            throw new Error(msg + "\n\nThat key was rejected, so it has been forgotten. " +
+                            "Run the script again to enter a different one.");
+        }
+        throw new Error(msg);
     }
     if (!j.layers || !j.layers.length) { throw new Error("fal returned no layers"); }
     return j.layers;
@@ -400,12 +497,9 @@ function run() {
     app.preferences.interpolation = ResampleMethod.BICUBICSHARPER;
 
     try {
+        // Prompts for a key if none is configured; null means the user cancelled that dialog.
         var key = falKey();
-        if (!key) {
-            alert("No fal.ai key found.\n\nAdd it as env.FAL_KEY in ~/.claude/settings.json, " +
-                  "or set a FAL_KEY environment variable.");
-            return;
-        }
+        if (!key) { return; }
 
         // Asked before anything is flattened or uploaded, so Cancel costs nothing.
         var promptText = askElements();
