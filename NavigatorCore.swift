@@ -1168,7 +1168,50 @@ enum LayerizeRules {
         bytes.count >= 100 && Array(bytes.prefix(8)) == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
     }
 
+    /// VERIFIED 2026-08-12 by keeping the base on a mostly-transparent input (frame.png): fal
+    /// returned a 2477x1703 plate that was 100% opaque with a colour standard deviation of 0.53 —
+    /// blank white, none of the artwork in it. Discarding it is right, and it is NOT where a missing
+    /// element hides. For a mostly-OPAQUE input the base is instead a real inpainted background
+    /// (SF4_Blue's came back as the full underwater scene), which is why it is kept there.
     static func shouldKeepBase(transparentFraction: Double) -> Bool { transparentFraction < 0.20 }
+
+    /// The line that must be in EVERY layerize prompt.
+    ///
+    /// fal returns names and descriptions in Chinese without it, and the layer filenames are built
+    /// from those names — an early run produced twelve layers all called "unnamed". It is never
+    /// replaced by the user's text, only prepended to it.
+    static let basePrompt = "Return name and description in english."
+
+    /// What actually gets sent as `prompt`.
+    ///
+    /// fal documents this field as "instructions describing which elements to separate", and it is
+    /// the only lever over WHAT comes back: with it empty the model separates "the major elements",
+    /// which for a single character is three or four blobs. Naming the parts — "Separate guns,
+    /// triggers, hands, and arms out from image" — is what produces per-limb layers, including
+    /// left/right instances as their own layers.
+    ///
+    /// A GENERIC completeness instruction was measured and does NOT help: "separate every distinct
+    /// structural element, leaving no part unassigned" scored 1.378% uncovered against 1.144% for no
+    /// instruction at all. Specific beats generic, so nothing generic is added here — only what the
+    /// user actually asked for.
+    static func composePrompt(_ userText: String?) -> String {
+        guard let raw = userText else { return basePrompt }
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return basePrompt }
+        // Someone pasting the whole prompt back in shouldn't get the base line twice.
+        if t.hasPrefix(basePrompt) { return t }
+        return basePrompt + "\n" + t
+    }
+
+    /// fal bills this endpoint by COMPUTE SECONDS at $0.00017 — from fal's own pricing API, checked
+    /// 2026-08-12. The previous estimate invented a per-layer price and reported roughly 10x too
+    /// much; it also chose a tier from `image.width` in the response, and that field is never
+    /// present, so it silently fell to the cheap tier on every call anyway.
+    ///
+    /// Wall-clock is the only timing Navigator can see and it includes queueing, so this can only
+    /// ever be an upper bound — display it as approximate, never as a billed figure.
+    static let costPerComputeSecond = 0.00017
+    static func estimatedCost(seconds: Double) -> Double { max(0, seconds) * costPerComputeSecond }
 
     /// Filesystem-safe WITHOUT destroying non-ASCII.
     ///
@@ -1194,22 +1237,9 @@ enum LayerizeRules {
         return String(format: "%@_L%02d_%@.png", stem, zIndex, suffix)
     }
 
-    /// What a COMPLETED call actually cost, from what came back.
-    ///
-    /// More honest than a worst case now that `auto` is the default: the output resolution isn't
-    /// known until the layers arrive, so neither is the per-layer rate. The largest returned edge
-    /// reveals which tier the model settled on.
-    static func actualCost(layerCount: Int, largestEdge: Int) -> Double {
-        let perLayer = largestEdge > 1536 ? 0.0675 : 0.03375
-        return perLayer * Double(max(0, layerCount))
-    }
-
-    /// Worst-case spend for an EXPLICIT tier. Still meaningful for the last-resort rung, where the
-    /// size is pinned; for `auto` there is no such figure, which is why actualCost exists.
-    static func worstCaseCost(tier: String) -> Double {
-        let perLayer = (tier == "auto_1K" || tier == "auto_1.5K") ? 0.03375 : 0.0675
-        return perLayer * Double(maxLayers)
-    }
+    // The per-layer cost model that used to live here was invented — fal bills this endpoint by
+    // compute second (see estimatedCost). It reported roughly 10x too much, and picked its tier from
+    // `image.width`, a field fal never actually returns, so it always fell to the cheap rate anyway.
 }
 
 // MARK: - Columns that are too expensive to show on a network volume
@@ -4127,5 +4157,249 @@ enum LayerizeErrorRules {
         if b.contains("safety") || b.contains("nsfw") || b.contains("flagged") { return false }
         if b.contains("image_size") || b.contains("too small") || b.contains("too large") { return false }
         return b.contains("could not be processed for layer decomposition")
+    }
+}
+
+// MARK: - Rebuilding a layered document from a _Layers folder
+
+/// The arithmetic for putting Layerize's output back together as a real layered document.
+///
+/// Verified by reconstructing SF4_Blue from nothing but `_layers.json`: 86% of pixels within
+/// 8/255 of the original and a mean difference of 6.6/255, the residual being resampling noise.
+///
+/// THE TRAP: a layer's PNG is NOT the size of its bounding box. Each element is rendered at its
+/// own resolution — measured factors of 1.00x, 1.73x, 2.73x and 2.21x within a single image — which
+/// is what fal means by "preserving each element's aspect ratio". A plugin that drops each PNG at
+/// (left, top) at native size puts everything 2-3x too big and overlapping. The bounding box is
+/// both the POSITION and the TARGET SIZE.
+enum LayerAssemblyRules {
+    /// Percentage to scale a layer by so it fills its bounding box. Photoshop's
+    /// ArtLayer.resize takes percentages, not pixels.
+    static func scalePercent(pngSide: Int, boxSide: Int) -> Double {
+        guard pngSide > 0, boxSide > 0 else { return 100 }
+        return Double(boxSide) / Double(pngSide) * 100
+    }
+
+    /// Width and height scale separately only if the render's aspect drifted from the box's.
+    /// Reported so a caller can notice, because a big divergence means the bbox and the render
+    /// disagree and the result will look stretched.
+    static func aspectDrift(pngW: Int, pngH: Int, boxW: Int, boxH: Int) -> Double {
+        guard pngW > 0, pngH > 0, boxW > 0, boxH > 0 else { return 0 }
+        let a = Double(pngW) / Double(pngH), b = Double(boxW) / Double(boxH)
+        return abs(a - b) / max(a, b)
+    }
+
+    /// Measured drift on real output was under 1%; anything past this is worth flagging rather
+    /// than silently stretching a layer.
+    static let maxTolerableDrift = 0.05
+
+    /// Is a bounding box usable — inside the canvas and not degenerate?
+    static func boxIsSane(_ box: [Int], canvasW: Int, canvasH: Int) -> Bool {
+        guard box.count == 4 else { return false }
+        let (l, t, r, b) = (box[0], box[1], box[2], box[3])
+        return r > l && b > t && l >= 0 && t >= 0 && r <= canvasW && b <= canvasH
+    }
+
+    /// Name for the rebuilt document, beside the _Layers folder it came from.
+    /// "Foo_Layers" -> "Foo_assembled.psd", so it never collides with the source image.
+    static func assembledName(fromLayersFolder folder: String) -> String {
+        var stem = folder
+        if stem.hasSuffix("_Layers") { stem = String(stem.dropLast("_Layers".count)) }
+        // A deduped folder ("Foo_Layers 2") keeps its distinguishing suffix.
+        stem = stem.trimmingCharacters(in: .whitespaces)
+        return stem.isEmpty ? "assembled.psd" : "\(stem)_assembled.psd"
+    }
+
+    /// True when the script produced a PSD but some layers didn't make it in. The rebuild succeeded,
+    /// so it must not be reported as a failure — but staying silent would hand back a document that
+    /// is quietly incomplete, which is how the old zero-byte-download bug went unnoticed for a whole
+    /// batch. The script spells MISSING/FAILED in its OK line precisely so this can spot it.
+    static func isPartial(_ message: String) -> Bool {
+        message.contains("MISSING ") || message.contains("FAILED ")
+    }
+}
+
+/// Completeness checking for a layerize result.
+///
+/// fal's API reference states there is no guarantee of coverage, and measurement bears that out: two
+/// runs of frame.png with the IDENTICAL prompt left 1.144% and 7.253% of the artwork with no layer
+/// covering it, the worse one losing an entire frame rail. A decomposition therefore cannot be
+/// trusted, it has to be measured — and measuring is free, local and deterministic, which is more
+/// than can be said for anything prompt-based. A generic "separate everything, leave nothing out"
+/// prompt was tried and produced no measurable improvement (1.378% vs 1.144%), so it isn't used;
+/// what did work was feeding the measured gap back as a coordinate hint.
+enum LayerCoverageRules {
+    /// Only meaningful when the base was DISCARDED.
+    ///
+    /// With the base kept, fal's base is a real inpainted background holding everything it didn't
+    /// separate, so the composite has no holes and nothing is truly lost — bluebird's boat deck
+    /// measured 93% within 32/255 in the very region it was twice claimed to be missing from. It is
+    /// only when the base is dropped (a transparent input, whose base is a blank plate) that an
+    /// unseparated element actually disappears. That is the one case worth spending a repair call on.
+    static func applies(keptBase: Bool) -> Bool { !keptBase }
+
+    /// Repair only when the decomposition is UNAMBIGUOUSLY broken.
+    ///
+    /// The uncovered fraction turns out to be a weak predictor of whether a retry will help. Measured
+    /// on frame.png: a 1.91% run repaired to 1.07% (helped) while a 1.06% run repaired to 1.06%
+    /// (gained nothing and cost 139 seconds). Those two are adjacent with opposite outcomes, so a
+    /// threshold tuned to sit between them would be fitting a mechanism to four noisy points — the
+    /// same error that produced the invented tier ladder. What IS clear is the 7.64% run, which lost
+    /// a whole frame rail and repaired to 1.64%, a 4.7x gain.
+    ///
+    /// So the bar is set where the evidence is unambiguous. Everything below it is reported and left
+    /// alone: a 2-minute call is too expensive to spend on a coin flip, and coverage appears in the
+    /// log either way so a borderline result can be re-run deliberately.
+    static let repairThreshold = 0.05
+
+    static func needsRepair(uncoveredFraction: Double) -> Bool {
+        uncoveredFraction > repairThreshold
+    }
+
+    /// Two targeted retries at most. Measured on frame.png, each one paid for itself:
+    /// 7.64% -> 1.91% -> 1.07% uncovered, at roughly two cents a call, and the second attempt is what
+    /// finally filled in the top frame rail. A third was not measured, so it is not taken — and the
+    /// strict-improvement guard means the only thing an unlucky roll costs is the call.
+    static let maxRepairAttempts = 2
+
+    /// fal's `prompt` accepts `<bbox>left top right bottom</bbox>` in NORMALIZED coordinates. Its own
+    /// manifest reports normalized boxes in per-mille (0-1000), so per-mille is the convention used
+    /// here — and this exact form recovered a top frame rail that two unprompted runs both lost.
+    /// Returns nil for a degenerate box, so a bad measurement can never spend a call.
+    /// `userText` is threaded through deliberately: a repair is a whole fresh decomposition, so
+    /// dropping the user's element instruction here would hand back a repaired set that no longer
+    /// separates what they asked for — a worse result that scores better on coverage.
+    static func repairPrompt(gap: [Int], canvasW: Int, canvasH: Int, userText: String? = nil) -> String? {
+        guard gap.count == 4, canvasW > 0, canvasH > 0 else { return nil }
+        let l = max(0, min(1000, gap[0] * 1000 / canvasW))
+        let t = max(0, min(1000, gap[1] * 1000 / canvasH))
+        let r = max(0, min(1000, gap[2] * 1000 / canvasW))
+        let b = max(0, min(1000, gap[3] * 1000 / canvasH))
+        guard r > l, b > t else { return nil }
+        return LayerizeRules.composePrompt(userText) + "\n"
+             + "The region <bbox>\(l) \(t) \(r) \(b)</bbox> was left out of the previous "
+             + "decomposition — return the element occupying it as its own separate layer."
+    }
+
+    /// Which attempt to keep. STRICTLY better only: a repair that covers no better must not replace
+    /// the original, or a worse roll of the dice gets shipped in exchange for the extra call. The
+    /// same prompt measured 1.144% then 7.253%, so this is not hypothetical.
+    static func repairIsBetter(original: Double, repaired: Double) -> Bool {
+        repaired < original
+    }
+
+    /// One line for the log, so a run's completeness is on the record rather than inferred later.
+    static func summary(uncoveredFraction: Double) -> String {
+        String(format: "coverage %.2f%% uncovered", uncoveredFraction * 100)
+    }
+
+    /// A layer ready to be placed: its normalized per-mille box and its decoded pixels.
+    struct Placement {
+        let normalized: [Int]
+        let image: CGImage
+        init(normalized: [Int], image: CGImage) {
+            self.normalized = normalized
+            self.image = image
+        }
+    }
+
+    /// Long-edge ceiling for the measurement raster, purely a memory bound: two RGBA contexts plus
+    /// two masks at fal's maximum 6000x6000 input would be about 360 MB, and three images layerize
+    /// concurrently. Below this there is NO resampling at all, which is the point — measuring at
+    /// 700px reported 1.06% where the truth was 1.21%, and a check that UNDER-states gaps is biased
+    /// in the one direction that matters, since it can skip a repair it should have made.
+    static let measureLongEdgeCap = 2500
+
+    /// Fraction of the SOURCE's opaque pixels that no layer covers, plus the bounding box of the
+    /// largest connected gap cluster in source-pixel coordinates. Returns nil when the question
+    /// doesn't apply — no layers, or a source with no opaque pixels to be missing from.
+    ///
+    /// Layers are placed by their NORMALIZED boxes against the source's own dimensions, so this never
+    /// needs to know what canvas size fal chose. Verified equivalent to what the assembly script
+    /// actually builds from `absolute` boxes: 1.21% measured on the real PSD versus 1.21% here.
+    static func measure(source: CGImage, layers: [Placement]) -> (fraction: Double, gap: [Int])? {
+        guard !layers.isEmpty, source.width > 0, source.height > 0 else { return nil }
+        let longEdge = max(source.width, source.height)
+        let scale = longEdge > measureLongEdgeCap ? Double(measureLongEdgeCap) / Double(longEdge) : 1.0
+        let w = max(1, Int((Double(source.width) * scale).rounded()))
+        let h = max(1, Int((Double(source.height) * scale).rounded()))
+
+        func canvas() -> CGContext? {
+            CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        }
+        guard let comp = canvas(), let srcCtx = canvas() else { return nil }
+
+        for l in layers {
+            guard l.normalized.count == 4 else { continue }
+            let x0 = Double(l.normalized[0]) / 1000 * Double(w)
+            let y0 = Double(l.normalized[1]) / 1000 * Double(h)
+            let x1 = Double(l.normalized[2]) / 1000 * Double(w)
+            let y1 = Double(l.normalized[3]) / 1000 * Double(h)
+            guard x1 > x0, y1 > y0 else { continue }
+            // CoreGraphics' origin is bottom-left; fal's boxes are top-left.
+            comp.draw(l.image, in: CGRect(x: x0, y: Double(h) - y1, width: x1 - x0, height: y1 - y0))
+        }
+        srcCtx.draw(source, in: CGRect(x: 0, y: 0, width: Double(w), height: Double(h)))
+
+        guard let cRaw = comp.data, let sRaw = srcCtx.data else { return nil }
+        let c = cRaw.assumingMemoryBound(to: UInt8.self)
+        let s = sRaw.assumingMemoryBound(to: UInt8.self)
+        var mask = [Bool](repeating: false, count: w * h)
+        var gapCount = 0, srcCount = 0
+        for p in 0..<(w * h) {
+            let i = p * 4 + 3
+            guard s[i] > 128 else { continue }       // only where the ORIGINAL has real content
+            srcCount += 1
+            guard c[i] < 32 else { continue }
+            mask[p] = true
+            gapCount += 1
+        }
+        guard srcCount > 0 else { return nil }
+        let fraction = Double(gapCount) / Double(srcCount)
+        guard gapCount > 0 else { return (0, [0, 0, 0, 0]) }
+
+        // The box handed back is the LARGEST CONNECTED CLUSTER, not the extent of every gap pixel.
+        // Measured on a real residual: one box around all 61,153 stray pixels spanned 98.3% of the
+        // canvas — "the element occupying the whole image is missing", which is no hint at all. The
+        // largest cluster of that same residual was 1.0% of the canvas and held 40% of the pixels.
+        // Scattered specks are antialiasing seams; a genuinely missing element is one big blob.
+        var seen = [Bool](repeating: false, count: w * h)
+        var best = (size: 0, minX: 0, minY: 0, maxX: 0, maxY: 0)
+        var queue: [Int] = []
+        for start in 0..<(w * h) where mask[start] && !seen[start] {
+            seen[start] = true
+            queue.removeAll(keepingCapacity: true)
+            queue.append(start)
+            var size = 0, minX = w, minY = h, maxX = 0, maxY = 0
+            var head = 0
+            while head < queue.count {
+                let p = queue[head]; head += 1
+                let x = p % w, y = p / w
+                size += 1
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+                // 4-connectivity keeps a solid element together while letting a 1px diagonal seam
+                // fall apart into the noise it is.
+                if x > 0, mask[p - 1], !seen[p - 1] { seen[p - 1] = true; queue.append(p - 1) }
+                if x < w - 1, mask[p + 1], !seen[p + 1] { seen[p + 1] = true; queue.append(p + 1) }
+                if y > 0, mask[p - w], !seen[p - w] { seen[p - w] = true; queue.append(p - w) }
+                if y < h - 1, mask[p + w], !seen[p + w] { seen[p + w] = true; queue.append(p + w) }
+            }
+            if size > best.size { best = (size, minX, minY, maxX, maxY) }
+        }
+        guard best.size > 0 else { return (fraction, [0, 0, 0, 0]) }
+        return (fraction, [Int(Double(best.minX) / scale), Int(Double(best.minY) / scale),
+                           Int(Double(best.maxX + 1) / scale), Int(Double(best.maxY + 1) / scale)])
+    }
+
+    /// fal returns `bounding_box.normalized` as numbers that may decode as Int or Double.
+    static func normalizedBox(_ bb: [String: Any]?) -> [Int]? {
+        guard let arr = bb?["normalized"] as? [Any], arr.count == 4 else { return nil }
+        let v = arr.compactMap { ($0 as? NSNumber)?.intValue }
+        return v.count == 4 ? v : nil
     }
 }

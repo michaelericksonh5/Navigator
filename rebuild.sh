@@ -41,7 +41,7 @@ cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
 [ -f "$DIR/Navigator.icns" ] && cp "$DIR/Navigator.icns" "$APP/Contents/Resources/Navigator.icns"
 # Bundle the Photoshop Remove-BG scripts so they ship inside the app — no one
 # needs a copy saved anywhere; Navigator points Photoshop at these.
-for jsx in NavigatorRemoveBG NavigatorChromaKeyStill NavigatorExportPNG NavigatorGenerativeUpscale; do
+for jsx in NavigatorRemoveBG NavigatorChromaKeyStill NavigatorExportPNG NavigatorGenerativeUpscale NavigatorAssembleLayers; do
   [ -f "$DIR/$jsx.jsx" ] && cp "$DIR/$jsx.jsx" "$APP/Contents/Resources/$jsx.jsx"
 done
 # Menu icons for services with no installed app to borrow an icon from (Vertex AI,
@@ -62,7 +62,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.14.00</string>
+<key>CFBundleShortVersionString</key><string>2.15.00</string>
 <key>CFBundleVersion</key><string>150</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>NSHighResolutionCapable</key><true/>
