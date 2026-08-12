@@ -62,8 +62,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.15.00</string>
-<key>CFBundleVersion</key><string>150</string>
+<key>CFBundleShortVersionString</key><string>2.15.01</string>
+<key>CFBundleVersion</key><string>151</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
