@@ -4577,15 +4577,15 @@ final class ShareURLRulesTests: XCTestCase {
     /// Favorites are exported and handed to coworkers, so a mount URL must never say whose
     /// account it came from. The mount table always reports the user@ form.
     func testUserIsStripped() {
-        XCTAssertEqual(ShareURLRules.withoutUser("smb://merickson@CORP-DC01.High5.local/Games"),
-                       "smb://CORP-DC01.High5.local/Games")
+        XCTAssertEqual(ShareURLRules.withoutUser("smb://alice@fileserver-a.example.com/Games"),
+                       "smb://fileserver-a.example.com/Games")
         XCTAssertEqual(ShareURLRules.withoutUser("smb://user:secret@host/share"),
                        "smb://host/share", "a password must never survive into a shared file")
     }
 
     /// Already-clean URLs, and the forms people actually type, must pass through untouched.
     func testCleanURLsAreUnchanged() {
-        for u in ["smb://CORP-DC01.High5.local/Games", "smb://corp-pure02/data",
+        for u in ["smb://fileserver-a.example.com/Games", "smb://fileserver-b/data",
                   "smb://host/share/sub folder", "afp://host/vol"] {
             XCTAssertEqual(ShareURLRules.withoutUser(u), u)
         }
@@ -4599,8 +4599,8 @@ final class ShareURLRulesTests: XCTestCase {
 
     /// The DFS host form with a domain suffix and a percent-escaped share name.
     func testEscapedShareNamesSurvive() {
-        XCTAssertEqual(ShareURLRules.withoutUser("smb://me@CORP-DC01.High5.local/50%20West"),
-                       "smb://CORP-DC01.High5.local/50%20West")
+        XCTAssertEqual(ShareURLRules.withoutUser("smb://me@fileserver-a.example.com/50%20West"),
+                       "smb://fileserver-a.example.com/50%20West")
     }
 }
 

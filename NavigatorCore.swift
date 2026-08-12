@@ -1249,11 +1249,11 @@ enum LayerizeRules {
 /// Measured on two real SMB shares:
 ///
 /// * **Owner** was the worst by a distance. `FileItem.owner` did a fresh `stat` per read, and
-///   the cell reads it on every SwiftUI render pass — 669 rows on //CORP-DC01/Games cost
+///   the cell reads it on every SwiftUI render pass — 669 rows on //fileserver-a/Games cost
 ///   ~60 SECONDS per pass, repeatably, because the SMB client never cached it. Memoizing that
 ///   fixed the repeat cost; not asking for it at all fixes the first pass too.
 /// * **Date Created / Last Opened / Added / Tags** need attributes beyond the ones the listing
-///   already fetches. On //corp-pure02/data those extras cost ~187 ms per entry on first
+///   already fetches. On //fileserver-b/data those extras cost ~187 ms per entry on first
 ///   fetch, even with name/size/date for the same folder already cached.
 ///
 /// Everything left is genuinely free: Name and Ext come straight off the filename, Kind is
@@ -1275,7 +1275,7 @@ enum NetworkColumnRules {
     ///
     /// Size and Date Modified are deliberately NOT here. An earlier version of this
     /// comment claimed they were free because they "ride along in the same stat"; that
-    /// was wrong — they ARE the stat, at 89 ms PER ENTRY on //CORP-DC01/Games (a DFS
+    /// was wrong — they ARE the stat, at 89 ms PER ENTRY on //fileserver-a/Games (a DFS
     /// namespace). That is 59 s for artSource, and 10.9 s for a 116-item folder. The cost
     /// is the server's, not the API's: resourceValues, raw lstat, 8/16/32-way concurrent
     /// lstat, and getattrlistbulk (all 669 in a single syscall) all land within
@@ -3834,7 +3834,7 @@ enum ShareIndexRules {
 enum ShareURLRules {
     /// Strip the user (and any password) from a share URL.
     ///
-    /// The mount table reports `//merickson@CORP-DC01.High5.local/Games`, so a mount URL derived
+    /// The mount table reports `//alice@fileserver.example.com/Games`, so a mount URL derived
     /// from it carries whose account it was. Favorites get EXPORTED and handed to coworkers — a
     /// file that tells their Mac to authenticate as someone else is both a small privacy leak and
     /// a support call, because NetFS will try that account and fail. Sanitizing here makes it a
