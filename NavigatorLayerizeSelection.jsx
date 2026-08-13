@@ -34,6 +34,17 @@
  *
  * TO SHARE THIS: send the .jsx on its own. The recipient runs it, is asked for a fal.ai key once,
  * and it is saved to their own machine at Folder.userData/Navigator/fal_key.txt.
+ *
+ * TO REPLACE A SAVED KEY: hold Option while starting the script. A stored key is otherwise never
+ * questioned again, so a rotated or mistyped-but-valid-looking one would need the file deleted by
+ * hand.
+ *
+ * ANALYZE (optional, High 5 only): the dialog can ask Gemini what is worth separating in this
+ * particular image and offer a few named plans. That runs on the company's metered Vertex service,
+ * which is a browser sign-in rather than a key — so it needs the h5g-ai-connect skill installed and
+ * `node client.mjs login` done once. Without it the button explains itself and everything else works
+ * exactly as before: the fal.ai key and the typed element list are all layerizing has ever needed.
+ * The service URL is read from the installed client, never written here, because this file is public.
  */
 
 #target photoshop
@@ -198,7 +209,7 @@ function askForKey() {
     var how = w.add("statictext", undefined,
         "1.  Sign in at  fal.ai/dashboard/keys\n" +
         "2.  Create an API key and copy it\n" +
-        "3.  Paste it below — it is saved on this Mac only, in\n" +
+        "3.  Paste it below \u2014 it is saved on this Mac only, in\n" +
         "     " + Folder.userData.fsName + "/Navigator/fal_key.txt\n\n" +
         "It is never written into this script, so the script is safe to share.",
         { multiline: true });
@@ -207,7 +218,10 @@ function askForKey() {
     var field = w.add("edittext", undefined, "", { noecho: true });
     field.preferredSize = [430, 24];
     var note = w.add("statictext", undefined,
-        "At High 5, a key may already be set up for you — Cancel and ask, rather than making a second one.");
+        "At High 5 a key may already be set up \u2014 Cancel and ask, rather than making a second one.\n" +
+        "To replace this key later, hold Option while starting the script.",
+        { multiline: true });
+    note.preferredSize = [430, 30];
     note.graphics.font = ScriptUI.newFont(note.graphics.font.name, "italic", 10);
 
     var row = w.add("group"); row.alignment = "right";
@@ -217,7 +231,7 @@ function askForKey() {
     save.onClick = function () {
         var k = String(field.text).replace(/^\s+|\s+$/g, "");
         if (!k.length) { alert("Paste a key, or press Cancel."); return; }
-        if (!storeKey(k)) { alert("Couldn't save the key — it will be used for this run only."); }
+        if (!storeKey(k)) { alert("Couldn't save the key \u2014 it will be used for this run only."); }
         out = k;
         w.close();
     };
@@ -226,8 +240,22 @@ function askForKey() {
     return out;
 }
 
-/// The key, from whichever source has one. Prompts as a last resort.
+/// True when Option/Alt is held as the script starts — the escape hatch for changing a stored key.
+///
+/// Without this the only ways out of a wrong-but-well-formed key are waiting for the server to
+/// reject it or hand-editing a file in the Library, because a stored key is never questioned again.
+function optionKeyHeld() {
+    try { return ScriptUI.environment.keyboardState.altKey === true; } catch (e) { return false; }
+}
+
+/// The key, from whichever source has one. Prompts as a last resort, or on demand.
 function falKey() {
+    // Hold Option while launching the script to replace a saved key.
+    if (optionKeyHeld() && readStoredKey() !== null) {
+        var replaced = askForKey();
+        if (replaced !== null) { return replaced; }
+        // Cancelled out of the change dialog — carry on with what was already there.
+    }
     var k = $.getenv("FAL_KEY");
     if (k) { return k; }
     k = readClaudeSettingsKey();
@@ -241,6 +269,280 @@ function falKey() {
 /// same way forever.
 function forgetStoredKey() {
     try { var f = keyPrefsFile(); if (f.exists) { f.remove(); } } catch (e) {}
+}
+
+// ---------------------------------------------------------------- Analyze (Vertex, optional)
+//
+// A second, INDEPENDENT credential lives here, and the difference matters when something fails:
+//
+//   fal.ai  — an API key, required, does the actual layerizing.
+//   Vertex  — a browser sign-in, OPTIONAL, only powers the "Analyze image" button.
+//
+// They fail separately and the dialog says which one is missing, because a coworker who sees
+// "not signed in" next to a fal key they just pasted will otherwise assume the key is wrong.
+//
+// No service URL is written into this file: the repository is public. It is read from the installed
+// h5g-ai-connect client, exactly as Navigator does, so a redeploy that moves the service needs no
+// change here — and anyone without that client has no Vertex access to reach anyway.
+
+var MAX_ELEMENTS = 16;   // fal returns "the base image followed by up to 16 separated layers"
+
+function homeDir() { return IS_WINDOWS ? $.getenv("USERPROFILE") : $.getenv("HOME"); }
+
+/// The Vertex session token, written by `node client.mjs login`. Null when not signed in.
+function h5gToken() {
+    try {
+        var home = homeDir();
+        if (!home) { return null; }
+        var f = new File(home + "/.h5g-ai-gen/token.json");
+        if (!f.exists) { return null; }
+        f.encoding = "UTF-8"; f.open("r");
+        var txt = f.read(); f.close();
+        var j = JSON.parse(txt);
+        return (j && j.token) ? j.token : null;
+    } catch (e) { return null; }
+}
+
+/// The metered service's URL: the env var the client honours, else scraped out of the client itself.
+function h5gServiceURL() {
+    var env = $.getenv("H5G_AIGEN_URL");
+    if (env) { return String(env).replace(/\/+$/, ""); }
+    var home = homeDir();
+    if (!home) { return null; }
+    var candidates = [
+        home + "/.claude/skills/h5g-ai-connect/client.mjs",
+        home + "/Documents/h5g-ai-connect/skills/h5g-ai-connect/client.mjs",
+        home + "/Downloads/claude-plugins-main/plugins/h5g-ai-connect/skills/h5g-ai-connect/client.mjs"
+    ];
+    var f = null;
+    for (var i = 0; i < candidates.length; i++) {
+        var c = new File(candidates[i]);
+        if (c.exists) { f = c; break; }
+    }
+    if (f === null) { f = findClientInPluginCache(new Folder(home + "/.claude/plugins/cache"), 0); }
+    if (f === null) { return null; }
+    try {
+        f.encoding = "UTF-8"; f.open("r");
+        var src = f.read(); f.close();
+        var at = src.indexOf("SERVICE_URL");
+        if (at < 0) { return null; }
+        var m = /https:\/\/[^"'\s]+/.exec(src.substring(at));
+        return m ? m[0].replace(/\/+$/, "") : null;
+    } catch (e) { return null; }
+}
+
+/// Plugin installs land under a versioned cache path, so the client has to be hunted for. Depth is
+/// capped: this walks the user's plugin cache, and an unbounded walk of a deep tree would hang
+/// Photoshop with no way to interrupt it.
+function findClientInPluginCache(folder, depth) {
+    if (depth > 6 || !folder || !folder.exists) { return null; }
+    var items;
+    try { items = folder.getFiles(); } catch (e) { return null; }
+    for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (it instanceof File) {
+            if (it.name === "client.mjs" && it.fsName.indexOf("h5g-ai-connect") !== -1) { return it; }
+        } else if (it instanceof Folder) {
+            var hit = findClientInPluginCache(it, depth + 1);
+            if (hit !== null) { return hit; }
+        }
+    }
+    return null;
+}
+
+/// Same brief Navigator gives the model, and for the same reasons.
+///
+/// Two earlier versions failed instructively. The first ordered elements "back to front (background
+/// first)" and spent four of ten slots on sky, mountains, lake and boat hull — scenery layerize
+/// hands back in the base for free. The second fixed that but kept fixed COUNTS per tier, so an
+/// image with three genuinely useful pieces got padded to reach the number. Usefulness is not a
+/// quantity, it is a purpose, so the model proposes named JOBS instead.
+var PLAN_SYSTEM_PROMPT =
+    "You plan how to split a flat 2D image into layers for a game-art pipeline.\n\n" +
+    "HOW THE TOOL WORKS, and why it constrains you:\n" +
+    "- It returns a BASE image plus AT MOST 16 named elements.\n" +
+    "- Anything you do NOT name stays merged in the base, and the base is kept as the bottom\n" +
+    "  layer. So the leftover background is ALWAYS returned \u2014 you never need to name it just to\n" +
+    "  keep it.\n" +
+    "- Name a background ONLY when it is a distinct designed plate someone would reuse or replace\n" +
+    "  on its own (a symbol's backdrop, a parallax band), NOT when it is ambient scenery sitting\n" +
+    "  behind UI.\n\n" +
+    "Propose 1-4 DIFFERENT ways to split THIS image, each aimed at a real job someone would do:\n" +
+    " - structure: the reusable compositional pieces (backdrop / frame / subject / UI chrome)\n" +
+    " - extract:   lift the interactive or foreground items off a scene, leaving the scene whole\n" +
+    " - animate:   split ONE subject into moving parts (limbs, jaw, fins, held objects)\n" +
+    " - parallax:  split a background plate into depth bands\n" +
+    " - inventory: one layer per repeated item in a sheet or grid\n" +
+    "Only propose options that make sense for what you actually see. ONE option is a perfectly\n" +
+    "good answer.\n\n" +
+    "PICK ONE LEVEL PER THING inside any single option. Never list a container and its own parts\n" +
+    "together \u2014 \"ornate frame with corner gems\" and \"top left corner gem\" cannot both be layers,\n" +
+    "because the gems are inside the frame. The same goes for a subject: either the whole dragon\n" +
+    "as one layer, or its head, jaw, claw and tail as several, never both.\n\n" +
+    "RULES:\n" +
+    "- NEVER pad a list to reach a number. Return only elements that genuinely earn their own\n" +
+    "  layer. Three good elements beat eight with filler. Do not invent sub-parts nobody asked\n" +
+    "  for.\n" +
+    "- Order elements MOST VALUABLE FIRST; the list is truncated at 16.\n" +
+    "- If a job would need more than 16 elements, still give the best 16 and set \"warning\".\n\n" +
+    "Return STRICT JSON only, no prose, no markdown fence:\n" +
+    "{\n" +
+    "  \"kind\": \"<what this image is, short>\",\n" +
+    "  \"options\": [\n" +
+    "    {\"label\": \"<3-5 words>\", \"job\": \"structure|extract|animate|parallax|inventory\",\n" +
+    "     \"why\": \"<one short line>\", \"elements\": [\"...\"], \"warning\": \"<optional>\"}\n" +
+    "  ]\n" +
+    "}\n" +
+    "Order options best-first for this image.";
+
+/// A gateway hiccup, not a real refusal — worth retrying rather than reporting. Observed live: the
+/// vision endpoint answered `HTTP 502: {"error":"Vertex 502: <!DOCTYPE html>…` mid-session.
+function isTransientError(msg) {
+    var e = String(msg).toLowerCase();
+    var marks = ["http 502", "http 503", "http 504", "http 429", "timed out", "timeout",
+                 "connection was lost", "network connection", "bad gateway", "temporarily unavailable"];
+    for (var i = 0; i < marks.length; i++) { if (e.indexOf(marks[i]) !== -1) { return true; } }
+    return false;
+}
+
+/// Something a person can read in one line of status. The service wraps upstream failures in JSON
+/// containing a whole HTML error page.
+function friendlyError(msg) {
+    if (isTransientError(msg)) { return "the AI service is busy \u2014 try Analyze again in a moment"; }
+    var s = String(msg);
+    var cut = s.indexOf("<!DOCTYPE");
+    if (cut < 0) { cut = s.indexOf("<html"); }
+    if (cut >= 0) { s = s.substring(0, cut); }
+    s = s.replace(/^[\s{}"\\:,]+|[\s{}"\\:,]+$/g, "");
+    return s.length > 140 ? s.substring(0, 140) + "\u2026" : s;
+}
+
+/// Parse the model's reply into { kind, options:[{label,job,why,elements,warning}] }.
+/// Tolerates a ```json fence and surrounding prose, because "STRICT JSON only" is an instruction,
+/// not a guarantee.
+function parsePlan(reply) {
+    var s = String(reply);
+    var a = s.indexOf("{"), b = s.lastIndexOf("}");
+    if (a < 0 || b <= a) { return null; }
+    var obj;
+    try { obj = JSON.parse(s.substring(a, b + 1)); } catch (e) { return null; }
+    if (!obj || !obj.options || !obj.options.length) { return null; }
+    function str(o, k) { return (o && typeof o[k] === "string") ? o[k].replace(/^\s+|\s+$/g, "") : ""; }
+    var options = [];
+    for (var i = 0; i < obj.options.length; i++) {
+        var o = obj.options[i];
+        var els = [];
+        var raw = (o && o.elements instanceof Array) ? o.elements : [];
+        for (var j = 0; j < raw.length; j++) {
+            if (typeof raw[j] === "string") {
+                var t = raw[j].replace(/^\s+|\s+$/g, "");
+                if (t.length) { els.push(t); }
+            }
+        }
+        if (!els.length) { continue; }          // an option that separates nothing is noise
+        options.push({ label: str(o, "label"), job: str(o, "job"), why: str(o, "why"),
+                       elements: els, warning: str(o, "warning") });
+    }
+    if (!options.length) { return null; }
+    return { kind: str(obj, "kind"), options: options };
+}
+
+/// What the popup shows. Counts the BASE: naming N elements yields N+1 layers, because everything
+/// unnamed comes back merged as the bottom layer. Reporting "2 layers" for a run that produced
+/// three made it look like the background had been missed, when the background was layer one.
+function optionTitle(o) {
+    return (o.label.length ? o.label : o.job) + "  (" + (o.elements.length + 1) + " layers)";
+}
+
+/// Turn element names into the instruction sent to fal as `prompt`.
+///
+/// "background" is dropped: it is the base image, which layerize returns anyway, so asking for it
+/// wastes one of the 16 slots. Returns { text, dropped }.
+function instructionFor(names) {
+    var usable = [], seen = {};
+    for (var i = 0; i < names.length; i++) {
+        var n = String(names[i]).replace(/^\s+|\s+$/g, "");
+        var lower = n.toLowerCase();
+        if (!n.length || lower === "background") { continue; }
+        if (seen[lower]) { continue; }          // appending a second proposal repeats names
+        seen[lower] = true;
+        usable.push(n);
+    }
+    var kept = usable.slice(0, MAX_ELEMENTS);
+    var dropped = usable.slice(MAX_ELEMENTS);
+    if (!kept.length) { return { text: "", dropped: dropped }; }
+    return { text: "Separate these elements out from the image as individual layers: " +
+                   kept.join(", "), dropped: dropped };
+}
+
+/// Recover element names from an instruction this script produced, so a second proposal can be
+/// appended to a first. Anything typed freehand that isn't in that shape is treated as one item,
+/// which keeps the person's words rather than discarding them.
+function elementsInInstruction(text) {
+    var t = String(text).replace(/^\s+|\s+$/g, "");
+    if (!t.length) { return []; }
+    var marker = "individual layers:";
+    var at = t.indexOf(marker);
+    if (at >= 0) { t = t.substring(at + marker.length); }
+    var parts = t.split(",");
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+        var p = parts[i].replace(/^\s+|\s+$/g, "");
+        if (p.length) { out.push(p); }
+    }
+    return out;
+}
+
+/// Ask Gemini what is worth separating. Returns { plan, cost, error } — `plan` null on failure.
+function requestPlan(pngFile) {
+    var token = h5gToken();
+    if (!token) {
+        return { plan: null, cost: 0,
+                 error: "not signed in to Vertex \u2014 run  node client.mjs login  from the " +
+                        "h5g-ai-connect skill" };
+    }
+    var base = h5gServiceURL();
+    if (!base) {
+        return { plan: null, cost: 0,
+                 error: "the h5g-ai-connect client isn't installed on this Mac, so there is no " +
+                        "service to ask" };
+    }
+    var b64 = base64Of(pngFile);
+    if (b64 === null) { return { plan: null, cost: 0, error: "could not encode the image" }; }
+
+    // Written in pieces rather than via JSON.stringify: the payload carries a megabyte of base64,
+    // and running the polyfill's five escape passes over it is pure waste — base64 has no character
+    // that needs escaping.
+    var payload = tempFile("vision_payload", "json");
+    payload.encoding = "UTF-8";
+    payload.open("w");
+    payload.write('{"prompt":' + JSON.stringify("Plan how to split this image into layers.") +
+                  ',"system_prompt":' + JSON.stringify(PLAN_SYSTEM_PROMPT) +
+                  ',"input_images":[{"mime":"image/png","base64":"');
+    payload.write(b64);
+    payload.write('"}]}');
+    payload.close();
+
+    var lastError = "no response";
+    for (var attempt = 0; attempt < 3; attempt++) {
+        var resp = curl('-s -S --max-time 120 -X POST -H "Authorization: Bearer ' + token + '" ' +
+                        '-H "Content-Type: application/json" "' + base + '/v1/vision" ' +
+                        '-d @"' + payload.fsName + '"');
+        if (resp) {
+            var j = null;
+            try { j = JSON.parse(resp); } catch (e) { j = null; }
+            if (j && typeof j.text === "string") {
+                var plan = parsePlan(j.text);
+                if (plan !== null) { return { plan: plan, cost: (j.cost_usd || 0), error: null }; }
+                lastError = "the planner's answer wasn't in the expected shape";
+                break;      // a malformed answer is not a transport problem; retrying re-spends
+            }
+            lastError = (j && j.error) ? String(j.error) : String(resp).substring(0, 300);
+        }
+        if (!isTransientError(lastError)) { break; }
+        $.sleep(1500);
+    }
+    return { plan: null, cost: 0, error: friendlyError(lastError) };
 }
 
 // The line that must be in EVERY prompt: without it fal returns names and descriptions in Chinese,
@@ -273,30 +575,108 @@ function rememberElements(t) {
 /// fal documents `prompt` as "instructions describing which elements to separate". Empty, the model
 /// picks out "the major elements" — three or four blobs for a single character. Naming the parts is
 /// what yields per-limb layers, left and right as separate ones.
-function askElements() {
+/// `thumbFile` is a small flattened PNG of the same region, used only by Analyze. Pass null to get
+/// the typed-only dialog.
+function askElements(thumbFile) {
     var w = new Window("dialog", "Layerize Selection");
     w.alignChildren = "fill";
     w.margins = 16;
 
     w.add("statictext", undefined, "What should be separated into layers?");
+    // Lines are kept under ~66 characters and the height matches the line count. A multiline
+    // statictext does NOT grow to fit: at 460px the first draft wrapped onto a fifth line and the
+    // example was simply cut off the bottom, which a screenshot caught and reading the code did not.
     var hint = w.add("statictext", undefined,
-        "Optional — the more specific, the better. Leave blank to let the model pick out\n" +
-        "the major elements by itself.\n\n" +
-        "e.g.  Separate guns, triggers, hands, and arms out from image",
+        "Optional \u2014 naming the parts gives better layers than a blank box.\n" +
+        "e.g.  Separate guns, triggers, hands, and arms out from image\n" +
+        "Or click Analyze image\u2026 for plans built from this picture.",
         { multiline: true });
-    hint.preferredSize = [420, 60];
+    hint.preferredSize = [460, 58];
+
+    // --- Analyze row: look at the image and propose plans ---------------------------------------
+    var arow = w.add("group");
+    arow.alignment = "fill";
+    var analyze = arow.add("button", undefined, "Analyze image\u2026");
+    analyze.preferredSize.width = 116;
+    var picker = arow.add("dropdownlist", undefined, []);
+    picker.preferredSize.width = 250;
+    picker.enabled = false;
+    var addBtn = arow.add("button", undefined, "\uff0b");
+    addBtn.preferredSize.width = 34;
+    addBtn.helpTip = "Add this proposal's elements to the list below, instead of replacing it";
+    addBtn.enabled = false;
+
+    var status = w.add("statictext", undefined, "", { truncate: "middle" });
+    status.preferredSize.width = 460;
+    status.graphics.font = ScriptUI.newFont(status.graphics.font.name, "italic", 10);
 
     var field = w.add("edittext", undefined, loadRememberedElements(), { multiline: true });
-    field.preferredSize = [420, 70];
+    field.preferredSize = [460, 80];
 
     var foot = w.add("statictext", undefined,
-        "“" + BASE_PROMPT + "” is always sent, so names come back in English.");
+        "\u201c" + BASE_PROMPT + "\u201d is always sent, so names come back in English.");
     foot.graphics.font = ScriptUI.newFont(foot.graphics.font.name, "italic", 10);
 
     var row = w.add("group");
     row.alignment = "right";
     var cancel = row.add("button", undefined, "Cancel", { name: "cancel" });
     var ok = row.add("button", undefined, "Layerize", { name: "ok" });
+
+    // Analyze is optional and uses a DIFFERENT credential from the rest of the script, so when it is
+    // unavailable it says exactly which one is missing. A coworker who has just pasted a fal key and
+    // then sees a dead button will otherwise conclude the key was wrong.
+    var plan = null;
+    if (thumbFile === null || thumbFile === undefined) {
+        analyze.enabled = false;
+        status.text = "Analyze needs the flattened area, which isn't available here \u2014 type the elements.";
+    } else if (h5gToken() === null) {
+        analyze.enabled = false;
+        status.text = "Analyze is High 5 only (Vertex sign-in). Your fal.ai key is fine \u2014 just type the elements.";
+    } else if (h5gServiceURL() === null) {
+        analyze.enabled = false;
+        status.text = "Analyze needs the h5g-ai-connect skill installed. Typing the elements works without it.";
+    }
+
+    function showOption(index, append) {
+        if (plan === null || index < 0 || index >= plan.options.length) { return; }
+        var o = plan.options[index];
+        var names = append ? elementsInInstruction(field.text).concat(o.elements) : o.elements;
+        var built = instructionFor(names);
+        field.text = built.text;
+        var note = o.why;
+        if (o.warning.length) { note = note.length ? note + " \u2014 " + o.warning : o.warning; }
+        if (built.dropped.length) {
+            note = (note.length ? note + " \u2014 " : "") + "over the " + MAX_ELEMENTS +
+                   "-element limit, dropped: " + built.dropped.join(", ");
+        }
+        status.text = note;
+    }
+
+    analyze.onClick = function () {
+        analyze.enabled = false;
+        status.text = "Looking at the image\u2026";
+        // Photoshop is single-threaded, so the window cannot repaint while curl runs. Force the one
+        // update that matters before blocking, or the button just appears to do nothing for 10s.
+        status.update();
+        w.update();
+        var r = requestPlan(thumbFile);
+        analyze.enabled = true;
+        if (r.plan === null) { status.text = "Analyze failed: " + r.error; return; }
+        plan = r.plan;
+        picker.removeAll();
+        for (var i = 0; i < plan.options.length; i++) { picker.add("item", optionTitle(plan.options[i])); }
+        picker.enabled = true;
+        addBtn.enabled = true;
+        picker.selection = 0;       // fires onChange, which fills the field
+        if (plan.kind.length) { status.text = plan.kind + " \u2014 " + status.text; }
+    };
+    picker.onChange = function () {
+        if (picker.selection !== null) { showOption(picker.selection.index, false); }
+    };
+    addBtn.onClick = function () {
+        if (picker.selection !== null) { showOption(picker.selection.index, true); }
+    };
+
     var result = null;
     ok.onClick = function () {
         var t = String(field.text).replace(/^\s+|\s+$/g, "");
@@ -322,8 +702,9 @@ function describe(e) {
 // ---------------------------------------------------------------- the work
 
 /// Flatten the given rect of the document to a temp PNG, downsampling only if fal's pixel ceiling
-/// demands it. Returns { file, w, h }.
-function exportRegion(doc, x1, y1, x2, y2) {
+/// demands it. Pass `maxDim` to cap the long edge as well — the Analyze thumbnail does, since a
+/// vision read only needs enough resolution to make out the subject. Returns { file, w, h }.
+function exportRegion(doc, x1, y1, x2, y2, maxDim) {
     var cropDoc = null;
     try {
         // Merged copy of everything visible, exactly like AI_Image_Edit_Update does: duplicate the
@@ -336,6 +717,12 @@ function exportRegion(doc, x1, y1, x2, y2) {
             var ratio = Math.sqrt(MAX_PIXELS / (w * h));
             cropDoc.resizeImage(UnitValue(Math.floor(w * ratio), "px"),
                                 UnitValue(Math.floor(h * ratio), "px"), null, ResampleMethod.BICUBICSHARPER);
+            w = cropDoc.width.as("px"); h = cropDoc.height.as("px");
+        }
+        if (maxDim && Math.max(w, h) > maxDim) {
+            var s = maxDim / Math.max(w, h);
+            cropDoc.resizeImage(UnitValue(Math.max(1, Math.round(w * s)), "px"),
+                                UnitValue(Math.max(1, Math.round(h * s)), "px"), null, ResampleMethod.BICUBICSHARPER);
             w = cropDoc.width.as("px"); h = cropDoc.height.as("px");
         }
 
@@ -384,7 +771,8 @@ function uploadToFal(f, key) {
     return j.file_url;
 }
 
-function base64DataURI(f) {
+/// Raw base64 of a file, via the platform's own encoder — ExtendScript has none.
+function base64Of(f) {
     var b64 = tempFile("layerize_b64", "txt");
     var cmd = IS_WINDOWS
         ? 'cmd.exe /c "certutil -encodehex -f "' + f.fsName + '" "' + b64.fsName + '" 0x40000001"'
@@ -394,7 +782,12 @@ function base64DataURI(f) {
     b64.open("r");
     var s = b64.read();
     b64.close();
-    return "data:image/png;base64," + s.replace(/[\r\n]/g, "");
+    return s.replace(/[\r\n]/g, "");
+}
+
+function base64DataURI(f) {
+    var s = base64Of(f);
+    return (s === null) ? null : "data:image/png;base64," + s;
 }
 
 /// Ask fal to decompose the image. Returns the parsed `layers` array.
@@ -447,9 +840,42 @@ function downloadTo(url, f) {
     return sig.charCodeAt(0) === 0x89 && sig.substring(1) === "PNG";
 }
 
+// ===== SHARED WITH THE OTHER NAVIGATOR JSX — keep byte-identical (checked by rebuild.sh) =====
+/// Open a file, cleaning up after Photoshop when it opens the document but fails the call that
+/// returns it, and retrying once.
+///
+/// This is real observed behaviour, not a hypothetical. app.open throws "The command Get is not
+/// currently available" while the document IS open — NavigatorRemoveBG.jsx hit the same thing and
+/// once found nine hidden copies stacked up. Here it cascaded: four assembly retries left four
+/// orphaned documents, after which even a known-good file would no longer open, so one flaky call
+/// turned into a Photoshop that had to be cleaned out by hand.
+///
+/// The orphan is matched by FULL PATH, never by name — a document of the user's that merely shares
+/// a filename must not be closed.
+function openOrCleanUp(file) {
+    for (var attempt = 0; attempt < 2; attempt++) {
+        try {
+            return app.open(file);
+        } catch (e) {
+            var target = file.fsName;
+            for (var i = app.documents.length - 1; i >= 0; i--) {
+                var full = null;
+                try { full = app.documents[i].fullName ? app.documents[i].fullName.fsName : null; } catch (fe) {}
+                if (full === target) {
+                    try { app.documents[i].close(SaveOptions.DONOTSAVECHANGES); } catch (ce) {}
+                    break;
+                }
+            }
+            if (attempt === 1) { throw e; }
+            $.sleep(400);          // the refusal is usually transient; give it a moment
+        }
+    }
+}
+// ===== END SHARED =====
+
 /// Place one layer PNG into `doc`, scaled from base-image space into the target rect.
 function placeLayer(doc, group, f, box, scaleX, scaleY, offsetX, offsetY, layerName) {
-    var srcDoc = app.open(f);
+    var srcDoc = openOrCleanUp(f);
     var placed = null;
     try {
         var src = srcDoc.artLayers[0];
@@ -496,14 +922,14 @@ function run() {
     // sharp result and a mushy one. ArtLayer.resize has no interpolation argument.
     app.preferences.interpolation = ResampleMethod.BICUBICSHARPER;
 
+    // Declared out here so the finally block can always put the selection back, including on the
+    // path where the dialog is cancelled after the marching ants have been stashed away.
+    var savedSelection = null;
+
     try {
         // Prompts for a key if none is configured; null means the user cancelled that dialog.
         var key = falKey();
         if (!key) { return; }
-
-        // Asked before anything is flattened or uploaded, so Cancel costs nothing.
-        var promptText = askElements();
-        if (promptText === null) { return; }
 
         // Selection if there is one, otherwise the whole canvas.
         var x1 = 0, y1 = 0, x2 = doc.width.as("px"), y2 = doc.height.as("px");
@@ -529,30 +955,41 @@ function run() {
             return;
         }
 
-        progress("Flattening " + selW + "x" + selH + (usedSelection ? " selection" : " canvas") + "…");
+        progress("Flattening " + selW + "x" + selH + (usedSelection ? " selection" : " canvas") + "\u2026");
         // Deselect so the duplicate/crop is not itself clipped by the marching ants.
-        var savedSelection = null;
         if (usedSelection) {
             savedSelection = doc.channels.add();
             savedSelection.name = "Layerize_Selection";
             doc.selection.store(savedSelection);
             doc.selection.deselect();
         }
+
+        // A small flatten first, purely so Analyze has something to look at. It is the cheap half of
+        // the work — the full-resolution export is left until after the dialog is accepted, so
+        // cancelling still costs nothing worth noticing.
+        var thumb = null;
+        try { thumb = exportRegion(doc, x1, y1, x2, y2, 768).file; } catch (te) { thumb = null; }
+
+        progressDone();
+        var promptText = askElements(thumb);
+        if (promptText === null) { return; }
+
+        progress("Flattening " + selW + "x" + selH + "\u2026");
         var exported = exportRegion(doc, x1, y1, x2, y2);
         if (exported.file.length > MAX_BYTES) {
             throw new Error("the flattened area is " + Math.round(exported.file.length / 1048576) +
-                            " MB, over fal's 30 MB limit — select a smaller area");
+                            " MB, over fal's 30 MB limit \u2014 select a smaller area");
         }
 
-        progress("Uploading " + Math.round(exported.file.length / 1048576 * 10) / 10 + " MB…");
+        progress("Uploading " + Math.round(exported.file.length / 1048576 * 10) / 10 + " MB\u2026");
         var imageRef = uploadToFal(exported.file, key);
         if (imageRef === null) {
-            progress("Upload failed — inlining instead…");
+            progress("Upload failed \u2014 inlining instead\u2026");
             imageRef = base64DataURI(exported.file);
             if (imageRef === null) { throw new Error("could not upload or encode the image"); }
         }
 
-        progress("Layerizing — this takes 2-3 minutes and Photoshop will be unresponsive…");
+        progress("Layerizing \u2014 this takes 2-3 minutes and Photoshop will be unresponsive\u2026");
         var layers = requestLayerize(imageRef, key, promptText);
 
         // The base (z_index 0, no bounding box) defines the coordinate space every box is measured
@@ -568,10 +1005,10 @@ function run() {
 
         var canvasW = 0, canvasH = 0;
         if (baseEntry !== null && baseEntry.image && baseEntry.image.url) {
-            progress("Measuring the returned canvas…");
+            progress("Measuring the returned canvas\u2026");
             var baseFile = tempFile("layerize_base", "png");
             if (downloadTo(baseEntry.image.url, baseFile)) {
-                var bd = app.open(baseFile);
+                var bd = openOrCleanUp(baseFile);
                 canvasW = bd.width.as("px"); canvasH = bd.height.as("px");
                 bd.close(SaveOptions.DONOTSAVECHANGES);
                 app.activeDocument = doc;
@@ -609,7 +1046,7 @@ function run() {
         for (var m = 0; m < elements.length; m++) {
             var e = elements[m];
             progress("Placing layer " + (m + 1) + " of " + elements.length +
-                     (e.name ? " — " + e.name : "") + "…");
+                     (e.name ? " \u2014 " + e.name : "") + "\u2026");
             var lf = tempFile("layerize_layer_" + m, "png");
             if (!e.image || !e.image.url || !downloadTo(e.image.url, lf)) {
                 failed.push((e.name || ("layer " + m)) + " (download failed)");
@@ -619,24 +1056,23 @@ function run() {
                 placeLayer(doc, group, lf, e.bounding_box.absolute, scaleX, scaleY, x1, y1, e.name);
                 placed++;
             } catch (pe) {
-                failed.push((e.name || ("layer " + m)) + " — " + describe(pe));
+                failed.push((e.name || ("layer " + m)) + " \u2014 " + describe(pe));
             }
         }
 
-        if (savedSelection !== null) {
-            try { doc.selection.load(savedSelection); savedSelection.remove(); } catch (se) {}
-        }
-
         progressDone();
-        var msg = "Added " + placed + " layer" + (placed === 1 ? "" : "s") + " in the “Layerized” group.";
-        if (failed.length) { msg += "\n\n" + failed.length + " could not be placed:\n• " + failed.join("\n• "); }
-        if (placed === 0) { msg = "Nothing could be placed.\n\n• " + failed.join("\n• "); }
+        var msg = "Added " + placed + " layer" + (placed === 1 ? "" : "s") + " in the \u201cLayerized\u201d group.";
+        if (failed.length) { msg += "\n\n" + failed.length + " could not be placed:\n\u2022 " + failed.join("\n\u2022 "); }
+        if (placed === 0) { msg = "Nothing could be placed.\n\n\u2022 " + failed.join("\n\u2022 "); }
         alert(msg);
     } catch (e) {
         progressDone();
         alert("Layerize failed:\n\n" + describe(e));
     } finally {
         progressDone();
+        if (savedSelection !== null) {
+            try { doc.selection.load(savedSelection); savedSelection.remove(); } catch (se) {}
+        }
         cleanupTemp();
         app.preferences.interpolation = priorInterp;
         app.preferences.rulerUnits = priorUnits;

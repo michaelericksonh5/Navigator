@@ -57,7 +57,7 @@ function uniqueFile(dirPath, base, ext) {
 }
 
 if (INTERACTIVE) {
-    var picked = Folder.selectDialog("Choose a Layerize “_Layers” folder to rebuild");
+    var picked = Folder.selectDialog("Choose a Layerize \u201c_Layers\u201d folder to rebuild");
     if (picked !== null) {
         LAYERS_DIR = picked.fsName;
         // Only a trailing "_Layers" is stripped, so a deduped folder keeps what distinguishes it:
@@ -97,7 +97,7 @@ function readManifest(dir) {
     } catch (parseErr) {
         // A truncated manifest reports ") does not have a value" at jsx line 1, which points at
         // nothing useful. Say what is actually wrong and how big the file was.
-        throw new Error("_layers.json is not valid JSON (" + t.length + " bytes read) — " +
+        throw new Error("_layers.json is not valid JSON (" + t.length + " bytes read) \u2014 " +
                         (parseErr.message ? parseErr.message : String(parseErr)));
     }
 }
@@ -124,11 +124,44 @@ function canvasFromBoxes(manifest) {
     return { w: Math.max(w, Math.round(estW)), h: Math.max(h, Math.round(estH)) };
 }
 
+// ===== SHARED WITH THE OTHER NAVIGATOR JSX — keep byte-identical (checked by rebuild.sh) =====
+/// Open a file, cleaning up after Photoshop when it opens the document but fails the call that
+/// returns it, and retrying once.
+///
+/// This is real observed behaviour, not a hypothetical. app.open throws "The command Get is not
+/// currently available" while the document IS open — NavigatorRemoveBG.jsx hit the same thing and
+/// once found nine hidden copies stacked up. Here it cascaded: four assembly retries left four
+/// orphaned documents, after which even a known-good file would no longer open, so one flaky call
+/// turned into a Photoshop that had to be cleaned out by hand.
+///
+/// The orphan is matched by FULL PATH, never by name — a document of the user's that merely shares
+/// a filename must not be closed.
+function openOrCleanUp(file) {
+    for (var attempt = 0; attempt < 2; attempt++) {
+        try {
+            return app.open(file);
+        } catch (e) {
+            var target = file.fsName;
+            for (var i = app.documents.length - 1; i >= 0; i--) {
+                var full = null;
+                try { full = app.documents[i].fullName ? app.documents[i].fullName.fsName : null; } catch (fe) {}
+                if (full === target) {
+                    try { app.documents[i].close(SaveOptions.DONOTSAVECHANGES); } catch (ce) {}
+                    break;
+                }
+            }
+            if (attempt === 1) { throw e; }
+            $.sleep(400);          // the refusal is usually transient; give it a moment
+        }
+    }
+}
+// ===== END SHARED =====
+
 /// Open a PNG, move its pixels into `doc` as a new top-of-stack layer, close the source.
 /// Returns { layer, w, h } — the PNG's own pixel dimensions come back because they're the
 /// denominator of the scale and the source document is gone by the time the caller needs them.
 function importPNG(doc, file) {
-    var srcDoc = app.open(file);
+    var srcDoc = openOrCleanUp(file);
     var placed = null, w = 0, h = 0;
     try {
         w = srcDoc.width.as("px");
@@ -227,7 +260,7 @@ function doWork() {
         STEP = "canvasSize";
         var canvasW, canvasH, dpi = 72;
         if (baseFile) {
-            var probe = app.open(baseFile);
+            var probe = openOrCleanUp(baseFile);
             try {
                 canvasW = probe.width.as("px");
                 canvasH = probe.height.as("px");
@@ -256,7 +289,7 @@ function doWork() {
                 importPNG(doc, baseFile).layer.name = "base";
                 placedCount++;
             } catch (baseErr) {
-                failed.push(baseEntry.file + " — " + describe(baseErr));
+                failed.push(baseEntry.file + " \u2014 " + describe(baseErr));
             }
         }
         for (var n = 0; n < manifest.length; n++) {
@@ -267,7 +300,7 @@ function doWork() {
                 if (placeLayer(doc, LAYERS_DIR, e)) { placedCount++; }
                 else { missing.push(e.file || "(no file named for z" + e.z_index + ")"); }
             } catch (layerErr) {
-                failed.push((e.file || "z" + e.z_index) + " — " + describe(layerErr));
+                failed.push((e.file || "z" + e.z_index) + " \u2014 " + describe(layerErr));
             }
         }
 
@@ -275,7 +308,7 @@ function doWork() {
         // Saving an empty transparent document and calling it OK would be worse than failing: the
         // user gets a PSD that looks like success and contains nothing.
         if (placedCount === 0) {
-            throw new Error("nothing could be placed — " + missing.length + " missing, " +
+            throw new Error("nothing could be placed \u2014 " + missing.length + " missing, " +
                             failed.length + " failed" +
                             (failed.length ? ": " + failed.join("; ") : ""));
         }
@@ -323,6 +356,6 @@ if (INTERACTIVE && LAYERS_DIR === null) {
 }
 // Only ever interactively — see the note on INTERACTIVE above.
 if (INTERACTIVE && RESULT !== "OK: cancelled") {
-    alert(RESULT.replace(/^OK: /, "Rebuilt:\n").replace(/^ERROR: /, "Couldn’t rebuild:\n"));
+    alert(RESULT.replace(/^OK: /, "Rebuilt:\n").replace(/^ERROR: /, "Couldn\u2019t rebuild:\n"));
 }
 RESULT;   // returned to osascript stdout so Navigator can report it
