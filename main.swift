@@ -2143,33 +2143,200 @@ private func falUpload(data: Data, contentType: String, fileName: String, key: S
 /// empty prompt returns "the major elements". Left blank this behaves exactly as before.
 ///
 /// Returns nil if the user cancels. The text is remembered so a repeat run is one Return away.
-func askLayerizeElements(imageCount: Int) -> String? {
-    let key = "layerizeElementPrompt"
+/// Holds the analysis between the button press and the segment clicks. A local in the function can't
+/// be reached from the target/action selectors AppKit needs.
+final class LayerizeElementPanel: NSObject {
+    // A SCROLLING text view, not an NSTextField. A sixteen-element list is four or five wrapped
+    // lines and a fixed field just clips it — you could neither read nor scroll what was about to
+    // be sent, which is the one thing this box exists to let you check.
+    let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 400, height: 110))
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 26, width: 400, height: 110))
+    // A POPUP of proposed jobs, not a granularity slider. Which split is useful depends on what you
+    // are about to do — reskin, rig, parallax — and that is a purpose, not a quantity.
+    let picker = NSPopUpButton(frame: .zero, pullsDown: false)
+    let analyze = NSButton(title: "Analyze image…", target: nil, action: nil)
+    /// Appends the selected proposal to what is already in the box, so two jobs can be done in one
+    /// pass. Left to the person on purpose: merging automatically produced contradictions like a
+    /// frame AND the gems inside it, and only someone looking at the list can resolve that.
+    let addButton = NSButton(title: "＋", target: nil, action: nil)
+    let status = NSTextField(labelWithString: "")
+    let view = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 176))
+    var plan: LayerizeElementRules.Plan?
+    /// The elements currently requested. Held here rather than recovered from the text box: reading
+    /// them back meant splitting on commas, which breaks the moment an element name contains one
+    /// ("frame, inner" or "MEGA, MAJOR, MINOR panel"). The box stays freely editable and whatever is
+    /// in it at OK is what gets sent — this is only the source of truth for counting and for "＋".
+    var currentElements: [String] = []
+    /// The image the analysis describes — the first in the batch, since one prompt covers them all.
+    var sourcePNG: Data?
+
+    var text: String {
+        get { textView.string }
+        set { textView.string = newValue }
+    }
+
+    override init() {
+        super.init()
+        textView.isEditable = true
+        textView.isRichText = false
+        textView.font = .systemFont(ofSize: 12)
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        scroll.documentView = textView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.autohidesScrollers = false
+
+        analyze.frame = NSRect(x: 0, y: 146, width: 132, height: 24)
+        analyze.bezelStyle = .rounded
+        analyze.target = self
+        analyze.action = #selector(runAnalysis)
+
+        addButton.frame = NSRect(x: 372, y: 146, width: 28, height: 25)
+        addButton.bezelStyle = .rounded
+        addButton.target = self
+        addButton.action = #selector(appendChoice)
+        addButton.isEnabled = false
+        addButton.toolTip = "Add this proposal to the list instead of replacing it"
+
+        picker.frame = NSRect(x: 142, y: 146, width: 224, height: 25)
+        picker.target = self
+        picker.action = #selector(pickGranularity)
+        picker.isEnabled = false
+        picker.addItem(withTitle: "— analyse to see options —")
+
+        status.frame = NSRect(x: 0, y: 4, width: 400, height: 16)
+        status.font = .systemFont(ofSize: 10)
+        status.textColor = .secondaryLabelColor
+        status.lineBreakMode = .byTruncatingTail
+
+        view.addSubview(analyze)
+        view.addSubview(picker)
+        view.addSubview(addButton)
+        view.addSubview(scroll)
+        view.addSubview(status)
+    }
+
+    @objc private func runAnalysis() {
+        guard let png = sourcePNG else { return }
+        analyze.isEnabled = false
+        defer { analyze.isEnabled = true }
+
+        // Up to three goes: a 502 from the gateway is transient by definition, and giving up on the
+        // first one spends the whole wait and returns nothing — which is what happened in practice.
+        var lastError = "no response"
+        for attempt in 1...3 {
+            status.stringValue = attempt == 1 ? "Looking at the image…"
+                                              : "Service was busy — retrying (\(attempt) of 3)…"
+            status.display()
+            let r = describeOffMainThread(png)
+            if let text = r.text, let g = LayerizeElementRules.parse(text) {
+                plan = g
+                picker.removeAllItems()
+                for o in g.options { picker.addItem(withTitle: o.menuTitle) }
+                picker.isEnabled = g.options.count > 1
+                addButton.isEnabled = g.options.count > 1
+                picker.selectItem(at: 0)
+                pickGranularity()
+                return
+            }
+            lastError = r.error ?? "the reply wasn’t in the expected form"
+            guard LayerizeElementRules.isTransient(lastError), attempt < 3 else { break }
+            Thread.sleep(forTimeInterval: 1.5)
+        }
+        status.stringValue = "Couldn’t analyse — " + LayerizeElementRules.friendlyError(lastError)
+    }
+
+    /// Run the vision call off the main thread while keeping the modal alive.
+    ///
+    /// Called directly it blocks the run loop for up to its 60-second timeout, so the dialog freezes
+    /// solid with no way to cancel — and on a slow day that is a minute of a dead window. Pumping the
+    /// run loop while waiting keeps buttons drawing and the Cancel button usable.
+    private func describeOffMainThread(_ png: Data) -> (text: String?, cost: Double?, error: String?) {
+        var result: (text: String?, cost: Double?, error: String?)?
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = H5GService.describe(
+                prompt: "Plan how to split this image into layers.",
+                systemPrompt: LayerizeElementRules.systemPrompt, imagePNG: png)
+            DispatchQueue.main.async { result = r }
+        }
+        // A little past the service's own 60s timeout, so this never outlives the request itself.
+        let deadline = Date().addingTimeInterval(70)
+        while result == nil, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        return result ?? (nil, nil, "the AI service didn’t answer in time")
+    }
+
+    /// Merge the selected proposal into whatever is already typed, rather than replacing it.
+    @objc private func appendChoice() {
+        guard let p = plan, picker.indexOfSelectedItem >= 0,
+              picker.indexOfSelectedItem < p.options.count else { return }
+        for e in p.options[picker.indexOfSelectedItem].elements
+        where !currentElements.contains(where: { $0.caseInsensitiveCompare(e) == .orderedSame }) {
+            currentElements.append(e)
+        }
+        let r = LayerizeElementRules.instruction(for: currentElements)
+        text = r.text
+        showStatus(count: currentElements.count, why: "combined", dropped: r.dropped, warning: "")
+    }
+
+    /// One place that renders the note under the box, so the layer count and the ceiling are stated
+    /// the same way however the list got there.
+    private func showStatus(count: Int, why: String, dropped: [String], warning: String) {
+        let kind = plan?.kind ?? ""
+        var line = "\(min(count, LayerizeElementRules.maxElements) + 1) layers"
+        if !dropped.isEmpty {
+            line += " — AT fal's limit of \(LayerizeElementRules.maxElements) elements, dropping: "
+                  + dropped.joined(separator: ", ")
+        } else if count == LayerizeElementRules.maxElements {
+            line += " — at fal's maximum; anything more would be refused"
+        } else {
+            line += " (everything unnamed stays in the bottom layer)"
+        }
+        if !warning.isEmpty { line += "  ·  " + warning }
+        if !kind.isEmpty { line += "  ·  " + kind }
+        if !why.isEmpty && why != "combined" { line += " — " + why }
+        status.stringValue = line
+    }
+
+    @objc private func pickGranularity() {
+        guard let p = plan, picker.indexOfSelectedItem >= 0,
+              picker.indexOfSelectedItem < p.options.count else { return }
+        let o = p.options[picker.indexOfSelectedItem]
+        currentElements = o.elements
+        let r = LayerizeElementRules.instruction(for: currentElements)
+        text = r.text
+        showStatus(count: currentElements.count, why: o.why, dropped: r.dropped, warning: o.warning)
+    }
+}
+
+func askLayerizeElements(imageCount: Int, firstImage: Data?) -> String? {
     let a = NSAlert()
     a.messageText = imageCount == 1 ? "What should be separated?"
                                     : "What should be separated? (\(imageCount) images)"
     a.informativeText = """
         Optional. Name the parts you want as their own layers — the more specific, the better.
 
-        e.g.  Separate guns, triggers, hands, and arms out from image
+        “Analyze image…” asks Gemini to list what it can see, at three levels of detail, and fills \
+        the box in for you. Edit it however you like.
 
         Leave it blank to let the model pick out the major elements by itself. Names and \
         descriptions always come back in English.
         """
-    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 44))
-    field.placeholderString = "Separate guns, triggers, hands, and arms out from image"
-    field.stringValue = UserDefaults.standard.string(forKey: key) ?? ""
-    field.usesSingleLineMode = false
-    field.cell?.wraps = true
-    field.cell?.isScrollable = false
-    a.accessoryView = field
+    let panel = LayerizeElementPanel()
+    panel.sourcePNG = firstImage
+    panel.analyze.isEnabled = (firstImage != nil)
+    // Deliberately EMPTY. Carrying the previous run's list forward means the next image gets
+    // layerized against a description of a different picture — silently, and wrongly.
+    if firstImage == nil { panel.status.stringValue = "Analysis needs an image Navigator can read." }
+    a.accessoryView = panel.view
     a.addButton(withTitle: "Layerize")
     a.addButton(withTitle: "Cancel")
-    a.window.initialFirstResponder = field
+    a.window.initialFirstResponder = panel.textView
     guard a.runModal() == .alertFirstButtonReturn else { return nil }
-    let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    UserDefaults.standard.set(text, forKey: key)
-    return text
+    return panel.text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 /// `imageRef` is whatever goes in `image_url` — a CDN URL from falUpload, or a base64 data URI. It is
@@ -2237,12 +2404,39 @@ private func falLayerize(imageRef: String, tier: String, key: String,
 // script next to it got an eight-case injection matrix.
 
 /// Fraction of fully-transparent pixels — decides whether the base layer is worth keeping.
-private func transparentFraction(_ url: URL) -> Double {
-    guard let cg = loadCGImage(url), let s = rgbaSample(cg, cap: 256) else { return 0 }
+/// Fraction of the OUTER EDGE that is transparent — the test for "is this a cutout?".
+///
+/// The overall transparent fraction, which this used to measure, cannot tell the two cases apart. A
+/// dragon symbol saved with its background removed measured 15.7% transparent and an opaque framed
+/// symbol measured 15.4% — indistinguishable — so a cutout slipped under the 20% threshold, its base
+/// was kept, and the user got fal's invented backdrop: grey in the corners, white along the edges.
+///
+/// The border is decisive. Measured across six real assets, cutouts came in at 96-99% transparent
+/// around the edge and true scenes at exactly 0%, with nothing in between:
+///     dragon 96.7   frame 96.9   character 96.0   |   bluebird 0.0   mockup 0.0
+private func borderTransparentFraction(_ url: URL) -> (border: Double, overall: Double) {
+    // 512 rather than 256: a one-pixel transparent margin on a 4K asset survives the downsample to
+    // 512 and can vanish at 256, which would read a cutout as opaque.
+    guard let cg = loadCGImage(url), let s = rgbaSample(cg, cap: 512) else { return (0, 0) }
+    let w = s.w, h = s.h
+    guard w > 4, h > 4 else { return (0, 0) }
+    let band = max(2, min(w, h) / 50)          // 2% of the short side
     var clear = 0, total = 0
-    var i = 3
-    while i < s.px.count { if s.px[i] < 16 { clear += 1 }; total += 1; i += 4 }
-    return total > 0 ? Double(clear) / Double(total) : 0
+    var clearAll = 0, totalAll = 0
+    for y in 0..<h {
+        let vertical = (y < band || y >= h - band)
+        for x in 0..<w {
+            guard vertical || x < band || x >= w - band else { continue }
+            let i = (y * w + x) * 4 + 3
+            guard i < s.px.count else { continue }
+            if s.px[i] < 16 { clear += 1 }
+            total += 1
+        }
+    }
+    var j = 3
+    while j < s.px.count { if s.px[j] < 16 { clearAll += 1 }; totalAll += 1; j += 4 }
+    return (total > 0 ? Double(clear) / Double(total) : 0,
+            totalAll > 0 ? Double(clearAll) / Double(totalAll) : 0)
 }
 
 /// Split image(s) into transparent layers, then assemble each folder into a layered PSD.
@@ -2291,7 +2485,11 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
 
     // Asked here, with the other preflight questions, so the batch still interrupts at most once and
     // nothing has been spent by the time Cancel is available.
-    guard let elements = askLayerizeElements(imageCount: plan.count) else { return }
+    // One prompt covers the batch, so the analysis looks at the first image — for a set of related
+    // frames (four poses of one character) that is exactly right. Downscaled: detail past ~1024px
+    // tells the describer nothing and just costs tokens.
+    let analysisImage = downscaledPNG(plan[0].url, maxDim: 1024)
+    guard let elements = askLayerizeElements(imageCount: plan.count, firstImage: analysisImage) else { return }
     let userPrompt = LayerizeRules.composePrompt(elements)
 
     // Each image gets its OWN output folder, resolved up front. Two sources can want the same one
@@ -2353,7 +2551,9 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 note { errors.append("\(src.lastPathComponent): encode failed") }; return
             }
 
-            let keepBase = LayerizeRules.shouldKeepBase(transparentFraction: transparentFraction(src))
+            let alpha = borderTransparentFraction(src)
+            let keepBase = LayerizeRules.shouldKeepBase(borderTransparentFraction: alpha.border,
+                                                       overallTransparentFraction: alpha.overall)
             let ladder = LayerizeRules.sizeLadder(width: cg.width, height: cg.height)
 
             // Upload ONCE, before the ladder, and reuse the URL for every attempt and repair.
@@ -2466,6 +2666,16 @@ func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                           LayerCoverageRules.repairIsBetter(original: current.fraction,
                                                             repaired: next.fraction) else {
                         navLog("  \(src.lastPathComponent): repair \(repairs) was no better — keeping what we had")
+                        break
+                    }
+                    // Better coverage is not enough. A repair is a fresh decomposition and can cover
+                    // more while having separated different things, quietly discarding what was asked
+                    // for and reporting it as an improvement.
+                    let asked = LayerizeElementRules.elements(inInstruction: elements)
+                    let got = candidate.compactMap { $0.layer.name }
+                    guard LayerCoverageRules.repairKeptRequestedElements(requested: asked, returned: got) else {
+                        navLog("  \(src.lastPathComponent): repair \(repairs) covered more "
+                               + "but lost requested elements — keeping the first result")
                         break
                     }
                     chosen = candidate

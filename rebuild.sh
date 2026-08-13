@@ -3,6 +3,7 @@
 set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 APP="/Applications/Navigator.app"
+"$DIR/check-shared-jsx.sh"
 echo "Compiling (universal: arm64 + x86_64)..."
 SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" "$DIR/NavigatorCore.swift" \
   -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers -framework NetFS -framework Security -framework FinderSync)
@@ -62,8 +63,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.15.01</string>
-<key>CFBundleVersion</key><string>151</string>
+<key>CFBundleShortVersionString</key><string>2.15.02</string>
+<key>CFBundleVersion</key><string>152</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>

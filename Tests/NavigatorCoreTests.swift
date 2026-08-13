@@ -1406,13 +1406,30 @@ final class LayerizeRulesTests: XCTestCase {
         XCTAssertEqual(LayerizeRules.check(width: 0, height: 0, bytes: 0), .reject(reason: "not a readable image"))
     }
 
-    /// MEASURED: a 52.7%-transparent cutout produced a flat invented teal base; Key Art
-    /// (opaque) produced a properly inpainted one worth keeping.
+    /// Measured BORDER transparency from six real assets. The overall fraction, which this used to
+    /// test, could not separate them: the dragon cutout was 15.7% transparent and an opaque framed
+    /// symbol 15.4%, so the cutout slipped under a 20% bar, kept fal's invented base, and put grey
+    /// and white blocks behind the art. Around the edge the two populations do not overlap at all.
     func testBaseKeptOnlyWhenTheInputHasARealBackground() {
-        XCTAssertTrue(LayerizeRules.shouldKeepBase(transparentFraction: 0.0))
-        XCTAssertTrue(LayerizeRules.shouldKeepBase(transparentFraction: 0.05))
-        XCTAssertFalse(LayerizeRules.shouldKeepBase(transparentFraction: 0.527))
-        XCTAssertFalse(LayerizeRules.shouldKeepBase(transparentFraction: 0.95))
+        // Real scenes — every edge pixel opaque, and no transparency anywhere.
+        XCTAssertTrue(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.0,
+                                                   overallTransparentFraction: 0.0))   // bluebird
+        XCTAssertTrue(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.0,
+                                                   overallTransparentFraction: 0.0))   // mockup
+        // Cutouts — the edge is almost entirely empty.
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.967,
+                                                    overallTransparentFraction: 0.157)) // dragon rmbg
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.969,
+                                                    overallTransparentFraction: 0.229)) // frame art
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.960,
+                                                    overallTransparentFraction: 0.548)) // character
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.988,
+                                                    overallTransparentFraction: 0.154)) // framed symbol
+        // THE BLIND SPOT the second signal exists for: art running to the edge on most sides, so the
+        // border looks opaque, while a third of the image is transparent. Border alone would keep
+        // fal's invented plate here and put grey back behind the art.
+        XCTAssertFalse(LayerizeRules.shouldKeepBase(borderTransparentFraction: 0.40,
+                                                    overallTransparentFraction: 0.30))
     }
 
     /// THE NAMING BUG: an ASCII-only sanitiser mapped every Chinese name to "" and collapsed
@@ -5064,12 +5081,161 @@ final class LayerAssemblyRulesTests: XCTestCase {
         XCTAssertNil(LayerCoverageRules.repairPrompt(gap: [0, 0, 50, 50], canvasW: 0, canvasH: 100))
     }
 
+    /// Coverage is not the whole test. A repair can cover more of the picture while having
+    /// separated different things — adopting that silently throws away the request and reports it
+    /// in the log as an improvement.
+    func testRepairMustKeepWhatWasAskedFor() {
+        let asked = ["gold border frame", "leaping bass", "water splash"]
+        // fal renames freely, so matching is by distinctive word, not equality.
+        XCTAssertTrue(LayerCoverageRules.repairKeptRequestedElements(
+            requested: asked,
+            returned: ["Golden border frame", "Jumping largemouth bass", "Water splash and bubbles"]))
+        // Two of three kept is still the same job.
+        XCTAssertTrue(LayerCoverageRules.repairKeptRequestedElements(
+            requested: asked, returned: ["Gold frame", "Leaping bass fish"]))
+        // One of three is a different result, not a better one.
+        XCTAssertFalse(LayerCoverageRules.repairKeptRequestedElements(
+            requested: asked, returned: ["Frame", "Upper region", "Lower region"]))
+        XCTAssertFalse(LayerCoverageRules.repairKeptRequestedElements(
+            requested: asked, returned: ["Whole symbol"]))
+        // Nothing specific was asked for, so nothing can be lost.
+        XCTAssertTrue(LayerCoverageRules.repairKeptRequestedElements(requested: [], returned: ["x"]))
+        XCTAssertTrue(LayerCoverageRules.repairKeptRequestedElements(
+            requested: ["background"], returned: ["anything"]))
+    }
+
     /// A repair is a fresh roll of the dice and can come back WORSE — measured 1.144% then 7.253%
     /// from the same prompt. Equal is not better; keep what's already on disk.
     func testRepairIsOnlyAdoptedWhenStrictlyBetter() {
         XCTAssertTrue(LayerCoverageRules.repairIsBetter(original: 0.01144, repaired: 0.00475))
         XCTAssertFalse(LayerCoverageRules.repairIsBetter(original: 0.01144, repaired: 0.07253))
         XCTAssertFalse(LayerCoverageRules.repairIsBetter(original: 0.01144, repaired: 0.01144))
+    }
+
+    // MARK: - LayerizeElementRules
+
+    /// The real reply for the fish symbol, verbatim. This is the case that exposed the flaw in the
+    /// previous design: with fixed tier counts ("medium: 8-14") the model padded a three-element
+    /// image with "pectoral fin". Here the fin still appears — correctly filed under an ANIMATE job
+    /// rather than smuggled into the structural split.
+    func testParsesJobOptionsWithoutPadding() {
+        let reply = """
+            {"kind": "game slot symbol with jumping bass", "options": [
+              {"label": "Isolate framing and subject", "job": "structure",
+               "why": "Separate the gold frame, fish subject, and foreground splash from the background scene.",
+               "elements": ["Gold border frame", "Jumping bass", "Water splash and bubbles foreground"]},
+              {"label": "Animate fish mouth and fins", "job": "animate",
+               "why": "Separate jaw and fins for a jumping animation loop.",
+               "elements": ["Lower jaw", "Pectoral fin", "Ventral fin", "Tail fin", "Main fish body"]},
+              {"label": "Parallax background lily pads", "job": "parallax",
+               "why": "Separate background elements for depth scrolling.",
+               "elements": ["Upper lily pads", "Stem background layer"]}]}
+            """
+        guard let p = LayerizeElementRules.parse(reply) else { return XCTFail("did not parse") }
+        XCTAssertEqual(p.kind, "game slot symbol with jumping bass")
+        XCTAssertEqual(p.options.count, 3)
+        XCTAssertEqual(p.options[0].job, "structure")
+        XCTAssertEqual(p.options[0].elements.count, 3)
+        // The fin belongs to the animation job, not to the structural split.
+        XCTAssertTrue(p.options[1].elements.contains("Pectoral fin"))
+        XCTAssertFalse(p.options[0].elements.contains(where: { $0.localizedCaseInsensitiveContains("fin") }))
+        XCTAssertEqual(p.options[0].menuTitle, "Isolate framing and subject  (4 layers)")
+    }
+
+    /// The base is a layer. Counting only elements made a two-element split read as "2 layers" and
+    /// look like it had lost the background, when the background WAS the third layer.
+    func testMenuTitleCountsTheBaseLayer() {
+        let o = LayerizeElementRules.Option(label: "Separate Frame and Fish", job: "structure",
+                                            elements: ["golden border frame", "leaping bass fish"])
+        XCTAssertEqual(o.layerCount, 3)
+        XCTAssertEqual(o.menuTitle, "Separate Frame and Fish  (3 layers)")
+    }
+
+    /// Appending a second proposal has to read back the list it wrote, or "＋" would double the
+    /// preamble and lose everything already there.
+    func testElementsRoundTripThroughTheInstruction() {
+        let first = LayerizeElementRules.instruction(for: ["golden border frame", "jumping bass"]).text
+        XCTAssertEqual(LayerizeElementRules.elements(inInstruction: first),
+                       ["golden border frame", "jumping bass"])
+        // Freehand text is kept whole rather than thrown away.
+        XCTAssertEqual(LayerizeElementRules.elements(inInstruction: "just the hat"), ["just the hat"])
+        XCTAssertEqual(LayerizeElementRules.elements(inInstruction: "  "), [])
+        // And a round trip of an appended list stays stable.
+        let merged = LayerizeElementRules.instruction(for: ["a", "b", "c"]).text
+        XCTAssertEqual(LayerizeElementRules.elements(inInstruction: merged), ["a", "b", "c"])
+    }
+
+    /// A single-element answer is legitimate — a frame is "the frame, and everything else stays in
+    /// the base". The old design could not express that without inventing four more elements.
+    func testOneElementPlanIsValid() {
+        let reply = """
+            {"kind": "wooden framed underwater window", "options": [
+              {"label": "Separate Frame and Water View", "job": "structure",
+               "why": "Isolates the wooden outer frame from the inner content.",
+               "elements": ["wooden frame"]}]}
+            """
+        guard let p = LayerizeElementRules.parse(reply) else { return XCTFail("did not parse") }
+        XCTAssertEqual(p.options.count, 1)
+        XCTAssertEqual(p.options[0].elements, ["wooden frame"])
+        // One named element still yields two layers: the frame, and everything else beneath it.
+        XCTAssertEqual(p.options[0].menuTitle, "Separate Frame and Water View  (2 layers)")
+    }
+
+    /// The real 502 seen in the dialog, verbatim. A gateway hiccup is worth retrying, and its raw
+    /// body — which contains a whole HTML error page — must never reach the one line of status.
+    func testTransientServiceErrorsAreRetriedAndReadable() {
+        let real = "AI service HTTP 502: {\"error\":\"Vertex 502: <!DOCTYPE html><html><head><title>502</title>"
+        XCTAssertTrue(LayerizeElementRules.isTransient(real))
+        let friendly = LayerizeElementRules.friendlyError(real)
+        XCTAssertFalse(friendly.contains("DOCTYPE"), friendly)
+        XCTAssertFalse(friendly.contains("<html"), friendly)
+        XCTAssertTrue(friendly.contains("busy"), friendly)
+
+        XCTAssertTrue(LayerizeElementRules.isTransient("The request timed out."))
+        XCTAssertTrue(LayerizeElementRules.isTransient("AI service HTTP 503: unavailable"))
+        // A real refusal must NOT be retried — retrying it just wastes the wait three times.
+        XCTAssertFalse(LayerizeElementRules.isTransient("Not signed in to Vertex."))
+        XCTAssertFalse(LayerizeElementRules.isTransient("AI service HTTP 401: bad token"))
+        // And an unrecognised message keeps its text, merely capped.
+        let long = String(repeating: "x", count: 400)
+        XCTAssertLessThanOrEqual(LayerizeElementRules.friendlyError(long).count, 141)
+    }
+
+    /// Garbage, and options that separate nothing, must not reach the UI as empty menu entries.
+    func testParseRejectsEmptyOrOptionlessPlans() {
+        XCTAssertNil(LayerizeElementRules.parse("I can't see an image."))
+        XCTAssertNil(LayerizeElementRules.parse("{\"kind\":\"x\",\"options\":[]}"))
+        XCTAssertNil(LayerizeElementRules.parse("{\"kind\":\"x\",\"options\":[{\"label\":\"a\",\"elements\":[]}]}"))
+        // A fence or preamble must still parse.
+        let fenced = "Sure!\n```json\n{\"kind\":\"k\",\"options\":[{\"label\":\"L\",\"job\":\"structure\",\"elements\":[\"a\"]}]}\n```"
+        XCTAssertEqual(LayerizeElementRules.parse(fenced)?.options.first?.elements, ["a"])
+    }
+
+    /// fal returns at most 16 layers plus the base. A longer list isn't rejected — the tail is just
+    /// never returned — so it must be trimmed knowingly and the cut reported.
+    func testInstructionRespectsFalsSixteenLayerCeiling() {
+        let twenty = (1...20).map { "part \($0)" }
+        let r = LayerizeElementRules.instruction(for: twenty)
+        XCTAssertEqual(r.dropped, ["part 17", "part 18", "part 19", "part 20"])
+        XCTAssertTrue(r.text.contains("part 16"))
+        XCTAssertFalse(r.text.contains("part 17"))
+    }
+
+    /// "background" is the base image, which comes back regardless and which Navigator discards for a
+    /// transparent input — asking for it would waste one of only sixteen slots.
+    func testInstructionDropsBackgroundAndEmptyNames() {
+        let r = LayerizeElementRules.instruction(for: ["background", " ", "left gun", "Background", "hat"])
+        XCTAssertEqual(r.text, "Separate these elements out from the image as individual layers: left gun, hat")
+        XCTAssertTrue(r.dropped.isEmpty)
+        XCTAssertEqual(LayerizeElementRules.instruction(for: ["background"]).text, "")
+    }
+
+    /// The composed prompt still carries the English-names line in front of the element list.
+    func testAnalyzedElementsComposeIntoAFullPrompt() {
+        let inst = LayerizeElementRules.instruction(for: ["left gun", "right gun"]).text
+        let full = LayerizeRules.composePrompt(inst)
+        XCTAssertTrue(full.hasPrefix(LayerizeRules.basePrompt))
+        XCTAssertTrue(full.contains("left gun, right gun"))
     }
 
     /// The English-names line is what every layer filename depends on, so it must survive whatever

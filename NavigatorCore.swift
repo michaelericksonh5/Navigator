@@ -1173,7 +1173,31 @@ enum LayerizeRules {
     /// blank white, none of the artwork in it. Discarding it is right, and it is NOT where a missing
     /// element hides. For a mostly-OPAQUE input the base is instead a real inpainted background
     /// (SF4_Blue's came back as the full underwater scene), which is why it is kept there.
-    static func shouldKeepBase(transparentFraction: Double) -> Bool { transparentFraction < 0.20 }
+    /// Keep fal's base image, or throw it away?
+    ///
+    /// The base is worth keeping only when fal had a real background to inpaint. For a CUTOUT it has
+    /// nothing to work from and invents a backdrop, which arrives as grey and white blocks behind
+    /// the art — that is what a user saw on a dragon symbol saved with its background removed.
+    ///
+    /// The test is the OUTER EDGE, not the overall transparent fraction. Overall cannot separate the
+    /// cases: that dragon measured 15.7% transparent and an opaque framed symbol 15.4%, so the cutout
+    /// slipped under a 20% bar and its invented base was kept. Measured around the border instead,
+    /// cutouts sit at 96-99% and real scenes at 0%, so the bar can go anywhere in that gap.
+    /// Two signals, because either one alone has a blind spot.
+    ///
+    /// The border catches the ordinary cutout. But art that runs to the edge on some sides — a
+    /// character cropped at the bottom, a full-bleed panel with a transparent corner — can show an
+    /// opaque border while still being a cutout, and would keep an invented base. Overall
+    /// transparency catches that: measured, real scenes are at 0.0% and every cutout at 15% or more,
+    /// so anything with meaningful transparency anywhere is treated as a cutout.
+    ///
+    /// Verified against six real assets — border / overall:
+    ///     bluebird 0.0/0.0   mockup 0.0/0.0                      -> keep
+    ///     dragon 96.7/15.7   frame 96.9/22.9   character 96.0/54.8   framed symbol 98.8/15.4 -> discard
+    static func shouldKeepBase(borderTransparentFraction: Double,
+                               overallTransparentFraction: Double) -> Bool {
+        borderTransparentFraction < 0.50 && overallTransparentFraction < 0.02
+    }
 
     /// The line that must be in EVERY layerize prompt.
     ///
@@ -4219,6 +4243,210 @@ enum LayerAssemblyRules {
     }
 }
 
+/// Naming the elements for Layerize, with a vision model's help.
+///
+/// fal's `prompt` decides WHAT comes back, but writing a good one means looking at the image and
+/// listing its parts — which is exactly what the restyle path already asks Gemini to do. Measured on
+/// a character: an empty prompt returned 4 blobs, the same image with a 16-element list returned 16
+/// named parts at 0.64% uncovered, and the analysis cost $0.0007 — a rounding error next to the
+/// 2-3 cents of the layerize call itself.
+enum LayerizeElementRules {
+    /// fal returns "the base image followed by up to 16 separated layers", so 16 is a hard ceiling.
+    /// A longer list is not an error — the tail is simply never returned — so it is trimmed here and
+    /// the caller is told what was dropped rather than left wondering where the hat went.
+    static let maxElements = 16
+
+    /// Asks for three granularities in one call, because the useful level depends on the image and
+    /// on the job: a slot UI is already well served by the model's own "major elements", while a
+    /// character for animation needs left and right split apart.
+    ///
+    /// The FIRST version of this prompt just asked for elements "ordered back to front (background
+    /// first)" and produced lists that were half scenery — a slot mockup came back as "sky and sun,
+    /// mountains and forests, lake and shore, boat hull and floor" plus the UI, spending four of ten
+    /// slots on a background that layerize returns intact anyway. The prompt now states the budget
+    /// and the fact that silence keeps something merged, which is the whole trick: naming nothing is
+    /// how you keep the background whole. Measured on the same image, medium went from 10 elements
+    /// (4 wasted) to 8 with none wasted, and `fine` fell from 25 to 15 — under the ceiling without
+    /// truncating anything.
+    /// Ask for JOBS, not sizes.
+    ///
+    /// Two earlier versions of this failed in instructive ways. The first ordered elements "back to
+    /// front (background first)" and spent four of ten slots on sky, mountains, lake and boat hull —
+    /// scenery that layerize hands back in the base for free. The second fixed that but kept fixed
+    /// COUNTS ("coarse 3-6, medium 8-14, fine up to 16"), so an image with three genuinely useful
+    /// pieces got padded to reach the number: a fish symbol came back with "pectoral fin" at the
+    /// medium tier, which nobody wanted. The counts were the bug — a granularity slider is the wrong
+    /// abstraction because usefulness is not a quantity, it is a purpose.
+    ///
+    /// So the model now proposes named JOBS suited to what it actually sees. The same fish symbol
+    /// offers "structure" (frame / bass / splash — matching how these symbols are split by hand) and
+    /// separately "animate" (jaw, fins, body). The pectoral fin is not junk, it was simply filed
+    /// under the wrong job. A plain frame offers one element and says so instead of inventing five.
+    static let systemPrompt = """
+        You plan how to split a flat 2D image into layers for a game-art pipeline.
+
+        HOW THE TOOL WORKS, and why it constrains you:
+        - It returns a BASE image plus AT MOST 16 named elements.
+        - Anything you do NOT name stays merged in the base, and the base is kept as the bottom
+          layer. So the leftover background is ALWAYS returned — you never need to name it just to
+          keep it.
+        - Name a background ONLY when it is a distinct designed plate someone would reuse or replace
+          on its own (a symbol's backdrop, a parallax band), NOT when it is ambient scenery sitting
+          behind UI.
+
+        Propose 1-4 DIFFERENT ways to split THIS image, each aimed at a real job someone would do:
+         - structure: the reusable compositional pieces (backdrop / frame / subject / UI chrome)
+         - extract:   lift the interactive or foreground items off a scene, leaving the scene whole
+         - animate:   split ONE subject into moving parts (limbs, jaw, fins, held objects)
+         - parallax:  split a background plate into depth bands
+         - inventory: one layer per repeated item in a sheet or grid
+        Only propose options that make sense for what you actually see. ONE option is a perfectly
+        good answer.
+
+        PICK ONE LEVEL PER THING inside any single option. Never list a container and its own parts
+        together — "ornate frame with corner gems" and "top left corner gem" cannot both be layers,
+        because the gems are inside the frame. The same goes for a subject: either the whole dragon
+        as one layer, or its head, jaw, claw and tail as several, never both.
+
+        RULES:
+        - NEVER pad a list to reach a number. Return only elements that genuinely earn their own
+          layer. Three good elements beat eight with filler. Do not invent sub-parts nobody asked
+          for.
+        - Order elements MOST VALUABLE FIRST; the list is truncated at 16.
+        - If a job would need more than 16 elements, still give the best 16 and set "warning".
+
+        Return STRICT JSON only, no prose, no markdown fence:
+        {
+          "kind": "<what this image is, short>",
+          "options": [
+            {"label": "<3-5 words>", "job": "structure|extract|animate|parallax|inventory",
+             "why": "<one short line>", "elements": ["..."], "warning": "<optional>"}
+          ]
+        }
+        Order options best-first for this image.
+        """
+
+    struct Option: Equatable {
+        var label: String = ""
+        var job: String = ""
+        var why: String = ""
+        var elements: [String] = []
+        var warning: String = ""
+
+        /// What the popup shows.
+        ///
+        /// Counts the BASE. Naming N elements yields N+1 layers, because everything unnamed comes
+        /// back merged as the bottom layer — verified in a real run, where a manifest for two named
+        /// elements contained z0 (no bounding box) plus the two. Reporting "2 layers" for that made
+        /// it look like the background had been missed, when the background was layer one.
+        var layerCount: Int { elements.count + 1 }
+        var menuTitle: String {
+            "\(label.isEmpty ? job : label)  (\(layerCount) layers)"
+        }
+    }
+
+    struct Plan: Equatable {
+        var kind: String = ""
+        var options: [Option] = []
+    }
+
+    /// A gateway hiccup, not a real refusal — worth retrying rather than reporting.
+    ///
+    /// Observed in the wild: the vision endpoint answered `AI service HTTP 502: {"error":"Vertex
+    /// 502: <!DOCTYPE html>…` mid-session and the dialog gave up on the first try, having spent the
+    /// wait and produced nothing.
+    static func isTransient(_ error: String) -> Bool {
+        let e = error.lowercased()
+        for code in ["http 502", "http 503", "http 504", "http 429"] where e.contains(code) { return true }
+        for phrase in ["timed out", "timeout", "connection was lost", "network connection",
+                       "bad gateway", "temporarily unavailable"] where e.contains(phrase) { return true }
+        return false
+    }
+
+    /// Something a person can read. The service wraps upstream failures in JSON that contains a whole
+    /// HTML error page, which floods the one line of status the dialog has.
+    static func friendlyError(_ error: String) -> String {
+        if isTransient(error) {
+            return "the AI service is busy — try Analyze again in a moment"
+        }
+        // Cut at the first sign of markup, then cap: nobody needs a stack of HTML in a status line.
+        var s = error
+        if let r = s.range(of: "<!DOCTYPE") ?? s.range(of: "<html") {
+            s = String(s[s.startIndex..<r.lowerBound])
+        }
+        s = s.trimmingCharacters(in: CharacterSet(charactersIn: " {}\"\\:,"))
+        return s.count > 140 ? String(s.prefix(140)) + "…" : s
+    }
+
+    /// Parse the model's reply. Tolerates a ```json fence and surrounding prose, because "STRICT
+    /// JSON only" is an instruction, not a guarantee.
+    static func parse(_ reply: String) -> Plan? {
+        guard let start = reply.firstIndex(of: "{"), let end = reply.lastIndex(of: "}"),
+              start < end else { return nil }
+        let json = String(reply[start...end])
+        guard let d = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
+        func str(_ o: [String: Any], _ k: String) -> String {
+            (o[k] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        }
+        let options: [Option] = (obj["options"] as? [[String: Any]] ?? []).compactMap { o in
+            let els = (o["elements"] as? [Any] ?? []).compactMap { $0 as? String }
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            guard !els.isEmpty else { return nil }      // an option that separates nothing is noise
+            return Option(label: str(o, "label"), job: str(o, "job"), why: str(o, "why"),
+                          elements: els, warning: str(o, "warning"))
+        }
+        guard !options.isEmpty else { return nil }
+        return Plan(kind: str(obj, "kind"), options: options)
+    }
+
+    // There is deliberately NO automatic "do everything at once" option here.
+    //
+    // Merging the proposals in code produced incoherent requests: a dragon symbol came back asking
+    // for "Outer gold square frame with corner green gems" AND "Top left corner green gem" as
+    // separate layers, plus "Golden dragon head and body" alongside "Lower jaw" and "Body and tail
+    // coil". A container and its own parts cannot both be layers, and code cannot tell that gems sit
+    // inside a frame — only the model knows that, and substring matching catches just the trivial
+    // cases ("bass fish" inside "bass fish body").
+    //
+    // Asking the MODEL to return a combined option did not work either. It was tried twice, the
+    // second time as a required schema field with an explicit container-versus-parts rule, and both
+    // times it returned the jobs as alternatives anyway — for a symbol whose two jobs need eight of
+    // sixteen slots.
+    //
+    // So combining is left to the person, who can see the list and edit it. The dialog appends one
+    // proposal's elements to another on request, and they resolve the overlap by deleting a line.
+
+    /// Recover the element names from an instruction this class produced, so a second proposal can
+    /// be appended to a first. Anything the person typed freehand that isn't in that shape is
+    /// treated as one item, which keeps their words rather than discarding them.
+    static func elements(inInstruction text: String) -> [String] {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return [] }
+        let marker = "individual layers:"
+        let body = t.range(of: marker).map { String(t[$0.upperBound...]) } ?? t
+        return body.components(separatedBy: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Turn a list of element names into the instruction sent as `prompt`.
+    ///
+    /// "background" is dropped: it is the base image, which layerize returns anyway and which
+    /// Navigator discards for a transparent input. Asking for it wastes one of the 16 slots.
+    static func instruction(for names: [String]) -> (text: String, dropped: [String]) {
+        let usable = names
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && $0.lowercased() != "background" }
+        let kept = Array(usable.prefix(maxElements))
+        let dropped = Array(usable.dropFirst(maxElements))
+        guard !kept.isEmpty else { return ("", dropped) }
+        return ("Separate these elements out from the image as individual layers: "
+                + kept.joined(separator: ", "), dropped)
+    }
+}
+
 /// Completeness checking for a layerize result.
 ///
 /// fal's API reference states there is no guarantee of coverage, and measurement bears that out: two
@@ -4286,6 +4514,40 @@ enum LayerCoverageRules {
     /// same prompt measured 1.144% then 7.253%, so this is not hypothetical.
     static func repairIsBetter(original: Double, repaired: Double) -> Bool {
         repaired < original
+    }
+
+    /// Did the repair keep what was actually asked for?
+    ///
+    /// Coverage alone is the wrong test. A repair is a whole fresh decomposition, so it can cover
+    /// more of the picture while having separated DIFFERENT things — ask for "gold frame, leaping
+    /// bass, water splash", get back a tighter-covering set that merged the fish into the background
+    /// and split the frame in four. Adopting that on coverage would silently throw away the request
+    /// and look like an improvement in the log.
+    ///
+    /// Matching is deliberately loose: fal renames freely ("leaping bass" comes back as "Jumping
+    /// largemouth bass"), so a requested name counts as kept when any returned name shares a
+    /// distinctive word with it. Short words are ignored because "the", "and", "left" match anything.
+    static func repairKeptRequestedElements(requested: [String], returned: [String]) -> Bool {
+        let wanted = requested
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && $0.lowercased() != "background" }
+        guard !wanted.isEmpty else { return true }      // nothing specific was asked for
+
+        func keywords(_ s: String) -> Set<String> {
+            Set(s.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { $0.count >= 4 })
+        }
+        let returnedWords = returned.reduce(into: Set<String>()) { $0.formUnion(keywords($1)) }
+        var kept = 0
+        for w in wanted {
+            let k = keywords(w)
+            // A request with no distinctive word can't be checked; don't punish the repair for it.
+            if k.isEmpty || !k.isDisjoint(with: returnedWords) { kept += 1 }
+        }
+        // Losing more than a third of what was asked for is a different result, not a better one.
+        // Integer arithmetic on purpose: two-of-three is 0.6666… and would fail a `>= 0.67` test.
+        return kept * 3 >= wanted.count * 2
     }
 
     /// One line for the log, so a run's completeness is on the record rather than inferred later.
