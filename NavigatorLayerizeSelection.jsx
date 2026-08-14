@@ -1291,15 +1291,74 @@ function base64DataURI(f) {
     return (s === null) ? null : "data:image/png;base64," + s;
 }
 
-/// Ask fal to decompose the image. Returns the parsed `layers` array.
-function requestLayerize(imageRef, key, promptText) {
+/// fal's own verdict, from the `msg` field only.
+///
+/// Classifying on the whole body is a trap Navigator already fell into: fal echoes the request back
+/// inside `"input"`, so `enable_safety_checker` puts the word "safety" in EVERY error, which made a
+/// retry check treat every refusal as a safety rejection and skip retrying entirely.
+function falMessage(body) {
+    var m = /"msg"\s*:\s*"(([^"\\]|\\.)*)"/.exec(String(body));
+    if (m) { return m[0]; }
+    var at = String(body).search(/"input"\s*:/);
+    return at > 0 ? String(body).substring(0, at) : String(body);
+}
+
+/// Whether a refusal is one a second identical call could get past.
+///
+/// Measured by Navigator: five images byte-for-byte comparable at the same size and tier, three
+/// decomposed fine and two were refused, and one of those was accepted on a byte-identical retry.
+/// So "could not be processed for layer decomposition" is the model declining THIS PICTURE, and it
+/// is sometimes transient. A size complaint or a safety verdict never is.
+function worthRetryingLayerize(body) {
+    var b = falMessage(body).toLowerCase();
+    if (b.indexOf("safety") >= 0 || b.indexOf("nsfw") >= 0 || b.indexOf("flagged") >= 0) { return false; }
+    if (b.indexOf("image_size") >= 0 || b.indexOf("too small") >= 0 ||
+        b.indexOf("too large") >= 0) { return false; }
+    return b.indexOf("could not be processed for layer decomposition") >= 0;
+}
+
+/// The tier ladder: `auto` (the documented default), `auto` again for a transient refusal, then ONE
+/// explicit tier as a last resort. Empirical, from Navigator: a 632x791 image refused at auto_1K was
+/// accepted at auto_1.5K, so a stubborn image wants MORE output resolution, not less.
+function sizeLadder(w, h) {
+    return ["auto", "auto", (w * h >= 1536 * 1536) ? "auto_2K" : "auto_1.5K"];
+}
+
+/// Ask fal to decompose the image, retrying a refusal that retrying can fix.
+/// Returns { layers, seconds, attempts, tier }.
+function requestLayerize(imageRef, key, promptText, w, h) {
+    var ladder = sizeLadder(w || 0, h || 0);
+    var seconds = 0, attempts = 0, lastError = null;
+    for (var rung = 0; rung < ladder.length; rung++) {
+        attempts++;
+        var t0 = new Date().getTime();
+        var r = layerizeOnce(imageRef, key, promptText, ladder[rung]);
+        seconds += (new Date().getTime() - t0) / 1000;
+        if (r.layers !== null) {
+            log("layerize ok on attempt " + attempts + " at " + ladder[rung] +
+                " after " + Math.round(seconds) + "s");
+            return { layers: r.layers, seconds: seconds, attempts: attempts, tier: ladder[rung] };
+        }
+        lastError = r.error;
+        if (r.fatal || !worthRetryingLayerize(r.body)) { break; }
+        log("layerize refused on attempt " + attempts + " at " + ladder[rung] +
+            ", retrying: " + String(lastError).substring(0, 160));
+        progress("fal declined that one \u2014 trying again (attempt " + (attempts + 1) + " of " +
+                 ladder.length + ")\u2026");
+    }
+    throw new Error(lastError === null ? "fal returned no layers" : lastError);
+}
+
+/// One call. Returns { layers, error, body, fatal } - never throws for a server refusal, so the
+/// ladder above can decide whether another attempt is worth the money.
+function layerizeOnce(imageRef, key, promptText, tier) {
     var payload = tempFile("layerize_payload", "json");
     payload.encoding = "UTF-8";
     payload.open("w");
     // Names come back in Chinese unless the prompt asks otherwise, and the layer names depend on it.
     payload.write(JSON.stringify({
         image_url: imageRef,
-        image_size: "auto",
+        image_size: tier,
         prompt: promptText,
         enhance_prompt_mode: "standard"
     }));
@@ -1314,16 +1373,19 @@ function requestLayerize(imageRef, key, promptText) {
     var resp = curl('-s -S -X POST -H "Authorization: Key ' + key + '" ' +
                     '-H "Content-Type: application/json" -H "Accept: application/json" ' +
                     '"' + LAYERIZE_ENDPOINT + '" -d @"' + payload.fsName + '"');
-    if (!resp) { throw new Error("no response from fal (is curl available?)"); }
+    if (!resp) {
+        return { layers: null, error: "no response from fal (is curl available?)", body: "", fatal: true };
+    }
     // The whole reply, verbatim. It is metadata and URLs, a few KB, and it is the ONLY record of
     // what fal decided - including whether it handed back a full-canvas backdrop as an element.
-    log("--- raw response from fal ---");
+    log("--- raw response from fal (" + tier + ") ---");
     log(String(resp));
     log("--- end of response ---");
     log("");
     var j;
     try { j = JSON.parse(resp); } catch (e) {
-        throw new Error("fal returned something that isn't JSON: " + resp.substring(0, 200));
+        return { layers: null, body: String(resp), fatal: true,
+                 error: "fal returned something that isn't JSON: " + resp.substring(0, 200) };
     }
     if (j.detail) {
         // fal reports refusals under `detail`, sometimes as an array of field errors.
@@ -1332,13 +1394,38 @@ function requestLayerize(imageRef, key, promptText) {
         // A rejected key must not be kept, or every future run fails the same way with no way out.
         if (/unauthor|forbidden|invalid.*key|authentication/i.test(msg)) {
             forgetStoredKey();
-            throw new Error(msg + "\n\nThat key was rejected, so it has been forgotten. " +
-                            "Run the script again to enter a different one.");
+            return { layers: null, body: String(resp), fatal: true,
+                     error: msg + "\n\nThat key was rejected, so it has been forgotten. " +
+                            "Run the script again to enter a different one." };
         }
-        throw new Error(msg);
+        return { layers: null, body: String(resp), fatal: false, error: explainRefusal(msg) };
     }
-    if (!j.layers || !j.layers.length) { throw new Error("fal returned no layers"); }
-    return j.layers;
+    if (!j.layers || !j.layers.length) {
+        return { layers: null, body: String(resp), fatal: false, error: "fal returned no layers" };
+    }
+    return { layers: j.layers, error: null, body: String(resp), fatal: false };
+}
+
+/// Turn fal's refusal into something that points at the real fix.
+///
+/// The distinction that matters, and that Navigator learned from a real batch: the model declining a
+/// particular picture is NOT a parameter fault. Five images identical in size and tier, three
+/// decomposed and two were refused - so telling someone to change the size sends them looking in
+/// exactly the wrong place.
+function explainRefusal(msg) {
+    var m = String(msg);
+    if (/could not be processed for layer decomposition/i.test(m)) {
+        return m + "\n\nThat is the model declining this particular picture, not a problem with " +
+               "its size or format \u2014 images identical in size succeed alongside it. It was " +
+               "retried automatically. If it keeps failing, this is a picture the model will not split.";
+    }
+    if (/image_size|resolution|too small|too large/i.test(m)) {
+        return m + "\n\nThat is about the size sent. Try selecting a larger or smaller area.";
+    }
+    if (/safety|nsfw|flagged/i.test(m)) {
+        return m + "\n\nfal's safety checker refused this image; retrying will not change it.";
+    }
+    return m;
 }
 
 function downloadTo(url, f) {
@@ -1519,7 +1606,8 @@ function run() {
         }
 
         progress("Layerizing \u2014 this takes 2-3 minutes and Photoshop will be unresponsive\u2026");
-        var layers = requestLayerize(imageRef, key, promptText);
+        var got = requestLayerize(imageRef, key, promptText, selW, selH);
+        var layers = got.layers;
 
         // The base (z_index 0, no bounding box) defines the coordinate space every box is measured
         // in. It is downloaded to read its size but NOT inserted: your own artwork is already in the
@@ -1583,11 +1671,28 @@ function run() {
         // group sits above the document, a whole-area layer like that hides the artwork underneath \u2014
         // which looks exactly like the script having painted over everything. Named in the summary
         // rather than dropped: a symbol's own backdrop disc is also whole-area and is wanted.
+        //
+        // Only layers NOBODY ASKED FOR are mentioned. The first version flagged everything
+        // whole-area, and a live run on a slot symbol duly accused "outer square frame" and "inner
+        // circular frame" of being fal's invention - both named in the request, and both legitimately
+        // spanning the whole image, because that is what a frame does. Accusing someone's own
+        // requested layer of being junk is worse than saying nothing at all.
+        var requestedNames = elementsInInstruction(promptText);
+        function wasAskedFor(nm) {
+            var want = String(nm).toLowerCase().replace(/^\s+|\s+$/g, "");
+            if (!want.length) { return false; }
+            for (var q = 0; q < requestedNames.length; q++) {
+                var r = String(requestedNames[q]).toLowerCase();
+                if (r === want || r.indexOf(want) >= 0 || want.indexOf(r) >= 0) { return true; }
+            }
+            return false;
+        }
         var placed = 0, failed = [], fullCanvasElements = [];
         for (var m = 0; m < elements.length; m++) {
             var e = elements[m];
             var bx = e.bounding_box.absolute;
-            if ((bx[2] - bx[0]) >= canvasW * 0.98 && (bx[3] - bx[1]) >= canvasH * 0.98) {
+            if ((bx[2] - bx[0]) >= canvasW * 0.98 && (bx[3] - bx[1]) >= canvasH * 0.98 &&
+                !wasAskedFor(e.name || "")) {
                 fullCanvasElements.push(e.name || ("layer " + (m + 1)));
             }
             progress("Placing layer " + (m + 1) + " of " + elements.length +
@@ -1628,6 +1733,11 @@ function run() {
         var msg = "Added " + placed + " layer" + (placed === 1 ? "" : "s") + " in the \u201cLayerized\u201d group.";
         if (failed.length) { msg += "\n\n" + failed.length + " could not be placed:\n\u2022 " + failed.join("\n\u2022 "); }
         if (placed === 0) { msg = "Nothing could be placed.\n\n\u2022 " + failed.join("\n\u2022 "); }
+        // Billed per COMPUTE second at $0.00017; wall time is all a script can see and includes
+        // queueing, so this is an upper bound and is shown as one. Same figure the right-click gives.
+        msg += "\n\n" + (got.attempts > 1 ? got.attempts + " calls, " : "") +
+               Math.round(got.seconds) + "s, up to $" +
+               (Math.round(got.seconds * 0.00017 * 1000) / 1000) + ".";
         msg += "\n\nSent " + selW + "x" + selH + ", " +
                (sentAlpha === false
                    ? "fully opaque \u2014 nothing in that area was transparent, so a visible layer was " +
@@ -1635,9 +1745,8 @@ function run() {
                    : "transparency intact.");
         if (LOG_FILE !== null) { msg += "\n\nLog: " + LOG_FILE.fsName; }
         if (fullCanvasElements.length) {
-            msg += "\n\nCovering the whole area: " + fullCanvasElements.join(", ") +
-                   ". If that hides your artwork, delete it \u2014 it is fal's own backdrop, not " +
-                   "something of yours.";
+            msg += "\n\nCovering the whole area, and not something you asked for: " +
+                   fullCanvasElements.join(", ") + ". Delete it if it hides your artwork.";
         }
         alert(msg);
     } catch (e) {
