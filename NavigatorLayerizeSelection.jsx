@@ -686,21 +686,45 @@ function startVertexSignIn() {
         return "The h5g-ai-connect skill isn't on this Mac, so there's nothing to sign in to. " +
                "Analyze is a High 5 extra; everything else works with just a fal.ai key.";
     }
+    // Run DETACHED, with the output captured to a file.
+    //
+    // The first version opened a Terminal window and made the person click Re-check afterwards,
+    // which is a rotten way to ask for a sign-in: Photoshop looks frozen while Terminal launches,
+    // and nothing updates until you remember to press a button. Backgrounding with a trailing "&"
+    // was measured returning in ~0.8s against 3.05s for the same command in the foreground, so the
+    // dialog stays alive, and the window's own activate event does the re-check when you come back
+    // from the browser. The output file is what makes a silent failure diagnosable.
+    SIGNIN_OUTPUT = null;
     try {
+        var out = new File(logFolder().fsName + "/vertex_signin_" + stamp() + ".txt");
         if (IS_WINDOWS) {
-            app.system('start "Vertex sign-in" cmd /k ""' + node + '" "' + client.fsName + '" login"');
+            app.system('start "" /b cmd /c ""' + node + '" "' + client.fsName +
+                       '" login > "' + out.fsName + '" 2>&1"');
         } else {
-            // Run it from a script file: quoting a nested osascript/Terminal command inline is how
-            // you get a command that works on one machine and not the next.
-            var sh = new File(Folder.temp.fsName + "/navigator_vertex_login.command");
-            sh.encoding = "UTF-8"; sh.lineFeed = "Unix"; sh.open("w");
-            sh.write('#!/bin/bash\n"' + node + '" "' + client.fsName + '" login\n' +
-                     'echo\necho "You can close this window and click Re-check in Photoshop."\n');
-            sh.close();
-            app.system('chmod +x "' + sh.fsName + '"');
-            app.system('open -a Terminal "' + sh.fsName + '"');
+            app.system('nohup "' + node + '" "' + client.fsName + '" login' +
+                       ' > "' + out.fsName + '" 2>&1 &');
         }
+        SIGNIN_OUTPUT = out;
     } catch (e) { return "Couldn't start the sign-in: " + e.message; }
+    return null;
+}
+
+var SIGNIN_OUTPUT = null;
+
+/// The last meaningful line the sign-in printed, so a failure is not silent.
+function signInTail() {
+    if (SIGNIN_OUTPUT === null || !SIGNIN_OUTPUT.exists) { return null; }
+    try {
+        SIGNIN_OUTPUT.encoding = "UTF-8";
+        SIGNIN_OUTPUT.open("r");
+        var t = SIGNIN_OUTPUT.read();
+        SIGNIN_OUTPUT.close();
+        var lines = String(t).split(/[\r\n]+/);
+        for (var i = lines.length - 1; i >= 0; i--) {
+            var L = lines[i].replace(/^\s+|\s+$/g, "");
+            if (L.length) { return L.length > 120 ? L.substring(0, 120) + "\u2026" : L; }
+        }
+    } catch (e) {}
     return null;
 }
 
@@ -738,12 +762,16 @@ function showConnections() {
 
         var tok = h5gToken(), url = h5gServiceURL();
         if (tok !== null && url !== null) {
+            waitingForSignIn = false;
             vxStatus.text = "Signed in. Analyze is available.";
         } else if (resolveH5GClient() === null) {
             vxStatus.text = "The h5g-ai-connect skill isn't installed, so Analyze is unavailable.\n" +
                             "Everything else works with just a fal.ai key.";
         } else if (tok === null) {
-            vxStatus.text = "Not signed in. Sign in once and it lasts about 30 days.";
+            var tail = signInTail();
+            vxStatus.text = (tail === null)
+                ? "Not signed in. Sign in once and it lasts about 30 days."
+                : "Not signed in yet. The sign-in said:\n" + tail;
         } else {
             vxStatus.text = "Signed in, but the service address couldn't be read from the\n" +
                             "installed client. Analyze is unavailable; layerizing is unaffected.";
@@ -754,14 +782,17 @@ function showConnections() {
 
     setKey.onClick = function () { if (askForKey() !== null) { refresh(); } };
     forgetKey.onClick = function () { forgetStoredKey(); refresh(); };
+    var waitingForSignIn = false;
     signIn.onClick = function () {
         var err = startVertexSignIn();
-        vxStatus.text = (err === null)
-            ? "A Terminal window is finishing the sign-in. Pick your @high5games.com\n" +
-              "account in the browser, then click Re-check."
-            : err;
+        if (err !== null) { vxStatus.text = err; return; }
+        waitingForSignIn = true;
+        vxStatus.text = "Pick your @high5games.com account in the browser.\n" +
+                        "This updates by itself when you come back to Photoshop.";
     };
     recheck.onClick = refresh;
+    // Coming back from the browser re-checks on its own; Re-check stays as a manual fallback.
+    w.onActivate = function () { if (waitingForSignIn) { refresh(); } };
 
     var foot = w.add("group");
     foot.alignment = "right";
@@ -916,9 +947,11 @@ function requestPlan(pngFile) {
     payload.write('"}]}');
     payload.close();
 
+    // 60s and two tries, not 120s and three: the worst case is time spent with Photoshop frozen
+    // and no way to cancel, and a vision call that has not answered in a minute is not going to.
     var lastError = "no response";
-    for (var attempt = 0; attempt < 3; attempt++) {
-        var resp = curl('-s -S --max-time 120 -X POST -H "Authorization: Bearer ' + token + '" ' +
+    for (var attempt = 0; attempt < 2; attempt++) {
+        var resp = curl('-s -S --max-time 60 -X POST -H "Authorization: Bearer ' + token + '" ' +
                         '-H "Content-Type: application/json" "' + base + '/v1/vision" ' +
                         '-d @"' + payload.fsName + '"');
         if (resp) {
@@ -926,13 +959,20 @@ function requestPlan(pngFile) {
             try { j = JSON.parse(resp); } catch (e) { j = null; }
             if (j && typeof j.text === "string") {
                 var plan = parsePlan(j.text);
-                if (plan !== null) { return { plan: plan, cost: (j.cost_usd || 0), error: null }; }
+                if (plan !== null) {
+                    log("analyze ok: " + plan.options.length + " option(s), cost $" + (j.cost_usd || 0));
+                    return { plan: plan, cost: (j.cost_usd || 0), error: null };
+                }
+                // Logged verbatim: this is what a refusal looks like, and on a blank or near-blank
+                // image the model answers in prose because there is genuinely nothing to plan.
+                log("analyze got a reply that was not a plan: " + String(j.text).substring(0, 400));
                 lastError = "the planner's answer wasn't in the expected shape";
                 break;      // a malformed answer is not a transport problem; retrying re-spends
             }
             lastError = (j && j.error) ? String(j.error) : String(resp).substring(0, 300);
         }
         if (!isTransientError(lastError)) { break; }
+        log("analyze attempt " + (attempt + 1) + " failed, retrying: " + lastError);
         $.sleep(1500);
     }
     return { plan: null, cost: 0, error: friendlyError(lastError) };
@@ -1042,6 +1082,19 @@ function askElements(thumbFile) {
         }
     }
     refreshAnalyze();
+
+    // The thumbnail is the same flatten that will be sent, so its alpha answers "will this go up
+    // as a cutout or as an opaque picture" BEFORE two or three minutes are spent finding out.
+    // Reported, not blocked: a scene or a photo legitimately has no transparency.
+    if (thumbFile !== null && thumbFile !== undefined) {
+        var ti = pngInfo(thumbFile);
+        if (ti !== null && ti.hasAlpha === false) {
+            status.text = "Note: this area is FULLY OPAQUE, so it will be sent as a flat picture. " +
+                          "Something visible is covering the transparency \u2014 a layer underneath, " +
+                          "or an artboard's white background.";
+        }
+    }
+
     conn.onClick = function () { showConnections(); refreshAnalyze(); };
     keep.onClick = function () { KEEP_IMAGES = (keep.value === true); };
 
@@ -1062,21 +1115,35 @@ function askElements(thumbFile) {
 
     analyze.onClick = function () {
         analyze.enabled = false;
-        status.text = "Looking at the image\u2026";
+        // Says it will freeze, because it will: the curl below blocks Photoshop's only thread and
+        // no repaint can happen until it returns. Silence here reads as a hung script.
+        status.text = "Looking at the image\u2026 Photoshop will be unresponsive for up to a minute.";
         // Photoshop is single-threaded, so the window cannot repaint while curl runs. Force the one
         // update that matters before blocking, or the button just appears to do nothing for 10s.
         status.update();
         w.update();
-        var r = requestPlan(thumbFile);
-        analyze.enabled = true;
-        if (r.plan === null) { status.text = "Analyze failed: " + r.error; return; }
-        plan = r.plan;
-        picker.removeAll();
-        for (var i = 0; i < plan.options.length; i++) { picker.add("item", optionTitle(plan.options[i])); }
-        picker.enabled = true;
-        addBtn.enabled = true;
-        picker.selection = 0;       // fires onChange, which fills the field
-        if (plan.kind.length) { status.text = plan.kind + " \u2014 " + status.text; }
+        // Everything below is wrapped, because ScriptUI SWALLOWS an exception thrown inside an
+        // onClick handler: the handler simply stops, and what is left on screen is a disabled
+        // button next to "Looking at the image..." forever, with no error anywhere. That exact
+        // dead end was reported, and a stuck button is indistinguishable from a hung network call.
+        try {
+            var r = requestPlan(thumbFile);
+            if (r.plan === null) { status.text = "Analyze failed: " + r.error; return; }
+            plan = r.plan;
+            picker.removeAll();
+            for (var i = 0; i < plan.options.length; i++) { picker.add("item", optionTitle(plan.options[i])); }
+            picker.enabled = true;
+            addBtn.enabled = true;
+            picker.selection = 0;       // fires onChange, which fills the field
+            if (plan.kind.length) { status.text = plan.kind + " \u2014 " + status.text; }
+        } catch (e) {
+            log("ANALYZE THREW: " + describe(e));
+            status.text = "Analyze failed: " + describe(e) +
+                          (LOG_FILE === null ? "" : " (see the log)");
+        } finally {
+            // Re-enabled no matter what, so a second attempt is always possible.
+            analyze.enabled = true;
+        }
     };
     picker.onChange = function () {
         if (picker.selection !== null) { showOption(picker.selection.index, false); }
