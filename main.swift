@@ -3058,9 +3058,12 @@ func resolveH5GClient() -> String? {
         "\(home)/Downloads/claude-plugins-main/plugins/h5g-ai-connect/skills/h5g-ai-connect/client.mjs",
     ]
     if let f = fixed.first(where: { FileManager.default.fileExists(atPath: $0) }) { return f }
-    let cache = "\(home)/.claude/plugins/cache"
-    if let e = FileManager.default.enumerator(atPath: cache) {
-        for case let p as String in e where p.hasSuffix("skills/h5g-ai-connect/client.mjs") { return "\(cache)/\(p)" }
+    // Walk ALL of ~/.claude/plugins, not just its cache. A plugin installed through the desktop app
+    // lands under plugins/marketplaces/…, which the cache-only walk missed entirely — that is how a
+    // coworker with the plugin properly installed was still told Vertex was not set up.
+    let root = "\(home)/.claude/plugins"
+    if let e = FileManager.default.enumerator(atPath: root) {
+        for case let p as String in e where p.hasSuffix("skills/h5g-ai-connect/client.mjs") { return "\(root)/\(p)" }
     }
     return nil
 }
@@ -3343,6 +3346,71 @@ final class LoopbackCallback {
     func stop() {
         listener?.cancel(); listener = nil
         conn?.cancel(); conn = nil
+    }
+}
+
+/// Vertex readiness for the Setup & Permissions row.
+///
+/// The row's probe is synchronous and runs on every redraw, so it cannot make a network call. The
+/// real answer is cached here and refreshed in the background. Until the first answer arrives the
+/// row says Unknown rather than guessing - the previous version reported GRANTED whenever
+/// ~/.h5g-ai-gen/token.json merely EXISTED, so an expired session showed a green light.
+enum VertexStatus {
+    private static let lock = NSLock()
+    private static var email: String?
+    private static var failure: String?
+    private static var checkedAt: Date?
+    private static var inFlight = false
+
+    /// Kick off a check if we have never done one, or the last was a while ago.
+    static func refresh(force: Bool = false) {
+        lock.lock()
+        let stale = checkedAt == nil || Date().timeIntervalSince(checkedAt!) > 300
+        guard (force || stale), !inFlight else { lock.unlock(); return }
+        inFlight = true
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).async {
+            let who = H5GService.me()
+            lock.lock()
+            email = who.email; failure = who.error; checkedAt = Date(); inFlight = false
+            lock.unlock()
+        }
+    }
+
+    static func invalidate() {
+        lock.lock(); email = nil; failure = nil; checkedAt = nil; lock.unlock()
+    }
+
+    /// Do the check NOW and wait for it. Only ever called from a background queue - Setup &
+    /// Permissions already probes off the main thread, so the row can have a real answer on its
+    /// first paint instead of sitting at "Checking with the service…" until something else
+    /// happens to trigger a redraw.
+    static func warm() {
+        guard H5GService.baseURL != nil, vertexSignedIn() else { return }
+        lock.lock()
+        let fresh = checkedAt != nil && Date().timeIntervalSince(checkedAt!) < 300
+        lock.unlock()
+        guard !fresh else { return }
+        let who = H5GService.me()
+        lock.lock()
+        email = who.email; failure = who.error; checkedAt = Date()
+        lock.unlock()
+    }
+
+    /// (state, one-line detail). Never blocks.
+    static func current() -> (state: PermissionState, detail: String) {
+        guard H5GService.baseURL != nil else {
+            return (.denied, "No service address on this Mac yet — ask Michael for it, or open a setup link he sends you.")
+        }
+        guard vertexSignedIn() else {
+            VertexStatus.invalidate()
+            return (.off, "Not signed in. The button opens a Google sign-in in your browser.")
+        }
+        refresh()
+        lock.lock(); let e = email, f = failure, at = checkedAt; lock.unlock()
+        if let e, !e.isEmpty { return (.granted, "Signed in as \(e).") }
+        if at == nil { return (.unknown, "Checking with the service…") }
+        return (.off, f ?? "Signed in, but the service didn’t confirm it.")
     }
 }
 
@@ -16117,8 +16185,11 @@ struct SetupItem: Identifiable {
                       settingsLabel: "Register & Explain",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultBrowserAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "vertex", title: "Vertex sign-in (Google, company-metered)",
-                      why: "Powers Restyle and Imagen upscaling. A browser sign-in with your @high5games.com account — no key to paste, no gcloud, no Node.js, and no Claude or plugin needed. The first time, Navigator asks for the service address once (ask Michael for it). Lasts about 30 days, then asks once more.",
-                      probe: { _ in vertexSignedIn() ? .granted : .off },
+                      why: "Powers Restyle, Imagen upscaling and Layerize's Analyze. A browser sign-in with your @high5games.com account — no key to paste, no gcloud, no Node.js, and no Claude or plugin needed. Lasts about 30 days.\n\n"
+                         + VertexStatus.current().detail
+                         + "\n\nGreen means the service confirmed the account, not merely that a session file exists.",
+                      // The real question, asked of the service and cached — see VertexStatus.
+                      probe: { _ in VertexStatus.current().state },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Sign in…",
                       // Starts the sign-in outright. It used to open a dialog telling you to go and
@@ -16383,6 +16454,9 @@ struct SetupAssistantView: View {
         checking = true
         let items = self.items
         DispatchQueue.global(qos: .userInitiated).async {
+            // Ask the AI service before the rows are probed, so the Vertex row paints its real
+            // state and account on the first pass rather than a placeholder.
+            VertexStatus.warm()
             let asked = PermissionProbe.asked
             // Full Disk Access is first in the list on purpose: every row below it reads its
             // answer, so probing it first means no row ever paints "Not yet asked" for a
@@ -16638,8 +16712,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     // A Finder Quick Action fired: navigatoraction://<action>?hex=<hex of newline-
     // joined file paths>. Decode and run the matching action on the images.
     private func handleActionURL(_ url: URL) {
-        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let hex = comps.queryItems?.first(where: { $0.name == "hex" })?.value else { return }
+        guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
+
+        // A Vertex setup link, sent by whoever already has the address:
+        //   navigatoraction://vertex-setup?url=https://…
+        // Handled before the file-list requirement below, because this link carries no files. It
+        // exists so nobody has to retype a service address from a chat message - the whole reason
+        // the previous dialog said "ask Michael for it".
+        if url.host?.lowercased() == "vertex-setup" {
+            NSApp.activate(ignoringOtherApps: true)
+            var value = comps.queryItems?.first(where: { $0.name == "url" })?.value ?? ""
+            while value.hasSuffix("/") { value = String(value.dropLast()) }
+            let a = NSAlert()
+            guard value.lowercased().hasPrefix("https://"), URL(string: value) != nil else {
+                a.alertStyle = .warning
+                a.messageText = "That setup link isn’t valid"
+                a.informativeText = "It must carry an https:// service address. Ask for a fresh link."
+                a.addButton(withTitle: "OK"); a.runModal(); return
+            }
+            a.messageText = "Set up Vertex on this Mac?"
+            a.informativeText = "This link points Navigator at:\n\n\(value)\n\n"
+                              + "Only accept it from someone you trust — it decides where your "
+                              + "Google sign-in goes. Nothing is sent anywhere yet."
+            a.addButton(withTitle: "Use This Address")
+            a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+            VertexSetup.storedServiceURL = value
+            VertexStatus.invalidate()
+            vertexSignInAction(nil)
+            return
+        }
+
+        guard let hex = comps.queryItems?.first(where: { $0.name == "hex" })?.value else { return }
         var bytes = [UInt8](); var idx = hex.startIndex
         while let next = hex.index(idx, offsetBy: 2, limitedBy: hex.endIndex), next <= hex.endIndex {
             if let b = UInt8(hex[idx..<next], radix: 16) { bytes.append(b) } else { break }
@@ -17274,6 +17378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         qaItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
         let vSignIn = aiMenu.addItem(withTitle: "Sign in to Vertex…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
+        aiMenu.addItem(withTitle: "Copy Vertex Setup Link…", action: #selector(copyVertexSetupLinkAction(_:)), keyEquivalent: "")
         vSignIn.target = self
         let vStatus = aiMenu.addItem(withTitle: "Vertex Status…", action: #selector(vertexStatusAction(_:)), keyEquivalent: "")
         vStatus.target = self
@@ -17304,6 +17409,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if a.runModal() == .alertFirstButtonReturn {
             APIKeys.fal = field.stringValue
         }
+    }
+
+    // AI → Copy Vertex Setup Link — hand a coworker one clickable link instead of an address to
+    // retype. The address is not a password, but it is not ours to publish either, so it travels by
+    // whatever channel you already use for internal things and never through this app's repository.
+    @objc func copyVertexSetupLinkAction(_ sender: Any?) {
+        guard let base = H5GService.baseURL else {
+            let a = NSAlert(); a.alertStyle = .warning
+            a.messageText = "No service address on this Mac"
+            a.informativeText = "Set Vertex up here first, then you can pass the link on."
+            a.addButton(withTitle: "OK"); a.runModal(); return
+        }
+        var comps = URLComponents()
+        comps.scheme = "navigatoraction"
+        comps.host = "vertex-setup"
+        comps.queryItems = [URLQueryItem(name: "url", value: base)]
+        guard let link = comps.url?.absoluteString else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(link, forType: .string)
+        let a = NSAlert()
+        a.messageText = "Setup link copied"
+        a.informativeText = "Send it to anyone who needs Vertex in Navigator. They click it, confirm "
+                          + "the address, and Navigator takes them straight to the Google sign-in — "
+                          + "no Node.js, no plugin, nothing to type."
+        a.addButton(withTitle: "OK"); a.runModal()
     }
 
     // AI → Sign in to Vertex — Navigator's own browser sign-in. No Terminal, no Node, no plugin:
