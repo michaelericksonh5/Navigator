@@ -2,9 +2,14 @@
 # Install the layer-assembly script into Photoshop's own Scripts folder, for every installed version.
 #
 # Photoshop populates File > Scripts from Presets/Scripts INSIDE the application bundle, which is
-# owned by root — hence sudo. Copies are also placed in the per-user
-# ~/Library/Application Support/Adobe/<version>/Presets/Scripts by Navigator's build, but whether
-# Photoshop scans that location for the Scripts menu was never confirmed, so this is the reliable one.
+# owned by root — hence sudo.
+#
+# THIS IS THE ONLY THING THAT PUTS THE SCRIPTS IN PHOTOSHOP'S MENU. Installing Navigator does not:
+# rebuild.sh copies a different set of .jsx files into Navigator.app/Contents/Resources, which
+# Navigator hands to Photoshop by path for its own right-click actions, and they never appear in the
+# menu. A previous version of this comment claimed the build also seeded a per-user
+# ~/Library/Application Support/Adobe/<version>/Presets/Scripts — it does not, and that folder does
+# not exist. So after every change to either script, run this again.
 #
 # Usage:  ./install-photoshop-script.sh
 # Then quit and reopen Photoshop — the menu is built at launch.
