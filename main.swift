@@ -10,6 +10,7 @@ import CoreServices
 import NetFS
 import FinderSync   // detect / offer to enable the Finder menu extension
 import Carbon.HIToolbox   // RegisterEventHotKey — the ONLY permission-free global hotkey
+import Network   // loopback listener for the Vertex sign-in callback
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
 import os
 
@@ -3116,11 +3117,249 @@ private func cleanH5GError(_ r: H5GResult) -> String {
     return lines.last { !$0.isEmpty } ?? "upscale failed"
 }
 
+/// Signing in to Vertex WITHOUT Claude, Node, or the h5g-ai-connect plugin.
+///
+/// The plugin was never doing anything Navigator cannot do. Its `login` is a plain loopback OAuth
+/// hand-off, documented in its own source: start a listener on 127.0.0.1, open
+/// `<service>/auth/start?redirect_uri=http://127.0.0.1:<port>/cb&state=<random>`, and the service
+/// redirects back to that callback with `?token=`. The token is written to
+/// ~/.h5g-ai-gen/token.json as { token, saved } - the SAME file and shape the plugin writes, so a
+/// machine with both keeps working either way.
+///
+/// Everything else about Vertex already needed no Node: H5GService posts to /v1/images and
+/// /v1/vision directly. Only sign-in and the status check were shelling out, which is why a
+/// coworker with no Claude install hit a wall for no real reason.
+///
+/// The service address is NOT in this repository, which is public. It is taken from the env var the
+/// plugin honours, or scraped from an installed plugin, or - for a machine with neither - typed once
+/// and remembered here.
+enum VertexSetup {
+    private static let urlKey = "h5gServiceURL"
+
+    static var storedServiceURL: String? {
+        get {
+            guard let v = Prefs.d.string(forKey: urlKey), !v.isEmpty else { return nil }
+            return v
+        }
+        set { Prefs.d.set(newValue ?? "", forKey: urlKey) }
+    }
+
+    /// True when Vertex can be reached at all — a service address is known.
+    static var isConfigured: Bool { H5GService.baseURL != nil }
+
+    /// Ask for the service address once. Not a secret, but not ours to publish either, so it is
+    /// pasted in rather than shipped.
+    @discardableResult
+    static func askForServiceURL() -> String? {
+        let a = NSAlert()
+        a.messageText = "Set up Vertex on this Mac"
+        a.informativeText = """
+            Vertex generation runs on High 5 Games' own metered service, and Navigator needs its \
+            address once. Ask Michael for the Vertex service address and paste it below.
+
+            You do NOT need Node.js, Claude, or any plugin — and no API key. After this, \
+            AI → Sign in to Vertex opens a normal Google sign-in in your browser.
+            """
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        field.placeholderString = "https://…"
+        field.stringValue = storedServiceURL ?? ""
+        a.accessoryView = field
+        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        var v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        while v.hasSuffix("/") { v = String(v.dropLast()) }
+        guard v.lowercased().hasPrefix("https://"), URL(string: v) != nil else {
+            let bad = NSAlert()
+            bad.alertStyle = .warning
+            bad.messageText = "That doesn’t look like a service address"
+            bad.informativeText = "It should start with https:// and be the address Michael gave you."
+            bad.addButton(withTitle: "OK")
+            bad.runModal()
+            return nil
+        }
+        storedServiceURL = v
+        return v
+    }
+
+    /// Run the loopback sign-in. Calls back on the main thread with the signed-in email, or an error.
+    static func signIn(completion: @escaping (String?, String?) -> Void) {
+        guard let base = H5GService.baseURL else {
+            completion(nil, "No Vertex service address is set on this Mac."); return
+        }
+        var stateBytes = [UInt8](repeating: 0, count: 8)
+        _ = SecRandomCopyBytes(kSecRandomDefault, stateBytes.count, &stateBytes)
+        let state = stateBytes.map { String(format: "%02x", $0) }.joined()
+
+        let server = LoopbackCallback()
+        guard let port = server.start(state: state) else {
+            completion(nil, "Couldn’t open a local port for the sign-in callback."); return
+        }
+        let redirect = "http://127.0.0.1:\(port)/cb"
+        var comps = URLComponents(string: base + "/auth/start")
+        comps?.queryItems = [URLQueryItem(name: "redirect_uri", value: redirect),
+                             URLQueryItem(name: "state", value: state)]
+        guard let authURL = comps?.url else {
+            server.stop()
+            completion(nil, "Couldn’t build the sign-in URL from \(base)."); return
+        }
+        navLog("vertex sign-in: listening on 127.0.0.1:\(port), opening the browser")
+        NSWorkspace.shared.open(authURL)
+
+        // Five minutes, the same budget the plugin allows for a person to finish in the browser.
+        server.await(timeout: 300) { token, err in
+            guard let token else {
+                DispatchQueue.main.async { completion(nil, err ?? "The sign-in didn’t complete.") }
+                return
+            }
+            if let writeErr = writeToken(token) {
+                DispatchQueue.main.async { completion(nil, writeErr) }
+                return
+            }
+            // Confirm with the service rather than assuming the token is good.
+            let who = H5GService.me()
+            DispatchQueue.main.async {
+                if let email = who.email { completion(email, nil) }
+                else { completion(nil, who.error ?? "Signed in, but the service didn’t confirm who you are.") }
+            }
+        }
+    }
+
+    /// Same path and shape the plugin uses, so the two interoperate on a machine that has both.
+    private static func writeToken(_ token: String) -> String? {
+        let dir = (NSHomeDirectory() as NSString).appendingPathComponent(".h5g-ai-gen")
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let f = URL(fileURLWithPath: (dir as NSString).appendingPathComponent("token.json"))
+            let fmt = ISO8601DateFormatter()
+            fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let body: [String: Any] = ["token": token, "saved": fmt.string(from: Date())]
+            try JSONSerialization.data(withJSONObject: body).write(to: f)
+            // The token is a credential: keep it readable only by this user.
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: f.path)
+            return nil
+        } catch { return "Couldn’t save the session: \(error.localizedDescription)" }
+    }
+}
+
+/// A one-shot HTTP listener on loopback, just enough to catch `GET /cb?token=…`.
+///
+/// Deliberately tiny and deliberately loopback-only: it accepts one request, answers it, and stops.
+final class LoopbackCallback {
+    private var listener: NWListener?
+    private var conn: NWConnection?
+    private var expectedState = ""
+    private var finished = false
+    private let lock = NSLock()
+    private var result: (token: String?, error: String?)?
+    private let sem = DispatchSemaphore(value: 0)
+
+    /// Starts listening on an ephemeral port. Returns the port, or nil.
+    func start(state: String) -> UInt16? {
+        expectedState = state
+        let ready = DispatchSemaphore(value: 0)
+        do {
+            let params = NWParameters.tcp
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+            let l = try NWListener(using: params)
+            l.newConnectionHandler = { [weak self] c in self?.handle(c) }
+            l.stateUpdateHandler = { st in if case .ready = st { ready.signal() } }
+            l.start(queue: .global(qos: .userInitiated))
+            listener = l
+        } catch {
+            navLog("vertex sign-in: could not listen — \(error.localizedDescription)")
+            return nil
+        }
+        guard ready.wait(timeout: .now() + 5) == .success, let p = listener?.port?.rawValue else {
+            stop(); return nil
+        }
+        return p
+    }
+
+    private func handle(_ c: NWConnection) {
+        conn = c
+        c.start(queue: .global(qos: .userInitiated))
+        c.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, _, _ in
+            guard let self else { return }
+            let head = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            // "GET /cb?token=…&state=… HTTP/1.1"
+            let firstLine = head.components(separatedBy: "\r\n").first ?? ""
+            let parts = firstLine.split(separator: " ")
+            var token: String? = nil, gotState: String? = nil
+            if parts.count >= 2, let comps = URLComponents(string: "http://127.0.0.1" + parts[1]),
+               comps.path == "/cb" {
+                token = comps.queryItems?.first(where: { $0.name == "token" })?.value
+                gotState = comps.queryItems?.first(where: { $0.name == "state" })?.value
+            }
+            // Only checked when the service sends it back, which the plugin does not rely on. A
+            // mismatch means this callback belongs to some other sign-in, so it is refused.
+            if let gotState, gotState != self.expectedState {
+                self.reply(c, "<h2>That sign-in didn’t match this request. Try again from Navigator.</h2>")
+                self.finish(nil, "The sign-in callback didn’t match this request.")
+                return
+            }
+            if let token, !token.isEmpty {
+                self.reply(c, "<h2>Signed in — you can close this tab and return to Navigator.</h2>")
+                self.finish(token, nil)
+            } else {
+                self.reply(c, "<h2>No sign-in token came back. Try again from Navigator.</h2>")
+                self.finish(nil, "No token came back from the sign-in.")
+            }
+        }
+    }
+
+    private func reply(_ c: NWConnection, _ html: String) {
+        let body = Data(("<html><body style=\"font-family:-apple-system,sans-serif;padding:3em\">"
+                         + html + "</body></html>").utf8)
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                 + "Content-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        c.send(content: Data(head.utf8) + body, completion: .contentProcessed { _ in c.cancel() })
+    }
+
+    private func finish(_ token: String?, _ error: String?) {
+        lock.lock()
+        let already = finished
+        if !already { finished = true; result = (token, error) }
+        lock.unlock()
+        guard !already else { return }
+        sem.signal()
+        stop()
+    }
+
+    /// Blocks a background queue until the callback lands or the timeout passes.
+    func await(timeout: TimeInterval, completion: @escaping (String?, String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            if self.sem.wait(timeout: .now() + timeout) != .success {
+                self.stop()
+                completion(nil, "The sign-in timed out after \(Int(timeout / 60)) minutes.")
+                return
+            }
+            self.lock.lock(); let r = self.result; self.lock.unlock()
+            completion(r?.token, r?.error)
+        }
+    }
+
+    func stop() {
+        listener?.cancel(); listener = nil
+        conn?.cancel(); conn = nil
+    }
+}
+
 func promptVertexSetup() {
-    let a = NSAlert(); a.alertStyle = .warning
-    a.messageText = "Vertex (Imagen) isn’t set up on this Mac"
-    a.informativeText = "Navigator's Vertex features need Node.js and the H5G ai-connect plugin installed. Ask Michael for the h5g-ai-connect setup, then try again."
-    a.addButton(withTitle: "OK"); a.runModal()
+    let a = NSAlert(); a.alertStyle = .informational
+    a.messageText = "Set up Vertex on this Mac"
+    a.informativeText = """
+        Vertex generation runs on High 5 Games' metered service, under your own Google account. \
+        Navigator needs the service address once — ask Michael for it.
+
+        You do NOT need Node.js, Claude, or any plugin, and there is no API key to enter.
+        """
+    a.addButton(withTitle: "Enter Service Address…")
+    a.addButton(withTitle: "Cancel")
+    guard a.runModal() == .alertFirstButtonReturn else { return }
+    // No "now go and do the next thing" alert: the caller continues straight into the sign-in.
+    _ = VertexSetup.askForServiceURL()
 }
 func promptVertexSignin() {
     let a = NSAlert(); a.alertStyle = .warning
@@ -15878,11 +16117,13 @@ struct SetupItem: Identifiable {
                       settingsLabel: "Register & Explain",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultBrowserAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "vertex", title: "Vertex sign-in (Google, company-metered)",
-                      why: "Powers Restyle. A browser sign-in with your @high5games.com account — there is no key to paste, and no gcloud to install. Lasts about 30 days, then asks once more. Use AI ▸ Sign in to Vertex…",
+                      why: "Powers Restyle and Imagen upscaling. A browser sign-in with your @high5games.com account — no key to paste, no gcloud, no Node.js, and no Claude or plugin needed. The first time, Navigator asks for the service address once (ask Michael for it). Lasts about 30 days, then asks once more.",
                       probe: { _ in vertexSignedIn() ? .granted : .off },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Sign in…",
-                      openSettings: { promptVertexSignin() }),
+                      // Starts the sign-in outright. It used to open a dialog telling you to go and
+                      // find the menu item that does this, which is a button that describes a button.
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.vertexSignInAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "falkey", title: "fal.ai API key",
                       why: "Powers Layerize and the fal upscalers (Crystal, AuraSR, Topaz). Stored in your login keychain.\n\nExpect one prompt after each Navigator update: updating re-signs the app, which invalidates the keychain's saved permission. Choose Always Allow when it asks — the key itself is fine and never needs re-entering.",
                       probe: { _ in PermissionProbe.keyStored(account: "fal.ai") },
@@ -17065,18 +17306,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
-    // AI → Sign in to Vertex — runs the H5G client's browser Google sign-in in a
-    // visible Terminal window so the user sees the flow and the result. No key is
-    // typed; the token is stored by the client at ~/.h5g-ai-gen/token.json.
+    // AI → Sign in to Vertex — Navigator's own browser sign-in. No Terminal, no Node, no plugin:
+    // it opens the service's Google sign-in and catches the callback on loopback itself. The old
+    // version shelled out to the plugin, which is why a Mac without Claude installed was told to
+    // "ask Michael" and could get no further.
     @objc func vertexSignInAction(_ sender: Any?) {
-        guard let node = resolveNode(), let client = resolveH5GClient() else { promptVertexSetup(); return }
-        func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let shell = "clear; \(q(node)) \(q(client)) login; echo; echo 'You can close this window.'"
-        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\"\nend tell"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", script]
-        try? p.run()
+        // No service address yet: explain, ask for it, and carry on only if we got one.
+        if H5GService.baseURL == nil {
+            promptVertexSetup()
+            guard H5GService.baseURL != nil else { return }
+        }
+        // A modal "go and do it in your browser" note, dismissed BY the result rather than left for
+        // the person to close. The first version left both on screen at once, which a live run of
+        // the whole flow showed and reading the code did not.
+        let note = NSAlert()
+        note.messageText = "Finish the sign-in in your browser"
+        note.informativeText = "Pick your @high5games.com account. Navigator will confirm here "
+                             + "when it's done, or you can cancel and try later."
+        note.addButton(withTitle: "Cancel")
+        var cancelled = false
+        VertexSetup.signIn { email, err in
+            // The person gave up and closed the note; do not ambush them with a result later.
+            guard !cancelled else { return }
+            NSApp.abortModal()
+            note.window.orderOut(nil)
+            let a = NSAlert()
+            if let email {
+                a.messageText = "Signed in to Vertex"
+                a.informativeText = "Account: \(email)\nThe session lasts about 30 days."
+            } else {
+                a.alertStyle = .warning
+                a.messageText = "Vertex sign-in didn’t finish"
+                a.informativeText = err ?? "Unknown error."
+            }
+            a.addButton(withTitle: "OK")
+            a.runModal()
+        }
+        if note.runModal() == .alertFirstButtonReturn { cancelled = true }
     }
 
     // Nudge, once per version, if Navigator's Finder menu is switched off.
@@ -17127,17 +17393,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     // AI → Vertex Status — `whoami` against the metered service.
     @objc func vertexStatusAction(_ sender: Any?) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = runH5GClient(["whoami"])
-            let email = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Asked of the service directly. This used to run the plugin's `whoami` through Node, so
+            // a Mac with neither reported "not signed in" when the real answer was "couldn't check".
+            let who = H5GService.me()
             DispatchQueue.main.async {
                 let a = NSAlert()
-                if r.code == 0, !email.isEmpty, !email.lowercased().contains("not signed in") {
+                if let email = who.email, !email.isEmpty {
                     a.messageText = "Signed in to Vertex"
                     a.informativeText = "Account: \(email)\nImagen upscaling is ready."
                 } else {
                     a.alertStyle = .warning
                     a.messageText = "Not signed in to Vertex"
-                    a.informativeText = "Use AI → Sign in to Vertex (Imagen)… to sign in with your High 5 Games Google account."
+                    a.informativeText = (who.error.map { $0 + "\n\n" } ?? "")
+                        + "Use AI → Sign in to Vertex (Imagen)… to sign in with your High 5 Games Google account."
                 }
                 a.addButton(withTitle: "OK"); a.runModal()
             }
@@ -17778,6 +18046,34 @@ enum H5GService {
                 out = (nil, nil, "unexpected response: " + String(text.prefix(300))); return
             }
             out = (png, j["cost_usd"] as? Double, nil)
+        }.resume()
+        sem.wait()
+        return out
+    }
+
+    /// GET /v1/me — who the stored session belongs to. Used to confirm a fresh sign-in and to
+    /// answer AI → Vertex Status, both of which used to shell out to the plugin's `whoami`.
+    static func me() -> (email: String?, error: String?) {
+        guard let base = baseURL else { return (nil, "No Vertex service address is set on this Mac.") }
+        guard let token else { return (nil, "Not signed in to Vertex.") }
+        guard let url = URL(string: base + "/v1/me") else { return (nil, "bad service URL") }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 30
+        var out: (String?, String?) = (nil, "no response")
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            defer { sem.signal() }
+            if let err { out = (nil, err.localizedDescription); return }
+            guard let data, let http = resp as? HTTPURLResponse else { out = (nil, "no data"); return }
+            guard http.statusCode == 200 else {
+                out = (nil, http.statusCode == 401
+                    ? "Your Vertex session has expired — sign in again."
+                    : "AI service HTTP \(http.statusCode)")
+                return
+            }
+            let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            out = ((j?["email"] as? String), nil)
         }.resume()
         sem.wait()
         return out
