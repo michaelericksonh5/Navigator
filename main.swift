@@ -13657,6 +13657,13 @@ struct ImageViewerView: View {
                     fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
+                // Layerize belongs here for the same reason Restyle does: this viewer is where you
+                // actually look at an image and decide what to do with it, and it was the one AI
+                // surface that could only be reached by going back to the file list. Same call the
+                // right-click uses, so the folder, the PSD and the coverage repair are identical.
+                Button { layerizeImages([u]) } label: {
+                    serviceLabel("Layerize (AI)…", ServiceIcon.fal)
+                }
             }
             if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
                 Divider()
