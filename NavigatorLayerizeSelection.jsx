@@ -1089,9 +1089,9 @@ function askElements(thumbFile) {
     if (thumbFile !== null && thumbFile !== undefined) {
         var ti = pngInfo(thumbFile);
         if (ti !== null && ti.hasAlpha === false) {
-            status.text = "Note: this area is FULLY OPAQUE, so it will be sent as a flat picture. " +
-                          "Something visible is covering the transparency \u2014 a layer underneath, " +
-                          "or an artboard's white background.";
+            status.text = "Note: this area has no transparency, so it goes up as a flat picture. " +
+                          "That is normal for a scene; for a cutout, check for a visible layer or " +
+                          "artboard background underneath.";
         }
     }
 
@@ -1175,6 +1175,26 @@ function describe(e) {
 }
 
 // ---------------------------------------------------------------- the work
+
+/// Put the document's view back on the colour composite.
+///
+/// THE WHITE OVERLAY BUG. `doc.channels.add()` does not just add a channel: Photoshop makes the new
+/// alpha channel the ACTIVE one, and the document stops showing the artwork and starts showing that
+/// channel - white where the selection is, black where it is not. It looks exactly like a huge white
+/// plate has been dropped over the picture, and it is not a layer, which is why looking through the
+/// Layers panel for a white layer finds nothing.
+///
+/// This was mine, and recent. The selection used to be stashed immediately before the network call,
+/// so the mask view existed only during the wait; restructuring the run to give Analyze a thumbnail
+/// moved the stash ahead of the dialog, and the mask became the first thing you see and stayed up.
+///
+/// Worth being precise about what it did NOT do: the flattened image is unaffected. The bytes sent
+/// to fal were compared with the mask channel active and with the composite active and are
+/// byte-identical, max channel difference 0. Nothing was ever wrong with the upload - only with what
+/// Photoshop was showing.
+function showComposite(doc) {
+    try { doc.activeChannels = doc.componentChannels; } catch (e) {}
+}
 
 /// Flatten the given rect of the document to a temp PNG, downsampling only if fal's pixel ceiling
 /// demands it. Pass `maxDim` to cap the long edge as well — the Analyze thumbnail does, since a
@@ -1459,6 +1479,10 @@ function run() {
             savedSelection.name = "Layerize_Selection";
             doc.selection.store(savedSelection);
             doc.selection.deselect();
+            try { savedSelection.visible = false; } catch (ve) {}
+            showComposite(doc);
+            log("stashed the selection in a temp alpha channel; view returned to " +
+                doc.activeChannels.length + " component channel(s)");
         }
 
         // A small flatten first, purely so Analyze has something to look at. It is the cheap half of
@@ -1626,6 +1650,8 @@ function run() {
         progressDone();
         if (savedSelection !== null) {
             try { doc.selection.load(savedSelection); savedSelection.remove(); } catch (se) {}
+            // Removing the channel does not reliably hand the view back either.
+            showComposite(doc);
         }
         cleanupTemp();
         app.preferences.interpolation = priorInterp;
