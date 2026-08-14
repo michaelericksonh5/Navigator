@@ -540,27 +540,111 @@ var PLAN_SYSTEM_PROMPT =
 // Claude's own settings are still tried FIRST for both, so a machine with the H5G plugins needs no
 // setup whatsoever. These controls are the fallback for a machine without them.
 
-/// Where node lives. Photoshop's PATH is not a shell's, so `node` alone usually resolves to nothing;
-/// the usual install locations are tried, then a login shell is asked as a last resort.
+/// Where node lives.
+///
+/// Asking a shell is NOT good enough, which was proved the hard way. A Photoshop launched from the
+/// Dock gets launchd's environment, and in a clean environment on this very machine `command -v
+/// node` finds nothing in login bash, login zsh OR interactive zsh — because node is managed by nvm
+/// and nvm is not initialised in any rc file. The first version of this reported "Node.js isn't
+/// installed" on a machine running node 26, and it looked correct in testing only because that
+/// Photoshop had inherited a developer shell's PATH.
+///
+/// So the version managers' own directories are searched directly, which is what Navigator's Swift
+/// side already does. The shell is asked last, for machines where the rc files DO set it up.
 function resolveNode() {
-    var fixed = ["/usr/local/bin/node", "/opt/homebrew/bin/node", "/usr/bin/node"];
-    if (!IS_WINDOWS) {
-        for (var i = 0; i < fixed.length; i++) {
-            if (new File(fixed[i]).exists) { return fixed[i]; }
+    var home = homeDir();
+    var candidates = [];
+
+    if (IS_WINDOWS) {
+        candidates.push("C:\\Program Files\\nodejs\\node.exe");
+        candidates.push("C:\\Program Files (x86)\\nodejs\\node.exe");
+        if (home) { candidates.push(home + "\\AppData\\Roaming\\npm\\node.exe"); }
+    } else {
+        candidates.push("/opt/homebrew/bin/node");     // Apple silicon Homebrew
+        candidates.push("/usr/local/bin/node");        // Intel Homebrew, and the .pkg installer
+        candidates.push("/usr/bin/node");
+        candidates.push("/opt/local/bin/node");        // MacPorts
+        if (home) {
+            candidates.push(home + "/.volta/bin/node");
+            candidates.push(home + "/.local/bin/node");
+            candidates.push(home + "/n/bin/node");
         }
-        // A login shell knows about nvm, fnm, asdf and anything else on the person's PATH.
-        var out = tempFile("nodepath", "txt");
-        app.system('/bin/bash -lc "command -v node" > "' + out.fsName + '" 2>/dev/null');
-        if (out.exists) {
-            out.open("r"); var t = out.read(); out.close();
-            t = String(t).replace(/^\s+|\s+$/g, "");
-            if (t.length && new File(t).exists) { return t; }
-        }
-        return null;
     }
-    var win = ["C:\\Program Files\\nodejs\\node.exe", "C:\\Program Files (x86)\\nodejs\\node.exe"];
-    for (var w = 0; w < win.length; w++) { if (new File(win[w]).exists) { return win[w]; } }
+
+    // Version managers keep every release in its own directory, newest is not last alphabetically,
+    // and a plain string sort puts v9 above v26. Compared numerically, component by component.
+    if (home) {
+        var roots = [
+            { dir: home + "/.nvm/versions/node",                                  bin: "/bin/node" },
+            { dir: home + "/Library/Application Support/fnm/node-versions",        bin: "/installation/bin/node" },
+            { dir: home + "/.local/share/fnm/node-versions",                      bin: "/installation/bin/node" },
+            { dir: home + "/.asdf/installs/nodejs",                                bin: "/bin/node" }
+        ];
+        for (var r = 0; r < roots.length; r++) {
+            var found = newestNodeIn(roots[r].dir, roots[r].bin);
+            if (found !== null) { candidates.push(found); }
+        }
+    }
+
+    for (var i = 0; i < candidates.length; i++) {
+        if (new File(candidates[i]).exists) { return candidates[i]; }
+    }
+
+    // Last resort: a shell that may have the version manager wired into its startup files.
+    var shells = IS_WINDOWS
+        ? ['cmd.exe /c "where node"']
+        : ['/bin/zsh -lc "command -v node"', '/bin/bash -lc "command -v node"',
+           '/bin/zsh -ic "command -v node"', '/bin/bash -ic "command -v node"'];
+    for (var s = 0; s < shells.length; s++) {
+        var out = tempFile("nodepath", "txt");
+        app.system(shells[s] + ' > "' + out.fsName + '" 2>/dev/null');
+        if (!out.exists) { continue; }
+        out.open("r"); var t = out.read(); out.close();
+        // An interactive shell can print noise ("no job control in this shell") before the answer,
+        // so every line is considered rather than just the first.
+        var lines = String(t).split(/[\r\n]+/);
+        for (var L = 0; L < lines.length; L++) {
+            var p = lines[L].replace(/^\s+|\s+$/g, "");
+            if (p.length && new File(p).exists) { return p; }
+        }
+    }
     return null;
+}
+
+/// The highest-numbered node under a version manager's directory, or null.
+function newestNodeIn(dir, binSuffix) {
+    var f = new Folder(dir);
+    if (!f.exists) { return null; }
+    var items;
+    try { items = f.getFiles(); } catch (e) { return null; }
+    var bestPath = null, bestParts = null;
+    for (var i = 0; i < items.length; i++) {
+        if (!(items[i] instanceof Folder)) { continue; }
+        var exe = new File(items[i].fsName + binSuffix);
+        if (!exe.exists) { continue; }
+        var parts = versionParts(items[i].name);
+        if (bestParts === null || compareVersions(parts, bestParts) > 0) {
+            bestParts = parts; bestPath = exe.fsName;
+        }
+    }
+    return bestPath;
+}
+
+function versionParts(s) {
+    var m = String(s).replace(/^v/i, "").split(".");
+    var out = [];
+    for (var i = 0; i < 3; i++) {
+        var n = parseInt(m[i], 10);
+        out.push(isNaN(n) ? 0 : n);
+    }
+    return out;
+}
+
+function compareVersions(a, b) {
+    for (var i = 0; i < 3; i++) {
+        if (a[i] !== b[i]) { return a[i] > b[i] ? 1 : -1; }
+    }
+    return 0;
 }
 
 /// The h5g-ai-connect client, which owns the Vertex sign-in. Null when the skill isn't installed.
@@ -593,8 +677,9 @@ function falKeySource() {
 function startVertexSignIn() {
     var node = resolveNode();
     if (node === null) {
-        return "Node.js isn't installed, and the Vertex sign-in needs it. Install Node 18 or newer, " +
-               "or ask for a fal.ai key instead \u2014 layerizing itself doesn't use Vertex.";
+        return "Couldn't find Node.js, which the Vertex sign-in needs. If it is installed, run\n" +
+               "  node " + (resolveH5GClient() === null ? "<client.mjs>" : resolveH5GClient().fsName) +
+               " login\nin a Terminal yourself, then click Re-check. Layerizing does not use Vertex.";
     }
     var client = resolveH5GClient();
     if (client === null) {
@@ -637,8 +722,10 @@ function showConnections() {
     var vxPanel = w.add("panel", undefined, "Vertex  \u2014  optional, only powers Analyze image");
     vxPanel.alignChildren = "fill";
     vxPanel.margins = 12;
+    // 62px, because a multiline statictext does not grow to fit and these messages run to three
+    // lines at 440 wide - the first version cut off mid-sentence.
     var vxStatus = vxPanel.add("statictext", undefined, "", { multiline: true });
-    vxStatus.preferredSize = [440, 44];
+    vxStatus.preferredSize = [440, 62];
     var vxRow = vxPanel.add("group");
     var signIn = vxRow.add("button", undefined, "Sign in to Vertex\u2026");
     var recheck = vxRow.add("button", undefined, "Re-check");
@@ -653,13 +740,13 @@ function showConnections() {
         if (tok !== null && url !== null) {
             vxStatus.text = "Signed in. Analyze is available.";
         } else if (resolveH5GClient() === null) {
-            vxStatus.text = "The h5g-ai-connect skill isn't installed on this Mac, so Analyze is " +
-                            "unavailable. Everything else works with just a fal.ai key.";
+            vxStatus.text = "The h5g-ai-connect skill isn't installed, so Analyze is unavailable.\n" +
+                            "Everything else works with just a fal.ai key.";
         } else if (tok === null) {
             vxStatus.text = "Not signed in. Sign in once and it lasts about 30 days.";
         } else {
-            vxStatus.text = "Signed in, but the service address couldn't be read from the installed " +
-                            "client. Analyze is unavailable; layerizing is unaffected.";
+            vxStatus.text = "Signed in, but the service address couldn't be read from the\n" +
+                            "installed client. Analyze is unavailable; layerizing is unaffected.";
         }
         signIn.enabled = (resolveH5GClient() !== null);
     }
@@ -670,8 +757,8 @@ function showConnections() {
     signIn.onClick = function () {
         var err = startVertexSignIn();
         vxStatus.text = (err === null)
-            ? "A Terminal window is finishing the sign-in \u2014 pick your @high5games.com account in " +
-              "the browser, then click Re-check."
+            ? "A Terminal window is finishing the sign-in. Pick your @high5games.com\n" +
+              "account in the browser, then click Re-check."
             : err;
     };
     recheck.onClick = refresh;
@@ -691,6 +778,9 @@ function logConnections() {
     log("  home dir:     " + (home ? home : "*** $.getenv could not resolve it ***"));
     var client = resolveH5GClient();
     log("  h5g client:   " + (client === null ? "not installed" : client.fsName));
+    var node = resolveNode();
+    log("  node:         " + (node === null ? "NOT FOUND" : node));
+    log("  PATH:         " + ($.getenv("PATH") || "(empty)"));
     log("  vertex token: " + (h5gToken() === null ? "not signed in" : "present"));
     var url = h5gServiceURL();
     log("  service url:  " + (url === null ? "could not be resolved" : "resolved"));

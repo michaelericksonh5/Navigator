@@ -3039,7 +3039,10 @@ func resolveNode() -> String? {
     let fm = FileManager.default
     var candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
     let nvm = (NSHomeDirectory() as NSString).appendingPathComponent(".nvm/versions/node")
-    if let vers = try? fm.contentsOfDirectory(atPath: nvm).sorted(by: >) {
+    // Newest first, compared NUMERICALLY. A plain string sort ranks "v9.0.0" above "v26.5.0" and
+    // would hand back a years-old node on any machine with both installed.
+    if let vers = try? fm.contentsOfDirectory(atPath: nvm)
+        .sorted(by: { NodeVersion.isDescending($0, $1) }) {
         candidates.insert(contentsOf: vers.map { "\(nvm)/\($0)/bin/node" }, at: 0)
     }
     return candidates.first { fm.isExecutableFile(atPath: $0) }
