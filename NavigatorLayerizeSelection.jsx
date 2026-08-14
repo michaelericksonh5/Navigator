@@ -146,8 +146,11 @@ function stamp() {
            p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
 }
 
+var LOG_T0 = 0;
+
 function logStart() {
     LOG = [];
+    LOG_T0 = (new Date()).getTime();
     try { LOG_FILE = new File(logFolder().fsName + "/layerize_" + stamp() + ".txt"); }
     catch (e) { LOG_FILE = null; }
     log("Layerize Selection log");
@@ -159,7 +162,11 @@ function logStart() {
 }
 
 function log(line) {
-    LOG.push(String(line));
+    // Every line carries seconds since the run started. Without it "it feels slow" cannot be turned
+    // into "the API took 103s and placement took 12s", which are entirely different problems.
+    var t = ((new Date()).getTime() - LOG_T0) / 1000;
+    var stamp = (t < 10 ? "  " : (t < 100 ? " " : "")) + t.toFixed(1) + "s  ";
+    LOG.push(stamp + String(line));
     // Flushed on every line, not at the end: if Photoshop dies or a call never returns, the log up
     // to that point is the only thing that says where it stopped, and a log written at the end
     // would be exactly the log that never gets written.
@@ -949,6 +956,7 @@ function requestPlan(pngFile) {
 
     // 60s and two tries, not 120s and three: the worst case is time spent with Photoshop frozen
     // and no way to cancel, and a vision call that has not answered in a minute is not going to.
+    log("analyze: asking " + base + "/v1/vision  (" + Math.round(b64.length / 1024) + " KB of base64)");
     var lastError = "no response";
     for (var attempt = 0; attempt < 2; attempt++) {
         var resp = curl('-s -S --max-time 60 -X POST -H "Authorization: Bearer ' + token + '" ' +
@@ -970,11 +978,17 @@ function requestPlan(pngFile) {
                 break;      // a malformed answer is not a transport problem; retrying re-spends
             }
             lastError = (j && j.error) ? String(j.error) : String(resp).substring(0, 300);
+        } else {
+            lastError = "curl produced no output at all";
         }
         if (!isTransientError(lastError)) { break; }
         log("analyze attempt " + (attempt + 1) + " failed, retrying: " + lastError);
         $.sleep(1500);
     }
+    // Logged on EVERY failing path. The first version only logged success and retries, so an Analyze
+    // that failed outright left no trace whatsoever - which is exactly what happened when it was
+    // reported as "doing nothing", and the log could not answer it.
+    log("analyze FAILED: " + String(lastError).substring(0, 600));
     return { plan: null, cost: 0, error: friendlyError(lastError) };
 }
 
@@ -1367,7 +1381,9 @@ function layerizeOnce(imageRef, key, promptText, tier) {
     log("");
     log("--- request to fal ---");
     log("endpoint:   " + LAYERIZE_ENDPOINT);
-    log("image_size: auto      enhance_prompt_mode: standard");
+    // The ACTUAL tier, not a hardcoded one: on a ladder retry the log would otherwise claim "auto"
+    // while auto_1.5K went out, which is precisely the sort of thing a log exists to prevent.
+    log("image_size: " + tier + "      enhance_prompt_mode: standard      (both from fal's schema)");
     log("prompt:     " + promptText.replace(/\n/g, "\n            "));
     log("");
     var resp = curl('-s -S -X POST -H "Authorization: Key ' + key + '" ' +
@@ -1487,11 +1503,18 @@ function channelPixelCount(channel) {
 /// Returns { fraction, gap: [l, t, r, b] in source pixels, srcPixels } or null when the question
 /// does not apply - a source with no real transparency is a scene, whose background is SUPPOSED to
 /// stay unseparated, and measuring it would report an enormous intentional gap.
-function measureCoverage(sourceFile, set) {
-    if (!set.length) { return null; }
+function measureCoverage(sourceFile, doc, group, offsetX, offsetY, selW, selH) {
+    if (group === null) { return null; }
     var m = null, result = null;
     try {
+        var t0 = (new Date()).getTime();
         m = openOrCleanUp(sourceFile);
+        // The exported source may have been downsampled for fal's pixel ceiling; the placed layers
+        // are in document pixels. Bringing the source back to the selection's own size makes the
+        // group line up with a plain translate and no scaling anywhere.
+        if (m.width.as("px") !== selW || m.height.as("px") !== selH) {
+            m.resizeImage(UnitValue(selW, "px"), UnitValue(selH, "px"), null, ResampleMethod.BILINEAR);
+        }
         var srcW = m.width.as("px"), srcH = m.height.as("px");
         var base = m.artLayers[0];
         // An opaque PNG opens as a Background layer, which has no transparency to load.
@@ -1520,25 +1543,52 @@ function measureCoverage(sourceFile, set) {
             return null;
         }
 
-        // Every layer placed into one group, by its NORMALIZED box against the source's own size, so
-        // this never needs to know what canvas size fal chose.
-        var group = m.layerSets.add();
-        group.name = "coverage";
-        var placedAny = false;
-        for (var i = 0; i < set.length; i++) {
-            var nb = normalizedBoxOf(set[i].e);
-            if (nb === null) { continue; }
-            var x0 = nb[0] / 1000 * srcW, y0 = nb[1] / 1000 * srcH;
-            var x1 = nb[2] / 1000 * srcW, y1 = nb[3] / 1000 * srcH;
-            if (x1 <= x0 || y1 <= y0) { continue; }
-            try {
-                placeLayer(m, group, set[i].file, [x0, y0, x1, y1], 1, 1, 0, 0, null);
-                placedAny = true;
-            } catch (pe) { log("coverage: could not place " + (set[i].e.name || i) + " - " + describe(pe)); }
+        // The layers are ALREADY placed in the document, so the group is copied across rather than
+        // rebuilt. Rebuilding meant opening every layer PNG a second time - eight extra document
+        // opens of files up to 6 MB on a real run, for pixels Photoshop already had. A cross-document
+        // group duplicate was measured at 71 ms.
+        var copied = null;
+        try {
+            // The SAME trap as the white overlay, in a different costume: channels.add() above made
+            // an alpha channel the active one in the measuring document, and with a non-composite
+            // channel active Photoshop will not accept layers into that document - the duplicate is
+            // simply ignored, no error raised. Hand the view back first.
+            showComposite(m);
+            app.activeDocument = doc;
+            var before = m.layerSets.length;
+            // LayerSet.duplicate returns NOTHING when the target is another document - it copies the
+            // group across quite happily and hands back undefined. Verifying the probe by looking at
+            // the target document hid that; the arrival is looked up here rather than assumed.
+            group.duplicate(m, ElementPlacement.PLACEATBEGINNING);
+            app.activeDocument = m;
+            // The RETURN VALUE is not used. It is neither the new set nor null - it came back
+            // truthy but with no artLayers, so both "trust it" and "fall back when falsy" were
+            // wrong. The measuring document starts with no groups at all, so the one that is there
+            // afterwards is the one that arrived.
+            for (var q = 0; q < m.layerSets.length; q++) {
+                if (m.layerSets[q].name === group.name) { copied = m.layerSets[q]; break; }
+            }
+            if (copied === null && m.layerSets.length > before) { copied = m.layerSets[0]; }
+            log("coverage: copied the placed group across (" + before + " -> " +
+                m.layerSets.length + " group(s) in the measuring document)");
+        } catch (de) {
+            log("coverage: could not copy the placed layers across - " + describe(de));
+            return null;
         }
-        if (!placedAny) { log("coverage: nothing could be placed to measure against"); return null; }
-
-        var merged = group.merge();
+        if (!copied) { log("coverage: the placed layers did not arrive in the measuring document"); return null; }
+        app.activeDocument = m;
+        // Merging needs the set to be the ACTIVE layer, and a set holding exactly one layer needs no
+        // merge at all - asking for one throws "The command Merge Layers is not currently available",
+        // which a single-element result hit immediately.
+        var merged = null;
+        try { m.activeLayer = copied; } catch (se) {}
+        if (copied.artLayers.length === 1 && copied.layerSets.length === 0) {
+            merged = copied.artLayers[0];
+        } else {
+            merged = copied.merge();
+        }
+        // The group sits at the selection's offset in the document; the source starts at 0,0.
+        if (offsetX !== 0 || offsetY !== 0) { merged.translate(-offsetX, -offsetY); }
         loadTransparency(m, merged);
         var covCh = m.channels.add();
         covCh.name = "cov";
@@ -1585,7 +1635,8 @@ function measureCoverage(sourceFile, set) {
         }
         result = { fraction: fraction, gap: gap, srcPixels: srcPixels, w: srcW, h: srcH };
         log("coverage: " + (Math.round(fraction * 10000) / 100) + "% uncovered" +
-            (gap[2] > gap[0] ? "  largest gap " + gap.join(",") : ""));
+            (gap[2] > gap[0] ? "  largest gap " + gap.join(",") : "") +
+            "  (measured in " + (((new Date()).getTime() - t0) / 1000).toFixed(1) + "s)");
     } catch (e) {
         log("coverage: measurement failed, carrying on without it - " + describe(e));
         result = null;
@@ -1593,19 +1644,6 @@ function measureCoverage(sourceFile, set) {
         try { if (m !== null) { m.close(SaveOptions.DONOTSAVECHANGES); } } catch (ce) {}
     }
     return result;
-}
-
-/// fal's `bounding_box.normalized`, per-mille. Null when absent or malformed.
-function normalizedBoxOf(e) {
-    var n = e && e.bounding_box ? e.bounding_box.normalized : null;
-    if (!n || n.length !== 4) { return null; }
-    var out = [];
-    for (var i = 0; i < 4; i++) {
-        var v = Math.round(Number(n[i]));
-        if (isNaN(v)) { return null; }
-        out.push(v);
-    }
-    return out;
 }
 
 /// Worth spending another two-minute call on?
@@ -1737,21 +1775,129 @@ function splitResponse(layers) {
     return { base: base, elements: elements };
 }
 
-/// Download every element to a temp PNG. Returns { set: [{e, file}], failed: [names] }.
+/// Download every element. Returns { set: [{e, file}], failed: [names] }.
+///
+/// ONE curl for the whole set. curl takes repeated `-o file url` pairs and reuses the connection
+/// across them, where a call each meant a process spawn and a fresh TLS handshake per layer - eight
+/// of both on a real run. The result of each is still checked individually.
 function downloadSet(elements) {
-    var set = [], failed = [];
+    var set = [], failed = [], args = "-s -S -L", planned = [];
     for (var m = 0; m < elements.length; m++) {
         var e = elements[m];
-        var lf = tempFile("layerize_layer_" + m + "_" + Math.floor(Math.random() * 9999), "png");
-        if (!e.image || !e.image.url || !downloadTo(e.image.url, lf)) {
-            log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") + ": DOWNLOAD FAILED  " +
-                ((e.image && e.image.url) ? e.image.url : "(no url)"));
-            failed.push((e.name || ("layer " + (m + 1))) + " (download failed)");
+        if (!e.image || !e.image.url) {
+            failed.push((e.name || ("layer " + (m + 1))) + " (no url)");
             continue;
         }
-        set.push({ e: e, file: lf });
+        var lf = tempFile("layerize_layer_" + m + "_" + Math.floor(Math.random() * 9999), "png");
+        args += ' -o "' + lf.fsName + '" "' + e.image.url + '"';
+        planned.push({ e: e, file: lf });
     }
+    if (!planned.length) { return { set: set, failed: failed }; }
+    var t0 = (new Date()).getTime();
+    curl(args);
+    var bytes = 0;
+    for (var k = 0; k < planned.length; k++) {
+        if (isPlausiblePNG(planned[k].file)) {
+            bytes += planned[k].file.length;
+            set.push(planned[k]);
+        } else {
+            log("  " + (planned[k].e.name || "(unnamed)") + ": DOWNLOAD FAILED  " + planned[k].e.image.url);
+            failed.push((planned[k].e.name || "a layer") + " (download failed)");
+        }
+    }
+    log("downloaded " + set.length + " of " + planned.length + " layers, " +
+        Math.round(bytes / 1048576 * 10) / 10 + " MB in one curl, " +
+        (((new Date()).getTime() - t0) / 1000).toFixed(1) + "s");
     return { set: set, failed: failed };
+}
+
+/// A real PNG with real bytes in it. A zero-byte or HTML error body must never be counted as a
+/// layer - an empty download once got written, counted and recorded as one.
+function isPlausiblePNG(f) {
+    if (!f.exists || f.length < 100) { return false; }
+    try {
+        f.encoding = "BINARY";
+        f.open("r");
+        var sig = f.read(4);
+        f.close();
+        return sig.charCodeAt(0) === 0x89 && sig.substring(1) === "PNG";
+    } catch (e) { try { f.close(); } catch (ce) {} return false; }
+}
+
+/// Place a downloaded set into a new named group. Returns { group, placed, failed, fullCanvas }.
+///
+/// Separate from run() because a coverage repair places a SECOND set and has to be able to throw one
+/// of the two away: the repair lands in its own group, and whichever loses is removed.
+function placeSet(doc, groupName, downloaded, canvasW, canvasH, scaleX, scaleY, offsetX, offsetY, promptText) {
+    var elements = [];
+    for (var i = 0; i < downloaded.set.length; i++) { elements.push(downloaded.set[i].e); }
+    elements.sort(function (a, b) { return (a.z_index || 0) - (b.z_index || 0); });
+    function fileOf(e) {
+        for (var k = 0; k < downloaded.set.length; k++) {
+            if (downloaded.set[k].e === e) { return downloaded.set[k].file; }
+        }
+        return null;
+    }
+
+    // The script never inserts fal's base, but fal sometimes hands the same backdrop back as a NAMED
+    // element with a bounding box, and then it is placed like anything else. Because the group sits
+    // above the document, a whole-area layer like that hides the artwork underneath.
+    //
+    // Only layers NOBODY ASKED FOR are mentioned. The first version flagged everything whole-area,
+    // and a live run on a slot symbol duly accused "outer square frame" and "inner circular frame"
+    // of being fal's invention - both named in the request, and both legitimately spanning the
+    // image, because that is what a frame does.
+    var requestedNames = elementsInInstruction(promptText);
+    function wasAskedFor(nm) {
+        var want = String(nm).toLowerCase().replace(/^\s+|\s+$/g, "");
+        if (!want.length) { return false; }
+        for (var q = 0; q < requestedNames.length; q++) {
+            var r = String(requestedNames[q]).toLowerCase();
+            if (r === want || r.indexOf(want) >= 0 || want.indexOf(r) >= 0) { return true; }
+        }
+        return false;
+    }
+
+    var group = doc.layerSets.add();
+    group.name = groupName;
+    var placed = 0, failed = [], fullCanvas = [];
+    var t0 = (new Date()).getTime();
+    for (var m = 0; m < elements.length; m++) {
+        var e = elements[m];
+        var bx = e.bounding_box.absolute;
+        var isFull = ((bx[2] - bx[0]) >= canvasW * 0.98 && (bx[3] - bx[1]) >= canvasH * 0.98 &&
+                      !wasAskedFor(e.name || ""));
+        if (isFull) { fullCanvas.push(e.name || ("layer " + (m + 1))); }
+        progress("Placing layer " + (m + 1) + " of " + elements.length +
+                 (e.name ? " \u2014 " + e.name : "") + "\u2026");
+        var lf = fileOf(e);
+        if (lf === null) { failed.push((e.name || ("layer " + (m + 1))) + " (no downloaded file)"); continue; }
+        log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") +
+            "\n      png:   " + describePng(lf) +
+            "\n      box:   " + bx.join(",") + "   in a " + canvasW + "x" + canvasH + " canvas" +
+            "\n      onto:  " + Math.round((bx[2] - bx[0]) * scaleX) + "x" +
+            Math.round((bx[3] - bx[1]) * scaleY) + " at " +
+            Math.round(offsetX + bx[0] * scaleX) + "," + Math.round(offsetY + bx[1] * scaleY) +
+            (isFull ? "\n      *** covers the whole area ***" : ""));
+        logKeep(lf, "layer" + (m + 1) + "_" + String(e.name || "unnamed").replace(/[^A-Za-z0-9]+/g, "_") + ".png");
+        try {
+            var placedLayer = placeLayer(doc, group, lf, bx, scaleX, scaleY, offsetX, offsetY, e.name);
+            try {
+                var pb = placedLayer.bounds;
+                log("      final: " + Math.round(pb[2].as("px") - pb[0].as("px")) + "x" +
+                    Math.round(pb[3].as("px") - pb[1].as("px")) + " at " +
+                    Math.round(pb[0].as("px")) + "," + Math.round(pb[1].as("px")));
+            } catch (be) {}
+            placed++;
+        } catch (pe) {
+            log("      PLACEMENT FAILED: " + describe(pe));
+            failed.push((e.name || ("layer " + (m + 1))) + " \u2014 " + describe(pe));
+        }
+    }
+    log("placed " + placed + ' layer(s) into "' + groupName + '" in ' +
+        (((new Date()).getTime() - t0) / 1000).toFixed(1) + "s");
+    for (var f = 0; f < downloaded.failed.length; f++) { failed.push(downloaded.failed[f]); }
+    return { group: group, placed: placed, failed: failed, fullCanvas: fullCanvas };
 }
 
 /// Place one layer PNG into `doc`, scaled from base-image space into the target rect.
@@ -1894,13 +2040,23 @@ function run() {
 
         var canvasW = 0, canvasH = 0;
         if (baseEntry !== null && baseEntry.image && baseEntry.image.url) {
-            progress("Measuring the returned canvas\u2026");
-            var baseFile = tempFile("layerize_base", "png");
-            if (downloadTo(baseEntry.image.url, baseFile)) {
-                var bd = openOrCleanUp(baseFile);
-                canvasW = bd.width.as("px"); canvasH = bd.height.as("px");
-                bd.close(SaveOptions.DONOTSAVECHANGES);
-                app.activeDocument = doc;
+            progress("Reading the returned canvas size\u2026");
+            // Only the first 64 bytes are wanted: a PNG's width and height live in the IHDR at bytes
+            // 16-23. The base for one real run was 4.7 MB, and it was being downloaded in full and
+            // then OPENED as a Photoshop document purely to read two numbers.
+            var headFile = tempFile("layerize_base_head", "png");
+            var head = null;
+            curl('-s -S -r 0-63 -o "' + headFile.fsName + '" "' + baseEntry.image.url + '"');
+            head = pngInfo(headFile);
+            if (head === null) {
+                // The CDN ignored the range request, or handed back something else. Fall back to the
+                // whole file rather than give up - still no document open.
+                var baseFile = tempFile("layerize_base", "png");
+                if (downloadTo(baseEntry.image.url, baseFile)) { head = pngInfo(baseFile); }
+            }
+            if (head !== null) {
+                canvasW = head.w; canvasH = head.h;
+                log("base canvas " + canvasW + "x" + canvasH + " read from the PNG header");
             }
         }
         if (canvasW <= 0 || canvasH <= 0) {
@@ -1926,29 +2082,35 @@ function run() {
         // size, so everything is scaled by region / base.
         var scaleX = selW / canvasW, scaleY = selH / canvasH;
 
-        // --- download, measure, and repair BEFORE anything touches the document ------------------
+        // --- download, place, then measure; repair only if it is unambiguously broken --------
         //
-        // Downloading first is what makes the repair safe: a repair is a whole fresh decomposition,
-        // so if placement happened as layers arrived, a repair would have to undo half a group. This
-        // way the document is not touched until the winning set is settled.
+        // Placing FIRST and measuring from what landed is what makes this affordable. Measuring
+        // beforehand meant opening every layer PNG a second time - eight extra document opens of
+        // files up to 6 MB - to rebuild a composite Photoshop was about to build anyway. A repair
+        // goes into its own group, so a repair that turns out worse is deleted instead of having
+        // destroyed a good result.
         progress("Downloading " + elements.length + " layers\u2026");
-        var chosen = downloadSet(elements);
-        if (!chosen.set.length) {
+        var first = downloadSet(elements);
+        if (!first.set.length) {
             throw new Error("none of the returned layers could be downloaded:\n\u2022 " +
-                            chosen.failed.join("\n\u2022 "));
+                            first.failed.join("\n\u2022 "));
         }
-        var failed = chosen.failed;
-        var current = measureCoverage(exported.file, chosen.set);
+
+        try { app.activeDocument = doc; } catch (ae) {}
+        var placement = placeSet(doc, "Layerized", first, canvasW, canvasH, scaleX, scaleY, x1, y1,
+                                 promptText);
+        var chosen = first, group = placement.group;
+        var placed = placement.placed, failed = placement.failed;
+        var fullCanvasElements = placement.fullCanvas;
+
         var coverageNote = "";
+        var current = measureCoverage(exported.file, doc, group, x1, y1, selW, selH);
         if (current !== null) {
             var firstFraction = current.fraction;
             var repairs = 0;
             while (needsRepair(current.fraction, current.gap) && repairs < COVERAGE_MAX_REPAIRS) {
                 var rp = repairPromptFor(current.gap, current.w, current.h, promptText);
-                if (rp === null) {
-                    log("coverage: no usable region to point at - not repairing");
-                    break;
-                }
+                if (rp === null) { log("coverage: no usable region to point at - not repairing"); break; }
                 repairs++;
                 progress("Missing " + Math.round(current.fraction * 100) + "% \u2014 asking again for " +
                          "the gap (repair " + repairs + " of " + COVERAGE_MAX_REPAIRS + ")\u2026");
@@ -1960,37 +2122,45 @@ function run() {
                 got.attempts += rr.attempts;
                 var rsplit = splitResponse(rr.layers);
                 if (!rsplit.elements.length) { log("coverage: repair " + repairs + " separated nothing"); break; }
+                progress("Downloading " + rsplit.elements.length + " repaired layers\u2026");
                 var candidate = downloadSet(rsplit.elements);
                 if (!candidate.set.length) { log("coverage: repair " + repairs + " downloaded nothing"); break; }
-                var next = measureCoverage(exported.file, candidate.set);
+
+                try { app.activeDocument = doc; } catch (ae2) {}
+                var rplace = placeSet(doc, "Layerized (repair " + repairs + ")", candidate,
+                                      canvasW, canvasH, scaleX, scaleY, x1, y1, promptText);
+                var next = measureCoverage(exported.file, doc, rplace.group, x1, y1, selW, selH);
+
                 // STRICTLY better only. The same prompt measured 1.14% and 7.25% on one image, so a
-                // repair that ties must not replace what we have - otherwise a worse roll of the
-                // dice gets shipped in exchange for the extra call.
-                if (next === null || next.fraction >= current.fraction) {
-                    log("coverage: repair " + repairs + " was no better (" +
-                        (next === null ? "not measurable" : Math.round(next.fraction * 10000) / 100 + "%") +
-                        ") - keeping what we had");
-                    break;
-                }
+                // repair that merely ties must not replace what we have.
+                var better = (next !== null && next.fraction < current.fraction);
                 var returnedNames = [];
                 for (var rn = 0; rn < candidate.set.length; rn++) {
                     returnedNames.push(candidate.set[rn].e.name || "");
                 }
-                if (!repairKeptRequested(elementsInInstruction(promptText), returnedNames)) {
-                    log("coverage: repair " + repairs + " covered more but lost requested elements " +
-                        "- keeping the first result");
+                // A repair is a fresh decomposition: it can cover more while having separated
+                // DIFFERENT things, which would throw the request away and look like an improvement.
+                var keptAsked = repairKeptRequested(elementsInInstruction(promptText), returnedNames);
+                if (!better || !keptAsked) {
+                    log("coverage: repair " + repairs + " rejected (" +
+                        (!better ? "no better: " + (next === null ? "not measurable"
+                                                                  : Math.round(next.fraction * 10000) / 100 + "%")
+                                 : "lost requested elements") + ") - keeping what we had");
+                    try { app.activeDocument = doc; rplace.group.remove(); } catch (dre) {}
                     break;
                 }
                 log("coverage: repair " + repairs + " adopted, " +
                     Math.round(current.fraction * 10000) / 100 + "% -> " +
                     Math.round(next.fraction * 10000) / 100 + "%");
+                try { app.activeDocument = doc; group.remove(); } catch (dre2) {}
+                group = rplace.group;
+                group.name = "Layerized";
                 chosen = candidate;
-                failed = candidate.failed;
+                placed = rplace.placed;
+                failed = rplace.failed;
+                fullCanvasElements = rplace.fullCanvas;
                 current = next;
             }
-            // Worded carefully. Placing IN PLACE means uncovered is not lost - the original is
-            // still underneath the group. What it actually costs you is that the leftover is not
-            // separately movable, which is the thing worth knowing.
             var pct = Math.round(current.fraction * 10000) / 100;
             coverageNote = (pct < 0.5)
                 ? "Every part of the artwork ended up in a layer"
@@ -2001,87 +2171,7 @@ function run() {
                                 repairs + " repair" + (repairs === 1 ? "" : "s") + ")";
             }
         }
-        elements = [];
-        for (var ci = 0; ci < chosen.set.length; ci++) { elements.push(chosen.set[ci].e); }
-        var fileFor = {};
-        for (var cj = 0; cj < chosen.set.length; cj++) { fileFor[cj] = chosen.set[cj].file; }
-
-        elements.sort(function (a, b) { return (a.z_index || 0) - (b.z_index || 0); });
-        // Sorting reordered `elements`, so the download map is rebuilt against the sorted order.
-        var sortedFiles = [];
-        for (var si = 0; si < elements.length; si++) {
-            for (var sj = 0; sj < chosen.set.length; sj++) {
-                if (chosen.set[sj].e === elements[si]) { sortedFiles.push(chosen.set[sj].file); break; }
-            }
-        }
-
-        // Measuring opened and closed its own document; Photoshop refuses layerSets.add and
-        // activeLayer on a document that is not frontmost.
-        try { app.activeDocument = doc; } catch (ae) {}
-
-        var group = doc.layerSets.add();
-        group.name = "Layerized";
-
-        // The script never inserts fal's base, but fal sometimes hands the same backdrop back as a
-        // NAMED element with a bounding box, and then it is placed like anything else. Because the
-        // group sits above the document, a whole-area layer like that hides the artwork underneath \u2014
-        // which looks exactly like the script having painted over everything. Named in the summary
-        // rather than dropped: a symbol's own backdrop disc is also whole-area and is wanted.
-        //
-        // Only layers NOBODY ASKED FOR are mentioned. The first version flagged everything
-        // whole-area, and a live run on a slot symbol duly accused "outer square frame" and "inner
-        // circular frame" of being fal's invention - both named in the request, and both legitimately
-        // spanning the whole image, because that is what a frame does. Accusing someone's own
-        // requested layer of being junk is worse than saying nothing at all.
-        var requestedNames = elementsInInstruction(promptText);
-        function wasAskedFor(nm) {
-            var want = String(nm).toLowerCase().replace(/^\s+|\s+$/g, "");
-            if (!want.length) { return false; }
-            for (var q = 0; q < requestedNames.length; q++) {
-                var r = String(requestedNames[q]).toLowerCase();
-                if (r === want || r.indexOf(want) >= 0 || want.indexOf(r) >= 0) { return true; }
-            }
-            return false;
-        }
-        var placed = 0, failed = [], fullCanvasElements = [];
-        for (var m = 0; m < elements.length; m++) {
-            var e = elements[m];
-            var bx = e.bounding_box.absolute;
-            if ((bx[2] - bx[0]) >= canvasW * 0.98 && (bx[3] - bx[1]) >= canvasH * 0.98 &&
-                !wasAskedFor(e.name || "")) {
-                fullCanvasElements.push(e.name || ("layer " + (m + 1)));
-            }
-            progress("Placing layer " + (m + 1) + " of " + elements.length +
-                     (e.name ? " \u2014 " + e.name : "") + "\u2026");
-            var lf = sortedFiles[m];
-            if (!lf) {
-                failed.push((e.name || ("layer " + m)) + " (no downloaded file)");
-                continue;
-            }
-            log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") +
-                "\n      png:   " + describePng(lf) +
-                "\n      box:   " + bx.join(",") + "   in a " + canvasW + "x" + canvasH + " canvas" +
-                "\n      onto:  " + Math.round((bx[2] - bx[0]) * scaleX) + "x" +
-                Math.round((bx[3] - bx[1]) * scaleY) + " at " +
-                Math.round(x1 + bx[0] * scaleX) + "," + Math.round(y1 + bx[1] * scaleY) +
-                (fullCanvasElements.length &&
-                 fullCanvasElements[fullCanvasElements.length - 1] === (e.name || ("layer " + (m + 1)))
-                     ? "\n      *** covers the whole area ***" : ""));
-            logKeep(lf, "layer" + (m + 1) + "_" + String(e.name || "unnamed").replace(/[^A-Za-z0-9]+/g, "_") + ".png");
-            try {
-                var placedLayer = placeLayer(doc, group, lf, e.bounding_box.absolute, scaleX, scaleY, x1, y1, e.name);
-                try {
-                    var pb = placedLayer.bounds;
-                    log("      final: " + Math.round(pb[2].as("px") - pb[0].as("px")) + "x" +
-                        Math.round(pb[3].as("px") - pb[1].as("px")) + " at " +
-                        Math.round(pb[0].as("px")) + "," + Math.round(pb[1].as("px")));
-                } catch (be) {}
-                placed++;
-            } catch (pe) {
-                log("      PLACEMENT FAILED: " + describe(pe));
-                failed.push((e.name || ("layer " + m)) + " \u2014 " + describe(pe));
-            }
-        }
+        try { app.activeDocument = doc; } catch (ae3) {}
 
         progressDone();
         var msg = "Added " + placed + " layer" + (placed === 1 ? "" : "s") + " in the \u201cLayerized\u201d group.";
