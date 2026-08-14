@@ -462,7 +462,10 @@ function h5gServiceURL() {
         var c = new File(candidates[i]);
         if (c.exists) { f = c; break; }
     }
-    if (f === null) { f = findClientInPluginCache(new Folder(home + "/.claude/plugins/cache"), 0); }
+    // ALL of ~/.claude/plugins, not just its cache: a plugin installed through the desktop app lands
+    // under plugins/marketplaces/…, and a cache-only search missed it - the same gap that had a
+    // coworker with a properly installed plugin told Vertex was unavailable.
+    if (f === null) { f = findClientInPluginCache(new Folder(home + "/.claude/plugins"), 0); }
     if (f === null) { return null; }
     try {
         f.encoding = "UTF-8"; f.open("r");
@@ -474,11 +477,11 @@ function h5gServiceURL() {
     } catch (e) { return null; }
 }
 
-/// Plugin installs land under a versioned cache path, so the client has to be hunted for. Depth is
-/// capped: this walks the user's plugin cache, and an unbounded walk of a deep tree would hang
-/// Photoshop with no way to interrupt it.
+/// Plugin installs land under a versioned path, so the client has to be hunted for - under `cache`
+/// for a CLI install and under `marketplaces` for a desktop-app one. Depth is capped: an unbounded
+/// walk of a deep tree would hang Photoshop with no way to interrupt it.
 function findClientInPluginCache(folder, depth) {
-    if (depth > 6 || !folder || !folder.exists) { return null; }
+    if (depth > 8 || !folder || !folder.exists) { return null; }
     var items;
     try { items = folder.getFiles(); } catch (e) { return null; }
     for (var i = 0; i < items.length; i++) {
