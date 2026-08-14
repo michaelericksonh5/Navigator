@@ -4250,6 +4250,30 @@ enum LayerAssemblyRules {
 /// a character: an empty prompt returned 4 blobs, the same image with a 16-element list returned 16
 /// named parts at 0.64% uncovered, and the analysis cost $0.0007 — a rounding error next to the
 /// 2-3 cents of the layerize call itself.
+/// Ordering for version-manager directory names like "v26.5.0".
+///
+/// Exists because sorting those names as strings puts "v9.0.0" above "v26.5.0", so a machine with
+/// both installed would be handed a years-old node. The same mistake was shipped in the Photoshop
+/// script, where it surfaced as "Node.js isn't installed" on a machine running node 26.
+enum NodeVersion {
+    static func parts(_ name: String) -> [Int] {
+        let trimmed = name.hasPrefix("v") || name.hasPrefix("V")
+            ? String(name.dropFirst()) : name
+        let fields = trimmed.split(separator: ".", omittingEmptySubsequences: false)
+        return (0..<3).map { i in
+            i < fields.count ? (Int(fields[i].prefix(while: \.isNumber)) ?? 0) : 0
+        }
+    }
+
+    /// True when `a` sorts before `b` in a newest-first list.
+    static func isDescending(_ a: String, _ b: String) -> Bool {
+        let x = parts(a), y = parts(b)
+        for i in 0..<3 where x[i] != y[i] { return x[i] > y[i] }
+        // Equal numerically: fall back to the name so the sort stays deterministic.
+        return a > b
+    }
+}
+
 enum LayerizeElementRules {
     /// fal returns "the base image followed by up to 16 separated layers", so 16 is a hard ceiling.
     /// A longer list is not an error — the tail is simply never returned — so it is trimmed here and

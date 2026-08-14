@@ -5377,4 +5377,34 @@ final class LayerAssemblyRulesTests: XCTestCase {
         XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 0), 0)
         XCTAssertEqual(LayerizeRules.estimatedCost(seconds: -5), 0)
     }
+
+    // MARK: - Node version ordering
+
+    /// The bug this exists for: sorting version directory names as strings ranks "v9.0.0" above
+    /// "v26.5.0", so a machine with both would be handed a years-old node.
+    func testNodeVersionSortsNumericallyNotAlphabetically() {
+        XCTAssertTrue(NodeVersion.isDescending("v26.5.0", "v9.0.0"))
+        XCTAssertFalse(NodeVersion.isDescending("v9.0.0", "v26.5.0"))
+        XCTAssertEqual(["v9.0.0", "v26.5.0", "v18.19.1", "v20.0.0"]
+                        .sorted(by: NodeVersion.isDescending),
+                       ["v26.5.0", "v20.0.0", "v18.19.1", "v9.0.0"])
+    }
+
+    func testNodeVersionPartsTolerateOddNames() {
+        XCTAssertEqual(NodeVersion.parts("v26.5.0"), [26, 5, 0])
+        XCTAssertEqual(NodeVersion.parts("26.5.0"), [26, 5, 0])
+        XCTAssertEqual(NodeVersion.parts("v22"), [22, 0, 0])
+        XCTAssertEqual(NodeVersion.parts("v20.11"), [20, 11, 0])
+        // A pre-release suffix must not throw the major version away.
+        XCTAssertEqual(NodeVersion.parts("v21.0.0-rc.1"), [21, 0, 0])
+        XCTAssertEqual(NodeVersion.parts("system"), [0, 0, 0])
+        XCTAssertEqual(NodeVersion.parts(""), [0, 0, 0])
+    }
+
+    /// Minor and patch must still break ties, not just the major.
+    func testNodeVersionComparesMinorAndPatch() {
+        XCTAssertTrue(NodeVersion.isDescending("v20.11.0", "v20.9.0"))
+        XCTAssertTrue(NodeVersion.isDescending("v20.9.2", "v20.9.1"))
+        XCTAssertFalse(NodeVersion.isDescending("v20.9.1", "v20.9.2"))
+    }
 }
