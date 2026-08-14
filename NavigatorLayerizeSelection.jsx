@@ -828,6 +828,25 @@ function requestLayerize(imageRef, key, promptText) {
     return j.layers;
 }
 
+/// True when a PNG carries an alpha channel, read from the IHDR rather than asked of Photoshop.
+///
+/// Byte 25 of a PNG is the colour type: 6 is RGBA and 4 is grey+alpha; 2 and 0 have no alpha at
+/// all. This is the one fact that settles "did white get baked into what we sent" — Photoshop
+/// writes an RGB PNG exactly when the flattened area has no transparency left, which happens when
+/// a visible layer is covering it. Reported rather than judged: a scene with no transparency is
+/// perfectly normal, and only the person looking at the document knows which they meant.
+function pngHasAlpha(f) {
+    try {
+        f.encoding = "BINARY";
+        f.open("r");
+        var head = f.read(26);
+        f.close();
+        if (head.length < 26) { return null; }
+        var colourType = head.charCodeAt(25);
+        return (colourType === 4 || colourType === 6);
+    } catch (e) { try { f.close(); } catch (ce) {} return null; }
+}
+
 function downloadTo(url, f) {
     curl('-s -S -L -o "' + f.fsName + '" "' + url + '"');
     // A PNG is 0x89 'P' 'N' 'G'. A zero-byte or HTML error body must not be treated as an image —
@@ -981,6 +1000,11 @@ function run() {
                             " MB, over fal's 30 MB limit \u2014 select a smaller area");
         }
 
+        // Recorded before the upload so the final message can say what was actually sent. "It added
+        // white over everything" is impossible to act on; "what we sent was fully opaque" points
+        // straight at a visible layer in the document, and its opposite clears the export entirely.
+        var sentAlpha = pngHasAlpha(exported.file);
+
         progress("Uploading " + Math.round(exported.file.length / 1048576 * 10) / 10 + " MB\u2026");
         var imageRef = uploadToFal(exported.file, key);
         if (imageRef === null) {
@@ -1042,9 +1066,18 @@ function run() {
         var group = doc.layerSets.add();
         group.name = "Layerized";
 
-        var placed = 0, failed = [];
+        // The script never inserts fal's base, but fal sometimes hands the same backdrop back as a
+        // NAMED element with a bounding box, and then it is placed like anything else. Because the
+        // group sits above the document, a whole-area layer like that hides the artwork underneath \u2014
+        // which looks exactly like the script having painted over everything. Named in the summary
+        // rather than dropped: a symbol's own backdrop disc is also whole-area and is wanted.
+        var placed = 0, failed = [], fullCanvasElements = [];
         for (var m = 0; m < elements.length; m++) {
             var e = elements[m];
+            var bx = e.bounding_box.absolute;
+            if ((bx[2] - bx[0]) >= canvasW * 0.98 && (bx[3] - bx[1]) >= canvasH * 0.98) {
+                fullCanvasElements.push(e.name || ("layer " + (m + 1)));
+            }
             progress("Placing layer " + (m + 1) + " of " + elements.length +
                      (e.name ? " \u2014 " + e.name : "") + "\u2026");
             var lf = tempFile("layerize_layer_" + m, "png");
@@ -1064,6 +1097,16 @@ function run() {
         var msg = "Added " + placed + " layer" + (placed === 1 ? "" : "s") + " in the \u201cLayerized\u201d group.";
         if (failed.length) { msg += "\n\n" + failed.length + " could not be placed:\n\u2022 " + failed.join("\n\u2022 "); }
         if (placed === 0) { msg = "Nothing could be placed.\n\n\u2022 " + failed.join("\n\u2022 "); }
+        msg += "\n\nSent " + selW + "x" + selH + ", " +
+               (sentAlpha === false
+                   ? "fully opaque \u2014 nothing in that area was transparent, so a visible layer was " +
+                     "covering it. Hide it and run again if you meant to send a cutout."
+                   : "transparency intact.");
+        if (fullCanvasElements.length) {
+            msg += "\n\nCovering the whole area: " + fullCanvasElements.join(", ") +
+                   ". If that hides your artwork, delete it \u2014 it is fal's own backdrop, not " +
+                   "something of yours.";
+        }
         alert(msg);
     } catch (e) {
         progressDone();
