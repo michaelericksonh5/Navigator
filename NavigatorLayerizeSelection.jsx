@@ -1440,6 +1440,248 @@ function downloadTo(url, f) {
     return sig.charCodeAt(0) === 0x89 && sig.substring(1) === "PNG";
 }
 
+// ---------------------------------------------------------------- coverage, and repairing it
+//
+// fal guarantees NOTHING about coverage, and it varies run to run: Navigator measured the same
+// prompt on the same image leaving 1.14% of the artwork in no layer on one run and 7.64% on another,
+// where the bad roll had lost a whole frame rail. Without this the script just took whatever came
+// back.
+//
+// Measuring is done BY PHOTOSHOP rather than by walking pixels: ExtendScript cannot touch a bitmap
+// directly at any usable speed, but stored selections are 8-bit masks and channel arithmetic over
+// them is exactly this calculation. Source transparency goes in one channel, the union of every
+// placed layer goes in another, and the gap is the first minus the second.
+
+var COVERAGE_REPAIR_THRESHOLD = 0.05;   // only when the decomposition is UNAMBIGUOUSLY broken
+var COVERAGE_MAX_REPAIRS = 2;
+var COVERAGE_MIN_TRANSPARENT = 0.02;    // below this the input is a scene, not a cutout
+
+/// Load a layer's own transparency as the selection. There is no DOM call for this, so it goes
+/// through Action Manager - the standard "channel -> transparencyEnum" set.
+function loadTransparency(doc, layer) {
+    doc.activeLayer = layer;
+    var d = new ActionDescriptor();
+    var r = new ActionReference();
+    r.putProperty(stringIDToTypeID("channel"), stringIDToTypeID("selection"));
+    d.putReference(stringIDToTypeID("null"), r);
+    var r2 = new ActionReference();
+    r2.putEnumerated(stringIDToTypeID("channel"), stringIDToTypeID("channel"),
+                     stringIDToTypeID("transparencyEnum"));
+    d.putReference(stringIDToTypeID("to"), r2);
+    executeAction(stringIDToTypeID("set"), d, DialogModes.NO);
+}
+
+/// Pixels in a stored-selection channel that are more than half selected.
+///
+/// The histogram is 256 bins of pixel counts, so this is a sum rather than a scan. Half is the same
+/// cut Navigator uses on the source side (alpha > 128); antialiased edges land below it and are
+/// counted as neither present nor missing, which is what they are.
+function channelPixelCount(channel) {
+    var h = channel.histogram, n = 0;
+    for (var i = 129; i < 256; i++) { n += h[i]; }
+    return n;
+}
+
+/// How much of the source no layer covers.
+///
+/// Returns { fraction, gap: [l, t, r, b] in source pixels, srcPixels } or null when the question
+/// does not apply - a source with no real transparency is a scene, whose background is SUPPOSED to
+/// stay unseparated, and measuring it would report an enormous intentional gap.
+function measureCoverage(sourceFile, set) {
+    if (!set.length) { return null; }
+    var m = null, result = null;
+    try {
+        m = openOrCleanUp(sourceFile);
+        var srcW = m.width.as("px"), srcH = m.height.as("px");
+        var base = m.artLayers[0];
+        // An opaque PNG opens as a Background layer, which has no transparency to load.
+        if (base.isBackgroundLayer) {
+            log("coverage: the source is fully opaque (a scene) - not measured");
+            return null;
+        }
+
+        loadTransparency(m, base);
+        var srcCh = m.channels.add();
+        srcCh.name = "src";
+        var srcPixels = 0;
+        try {
+            m.selection.store(srcCh);
+            srcPixels = channelPixelCount(srcCh);
+        } catch (noOpaque) {
+            log("coverage: the source has no opaque pixels at all");
+            return null;
+        }
+        var total = srcW * srcH;
+        if (srcPixels <= 0) { log("coverage: the source has no opaque pixels"); return null; }
+        if ((total - srcPixels) < total * COVERAGE_MIN_TRANSPARENT) {
+            log("coverage: the source is " +
+                Math.round((total - srcPixels) / total * 1000) / 10 + "% transparent, under the " +
+                Math.round(COVERAGE_MIN_TRANSPARENT * 100) + "% cutout bar - not measured");
+            return null;
+        }
+
+        // Every layer placed into one group, by its NORMALIZED box against the source's own size, so
+        // this never needs to know what canvas size fal chose.
+        var group = m.layerSets.add();
+        group.name = "coverage";
+        var placedAny = false;
+        for (var i = 0; i < set.length; i++) {
+            var nb = normalizedBoxOf(set[i].e);
+            if (nb === null) { continue; }
+            var x0 = nb[0] / 1000 * srcW, y0 = nb[1] / 1000 * srcH;
+            var x1 = nb[2] / 1000 * srcW, y1 = nb[3] / 1000 * srcH;
+            if (x1 <= x0 || y1 <= y0) { continue; }
+            try {
+                placeLayer(m, group, set[i].file, [x0, y0, x1, y1], 1, 1, 0, 0, null);
+                placedAny = true;
+            } catch (pe) { log("coverage: could not place " + (set[i].e.name || i) + " - " + describe(pe)); }
+        }
+        if (!placedAny) { log("coverage: nothing could be placed to measure against"); return null; }
+
+        var merged = group.merge();
+        loadTransparency(m, merged);
+        var covCh = m.channels.add();
+        covCh.name = "cov";
+        try { m.selection.store(covCh); }
+        catch (noCover) { log("coverage: the placed layers covered nothing at all"); }
+
+        // src MINUS cov, in the mask arithmetic Photoshop already does.
+        m.selection.load(srcCh, SelectionType.REPLACE);
+        m.selection.load(covCh, SelectionType.DIMINISH);
+        var gapCh = m.channels.add();
+        gapCh.name = "gap";
+        var gapPixels = 0;
+        // Storing an EMPTY selection throws "The command Set is not currently available", and an
+        // empty gap is not an error - it is the good case, every opaque pixel covered. A synthetic
+        // source with both of its squares covered hit this and reported the whole measurement as
+        // failed, which would have silently disabled repair on exactly the runs that went well.
+        try {
+            m.selection.store(gapCh);
+            gapPixels = channelPixelCount(gapCh);
+        } catch (nothingLeft) {
+            gapPixels = 0;
+        }
+        var fraction = gapPixels / srcPixels;
+
+        var gap = [0, 0, 0, 0];
+        if (gapPixels > 0) {
+            // Contract then expand - a morphological OPEN. Navigator takes the largest connected
+            // cluster for the same reason: the bounding box of EVERY stray gap pixel spanned 98.3%
+            // of one canvas, which says "the element occupying the whole image is missing" and is no
+            // hint at all. Scattered specks are antialiasing seams along the cuts; a genuinely
+            // missing element is one solid blob. Contracting deletes the seams outright, and if
+            // nothing survives, there was nothing worth a repair call.
+            try {
+                m.selection.load(gapCh, SelectionType.REPLACE);
+                m.selection.contract(4);
+                m.selection.expand(4);
+                var b = m.selection.bounds;      // throws when the selection emptied
+                gap = [Math.round(b[0].as("px")), Math.round(b[1].as("px")),
+                       Math.round(b[2].as("px")), Math.round(b[3].as("px"))];
+            } catch (noBlob) {
+                log("coverage: the gap is only thin seams, no solid region - no repair worth making");
+                gap = [0, 0, 0, 0];
+            }
+        }
+        result = { fraction: fraction, gap: gap, srcPixels: srcPixels, w: srcW, h: srcH };
+        log("coverage: " + (Math.round(fraction * 10000) / 100) + "% uncovered" +
+            (gap[2] > gap[0] ? "  largest gap " + gap.join(",") : ""));
+    } catch (e) {
+        log("coverage: measurement failed, carrying on without it - " + describe(e));
+        result = null;
+    } finally {
+        try { if (m !== null) { m.close(SaveOptions.DONOTSAVECHANGES); } } catch (ce) {}
+    }
+    return result;
+}
+
+/// fal's `bounding_box.normalized`, per-mille. Null when absent or malformed.
+function normalizedBoxOf(e) {
+    var n = e && e.bounding_box ? e.bounding_box.normalized : null;
+    if (!n || n.length !== 4) { return null; }
+    var out = [];
+    for (var i = 0; i < 4; i++) {
+        var v = Math.round(Number(n[i]));
+        if (isNaN(v)) { return null; }
+        out.push(v);
+    }
+    return out;
+}
+
+/// Worth spending another two-minute call on?
+///
+/// The bar is set where the evidence is unambiguous. Navigator measured a 1.91% run repairing to
+/// 1.07% (helped) and a 1.06% run repairing to 1.06% (gained nothing and cost 139 seconds) - two
+/// adjacent points with opposite outcomes, so a threshold tuned between them would be fitting a
+/// story to noise. The 7.64% run that lost a whole frame rail and repaired to 1.64% is the clear
+/// case. Everything below is reported and left alone.
+function needsRepair(fraction, gap) {
+    return fraction > COVERAGE_REPAIR_THRESHOLD && gap[2] > gap[0] && gap[3] > gap[1];
+}
+
+/// The targeted retry prompt. fal accepts `<bbox>left top right bottom</bbox>` in per-mille, and
+/// this exact form recovered a top frame rail that two unprompted runs both lost.
+///
+/// The user's own element instruction is threaded back in deliberately: a repair is a whole fresh
+/// decomposition, and dropping it would hand back a set that no longer separates what was asked for.
+function repairPromptFor(gap, w, h, userPrompt) {
+    if (w <= 0 || h <= 0) { return null; }
+    var l = Math.max(0, Math.min(1000, Math.round(gap[0] * 1000 / w)));
+    var t = Math.max(0, Math.min(1000, Math.round(gap[1] * 1000 / h)));
+    var r = Math.max(0, Math.min(1000, Math.round(gap[2] * 1000 / w)));
+    var b = Math.max(0, Math.min(1000, Math.round(gap[3] * 1000 / h)));
+    if (r <= l || b <= t) { return null; }
+    // A hint covering the whole picture is not a hint. Navigator hit exactly this and it is why the
+    // gap box is the biggest solid region rather than the extent of every stray pixel.
+    if ((r - l) > 900 && (b - t) > 900) { return null; }
+    return userPrompt + "\nThe region <bbox>" + l + " " + t + " " + r + " " + b + "</bbox> was left " +
+           "out of the previous decomposition - return the element occupying it as its own separate layer.";
+}
+
+/// Did the repair keep what was actually asked for?
+///
+/// Coverage alone is the wrong test. A repair is a fresh decomposition and can cover MORE while
+/// having separated different things - ask for "gold frame, leaping bass, water splash" and get back
+/// a tighter-covering set that merged the fish into the background. Adopting that on coverage would
+/// throw the request away and log it as an improvement.
+///
+/// Matching is loose on purpose, because fal renames freely ("leaping bass" comes back as "Jumping
+/// largemouth bass"): a requested name counts as kept when a returned name shares a word of four or
+/// more letters with it. Short words are ignored - "the", "and", "left" match anything.
+function repairKeptRequested(requested, returned) {
+    var wanted = [];
+    for (var i = 0; i < requested.length; i++) {
+        var t = String(requested[i]).replace(/^\s+|\s+$/g, "");
+        if (t.length && t.toLowerCase() !== "background") { wanted.push(t); }
+    }
+    if (!wanted.length) { return true; }        // nothing specific was asked for
+
+    function keywords(s) {
+        var parts = String(s).toLowerCase().split(/[^a-z0-9]+/), out = {};
+        for (var k = 0; k < parts.length; k++) { if (parts[k].length >= 4) { out[parts[k]] = true; } }
+        return out;
+    }
+    var returnedWords = {};
+    for (var r = 0; r < returned.length; r++) {
+        var kw = keywords(returned[r]);
+        for (var w in kw) { if (kw.hasOwnProperty(w)) { returnedWords[w] = true; } }
+    }
+    var kept = 0;
+    for (var q = 0; q < wanted.length; q++) {
+        var k2 = keywords(wanted[q]), any = false, empty = true;
+        for (var w2 in k2) {
+            if (!k2.hasOwnProperty(w2)) { continue; }
+            empty = false;
+            if (returnedWords[w2]) { any = true; break; }
+        }
+        // A request with no distinctive word cannot be checked; do not punish the repair for it.
+        if (empty || any) { kept++; }
+    }
+    // Losing more than a third of what was asked for is a DIFFERENT result, not a better one.
+    // Integer arithmetic on purpose: two-of-three is 0.6666... and would fail a `>= 0.67` test.
+    return kept * 3 >= wanted.length * 2;
+}
+
 // ===== SHARED WITH THE OTHER NAVIGATOR JSX — keep byte-identical (checked by rebuild.sh) =====
 /// Open a file, cleaning up after Photoshop when it opens the document but fails the call that
 /// returns it, and retrying once.
@@ -1472,6 +1714,45 @@ function openOrCleanUp(file) {
     }
 }
 // ===== END SHARED =====
+
+/// Split fal's reply into the base (z 0, no bounding box) and the real elements.
+///
+/// The base defines the coordinate space every box is measured in. It is used to read the canvas
+/// size but NEVER inserted: your own artwork is already in the document underneath, and for a
+/// transparent input the base is only a blank plate anyway.
+function splitResponse(layers) {
+    var base = null, elements = [];
+    for (var i = 0; i < layers.length; i++) {
+        var L = layers[i];
+        var hasBox = (L.bounding_box && L.bounding_box.absolute && L.bounding_box.absolute.length === 4);
+        if (!hasBox && base === null) { base = L; } else if (hasBox) { elements.push(L); }
+        log("  returned [" + i + "] z=" + (typeof L.z_index === "undefined" ? "?" : L.z_index) +
+            "  " + (L.name || "(unnamed)") +
+            (hasBox ? "  box=" + L.bounding_box.absolute.join(",")
+                    : "  NO BOX -> treated as the base" +
+                      (base === L ? " (kept for measuring, never inserted)"
+                                  : " -> DISCARDED, a second box-less entry")));
+    }
+    log("");
+    return { base: base, elements: elements };
+}
+
+/// Download every element to a temp PNG. Returns { set: [{e, file}], failed: [names] }.
+function downloadSet(elements) {
+    var set = [], failed = [];
+    for (var m = 0; m < elements.length; m++) {
+        var e = elements[m];
+        var lf = tempFile("layerize_layer_" + m + "_" + Math.floor(Math.random() * 9999), "png");
+        if (!e.image || !e.image.url || !downloadTo(e.image.url, lf)) {
+            log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") + ": DOWNLOAD FAILED  " +
+                ((e.image && e.image.url) ? e.image.url : "(no url)"));
+            failed.push((e.name || ("layer " + (m + 1))) + " (download failed)");
+            continue;
+        }
+        set.push({ e: e, file: lf });
+    }
+    return { set: set, failed: failed };
+}
 
 /// Place one layer PNG into `doc`, scaled from base-image space into the target rect.
 function placeLayer(doc, group, f, box, scaleX, scaleY, offsetX, offsetY, layerName) {
@@ -1607,24 +1888,8 @@ function run() {
 
         progress("Layerizing \u2014 this takes 2-3 minutes and Photoshop will be unresponsive\u2026");
         var got = requestLayerize(imageRef, key, promptText, selW, selH);
-        var layers = got.layers;
-
-        // The base (z_index 0, no bounding box) defines the coordinate space every box is measured
-        // in. It is downloaded to read its size but NOT inserted: your own artwork is already in the
-        // document underneath, and for a transparent input the base is only a blank plate anyway.
-        var baseEntry = null, elements = [];
-        for (var i = 0; i < layers.length; i++) {
-            var L = layers[i];
-            var hasBox = (L.bounding_box && L.bounding_box.absolute && L.bounding_box.absolute.length === 4);
-            if (!hasBox && baseEntry === null) { baseEntry = L; } else if (hasBox) { elements.push(L); }
-            log("  returned [" + i + "] z=" + (typeof L.z_index === "undefined" ? "?" : L.z_index) +
-                "  " + (L.name || "(unnamed)") +
-                (hasBox ? "  box=" + L.bounding_box.absolute.join(",")
-                        : "  NO BOX -> treated as the base" +
-                          (baseEntry === L ? " (kept for measuring, never inserted)"
-                                           : " -> DISCARDED, a second box-less entry")));
-        }
-        log("");
+        var split = splitResponse(got.layers);
+        var baseEntry = split.base, elements = split.elements;
         if (!elements.length) { throw new Error("fal separated nothing out of that area"); }
 
         var canvasW = 0, canvasH = 0;
@@ -1661,7 +1926,98 @@ function run() {
         // size, so everything is scaled by region / base.
         var scaleX = selW / canvasW, scaleY = selH / canvasH;
 
+        // --- download, measure, and repair BEFORE anything touches the document ------------------
+        //
+        // Downloading first is what makes the repair safe: a repair is a whole fresh decomposition,
+        // so if placement happened as layers arrived, a repair would have to undo half a group. This
+        // way the document is not touched until the winning set is settled.
+        progress("Downloading " + elements.length + " layers\u2026");
+        var chosen = downloadSet(elements);
+        if (!chosen.set.length) {
+            throw new Error("none of the returned layers could be downloaded:\n\u2022 " +
+                            chosen.failed.join("\n\u2022 "));
+        }
+        var failed = chosen.failed;
+        var current = measureCoverage(exported.file, chosen.set);
+        var coverageNote = "";
+        if (current !== null) {
+            var firstFraction = current.fraction;
+            var repairs = 0;
+            while (needsRepair(current.fraction, current.gap) && repairs < COVERAGE_MAX_REPAIRS) {
+                var rp = repairPromptFor(current.gap, current.w, current.h, promptText);
+                if (rp === null) {
+                    log("coverage: no usable region to point at - not repairing");
+                    break;
+                }
+                repairs++;
+                progress("Missing " + Math.round(current.fraction * 100) + "% \u2014 asking again for " +
+                         "the gap (repair " + repairs + " of " + COVERAGE_MAX_REPAIRS + ")\u2026");
+                log("coverage: repair " + repairs + " targeting " + current.gap.join(","));
+                var rr = null;
+                try { rr = requestLayerize(imageRef, key, rp, selW, selH); }
+                catch (re) { log("coverage: repair " + repairs + " call failed - " + describe(re)); break; }
+                got.seconds += rr.seconds;
+                got.attempts += rr.attempts;
+                var rsplit = splitResponse(rr.layers);
+                if (!rsplit.elements.length) { log("coverage: repair " + repairs + " separated nothing"); break; }
+                var candidate = downloadSet(rsplit.elements);
+                if (!candidate.set.length) { log("coverage: repair " + repairs + " downloaded nothing"); break; }
+                var next = measureCoverage(exported.file, candidate.set);
+                // STRICTLY better only. The same prompt measured 1.14% and 7.25% on one image, so a
+                // repair that ties must not replace what we have - otherwise a worse roll of the
+                // dice gets shipped in exchange for the extra call.
+                if (next === null || next.fraction >= current.fraction) {
+                    log("coverage: repair " + repairs + " was no better (" +
+                        (next === null ? "not measurable" : Math.round(next.fraction * 10000) / 100 + "%") +
+                        ") - keeping what we had");
+                    break;
+                }
+                var returnedNames = [];
+                for (var rn = 0; rn < candidate.set.length; rn++) {
+                    returnedNames.push(candidate.set[rn].e.name || "");
+                }
+                if (!repairKeptRequested(elementsInInstruction(promptText), returnedNames)) {
+                    log("coverage: repair " + repairs + " covered more but lost requested elements " +
+                        "- keeping the first result");
+                    break;
+                }
+                log("coverage: repair " + repairs + " adopted, " +
+                    Math.round(current.fraction * 10000) / 100 + "% -> " +
+                    Math.round(next.fraction * 10000) / 100 + "%");
+                chosen = candidate;
+                failed = candidate.failed;
+                current = next;
+            }
+            // Worded carefully. Placing IN PLACE means uncovered is not lost - the original is
+            // still underneath the group. What it actually costs you is that the leftover is not
+            // separately movable, which is the thing worth knowing.
+            var pct = Math.round(current.fraction * 10000) / 100;
+            coverageNote = (pct < 0.5)
+                ? "Every part of the artwork ended up in a layer"
+                : pct + "% of the artwork ended up in no layer, so it is not separately movable " +
+                  "\u2014 it is still there in your original underneath";
+            if (current.fraction < firstFraction) {
+                coverageNote += " (down from " + Math.round(firstFraction * 10000) / 100 + "% after " +
+                                repairs + " repair" + (repairs === 1 ? "" : "s") + ")";
+            }
+        }
+        elements = [];
+        for (var ci = 0; ci < chosen.set.length; ci++) { elements.push(chosen.set[ci].e); }
+        var fileFor = {};
+        for (var cj = 0; cj < chosen.set.length; cj++) { fileFor[cj] = chosen.set[cj].file; }
+
         elements.sort(function (a, b) { return (a.z_index || 0) - (b.z_index || 0); });
+        // Sorting reordered `elements`, so the download map is rebuilt against the sorted order.
+        var sortedFiles = [];
+        for (var si = 0; si < elements.length; si++) {
+            for (var sj = 0; sj < chosen.set.length; sj++) {
+                if (chosen.set[sj].e === elements[si]) { sortedFiles.push(chosen.set[sj].file); break; }
+            }
+        }
+
+        // Measuring opened and closed its own document; Photoshop refuses layerSets.add and
+        // activeLayer on a document that is not frontmost.
+        try { app.activeDocument = doc; } catch (ae) {}
 
         var group = doc.layerSets.add();
         group.name = "Layerized";
@@ -1697,11 +2053,9 @@ function run() {
             }
             progress("Placing layer " + (m + 1) + " of " + elements.length +
                      (e.name ? " \u2014 " + e.name : "") + "\u2026");
-            var lf = tempFile("layerize_layer_" + m, "png");
-            if (!e.image || !e.image.url || !downloadTo(e.image.url, lf)) {
-                log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") + ": DOWNLOAD FAILED  " +
-                    ((e.image && e.image.url) ? e.image.url : "(no url)"));
-                failed.push((e.name || ("layer " + m)) + " (download failed)");
+            var lf = sortedFiles[m];
+            if (!lf) {
+                failed.push((e.name || ("layer " + m)) + " (no downloaded file)");
                 continue;
             }
             log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") +
@@ -1738,6 +2092,7 @@ function run() {
         msg += "\n\n" + (got.attempts > 1 ? got.attempts + " calls, " : "") +
                Math.round(got.seconds) + "s, up to $" +
                (Math.round(got.seconds * 0.00017 * 1000) / 1000) + ".";
+        if (coverageNote.length) { msg += "\n\n" + coverageNote + "."; }
         msg += "\n\nSent " + selW + "x" + selH + ", " +
                (sentAlpha === false
                    ? "fully opaque \u2014 nothing in that area was transparent, so a visible layer was " +
