@@ -39,6 +39,18 @@
  * questioned again, so a rotated or mistyped-but-valid-looking one would need the file deleted by
  * hand.
  *
+ * CONNECTIONS: the dialog has a Connections button. It shows where the fal.ai key came from and
+ * lets you set or forget one, and it shows whether Vertex is signed in and can start that sign-in.
+ * Claude's own settings are tried FIRST for both, so a machine with the H5G plugins needs nothing;
+ * these controls exist for machines without them.
+ *
+ * THE LOG: every run writes a plain-text log to Documents/Navigator Layerize Logs, and its path is
+ * in the final message. It records the document's layers, exactly what was sent (including whether
+ * any transparency survived the flatten), fal's raw response verbatim, and the placement arithmetic
+ * for every layer. ExtendScript offers no console and no stack from the Scripts menu, so without it
+ * a bad run leaves no evidence at all. Tick "Keep images in the log folder" to also save what was
+ * sent and every layer that came back.
+ *
  * ANALYZE (optional, High 5 only): the dialog can ask Gemini what is worth separating in this
  * particular image and offer a few named plans. That runs on the company's metered Vertex service,
  * which is a browser sign-in rather than a key — so it needs the h5g-ai-connect skill installed and
@@ -105,6 +117,130 @@ var MAX_BYTES  = 30 * 1024 * 1024;
 
 var TEMP_FILES = [];
 var PROG = null;
+
+// ---------------------------------------------------------------- the log
+//
+// Every run writes one. ExtendScript gives you no console, no breakpoints and no stack when a script
+// is launched from the Scripts menu, so without this the only evidence of a bad run is whatever the
+// person watching can describe — and "it put white over everything" has at least four possible
+// causes that all look identical on screen. The log records what was in the document, exactly what
+// was sent, exactly what came back, and the placement arithmetic for every layer.
+//
+// It is plain text in a folder you can open, and its path is named in the final message.
+
+var LOG = [];
+var LOG_FILE = null;
+var KEEP_IMAGES = false;
+
+function logFolder() {
+    var docs = Folder.myDocuments;
+    var f = new Folder(docs.fsName + "/Navigator Layerize Logs");
+    if (!f.exists) { f.create(); }
+    return f;
+}
+
+function stamp() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? "0" : "") + n; }
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "_" +
+           p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+
+function logStart() {
+    LOG = [];
+    try { LOG_FILE = new File(logFolder().fsName + "/layerize_" + stamp() + ".txt"); }
+    catch (e) { LOG_FILE = null; }
+    log("Layerize Selection log");
+    log("when:       " + (new Date()).toString());
+    log("photoshop:  " + app.name + " " + app.version);
+    log("os:         " + $.os);
+    log("script:     " + (typeof $.fileName === "string" ? $.fileName : "(unknown)"));
+    log("");
+}
+
+function log(line) {
+    LOG.push(String(line));
+    // Flushed on every line, not at the end: if Photoshop dies or a call never returns, the log up
+    // to that point is the only thing that says where it stopped, and a log written at the end
+    // would be exactly the log that never gets written.
+    logFlush();
+}
+
+function logFlush() {
+    if (LOG_FILE === null) { return; }
+    try {
+        LOG_FILE.encoding = "UTF-8";
+        LOG_FILE.lineFeed = "Unix";
+        LOG_FILE.open("w");
+        LOG_FILE.write(LOG.join("\n") + "\n");
+        LOG_FILE.close();
+    } catch (e) { LOG_FILE = null; }      // a log that cannot be written must not break the run
+}
+
+/// Copy a file next to the log, so a bad image can be looked at instead of described. Only when the
+/// person asked for it: layer PNGs run to several MB each.
+function logKeep(f, asName) {
+    if (!KEEP_IMAGES || f === null) { return; }
+    try {
+        var dest = new File(logFolder().fsName + "/" + stamp() + "_" + asName);
+        f.copy(dest.fsName);
+        log("    kept: " + dest.fsName);
+    } catch (e) { log("    could not keep " + asName + ": " + e.message); }
+}
+
+/// A PNG's own header: dimensions and whether it carries alpha.
+///
+/// Read from the IHDR rather than asked of Photoshop, because this has to work on a file that was
+/// just downloaded and never opened. Bytes 16-23 are width and height, big-endian; byte 25 is the
+/// colour type, where 6 is RGBA and 4 is grey+alpha, and 0/2/3 carry no alpha at all.
+function pngInfo(f) {
+    try {
+        if (!f || !f.exists) { return null; }
+        f.encoding = "BINARY";
+        f.open("r");
+        var head = f.read(26);
+        f.close();
+        if (head.length < 26) { return null; }
+        function be32(at) {
+            return (head.charCodeAt(at) << 24) | (head.charCodeAt(at + 1) << 16) |
+                   (head.charCodeAt(at + 2) << 8) | head.charCodeAt(at + 3);
+        }
+        var colourType = head.charCodeAt(25);
+        return { w: be32(16), h: be32(20), colourType: colourType,
+                 hasAlpha: (colourType === 4 || colourType === 6), bytes: f.length };
+    } catch (e) { try { f.close(); } catch (ce) {} return null; }
+}
+
+function describePng(f) {
+    var i = pngInfo(f);
+    if (i === null) { return "not a readable PNG"; }
+    return i.w + "x" + i.h + ", " + Math.round(i.bytes / 1024) + " KB, colour type " +
+           i.colourType + (i.hasAlpha ? " (has alpha)" : " (NO alpha)");
+}
+
+/// Everything about the document that could explain a white result. Written before anything is
+/// flattened, because after the flatten the evidence is gone.
+function logDocument(doc) {
+    log("document:   " + doc.name);
+    log("  size:     " + doc.width.as("px") + " x " + doc.height.as("px") +
+        "  mode=" + doc.mode + "  depth=" + doc.bitsPerChannel);
+    log("  layers:   " + doc.layers.length + " at the top level");
+    for (var i = 0; i < doc.layers.length; i++) {
+        var L = doc.layers[i];
+        var line = "    [" + i + "] " + L.name + "   " + L.typename +
+                   "  visible=" + L.visible;
+        try { line += "  opacity=" + Math.round(L.opacity) + "%"; } catch (e) {}
+        try { line += "  blend=" + L.blendMode; } catch (e) {}
+        try { if (L.isBackgroundLayer === true) { line += "  *** BACKGROUND LAYER (opaque) ***"; } } catch (e) {}
+        try {
+            var b = L.bounds;
+            line += "  bounds=" + Math.round(b[0].as("px")) + "," + Math.round(b[1].as("px")) +
+                    "," + Math.round(b[2].as("px")) + "," + Math.round(b[3].as("px"));
+        } catch (e) {}
+        log(line);
+    }
+    log("");
+}
 
 // ---------------------------------------------------------------- small helpers
 
@@ -395,6 +531,173 @@ var PLAN_SYSTEM_PROMPT =
     "}\n" +
     "Order options best-first for this image.";
 
+// ---------------------------------------------------------------- Connections
+//
+// Both credentials get one place you can open on purpose, rather than only being asked when
+// something is already missing. There was previously no way at all to sign in to Vertex, and the
+// only way to change a fal key was a keyboard trick nobody would find.
+//
+// Claude's own settings are still tried FIRST for both, so a machine with the H5G plugins needs no
+// setup whatsoever. These controls are the fallback for a machine without them.
+
+/// Where node lives. Photoshop's PATH is not a shell's, so `node` alone usually resolves to nothing;
+/// the usual install locations are tried, then a login shell is asked as a last resort.
+function resolveNode() {
+    var fixed = ["/usr/local/bin/node", "/opt/homebrew/bin/node", "/usr/bin/node"];
+    if (!IS_WINDOWS) {
+        for (var i = 0; i < fixed.length; i++) {
+            if (new File(fixed[i]).exists) { return fixed[i]; }
+        }
+        // A login shell knows about nvm, fnm, asdf and anything else on the person's PATH.
+        var out = tempFile("nodepath", "txt");
+        app.system('/bin/bash -lc "command -v node" > "' + out.fsName + '" 2>/dev/null');
+        if (out.exists) {
+            out.open("r"); var t = out.read(); out.close();
+            t = String(t).replace(/^\s+|\s+$/g, "");
+            if (t.length && new File(t).exists) { return t; }
+        }
+        return null;
+    }
+    var win = ["C:\\Program Files\\nodejs\\node.exe", "C:\\Program Files (x86)\\nodejs\\node.exe"];
+    for (var w = 0; w < win.length; w++) { if (new File(win[w]).exists) { return win[w]; } }
+    return null;
+}
+
+/// The h5g-ai-connect client, which owns the Vertex sign-in. Null when the skill isn't installed.
+function resolveH5GClient() {
+    var home = homeDir();
+    if (!home) { return null; }
+    var candidates = [
+        home + "/.claude/skills/h5g-ai-connect/client.mjs",
+        home + "/Documents/h5g-ai-connect/skills/h5g-ai-connect/client.mjs",
+        home + "/Downloads/claude-plugins-main/plugins/h5g-ai-connect/skills/h5g-ai-connect/client.mjs"
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+        var c = new File(candidates[i]);
+        if (c.exists) { return c; }
+    }
+    return findClientInPluginCache(new Folder(home + "/.claude/plugins/cache"), 0);
+}
+
+/// Which source the fal key came from, without revealing the key itself.
+function falKeySource() {
+    if ($.getenv("FAL_KEY")) { return "the FAL_KEY environment variable"; }
+    if (readClaudeSettingsKey()) { return "Claude's settings.json"; }
+    if (readStoredKey()) { return "this script's saved key"; }
+    return null;
+}
+
+/// Open the Vertex sign-in in a Terminal window, because the flow is a browser round trip that
+/// needs a live console — Photoshop cannot host it, and a silent app.system would leave the person
+/// staring at nothing while a browser tab waits for them somewhere behind Photoshop.
+function startVertexSignIn() {
+    var node = resolveNode();
+    if (node === null) {
+        return "Node.js isn't installed, and the Vertex sign-in needs it. Install Node 18 or newer, " +
+               "or ask for a fal.ai key instead \u2014 layerizing itself doesn't use Vertex.";
+    }
+    var client = resolveH5GClient();
+    if (client === null) {
+        return "The h5g-ai-connect skill isn't on this Mac, so there's nothing to sign in to. " +
+               "Analyze is a High 5 extra; everything else works with just a fal.ai key.";
+    }
+    try {
+        if (IS_WINDOWS) {
+            app.system('start "Vertex sign-in" cmd /k ""' + node + '" "' + client.fsName + '" login"');
+        } else {
+            // Run it from a script file: quoting a nested osascript/Terminal command inline is how
+            // you get a command that works on one machine and not the next.
+            var sh = new File(Folder.temp.fsName + "/navigator_vertex_login.command");
+            sh.encoding = "UTF-8"; sh.lineFeed = "Unix"; sh.open("w");
+            sh.write('#!/bin/bash\n"' + node + '" "' + client.fsName + '" login\n' +
+                     'echo\necho "You can close this window and click Re-check in Photoshop."\n');
+            sh.close();
+            app.system('chmod +x "' + sh.fsName + '"');
+            app.system('open -a Terminal "' + sh.fsName + '"');
+        }
+    } catch (e) { return "Couldn't start the sign-in: " + e.message; }
+    return null;
+}
+
+/// The connections panel: what is configured, and how to change it.
+function showConnections() {
+    var w = new Window("dialog", "Layerize Connections");
+    w.alignChildren = "fill";
+    w.margins = 16;
+
+    var falPanel = w.add("panel", undefined, "fal.ai  \u2014  required, does the layerizing");
+    falPanel.alignChildren = "fill";
+    falPanel.margins = 12;
+    var falStatus = falPanel.add("statictext", undefined, "", { truncate: "middle" });
+    falStatus.preferredSize.width = 440;
+    var falRow = falPanel.add("group");
+    var setKey = falRow.add("button", undefined, "Set key\u2026");
+    var forgetKey = falRow.add("button", undefined, "Forget saved key");
+
+    var vxPanel = w.add("panel", undefined, "Vertex  \u2014  optional, only powers Analyze image");
+    vxPanel.alignChildren = "fill";
+    vxPanel.margins = 12;
+    var vxStatus = vxPanel.add("statictext", undefined, "", { multiline: true });
+    vxStatus.preferredSize = [440, 44];
+    var vxRow = vxPanel.add("group");
+    var signIn = vxRow.add("button", undefined, "Sign in to Vertex\u2026");
+    var recheck = vxRow.add("button", undefined, "Re-check");
+
+    function refresh() {
+        var src = falKeySource();
+        falStatus.text = (src === null) ? "No key set \u2014 layerizing cannot run without one."
+                                        : "Key found in " + src + ".";
+        forgetKey.enabled = (readStoredKey() !== null);
+
+        var tok = h5gToken(), url = h5gServiceURL();
+        if (tok !== null && url !== null) {
+            vxStatus.text = "Signed in. Analyze is available.";
+        } else if (resolveH5GClient() === null) {
+            vxStatus.text = "The h5g-ai-connect skill isn't installed on this Mac, so Analyze is " +
+                            "unavailable. Everything else works with just a fal.ai key.";
+        } else if (tok === null) {
+            vxStatus.text = "Not signed in. Sign in once and it lasts about 30 days.";
+        } else {
+            vxStatus.text = "Signed in, but the service address couldn't be read from the installed " +
+                            "client. Analyze is unavailable; layerizing is unaffected.";
+        }
+        signIn.enabled = (resolveH5GClient() !== null);
+    }
+    refresh();
+
+    setKey.onClick = function () { if (askForKey() !== null) { refresh(); } };
+    forgetKey.onClick = function () { forgetStoredKey(); refresh(); };
+    signIn.onClick = function () {
+        var err = startVertexSignIn();
+        vxStatus.text = (err === null)
+            ? "A Terminal window is finishing the sign-in \u2014 pick your @high5games.com account in " +
+              "the browser, then click Re-check."
+            : err;
+    };
+    recheck.onClick = refresh;
+
+    var foot = w.add("group");
+    foot.alignment = "right";
+    foot.add("button", undefined, "Done", { name: "ok" });
+    w.show();
+}
+
+/// Record the credential situation in the log, without ever writing a key or token into it.
+function logConnections() {
+    log("connections:");
+    var src = falKeySource();
+    log("  fal.ai key:   " + (src === null ? "NOT SET" : "found in " + src));
+    var home = homeDir();
+    log("  home dir:     " + (home ? home : "*** $.getenv could not resolve it ***"));
+    var client = resolveH5GClient();
+    log("  h5g client:   " + (client === null ? "not installed" : client.fsName));
+    log("  vertex token: " + (h5gToken() === null ? "not signed in" : "present"));
+    var url = h5gServiceURL();
+    log("  service url:  " + (url === null ? "could not be resolved" : "resolved"));
+    log("  analyze:      " + ((h5gToken() !== null && url !== null) ? "available" : "unavailable"));
+    log("");
+}
+
 /// A gateway hiccup, not a real refusal — worth retrying rather than reporting. Observed live: the
 /// vision endpoint answered `HTTP 502: {"error":"Vertex 502: <!DOCTYPE html>…` mid-session.
 function isTransientError(msg) {
@@ -618,7 +921,14 @@ function askElements(thumbFile) {
     foot.graphics.font = ScriptUI.newFont(foot.graphics.font.name, "italic", 10);
 
     var row = w.add("group");
-    row.alignment = "right";
+    row.alignment = "fill";
+    var conn = row.add("button", undefined, "Connections\u2026");
+    conn.preferredSize.width = 116;
+    conn.helpTip = "Set the fal.ai key, or sign in to Vertex for Analyze";
+    var keep = row.add("checkbox", undefined, "Keep images in the log folder");
+    keep.helpTip = "Saves what was sent and every layer that came back, for working out a bad result";
+    var spacer = row.add("group");
+    spacer.alignment = "fill";
     var cancel = row.add("button", undefined, "Cancel", { name: "cancel" });
     var ok = row.add("button", undefined, "Layerize", { name: "ok" });
 
@@ -626,16 +936,24 @@ function askElements(thumbFile) {
     // unavailable it says exactly which one is missing. A coworker who has just pasted a fal key and
     // then sees a dead button will otherwise conclude the key was wrong.
     var plan = null;
-    if (thumbFile === null || thumbFile === undefined) {
-        analyze.enabled = false;
-        status.text = "Analyze needs the flattened area, which isn't available here \u2014 type the elements.";
-    } else if (h5gToken() === null) {
-        analyze.enabled = false;
-        status.text = "Analyze is High 5 only (Vertex sign-in). Your fal.ai key is fine \u2014 just type the elements.";
-    } else if (h5gServiceURL() === null) {
-        analyze.enabled = false;
-        status.text = "Analyze needs the h5g-ai-connect skill installed. Typing the elements works without it.";
+    function refreshAnalyze() {
+        if (thumbFile === null || thumbFile === undefined) {
+            analyze.enabled = false;
+            status.text = "Analyze needs the flattened area, which isn't available here \u2014 type the elements.";
+        } else if (h5gToken() === null) {
+            analyze.enabled = false;
+            status.text = "Analyze needs a Vertex sign-in \u2014 click Connections. Your fal.ai key is unrelated.";
+        } else if (h5gServiceURL() === null) {
+            analyze.enabled = false;
+            status.text = "Analyze needs the h5g-ai-connect skill installed. Typing the elements works without it.";
+        } else {
+            analyze.enabled = true;
+            status.text = "";
+        }
     }
+    refreshAnalyze();
+    conn.onClick = function () { showConnections(); refreshAnalyze(); };
+    keep.onClick = function () { KEEP_IMAGES = (keep.value === true); };
 
     function showOption(index, append) {
         if (plan === null || index < 0 || index >= plan.options.length) { return; }
@@ -726,6 +1044,9 @@ function exportRegion(doc, x1, y1, x2, y2, maxDim) {
             w = cropDoc.width.as("px"); h = cropDoc.height.as("px");
         }
 
+        log("  merged copy: " + w + "x" + h + ", layers in the copy=" + cropDoc.layers.length +
+            ", bottom isBackgroundLayer=" +
+            (cropDoc.layers[cropDoc.layers.length - 1].isBackgroundLayer === true));
         var f = tempFile("layerize_in", "png");
         var opts = new PNGSaveOptions();
         opts.compression = 6;
@@ -767,7 +1088,10 @@ function uploadToFal(f, key) {
     var code = curl('-s -o "' + sink.fsName + '" -w "%{http_code}" -X PUT ' +
                     '-H "Content-Type: image/png" --data-binary @"' + f.fsName + '" "' +
                     j.upload_url + '"');
-    if (!code || String(code).replace(/[\r\n]/g, "").indexOf("200") !== 0) { return null; }
+    if (!code || String(code).replace(/[\r\n]/g, "").indexOf("200") !== 0) {
+        log("  upload PUT did not return 200: " + String(code).substring(0, 80));
+        return null;
+    }
     return j.file_url;
 }
 
@@ -804,10 +1128,22 @@ function requestLayerize(imageRef, key, promptText) {
     }));
     payload.close();
 
+    log("");
+    log("--- request to fal ---");
+    log("endpoint:   " + LAYERIZE_ENDPOINT);
+    log("image_size: auto      enhance_prompt_mode: standard");
+    log("prompt:     " + promptText.replace(/\n/g, "\n            "));
+    log("");
     var resp = curl('-s -S -X POST -H "Authorization: Key ' + key + '" ' +
                     '-H "Content-Type: application/json" -H "Accept: application/json" ' +
                     '"' + LAYERIZE_ENDPOINT + '" -d @"' + payload.fsName + '"');
     if (!resp) { throw new Error("no response from fal (is curl available?)"); }
+    // The whole reply, verbatim. It is metadata and URLs, a few KB, and it is the ONLY record of
+    // what fal decided - including whether it handed back a full-canvas backdrop as an element.
+    log("--- raw response from fal ---");
+    log(String(resp));
+    log("--- end of response ---");
+    log("");
     var j;
     try { j = JSON.parse(resp); } catch (e) {
         throw new Error("fal returned something that isn't JSON: " + resp.substring(0, 200));
@@ -826,25 +1162,6 @@ function requestLayerize(imageRef, key, promptText) {
     }
     if (!j.layers || !j.layers.length) { throw new Error("fal returned no layers"); }
     return j.layers;
-}
-
-/// True when a PNG carries an alpha channel, read from the IHDR rather than asked of Photoshop.
-///
-/// Byte 25 of a PNG is the colour type: 6 is RGBA and 4 is grey+alpha; 2 and 0 have no alpha at
-/// all. This is the one fact that settles "did white get baked into what we sent" — Photoshop
-/// writes an RGB PNG exactly when the flattened area has no transparency left, which happens when
-/// a visible layer is covering it. Reported rather than judged: a scene with no transparency is
-/// perfectly normal, and only the person looking at the document knows which they meant.
-function pngHasAlpha(f) {
-    try {
-        f.encoding = "BINARY";
-        f.open("r");
-        var head = f.read(26);
-        f.close();
-        if (head.length < 26) { return null; }
-        var colourType = head.charCodeAt(25);
-        return (colourType === 4 || colourType === 6);
-    } catch (e) { try { f.close(); } catch (ce) {} return null; }
 }
 
 function downloadTo(url, f) {
@@ -931,6 +1248,7 @@ function placeLayer(doc, group, f, box, scaleX, scaleY, offsetX, offsetY, layerN
 function run() {
     if (app.documents.length === 0) { alert("Open a document first."); return; }
     var doc = app.activeDocument;
+    logStart();
 
     var priorUnits = app.preferences.rulerUnits;
     app.preferences.rulerUnits = Units.PIXELS;
@@ -946,9 +1264,12 @@ function run() {
     var savedSelection = null;
 
     try {
+        logDocument(doc);
+        logConnections();
+
         // Prompts for a key if none is configured; null means the user cancelled that dialog.
         var key = falKey();
-        if (!key) { return; }
+        if (!key) { log("no fal.ai key - the person cancelled the key dialog"); return; }
 
         // Selection if there is one, otherwise the whole canvas.
         var x1 = 0, y1 = 0, x2 = doc.width.as("px"), y2 = doc.height.as("px");
@@ -991,10 +1312,12 @@ function run() {
 
         progressDone();
         var promptText = askElements(thumb);
-        if (promptText === null) { return; }
+        if (promptText === null) { log("the person cancelled the element dialog"); return; }
 
         progress("Flattening " + selW + "x" + selH + "\u2026");
         var exported = exportRegion(doc, x1, y1, x2, y2);
+        log("sent to fal: " + describePng(exported.file));
+        logKeep(exported.file, "sent_to_fal.png");
         if (exported.file.length > MAX_BYTES) {
             throw new Error("the flattened area is " + Math.round(exported.file.length / 1048576) +
                             " MB, over fal's 30 MB limit \u2014 select a smaller area");
@@ -1003,7 +1326,8 @@ function run() {
         // Recorded before the upload so the final message can say what was actually sent. "It added
         // white over everything" is impossible to act on; "what we sent was fully opaque" points
         // straight at a visible layer in the document, and its opposite clears the export entirely.
-        var sentAlpha = pngHasAlpha(exported.file);
+        var sentAlpha = pngInfo(exported.file);
+        sentAlpha = (sentAlpha === null) ? null : sentAlpha.hasAlpha;
 
         progress("Uploading " + Math.round(exported.file.length / 1048576 * 10) / 10 + " MB\u2026");
         var imageRef = uploadToFal(exported.file, key);
@@ -1024,7 +1348,14 @@ function run() {
             var L = layers[i];
             var hasBox = (L.bounding_box && L.bounding_box.absolute && L.bounding_box.absolute.length === 4);
             if (!hasBox && baseEntry === null) { baseEntry = L; } else if (hasBox) { elements.push(L); }
+            log("  returned [" + i + "] z=" + (typeof L.z_index === "undefined" ? "?" : L.z_index) +
+                "  " + (L.name || "(unnamed)") +
+                (hasBox ? "  box=" + L.bounding_box.absolute.join(",")
+                        : "  NO BOX -> treated as the base" +
+                          (baseEntry === L ? " (kept for measuring, never inserted)"
+                                           : " -> DISCARDED, a second box-less entry")));
         }
+        log("");
         if (!elements.length) { throw new Error("fal separated nothing out of that area"); }
 
         var canvasW = 0, canvasH = 0;
@@ -1082,13 +1413,32 @@ function run() {
                      (e.name ? " \u2014 " + e.name : "") + "\u2026");
             var lf = tempFile("layerize_layer_" + m, "png");
             if (!e.image || !e.image.url || !downloadTo(e.image.url, lf)) {
+                log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") + ": DOWNLOAD FAILED  " +
+                    ((e.image && e.image.url) ? e.image.url : "(no url)"));
                 failed.push((e.name || ("layer " + m)) + " (download failed)");
                 continue;
             }
+            log("  layer " + (m + 1) + " " + (e.name || "(unnamed)") +
+                "\n      png:   " + describePng(lf) +
+                "\n      box:   " + bx.join(",") + "   in a " + canvasW + "x" + canvasH + " canvas" +
+                "\n      onto:  " + Math.round((bx[2] - bx[0]) * scaleX) + "x" +
+                Math.round((bx[3] - bx[1]) * scaleY) + " at " +
+                Math.round(x1 + bx[0] * scaleX) + "," + Math.round(y1 + bx[1] * scaleY) +
+                (fullCanvasElements.length &&
+                 fullCanvasElements[fullCanvasElements.length - 1] === (e.name || ("layer " + (m + 1)))
+                     ? "\n      *** covers the whole area ***" : ""));
+            logKeep(lf, "layer" + (m + 1) + "_" + String(e.name || "unnamed").replace(/[^A-Za-z0-9]+/g, "_") + ".png");
             try {
-                placeLayer(doc, group, lf, e.bounding_box.absolute, scaleX, scaleY, x1, y1, e.name);
+                var placedLayer = placeLayer(doc, group, lf, e.bounding_box.absolute, scaleX, scaleY, x1, y1, e.name);
+                try {
+                    var pb = placedLayer.bounds;
+                    log("      final: " + Math.round(pb[2].as("px") - pb[0].as("px")) + "x" +
+                        Math.round(pb[3].as("px") - pb[1].as("px")) + " at " +
+                        Math.round(pb[0].as("px")) + "," + Math.round(pb[1].as("px")));
+                } catch (be) {}
                 placed++;
             } catch (pe) {
+                log("      PLACEMENT FAILED: " + describe(pe));
                 failed.push((e.name || ("layer " + m)) + " \u2014 " + describe(pe));
             }
         }
@@ -1102,6 +1452,7 @@ function run() {
                    ? "fully opaque \u2014 nothing in that area was transparent, so a visible layer was " +
                      "covering it. Hide it and run again if you meant to send a cutout."
                    : "transparency intact.");
+        if (LOG_FILE !== null) { msg += "\n\nLog: " + LOG_FILE.fsName; }
         if (fullCanvasElements.length) {
             msg += "\n\nCovering the whole area: " + fullCanvasElements.join(", ") +
                    ". If that hides your artwork, delete it \u2014 it is fal's own backdrop, not " +
@@ -1110,7 +1461,10 @@ function run() {
         alert(msg);
     } catch (e) {
         progressDone();
-        alert("Layerize failed:\n\n" + describe(e));
+        log("");
+        log("FAILED: " + describe(e));
+        alert("Layerize failed:\n\n" + describe(e) +
+              (LOG_FILE === null ? "" : "\n\nLog: " + LOG_FILE.fsName));
     } finally {
         progressDone();
         if (savedSelection !== null) {
