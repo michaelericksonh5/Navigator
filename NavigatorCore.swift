@@ -3876,6 +3876,56 @@ enum ShareURLRules {
 /// NetFSMountURLSync reports POSIX errno values. Telling a coworker "check the address and that
 /// you're on the VPN" for every failure is a guess that makes them doubt the part they got right —
 /// and on these shares the VPN is the usual culprit, so it's worth naming precisely.
+/// A network folder that hangs because macOS is stuck trying to mount it, not because the share is
+/// down.
+///
+/// Measured on a real domain share: /Volumes/Games listed instantly while /Volumes/Games/artSource
+/// hung a plain `ls` indefinitely, with a mount_url helper for that exact path running for five and
+/// a half minutes and never producing a mount. Those subfolders are DFS links — listing the parent
+/// makes macOS auto-mount each one, and a referral whose target is unreachable simply never returns.
+///
+/// This matters because the existing "isn't responding" panel offered to RECONNECT THE SHARE, and
+/// the share was never the problem: reconnecting a healthy parent does nothing for a wedged child.
+/// The stuck helper has to be cancelled instead.
+enum StuckMountRules {
+    /// PIDs of mount helpers wedged on `path`, parsed from `ps -Ao pid=,command=` output.
+    ///
+    /// Matched on the MOUNTPOINT argument, which is the last path on the line, rather than anywhere
+    /// in the command: the same line also carries the smb:// source, and matching that would let a
+    /// helper working on a different mountpoint of the same share be killed.
+    static func wedgedPIDs(psOutput: String, mountPoint path: String) -> [Int32] {
+        var out: [Int32] = []
+        let target = path.hasSuffix("/") ? String(path.dropLast()) : path
+        guard !target.isEmpty, target != "/" else { return [] }
+        for line in psOutput.split(separator: "\n") {
+            let text = String(line)
+            guard text.contains("mount_url") || text.contains("mount_smbfs") else { continue }
+            // The mountpoint is the trailing argument. Compared whole so /Volumes/Games never
+            // matches a helper for /Volumes/Games Extra.
+            guard text.hasSuffix(" " + target) || text.hasSuffix("\t" + target) else { continue }
+            let head = text.trimmingCharacters(in: .whitespaces)
+            let pidText = head.prefix(while: { $0.isNumber })
+            if let pid = Int32(pidText), pid > 1 { out.append(pid) }
+        }
+        return out
+    }
+
+    /// What to tell someone whose folder will not open, given whether a helper is wedged on it.
+    static func explain(name: String, wedged: Bool) -> (title: String, detail: String, action: String?) {
+        if wedged {
+            return ("macOS is stuck mounting “\(name)”",
+                    "The drive itself is fine — this folder is a link to another server, and macOS "
+                    + "has been trying to connect to it without giving up. Cancelling that attempt "
+                    + "releases the folder. Nothing is lost, and no files are touched.",
+                    "Cancel the Stuck Mount")
+        }
+        return ("“\(name)” isn’t responding",
+                "The network drive stopped answering. Reconnecting drops the stuck connection and "
+                + "mounts the share again.",
+                nil)
+    }
+}
+
 enum MountFailureRules {
     enum Cause: Equatable { case unreachable, credentials, noSuchShare, cancelled, other }
 

@@ -3414,6 +3414,39 @@ enum VertexStatus {
     }
 }
 
+/// Report a failed mount, and on a credentials failure offer the one action that fixes the common
+/// cause: a password that changed while macOS kept the old one.
+///
+/// Without this the alert said "check the username and password" and left you there — but there was
+/// nothing to check, because the saved entry was being used silently and it was simply out of date.
+func reportMountFailure(cause: MountFailureRules.Cause, host: String, retry: (() -> Void)? = nil) {
+    guard let msg = MountFailureRules.message(for: cause, host: host) else { return }
+    let a = NSAlert()
+    a.messageText = msg.title
+    if cause == .credentials {
+        a.informativeText = msg.detail
+            + "\n\nIf your work password changed recently, macOS is probably still offering the old "
+            + "one it saved. Forgetting it makes the next connection ask for your password again."
+        a.addButton(withTitle: "Forget Saved Password & Retry")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let removed = Browser.forgetSavedPassword(host: host)
+        if let retry { retry() }
+        if removed == 0 {
+            let none = NSAlert()
+            none.messageText = "No saved password to forget"
+            none.informativeText = "macOS had nothing stored for “\(host)”, so the refusal wasn’t a "
+                                 + "stale password. Check the username, and that the account isn’t locked."
+            none.addButton(withTitle: "OK")
+            none.runModal()
+        }
+        return
+    }
+    a.informativeText = msg.detail
+    a.addButton(withTitle: "OK")
+    a.runModal()
+}
+
 func promptVertexSetup() {
     let a = NSAlert(); a.alertStyle = .informational
     a.messageText = "Set up Vertex on this Mac"
@@ -6750,9 +6783,15 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     // Name the actual cause rather than blaming the VPN unconditionally: a
                     // reachable server that rejected the login needs the opposite advice.
                     let cause = MountFailureRules.cause(errno: attempt.rc)
-                    if let msg = MountFailureRules.message(for: cause,
-                                                          host: info.share.host ?? "the server") {
-                        reportFileError(msg.title, msg.detail, permissionHint: false)
+                    let host = info.share.host ?? "the server"
+                    let share = info.share
+                    reportMountFailure(cause: cause, host: host) { [weak self] in
+                        // Retry immediately after forgetting the stale entry, so the person gets the
+                        // password prompt there and then instead of having to find their way back.
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            _ = Browser.mountShareReporting(share)
+                            DispatchQueue.main.async { self?.load() }
+                        }
                     }
                     return
                 }
@@ -6801,6 +6840,56 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // pop an authentication sheet out of nowhere, so it only succeeds when the
     // credentials are already in the keychain. Clicking a favorite still uses the
     // interactive mountShare below.
+    /// PIDs of mount helpers wedged on `url`. See StuckMountRules for why this exists.
+    static func wedgedMountPIDs(for url: URL) -> [Int32] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-Ao", "pid=,command="]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        return StuckMountRules.wedgedPIDs(psOutput: text, mountPoint: url.path)
+    }
+
+    /// Cancel the stuck attempt. SIGTERM first, and only then SIGKILL: a helper that can still tidy
+    /// up after itself should be allowed to. These are the user's OWN processes - mount helpers run
+    /// as the person who triggered them - so no privilege escalation is involved and nothing is
+    /// unmounted: the mount never completed, which is the whole problem.
+    static func cancelWedgedMounts(for url: URL) -> Int {
+        let pids = wedgedMountPIDs(for: url)
+        guard !pids.isEmpty else { return 0 }
+        navLog("stuck mount: cancelling \(pids.count) helper(s) wedged on \(url.path) — pids \(pids)")
+        for pid in pids { kill(pid, SIGTERM) }
+        // Give them a moment, then insist for anything that ignored it.
+        Thread.sleep(forTimeInterval: 1.0)
+        for pid in pids where kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+        return pids.count
+    }
+
+    /// Remove the saved password macOS keeps for a file server, so the next connection asks again.
+    ///
+    /// This is the answer to "what happens when the domain password changes": macOS stores the old
+    /// one as an internet password and keeps offering it, so the mount fails against a server that
+    /// is reachable and a share that exists, with nothing on screen explaining why. Deleting the
+    /// entry is what makes the next attempt prompt. Only ever called from the credentials-failure
+    /// alert, and only for the host that just refused.
+    static func forgetSavedPassword(host: String) -> Int {
+        var removed = 0
+        for proto in [kSecAttrProtocolSMB, kSecAttrProtocolAFP] {
+            let q: [String: Any] = [
+                kSecClass as String: kSecClassInternetPassword,
+                kSecAttrServer as String: host,
+                kSecAttrProtocol as String: proto,
+            ]
+            let rc = SecItemDelete(q as CFDictionary)
+            if rc == errSecSuccess { removed += 1 }
+        }
+        navLog("keychain: forgot \(removed) saved password entr\(removed == 1 ? "y" : "ies") for \(host)")
+        return removed
+    }
+
     static func mountShareSilently(_ url: URL) -> String? {
         let opts = NSMutableDictionary()
         opts[kNAUIOptionKey] = kNAUIOptionNoUI
@@ -14703,21 +14792,56 @@ final class GetInfoController {
 // actually help: reconnect the share, or stop waiting and go somewhere useful.
 struct StalledShareView: View {
     @ObservedObject var browser: Browser
+    /// Checked when the panel appears, not on every redraw: it shells out to ps.
+    @State private var wedged = false
+    @State private var checked = false
+
+    private var text: (title: String, detail: String, action: String?) {
+        StuckMountRules.explain(name: browser.currentURL.lastPathComponent, wedged: wedged)
+    }
+
     var body: some View {
         VStack(spacing: 14) {
-            Image(systemName: "wifi.exclamationmark").font(.system(size: 38)).foregroundStyle(.orange)
-            Text("“\(browser.currentURL.lastPathComponent)” isn’t responding").font(.headline)
-            Text("The network drive stopped answering. Reconnecting drops the stuck connection and mounts the share again.")
+            Image(systemName: wedged ? "externaldrive.badge.exclamationmark" : "wifi.exclamationmark")
+                .font(.system(size: 38)).foregroundStyle(.orange)
+            Text(text.title).font(.headline)
+            Text(text.detail)
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 420)
             HStack(spacing: 10) {
-                Button("Reconnect") { browser.reconnectShare() }.keyboardShortcut(.defaultAction)
+                if let label = text.action {
+                    // The parent share is healthy in this case, so cancelling the wedged attempt is
+                    // the fix and Reconnect is not offered as the default.
+                    Button(label) {
+                        let target = browser.currentURL
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let n = Browser.cancelWedgedMounts(for: target)
+                            DispatchQueue.main.async {
+                                wedged = false
+                                browser.networkStalled = false
+                                if n > 0 { Browser.invalidateCache(target.path); browser.load() }
+                                else { browser.goUp() }
+                            }
+                        }
+                    }.keyboardShortcut(.defaultAction)
+                } else {
+                    Button("Reconnect") { browser.reconnectShare() }.keyboardShortcut(.defaultAction)
+                }
                 Button("Stop Waiting") { browser.networkStalled = false; browser.busy = false; browser.busyText = "" }
                 Button("Go Up") { browser.networkStalled = false; browser.goUp() }
             }
         }
         .padding(30)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            guard !checked else { return }
+            checked = true
+            let target = browser.currentURL
+            DispatchQueue.global(qos: .utility).async {
+                let hit = !Browser.wedgedMountPIDs(for: target).isEmpty
+                DispatchQueue.main.async { wedged = hit }
+            }
+        }
     }
 }
 
@@ -17983,12 +18107,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             let attempt = Browser.mountShareReporting(url)
             guard let mp = attempt.mountPoint else {
                 let cause = MountFailureRules.cause(errno: attempt.rc)
-                guard let msg = MountFailureRules.message(for: cause, host: url.host ?? "the server") else { return }
+                let host = url.host ?? "the server"
                 DispatchQueue.main.async {
-                    let a = NSAlert()
-                    a.messageText = msg.title
-                    a.informativeText = msg.detail
-                    a.runModal()
+                    reportMountFailure(cause: cause, host: host) {
+                        DispatchQueue.global(qos: .userInitiated).async { _ = Browser.mountShareReporting(url) }
+                    }
                 }
                 return
             }

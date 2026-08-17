@@ -5407,4 +5407,58 @@ final class LayerAssemblyRulesTests: XCTestCase {
         XCTAssertTrue(NodeVersion.isDescending("v20.9.2", "v20.9.1"))
         XCTAssertFalse(NodeVersion.isDescending("v20.9.1", "v20.9.2"))
     }
+
+    // MARK: - Stuck network mounts
+
+    /// Real output shape, from the machine where /Volumes/Games/artSource hung indefinitely.
+    private var realPS: String {
+        """
+        11299 /usr/libexec/mount_url -n -o nobrowse -o nosuid,nodev -o soft -o automounted -o nosuid smb://user@CORP-DC01.High5.local/Games/artSource /Volumes/Games/artSource
+        11498 /usr/libexec/mount_url -n -o nobrowse -o nosuid,nodev -o soft -o automounted -o nosuid smb://user@CORP-DC01.High5.local/Games/Zero Gravity /Volumes/Games/Zero Gravity
+        4409 /Applications/Navigator.app/Contents/MacOS/Navigator
+        """
+    }
+
+    func testFindsTheHelperWedgedOnExactlyThisFolder() {
+        XCTAssertEqual(StuckMountRules.wedgedPIDs(psOutput: realPS,
+                                                  mountPoint: "/Volumes/Games/artSource"), [11299])
+        XCTAssertEqual(StuckMountRules.wedgedPIDs(psOutput: realPS,
+                                                  mountPoint: "/Volumes/Games/Zero Gravity"), [11498])
+    }
+
+    /// The share ROOT must never match a child's helper — killing those would be unrelated damage.
+    func testParentShareDoesNotMatchAChildsHelper() {
+        XCTAssertTrue(StuckMountRules.wedgedPIDs(psOutput: realPS, mountPoint: "/Volumes/Games").isEmpty)
+    }
+
+    /// A prefix must not match: /Volumes/Games/art is not /Volumes/Games/artSource.
+    func testPrefixDoesNotMatch() {
+        XCTAssertTrue(StuckMountRules.wedgedPIDs(psOutput: realPS, mountPoint: "/Volumes/Games/art").isEmpty)
+    }
+
+    func testIgnoresNonMountProcessesAndNonsense() {
+        XCTAssertTrue(StuckMountRules.wedgedPIDs(psOutput: realPS, mountPoint: "/Applications/Navigator.app/Contents/MacOS/Navigator").isEmpty)
+        XCTAssertTrue(StuckMountRules.wedgedPIDs(psOutput: "", mountPoint: "/Volumes/Games/artSource").isEmpty)
+        XCTAssertTrue(StuckMountRules.wedgedPIDs(psOutput: realPS, mountPoint: "").isEmpty)
+        XCTAssertTrue(StuckMountRules.wedgedPIDs(psOutput: realPS, mountPoint: "/").isEmpty)
+    }
+
+    /// A trailing slash is the same folder.
+    func testTrailingSlashStillMatches() {
+        XCTAssertEqual(StuckMountRules.wedgedPIDs(psOutput: realPS,
+                                                  mountPoint: "/Volumes/Games/artSource/"), [11299])
+    }
+
+    /// The wedged case must NOT advise reconnecting the share, which was the old blanket advice and
+    /// is useless when the parent share is healthy.
+    func testWedgedAdviceDoesNotSayReconnect() {
+        let w = StuckMountRules.explain(name: "artSource", wedged: true)
+        XCTAssertTrue(w.title.contains("stuck mounting"))
+        XCTAssertFalse(w.detail.lowercased().contains("reconnect"))
+        XCTAssertEqual(w.action, "Cancel the Stuck Mount")
+
+        let plain = StuckMountRules.explain(name: "Games", wedged: false)
+        XCTAssertTrue(plain.detail.lowercased().contains("reconnect"))
+        XCTAssertNil(plain.action)
+    }
 }
