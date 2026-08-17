@@ -2236,7 +2236,7 @@ final class ViewOptionsLRUTests: XCTestCase {
         lru.set(opts("icon"), for: "/tmp/a")
         lru.set(opts("gallery"), for: "/tmp/a")
         XCTAssertEqual(lru.count, 1)
-        XCTAssertEqual(lru.order, ["/tmp/a"])
+        XCTAssertEqual(lru.order, ["/private/tmp/a"])   // canonical: firmlinks resolve INTO /private
         XCTAssertEqual(lru.value(for: "/tmp/a")?.viewMode, "gallery")
     }
 
@@ -2301,7 +2301,7 @@ final class ViewOptionsLRUTests: XCTestCase {
         lru.set(opts("icon"), for: "/tmp/b")
         let back = try JSONDecoder().decode(ViewOptionsLRU.self, from: JSONEncoder().encode(lru))
         XCTAssertEqual(back, lru)
-        XCTAssertEqual(back.order, ["/tmp/b", "/tmp/a"])
+        XCTAssertEqual(back.order, ["/private/tmp/b", "/private/tmp/a"])
     }
 }
 
@@ -3084,7 +3084,7 @@ final class FolderPlaceLRUTests: XCTestCase {
         lru.set(place("f1"), for: "/tmp/a")
         lru.set(place("f2"), for: "/tmp/a")
         XCTAssertEqual(lru.count, 1)
-        XCTAssertEqual(lru.order, ["/tmp/a"])
+        XCTAssertEqual(lru.order, ["/private/tmp/a"])   // canonical: firmlinks resolve INTO /private
         XCTAssertEqual(lru.value(for: "/tmp/a")?.anchorID, "f2")
     }
 
@@ -3313,8 +3313,20 @@ final class FolderKeyTests: XCTestCase {
         XCTAssertEqual(folderKey(root + "/Real"), folderKey("/private" + root + "/Real"))
     }
 
-    func testSymlinkedFolderKeysAsItsTarget() {
-        XCTAssertEqual(folderKey(root + "/Link"), folderKey(root + "/Real"))
+    /// DELIBERATELY NO LONGER TRUE, and the reverse is asserted so nobody "fixes" it back.
+    ///
+    /// Resolving a user-made symlink needs the filesystem, and folderKey is computed on every folder
+    /// render and inside FolderViewOptionsStore's dispatch_once init. With realpath in there, one
+    /// remembered folder on a network mount that had stopped answering froze the whole app before it
+    /// drew a window - measured, main thread parked in realpath -> __getattrlist.
+    ///
+    /// So a hand-made symlink now keys as itself. The cost is that one folder reached both ways can
+    /// hold two view records; the alternative was an app that would not start.
+    func testSymlinkedFolderIsNotUnifiedWithItsTarget_byDesign() {
+        XCTAssertNotEqual(folderKey(root + "/Link"), folderKey(root + "/Real"))
+        // Still stable, still normalising - the same key every time.
+        XCTAssertEqual(folderKey(root + "/Link"), folderKey(root + "/Link/"))
+        XCTAssertEqual(folderKey(root + "/Link"), folderKey(root + "/Real/../Link"))
     }
 
     func testTrailingSlashAndDotDotAreTheSameFolder() {
@@ -5451,14 +5463,90 @@ final class LayerAssemblyRulesTests: XCTestCase {
 
     /// The wedged case must NOT advise reconnecting the share, which was the old blanket advice and
     /// is useless when the parent share is healthy.
-    func testWedgedAdviceDoesNotSayReconnect() {
+    /// The advice must not say "reconnect" (the parent share is healthy) and must not PROMISE that
+    /// cancelling fixes it — measured, macOS starts a fresh automount within seconds of the path
+    /// being touched again, so the only thing that helps is leaving the folder alone.
+    func testWedgedAdviceIsHonestAboutWhatCancellingAchieves() {
         let w = StuckMountRules.explain(name: "artSource", wedged: true)
-        XCTAssertTrue(w.title.contains("stuck mounting"))
+        XCTAssertTrue(w.title.contains("isn’t answering"))
         XCTAssertFalse(w.detail.lowercased().contains("reconnect"))
-        XCTAssertEqual(w.action, "Cancel the Stuck Mount")
+        XCTAssertFalse(w.detail.lowercased().contains("releases the folder"))
+        XCTAssertTrue(w.detail.lowercased().contains("leaving it alone"))
+        XCTAssertEqual(w.action, "Stop Trying & Go Up")
 
         let plain = StuckMountRules.explain(name: "Games", wedged: false)
         XCTAssertTrue(plain.detail.lowercased().contains("reconnect"))
         XCTAssertNil(plain.action)
+    }
+
+    // MARK: - folderKey must never touch the filesystem
+
+    /// The freeze this guards against: folderKey ran realpath(3) over every remembered folder inside
+    /// a dispatch_once on the main thread, so one remembered folder on a wedged network mount froze
+    /// the app before it drew a window. A path that cannot possibly be resolved must still key
+    /// instantly and sensibly.
+    func testFolderKeyWorksForPathsThatCannotBeResolved() {
+        let ghost = "/Volumes/DefinitelyNotMounted-\(UUID().uuidString)/artSource"
+        XCTAssertEqual(folderKey(ghost), ghost.lowercased())
+        XCTAssertEqual(folderKey("/Volumes/Games/artSource"), "/volumes/games/artsource")
+    }
+
+    /// The case realpath was originally reached for, still handled — lexically.
+    func testFolderKeyUnifiesTheMacOSFirmlinks() {
+        XCTAssertEqual(folderKey("/tmp/Photos"), folderKey("/private/tmp/Photos"))
+        XCTAssertEqual(folderKey("/var/log"), folderKey("/private/var/log"))
+        XCTAssertEqual(folderKey("/etc/hosts"), folderKey("/private/etc/hosts"))
+        XCTAssertEqual(folderKey("/tmp"), "/private/tmp")
+    }
+
+    /// A folder merely STARTING with one of those names is not one of them.
+    func testFolderKeyDoesNotMaulLookalikePaths() {
+        XCTAssertEqual(folderKey("/tmpfiles/a"), "/tmpfiles/a")
+        XCTAssertEqual(folderKey("/Users/x/tmp/a"), "/users/x/tmp/a")
+        XCTAssertEqual(folderKey("/variants"), "/variants")
+    }
+
+    func testFolderKeyStillNormalisesTheOrdinaryThings() {
+        XCTAssertEqual(folderKey("/Users/x/Art/"), folderKey("/Users/x/Art"))
+        XCTAssertEqual(folderKey("/Users/x/Art/../Art"), folderKey("/Users/x/Art"))
+        XCTAssertEqual(folderKey("/Users/X/ART"), folderKey("/users/x/art"))
+        XCTAssertEqual(folderKey(""), "")
+    }
+
+    /// The migration is what ran on the main thread; with a lexical key it must be pure and cheap,
+    /// and must still collapse two spellings of one folder into a single record.
+    func testMigrationCollapsesDuplicateSpellingsWithoutIO() {
+        var lru = ViewOptionsLRU()
+        let a = ViewOptions(viewMode: "grid", iconSize: 64, sortKey: "name",
+                            sortAscending: true, groupBy: "none", columns: ["name", "size"])
+        lru.set(a, for: "/Volumes/Games/artSource")
+        let migrated = lru.migratedToNormalizedKeys()
+        XCTAssertNotNil(migrated.value(for: "/Volumes/Games/artSource/"))
+        XCTAssertNotNil(migrated.value(for: "/volumes/games/artsource"))
+    }
+
+    // MARK: - Which paths must never be stat'd on the main thread
+
+    /// The launch freeze: icon(for:) stat'd every item unless currentIsNetwork was set, and that flag
+    /// is false at launch. A mounted share that stopped answering froze the app inside a SwiftUI body.
+    func testVolumePathsAreTreatedAsPossiblyBlocking() {
+        XCTAssertTrue(VolumePathRules.mayBlockOnIO("/Volumes/Games/artSource"))
+        XCTAssertTrue(VolumePathRules.mayBlockOnIO("/Volumes/Games"))
+        XCTAssertTrue(VolumePathRules.mayBlockOnIO("/Volumes"))
+    }
+
+    /// The boot volume and the home folder are where most browsing happens and must keep their
+    /// per-file icons.
+    func testLocalPathsKeepTheirPerFileIcons() {
+        XCTAssertFalse(VolumePathRules.mayBlockOnIO("/"))
+        XCTAssertFalse(VolumePathRules.mayBlockOnIO("/Users/x/Pictures/a.png"))
+        XCTAssertFalse(VolumePathRules.mayBlockOnIO("/Applications/Navigator.app"))
+        XCTAssertFalse(VolumePathRules.mayBlockOnIO(""))
+    }
+
+    /// A lookalike must not be swept in.
+    func testVolumesLookalikeIsNotMatched() {
+        XCTAssertFalse(VolumePathRules.mayBlockOnIO("/VolumesExtra/a"))
+        XCTAssertFalse(VolumePathRules.mayBlockOnIO("/Users/x/Volumes/a"))
     }
 }
