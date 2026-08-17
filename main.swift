@@ -769,7 +769,10 @@ final class NetworkPollCoordinator {
         // busy / stalled / slow are the app's own "this share is not answering right
         // now" signals. Adding poll traffic on top of a load that is already crawling
         // makes both slower.
-        guard !browser.busy, !browser.slowNetwork, !browser.networkStalled else { return }
+        // staleListing included deliberately: without it this watchdog kept re-entering a folder
+        // whose refresh was wedged, and every visit started another automount attempt.
+        guard !browser.busy, !browser.slowNetwork, !browser.networkStalled,
+              !browser.staleListing else { return }
         let key = ObjectIdentifier(browser)
         var s = state[key] ?? State()
         let path = browser.currentURL.path
@@ -1054,6 +1057,31 @@ final class ThumbnailCache {
     }
 
     func thumbnail(for url: URL, size: CGFloat = 256, completion: @escaping (NSImage?) -> Void) {
+        // A path on a volume that can stop answering is never stat'd HERE. This function is called
+        // from a SwiftUI view body, and contentStamp does a synchronous stat: on a mount that had
+        // wedged, that stat never returned and took the window with it — measured, main thread
+        // parked in ThumbIcon.body -> thumbnail -> contentStamp -> stat, no window on screen.
+        //
+        // Handing back no thumbnail leaves the row showing its type icon, which is what a slow share
+        // gets anyway. The work moves off the main thread rather than being abandoned.
+        if VolumePathRules.mayBlockOnIO(url.path) {
+            let key = ThumbnailKeyRules.prefix(path: url.path, size: Int(size)) as NSString
+            if let c = cache.object(forKey: key) { completion(c); return }
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { DispatchQueue.main.async { completion(nil) }; return }
+                let stamp = self.contentStamp(url)      // may block, but never on the main thread
+                let full = ThumbnailKeyRules.key(path: url.path, size: Int(size),
+                                                 mtime: stamp.mtime, bytes: stamp.bytes) as NSString
+                if let c = self.cache.object(forKey: full) {
+                    // Cache under the cheap key too, so the next paint is instant and stat-free.
+                    self.cache.setObject(c, forKey: key)
+                    DispatchQueue.main.async { completion(c) }
+                } else {
+                    DispatchQueue.main.async { completion(nil) }
+                }
+            }
+            return
+        }
         // Keyed by CONTENT, not just path: a file re-exported over itself must not keep serving
         // its old thumbnail. See ThumbnailKeyRules.
         let stamp = contentStamp(url)
@@ -4901,6 +4929,15 @@ final class Browser: ObservableObject, Identifiable {
     // wedged or the server won't answer, and "Loading…" forever with no way out is
     // what sends people to Finder to reconnect. Drives the recovery panel.
     @Published var networkStalled = false
+    /// A cached listing is on screen but the refresh behind it has not come back.
+    ///
+    /// This is the case the stalled panel could never cover: it requires items.isEmpty, and a folder
+    /// you have visited before paints from cache — 671 cached entries in the run that exposed this —
+    /// so a wedged mount showed a complete, normal-looking, STALE listing and said nothing at all.
+    @Published var staleListing = false
+    /// True while a background directory refresh is outstanding. Needed because `busy` is false once
+    /// a cached listing has painted, so it cannot answer "is the refresh still out there".
+    private var refreshInFlight = false
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
@@ -5510,7 +5547,15 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         // On network volumes, use cached icons keyed by type (no per-file I/O over
         // SMB). Locally, use the real per-file icon (custom folder/app icons).
-        guard currentIsNetwork else { return NSWorkspace.shared.icon(forFile: item.url.path) }
+        //
+        // The path is consulted as well as `currentIsNetwork`, and that is the important part:
+        // currentIsNetwork is only assigned partway through load(), so at launch it is false for
+        // every item and this fell through to icon(forFile:), which stats the file. On a mount that
+        // had stopped answering that stat never returned — inside a SwiftUI body, on the main
+        // thread, before any window existed. See VolumePathRules.
+        guard currentIsNetwork || VolumePathRules.mayBlockOnIO(item.url.path) else {
+            return NSWorkspace.shared.icon(forFile: item.url.path)
+        }
         let key = item.isDirectory ? "/dir" : (item.ext.isEmpty ? "/file" : item.ext)
         if let c = Browser.typeIconCache[key] { return c }
         let type: UTType = item.isDirectory ? .folder : (UTType(filenameExtension: item.ext) ?? .data)
@@ -6149,6 +6194,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         stopMetadataQuery(&recentsQuery)
         slowNetwork = false
         networkStalled = false
+        staleListing = false
         pathText = addressString(for: currentURL)
         selection = []
         // Arriving in the Trash: read Finder's put-back records so Put Back knows
@@ -6255,6 +6301,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 Browser.dirCache[cacheKey] = committed
                 self.items = committed
                 self.busy = false; self.busyText = ""
+                self.refreshInFlight = false
+                self.staleListing = false          // it came back; the listing is live again
                 self.updateFreeSpace(); self.updateStatus()
             }
         }
@@ -6273,6 +6321,18 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // Non-blocking hint if the enumeration stalls (slow/hiccuping SMB mount):
         // a quiet note in the breadcrumb bar, not a popup. Fires only if we're
         // still on this same load after a few seconds.
+        // Armed EVEN WHEN the folder painted from cache. Previously both timers lived under
+        // `if !hadSeed`, so the one situation that needed saying something — a familiar folder whose
+        // share has stopped answering — was the one situation with no timer running at all.
+        refreshInFlight = true
+        if hadSeed {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard let self, gen == self.loadGeneration, self.refreshInFlight else { return }
+                navLog("stale listing: \(dir.lastPathComponent) is showing cached contents; "
+                       + "the refresh has not returned in 15s")
+                self.staleListing = true
+            }
+        }
         if !hadSeed {
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
                 guard let self, gen == self.loadGeneration, self.busy else { return }
@@ -6281,14 +6341,22 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             // Nothing at all after this long → treat the share as not responding and
             // offer a way out, instead of spinning indefinitely.
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-                guard let self, gen == self.loadGeneration, self.busy, self.items.isEmpty else { return }
+                guard let self else { return }
+                // Logged unconditionally: when this panel fails to appear, the reason it declined is
+                // the only thing that explains why someone sat looking at an empty folder instead.
+                navLog("stall check \(dir.lastPathComponent): sameLoad=\(gen == self.loadGeneration) "
+                       + "busy=\(self.busy) items=\(self.items.count)")
+                guard gen == self.loadGeneration, self.busy, self.items.isEmpty else { return }
+                navLog("stalled: \(dir.path) produced nothing in 15s — showing the way-out panel")
                 self.networkStalled = true
             }
         }
         let keys = netKeys   // column-aware: see Browser.networkKeys
         let needsDetails = NetworkColumnRules.needsAttributePass(columns: visibleColumns,
                                                                 sortKey: currentSortColumn)
-        navLog("network load \(currentURL.lastPathComponent): columns=\(visibleColumns.sorted().joined(separator: ",")) sort=\(currentSortColumn) needsDetails=\(needsDetails)")
+        // hadSeed is logged because it GATES the slow/stalled timers below: a folder that painted
+        // from cache never arms them, so a wedged mount showed a stale listing and no explanation.
+        navLog("network load \(currentURL.lastPathComponent): columns=\(visibleColumns.sorted().joined(separator: ",")) sort=\(currentSortColumn) needsDetails=\(needsDetails) hadSeed=\(hadSeed) items=\(items.count) busy=\(busy)")
         var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
         if !showHidden { opts.insert(.skipsHiddenFiles) }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -6888,6 +6956,26 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         navLog("keychain: forgot \(removed) saved password entr\(removed == 1 ? "y" : "ies") for \(host)")
         return removed
+    }
+
+    /// The one action for a folder that will not refresh: cancel a wedged mount attempt if there is
+    /// one, otherwise reconnect the share. Both end with a reload, so the listing stops being stale.
+    func fixStalledFolder() {
+        let target = currentURL
+        let name = target.lastPathComponent
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let cancelled = Browser.cancelWedgedMounts(for: target)
+            navLog("fix stalled \(name): cancelled \(cancelled) wedged helper(s); leaving the folder")
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.staleListing = false
+                // Reloading would touch the path again and macOS would start a NEW automount within
+                // seconds — measured. Cancelling only helps if we then stop poking it, so this goes
+                // up a level instead of retrying.
+                Browser.invalidateCache(target.path)
+                self.goUp()
+            }
+        }
     }
 
     static func mountShareSilently(_ url: URL) -> String? {
@@ -12974,7 +13062,19 @@ struct StatusBar: View {
                 }
             }
             Spacer()
-            if browser.slowNetwork {
+            // A stale listing gets a LOUDER note than "responding slowly", and an action, because
+            // what is on screen looks completely normal and is not: the folder painted from cache and
+            // the refresh never came back. Silence here is what made this read as "Navigator hung".
+            if browser.staleListing {
+                HStack(spacing: 6) {
+                    Label("Showing cached contents — the drive hasn’t answered",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange).lineLimit(1).fixedSize()
+                    Button("Fix…") { browser.fixStalledFolder() }
+                        .font(.caption).buttonStyle(.link)
+                }
+                .padding(.trailing, 8).transition(.opacity)
+            } else if browser.slowNetwork {
                 Label("Network drive responding slowly…", systemImage: "wifi.exclamationmark")
                     .font(.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
                     .padding(.trailing, 8).transition(.opacity)
@@ -14812,18 +14912,7 @@ struct StalledShareView: View {
                 if let label = text.action {
                     // The parent share is healthy in this case, so cancelling the wedged attempt is
                     // the fix and Reconnect is not offered as the default.
-                    Button(label) {
-                        let target = browser.currentURL
-                        DispatchQueue.global(qos: .userInitiated).async {
-                            let n = Browser.cancelWedgedMounts(for: target)
-                            DispatchQueue.main.async {
-                                wedged = false
-                                browser.networkStalled = false
-                                if n > 0 { Browser.invalidateCache(target.path); browser.load() }
-                                else { browser.goUp() }
-                            }
-                        }
-                    }.keyboardShortcut(.defaultAction)
+                    Button(label) { browser.fixStalledFolder() }.keyboardShortcut(.defaultAction)
                 } else {
                     Button("Reconnect") { browser.reconnectShare() }.keyboardShortcut(.defaultAction)
                 }
@@ -14838,8 +14927,10 @@ struct StalledShareView: View {
             checked = true
             let target = browser.currentURL
             DispatchQueue.global(qos: .utility).async {
-                let hit = !Browser.wedgedMountPIDs(for: target).isEmpty
-                DispatchQueue.main.async { wedged = hit }
+                let pids = Browser.wedgedMountPIDs(for: target)
+                navLog("stalled panel: \(target.path) — wedged mount helper(s): "
+                       + (pids.isEmpty ? "none, offering Reconnect" : "\(pids), offering Cancel"))
+                DispatchQueue.main.async { wedged = !pids.isEmpty }
             }
         }
     }

@@ -2004,29 +2004,81 @@ struct ViewOptions: Codable, Equatable {
 /// view you had just set on it, depending on how you got there. Same for a trailing
 /// slash, for a path carrying `..`, and for the case someone typed.
 ///
-/// `realpath(3)` and NOT `standardizedFileURL.resolvingSymlinksInPath()`, which is the
-/// obvious answer and the wrong one: Foundation deliberately maps `/private/tmp` back to
-/// `/tmp` — but only for the root itself, so `/tmp/Photos` and `/private/tmp/Photos`
-/// survive that pair of calls as two different strings, which is precisely the bug.
-/// realpath resolves every component, and also eats `..` and the trailing slash.
+/// NO FILESYSTEM ACCESS. This function must never touch the disk, and that is the whole point of
+/// the version you are reading.
 ///
-/// A path realpath can't resolve — a deleted folder, an unmounted share, a stored key
-/// from a volume that isn't here — falls back to Foundation's normalisation rather than
-/// failing. A record filed under a folder that no longer exists is only ever going to be
-/// evicted anyway; refusing to produce a key for it would just move the crash here.
+/// It used to call `realpath(3)`, which resolves every component by asking the filesystem. That is
+/// correct and it is also a blocking call, and this key is computed in two places that cannot
+/// tolerate blocking: on every folder render, and inside `FolderViewOptionsStore`'s one-time init,
+/// which runs under `dispatch_once` on the main thread and normalises EVERY remembered folder path.
+/// One remembered folder on a network mount that has stopped answering therefore froze the entire
+/// application before it could draw a window — measured, with the main thread parked in
+/// `realpath -> __getattrlist` on a wedged SMB path and no window on screen at all.
 ///
-/// Lowercased LAST, and deliberately: macOS volumes are case-insensitive by default, so
-/// `Photos` and `photos` are one folder and two records for them is the mistake people
-/// actually hit. On a case-SENSITIVE volume two genuinely different folders then share
-/// one record — a view arriving wrong, never a file touched, which is much the cheaper
-/// of the two mistakes.
+/// The reason realpath was reached for was real: Foundation maps `/private/tmp` back to `/tmp` for
+/// the root only, so `/tmp/Photos` and `/private/tmp/Photos` survived
+/// `standardizedFileURL.resolvingSymlinksInPath()` as two different strings. But the symlinks that
+/// causes it are a FIXED, DOCUMENTED set on macOS — /tmp, /var and /etc are firmlinks into
+/// /private — so the same unification is available lexically, for nothing.
+///
+/// What is given up: a symlink someone made themselves no longer unifies with its target, so a
+/// folder reached both ways can hold two view records. That is a view arriving wrong in a rare case,
+/// against an app that would not start. Not a close call.
+///
+/// Lowercased LAST, and deliberately: macOS volumes are case-insensitive by default, so `Photos` and
+/// `photos` are one folder and two records for them is the mistake people actually hit. On a
+/// case-SENSITIVE volume two genuinely different folders then share one record — a view arriving
+/// wrong, never a file touched, which is much the cheaper of the two mistakes.
 func folderKey(_ path: String) -> String {
     guard !path.isEmpty else { return "" }
-    if let real = realpath(path, nil) {
-        defer { free(real) }
-        return String(cString: real).lowercased()
+    // Foundation's path APIs are NOT usable here. `resolvingSymlinksInPath()` obviously reads the
+    // disk, but `standardizedFileURL` does too - measured: standardizing
+    // /Volumes/<wedged>/deep/file.png never returned, and it resolved a symlink to its target on a
+    // local path, which it could only do by asking the filesystem. A first attempt at this fix used
+    // it and would have left the freeze exactly where it was.
+    //
+    // So the components are walked as strings and nothing here can block.
+    var p = path
+    if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }   // reads NSHomeDirectory, not the disk
+    let absolute = p.hasPrefix("/")
+    var parts: [String] = []
+    for comp in p.split(separator: "/", omittingEmptySubsequences: true) {
+        switch comp {
+        case ".":  continue
+        case "..": if !parts.isEmpty && parts.last != ".." { parts.removeLast() } else if !absolute { parts.append("..") }
+        default:   parts.append(String(comp))
+        }
     }
-    return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
+    var joined = (absolute ? "/" : "") + parts.joined(separator: "/")
+    if absolute && joined.isEmpty { joined = "/" }
+    // /tmp, /var and /etc are firmlinks into /private on every macOS install. Canonicalising INTO
+    // /private matches what realpath produced for folders that existed, so keys already stored for
+    // real folders keep matching.
+    for root in ["/tmp", "/var", "/etc"] {
+        if joined == root || joined.hasPrefix(root + "/") { joined = "/private" + joined; break }
+    }
+    return joined.lowercased()
+}
+
+/// Whether a path may live on a volume that can stop answering — decided from the STRING ALONE.
+///
+/// Exists because asking the filesystem is the thing being avoided. Browser.icon(for:) used to fall
+/// back to `NSWorkspace.icon(forFile:)`, which stats the file, whenever `currentIsNetwork` was false
+/// — and that flag is only assigned partway through load(), so at launch it is false for every item.
+/// Restoring a folder on a mount that had stopped answering therefore froze the app inside a SwiftUI
+/// view body, with the main thread parked in `stat`. Measured: no window ever appeared.
+///
+/// `isNetworkURL` cannot be used for this. It reads `.volumeIsLocalKey`, which is exactly the kind of
+/// call that blocks on the volume in question.
+///
+/// Everything under /Volumes is treated as possibly-remote. That includes local external drives, so
+/// those lose a custom per-file icon and get a type icon instead — a slightly plainer row, against an
+/// app that would not open. The boot volume is "/" and is unaffected, which is where most browsing
+/// happens.
+enum VolumePathRules {
+    static func mayBlockOnIO(_ path: String) -> Bool {
+        path == "/Volumes" || path.hasPrefix("/Volumes/")
+    }
 }
 
 /// Per-folder view options keyed by path, with a hard cap and least-recently-used
@@ -3913,11 +3965,17 @@ enum StuckMountRules {
     /// What to tell someone whose folder will not open, given whether a helper is wedged on it.
     static func explain(name: String, wedged: Bool) -> (title: String, detail: String, action: String?) {
         if wedged {
-            return ("macOS is stuck mounting “\(name)”",
-                    "The drive itself is fine — this folder is a link to another server, and macOS "
-                    + "has been trying to connect to it without giving up. Cancelling that attempt "
-                    + "releases the folder. Nothing is lost, and no files are touched.",
-                    "Cancel the Stuck Mount")
+            // The copy here was WRONG in the first version and the correction is the point of this
+            // comment. It said cancelling "releases the folder". It does not: SIGKILLing the helper
+            // was measured, and macOS spawned a fresh automount within seconds of anything touching
+            // the path again. Cancelling stops the wedged attempt; it cannot make an unreachable
+            // server answer. So the honest action is to stop trying AND leave the folder alone.
+            return ("“\(name)” points at a server that isn’t answering",
+                    "The drive itself is fine. This folder is a link to another server, and that "
+                    + "server hasn’t responded — so macOS keeps trying to connect and anything "
+                    + "touching the folder waits with it. Leaving it alone is the fix until that "
+                    + "server is back. No files are affected.",
+                    "Stop Trying & Go Up")
         }
         return ("“\(name)” isn’t responding",
                 "The network drive stopped answering. Reconnecting drops the stuck connection and "
