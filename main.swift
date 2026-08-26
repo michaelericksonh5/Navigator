@@ -7394,15 +7394,21 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         pathText = addressString(for: currentURL)
         let a = NSAlert()
         a.messageText = "That Drive folder isn’t on this Mac"
-        a.informativeText = """
-            The link is valid, but Google Drive for desktop has no local record of that folder for this account. That usually means one of:
-
-            • it lives in a shared drive this account hasn’t opened yet — Drive fills its index in as you browse, so open it once in the browser and the link will work here afterwards
-            • it was shared with you but never added to My Drive or a mirrored shared drive
-            • it belongs to a different Google account than the one Drive is signed in to
-
-            Opening it in the browser always works.
-            """
+        // The reasons are listed with the FIX for each, because the most common one - a folder under
+        // "Shared with me" - is not a Navigator limitation and cannot be worked around by us: Drive
+        // for desktop mounts only My Drive, Shared drives and Other computers. Checked on this
+        // machine; there is no "Shared with me" folder in the mount at all. Such an item has no local
+        // path until the person adds a shortcut to it, so saying "it isn't synced" without saying
+        // that leaves them stuck.
+        a.informativeText = [
+            "The link is valid, but Google Drive for desktop has no local record of that folder for this account.",
+            "",
+            "If it is under “Shared with me”: Drive never mirrors that section — only My Drive, Shared drives and Other computers. In Drive, right-click the folder → Organise → Add shortcut to Drive, pick a spot in My Drive, and it will appear on this Mac and the link will work here.",
+            "",
+            "If it is in a shared drive: this account may not have opened it yet. Drive builds its local index as you browse, so open it once in the browser and try again.",
+            "",
+            "It may also belong to a different Google account than the one Drive is signed in to.",
+        ].joined(separator: "\n")
         a.addButton(withTitle: "Open in Browser")
         a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn, let u = URL(string: link) else { return }
