@@ -7027,13 +7027,29 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // block. Resolve Google Drive path forms, then act on the result on main.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var path = p
-            if !FileManager.default.fileExists(atPath: path), let resolved = Browser.resolveGoogleDrivePath(path) { path = resolved }
+            // A drive.google.com link is a legitimate way to say "this folder" — it is what gets
+            // pasted into Slack, and it names a place this Mac very likely has mounted. Resolving it
+            // uses Drive for desktop's own index (see googleDriveLocalPath), which is one indexed
+            // lookup, NOT a walk of the mount.
+            var driveLink: String? = nil
+            if !FileManager.default.fileExists(atPath: path) {
+                if let resolved = Browser.resolveGoogleDrivePath(path) {
+                    path = resolved
+                } else if PathRules.googleDriveItemID(webURL: p) != nil {
+                    driveLink = p
+                    if let local = googleDriveLocalPath(webURL: p) { path = local }
+                }
+            }
             var isDir: ObjCBool = false
             let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
             DispatchQueue.main.async {
                 guard let self else { return }
                 if exists, isDir.boolValue { self.navigate(to: URL(fileURLWithPath: path)) }
                 else if exists { NSWorkspace.shared.open(URL(fileURLWithPath: path)); self.pathText = self.addressString(for: self.currentURL) }
+                // A Drive link that did not resolve gets an explanation, not a beep: the reason is
+                // never obvious, and the answer is usually "this account has never opened it, so
+                // Drive has not indexed it here".
+                else if let link = driveLink { self.reportUnresolvedDriveLink(link) }
                 else { NSSound.beep(); self.pathText = self.addressString(for: self.currentURL) }
             }
         }
@@ -7368,6 +7384,31 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // The forms and the reasoning are in PathRules.googleDrivePath; the only thing this
     // adds is finding the local account folder, which no pure rule can know.
     // Returns nil if it isn't a Drive path.
+    /// A Drive link that names a folder this Mac cannot place. Says which of the two reasons it is
+    /// as far as it can tell, and offers the browser, which always works.
+    ///
+    /// Drive for desktop's index only holds what this account has actually seen — a shared drive is
+    /// filled in as you browse it — so a perfectly valid link to a folder nobody here has opened
+    /// resolves to nothing, and that looks like a broken feature unless it is said out loud.
+    func reportUnresolvedDriveLink(_ link: String) {
+        pathText = addressString(for: currentURL)
+        let a = NSAlert()
+        a.messageText = "That Drive folder isn’t on this Mac"
+        a.informativeText = """
+            The link is valid, but Google Drive for desktop has no local record of that folder for this account. That usually means one of:
+
+            • it lives in a shared drive this account hasn’t opened yet — Drive fills its index in as you browse, so open it once in the browser and the link will work here afterwards
+            • it was shared with you but never added to My Drive or a mirrored shared drive
+            • it belongs to a different Google account than the one Drive is signed in to
+
+            Opening it in the browser always works.
+            """
+        a.addButton(withTitle: "Open in Browser")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn, let u = URL(string: link) else { return }
+        NSWorkspace.shared.open(u)
+    }
+
     static func resolveGoogleDrivePath(_ input: String) -> String? {
         guard let root = googleDriveAccountRoot() else { return nil }
         return PathRules.googleDrivePath(input, accountRoot: root)

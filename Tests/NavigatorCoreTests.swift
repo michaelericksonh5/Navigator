@@ -5549,4 +5549,47 @@ final class LayerAssemblyRulesTests: XCTestCase {
         XCTAssertFalse(VolumePathRules.mayBlockOnIO("/VolumesExtra/a"))
         XCTAssertFalse(VolumePathRules.mayBlockOnIO("/Users/x/Volumes/a"))
     }
+
+    // MARK: - Drive links pasted into the address bar
+
+    /// The shapes Google actually hands out, including the tracking suffix every "Copy link"
+    /// button appends — which is why this parses with URLComponents rather than splitting on "/".
+    func testDriveLinkShapesPeopleActuallyPaste() {
+        let id = "1N6vZy7cy2Qf_a-FFARmCeEV4SMSKzdkQ"
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/\(id)"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/\(id)?usp=sharing"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/\(id)?usp=drive_link&foo=1"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "  https://drive.google.com/drive/folders/\(id)  "), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/u/0/folders/\(id)"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/file/d/\(id)/view?usp=sharing"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://docs.google.com/document/d/\(id)/edit"), id)
+        XCTAssertEqual(PathRules.googleDriveItemID(webURL: "https://drive.google.com/open?id=\(id)"), id)
+    }
+
+    /// Anything that is not a Drive link must not be treated as one — the address bar still has to
+    /// beep for a typo rather than opening a "that folder isn't on this Mac" dialog.
+    func testNonDriveInputIsNotMistakenForALink() {
+        XCTAssertNil(PathRules.googleDriveItemID(webURL: "https://example.com/drive/folders/1N6vZy7cy2Qf_a"))
+        XCTAssertNil(PathRules.googleDriveItemID(webURL: "/Users/x/Pictures"))
+        XCTAssertNil(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/"))
+        XCTAssertNil(PathRules.googleDriveItemID(webURL: "https://drive.google.com/drive/folders/short"))
+        XCTAssertNil(PathRules.googleDriveItemID(webURL: ""))
+        // A path that merely mentions the host is a path, not a link.
+        XCTAssertNil(PathRules.googleDriveItemID(webURL: "/Volumes/drive.google.com/x"))
+    }
+
+    /// The parent walk's output order, which is what turns a resolved chain into a real path.
+    /// Verified against this machine's own index: Toyota_Clone_01 <- Production_AI 2 <-
+    /// Content Management - AI, with the last row flagged as a shared-drive root.
+    func testChainFromTheIndexBecomesADriveRelativePath() {
+        XCTAssertEqual(
+            PathRules.driveRelativePath(leafFirst: ["Toyota_Clone_01", "Production_AI 2", "Content Management - AI"],
+                                        isSharedDrive: true),
+            "Shared drives/Content Management - AI/Production_AI 2/Toyota_Clone_01")
+        XCTAssertEqual(
+            PathRules.driveRelativePath(leafFirst: ["Art", "My Drive"], isSharedDrive: false),
+            "My Drive/Art")
+        XCTAssertNil(PathRules.driveRelativePath(leafFirst: [], isSharedDrive: true))
+        XCTAssertNil(PathRules.driveRelativePath(leafFirst: ["A", ""], isSharedDrive: false))
+    }
 }
