@@ -5593,3 +5593,29 @@ final class LayerAssemblyRulesTests: XCTestCase {
         XCTAssertNil(PathRules.driveRelativePath(leafFirst: ["A", ""], isSharedDrive: false))
     }
 }
+
+final class TerminalTokenTests: XCTestCase {
+
+    // Typing "cmd" in Explorer's address bar opens a shell there; this is that, and the
+    // words people actually reach for on a Mac.
+    func testRecognisesTheKeywords() {
+        XCTAssertTrue(TerminalRules.isTerminalToken("terminal"))
+        XCTAssertTrue(TerminalRules.isTerminalToken("cmd"))
+        XCTAssertTrue(TerminalRules.isTerminalToken("shell"))
+    }
+
+    // The address bar is typed in by hand: case and stray spaces are normal, not errors.
+    func testIgnoresCaseAndSurroundingSpace() {
+        XCTAssertTrue(TerminalRules.isTerminalToken("Terminal"))
+        XCTAssertTrue(TerminalRules.isTerminalToken("  CMD  "))
+    }
+
+    // The trap: matching loosely would hijack real paths. A folder named Terminal, or any
+    // path merely CONTAINING the word, must still navigate.
+    func testDoesNotHijackRealPaths() {
+        XCTAssertFalse(TerminalRules.isTerminalToken("/Applications/Utilities/Terminal.app"))
+        XCTAssertFalse(TerminalRules.isTerminalToken("~/Documents/terminal"))
+        XCTAssertFalse(TerminalRules.isTerminalToken("terminal stuff"))
+        XCTAssertFalse(TerminalRules.isTerminalToken(""))
+    }
+}

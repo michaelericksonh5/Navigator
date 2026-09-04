@@ -4797,3 +4797,22 @@ enum LayerCoverageRules {
         return v.count == 4 ? v : nil
     }
 }
+
+/// The Explorer habit of typing `cmd` in the address bar to get a shell where you are standing.
+///
+/// Only the keyword test lives here; resolving a URL to the directory a shell should open in is
+/// already `openInTerminal(_:)` in main.swift, and duplicating it would give two answers to drift
+/// apart.
+enum TerminalRules {
+
+    /// Address-bar words that mean "give me a shell here" rather than "navigate to a path".
+    /// `cmd` is in the list because that is the Windows Explorer muscle memory this exists to
+    /// serve; `terminal` because that is what the thing is called on this platform.
+    ///
+    /// Matching is on the WHOLE trimmed field, case-insensitively. A bare word is never a path
+    /// Navigator resolves anyway (it has no notion of a relative cwd), so nothing is shadowed.
+    static func isTerminalToken(_ raw: String) -> Bool {
+        let s = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        return s == "terminal" || s == "cmd" || s == "shell"
+    }
+}

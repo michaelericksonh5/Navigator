@@ -7023,6 +7023,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         var p = pathText.trimmingCharacters(in: .whitespaces)
         if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
         guard !p.isEmpty else { pathText = addressString(for: currentURL); return }
+        // Explorer's `cmd` habit: a bare "terminal"/"cmd"/"shell" means "give me a shell here",
+        // not "navigate to a path". Checked before the filesystem work below so it costs nothing
+        // and cannot sit behind a slow fileExists over SMB.
+        if TerminalRules.isTerminalToken(p) {
+            openInTerminal(currentURL)
+            pathText = addressString(for: currentURL)
+            return
+        }
         // Validate the typed path off the main thread — a fileExists over SMB can
         // block. Resolve Google Drive path forms, then act on the result on main.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -10935,6 +10943,7 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 for it in browser.items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
             }
             Button("Reveal in Finder") { browser.revealInFinder([]) }
+            Button("Open in Terminal") { openInTerminal(browser.currentURL) }
             Button("Copy Path") { browser.copyPath([]) }
             Button("Copy as Path (Quoted)") { browser.copyQuotedPath([]) }
             if contextMenuIsExtended() { extendedCopyItems(browser, ids: []) }
