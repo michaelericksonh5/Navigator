@@ -327,18 +327,63 @@ func formatDuration(_ seconds: Double) -> String {
     return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
 }
 
+// Finder's seven standard tag colours. A CUSTOM tag name returns nil: Finder gives those no
+// colour of their own either, so nothing should be tinted or dotted for them.
+func tagNSColor(_ name: String) -> NSColor? {
+    switch name.lowercased() {
+    case "red":            return .systemRed
+    case "orange":         return .systemOrange
+    case "yellow":         return .systemYellow
+    case "green":          return .systemGreen
+    case "blue":           return .systemBlue
+    case "purple":         return .systemPurple
+    case "gray", "grey":   return .systemGray
+    default:               return nil
+    }
+}
+
 // Maps Finder's standard tag names to their dot colors; unknown tags show gray.
 func tagColor(_ name: String) -> Color {
-    switch name.lowercased() {
-    case "red": return .red
-    case "orange": return .orange
-    case "yellow": return .yellow
-    case "green": return .green
-    case "blue": return .blue
-    case "purple": return .purple
-    case "gray", "grey": return .gray
-    default: return .secondary
-    }
+    tagNSColor(name).map { Color(nsColor: $0) } ?? .secondary
+}
+
+/// The first tag on an item that has a real Finder colour, if any.
+func firstColouredTag(_ tags: [String]) -> String? { tags.first { tagNSColor($0) != nil } }
+
+/// Recolour an icon with a tag colour while keeping its shading.
+///
+/// `.color` blend keeps the SOURCE's luminosity and takes hue/saturation from the fill, which is
+/// what leaves a tinted folder still looking like a folder instead of a flat silhouette. The
+/// `.destinationIn` pass restores the original alpha, because the fill covers the whole rect
+/// including the transparent margin around the icon.
+func tintedIcon(_ img: NSImage, _ color: NSColor) -> NSImage {
+    let size = img.size
+    guard size.width > 0, size.height > 0 else { return img }
+    var proposed = CGRect(origin: .zero, size: size)
+    guard let cg = img.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else { return img }
+    // Everything below stays in CoreGraphics on purpose. The obvious AppKit version
+    // (lockFocus + NSRect.fill()) does NOT work: NSRect.fill() composites with an
+    // NSCompositingOperation and silently ignores a CGBlendMode set on the same context,
+    // so the .color pass never lands and you get a tinted outline around an untinted icon.
+    let w = cg.width, h = cg.height
+    guard w > 0, h > 0,
+          let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return img }
+    let r = CGRect(x: 0, y: 0, width: w, height: h)
+    ctx.draw(cg, in: r)
+    // .color keeps the icon's LUMINOSITY and takes hue/saturation from the fill, so a tinted
+    // folder still reads as a folder rather than a flat silhouette.
+    ctx.setBlendMode(.color)
+    ctx.setFillColor((color.usingColorSpace(.deviceRGB) ?? color).cgColor)
+    ctx.fill(r)
+    // The fill covered the whole rect, including the transparent margin - put the original
+    // alpha back so the icon keeps its shape.
+    ctx.setBlendMode(.destinationIn)
+    ctx.draw(cg, in: r)
+    guard let out = ctx.makeImage() else { return img }
+    return NSImage(cgImage: out, size: size)
 }
 
 // A table cell that lazily loads Spotlight metadata for one file (like the
@@ -5539,7 +5584,30 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         (try? url.resourceValues(forKeys: [.volumeIsLocalKey]))?.volumeIsLocal == false
     }
     private static var typeIconCache: [String: NSImage] = [:]
+    private static var tintedIconCache: [String: NSImage] = [:]
+
+    /// Tagged FOLDERS get their icon recoloured; files keep their type icon.
+    ///
+    /// Finder itself only dots the name (see NameCell) — this goes further because a tinted
+    /// folder is what makes a tagged folder findable at a glance in a long list. Files are
+    /// deliberately excluded: a tinted PDF or PSD icon reads as a different FILE TYPE, not as
+    /// a tag, which is worse than no indicator.
     func icon(for item: FileItem) -> NSImage {
+        let base = baseIcon(for: item)
+        guard item.isDirectory,
+              let tag = firstColouredTag(item.tags),
+              let colour = tagNSColor(tag) else { return base }
+        // Keyed by path as well as tag: folders can carry CUSTOM icons, and keying on the tag
+        // alone would paint one folder's custom icon onto every folder sharing that tag.
+        let key = "\(tag)|\(item.url.path)"
+        if let c = Browser.tintedIconCache[key] { return c }
+        let img = tintedIcon(base, colour)
+        if Browser.tintedIconCache.count > 512 { Browser.tintedIconCache.removeAll() }
+        Browser.tintedIconCache[key] = img
+        return img
+    }
+
+    private func baseIcon(for item: FileItem) -> NSImage {
         // The Trash gets its proper can icon (icon(forFile:) returns a blank
         // document for ~/.Trash, and it's often unreadable without Full Disk Access).
         if item.url.lastPathComponent == ".Trash" {
@@ -10530,6 +10598,11 @@ struct NameCell: View {
                     .frame(maxWidth: 260)
             } else {
                 Text(item.name).lineLimit(1)
+            }
+            // What Finder actually shows for a tag: a coloured dot after the name. Rendered here
+            // so a tag is visible WITHOUT turning the Tags column on, which is how Finder behaves.
+            ForEach(item.tags.filter { tagNSColor($0) != nil }.prefix(3), id: \.self) { tag in
+                Circle().fill(tagColor(tag)).frame(width: 8, height: 8)
             }
             cloudBadgeView(cloud)
         }
