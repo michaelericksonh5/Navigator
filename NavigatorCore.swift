@@ -174,6 +174,21 @@ enum PathRules {
     /// nil means "not a Drive path", never "couldn't fix it": callers keep whatever
     /// they had rather than substituting a guess. The account folder is the one
     /// component always dropped, because it is the one thing that is never portable.
+    /// A portable, username-free path for a Drive item, matching the breadcrumb:
+    /// /Users/x/Library/CloudStorage/GoogleDrive-x@…/Shared drives/A/B
+    ///   → "Google Drive/Shared drives/A/B"
+    ///
+    /// Purely a string transform on the PATH. It needs nothing from Drive itself - no item id,
+    /// no sync state - which is the whole point: it works on a file Drive has not registered
+    /// yet. Anything gated on a Drive item id must not also gate this.
+    static func googleDrivePortablePath(_ path: String) -> String? {
+        guard let r = path.range(of: "/CloudStorage/GoogleDrive-") else { return nil }
+        let after = path[r.upperBound...]
+        guard let slash = after.firstIndex(of: "/") else { return nil }
+        let rel = after[after.index(after: slash)...]
+        return rel.isEmpty ? "Google Drive" : "Google Drive/\(rel)"
+    }
+
     static func googleDrivePath(_ input: String, accountRoot: String) -> String? {
         let s = input.trimmingCharacters(in: .whitespacesAndNewlines)
         var rel: String?

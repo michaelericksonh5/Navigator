@@ -1469,16 +1469,11 @@ func googleDriveURL(for url: URL, isDirectory: Bool) -> URL? {
         ? "https://drive.google.com/drive/folders/\(id)"
         : "https://drive.google.com/file/d/\(id)/view")
 }
-// A portable, username-free path for a Drive item, matching the breadcrumb:
-// /Users/x/Library/CloudStorage/GoogleDrive-x@…/Shared drives/A/B
-//   → "Google Drive/Shared drives/A/B"
+// A portable, username-free path for a Drive item. The string logic is
+// PathRules.googleDrivePortablePath in NavigatorCore, so it is covered by tests;
+// this only unwraps the URL.
 func googleDrivePortablePath(_ url: URL) -> String? {
-    let p = url.path
-    guard let r = p.range(of: "/CloudStorage/GoogleDrive-") else { return nil }
-    let after = p[r.upperBound...]
-    guard let slash = after.firstIndex(of: "/") else { return nil }
-    let rel = after[after.index(after: slash)...]
-    return rel.isEmpty ? "Google Drive" : "Google Drive/\(rel)"
+    PathRules.googleDrivePortablePath(url.path)
 }
 // Where Drive for desktop mounts THIS Mac's account. The one thing about a Drive
 // path that no pure rule can work out, and the anchor every resolved form lands on.
@@ -7309,8 +7304,20 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func compareImages(_ ids: Set<String>) -> [URL] {
         orderedVisibleItems().filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
     }
-    // True when the selection lives inside Google Drive (has a Drive item ID).
-    func isGoogleDriveSelection(_ ids: Set<String>) -> Bool {
+    /// True when the selection lives under a Drive mount. A PATH fact only - it says nothing
+    /// about whether Drive has registered the file yet, and deliberately so: everything that
+    /// works off the path alone (the username-free portable path, the availability toggles)
+    /// must stay available on a file Drive has not finished syncing.
+    func isGoogleDrivePath(_ ids: Set<String>) -> Bool {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }) else { return false }
+        return googleDrivePortablePath(it.url) != nil
+    }
+
+    /// True when the selection can be turned into a drive.google.com LINK - it lives in Drive
+    /// AND Drive has assigned it an item id. Only the two web-link items may be gated on this;
+    /// a freshly written file has no item id for a while after it is created, and gating the
+    /// path-based items on it made them vanish exactly when they were most useful.
+    func isGoogleDriveLinkable(_ ids: Set<String>) -> Bool {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }) else { return false }
         // Must actually LIVE in Google Drive — not merely carry the drivefs xattr,
         // which files copied OUT of Drive keep (that made the Drive menu appear on
@@ -10979,7 +10986,7 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             Button("Copy") { browser.copyFiles(ids) }
             Button("Cut") { browser.cutFiles(ids) }
             Button("Paste") { browser.pasteFiles() }
-            if !browser.isGoogleDriveSelection(ids) {
+            if !browser.isGoogleDrivePath(ids) {
                 Button("Copy Path") { browser.copyPath(ids) }
                 // Windows' "Copy as path" — the same path in QUOTED form, so it can be
                 // pasted straight into a shell. The suffix is in the title because
@@ -10987,11 +10994,16 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 Button("Copy as Path (Quoted)") { browser.copyQuotedPath(ids) }
             }
             Button("Copy Name") { browser.copyName(ids) }
-            if browser.isGoogleDriveSelection(ids) {
-                Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Web Link") }
+            if browser.isGoogleDrivePath(ids) {
+                // Web links are the ONLY things here that need a Drive item id.
+                if browser.isGoogleDriveLinkable(ids) {
+                    Button { browser.copyGoogleDriveLink(ids) } label: { gdLabel("Copy Web Link") }
+                }
                 Button { browser.copyGoogleDrivePath(ids) } label: { gdLabel("Copy Local Path") }
                 Button { browser.copyPath(ids) } label: { gdLabel("Copy Path for Claude") }
-                Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Web") }
+                if browser.isGoogleDriveLinkable(ids) {
+                    Button { browser.openGoogleDriveLink(ids) } label: { gdLabel("Open in Web") }
+                }
                 // Only the applicable one — never both.
                 if browser.driveSelectionIsOffline(ids) {
                     Button { browser.setDriveAvailability(ids, offline: false) } label: { gdLabel("Make available online only") }

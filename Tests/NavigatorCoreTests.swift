@@ -5619,3 +5619,41 @@ final class TerminalTokenTests: XCTestCase {
         XCTAssertFalse(TerminalRules.isTerminalToken(""))
     }
 }
+
+// The username-free path is a STRING transform on the path. It must not depend on
+// anything Drive supplies at runtime — that distinction is the bug these cover: the
+// whole Drive menu, including this, used to be gated on a Drive item id, so a file
+// Drive had not registered yet lost the one item that scrubs the account email.
+final class GoogleDrivePortablePathTests: XCTestCase {
+
+    func testScrubsTheAccountEmail() {
+        XCTAssertEqual(
+            PathRules.googleDrivePortablePath(
+                "/Users/me/Library/CloudStorage/GoogleDrive-me@corp.com/Shared drives/Content/Art"),
+            "Google Drive/Shared drives/Content/Art")
+    }
+
+    // A deeply nested path, and one whose own name contains a hyphen, must survive intact:
+    // the split is on the FIRST slash after the account folder, not on any later text.
+    func testKeepsTheRestOfThePathVerbatim() {
+        XCTAssertEqual(
+            PathRules.googleDrivePortablePath(
+                "/Users/x/Library/CloudStorage/GoogleDrive-a@b.com/Shared drives/CM - AI/P 2/T_01/Sel Art/HP4_Turtle.spine"),
+            "Google Drive/Shared drives/CM - AI/P 2/T_01/Sel Art/HP4_Turtle.spine")
+    }
+
+    func testAccountRootAloneHasNoTrailingSlash() {
+        XCTAssertEqual(
+            PathRules.googleDrivePortablePath("/Users/x/Library/CloudStorage/GoogleDrive-a@b.com/"),
+            "Google Drive")
+    }
+
+    // Must refuse anything that is not a Drive mount, or the caller would show Drive-only
+    // menu items on ordinary local files.
+    func testRefusesNonDrivePaths() {
+        XCTAssertNil(PathRules.googleDrivePortablePath("/Users/x/Documents/Art"))
+        XCTAssertNil(PathRules.googleDrivePortablePath("/Users/x/Library/CloudStorage/iCloudDrive/Art"))
+        XCTAssertNil(PathRules.googleDrivePortablePath("/Volumes/Share/Art"))
+        XCTAssertNil(PathRules.googleDrivePortablePath(""))
+    }
+}
