@@ -949,21 +949,24 @@ func restoreItems(_ pairs: [(from: URL, to: URL)]) -> String? {
 /// empty "New Folder" and throw away whatever the user had dropped into it, or
 /// re-zip contents that have since changed.
 func trashItems(_ urls: [URL]) -> (restores: [(from: URL, to: URL)], problem: String?) {
+    let result = trashItemsWithFailures(urls)
+    let failed = result.failures.map { "• \($0.url.lastPathComponent): \($0.reason)" }
+    return (result.restores, failed.isEmpty ? nil : failed.prefix(5).joined(separator: "\n"))
+}
+
+func trashItemsWithFailures(_ urls: [URL]) -> (restores: [(from: URL, to: URL)], failures: [(url: URL, reason: String)]) {
     var restores: [(from: URL, to: URL)] = []
-    var failed: [String] = []
+    var failures: [(url: URL, reason: String)] = []
     for u in urls {
         var out: NSURL?
         do {
             try FileManager.default.trashItem(at: u, resultingItemURL: &out)
             if let t = out as URL? { restores.append((from: t, to: u)) }
-        } catch { failed.append("• \(u.lastPathComponent): \(error.localizedDescription)") }
+        } catch { failures.append((u, error.localizedDescription)) }
     }
-    // Remember where each one came from, so the Trash view's Put Back can restore it
-    // even after the app has been quit and relaunched. Recorded HERE because every
-    // trash operation in the app funnels through either this or moveToTrash — putting
-    // it in only one of them is how half the Trash ends up unrestorable.
+    // Record every entry point, so viewer deletes and Browser deletes both support Put Back.
     TrashOrigins.record(restores)
-    return (restores, failed.isEmpty ? nil : failed.prefix(5).joined(separator: "\n"))
+    return (restores, failures)
 }
 
 // MARK: - Clipboard text forms for a selection
@@ -5026,3 +5029,144 @@ final class WalkAdmission: @unchecked Sendable {
         if outstanding > 0 { outstanding -= 1 }
     }
 }
+
+// MARK: - File creation
+
+// Keep the worker's disk operations here so tests exercise the same names and partial
+// successes that Browser registers for Undo, without needing a window or selection.
+enum FileOperations {
+    // Use Finder's xattr format so named colors retain their color index on disk.
+    // Browser still ignores write failures as before; callers that need proof can catch them.
+    static func writeTags(_ url: URL, _ names: [String]) throws {
+        let colorIndex: [String: Int] = ["gray": 1, "grey": 1, "green": 2, "purple": 3,
+                                       "blue": 4, "yellow": 5, "red": 6, "orange": 7]
+        let attr = "com.apple.metadata:_kMDItemUserTags"
+        let status: Int32
+        if names.isEmpty {
+            status = url.withUnsafeFileSystemRepresentation { removexattr($0, attr, 0) }
+        } else {
+            let entries = names.map { n in colorIndex[n.lowercased()].map { "\(n)\n\($0)" } ?? n }
+            let data = try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0)
+            status = data.withUnsafeBytes { raw in
+                url.withUnsafeFileSystemRepresentation { setxattr($0, attr, raw.baseAddress, data.count, 0, 0) }
+            }
+        }
+        if status != 0 {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
+    static func uniqueDestination(_ directory: URL, _ name: String) -> URL {
+        PathRules.uniqueDest(directory, name) { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    static func newFolder(in directory: URL) throws -> URL {
+        let target = uniqueDestination(directory, "New Folder")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        return target
+    }
+
+    static func newFile(in directory: URL, name: String, contents: Data) throws -> URL {
+        let target = uniqueDestination(directory, name)
+        guard FileManager.default.createFile(atPath: target.path, contents: contents) else {
+            throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+                          userInfo: [NSLocalizedDescriptionKey: "Navigator couldn't write to “\(directory.lastPathComponent)”."])
+        }
+        return target
+    }
+
+    static func duplicate(_ source: URL, in directory: URL) throws -> URL {
+        let ext = source.pathExtension
+        let base = source.deletingPathExtension().lastPathComponent
+        let target = uniqueDestination(directory, ext.isEmpty ? "\(base) copy" : "\(base) copy.\(ext)")
+        try FileManager.default.copyItem(at: source, to: target)
+        return target
+    }
+
+    static func makeAlias(_ source: URL, in directory: URL) throws -> URL {
+        let target = uniqueDestination(directory, source.deletingPathExtension().lastPathComponent + " alias")
+        let data = try source.bookmarkData(options: .suitableForBookmarkFile, includingResourceValuesForKeys: nil, relativeTo: nil)
+        try URL.writeBookmarkData(data, to: target)
+        return target
+    }
+
+    static func makeSymlink(_ source: URL, in directory: URL) throws -> URL {
+        let base = source.deletingPathExtension().lastPathComponent
+        let ext = source.pathExtension
+        let target = uniqueDestination(directory, ext.isEmpty ? "\(base) symlink" : "\(base) symlink.\(ext)")
+        try FileManager.default.createSymbolicLink(at: target, withDestinationURL: source)
+        return target
+    }
+
+    struct FolderSelection {
+        let folder: URL
+        let moved: [(from: URL, to: URL)]
+        let failures: [String]
+    }
+
+    static func newFolder(in directory: URL, containing sources: [URL]) throws -> FolderSelection {
+        let fm = FileManager.default
+        let target = uniqueDestination(directory, sources.count == 1 ? "New Folder With Item" : "New Folder With Items")
+        try fm.createDirectory(at: target, withIntermediateDirectories: false)
+        var moved: [(from: URL, to: URL)] = []
+        var failures: [String] = []
+        for source in sources {
+            let dest = target.appendingPathComponent(source.lastPathComponent)
+            do { try fm.moveItem(at: source, to: dest); moved.append((source, dest)) }
+            catch { failures.append("• \(source.lastPathComponent): \(error.localizedDescription)") }
+        }
+        // A completely failed batch must not leave an empty folder looking like success.
+        if moved.isEmpty { try? fm.removeItem(at: target) }
+        return FolderSelection(folder: target, moved: moved, failures: failures)
+    }
+
+    static func undoFolderSelection(_ result: FolderSelection) -> String? {
+        let problem = restoreItems(result.moved.map { (from: $0.to, to: $0.from) })
+        // Files added after creation belong to the user; Undo must not delete them.
+        if (try? FileManager.default.contentsOfDirectory(atPath: result.folder.path))?.isEmpty == true {
+            try? FileManager.default.removeItem(at: result.folder)
+        }
+        return problem
+    }
+
+    static func redoFolderSelection(_ result: FolderSelection) -> String? {
+        try? FileManager.default.createDirectory(at: result.folder, withIntermediateDirectories: false)
+        return restoreItems(result.moved)
+    }
+}
+
+// The platform copy engine (copyfile) with byte-level progress: clones on
+// APFS (instant), byte-copies across volumes / SMB / File Provider while
+// reporting bytes, and preserves metadata — the same engine FileManager uses.
+// Used for regular files so a large copy shows a real, moving bar.
+func copyWithProgress(_ src: URL, _ dst: URL,
+                             isCancelled: @escaping () -> Bool = { false },
+                             onBytes: @escaping (Int64) -> Void) throws {
+    final class Box {
+        let cb: (Int64) -> Void; let cancelled: () -> Bool
+        init(_ c: @escaping (Int64) -> Void, _ x: @escaping () -> Bool) { cb = c; cancelled = x }
+    }
+    let boxPtr = Unmanaged.passRetained(Box(onBytes, isCancelled)).toOpaque()
+    defer { Unmanaged<Box>.fromOpaque(boxPtr).release() }
+    let state = copyfile_state_alloc(); defer { copyfile_state_free(state) }
+    let cb: copyfile_callback_t = { what, stage, st, _, _, ctx in
+        if what == COPYFILE_COPY_DATA, stage == COPYFILE_PROGRESS, let ctx {
+            let box = Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue()
+            var copied: off_t = 0
+            _ = copyfile_state_get(st, UInt32(COPYFILE_STATE_COPIED), &copied)
+            box.cb(Int64(copied))
+            // Honour Cancel *during* a single large file. Without this, hitting
+            // Cancel closed the window while the copy ran on to completion.
+            if box.cancelled() { return COPYFILE_QUIT }
+        }
+        return COPYFILE_CONTINUE
+    }
+    _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CTX), boxPtr)
+    _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CB), unsafeBitCast(cb, to: UnsafeMutableRawPointer.self))
+    // A destination created after the conflict check must never be overwritten.
+    if copyfile(src.path, dst.path, state, copyfile_flags_t(COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL)) != 0 {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
+                      userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+    }
+}
+

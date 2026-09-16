@@ -6054,3 +6054,440 @@ final class WalkAdmissionTests: XCTestCase {
         XCTAssertEqual(a.current, 8)
     }
 }
+
+final class FileOperationDiskTests: XCTestCase {
+    private let fm = FileManager.default
+    private let directory = FileManager.default.temporaryDirectory.appendingPathComponent("NavigatorDiskTests-\(UUID().uuidString)")
+    private var trashed: [URL] = []
+    private var oldDefaults: UserDefaults?
+    private let suite = "NavigatorDiskTests-\(UUID().uuidString)"
+
+    override func setUpWithError() throws {
+        try fm.createDirectory(at: directory, withIntermediateDirectories: false)
+        oldDefaults = TrashOrigins.defaults
+        TrashOrigins.defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    }
+
+    override func tearDownWithError() throws {
+        // A failed assertion must not leave test files in the user's Trash.
+        for url in trashed where fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+        TrashOrigins.defaults.removePersistentDomain(forName: suite)
+        if let oldDefaults { TrashOrigins.defaults = oldDefaults }
+        try fm.removeItem(at: directory)
+    }
+
+    private func file(_ name: String, _ contents: String = "original bytes") throws -> URL {
+        let url = directory.appendingPathComponent(name)
+        try Data(contents.utf8).write(to: url)
+        return url
+    }
+
+    private func contents(_ url: URL) throws -> String { try String(contentsOf: url, encoding: .utf8) }
+
+    private func tree(_ root: URL) throws -> [String: Data] {
+        var result: [String: Data] = [:]
+        for name in try fm.subpathsOfDirectory(atPath: root.path) {
+            let url = root.appendingPathComponent(name)
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey])
+            result[name + (values.isDirectory == true ? "/" : "")] = values.isDirectory == true ? Data() : try Data(contentsOf: url)
+        }
+        return result
+    }
+
+    /// Does this path exist, WITHOUT following symlinks?
+    ///
+    /// FileManager.fileExists(atPath:) follows them, so it answers false for a symlink whose
+    /// target is gone - and trashing a file together with a link to it produces exactly that:
+    /// the link is sitting in the Trash, perfectly present, reported missing. lstat asks about
+    /// the link itself, which is what "did this item move" actually means.
+    private func itemExists(_ url: URL) -> Bool {
+        (try? fm.attributesOfItem(atPath: url.path)) != nil
+    }
+
+    private func trash(_ urls: [URL]) throws -> [(from: URL, to: URL)] {
+        let probe = try file("trash-probe-\(UUID().uuidString)")
+        var landed: NSURL?
+        do {
+            try fm.trashItem(at: probe, resultingItemURL: &landed)
+        } catch {
+            let ns = error as NSError
+            if (ns.domain == NSCocoaErrorDomain && [NSFileWriteNoPermissionError, NSFileReadNoPermissionError].contains(ns.code))
+                || (ns.domain == NSPOSIXErrorDomain && [Int(EPERM), Int(EACCES)].contains(ns.code)) {
+                throw XCTSkip("FileManager.trashItem blocked in this environment: \(error.localizedDescription)")
+            }
+            throw error
+        }
+        let probeTrash = try XCTUnwrap(landed as URL?)
+        trashed.append(probeTrash)
+        try fm.removeItem(at: probeTrash)
+        let result = trashItemsWithFailures(urls)
+        trashed += result.restores.map { $0.from }
+        // Once the platform probe succeeds, any helper failure is a regression, not a skip.
+        XCTAssertTrue(result.failures.isEmpty, "\(result.failures)")
+        XCTAssertEqual(result.restores.count, urls.count)
+        for pair in result.restores {
+            XCTAssertFalse(itemExists(pair.to), "\(pair.to.lastPathComponent) should have left the folder")
+            XCTAssertTrue(itemExists(pair.from), "\(pair.to.lastPathComponent) should be in the Trash")
+        }
+        return result.restores
+    }
+
+    func testNewFolderChoosesFreeName() throws {
+        let first = try FileOperations.newFolder(in: directory)
+        let second = try FileOperations.newFolder(in: directory)
+        XCTAssertEqual(first.lastPathComponent, "New Folder")
+        XCTAssertEqual(second.lastPathComponent, "New Folder 2")
+        XCTAssertEqual(try tree(directory), ["New Folder/": Data(), "New Folder 2/": Data()])
+    }
+
+    func testNewTextFilePreservesCollisionAndContents() throws {
+        let original = try file("New Text File.txt", "keep me")
+        let empty = try FileOperations.newFile(in: directory, name: "New Text File.txt", contents: Data())
+        let third = try FileOperations.newFile(in: directory, name: "New Text File.txt", contents: Data("third".utf8))
+        XCTAssertEqual(empty.lastPathComponent, "New Text File 2.txt")
+        XCTAssertEqual(third.lastPathComponent, "New Text File 3.txt")
+        XCTAssertEqual(try contents(original), "keep me")
+        XCTAssertEqual(try Data(contentsOf: empty), Data())
+        XCTAssertEqual(try contents(third), "third")
+    }
+
+    func testCreationInVanishedParentFails() throws {
+        let absent = directory.appendingPathComponent("gone")
+        XCTAssertThrowsError(try FileOperations.newFolder(in: absent))
+        XCTAssertThrowsError(try FileOperations.newFile(in: absent, name: "text.txt", contents: Data()))
+        XCTAssertThrowsError(try FileOperations.newFolder(in: absent, containing: [file("source")]))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: directory.path), ["source"])
+    }
+
+    func testDuplicateFileCollisionsKeepAllBytes() throws {
+        let source = try file("photo.txt")
+        let first = try FileOperations.duplicate(source, in: directory)
+        let second = try FileOperations.duplicate(source, in: directory)
+        XCTAssertEqual(first.lastPathComponent, "photo copy.txt")
+        XCTAssertEqual(second.lastPathComponent, "photo copy 2.txt")
+        for url in [source, first, second] { XCTAssertEqual(try contents(url), "original bytes") }
+    }
+
+    func testDuplicateDirectoryCopiesNestedTree() throws {
+        let source = try FileOperations.newFolder(in: directory)
+        try fm.createDirectory(at: source.appendingPathComponent("nested"), withIntermediateDirectories: false)
+        try Data("nested bytes".utf8).write(to: source.appendingPathComponent("nested/file"))
+        let copy = try FileOperations.duplicate(source, in: directory)
+        XCTAssertEqual(try tree(copy), try tree(source))
+    }
+
+    func testDuplicateVanishedSourceDoesNotCreateDestination() throws {
+        let source = try file("vanished")
+        try fm.removeItem(at: source)
+        XCTAssertThrowsError(try FileOperations.duplicate(source, in: directory))
+        XCTAssertEqual(try tree(directory), [:])
+    }
+
+    func testAliasResolvesAndCollisionsPreservePreviousAlias() throws {
+        let source = try file("report.txt")
+        let first = try FileOperations.makeAlias(source, in: directory)
+        let second = try FileOperations.makeAlias(source, in: directory)
+        XCTAssertEqual(first.lastPathComponent, "report alias")
+        XCTAssertEqual(second.lastPathComponent, "report alias 2")
+        for alias in [first, second] {
+            let resolved = try URL(resolvingAliasFileAt: alias, options: [.withoutUI, .withoutMounting])
+            XCTAssertEqual(resolved.standardizedFileURL.resolvingSymlinksInPath(), source.standardizedFileURL.resolvingSymlinksInPath())
+            XCTAssertEqual(try contents(resolved), "original bytes")
+        }
+    }
+
+    func testAliasVanishedSourceFails() throws {
+        let source = try file("gone.txt")
+        try fm.removeItem(at: source)
+        XCTAssertThrowsError(try FileOperations.makeAlias(source, in: directory))
+        XCTAssertEqual(try tree(directory), [:])
+    }
+
+    func testSymlinkTargetsAndNameCollisions() throws {
+        let source = try file("report.txt")
+        let first = try FileOperations.makeSymlink(source, in: directory)
+        let second = try FileOperations.makeSymlink(source, in: directory)
+        XCTAssertEqual(first.lastPathComponent, "report symlink.txt")
+        XCTAssertEqual(second.lastPathComponent, "report symlink 2.txt")
+        for link in [first, second] {
+            XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: link.path), source.path)
+            XCTAssertEqual(try contents(link), "original bytes")
+        }
+    }
+
+    func testSymlinkAllowsVanishedTargetAsBefore() throws {
+        let source = directory.appendingPathComponent("gone")
+        let link = try FileOperations.makeSymlink(source, in: directory)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: link.path), source.path)
+        XCTAssertThrowsError(try Data(contentsOf: link))
+    }
+
+    func testSelectionFolderRoundTripMatchesTree() throws {
+        let sources = try [file("one", "1"), file("two", "2")]
+        let before = try tree(directory)
+        let result = try FileOperations.newFolder(in: directory, containing: sources)
+        XCTAssertTrue(result.failures.isEmpty)
+        XCTAssertEqual(result.moved.count, 2)
+        XCTAssertEqual(result.folder.lastPathComponent, "New Folder With Items")
+        let after = try tree(directory)
+        XCTAssertEqual(after, ["New Folder With Items/": Data(), "New Folder With Items/one": Data("1".utf8), "New Folder With Items/two": Data("2".utf8)])
+        XCTAssertNil(FileOperations.undoFolderSelection(result))
+        XCTAssertEqual(try tree(directory), before)
+        XCTAssertNil(FileOperations.redoFolderSelection(result))
+        XCTAssertEqual(try tree(directory), after)
+    }
+
+    func testSelectionFolderCollisionAndPartialVanishedSource() throws {
+        let source = try file("one")
+        let gone = try file("gone")
+        try fm.removeItem(at: gone)
+        let existing = directory.appendingPathComponent("New Folder With Items")
+        try fm.createDirectory(at: existing, withIntermediateDirectories: false)
+        let result = try FileOperations.newFolder(in: directory, containing: [gone, source])
+        XCTAssertEqual(result.folder.lastPathComponent, "New Folder With Items 2")
+        XCTAssertEqual(result.moved.count, 1)
+        XCTAssertEqual(result.failures.count, 1)
+        XCTAssertTrue(result.failures[0].contains("gone"))
+        XCTAssertEqual(try contents(result.folder.appendingPathComponent("one")), "original bytes")
+        XCTAssertNil(FileOperations.undoFolderSelection(result))
+        XCTAssertEqual(try contents(source), "original bytes")
+        XCTAssertTrue(fm.fileExists(atPath: existing.path))
+    }
+
+    func testSelectionWithOnlyVanishedSourceRemovesEmptyFolder() throws {
+        let result = try FileOperations.newFolder(in: directory, containing: [directory.appendingPathComponent("gone")])
+        XCTAssertTrue(result.moved.isEmpty)
+        XCTAssertEqual(result.failures.count, 1)
+        XCTAssertFalse(fm.fileExists(atPath: result.folder.path))
+        XCTAssertEqual(try tree(directory), [:])
+    }
+
+    func testSelectionSameBasenamesReportPartialFailure() throws {
+        let a = try FileOperations.newFolder(in: directory)
+        let b = try FileOperations.newFolder(in: directory)
+        let one = a.appendingPathComponent("same"), two = b.appendingPathComponent("same")
+        try Data("one".utf8).write(to: one)
+        try Data("two".utf8).write(to: two)
+        let result = try FileOperations.newFolder(in: directory, containing: [one, two])
+        XCTAssertEqual(result.moved.count, 1)
+        XCTAssertEqual(result.failures.count, 1)
+        XCTAssertEqual(try contents(result.folder.appendingPathComponent("same")), "one")
+        XCTAssertEqual(try contents(two), "two")
+    }
+
+    func testSelectionUndoPreservesFilesAddedLater() throws {
+        let source = try file("one")
+        let result = try FileOperations.newFolder(in: directory, containing: [source])
+        let added = result.folder.appendingPathComponent("added")
+        try Data("keep".utf8).write(to: added)
+        XCTAssertNil(FileOperations.undoFolderSelection(result))
+        XCTAssertEqual(try contents(added), "keep")
+        XCTAssertEqual(try contents(source), "original bytes")
+        XCTAssertNil(FileOperations.redoFolderSelection(result))
+        XCTAssertEqual(try contents(added), "keep")
+        XCTAssertEqual(try contents(result.folder.appendingPathComponent("one")), "original bytes")
+    }
+
+    func testSelectionUndoOccupiedOriginalDoesNotOverwrite() throws {
+        let source = try file("one")
+        let result = try FileOperations.newFolder(in: directory, containing: [source])
+        try Data("occupant".utf8).write(to: source)
+        XCTAssertNotNil(FileOperations.undoFolderSelection(result))
+        XCTAssertEqual(try contents(source), "occupant")
+        XCTAssertEqual(try contents(result.folder.appendingPathComponent("one")), "original bytes")
+    }
+
+    func testSelectionRedoOccupiedChildDoesNotOverwrite() throws {
+        let source = try file("one")
+        let result = try FileOperations.newFolder(in: directory, containing: [source])
+        XCTAssertNil(FileOperations.undoFolderSelection(result))
+        try fm.createDirectory(at: result.folder, withIntermediateDirectories: false)
+        let child = result.folder.appendingPathComponent("one")
+        try Data("occupant".utf8).write(to: child)
+        XCTAssertNotNil(FileOperations.redoFolderSelection(result))
+        XCTAssertEqual(try contents(source), "original bytes")
+        XCTAssertEqual(try contents(child), "occupant")
+    }
+
+    func testProgressCopyPreservesBytesAndPermissions() throws {
+        let source = try file("source", String(repeating: "payload", count: 10000))
+        try fm.setAttributes([.posixPermissions: 0o640], ofItemAtPath: source.path)
+        let dest = directory.appendingPathComponent("copy")
+        var counts: [Int64] = []
+        try copyWithProgress(source, dest, onBytes: { counts.append($0) })
+        XCTAssertEqual(try Data(contentsOf: source), try Data(contentsOf: dest))
+        XCTAssertEqual((try fm.attributesOfItem(atPath: dest.path)[.posixPermissions] as? NSNumber)?.intValue, 0o640)
+        // APFS may clone without callbacks; any callbacks it does emit must be monotonic.
+        XCTAssertEqual(counts, counts.sorted())
+    }
+
+    func testProgressCopyRefusesOccupiedDestination() throws {
+        let source = try file("source"), dest = try file("copy", "occupant")
+        XCTAssertThrowsError(try copyWithProgress(source, dest, onBytes: { _ in }))
+        XCTAssertEqual(try contents(source), "original bytes")
+        XCTAssertEqual(try contents(dest), "occupant")
+    }
+
+    func testProgressCopyVanishedSourceFails() throws {
+        let source = try file("source")
+        try fm.removeItem(at: source)
+        let dest = directory.appendingPathComponent("copy")
+        XCTAssertThrowsError(try copyWithProgress(source, dest, onBytes: { _ in }))
+        XCTAssertFalse(fm.fileExists(atPath: dest.path))
+    }
+
+    func testRestoreMoveRoundTripAndVanishedSource() throws {
+        let source = try file("source"), dest = directory.appendingPathComponent("moved")
+        let before = try tree(directory)
+        XCTAssertNil(restoreItems([(source, dest)]))
+        XCTAssertFalse(fm.fileExists(atPath: source.path))
+        XCTAssertEqual(try contents(dest), "original bytes")
+        let after = try tree(directory)
+        XCTAssertNil(restoreItems([(dest, source)]))
+        XCTAssertEqual(try tree(directory), before)
+        XCTAssertNil(restoreItems([(source, dest)]))
+        XCTAssertEqual(try tree(directory), after)
+        try fm.removeItem(at: dest)
+        XCTAssertNotNil(restoreItems([(dest, source)]))
+        XCTAssertEqual(try tree(directory), [:])
+    }
+
+    func testPermissionDeniedDoesNotCreateOrMoveItems() throws {
+        let source = try file("source")
+        let locked = try FileOperations.newFolder(in: directory)
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+        guard !fm.isWritableFile(atPath: locked.path) else { throw XCTSkip("This user bypasses POSIX write permissions") }
+        XCTAssertThrowsError(try FileOperations.newFolder(in: locked))
+        XCTAssertThrowsError(try FileOperations.newFile(in: locked, name: "text", contents: Data()))
+        XCTAssertThrowsError(try FileOperations.duplicate(source, in: locked))
+        XCTAssertThrowsError(try FileOperations.makeAlias(source, in: locked))
+        XCTAssertThrowsError(try FileOperations.makeSymlink(source, in: locked))
+        XCTAssertThrowsError(try FileOperations.newFolder(in: locked, containing: [source]))
+        let dest = locked.appendingPathComponent("dest")
+        XCTAssertThrowsError(try copyWithProgress(source, dest, onBytes: { _ in }))
+        XCTAssertNotNil(restoreItems([(source, dest)]))
+        XCTAssertEqual(try contents(source), "original bytes")
+        XCTAssertEqual(try tree(locked), [:])
+    }
+
+    func testTrashRestoreRedoRoundTripWithContentsAndOrigins() throws {
+        let source = try file("NavigatorTrash-\(UUID().uuidString).txt")
+        let before = try tree(directory)
+        var pairs = try trash([source])
+        let first = try XCTUnwrap(pairs.first)
+        XCTAssertEqual(try contents(first.from), "original bytes")
+        XCTAssertEqual(TrashOrigins.origin(of: first.from.path)?.name, source.lastPathComponent)
+        XCTAssertNil(restoreItems(pairs))
+        TrashOrigins.forget(pairs.map { $0.from.path })
+        XCTAssertEqual(try tree(directory), before)
+        XCTAssertNil(TrashOrigins.origin(of: first.from.path))
+        pairs = try trash([source])
+        XCTAssertEqual(try tree(directory), [:])
+        XCTAssertNil(restoreItems(pairs))
+        XCTAssertEqual(try tree(directory), before)
+    }
+
+    func testTrashUndoOccupiedOriginalPreservesBothFiles() throws {
+        let source = try file("NavigatorTrash-\(UUID().uuidString).txt")
+        let pairs = try trash([source])
+        try Data("occupant".utf8).write(to: source)
+        XCTAssertNotNil(restoreItems(pairs))
+        XCTAssertEqual(try contents(source), "occupant")
+        XCTAssertEqual(try contents(XCTUnwrap(pairs.first).from), "original bytes")
+        try fm.removeItem(at: source)
+        XCTAssertNil(restoreItems(pairs))
+        XCTAssertEqual(try contents(source), "original bytes")
+    }
+
+    func testTrashVanishedSourceReportsFailure() throws {
+        let source = try file("gone")
+        try fm.removeItem(at: source)
+        let result = trashItems([source])
+        XCTAssertTrue(result.restores.isEmpty)
+        XCTAssertNotNil(result.problem)
+        XCTAssertTrue(result.problem?.contains("gone") == true)
+        XCTAssertEqual(try tree(directory), [:])
+    }
+
+    func testCreationUndoRedoRestoresExactTreeIncludingLaterContents() throws {
+        let folder = try FileOperations.newFolder(in: directory)
+        try Data("added later".utf8).write(to: folder.appendingPathComponent("child"))
+        let text = try FileOperations.newFile(in: directory, name: "New Text File.txt", contents: Data())
+        let duplicate = try FileOperations.duplicate(text, in: directory)
+        let link = try FileOperations.makeSymlink(text, in: directory)
+        let alias = try FileOperations.makeAlias(text, in: directory)
+        let created = [folder, text, duplicate, link, alias]
+        let before = try tree(directory)
+        let pairs = try trash(created)
+        XCTAssertEqual(try tree(directory), [:])
+        XCTAssertNil(restoreItems(pairs))
+        XCTAssertEqual(try tree(directory), before)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: link.path), text.path)
+        XCTAssertEqual(try contents(folder.appendingPathComponent("child")), "added later")
+    }
+
+    func testTagsWriteReplaceAndRemoveRealAttribute() throws {
+        let source = try file("tagged")
+        func tags() throws -> [String] {
+            let data = try source.withUnsafeFileSystemRepresentation { path -> Data in
+                let count = getxattr(path, "com.apple.metadata:_kMDItemUserTags", nil, 0, 0, 0)
+                guard count >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                var data = Data(count: count)
+                let read = data.withUnsafeMutableBytes { getxattr(path, "com.apple.metadata:_kMDItemUserTags", $0.baseAddress, count, 0, 0) }
+                guard read == count else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                return data
+            }
+            return try XCTUnwrap(PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String])
+        }
+        try FileOperations.writeTags(source, ["Red", "Custom"])
+        XCTAssertEqual(try tags(), ["Red\n6", "Custom"])
+        try FileOperations.writeTags(source, ["Blue"])
+        XCTAssertEqual(try tags(), ["Blue\n4"])
+        try FileOperations.writeTags(source, [])
+        XCTAssertThrowsError(try tags()) { XCTAssertEqual(($0 as NSError).code, Int(ENOATTR)) }
+        XCTAssertEqual(try contents(source), "original bytes")
+    }
+
+    func testTagsVanishedSourceReportsFailure() throws {
+        let source = try file("gone")
+        try fm.removeItem(at: source)
+        XCTAssertThrowsError(try FileOperations.writeTags(source, ["Red"]))
+        XCTAssertThrowsError(try FileOperations.writeTags(source, []))
+    }
+
+    func testWorkerUndoRedoPublishesAfterDiskWork() throws {
+        let source = try file("one")
+        let before = try tree(directory)
+        let result = try FileOperations.newFolder(in: directory, containing: [source])
+        let after = try tree(directory)
+        let stack = UndoStack()
+        var completion = expectation(description: "undo completes")
+        stack.execute = { action, done in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let problem = action()
+                DispatchQueue.main.async { done(problem); completion.fulfill() }
+            }
+        }
+        stack.onFailure = { summary, detail in XCTFail("\(summary): \(detail)") }
+        stack.push("New Folder with Selection", undo: {
+            XCTAssertFalse(Thread.isMainThread)
+            return FileOperations.undoFolderSelection(result)
+        }, redo: {
+            XCTAssertFalse(Thread.isMainThread)
+            return FileOperations.redoFolderSelection(result)
+        })
+        stack.undo()
+        XCTAssertTrue(stack.isPerforming)
+        XCTAssertFalse(stack.canRedo)
+        wait(for: [completion], timeout: 5)
+        XCTAssertTrue(stack.canRedo)
+        XCTAssertEqual(try tree(directory), before)
+        completion = expectation(description: "redo completes")
+        stack.redo()
+        wait(for: [completion], timeout: 5)
+        XCTAssertTrue(stack.canUndo)
+        XCTAssertEqual(try tree(directory), after)
+    }
+
+}

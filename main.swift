@@ -7694,7 +7694,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     guard FileManager.default.fileExists(atPath: u.path) else {
                         missing.append("• \(u.lastPathComponent)"); continue
                     }
-                    Browser.writeTags(u, tags)
+                    try? FileOperations.writeTags(u, tags)
                 }
                 self?.load()
                 return missing.isEmpty ? nil
@@ -7721,14 +7721,9 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         let dir = currentURL
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            var restores: [(from: URL, to: URL)] = []   // where it landed in the Trash → where it came from
-            var failures: [(url: URL, reason: String)] = []
-            for u in urls {
-                var out: NSURL?
-                do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((from: t, to: u)) } }
-                catch { failures.append((u, error.localizedDescription)) }
-            }
-            TrashOrigins.record(restores)
+            let result = trashItemsWithFailures(urls)
+            var restores = result.restores
+            let failures = result.failures
             DispatchQueue.main.async {
                 if !restores.isEmpty {
                     RecentFolders.shared.record(dir)
@@ -7772,8 +7767,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func newFolder() {
         let dir = currentURL
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let target = uniqueDest(dir, "New Folder")
-            do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
+            let target: URL
+            do { target = try FileOperations.newFolder(in: dir) }
             catch {
                 DispatchQueue.main.async { reportFileError("Couldn't create the folder", error.localizedDescription) }
                 return
@@ -7804,8 +7799,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     private func newEmptyFile(_ name: String, _ contents: Data, desc: String) {
         let dir = currentURL
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let target = uniqueDest(dir, name)
-            guard fm.createFile(atPath: target.path, contents: contents) else {
+            let target: URL
+            do { target = try FileOperations.newFile(in: dir, name: name, contents: contents) } catch {
                 DispatchQueue.main.async { reportFileError("Couldn't create “\(name)”",
                                 "Navigator couldn't write to “\(dir.lastPathComponent)”.") }; return
             }
@@ -7831,22 +7826,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard !sources.isEmpty else { NSSound.beep(); return }
         let dir = currentURL
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let target = uniqueDest(dir, sources.count == 1 ? "New Folder With Item" : "New Folder With Items")
-            do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
+            let result: FileOperations.FolderSelection
+            do { result = try FileOperations.newFolder(in: dir, containing: sources) }
             catch {
                 DispatchQueue.main.async { reportFileError("Couldn't create the folder", error.localizedDescription) }
                 return
             }
-            var moved: [(from: URL, to: URL)] = []
-            var failures: [String] = []
-            for src in sources {
-                let dest = target.appendingPathComponent(src.lastPathComponent)
-                do { try fm.moveItem(at: src, to: dest); moved.append((from: src, to: dest)) }
-                catch { failures.append("• \(src.lastPathComponent): \(error.localizedDescription)") }
-            }
-            // Nothing made it in — bin the folder rather than leaving an empty stray behind.
+            let target = result.folder, moved = result.moved, failures = result.failures
             if moved.isEmpty {
-                try? fm.removeItem(at: target)
                 DispatchQueue.main.async { reportFileError("Couldn't move the items into a new folder", failures.joined(separator: "\n")) }
                 return
             }
@@ -7858,17 +7845,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 }
                 RecentFolders.shared.record(dir)
                 UndoStack.shared.push("New Folder with Selection", undo: { [weak self] in
-                    let problem = restoreItems(moved.map { (from: $0.to, to: $0.from) })
-                    // Only remove it if it's genuinely empty: the user may have dropped
-                    // something else in since, and deleting that would be data loss.
-                    if (try? FileManager.default.contentsOfDirectory(atPath: target.path))?.isEmpty == true {
-                        try? FileManager.default.removeItem(at: target)
-                    }
+                    let problem = FileOperations.undoFolderSelection(result)
                     self?.load()
                     return problem
                 }, redo: { [weak self] in
-                    try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
-                    let problem = restoreItems(moved)
+                    let problem = FileOperations.redoFolderSelection(result)
                     self?.load()
                     return problem
                 })
@@ -8069,41 +8050,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         performTransfer(sources, into: dir, move: move, resetCut: false)
     }
 
-    // The platform copy engine (copyfile) with byte-level progress: clones on
-    // APFS (instant), byte-copies across volumes / SMB / File Provider while
-    // reporting bytes, and preserves metadata — the same engine FileManager uses.
-    // Used for regular files so a large copy shows a real, moving bar.
-    static func copyWithProgress(_ src: URL, _ dst: URL,
-                                 isCancelled: @escaping () -> Bool = { false },
-                                 onBytes: @escaping (Int64) -> Void) throws {
-        final class Box {
-            let cb: (Int64) -> Void; let cancelled: () -> Bool
-            init(_ c: @escaping (Int64) -> Void, _ x: @escaping () -> Bool) { cb = c; cancelled = x }
-        }
-        let boxPtr = Unmanaged.passRetained(Box(onBytes, isCancelled)).toOpaque()
-        defer { Unmanaged<Box>.fromOpaque(boxPtr).release() }
-        let state = copyfile_state_alloc(); defer { copyfile_state_free(state) }
-        let cb: copyfile_callback_t = { what, stage, st, _, _, ctx in
-            if what == COPYFILE_COPY_DATA, stage == COPYFILE_PROGRESS, let ctx {
-                let box = Unmanaged<Box>.fromOpaque(ctx).takeUnretainedValue()
-                var copied: off_t = 0
-                _ = copyfile_state_get(st, UInt32(COPYFILE_STATE_COPIED), &copied)
-                box.cb(Int64(copied))
-                // Honour Cancel *during* a single large file. Without this, hitting
-                // Cancel closed the window while the copy ran on to completion.
-                if box.cancelled() { return COPYFILE_QUIT }
-            }
-            return COPYFILE_CONTINUE
-        }
-        _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CTX), boxPtr)
-        _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CB), unsafeBitCast(cb, to: UnsafeMutableRawPointer.self))
-        // A destination created after the conflict check must never be overwritten.
-        if copyfile(src.path, dst.path, state, copyfile_flags_t(COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL)) != 0 {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
-                          userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
-        }
-    }
-
     // True when `dir` is `src` itself or lives inside it. Copying/moving a folder
     // into its own subtree must be refused: FileManager happily recurses into the
     // copy it is creating, and only stops when the path gets too long — a real test
@@ -8269,7 +8215,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 do {
                     if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
                     else if useBytes {
-                        try Browser.copyWithProgress(src, dest, isCancelled: { progress.cancelled }, onBytes: onBytes)
+                        try copyWithProgress(src, dest, isCancelled: { progress.cancelled }, onBytes: onBytes)
                         copied.append(dest)
                     }
                     else { try fm.copyItem(at: src, to: dest); copied.append(dest) }   // APFS clones this too
@@ -8383,11 +8329,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var created: [URL] = []
             var failure: String?
             for it in selected {
-                let aliasURL = uniqueDest(dir, it.url.deletingPathExtension().lastPathComponent + " alias")
                 do {
-                    let data = try it.url.bookmarkData(options: .suitableForBookmarkFile, includingResourceValuesForKeys: nil, relativeTo: nil)
-                    try URL.writeBookmarkData(data, to: aliasURL)
-                    created.append(aliasURL)
+                    created.append(try FileOperations.makeAlias(it.url, in: dir))
                 } catch { failure = failure ?? error.localizedDescription }
             }
             DispatchQueue.main.async {
@@ -8401,25 +8344,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
     }
 
-    // Writes Finder tags via the com.apple.metadata:_kMDItemUserTags xattr (the
-    // URLResourceValues.tagNames setter is macOS 26+, so we set the store directly).
-    // Standard color names get their color index ("Red\n6"); custom tags stay plain.
-    static func writeTags(_ url: URL, _ names: [String]) {
-        let colorIndex: [String: Int] = ["gray": 1, "grey": 1, "green": 2, "purple": 3,
-                                         "blue": 4, "yellow": 5, "red": 6, "orange": 7]
-        let attr = "com.apple.metadata:_kMDItemUserTags"
-        if names.isEmpty {
-            _ = url.withUnsafeFileSystemRepresentation { removexattr($0, attr, 0) }
-            return
-        }
-        let entries = names.map { n -> String in colorIndex[n.lowercased()].map { "\(n)\n\($0)" } ?? n }
-        guard let data = try? PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0) else { return }
-        _ = data.withUnsafeBytes { raw in
-            url.withUnsafeFileSystemRepresentation { path in
-                setxattr(path, attr, raw.baseAddress, data.count, 0, 0)
-            }
-        }
-    }
     func toggleTag(_ ids: Set<String>, _ tag: String) {
         let affected = items.filter { ids.contains($0.id) }
         guard !affected.isEmpty else { return }
@@ -8432,7 +8356,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         let updates = redoData
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            for (url, tags) in updates { Browser.writeTags(url, tags) }
+            for (url, tags) in updates { try? FileOperations.writeTags(url, tags) }
             DispatchQueue.main.async { pushTags(undoData, updates); load() }
         }
     }
@@ -8441,7 +8365,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard !affected.isEmpty else { return }
         let undoData: [(URL, [String])] = affected.map { ($0.url, $0.tags) }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            for it in affected { Browser.writeTags(it.url, tags) }
+            for it in affected { try? FileOperations.writeTags(it.url, tags) }
             DispatchQueue.main.async { pushTags(undoData, affected.map { ($0.url, tags) }); load() }
         }
     }
@@ -8509,11 +8433,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var failure: String?
             var created: [URL] = []
             for it in selected {
-                let base = it.url.deletingPathExtension().lastPathComponent
-                let ext = it.url.pathExtension
-                let linkName = ext.isEmpty ? "\(base) symlink" : "\(base) symlink.\(ext)"
-                let linkURL = uniqueDest(dir, linkName)
-                do { try fm.createSymbolicLink(at: linkURL, withDestinationURL: it.url); created.append(linkURL) }
+                do { created.append(try FileOperations.makeSymlink(it.url, in: dir)) }
                 catch { failure = failure ?? error.localizedDescription }
             }
             DispatchQueue.main.async {
@@ -8644,11 +8564,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var created: [URL] = []
             var failure: String?
             for it in selected {
-                let ext = it.url.pathExtension
-                let base = it.url.deletingPathExtension().lastPathComponent
-                let name = ext.isEmpty ? "\(base) copy" : "\(base) copy.\(ext)"
-                let dest = uniqueDest(dir, name)
-                do { try fm.copyItem(at: it.url, to: dest); created.append(dest) }
+                do { created.append(try FileOperations.duplicate(it.url, in: dir)) }
                 catch { failure = failure ?? error.localizedDescription }
             }
             DispatchQueue.main.async {
@@ -14318,7 +14234,7 @@ struct ImageViewerView: View {
                                 "Pick a different name.", permissionHint: false) }; return
             }
             do {
-                try FileManager.default.moveItem(at: u, to: dest)
+                _ = try renameItem(u, to: dest, replacing: false)
             } catch {
                 DispatchQueue.main.async { reportFileError("Couldn’t rename “\(u.lastPathComponent)”.", error.localizedDescription) }; return
             }
@@ -14328,14 +14244,14 @@ struct ImageViewerView: View {
                 // Captured values, not self: this is a struct, and these closures outlive the window
                 // anyway because the undo stack is app-wide. Same mechanism deleteCurrent uses.
                 UndoStack.shared.push("Rename", undo: {
-                    do { try FileManager.default.moveItem(at: dest, to: u) } catch { return error.localizedDescription }
+                    do { _ = try renameItem(dest, to: u, replacing: false) } catch { return error.localizedDescription }
                     DispatchQueue.main.async {
                         NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
                                                         userInfo: ["viewer": vid, "url": dest, "replaceWith": u])
                     }
                     return nil
                 }, redo: {
-                    do { try FileManager.default.moveItem(at: u, to: dest) } catch { return error.localizedDescription }
+                    do { _ = try renameItem(u, to: dest, replacing: false) } catch { return error.localizedDescription }
                     DispatchQueue.main.async {
                         NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
                                                         userInfo: ["viewer": vid, "url": u, "replaceWith": dest])
@@ -18389,7 +18305,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             item.keyEquivalentModifierMask = PickerBridge.cocoaModifiers(c.carbonModifiers)
             return true
         }
-        if item.action == #selector(makeAliasAction(_:)) { return !appModel.active.selection.isEmpty }
+        // Everything here acts ON the selection, so with nothing selected there is nothing to
+        // act on. Only Make Alias and New Folder with Selection used to say so; Duplicate,
+        // Compress, Get Info, Rename, Quick Look and Move to Trash stayed enabled and then did
+        // nothing when picked - a menu item that is lit and inert reads as a broken feature.
+        // Found by driving the real menus: Duplicate reported enabled with an empty selection.
+        let needsSelection: [Selector] = [
+            #selector(makeAliasAction(_:)), #selector(duplicateAction(_:)),
+            #selector(compressAction(_:)),  #selector(getInfoAction(_:)),
+            #selector(renameAction(_:)),    #selector(quickLookAction(_:)),
+            #selector(moveToTrashAction(_:)),
+        ]
+        if let a = item.action, needsSelection.contains(a) { return !appModel.active.selection.isEmpty }
         // Grey out rather than beep: with nothing selected there is nothing to wrap up.
         if item.action == #selector(newFolderWithSelectionAction(_:)) { return !appModel.active.selection.isEmpty }
         if item.action == #selector(ejectAction(_:)) {
