@@ -13,6 +13,20 @@ import CoreGraphics
 
 enum PathRules {
 
+    // Search selections can span parents; bare names would archive unrelated siblings.
+    static func archiveInputs(_ urls: [URL]) -> (directory: URL, entries: [String])? {
+        guard let first = urls.first, urls.allSatisfy({ $0.isFileURL }) else { return nil }
+        let paths = urls.map { $0.standardizedFileURL.pathComponents }
+        var common = first.standardizedFileURL.deletingLastPathComponent().pathComponents
+        for path in paths {
+            common = Array(zip(common, path.dropLast()).prefix { $0 == $1 }.map { $0.0 })
+        }
+        let directory = URL(fileURLWithPath: NSString.path(withComponents: common), isDirectory: true)
+        // Prefixing ./ also keeps a selected name beginning with '-' out of zip's options.
+        let entries = paths.map { "./" + $0.dropFirst(common.count).joined(separator: "/") }
+        return (directory, entries)
+    }
+
     /// True when `dir` is `src` itself or sits inside it.
     ///
     /// Copying or moving a folder into its own subtree must be refused: FileManager
@@ -748,7 +762,17 @@ typealias UndoAction = () -> String?
 /// fifteen call sites does not.
 final class UndoStack {
     static let shared = UndoStack()
-    struct Entry { let desc: String; let undo: UndoAction; let redo: UndoAction }
+    /// `cleanup` runs when an entry can never be replayed again. Rename-with-Replace keeps
+    /// the displaced file in a hidden stash so Undo can put it back; without this hook that
+    /// stash would sit in the folder forever once the entry fell off the stack, and a user
+    /// who renames over a hundred files would accumulate a hundred hidden leftovers.
+    struct Entry {
+        let desc: String; let undo: UndoAction; let redo: UndoAction
+        var cleanup: (() -> Void)? = nil
+    }
+
+    /// One place that retires entries, so a new death point cannot forget to run cleanup.
+    private func retire(_ entries: [Entry]) { for e in entries { e.cleanup?() } }
 
     /// 200, not the old 50: an entry is two closures over a handful of URLs, a few
     /// hundred bytes, so history is essentially free and the old cap threw away a
@@ -770,14 +794,15 @@ final class UndoStack {
     var topDescription: String? { undoStack.last?.desc }
     var topRedoDescription: String? { redoStack.last?.desc }
 
-    func push(_ desc: String, undo: @escaping UndoAction, redo: @escaping UndoAction) {
-        undoStack.append(Entry(desc: desc, undo: undo, redo: redo))
-        if undoStack.count > Self.limit { undoStack.removeFirst() }
+    func push(_ desc: String, undo: @escaping UndoAction, redo: @escaping UndoAction,
+              cleanup: (() -> Void)? = nil) {
+        undoStack.append(Entry(desc: desc, undo: undo, redo: redo, cleanup: cleanup))
+        if undoStack.count > Self.limit { retire([undoStack.removeFirst()]) }
         // Any NEW operation invalidates every pending redo. Those closures hold paths
         // the new operation may have just renamed, moved or binned, so replaying one
         // would act on files the user never asked about — the classic corruption bug
         // in hand-rolled undo.
-        redoStack.removeAll()
+        retire(redoStack); redoStack.removeAll()
     }
 
     func undo() {
@@ -785,14 +810,14 @@ final class UndoStack {
         // A failed half DROPS the entry (popLast already removed it and we return
         // without re-filing it): its recorded state is demonstrably wrong now, and
         // offering to replay it would only compound the mess.
-        if let problem = e.undo() { onFailure("Couldn’t undo \(e.desc)", problem); return }
+        if let problem = e.undo() { retire([e]); onFailure("Couldn’t undo \(e.desc)", problem); return }
         redoStack.append(e)
-        if redoStack.count > Self.limit { redoStack.removeFirst() }
+        if redoStack.count > Self.limit { retire([redoStack.removeFirst()]) }
     }
 
     func redo() {
         guard let e = redoStack.popLast() else { onEmpty(); return }
-        if let problem = e.redo() { onFailure("Couldn’t redo \(e.desc)", problem); return }
+        if let problem = e.redo() { retire([e]); onFailure("Couldn’t redo \(e.desc)", problem); return }
         // Straight append, NOT push(): push() clears the redo stack, which would make
         // a redo wipe out every remaining redo behind it.
         undoStack.append(e)
@@ -845,6 +870,32 @@ func collisionSafeOrder(_ pairs: [(from: URL, to: URL)],
         remaining = blocked
     }
     return out
+}
+
+// Stage before both Rename and Redo: failure must leave the displaced item recoverable.
+// The returned backup is retained for Undo, so a successful rename does not destroy it either.
+func renameItem(_ source: URL, to destination: URL, replacing: Bool) throws -> URL? {
+    let fm = FileManager.default
+    var stash: URL?
+    if replacing {
+        // A legal 255-byte filename must not make its backup name exceed the volume's limit.
+        let backup = destination.deletingLastPathComponent().appendingPathComponent(".navigator-replacing-\(UUID().uuidString)")
+        try fm.moveItem(at: destination, to: backup)
+        stash = backup
+    }
+    do { try fm.moveItem(at: source, to: destination) }
+    catch {
+        if let stash {
+            // An occupied destination may be another process's file; never delete it to roll back.
+            do { try fm.moveItem(at: stash, to: destination) }
+            catch let rollbackError {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError,
+                              userInfo: [NSLocalizedDescriptionKey: "\(error.localizedDescription); could not restore the original; it is in this folder as “\(stash.lastPathComponent)”: \(rollbackError.localizedDescription)"])
+            }
+        }
+        throw error
+    }
+    return stash
 }
 
 /// Moves each `from` back to its `to`, collecting what failed into one message.
@@ -3662,6 +3713,7 @@ enum TransferLogLine {
                         total: Int, cancelled: Bool, target: String) -> String {
         let settled = move ? moved : copied
         var s = "transfer done: \(move ? "move" : "copy") \(settled)/\(total) → \(target)"
+        if move, copied > 0 { s += ", \(copied) copied but not moved" }
         if failed > 0 { s += ", \(failed) FAILED" }
         if skipped > 0 { s += ", \(skipped) skipped (name conflict)" }
         if cancelled { s += ", CANCELLED by the user" }

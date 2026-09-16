@@ -7966,7 +7966,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CTX), boxPtr)
         _ = copyfile_state_set(state, UInt32(COPYFILE_STATE_STATUS_CB), unsafeBitCast(cb, to: UnsafeMutableRawPointer.self))
-        if copyfile(src.path, dst.path, state, copyfile_flags_t(COPYFILE_ALL | COPYFILE_CLONE)) != 0 {
+        // A destination created after the conflict check must never be overwritten.
+        if copyfile(src.path, dst.path, state, copyfile_flags_t(COPYFILE_ALL | COPYFILE_CLONE | COPYFILE_EXCL)) != 0 {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno),
                           userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
         }
@@ -8074,7 +8075,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             /// with NEITHER the old file nor the new one, and nothing in Undo to get it back.
             func restoreReplaced(_ b: (stash: URL, original: URL)?, _ name: String) {
                 guard let b else { return }
-                try? fm.removeItem(at: b.original)      // bin the partial/failed incoming file first
+                // An occupied path may belong to another process; leave it and report the stash.
                 do { try fm.moveItem(at: b.stash, to: b.original) }
                 catch {
                     // The worst outcome this routine has: the incoming item failed AND the
@@ -8099,7 +8100,12 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 var iterationFailed = false
                 if isSelfDup(src) {
                     dest = self.numberedCopyDest(dir, src.lastPathComponent)
-                } else if conflictNames.contains(src.lastPathComponent) {
+                } else if conflictNames.contains(src.lastPathComponent) || fm.fileExists(atPath: target.path) {
+                    guard conflictNames.contains(src.lastPathComponent) else {
+                        failures.append((src.lastPathComponent, "destination appeared after the conflict check; retry the transfer"))
+                        base += sizes[i]
+                        continue
+                    }
                     switch policy {
                     case .skip: base += sizes[i]; skipped += 1; continue
                     case .replace:
@@ -8135,19 +8141,26 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
                     else if useBytes {
                         try Browser.copyWithProgress(src, dest, isCancelled: { progress.cancelled }, onBytes: onBytes)
-                        // A cancelled copyfile leaves a truncated file behind — bin it
-                        // rather than leaving a corrupt partial copy in the folder.
-                        if progress.cancelled { try? fm.removeItem(at: dest); restoreReplaced(replacedBackup, src.lastPathComponent); break }
                         copied.append(dest)
                     }
                     else { try fm.copyItem(at: src, to: dest); copied.append(dest) }   // APFS clones this too
                 } catch {
-                    if progress.cancelled { try? fm.removeItem(at: dest); restoreReplaced(replacedBackup, src.lastPathComponent); break }
+                    if progress.cancelled {
+                        failures.append((src.lastPathComponent, "cancelled; any incomplete destination was left at “\(dest.path)” to avoid deleting another process's file"))
+                        restoreReplaced(replacedBackup, src.lastPathComponent)
+                        break
+                    }
                     // Cross-volume move (rename fails) or a copyfile hiccup → plain copy.
                     do {
                         try fm.copyItem(at: src, to: dest)
-                        if move { try? fm.removeItem(at: src); moved.append((src, dest)) }
-                        else { copied.append(dest) }
+                        if move {
+                            do { try fm.removeItem(at: src); moved.append((src, dest)) }
+                            catch {
+                                // The copy landed, but Undo must not restore over a surviving source.
+                                copied.append(dest)
+                                failures.append((src.lastPathComponent, "copied, but the source could not be removed: \(error.localizedDescription)"))
+                            }
+                        } else { copied.append(dest) }
                     } catch let e {
                         // Per-file and with the UNDERLYING error, because the alert shows at
                         // most five failures and only when there are any — so a drop that moved
@@ -8192,7 +8205,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                         self?.load()
                         return problem
                     })
-                } else if !copied.isEmpty {
+                }
+                if !copied.isEmpty {
                     self.pushCreation("Copy", copied)
                 }
                 Browser.invalidateCache(dir.path)
@@ -8429,26 +8443,19 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             case .keepBoth:
                 dest = uniqueDest(dir, n)
             case .replace:
-                // Trash rather than delete: Undo has to be able to restore the item that
-                // was clobbered, and the Trash is the only place it can be restored from.
-                //
-                // Through trashItems, not fm.trashItem directly: that helper is also what
-                // records the TrashOrigins entry. Binning the displaced item by hand left
-                // it in the Trash with no origin, so Put Back on it fell through to
-                // Finder's lazily-written .DS_Store and usually offered nothing at all.
-                let r = trashItems([dest])
-                guard let t = r.restores.first?.from else {
-                    reportFileError("Couldn't replace “\(n)”", r.problem ?? "")
-                    return
-                }
-                replaced = t
+                replaced = dest
             default:
                 return   // Cancel — the original name stands
             }
         }
         let finalDest = dest
+        func applyRename() throws {
+            if let stash = try renameItem(oldURL, to: finalDest, replacing: replaced != nil) {
+                replaced = stash
+            }
+        }
         do {
-            try fm.moveItem(at: oldURL, to: finalDest)
+            try applyRename()
             RecentFolders.shared.record(currentURL)
             UndoStack.shared.push("Rename", undo: { [weak self] in
                 var problem = restoreItems([(from: finalDest, to: oldURL)])
@@ -8456,19 +8463,15 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 self?.load()
                 return problem
             }, redo: { [weak self] in
-                // The undo put any displaced item back at the destination name, so it
-                // has to be binned again before the rename can re-take that name —
-                // moveItem onto an occupied path just fails. Re-binning yields a fresh
-                // Trash path, which the undo half above then needs.
                 var problem: String?
-                if replaced != nil {
-                    let r = trashItems([finalDest])
-                    replaced = r.restores.first?.from
-                    problem = r.problem
-                }
-                problem = problem ?? restoreItems([(from: oldURL, to: finalDest)])
+                do { try applyRename() } catch { problem = error.localizedDescription }
                 self?.load()
                 return problem
+            }, cleanup: {
+                // The entry can never be replayed now, so the displaced original is
+                // unreachable through Undo - bin the stash rather than leaving a hidden
+                // file in the user's folder for good.
+                if let r = replaced { try? FileManager.default.removeItem(at: r) }
             })
             load()
         } catch { reportFileError("Couldn't rename “\(item.name)”", error.localizedDescription) }
@@ -8516,7 +8519,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func compress(_ ids: Set<String>) {
         let sel = items.filter { ids.contains($0.id) }
         guard !sel.isEmpty else { return }
-        let names = sel.map { $0.url.lastPathComponent }
+        guard let inputs = PathRules.archiveInputs(sel.map { $0.url }) else { return }
         let zipName = sel.count == 1 ? (sel[0].url.deletingPathExtension().lastPathComponent + ".zip") : "Archive.zip"
         let dest = uniqueDest(currentURL, zipName)
         let dir = currentURL
@@ -8524,8 +8527,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-            p.arguments = ["-r", "-q", dest.lastPathComponent] + names
-            p.currentDirectoryURL = dir
+            p.arguments = ["-r", "-q", dest.path] + inputs.entries
+            p.currentDirectoryURL = inputs.directory
             var runError: String?
             do { try p.run(); p.waitUntilExit() } catch { runError = error.localizedDescription }
             let ok = runError == nil && p.terminationStatus == 0

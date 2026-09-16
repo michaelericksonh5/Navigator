@@ -5773,3 +5773,144 @@ final class SearchProducerTests: XCTestCase {
         XCTAssertEqual(rows.sorted(), Array(0..<1000))
     }
 }
+
+final class ArchiveInputsTests: XCTestCase {
+    private func check(_ paths: [String], directory: String, entries: [String],
+                       file: StaticString = #filePath, line: UInt = #line) throws {
+        let plan = try XCTUnwrap(PathRules.archiveInputs(paths.map { URL(fileURLWithPath: $0) }))
+        XCTAssertEqual(plan.directory.path, directory, file: file, line: line)
+        XCTAssertEqual(plan.entries, entries, file: file, line: line)
+        XCTAssertEqual(plan.entries.map { plan.directory.appendingPathComponent($0).standardizedFileURL.path },
+                       paths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }, file: file, line: line)
+    }
+
+    func testSearchResultUsesItsOwnParent() throws {
+        try check(["/root/sub/report.txt"], directory: "/root/sub", entries: ["./report.txt"])
+    }
+
+    func testSeveralParentsAndDuplicateBasenames() throws {
+        try check(["/root/a/report.txt", "/root/b/report.txt", "/root/b/deep/image.png"],
+                  directory: "/root", entries: ["./a/report.txt", "./b/report.txt", "./b/deep/image.png"])
+    }
+
+    func testCommonAncestorIsRoot() throws {
+        try check(["/Users/me/report.txt", "/Volumes/data/report.txt"], directory: "/",
+                  entries: ["./Users/me/report.txt", "./Volumes/data/report.txt"])
+    }
+
+    func testSharedPrefixIsNotAParent() throws {
+        try check(["/root/a/one", "/root/ab/two"], directory: "/root", entries: ["./a/one", "./ab/two"])
+    }
+
+    func testOptionNamesAndSpaces() throws {
+        try check(["/root/-report.txt", "/root/my file.txt"], directory: "/root",
+                  entries: ["./-report.txt", "./my file.txt"])
+    }
+
+    func testEmptyAndNonFileSelectionsAreRejected() {
+        XCTAssertNil(PathRules.archiveInputs([]))
+        if let remote = URL(string: "https://example.com/file") {
+            XCTAssertNil(PathRules.archiveInputs([remote]))
+        }
+    }
+}
+
+final class RenameReplacementTests: XCTestCase {
+    func testFailedRenameRestoresDisplacedFile() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let dest = dir.appendingPathComponent("existing.txt")
+        try Data("original".utf8).write(to: dest)
+        XCTAssertThrowsError(try renameItem(dir.appendingPathComponent("missing"), to: dest, replacing: true))
+        XCTAssertEqual(try Data(contentsOf: dest), Data("original".utf8))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: dir.path), ["existing.txt"])
+    }
+
+    func testSuccessfulReplaceKeepsFixedLengthBackupForUndo() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let source = dir.appendingPathComponent("source")
+        let dest = dir.appendingPathComponent(String(repeating: "x", count: 240))
+        try Data("incoming".utf8).write(to: source)
+        try Data("original".utf8).write(to: dest)
+        let stash = try XCTUnwrap(renameItem(source, to: dest, replacing: true))
+        XCTAssertLessThan(stash.lastPathComponent.utf8.count, 64)
+        XCTAssertTrue(stash.lastPathComponent.hasPrefix(".navigator-replacing-"))
+        XCTAssertEqual(try Data(contentsOf: stash), Data("original".utf8))
+        XCTAssertEqual(try Data(contentsOf: dest), Data("incoming".utf8))
+        XCTAssertFalse(fm.fileExists(atPath: source.path))
+        XCTAssertNil(restoreItems([(from: dest, to: source), (from: stash, to: dest)]))
+        XCTAssertEqual(try Data(contentsOf: dest), Data("original".utf8))
+        XCTAssertEqual(try Data(contentsOf: source), Data("incoming".utf8))
+    }
+
+    func testFailedStagingLeavesSourceUntouched() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let source = dir.appendingPathComponent("source")
+        try Data("incoming".utf8).write(to: source)
+        XCTAssertThrowsError(try renameItem(source, to: dir.appendingPathComponent("missing"), replacing: true))
+        XCTAssertEqual(try Data(contentsOf: source), Data("incoming".utf8))
+    }
+
+    func testCopyWithFailedDeletionIsNotReportedAsMove() {
+        let line = TransferLogLine.summary(move: true, moved: 0, copied: 1, failed: 1,
+                                           skipped: 0, total: 1, cancelled: false, target: "/tmp")
+        XCTAssertTrue(line.contains("move 0/1"))
+        XCTAssertTrue(line.contains("1 copied but not moved"))
+        XCTAssertTrue(line.contains("1 FAILED"))
+    }
+}
+
+// Rename-with-Replace keeps the displaced file in a hidden stash so Undo can put it back.
+// That stash has to be binned the moment the entry can no longer be replayed, or a user who
+// renames over a hundred files is left with a hundred hidden leftovers in their folders.
+final class UndoStackCleanupTests: XCTestCase {
+
+    private func fresh() -> UndoStack {
+        let s = UndoStack(); s.onEmpty = {}; s.onFailure = { _, _ in }; return s
+    }
+
+    func testCleanupRunsWhenANewOperationInvalidatesRedo() {
+        let s = fresh()
+        var cleaned = 0
+        s.push("Rename", undo: { nil }, redo: { nil }, cleanup: { cleaned += 1 })
+        s.undo()                       // entry moves to the redo stack, still replayable
+        XCTAssertEqual(cleaned, 0)
+        s.push("Other", undo: { nil }, redo: { nil })   // invalidates every pending redo
+        XCTAssertEqual(cleaned, 1)
+    }
+
+    func testCleanupRunsWhenTheEntryIsEvictedByTheLimit() {
+        let s = fresh()
+        var cleaned = 0
+        s.push("Rename", undo: { nil }, redo: { nil }, cleanup: { cleaned += 1 })
+        for _ in 0..<UndoStack.limit { s.push("filler", undo: { nil }, redo: { nil }) }
+        XCTAssertEqual(cleaned, 1, "the oldest entry fell off the stack and must release its stash")
+    }
+
+    // A failed undo DROPS the entry rather than re-filing it, so its stash is unreachable too.
+    func testCleanupRunsWhenUndoFails() {
+        let s = fresh()
+        var cleaned = 0
+        s.push("Rename", undo: { "boom" }, redo: { nil }, cleanup: { cleaned += 1 })
+        s.undo()
+        XCTAssertEqual(cleaned, 1)
+    }
+
+    // The ordinary case: still replayable, so the stash must survive.
+    func testCleanupDoesNotRunWhileTheEntryIsStillLive() {
+        let s = fresh()
+        var cleaned = 0
+        s.push("Rename", undo: { nil }, redo: { nil }, cleanup: { cleaned += 1 })
+        XCTAssertEqual(cleaned, 0)
+        s.undo(); s.redo()
+        XCTAssertEqual(cleaned, 0)
+    }
+}
