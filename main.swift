@@ -3156,26 +3156,20 @@ func vertexSignedIn() -> Bool {
 func runH5GClient(_ args: [String]) -> H5GResult {
     guard let node = resolveNode() else { return H5GResult(out: "", err: "Node.js not found", code: 127) }
     guard let client = resolveH5GClient() else { return H5GResult(out: "", err: "h5g-ai-connect client not found", code: 127) }
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: node)
-    p.arguments = [client] + args
     var env = ProcessInfo.processInfo.environment
     let nodeDir = (node as NSString).deletingLastPathComponent
     env["PATH"] = "\(nodeDir):/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
-    p.environment = env
-    let o = Pipe(); let e = Pipe()
-    p.standardOutput = o; p.standardError = e
     navLog("run: node \(client) \(args.joined(separator: " "))")
-    do { try p.run() } catch {
-        navLog("run FAILED to launch: \(error.localizedDescription)")
+    let result = ExternalProcess.run(node, arguments: [client] + args, environment: env)
+    do {
+        let output = try result.completed()
+        navLog("exit \(output.status)  out: \(navLogFlat(output.out, limit: 900))  err: \(navLogFlat(output.err, limit: 900))")
+        return H5GResult(out: output.out, err: output.err, code: output.status)
+    } catch {
+        if case .failedToLaunch = result { navLog("run FAILED to launch: \(error.localizedDescription)") }
+        else { navLog("run timed out: \(error.localizedDescription)") }
         return H5GResult(out: "", err: error.localizedDescription, code: 127)
     }
-    let od = o.fileHandleForReading.readDataToEndOfFile()
-    let ed = e.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    let out = String(data: od, encoding: .utf8) ?? "", err = String(data: ed, encoding: .utf8) ?? ""
-    navLog("exit \(p.terminationStatus)  out: \(navLogFlat(out, limit: 900))  err: \(navLogFlat(err, limit: 900))")
-    return H5GResult(out: out, err: err, code: p.terminationStatus)
 }
 
 // client.mjs prints "✅ Saved <path>" on success.
@@ -4150,12 +4144,12 @@ func restartAdobeApp(bundleID: String, appURL: URL) {
     navLog("\(bundleID): restarted")
 }
 
-// While `p` is running, keep `bundleID` hidden — opening a document can un-hide
+// While the command is running, keep `bundleID` hidden — opening a document can un-hide
 // an app, so we re-hide it (only if it actually became visible, so no flicker
 // when it's already hidden). Runs on a background queue; returns immediately.
-func keepHidden(while p: Process, bundleID: String) {
+func keepHidden(while isRunning: @escaping () -> Bool, bundleID: String) {
     DispatchQueue.global(qos: .utility).async {
-        while p.isRunning {
+        while isRunning() {
             for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
             Thread.sleep(forTimeInterval: 0.5)
         }
@@ -4204,21 +4198,13 @@ func runPhotoshopScript(resource: String, arguments: [String], reportError: Bool
         end timeout
     end run
     """
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", appleScript, source] + arguments
-    let err = Pipe(); p.standardError = err
-    let out = Pipe(); p.standardOutput = out
     do {
-        try p.run()
-        keepHidden(while: p, bundleID: "com.adobe.Photoshop")
-        // Read pipes before waiting so a chatty script can't deadlock on a full pipe.
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
-        if p.terminationStatus != 0 {
+        let output = try ExternalProcess.run("/usr/bin/osascript",
+            arguments: ["-e", appleScript, source] + arguments, timeout: 3660,
+            onLaunch: { keepHidden(while: $0, bundleID: "com.adobe.Photoshop") }).completed()
+        let stdout = output.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stderr = output.err
+        if output.status != 0 {
             if reportError { DispatchQueue.main.async { reportAdobeAutomationFailure("Photoshop", stderr) } }
             return ScriptResult(ok: false, message: stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         } else if stdout.hasPrefix("ERROR") {
@@ -4290,20 +4276,13 @@ func runAfterEffectsScript(resource: String, globals: [String: String], reportEr
         end timeout
     end run
     """
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", appleScript, source]
-    let err = Pipe(); p.standardError = err
-    let out = Pipe(); p.standardOutput = out
     do {
-        try p.run()
-        keepHidden(while: p, bundleID: "com.adobe.AfterEffects")
-        let outData = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let stdout = (String(data: outData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
-        if p.terminationStatus != 0 {
+        let output = try ExternalProcess.run("/usr/bin/osascript",
+            arguments: ["-e", appleScript, source], timeout: 3660,
+            onLaunch: { keepHidden(while: $0, bundleID: "com.adobe.AfterEffects") }).completed()
+        let stdout = output.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stderr = output.err
+        if output.status != 0 {
             if reportError { DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", stderr) } }
             return ScriptResult(ok: false, message: stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         } else if stdout.contains("ERROR") {
@@ -4482,10 +4461,9 @@ func setDefaultApp(_ appURL: URL, for fileURL: URL) {
 }
 func openInTerminal(_ url: URL) {
     let dir = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-    p.arguments = ["-a", "Terminal", dir.path]
-    try? p.run()
+    DispatchQueue.global(qos: .utility).async {
+        _ = ExternalProcess.run("/usr/bin/open", arguments: ["-a", "Terminal", dir.path], timeout: 30)
+    }
 }
 
 func defaultLocations() -> [SidebarLocation] {
@@ -7064,10 +7042,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         loadGeneration += 1; cancelPendingDetails()                     // abandon the stalled enumeration
         items = []
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let du = Process()
-            du.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-            du.arguments = ["unmount", "force", info.volume]
-            try? du.run(); du.waitUntilExit()
+            _ = ExternalProcess.run("/usr/sbin/diskutil", arguments: ["unmount", "force", info.volume], timeout: 30)
             let attempt = Browser.mountShareReporting(info.share)
             let target = attempt.mountPoint.map { rel.isEmpty ? $0 : ($0 as NSString).appendingPathComponent(rel) }
             let destination = target.flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : attempt.mountPoint }
@@ -7136,14 +7111,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // interactive mountShare below.
     /// PIDs of mount helpers wedged on `url`. See StuckMountRules for why this exists.
     static func wedgedMountPIDs(for url: URL) -> [Int32] {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/ps")
-        p.arguments = ["-Ao", "pid=,command="]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let text = String(data: data, encoding: .utf8) ?? ""
+        guard let output = try? ExternalProcess.run("/bin/ps", arguments: ["-Ao", "pid=,command="], timeout: 30).completed() else { return [] }
+        let text = output.out
         return StuckMountRules.wedgedPIDs(psOutput: text, mountPoint: url.path)
     }
 
@@ -8614,13 +8583,13 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             guard let self else { return }
             guard let inputs = PathRules.archiveInputs(sel.map { $0.url }) else { return }
             let dest = self.uniqueDest(dir, zipName)
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-            p.arguments = ["-r", "-q", dest.path] + inputs.entries
-            p.currentDirectoryURL = inputs.directory
             var runError: String?
-            do { try p.run(); p.waitUntilExit() } catch { runError = error.localizedDescription }
-            let ok = runError == nil && p.terminationStatus == 0
+            var status: Int32 = -1
+            do {
+                status = try ExternalProcess.run("/usr/bin/zip", arguments: ["-r", "-q", dest.path] + inputs.entries,
+                                                 directory: inputs.directory).completed().status
+            } catch { runError = error.localizedDescription }
+            let ok = runError == nil && status == 0
             if !ok { try? FileManager.default.removeItem(at: dest) }
             DispatchQueue.main.async {
                 self.busy = false; self.busyText = ""
@@ -8629,7 +8598,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     self.pushCreation("Compress", [dest])
                 } else {
                     reportFileError("Couldn't create the archive",
-                                    runError ?? "zip exited with code \(p.terminationStatus).")
+                                    runError ?? "zip exited with code \(status).")
                 }
                 self.load()
             }
@@ -8656,18 +8625,12 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     failures.append((it.url.lastPathComponent, error.localizedDescription))
                     continue
                 }
-                let p = Process()
-                if it.url.pathExtension.lowercased() == "zip" {
-                    p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-                    p.arguments = ["-x", "-k", it.url.path, dest.path]
-                } else {
-                    p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-                    p.arguments = ["-xf", it.url.path, "-C", dest.path]
-                }
+                let isZip = it.url.pathExtension.lowercased() == "zip"
                 do {
-                    try p.run(); p.waitUntilExit()
-                    if p.terminationStatus == 0 { created.append(dest) }
-                    else { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, "The archive couldn't be expanded (code \(p.terminationStatus)).")) }
+                    let output = try ExternalProcess.run(isZip ? "/usr/bin/ditto" : "/usr/bin/tar",
+                        arguments: isZip ? ["-x", "-k", it.url.path, dest.path] : ["-xf", it.url.path, "-C", dest.path]).completed()
+                    if output.status == 0 { created.append(dest) }
+                    else { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, "The archive couldn't be expanded (code \(output.status)).")) }
                 } catch { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, error.localizedDescription)) }
             }
             DispatchQueue.main.async {
@@ -9383,15 +9346,19 @@ enum DragWedgeNotice {
 /// drag subsystem and a build sitting unused on disk — and a second copy of this would be a
 /// second place for the pgrep timeout to drift.
 func relaunchNavigator() {
-    let app = Bundle.main.bundleURL.path.replacingOccurrences(of: "'", with: "'\\''")
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/bin/bash")
-    p.arguments = ["-c", "for i in $(seq 1 120); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done; /usr/bin/open '\(app)'"]
-    do { try p.run() } catch {
-        navLog("relaunch: helper failed to start — \(error.localizedDescription)")
-        return
+    let app = Bundle.main.bundleURL.path
+    DispatchQueue.global(qos: .utility).async {
+        // Positional arguments keep quotes and shell metacharacters in paths literal.
+        // This helper outlives us: discard output before our pipe readers disappear
+        // so a later diagnostic cannot kill it with SIGPIPE.
+        let result = ExternalProcess.run("/bin/bash", arguments: ["-c",
+            "exec >/dev/null 2>&1; for i in $(seq 1 120); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done; /usr/bin/open \"$1\"",
+            "navigator-relaunch", app], timeout: 60,
+            onLaunch: { _ in DispatchQueue.main.async { NSApp.terminate(nil) } })
+        if case .failedToLaunch(let error) = result {
+            navLog("relaunch: helper failed to start — \(error.localizedDescription)")
+        }
     }
-    NSApp.terminate(nil)
 }
 
 /// Which binary is actually executing, versus the one installed at the same path.
@@ -14358,19 +14325,14 @@ struct ImageViewerView: View {
                     .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
                 return "WebP needs Google's encoder, which isn't installed. Install it with:\n\n    brew install webp"
             }
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: cwebp)
-            // -q 90 to match the other lossy formats; -alpha_q 100 keeps the alpha channel
-            // lossless, which matters for cutouts headed into a game runtime.
-            p.arguments = ["-quiet", "-q", "90", "-alpha_q", "100", src.path, "-o", tmp.path]
-            let err = Pipe(); p.standardError = err
-            do { try p.run() } catch { return error.localizedDescription }
-            // Drain while the encoder runs; a full stderr pipe otherwise blocks its exit.
-            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            p.waitUntilExit()
-            guard p.terminationStatus == 0 else {
-                return msg.isEmpty ? "cwebp exited with status \(p.terminationStatus)." : msg
-            }
+            // -q 90 matches the other lossy formats; lossless alpha preserves cutouts.
+            do {
+                let output = try ExternalProcess.run(cwebp,
+                    arguments: ["-quiet", "-q", "90", "-alpha_q", "100", src.path, "-o", tmp.path]).completed()
+                guard output.status == 0 else {
+                    return output.err.isEmpty ? "cwebp exited with status \(output.status)." : output.err
+                }
+            } catch { return error.localizedDescription }
         } else {
             guard let uti = format.uti else { return "No encoder for \(format.menuTitle)." }
             guard let srcRef = CGImageSourceCreateWithURL(src as CFURL, nil),
@@ -15593,31 +15555,37 @@ enum Updater {
         let fm = FileManager.default
         let work = fm.temporaryDirectory.appendingPathComponent("NavigatorUpdate-\(UUID().uuidString)")
         try? fm.createDirectory(at: work, withIntermediateDirectories: true)
-        let expand = Process(); expand.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        expand.arguments = ["-x", "-k", zip.path, work.path]
-        do { try expand.run(); expand.waitUntilExit() } catch { alert("Update failed", error.localizedDescription); return }
-        guard expand.terminationStatus == 0,
+        let expand: ExternalProcess.Output
+        do { expand = try ExternalProcess.run("/usr/bin/ditto", arguments: ["-x", "-k", zip.path, work.path]).completed() }
+        catch { alert("Update failed", error.localizedDescription); return }
+        guard expand.status == 0,
               let newApp = (try? fm.contentsOfDirectory(at: work, includingPropertiesForKeys: nil))?
                   .first(where: { $0.pathExtension == "app" }) else {
             alert("Update failed", "The downloaded update couldn't be expanded."); return
         }
         let dest = "/Applications/Navigator.app"
         // A helper that waits for us to quit, swaps the bundle, and relaunches —
-        // you can't overwrite a running app bundle from within itself.
+        // you can't overwrite a running app bundle from within itself. Discard output
+        // before we quit so the closed capture pipes cannot give the helper SIGPIPE.
         let script = """
         #!/bin/bash
+        exec >/dev/null 2>&1
         for i in $(seq 1 60); do /usr/bin/pgrep -x Navigator >/dev/null || break; sleep 0.25; done
-        /bin/rm -rf "\(dest)"
-        /usr/bin/ditto "\(newApp.path)" "\(dest)"
-        /usr/bin/xattr -dr com.apple.quarantine "\(dest)" 2>/dev/null
-        /usr/bin/open "\(dest)"
-        /bin/rm -rf "\(work.path)"
+        /bin/rm -rf "$2"
+        /usr/bin/ditto "$1" "$2"
+        /usr/bin/xattr -dr com.apple.quarantine "$2" 2>/dev/null
+        /usr/bin/open "$2"
+        /bin/rm -rf "$3"
         """
         let scriptURL = work.appendingPathComponent("update.sh")
         do { try script.write(to: scriptURL, atomically: true, encoding: .utf8) } catch { alert("Update failed", error.localizedDescription); return }
-        let runner = Process(); runner.executableURL = URL(fileURLWithPath: "/bin/bash"); runner.arguments = [scriptURL.path]
-        do { try runner.run() } catch { alert("Update failed", error.localizedDescription); return }
-        NSApp.terminate(nil)   // quit so the helper can replace the bundle
+        DispatchQueue.global(qos: .utility).async {
+            let result = ExternalProcess.run("/bin/bash", arguments: [scriptURL.path, newApp.path, dest, work.path],
+                onLaunch: { _ in DispatchQueue.main.async { NSApp.terminate(nil) } })
+            if case .failedToLaunch(let error) = result {
+                DispatchQueue.main.async { alert("Update failed", error.localizedDescription) }
+            }
+        }
     }
 
     private static func alert(_ title: String, _ msg: String, link: URL? = nil) {
@@ -17483,8 +17451,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             try? Self.quickActionInfoPlist(title: qa.title, acceptsFolders: qa.acceptsFolders).write(to: contents.appendingPathComponent("Info.plist"), atomically: true, encoding: .utf8)
             try? Self.quickActionWorkflow(command: cmd, acceptsFolders: qa.acceptsFolders).write(to: contents.appendingPathComponent("document.wflow"), atomically: true, encoding: .utf8)
         }
-        let flush = Process(); flush.executableURL = URL(fileURLWithPath: "/System/Library/CoreServices/pbs"); flush.arguments = ["-flush"]
-        try? flush.run()
+        DispatchQueue.global(qos: .utility).async {
+            _ = ExternalProcess.run("/System/Library/CoreServices/pbs", arguments: ["-flush"], timeout: 30)
+        }
         if sender != nil {
             let a = NSAlert(); a.messageText = "Finder Quick Actions installed"
             a.informativeText = "Right-click an image (or a folder) in Finder to find Navigator’s Remove BG, Chroma Key BG, and Upscale actions — the same as Navigator’s own menu. If they don’t show right away, enable them in System Settings → Keyboard → Keyboard Shortcuts → Services (or log out and back in)."

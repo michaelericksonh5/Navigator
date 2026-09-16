@@ -11,6 +11,108 @@ import Foundation
 // lives here so `swift test` exercises the SHIPPED code rather than a copy of it.
 import CoreGraphics
 
+import Darwin
+
+// One owner for argv, both pipes and reaping: waiting before draining can block
+// forever once either pipe fills, even when the other pipe is completely quiet.
+enum ExternalProcess {
+    struct Output {
+        let stdout: Data
+        let stderr: Data
+        let status: Int32
+        var out: String { String(data: stdout, encoding: .utf8) ?? "" }
+        var err: String { String(data: stderr, encoding: .utf8) ?? "" }
+    }
+
+    enum Result {
+        case success(Output)
+        case nonZero(Output)
+        case timedOut(Output)
+        case failedToLaunch(Error)
+
+        // Callers keep their command-specific exit messages; launch and timeout
+        // failures must never look like a successful status of zero.
+        func completed() throws -> Output {
+            switch self {
+            case .success(let output), .nonZero(let output): return output
+            case .failedToLaunch(let error): throw error
+            case .timedOut:
+                throw NSError(domain: "Navigator.ExternalProcess", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "The command timed out."])
+            }
+        }
+    }
+
+    private final class Capture {
+        var data = Data()
+
+        func drain(_ handle: FileHandle, until deadline: DispatchTime) {
+            let fd = handle.fileDescriptor
+            _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+            var buffer = [UInt8](repeating: 0, count: 16384)
+            // Descendants can inherit the pipe after the direct child exits. A
+            // bounded, nonblocking read prevents those descriptors defeating timeout.
+            while DispatchTime.now() < deadline {
+                var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let ready = poll(&descriptor, 1, 50)
+                if ready < 0 && errno != EINTR { break }
+                guard ready > 0 else { continue }
+                let count = read(fd, &buffer, buffer.count)
+                if count > 0 { data.append(contentsOf: buffer.prefix(count)) }
+                else if count == 0 { break }
+                else if errno != EINTR && errno != EAGAIN { break }
+            }
+        }
+    }
+
+    static func run(_ executable: String, arguments: [String] = [],
+                    directory: URL? = nil, environment: [String: String]? = nil,
+                    timeout: TimeInterval = 3600,
+                    onLaunch: ((@escaping () -> Bool) -> Void)? = nil) -> Result {
+        guard timeout.isFinite, timeout > 0 else {
+            return .failedToLaunch(NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL)))
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = directory
+        process.environment = environment
+        let stdout = Pipe(), stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch { return .failedToLaunch(error) }
+        let deadline = DispatchTime.now() + timeout
+        let drains = DispatchGroup()
+        let out = Capture(), err = Capture()
+        for (capture, pipe) in [(out, stdout), (err, stderr)] {
+            drains.enter()
+            DispatchQueue.global(qos: .utility).async {
+                capture.drain(pipe.fileHandleForReading, until: deadline + 0.5)
+                drains.leave()
+            }
+        }
+        // The callback returns immediately; it can observe liveness without
+        // taking ownership of the process or replacing our termination handler.
+        onLaunch?({ process.isRunning })
+        let timedOut = drains.wait(timeout: deadline) == .timedOut ||
+            exited.wait(timeout: deadline) == .timedOut
+        if timedOut && process.isRunning {
+            process.terminate()
+            // SIGTERM can be ignored. Escalate so timeout still reaps the child.
+            if exited.wait(timeout: .now() + 0.25) == .timedOut && process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        drains.wait()
+        process.waitUntilExit()
+        let output = Output(stdout: out.data, stderr: err.data, status: process.terminationStatus)
+        if timedOut { return .timedOut(output) }
+        return output.status == 0 ? .success(output) : .nonZero(output)
+    }
+}
+
 enum PathRules {
 
     static func canGoUp(_ url: URL) -> Bool {

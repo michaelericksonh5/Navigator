@@ -6533,3 +6533,114 @@ final class CommandAvailabilityTests: XCTestCase {
         XCTAssertEqual(PathRules.reorder(count: 3, from: [2], to: 0, pinnedToFront: 0), [0, 2, 1])
     }
 }
+
+final class ExternalProcessTests: XCTestCase {
+    func testEchoCapturesExactStdout() throws {
+        let result = ExternalProcess.run("/bin/echo", arguments: ["hello world"], timeout: 5)
+        guard case .success(let output) = result else { return XCTFail("echo failed: \(result)") }
+        XCTAssertEqual(output.stdout, Data("hello world\n".utf8))
+        XCTAssertTrue(output.stderr.isEmpty)
+    }
+
+    func testFalseIsNonZero() {
+        let result = ExternalProcess.run("/usr/bin/false", timeout: 5)
+        guard case .nonZero(let output) = result else { return XCTFail("false was not a non-zero exit") }
+        XCTAssertEqual(output.status, 1)
+    }
+
+    func testNonZeroRetainsStderr() {
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c", "printf 'reason' >&2; exit 7"], timeout: 5)
+        guard case .nonZero(let output) = result else { return XCTFail("missing non-zero exit") }
+        XCTAssertEqual(output.status, 7)
+        XCTAssertEqual(output.stderr, Data("reason".utf8))
+    }
+
+    // 200KB cannot fit in a pipe: waiting for exit before reading stderr hangs.
+    func testStderrLargerThanPipeBuffer() {
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c", "/usr/bin/head -c 200000 /dev/zero >&2"], timeout: 5)
+        guard case .success(let output) = result else { return XCTFail("stderr drain failed: \(result)") }
+        XCTAssertEqual(output.stderr, Data(count: 200000))
+        XCTAssertTrue(output.stdout.isEmpty)
+    }
+
+    // The parent shell keeps stdout open while waiting for its stderr writer.
+    // Sequential stdout-then-stderr reads hang here too, not just wait-first reads.
+    func testBothPipesLargerThanPipeBuffer() {
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c",
+            "/usr/bin/head -c 200000 /dev/zero & /usr/bin/head -c 200000 /dev/zero >&2 & wait"], timeout: 5)
+        guard case .success(let output) = result else { return XCTFail("concurrent drains failed: \(result)") }
+        XCTAssertEqual(output.stdout, Data(count: 200000))
+        XCTAssertEqual(output.stderr, Data(count: 200000))
+    }
+
+    func testTimeoutTerminatesAndReapsChild() throws {
+        let started = Date()
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c", "printf '%s' $$; exec /bin/sleep 10"], timeout: 0.2)
+        guard case .timedOut(let output) = result else { return XCTFail("sleep did not time out") }
+        let pid = try XCTUnwrap(Int32(output.out))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        var status: Int32 = 0
+        XCTAssertEqual(waitpid(pid, &status, WNOHANG), -1)
+        XCTAssertEqual(errno, ECHILD)
+        XCTAssertThrowsError(try result.completed())
+    }
+
+    func testTimeoutKillsChildIgnoringSIGTERM() throws {
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c", "trap '' TERM; printf '%s' $$; while :; do :; done"], timeout: 0.2)
+        guard case .timedOut(let output) = result else { return XCTFail("ignored SIGTERM defeated timeout") }
+        let pid = try XCTUnwrap(Int32(output.out))
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        XCTAssertEqual(output.status, SIGKILL)
+    }
+
+    func testInheritedPipeDoesNotDefeatTimeout() {
+        let started = Date()
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c", "/bin/sleep 2 & exit 0"], timeout: 0.2)
+        guard case .timedOut = result else { return XCTFail("inherited open pipe was not reported as timeout") }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5)
+    }
+
+    func testMissingBinaryFailsToLaunch() {
+        let result = ExternalProcess.run("/nonexistent-navigator-\(UUID().uuidString)", timeout: 5)
+        guard case .failedToLaunch = result else { return XCTFail("missing executable did not fail to launch") }
+        XCTAssertThrowsError(try result.completed())
+    }
+
+    func testArgumentsAreLiteral() {
+        let arguments = ["has spaces", "single'quote", "double\"quote", "$HOME", "`whoami`", "$(whoami)", ""]
+        let result = ExternalProcess.run("/usr/bin/printf", arguments: ["%s\n"] + arguments, timeout: 5)
+        guard case .success(let output) = result else { return XCTFail("literal arguments failed") }
+        XCTAssertEqual(output.stdout, Data((arguments.joined(separator: "\n") + "\n").utf8))
+    }
+
+    func testWorkingDirectoryAndEnvironment() throws {
+        let directory = URL(fileURLWithPath: "/Users", isDirectory: true)
+        let output = try ExternalProcess.run("/bin/sh", arguments: ["-c", "printf '%s\\n' \"$PWD\" \"$NAV_PROCESS_TEST\""],
+            directory: directory, environment: ["NAV_PROCESS_TEST": "literal $value"], timeout: 5).completed()
+        XCTAssertEqual(output.out, directory.path + "\nliteral $value\n")
+    }
+}
+
+
+extension ExternalProcessTests {
+    func testInvalidTimeoutFailsBeforeLaunch() {
+        for timeout in [0.0, -1.0, .infinity, .nan] {
+            let result = ExternalProcess.run("/bin/echo", timeout: timeout,
+                onLaunch: { _ in XCTFail("invalid timeout launched a child") })
+            guard case .failedToLaunch = result else { return XCTFail("invalid timeout was accepted") }
+        }
+    }
+
+    func testLaunchCallbackObservesLivenessWithoutOwningProcess() {
+        var isRunning: (() -> Bool)?
+        let result = ExternalProcess.run("/bin/echo", timeout: 5, onLaunch: { isRunning = $0 })
+        guard case .success = result else { return XCTFail("echo failed") }
+        XCTAssertNotNil(isRunning)
+        XCTAssertEqual(isRunning?(), false)
+        _ = ExternalProcess.run("/nonexistent-navigator-\(UUID().uuidString)", timeout: 5,
+            onLaunch: { _ in XCTFail("failed launch called onLaunch") })
+    }
+}
