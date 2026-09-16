@@ -5138,6 +5138,10 @@ final class Browser: ObservableObject, Identifiable {
     /// One fallback per search, so an unindexed folder can't ping-pong.
     private var spotlightFellBack = false
     @Synchronized private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
+
+    /// Process-wide: a walk parked in a blocking nextObject() is a leaked THREAD, and threads
+    /// are not per-Browser. See WalkAdmission for why cancellation cannot reach them.
+    static let walkAdmission = WalkAdmission()
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
     private let fm = FileManager.default
@@ -6178,8 +6182,19 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 self.status = "Searching… \(self.items.count) found"
             }
         }
+        // Refuse rather than park another thread behind walks that are never coming back.
+        guard Browser.walkAdmission.begin() else {
+            timer.cancel()
+            isSearching = false
+            status = "This volume is not responding — \(Browser.walkAdmission.limit) earlier searches here have not finished. Reconnect it, or search somewhere else."
+            navLog("walkSearch REFUSED: \(Browser.walkAdmission.current) walks still outstanding on \(root.path)")
+            return
+        }
         timer.resume()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // end() on EVERY exit, including the cancellation return in the loop below - a
+            // path that forgets it silently burns a slot for the life of the process.
+            defer { Browser.walkAdmission.end() }
             defer { DispatchQueue.main.async { timer.cancel() } }
             let keys = Browser.itemKeys
             let wantedKeys = Set(keys)   // hoisted out of the per-file loop below

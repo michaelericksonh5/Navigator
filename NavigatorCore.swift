@@ -4989,3 +4989,40 @@ final class SearchResultBuffer<Row>: @unchecked Sendable {
         return result
     }
 }
+
+/// Bounds how many recursive search walks can be outstanding at once.
+///
+/// Cancelling a walk sets a generation counter, and the walk notices by checking it at the top
+/// of its loop - AFTER `nextObject()` has returned. On a wedged mount `nextObject()` does not
+/// return, so the worker outlives its own cancellation, and the next search starts another one.
+/// Nothing reaps them: search a dead share, cancel, search again, and the threads accumulate
+/// for the life of the process.
+///
+/// This cannot be fixed by checking cancellation more often - the thread is inside a blocking
+/// syscall, and Foundation gives no way to interrupt it. So the count is bounded instead: past
+/// the limit a new walk is refused with a message, rather than silently parking another thread.
+/// A refusal the user can see beats an invisible leak.
+final class WalkAdmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private var outstanding = 0
+    let limit: Int
+
+    init(limit: Int = 4) { self.limit = limit }
+
+    var current: Int { lock.lock(); defer { lock.unlock() }; return outstanding }
+
+    /// False when the caller must NOT start a walk. Balance every true with `end()`.
+    func begin() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard outstanding < limit else { return false }
+        outstanding += 1
+        return true
+    }
+
+    func end() {
+        lock.lock(); defer { lock.unlock() }
+        // Clamped: a double end() must not make room that isn't there, or the bound silently
+        // stops bounding.
+        if outstanding > 0 { outstanding -= 1 }
+    }
+}

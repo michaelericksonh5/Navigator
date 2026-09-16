@@ -6008,3 +6008,49 @@ final class DeferredUndoTests: XCTestCase {
         XCTAssertFalse(stack.isPerforming)
     }
 }
+
+// The wedged-mount case, made reproducible without a wedged mount: a walk that never finishes
+// is simply one that never calls end(). These assert the bound holds under exactly that.
+final class WalkAdmissionTests: XCTestCase {
+
+    func testAllowsWalksUpToTheLimit() {
+        let a = WalkAdmission(limit: 4)
+        for i in 1...4 { XCTAssertTrue(a.begin(), "walk \(i) should be admitted"); XCTAssertEqual(a.current, i) }
+    }
+
+    // The actual failure: four walks blocked forever in nextObject(), and the user keeps
+    // typing. Without a bound each keystroke parks another thread.
+    func testRefusesOnceTheLimitIsReachedByWalksThatNeverFinish() {
+        let a = WalkAdmission(limit: 4)
+        for _ in 0..<4 { XCTAssertTrue(a.begin()) }
+        for _ in 0..<50 { XCTAssertFalse(a.begin(), "a wedged volume must not keep taking workers") }
+        XCTAssertEqual(a.current, 4, "outstanding work stays bounded no matter how often the user retries")
+    }
+
+    func testFinishingAWalkMakesRoomForTheNext() {
+        let a = WalkAdmission(limit: 2)
+        XCTAssertTrue(a.begin()); XCTAssertTrue(a.begin())
+        XCTAssertFalse(a.begin())
+        a.end()
+        XCTAssertTrue(a.begin(), "a walk that returned frees its slot")
+    }
+
+    // A double end() must not invent capacity - that would quietly disable the bound.
+    func testEndIsClampedAtZero() {
+        let a = WalkAdmission(limit: 1)
+        a.end(); a.end()
+        XCTAssertEqual(a.current, 0)
+        XCTAssertTrue(a.begin())
+        XCTAssertFalse(a.begin())
+    }
+
+    func testConcurrentAdmissionNeverExceedsTheLimit() {
+        let a = WalkAdmission(limit: 8)
+        let admitted = Synchronized(wrappedValue: 0)
+        DispatchQueue.concurrentPerform(iterations: 200) { _ in
+            if a.begin() { admitted.wrappedValue += 1 }   // never end(): every walk is wedged
+        }
+        XCTAssertEqual(admitted.wrappedValue, 8)
+        XCTAssertEqual(a.current, 8)
+    }
+}
