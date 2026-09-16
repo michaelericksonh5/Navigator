@@ -5694,3 +5694,82 @@ final class ShellQuotingTests: XCTestCase {
         XCTAssertEqual(PathText.quoted(["/a b", "/c d"]), "'/a b'\n'/c d'")
     }
 }
+
+final class SearchProducerTests: XCTestCase {
+    func testThisMacOverridesNetworkFolder() {
+        XCTAssertTrue(SearchBackendRules.usesRecursiveWalk(isNetwork: true, thisMac: false))
+        XCTAssertFalse(SearchBackendRules.usesRecursiveWalk(isNetwork: true, thisMac: true))
+        XCTAssertFalse(SearchBackendRules.usesRecursiveWalk(isNetwork: false, thisMac: false))
+        XCTAssertFalse(SearchBackendRules.usesRecursiveWalk(isNetwork: false, thisMac: true))
+    }
+
+    func testFolderKindUsesDirectoryMetadata() {
+        let unused: (String) -> Bool = { _ in
+            XCTFail("Directories and Any must not consult a filename extension")
+            return false
+        }
+        XCTAssertTrue(SearchBackendRules.matchesKind(tree: "public.folder", isDirectory: true, fileTypeMatches: unused))
+        XCTAssertFalse(SearchBackendRules.matchesKind(tree: "public.folder", isDirectory: false, fileTypeMatches: unused))
+        XCTAssertFalse(SearchBackendRules.matchesKind(tree: "public.image", isDirectory: true, fileTypeMatches: unused))
+        XCTAssertTrue(SearchBackendRules.matchesKind(tree: nil, isDirectory: true, fileTypeMatches: unused))
+        XCTAssertTrue(SearchBackendRules.matchesKind(tree: "public.image", isDirectory: false) { tree in
+            XCTAssertEqual(tree, "public.image")
+            return true
+        })
+        XCTAssertFalse(SearchBackendRules.matchesKind(tree: "public.image", isDirectory: false) { _ in false })
+    }
+
+    func testGenerationInvalidationAndConcurrentAdvances() {
+        let generation = Synchronized(wrappedValue: 0)
+        let old = generation.wrappedValue
+        DispatchQueue.concurrentPerform(iterations: 1000) { _ in generation.wrappedValue += 1 }
+        XCTAssertEqual(generation.wrappedValue, 1000)
+        XCTAssertNotEqual(old, generation.wrappedValue)
+    }
+
+    func testCancellationVisibleToWorker() {
+        let cancelled = Synchronized(wrappedValue: false)
+        let ready = DispatchSemaphore(value: 0)
+        let done = expectation(description: "worker sees cancellation")
+        DispatchQueue.global().async {
+            ready.wait()
+            XCTAssertTrue(cancelled.wrappedValue)
+            done.fulfill()
+        }
+        cancelled.wrappedValue = true
+        ready.signal()
+        wait(for: [done], timeout: 2)
+    }
+
+    func testSparseMatchDrainsBeforeProducerFinishes() {
+        let buffer = SearchResultBuffer<Int>()
+        let produced = DispatchSemaphore(value: 0)
+        let resume = DispatchSemaphore(value: 0)
+        let done = expectation(description: "producer finishes")
+        DispatchQueue.global().async {
+            buffer.append(1)
+            produced.signal()
+            resume.wait()
+            buffer.append(2)
+            done.fulfill()
+        }
+        XCTAssertEqual(produced.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(buffer.drain(), [1])
+        XCTAssertTrue(buffer.drain().isEmpty)
+        resume.signal()
+        wait(for: [done], timeout: 2)
+        XCTAssertEqual(buffer.drain(), [2])
+    }
+
+    func testConcurrentStreamingDoesNotLoseOrRepeatRows() {
+        let buffer = SearchResultBuffer<Int>()
+        let drained = Synchronized(wrappedValue: [Int]())
+        DispatchQueue.concurrentPerform(iterations: 1000) { i in
+            buffer.append(i)
+            let rows = buffer.drain()
+            drained.wrappedValue.append(contentsOf: rows)
+        }
+        let rows = drained.wrappedValue + buffer.drain()
+        XCTAssertEqual(rows.sorted(), Array(0..<1000))
+    }
+}

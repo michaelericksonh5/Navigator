@@ -4836,3 +4836,46 @@ enum TerminalRules {
         return s == "terminal" || s == "cmd" || s == "shell"
     }
 }
+
+// Readers run on filesystem workers while navigation and Cancel write on the UI thread.
+// Lock the read-modify-write too, so advancing a generation cannot lose an invalidation.
+@propertyWrapper
+final class Synchronized<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(wrappedValue: Value) { value = wrappedValue }
+    var wrappedValue: Value {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); defer { lock.unlock() }; value = newValue }
+        _modify { lock.lock(); defer { lock.unlock() }; yield &value }
+    }
+}
+
+enum SearchBackendRules {
+    static func usesRecursiveWalk(isNetwork: Bool, thisMac: Bool) -> Bool {
+        isNetwork && !thisMac
+    }
+
+    // A directory's extension says nothing about its kind: Art.png is still a folder.
+    static func matchesKind(tree: String?, isDirectory: Bool, fileTypeMatches: (String) -> Bool) -> Bool {
+        guard let tree else { return true }
+        if tree == "public.folder" { return isDirectory }
+        return !isDirectory && fileTypeMatches(tree)
+    }
+}
+
+// The UI timer must be able to drain matches even while nextObject is stuck on SMB.
+final class SearchResultBuffer<Row>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var rows: [Row] = []
+    func append(_ row: Row) {
+        lock.lock(); defer { lock.unlock() }
+        rows.append(row)
+    }
+    func drain() -> [Row] {
+        lock.lock(); defer { lock.unlock() }
+        let result = rows
+        rows.removeAll(keepingCapacity: true)
+        return result
+    }
+}

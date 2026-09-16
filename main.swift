@@ -34,7 +34,7 @@ enum ConflictPolicy { case keepBoth, replace, skip }
 final class TransferProgress: ObservableObject {
     @Published var fraction: Double = 0
     @Published var current: String = ""
-    @Published var cancelled = false
+    @Synchronized var cancelled = false
     @Published var done = 0            // items finished
     @Published var total = 0           // items in this transfer (0 = unknown)
     // "1,234 of 30,000 items" — a percentage alone doesn't tell you how much is left.
@@ -5087,7 +5087,7 @@ final class Browser: ObservableObject, Identifiable {
     private var searchQuery: NSMetadataQuery?
     /// One fallback per search, so an unindexed folder can't ping-pong.
     private var spotlightFellBack = false
-    private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
+    @Synchronized private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
     private let fm = FileManager.default
@@ -5742,10 +5742,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                         tags: (rv?.allValues[.tagNamesKey] as? [String]) ?? [])
     }
 
-    private func makeItem(_ u: URL) -> FileItem {
-        Browser.item(from: u, try? u.resourceValues(forKeys: Set(Browser.itemKeys)))
-    }
-
     // Names ONLY, straight from POSIX readdir — no attribute fetch of any kind.
     //
     // This exists because asking for attributes is catastrophically expensive on
@@ -5863,6 +5859,23 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         q = nil
     }
 
+    // Indexed values never stat a result path. A stale Spotlight hit on a wedged mount
+    // must not freeze the UI while Recents or search tries to confirm that it still exists.
+    private static func metadataItem(_ mi: NSMetadataItem, url: URL) -> FileItem {
+        let tree = mi.value(forAttribute: "kMDItemContentTypeTree") as? [String] ?? []
+        let isDir = tree.contains("public.folder") || tree.contains("public.directory")
+        let modified = mi.value(forAttribute: "kMDItemFSContentChangeDate") as? Date ?? .distantPast
+        return FileItem(id: url.path, url: url, name: url.lastPathComponent,
+                        isDirectory: isDir,
+                        size: (mi.value(forAttribute: "kMDItemFSSize") as? NSNumber)?.int64Value ?? 0,
+                        modified: modified,
+                        created: mi.value(forAttribute: "kMDItemFSCreationDate") as? Date ?? modified,
+                        accessed: mi.value(forAttribute: "kMDItemLastUsedDate") as? Date ?? modified,
+                        dateAdded: mi.value(forAttribute: "kMDItemDateAdded") as? Date ?? modified,
+                        kind: mi.value(forAttribute: "kMDItemKind") as? String ?? (isDir ? "Folder" : "Document"),
+                        tags: mi.value(forAttribute: "kMDItemUserTags") as? [String] ?? [])
+    }
+
     /// Reads up to `cap` USABLE rows out of a query.
     ///
     /// The cap used to be applied to the raw result index — `min(resultCount, 200)` — and rows
@@ -5880,7 +5893,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             defer { i += 1 }
             guard let mi = q.result(at: i) as? NSMetadataItem,
                   let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-            if let row = accept(mi, URL(fileURLWithPath: path)) { rows.append(row) }
+            if let row = accept(mi, URL(fileURLWithPath: path, isDirectory: false)) { rows.append(row) }
         }
         return (rows, rows.count >= cap && i < total)
     }
@@ -5889,15 +5902,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // across your home folder, newest first. (The separate "Recent Folders" list
     // is the folders you've worked in — see RecentFolders.)
     func loadRecents() {
+        stopResultProducers()
         isRecents = true
         isSearching = false
-        dirWatcher.stop()
         selection = []
         pathText = "Recents"
         items = []
         status = "Finding recent files…"
         sortOrder = [KeyPathComparator(\FileItem.modified, order: .reverse)]
-        stopMetadataQuery(&recentsQuery)
         let q = NSMetadataQuery()
         q.searchScopes = [NSMetadataQueryUserHomeScope]
         let since = Date().addingTimeInterval(-60 * 60 * 24 * 45) as NSDate
@@ -5922,11 +5934,9 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // notification read the SECOND query's still-empty results and published nothing.
         guard let q = note.object as? NSMetadataQuery, q === recentsQuery, isRecents else { return }
         q.disableUpdates()
-        let fm = self.fm
-        let (rows, _) = collect(from: q, cap: 200) { [weak self] _, url in
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue else { return nil }
-            return self?.makeItem(url)
+        let (rows, _) = collect(from: q, cap: 200) { mi, url in
+            let item = Browser.metadataItem(mi, url: url)
+            return item.isDirectory ? nil : item
         }
         let keep = selection
         items = rows
@@ -5936,6 +5946,20 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         q.enableUpdates()
     }
 
+    // A result view owns the list. Old walks, debounce callbacks and directory completions
+    // must lose ownership before the new view can publish, even if their I/O is still stuck.
+    private func stopResultProducers() {
+        searchDebounce?.cancel(); searchDebounce = nil
+        searchGen += 1
+        loadGeneration += 1; cancelPendingDetails()
+        stopMetadataQuery(&searchQuery)
+        stopMetadataQuery(&recentsQuery)
+        dirWatcher.stop()
+        busy = false; busyText = ""
+        refreshInFlight = false
+        slowNetwork = false; networkStalled = false; staleListing = false
+    }
+
     // Spotlight search within the current folder subtree (name + content).
     func runSearch() {
         let query = searchText.trimmingCharacters(in: .whitespaces)
@@ -5943,14 +5967,13 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // is how Explorer and Finder both behave. Only a search with no text AND no
         // filter is nothing at all.
         guard !query.isEmpty || searchFilters.isActive else { clearSearch(); return }
+        stopResultProducers()
+        isRecents = false
         isSearching = true
-        dirWatcher.stop()
         selection = []
         items = []
         status = "Searching…"
-        stopMetadataQuery(&searchQuery)
         spotlightFellBack = false
-        searchGen += 1
         // MEASURED, because the old rule was wrong twice over.
         //
         // It sent Google Drive to the recursive walk on the belief that File Provider volumes
@@ -5964,7 +5987,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // search on an indexed tree walked hundreds of thousands of entries for no reason.
         //
         // SMB shares genuinely are not indexed, so those still walk.
-        if currentIsNetwork {
+        if SearchBackendRules.usesRecursiveWalk(isNetwork: currentIsNetwork, thisMac: searchThisMac) {
             walkSearch(query, root: currentURL, gen: searchGen)
         } else {
             runSpotlight(query)
@@ -6032,8 +6055,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         if let tree = searchKind.typeTree { subs.append(NSPredicate(format: "kMDItemContentTypeTree == %@", tree)) }
         // Date/Size go into the PREDICATE as well as the post-hoc check in
         // searchChanged, purely so the result cap is spent on rows that can
-        // actually match — filtering after the cap would drop real hits. The post-hoc
-        // check is still the authority (a stale Spotlight index can disagree with disk).
+        // actually match — filtering after the cap would drop real hits.
         let dates = searchFilters.dateRange()
         if let f = dates.from { subs.append(NSPredicate(format: "kMDItemFSContentChangeDate >= %@", f as NSDate)) }
         if let t = dates.to { subs.append(NSPredicate(format: "kMDItemFSContentChangeDate < %@", t as NSDate)) }
@@ -6069,8 +6091,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         searchQuery = q
         q.start()
     }
-    // Recursive filesystem search — the only reliable way on SMB / Google Drive
-    // (Spotlight can't index them). Matches a name substring OR a file extension
+    // Recursive filesystem search for SMB and unindexed local folders.
+    // Matches a name substring OR a file extension
     // (so "png", ".png", or "logo" all work). Streams matches in as they're found,
     // on a background thread, cancellable via searchGen.
     private func walkSearch(_ raw: String, root: URL, gen: Int) {
@@ -6085,7 +6107,20 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // change the answer halfway through the results.
         let filters = self.searchFilters
         let now = Date()
+        let buffer = SearchResultBuffer<FileItem>()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+        timer.setEventHandler { [weak self] in
+            guard let self, gen == self.searchGen, self.isSearching else { timer.cancel(); return }
+            let rows = buffer.drain()
+            if !rows.isEmpty {
+                self.items.append(contentsOf: rows)
+                self.status = "Searching… \(self.items.count) found"
+            }
+        }
+        timer.resume()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer { DispatchQueue.main.async { timer.cancel() } }
             let keys = Browser.itemKeys
             let wantedKeys = Set(keys)   // hoisted out of the per-file loop below
             // skipsPackageDescendants: without it the walk climbs inside every .app and
@@ -6095,41 +6130,34 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var opts: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
             if !showHidden { opts.insert(.skipsHiddenFiles) }
             let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: opts)
-            var batch: [FileItem] = []
             var total = 0
             var hitCap = false
-            func flush(final: Bool) {
-                let snap = batch; batch.removeAll()
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, gen == self.searchGen else { return }
-                    if !snap.isEmpty { self.items.append(contentsOf: snap) }
-                    // A capped list that reports a bare count reads as the complete answer, and
-                    // then a missing file looks like it doesn't exist.
-                    self.status = final
-                        ? SearchTruncation.of(shown: self.items.count,
-                                              cap: Browser.searchResultCap,
-                                              hitCap: hitCap).statusText
-                        : "Searching… \(self.items.count) found"
-                }
-            }
             while let u = en?.nextObject() as? URL {
                 guard let self, gen == self.searchGen else { return }   // cancelled
                 let name = u.lastPathComponent
                 let ext = u.pathExtension
-                if kindTree != nil {   // kind filter set → require a matching content type
-                    if !(UTType(filenameExtension: ext.lowercased())?.conforms(to: UTType(kindTree!) ?? .data) ?? false) { continue }
-                }
                 // Empty token list = filter-only search, so every name qualifies.
                 guard SearchQueryRules.matchesFile(name: name, ext: ext, tokens: tokens) else { continue }
                 let item = Browser.item(from: u, try? u.resourceValues(forKeys: wantedKeys))
+                let matchesKind = SearchBackendRules.matchesKind(tree: kindTree, isDirectory: item.isDirectory) { tree in
+                    guard let wanted = UTType(tree), let actual = UTType(filenameExtension: ext.lowercased()) else { return false }
+                    return actual.conforms(to: wanted)
+                }
+                guard matchesKind else { continue }
                 guard filters.matches(modified: item.modified, size: item.size,
                                       isDirectory: item.isDirectory, now: now) else { continue }
-                batch.append(item)
+                buffer.append(item)
                 total += 1
-                if batch.count >= 40 { flush(final: false) }
                 if total >= Browser.searchResultCap { hitCap = true; break }
             }
-            flush(final: true)
+            let capped = hitCap
+            DispatchQueue.main.async { [weak self] in
+                timer.cancel()
+                guard let self, gen == self.searchGen, self.isSearching else { return }
+                self.items.append(contentsOf: buffer.drain())
+                self.status = SearchTruncation.of(shown: self.items.count,
+                                                 cap: Browser.searchResultCap, hitCap: capped).statusText
+            }
         }
     }
     /// Handles the first gather AND every live update.
@@ -6143,13 +6171,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard let q = note.object as? NSMetadataQuery, q === searchQuery, isSearching else { return }
         q.disableUpdates()
         let now = Date()
-        let (rows, stoppedEarly) = collect(from: q, cap: Browser.searchResultCap) { [weak self] _, url in
+        let (rows, stoppedEarly) = collect(from: q, cap: Browser.searchResultCap) { [weak self] mi, url in
             guard let self else { return nil }
-            let item = self.makeItem(url)
-            // Re-check against the SAME predicate walkSearch uses. Spotlight's index can
-            // lag the disk (a file saved seconds ago still carries its old size there),
-            // and a filter that means one thing on the Spotlight path and another on the
-            // recursive path is worse than no filter at all.
+            let item = Browser.metadataItem(mi, url: url)
+            // Use the same filter boundaries as the walk without reaching back to disk:
+            // Spotlight may lag a recent save, but verifying it can hang on a dead mount.
             guard self.searchFilters.matches(modified: item.modified, size: item.size,
                                              isDirectory: item.isDirectory, now: now) else { return nil }
             return item
@@ -6193,17 +6219,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     /// Called from AppModel.forgetSession, which is the one "this window is finished"
     /// signal — deliberately NOT on quit, where the process is going away anyway.
     func stopWatching() {
-        dirWatcher.stop()
-        stopMetadataQuery(&recentsQuery)
-        stopMetadataQuery(&searchQuery)
-        searchGen += 1   // cancel any in-flight recursive walk
-        loadGeneration += 1; cancelPendingDetails()   // and any in-flight listing, so it can't restart the watcher
+        stopResultProducers()
     }
 
     func clearSearch() {
-        searchDebounce?.cancel(); searchDebounce = nil
-        stopMetadataQuery(&searchQuery)
-        searchGen += 1   // cancel any in-flight recursive walk
         searchText = ""; isSearching = false
         // Filters go too. A filter left armed after the search is closed is invisible
         // state that silently narrows the NEXT search for no reason the user can see.
@@ -6211,7 +6230,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         load()
     }
 
-    private var loadGeneration = 0
+    @Synchronized private var loadGeneration = 0
     // Client-side directory cache (Windows-style): last-known listing per folder,
     // so revisits / back-forward are instant while a fresh copy loads in the
     // background. Main-thread only.
@@ -6292,23 +6311,15 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // main thread would freeze the UI. Results are applied on the main thread,
     // and stale loads (superseded by a newer navigation) are discarded.
     func load() {
+        stopResultProducers()
         isRecents = false
         isSearching = false
-        // Both metadata queries are LIVE now (they keep pushing updates rather than firing
-        // once), so leaving one running here would let it overwrite the listing of whatever
-        // folder we just navigated to. They must not outlive the view they populated.
-        stopMetadataQuery(&searchQuery)
-        stopMetadataQuery(&recentsQuery)
-        slowNetwork = false
-        networkStalled = false
-        staleListing = false
         pathText = addressString(for: currentURL)
         selection = []
         // Arriving in the Trash: read Finder's put-back records so Put Back knows
         // where items trashed by other apps came from.
         if isTrash { loadTrashPutBack() }
         let dir = currentURL
-        loadGeneration += 1; cancelPendingDetails()
         let gen = loadGeneration
         let cacheKey = dir.path + (showHidden ? "\u{1}h" : "")
         // Seed instantly from cache — no stat needed (DiskCache only ever holds
@@ -18965,7 +18976,12 @@ struct RestyleSheet: View {
 
     @State private var busy = false          // a single restyle is running
     @State private var batchRunning = false
-    @State private var cancelRequested = false
+    // Workers check Stop between requests; SwiftUI State itself is not a cross-thread flag.
+    @State private var cancellation = Synchronized(wrappedValue: false)
+    private var cancelRequested: Bool {
+        get { cancellation.wrappedValue }
+        nonmutating set { cancellation.wrappedValue = newValue }
+    }
     @State private var progress = ""
     @State private var status = ""
     @State private var failure = ""
