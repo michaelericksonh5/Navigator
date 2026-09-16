@@ -6070,7 +6070,7 @@ final class FileOperationDiskTests: XCTestCase {
 
     override func tearDownWithError() throws {
         // A failed assertion must not leave test files in the user's Trash.
-        for url in trashed where fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
+        for url in trashed where itemExists(url) { try fm.removeItem(at: url) }
         TrashOrigins.defaults.removePersistentDomain(forName: suite)
         if let oldDefaults { TrashOrigins.defaults = oldDefaults }
         try fm.removeItem(at: directory)
@@ -6105,24 +6105,9 @@ final class FileOperationDiskTests: XCTestCase {
     }
 
     private func trash(_ urls: [URL]) throws -> [(from: URL, to: URL)] {
-        let probe = try file("trash-probe-\(UUID().uuidString)")
-        var landed: NSURL?
-        do {
-            try fm.trashItem(at: probe, resultingItemURL: &landed)
-        } catch {
-            let ns = error as NSError
-            if (ns.domain == NSCocoaErrorDomain && [NSFileWriteNoPermissionError, NSFileReadNoPermissionError].contains(ns.code))
-                || (ns.domain == NSPOSIXErrorDomain && [Int(EPERM), Int(EACCES)].contains(ns.code)) {
-                throw XCTSkip("FileManager.trashItem blocked in this environment: \(error.localizedDescription)")
-            }
-            throw error
-        }
-        let probeTrash = try XCTUnwrap(landed as URL?)
-        trashed.append(probeTrash)
-        try fm.removeItem(at: probeTrash)
         let result = trashItemsWithFailures(urls)
         trashed += result.restores.map { $0.from }
-        // Once the platform probe succeeds, any helper failure is a regression, not a skip.
+        // A denied Trash operation must fail the test, not report untested behavior as green.
         XCTAssertTrue(result.failures.isEmpty, "\(result.failures)")
         XCTAssertEqual(result.restores.count, urls.count)
         for pair in result.restores {
@@ -6138,6 +6123,17 @@ final class FileOperationDiskTests: XCTestCase {
         XCTAssertEqual(first.lastPathComponent, "New Folder")
         XCTAssertEqual(second.lastPathComponent, "New Folder 2")
         XCTAssertEqual(try tree(directory), ["New Folder/": Data(), "New Folder 2/": Data()])
+    }
+
+    func testNamedExtractionFolderPreservesOccupantsAndRequiresParent() throws {
+        let occupant = try file("archive", "keep me")
+        let folder = try FileOperations.newFolder(in: directory, name: "archive")
+        XCTAssertEqual(folder.lastPathComponent, "archive 2")
+        XCTAssertEqual(try contents(occupant), "keep me")
+        XCTAssertEqual(try tree(folder), [:])
+        let absent = directory.appendingPathComponent("missing")
+        XCTAssertThrowsError(try FileOperations.newFolder(in: absent, name: "archive"))
+        XCTAssertFalse(itemExists(absent))
     }
 
     func testNewTextFilePreservesCollisionAndContents() throws {
@@ -6352,12 +6348,30 @@ final class FileOperationDiskTests: XCTestCase {
         XCTAssertEqual(try tree(directory), [:])
     }
 
+    func testRestoreResultsIncludeOnlySuccessfulMoves() throws {
+        let source = try file("source"), blocked = try file("blocked")
+        let occupant = try file("occupant", "keep me")
+        let destination = directory.appendingPathComponent("restored")
+        let missing = directory.appendingPathComponent("missing")
+        let result = restoreItemsWithResults([(source, destination), (blocked, occupant), (missing, source)])
+        XCTAssertEqual(result.moved.map { $0.from }, [source])
+        XCTAssertEqual(result.moved.map { $0.to }, [destination])
+        XCTAssertNotNil(result.problem)
+        XCTAssertEqual(try contents(destination), "original bytes")
+        XCTAssertEqual(try contents(blocked), "original bytes")
+        XCTAssertEqual(try contents(occupant), "keep me")
+        XCTAssertFalse(itemExists(source))
+    }
+
     func testPermissionDeniedDoesNotCreateOrMoveItems() throws {
         let source = try file("source")
         let locked = try FileOperations.newFolder(in: directory)
         try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: locked.path)
         defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path) }
-        guard !fm.isWritableFile(atPath: locked.path) else { throw XCTSkip("This user bypasses POSIX write permissions") }
+        guard !fm.isWritableFile(atPath: locked.path) else {
+            XCTFail("Cannot verify permission denial: this user bypasses POSIX write permissions")
+            return
+        }
         XCTAssertThrowsError(try FileOperations.newFolder(in: locked))
         XCTAssertThrowsError(try FileOperations.newFile(in: locked, name: "text", contents: Data()))
         XCTAssertThrowsError(try FileOperations.duplicate(source, in: locked))
@@ -6490,4 +6504,32 @@ final class FileOperationDiskTests: XCTestCase {
         XCTAssertEqual(try tree(directory), after)
     }
 
+}
+
+final class CommandAvailabilityTests: XCTestCase {
+    func testUpStopsAtRoot() {
+        XCTAssertFalse(PathRules.canGoUp(URL(fileURLWithPath: "/")))
+        XCTAssertTrue(PathRules.canGoUp(URL(fileURLWithPath: "/Users")))
+    }
+
+    func testTransferDestinationsMatchWhatCanActuallyMove() throws {
+        let directory = URL(fileURLWithPath: "/destination", isDirectory: true)
+        let local = directory.appendingPathComponent("local")
+        let other = URL(fileURLWithPath: "/elsewhere/other")
+        let token = try XCTUnwrap(URL(string: "navreorder:/favorite"))
+        XCTAssertEqual(PathRules.transferSources([], into: directory), [])
+        XCTAssertEqual(PathRules.transferSources([directory, local, token], into: directory), [])
+        XCTAssertEqual(PathRules.transferSources([directory, local, token, other], into: directory), [other])
+        XCTAssertEqual(PathRules.transferSources([directory, local, token, other], into: directory,
+                                                allowSameFolder: true), [local, other])
+    }
+
+    func testFavoriteNudgesRespectPinnedHomeAndEndpoints() {
+        let unchanged = [0, 1, 2]
+        XCTAssertEqual(PathRules.reorder(count: 3, from: [0], to: 2, pinnedToFront: 0), unchanged)
+        XCTAssertEqual(PathRules.reorder(count: 3, from: [1], to: 0, pinnedToFront: 0), unchanged)
+        XCTAssertEqual(PathRules.reorder(count: 3, from: [2], to: 4, pinnedToFront: 0), unchanged)
+        XCTAssertEqual(PathRules.reorder(count: 3, from: [1], to: 3, pinnedToFront: 0), [0, 2, 1])
+        XCTAssertEqual(PathRules.reorder(count: 3, from: [2], to: 0, pinnedToFront: 0), [0, 2, 1])
+    }
 }

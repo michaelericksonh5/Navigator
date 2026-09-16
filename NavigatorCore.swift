@@ -13,6 +13,19 @@ import CoreGraphics
 
 enum PathRules {
 
+    static func canGoUp(_ url: URL) -> Bool {
+        url.deletingLastPathComponent().path != url.path
+    }
+
+    // Paste may duplicate in place; drops and Send To cannot. Share the filtering so
+    // a destination menu never promises a transfer the executor will discard.
+    static func transferSources(_ urls: [URL], into directory: URL, allowSameFolder: Bool = false) -> [URL] {
+        urls.filter {
+            $0.isFileURL && $0.path != directory.path &&
+                (allowSameFolder || $0.deletingLastPathComponent().path != directory.path)
+        }
+    }
+
     // Search selections can span parents; bare names would archive unrelated siblings.
     static func archiveInputs(_ urls: [URL]) -> (directory: URL, entries: [String])? {
         guard let first = urls.first, urls.allSatisfy({ $0.isFileURL }) else { return nil }
@@ -933,12 +946,19 @@ func renameItem(_ source: URL, to destination: URL, replacing: Bool) throws -> U
 /// why the collision ordering lives here rather than in Batch Rename: any caller whose
 /// pairs overlap gets it without having to know it exists.
 func restoreItems(_ pairs: [(from: URL, to: URL)]) -> String? {
+    restoreItemsWithResults(pairs).problem
+}
+
+// Put Back must retain origins for failed moves and must not undo a move that never
+// happened. Keep the successful pairs alongside the same error report other callers use.
+func restoreItemsWithResults(_ pairs: [(from: URL, to: URL)]) -> (moved: [(from: URL, to: URL)], problem: String?) {
+    var moved: [(from: URL, to: URL)] = []
     var failed: [String] = []
     for p in collisionSafeOrder(pairs) {
-        do { try FileManager.default.moveItem(at: p.from, to: p.to) }
+        do { try FileManager.default.moveItem(at: p.from, to: p.to); moved.append(p) }
         catch { failed.append("• \(p.to.lastPathComponent): \(error.localizedDescription)") }
     }
-    return failed.isEmpty ? nil : failed.prefix(5).joined(separator: "\n")
+    return (moved, failed.isEmpty ? nil : failed.prefix(5).joined(separator: "\n"))
 }
 
 /// Bins each URL and hands back where each one landed, so the matching half can
@@ -5060,8 +5080,8 @@ enum FileOperations {
         PathRules.uniqueDest(directory, name) { FileManager.default.fileExists(atPath: $0) }
     }
 
-    static func newFolder(in directory: URL) throws -> URL {
-        let target = uniqueDestination(directory, "New Folder")
+    static func newFolder(in directory: URL, name: String = "New Folder") throws -> URL {
+        let target = uniqueDestination(directory, name)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
         return target
     }

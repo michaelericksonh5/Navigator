@@ -4623,6 +4623,12 @@ final class FavoritesStore: ObservableObject {
     // Keyboard-free, aim-free reordering from the context menu. Dragging is fine when
     // you hit a row, but "just below Home" is a small target and a miss looks like the
     // feature is broken — these always land.
+    func canReorder(path: String, toOffset: Int) -> Bool {
+        guard let i = index(of: path) else { return false }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return PathRules.reorder(count: items.count, from: IndexSet(integer: i), to: toOffset,
+                                 pinnedToFront: index(of: home)) != Array(items.indices)
+    }
     func moveToTop(path: String) {
         guard let i = index(of: path) else { return }
         move(fromOffsets: IndexSet(integer: i), toOffset: 0)
@@ -7226,7 +7232,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
 
     func goUp() {
         let parent = currentURL.deletingLastPathComponent()
-        if parent.path != currentURL.path { navigate(to: parent) }
+        if PathRules.canGoUp(currentURL) { navigate(to: parent) }
     }
     func goBack() {
         guard let prev = backStack.popLast() else { NSSound.beep(); return }
@@ -7728,14 +7734,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 if !restores.isEmpty {
                     RecentFolders.shared.record(dir)
                     UndoStack.shared.push("Move to Trash", undo: { [weak self] in
-                        let problem = restoreItems(restores)
+                        let result = restoreItemsWithResults(restores)
                         // The items are out of the Trash again, so their origin records name
                         // paths that no longer exist. Left behind they would be handed to the
                         // next thing that lands on the same Trash path (same name, same
                         // collision suffix) as ITS origin — a Put Back to the wrong folder.
-                        TrashOrigins.forget(restores.map { $0.from.path })
+                        TrashOrigins.forget(result.moved.map { $0.from.path })
                         self?.load()
-                        return problem
+                        return result.problem
                     }, redo: { [weak self] in
                         // Re-trashing lands at a DIFFERENT path each round (the Trash renames
                         // collisions), so the undo half has to be re-pointed at where the items
@@ -7904,11 +7910,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard !urls.isEmpty else { return }
         let isMove = Browser.cutMode && NSPasteboard.general.changeCount == Browser.cutChangeCount
         if isMove {
-            let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
+            let sources = PathRules.transferSources(urls, into: currentURL)
             guard !sources.isEmpty else { return }
             performTransfer(sources, into: currentURL, move: true, resetCut: true)
         } else {
-            let sources = urls.filter { $0.path != currentURL.path }   // keep same-folder → duplicated by isSelfDup
+            let sources = PathRules.transferSources(urls, into: currentURL, allowSameFolder: true)
             guard !sources.isEmpty else { return }
             performTransfer(sources, into: currentURL, move: false, resetCut: true)
         }
@@ -7922,7 +7928,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // transfers). Used by drag-and-drop: dropping items into the folder they
     // already live in is a no-op (cancel), NOT a self-copy.
     func copyURLs(_ urls: [URL], move: Bool) {
-        let sources = urls.filter { $0.path != currentURL.path && $0.deletingLastPathComponent().path != currentURL.path }
+        let sources = PathRules.transferSources(urls, into: currentURL)
         guard !sources.isEmpty else {
             // Same invisible no-op as importURLs, on the paste / drop-into-this-folder path.
             navLog(DropLogLine.text(surface: "copy into current folder", types: DropLog.pasteboardTypes(),
@@ -8034,7 +8040,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
 
     // Import (move or copy) dropped items into a target directory (a folder row or another tab).
     func importURLs(_ urls: [URL], into dir: URL, move: Bool) {
-        let sources = urls.filter { $0.deletingLastPathComponent().path != dir.path && $0.path != dir.path }
+        let sources = PathRules.transferSources(urls, into: dir)
         guard !sources.isEmpty else {
             // "It already lives there." A drop onto the folder a file is already in does
             // nothing, correctly — and looks exactly like drag and drop being broken, which is
@@ -8642,8 +8648,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             for it in sel {
                 var base = it.url.deletingPathExtension().lastPathComponent
                 if (base as NSString).pathExtension.lowercased() == "tar" { base = (base as NSString).deletingPathExtension }
-                let dest = self.uniqueDest(dir, base)
-                try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+                // Extract only into a folder we created. Ignoring a creation failure could
+                // expand into another process's folder, then delete it when tar failed.
+                let dest: URL
+                do { dest = try FileOperations.newFolder(in: dir, name: base) }
+                catch {
+                    failures.append((it.url.lastPathComponent, error.localizedDescription))
+                    continue
+                }
                 let p = Process()
                 if it.url.pathExtension.lowercased() == "zip" {
                     p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
@@ -8755,23 +8767,24 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     : origin.url
                 moves.append((from: it.url, to: dest))
             }
-            let problem = restoreItems(moves)
-            TrashOrigins.forget(moves.map { $0.from.path })
+            let result = restoreItemsWithResults(moves)
+            let restored = result.moved
+            TrashOrigins.forget(restored.map { $0.from.path })
             DispatchQueue.main.async {
-                if !moves.isEmpty {
-                    let undoPairs = moves.map { (from: $0.to, to: $0.from) }
+                if !restored.isEmpty {
+                    let undoPairs = restored.map { (from: $0.to, to: $0.from) }
                     UndoStack.shared.push("Put Back", undo: { [weak self] in
-                        let p = restoreItems(undoPairs)
-                        TrashOrigins.record(undoPairs.map { (from: $0.to, to: $0.from) })
-                        self?.load(); return p
+                        let r = restoreItemsWithResults(undoPairs)
+                        TrashOrigins.record(r.moved.map { (from: $0.to, to: $0.from) })
+                        self?.load(); return r.problem
                     }, redo: { [weak self] in
-                        let p = restoreItems(moves)
-                        TrashOrigins.forget(moves.map { $0.from.path })
-                        self?.load(); return p
+                        let r = restoreItemsWithResults(restored)
+                        TrashOrigins.forget(r.moved.map { $0.from.path })
+                        self?.load(); return r.problem
                     })
                     load()
-                    if let problem { reportFileError("Some items couldn't be put back", problem) }
                 }
+                if let problem = result.problem { reportFileError("Some items couldn't be put back", problem) }
                 if !missingFolders.isEmpty {
                     reportFileError("The original folder no longer exists",
                                     missingFolders.prefix(5).joined(separator: "\n")
@@ -8801,17 +8814,24 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard p.runModal() == .OK, let dir = p.url else { return }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let moves = sel.map { (from: $0.url, to: uniqueDest(dir, $0.name)) }
-            let problem = restoreItems(moves)
-            TrashOrigins.forget(moves.map { $0.from.path })
+            let result = restoreItemsWithResults(moves)
+            let restored = result.moved
+            TrashOrigins.forget(restored.map { $0.from.path })
             DispatchQueue.main.async {
-                let undoPairs = moves.map { (from: $0.to, to: $0.from) }
-                UndoStack.shared.push("Move Out of Trash", undo: { [weak self] in
-                    let p = restoreItems(undoPairs); self?.load(); return p
-                }, redo: { [weak self] in
-                    let p = restoreItems(moves); self?.load(); return p
-                })
+                if !restored.isEmpty {
+                    let undoPairs = restored.map { (from: $0.to, to: $0.from) }
+                    UndoStack.shared.push("Move Out of Trash", undo: { [weak self] in
+                        let r = restoreItemsWithResults(undoPairs)
+                        TrashOrigins.record(r.moved.map { (from: $0.to, to: $0.from) })
+                        self?.load(); return r.problem
+                    }, redo: { [weak self] in
+                        let r = restoreItemsWithResults(restored)
+                        TrashOrigins.forget(r.moved.map { $0.from.path })
+                        self?.load(); return r.problem
+                    })
+                }
                 load()
-                if let problem { reportFileError("Some items couldn't be moved", problem) }
+                if let problem = result.problem { reportFileError("Some items couldn't be moved", problem) }
             }
         }
     }
@@ -10131,8 +10151,13 @@ struct SidebarView: View {
                     Divider()
                     // Always-works alternative to aiming a drag.
                     Button("Move to Top") { favStore.moveToTop(path: n.url.path) }
-                    Button("Move Up") { favStore.moveUp(path: n.url.path) }
-                    Button("Move Down") { favStore.moveDown(path: n.url.path) }
+                        .disabled(!favStore.canReorder(path: n.url.path, toOffset: 0))
+                    if let i = favStore.items.firstIndex(where: { $0.path == n.url.path }) {
+                        Button("Move Up") { favStore.moveUp(path: n.url.path) }
+                            .disabled(!favStore.canReorder(path: n.url.path, toOffset: i - 1))
+                        Button("Move Down") { favStore.moveDown(path: n.url.path) }
+                            .disabled(!favStore.canReorder(path: n.url.path, toOffset: i + 2))
+                    }
                     Divider()
                     Button("Unpin from Sidebar") { favStore.remove(label: n.name, path: n.url.path) }
                 }
@@ -10318,7 +10343,7 @@ struct ControlBar: View {
                 Button { browser.goForward() } label: { Image(systemName: "chevron.right") }
                     .disabled(!browser.canGoForward).help("Forward (⌘])")
                 Button { browser.goUp() } label: { Image(systemName: "chevron.up") }
-                    .help("Up (⌘↑)")
+                    .disabled(!PathRules.canGoUp(browser.currentURL)).help("Up (⌘↑)")
                 Button { browser.refresh() } label: { Image(systemName: "arrow.clockwise") }
                     .keyboardShortcut("r", modifiers: .command).help("Refresh")
 
@@ -10468,7 +10493,7 @@ struct ControlBar: View {
                 // the one that can't be reached any other way from the toolbar.
                 if browser.isTrash {
                     Button { browser.putBack(browser.selection) } label: { Image(systemName: "arrow.uturn.backward") }
-                        .help("Put Back").disabled(!hasSel)
+                        .help("Put Back").disabled(!browser.items.contains { browser.selection.contains($0.id) && browser.trashOrigin(of: $0) != nil })
                     Button { confirmEmptyTrash(browser) } label: { Image(systemName: "trash.slash") }
                         .help("Empty Trash")
                 } else {
@@ -10548,8 +10573,8 @@ struct ControlBar: View {
     }
 
     @ViewBuilder private func sep() -> some View { Divider().frame(height: 16).padding(.horizontal, 3) }
-    private var hasSel: Bool { !browser.selection.isEmpty }
-    private var oneSel: Bool { browser.selection.count == 1 }
+    private var hasSel: Bool { !selURLs.isEmpty }
+    private var oneSel: Bool { selURLs.count == 1 }
     private var selURLs: [URL] { browser.items.filter { browser.selection.contains($0.id) }.map(\.url) }
 
     private var sortFieldBinding: Binding<SortField> {
@@ -10954,9 +10979,13 @@ func sendToMenu(_ browser: Browser, ids: Set<FileItem.ID>) -> some View {
     Menu {
         let home = FileManager.default.homeDirectoryForCurrentUser
         Button("Desktop") { browser.sendTo(ids, folder: home.appendingPathComponent("Desktop")) }
+            .disabled(PathRules.transferSources(browser.urls(ids), into: home.appendingPathComponent("Desktop")).isEmpty)
         Button("Documents") { browser.sendTo(ids, folder: home.appendingPathComponent("Documents")) }
+            .disabled(PathRules.transferSources(browser.urls(ids), into: home.appendingPathComponent("Documents")).isEmpty)
         Button("Downloads") { browser.sendTo(ids, folder: home.appendingPathComponent("Downloads")) }
+            .disabled(PathRules.transferSources(browser.urls(ids), into: home.appendingPathComponent("Downloads")).isEmpty)
         Button("Home Folder") { browser.sendTo(ids, folder: home) }
+            .disabled(PathRules.transferSources(browser.urls(ids), into: home).isEmpty)
         Divider()
         Button("Compressed (zipped) Folder") { browser.compress(ids) }
         // Mail only if the system can actually do it. canPerform() is the whole point:
@@ -10975,6 +11004,7 @@ func sendToMenu(_ browser: Browser, ids: Set<FileItem.ID>) -> some View {
             Divider()
             ForEach(drives, id: \.url) { d in
                 Button { browser.sendTo(ids, folder: d.url) } label: { Label(d.name, systemImage: d.symbol) }
+                    .disabled(PathRules.transferSources(browser.urls(ids), into: d.url).isEmpty)
             }
         }
     } label: {
@@ -11175,7 +11205,7 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             }
             Button("Get Info") { showInfo(browser, ids) }
             Button("Compress") { browser.compress(ids) }
-            if browser.items.contains(where: { ids.contains($0.id) && isArchive($0.url) }) {
+            if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isArchive($0.url) }) {
                 Button("Extract") { browser.extract(ids) }
             }
             Divider()
@@ -11233,7 +11263,7 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             Menu { newItemsMenu(browser, ids: browser.selection) } label: { Label("New", systemImage: "plus") }
             Button("Calculate All Sizes") {
                 for it in browser.items where it.isDirectory { FolderSizeCache.shared.compute(it.url) }
-            }
+            }.disabled(!browser.items.contains { $0.isDirectory })
             Button("Reveal in Finder") { browser.revealInFinder([]) }
             Button("Open in Terminal") { openInTerminal(browser.currentURL) }
             Button("Copy Path") { browser.copyPath([]) }
@@ -14335,8 +14365,9 @@ struct ImageViewerView: View {
             p.arguments = ["-quiet", "-q", "90", "-alpha_q", "100", src.path, "-o", tmp.path]
             let err = Pipe(); p.standardError = err
             do { try p.run() } catch { return error.localizedDescription }
-            p.waitUntilExit()
+            // Drain while the encoder runs; a full stderr pipe otherwise blocks its exit.
             let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            p.waitUntilExit()
             guard p.terminationStatus == 0 else {
                 return msg.isEmpty ? "cwebp exited with status \(p.terminationStatus)." : msg
             }
@@ -14458,10 +14489,10 @@ struct ImageViewerView: View {
                     }
                     HStack {
                         Button { step(-1) } label: { Image(systemName: "chevron.left.circle.fill").font(.system(size: 36)) }
-                            .buttonStyle(.plain).keyboardShortcut(.leftArrow, modifiers: [])
+                            .buttonStyle(.plain).keyboardShortcut(.leftArrow, modifiers: []).disabled(urls.count < 2)
                         Spacer()
                         Button { step(1) } label: { Image(systemName: "chevron.right.circle.fill").font(.system(size: 36)) }
-                            .buttonStyle(.plain).keyboardShortcut(.rightArrow, modifiers: [])
+                            .buttonStyle(.plain).keyboardShortcut(.rightArrow, modifiers: []).disabled(urls.count < 2)
                     }.foregroundStyle(.white.opacity(0.8)).padding(.horizontal, 14)
                 }
                 bottomBar
@@ -18293,8 +18324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if item.action == #selector(goBackAction(_:)) { return appModel.active.canGoBack }
         if item.action == #selector(goForwardAction(_:)) { return appModel.active.canGoForward }
         if item.action == #selector(goUpAction(_:)) {
-            let u = appModel.active.currentURL
-            return u.deletingLastPathComponent().path != u.path
+            return PathRules.canGoUp(appModel.active.currentURL)
         }
         // The chord is a user pref and this item is built once at launch, so it re-reads
         // it as the menu opens — an item advertising a shortcut the user has since changed
@@ -18305,6 +18335,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             item.keyEquivalentModifierMask = PickerBridge.cocoaModifiers(c.carbonModifiers)
             return true
         }
+        if item.action == #selector(copy(_:)) || item.action == #selector(cut(_:)) {
+            return isEditingText(in: NSApp.keyWindow) || !appModel.active.urls(appModel.active.selection).isEmpty
+        }
+        // Re-trashing is refused by Browser; the menu must not advertise it as available.
+        if item.action == #selector(moveToTrashAction(_:)), appModel.active.isTrash { return false }
         // Everything here acts ON the selection, so with nothing selected there is nothing to
         // act on. Only Make Alias and New Folder with Selection used to say so; Duplicate,
         // Compress, Get Info, Rename, Quick Look and Move to Trash stayed enabled and then did
@@ -18316,9 +18351,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             #selector(renameAction(_:)),    #selector(quickLookAction(_:)),
             #selector(moveToTrashAction(_:)),
         ]
-        if let a = item.action, needsSelection.contains(a) { return !appModel.active.selection.isEmpty }
+        if let a = item.action, needsSelection.contains(a) { return !appModel.active.urls(appModel.active.selection).isEmpty }
         // Grey out rather than beep: with nothing selected there is nothing to wrap up.
-        if item.action == #selector(newFolderWithSelectionAction(_:)) { return !appModel.active.selection.isEmpty }
+        if item.action == #selector(newFolderWithSelectionAction(_:)) { return !appModel.active.urls(appModel.active.selection).isEmpty }
         if item.action == #selector(ejectAction(_:)) {
             guard let v = ejectableVolume() else { item.title = "Eject"; return false }
             item.title = v.isNetwork ? "Disconnect “\(v.name)”" : "Eject “\(v.name)”"
