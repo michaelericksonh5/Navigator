@@ -76,7 +76,6 @@ extension Notification.Name {
 }
 
 enum ViewMode: String { case list, icon, gallery }
-enum ConflictPolicy { case keepBoth, replace, skip }
 
 final class TransferProgress: ObservableObject {
     @Published var fraction: Double = 0
@@ -7887,12 +7886,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         PathRules.uniqueDest(dir, name) { FileManager.default.fileExists(atPath: $0) }
     }
 
-    // Name for pasting a file into its own folder: "photo.jpg" -> "photo (1).jpg",
-    // then "(2)", "(3)"… (Windows/Explorer-style in-place copy).
-    private func numberedCopyDest(_ dir: URL, _ name: String) -> URL {
-        PathRules.numberedCopyDest(dir, name) { FileManager.default.fileExists(atPath: $0) }
-    }
-
     // Explicit paste (⌘V / context menu). Pasting a copied item into its own
     // folder makes a numbered duplicate ("photo.jpg" -> "photo (1).jpg"); a cut
     // item pasted into its own folder is a no-op.
@@ -8122,13 +8115,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     return
                 }
             }
-            var moved: [(from: URL, to: URL)] = []
-            var copied: [URL] = []
-            var failures: [(name: String, reason: String)] = []
-            /// Counted rather than derived, so the summary line can tell "the user chose Skip
-            /// for all three" apart from "three transfers silently failed" — the alert cannot,
-            /// and those two look identical in the destination folder.
-            var skipped = 0
+            let plan = Transfer.plan(sources: sources, into: dir, move: move,
+                                     conflictNames: conflictNames, decide: { _ in policy })
             let total = sources.count
             DispatchQueue.main.async { progress.total = total }
             let step = max(1, total / 50)
@@ -8139,125 +8127,33 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             let anyDir = sources.contains { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
             let totalBytes = sizes.reduce(0, +)
             let useBytes = !move && !anyDir && totalBytes > 0
+            // Prefix sizes include skipped/failed files, exactly as the old loop's base did.
+            var bases: [Int64] = []
             var base: Int64 = 0
+            for size in sizes { bases.append(base); base += size }
             var lastFrac = -1.0
-            /// Replace is staged, not destructive: the existing destination is renamed aside and
-            /// only discarded once the incoming item has actually landed. Removing it up front
-            /// meant a disk-full, a source read error or a cancel part-way through left the user
-            /// with NEITHER the old file nor the new one, and nothing in Undo to get it back.
-            func restoreReplaced(_ b: (stash: URL, original: URL)?, _ name: String) {
-                guard let b else { return }
-                // An occupied path may belong to another process; leave it and report the stash.
-                do { try fm.moveItem(at: b.stash, to: b.original) }
-                catch {
-                    // The worst outcome this routine has: the incoming item failed AND the
-                    // original could not be put back. It still exists, under the stash name -
-                    // staying silent here would look exactly like the data loss this staging
-                    // was added to prevent.
-                    navLog("transfer ROLLBACK FAILED for “\(name)”: original is still at \(b.stash.path) — \(error.localizedDescription)")
-                    failures.append((name, "could not restore the original; it is in this folder as “\(b.stash.lastPathComponent)”"))
-                }
-            }
-            func discardReplaced(_ b: (stash: URL, original: URL)?, _ name: String) {
-                guard let b else { return }
-                do { try fm.removeItem(at: b.stash) }
-                catch { navLog("transfer: replaced copy of “\(name)” left behind at \(b.stash.path) — \(error.localizedDescription)") }
-            }
-            for (i, src) in sources.enumerated() {
-                if progress.cancelled { break }
-                if useBytes { let n = src.lastPathComponent; DispatchQueue.main.async { progress.current = n } }
-                let target = dir.appendingPathComponent(src.lastPathComponent)
-                var dest = target
-                var replacedBackup: (stash: URL, original: URL)? = nil
-                var iterationFailed = false
-                if isSelfDup(src) {
-                    dest = self.numberedCopyDest(dir, src.lastPathComponent)
-                } else if conflictNames.contains(src.lastPathComponent) || fm.fileExists(atPath: target.path) {
-                    guard conflictNames.contains(src.lastPathComponent) else {
-                        failures.append((src.lastPathComponent, "destination appeared after the conflict check; retry the transfer"))
-                        base += sizes[i]
-                        continue
-                    }
-                    switch policy {
-                    case .skip: base += sizes[i]; skipped += 1; continue
-                    case .replace:
-                        // Same volume, so this rename is atomic and instant. Leading dot keeps it
-                        // out of the listing for the moment it exists.
-                        // FIXED length (21 + 36 = 57 chars), deliberately NOT including the
-                        // original filename: a 204-character name - legal on APFS - plus the
-                        // marker and a UUID came to 262, over the 255-character limit, so
-                        // replacing a long-named file would have failed outright.
-                        let stash = dir.appendingPathComponent(".navigator-replacing-\(UUID().uuidString)")
-                        do {
-                            try fm.moveItem(at: target, to: stash)
-                            replacedBackup = (stash: stash, original: target)
-                        } catch {
-                            // Could not set the old file aside - refuse rather than destroy it.
-                            navLog("transfer SKIPPED “\(src.lastPathComponent)”: could not set the existing item aside — \(error.localizedDescription)")
-                            failures.append((src.lastPathComponent, "could not replace the existing item: \(error.localizedDescription)"))
-                            base += sizes[i]
-                            continue
-                        }
-                    case .keepBoth: dest = self.uniqueDest(dir, src.lastPathComponent)
-                    }
-                }
-                let fileBase = base
-                let onBytes: (Int64) -> Void = { copiedBytes in
-                    let frac = Double(fileBase + copiedBytes) / Double(totalBytes)
-                    if frac - lastFrac >= 0.004 {            // ~250 UI updates max, even for a 2 GB file
+            let result = Transfer.execute(plan, useBytes: useBytes,
+                isCancelled: { progress.cancelled },
+                onStart: { i in
+                    if useBytes { let n = sources[i].lastPathComponent; DispatchQueue.main.async { progress.current = n } }
+                }, onBytes: { i, copiedBytes in
+                    let frac = Double(bases[i] + copiedBytes) / Double(totalBytes)
+                    if frac - lastFrac >= 0.004 {
                         lastFrac = frac
                         DispatchQueue.main.async { progress.fraction = min(1, frac) }
                     }
-                }
-                do {
-                    if move { try fm.moveItem(at: src, to: dest); moved.append((src, dest)) }
-                    else if useBytes {
-                        try copyWithProgress(src, dest, isCancelled: { progress.cancelled }, onBytes: onBytes)
-                        copied.append(dest)
+                }, onFinish: { i in
+                    if !useBytes, i % step == 0 || i == total - 1 {
+                        let n = sources[i].lastPathComponent, frac = total > 0 ? Double(i + 1) / Double(total) : 0
+                        let d = i + 1
+                        DispatchQueue.main.async { progress.current = n; progress.fraction = frac; progress.done = d }
+                    } else if useBytes {
+                        let d = i + 1
+                        DispatchQueue.main.async { progress.done = d }
                     }
-                    else { try fm.copyItem(at: src, to: dest); copied.append(dest) }   // APFS clones this too
-                } catch {
-                    if progress.cancelled {
-                        failures.append((src.lastPathComponent, "cancelled; any incomplete destination was left at “\(dest.path)” to avoid deleting another process's file"))
-                        restoreReplaced(replacedBackup, src.lastPathComponent)
-                        break
-                    }
-                    // Cross-volume move (rename fails) or a copyfile hiccup → plain copy.
-                    do {
-                        try fm.copyItem(at: src, to: dest)
-                        if move {
-                            do { try fm.removeItem(at: src); moved.append((src, dest)) }
-                            catch {
-                                // The copy landed, but Undo must not restore over a surviving source.
-                                copied.append(dest)
-                                failures.append((src.lastPathComponent, "copied, but the source could not be removed: \(error.localizedDescription)"))
-                            }
-                        } else { copied.append(dest) }
-                    } catch let e {
-                        // Per-file and with the UNDERLYING error, because the alert shows at
-                        // most five failures and only when there are any — so a drop that moved
-                        // two of three files reported complete success. `error` here is the
-                        // second failure (the fallback copy); the first is named too, since a
-                        // cross-volume move failing and then the copy failing are different
-                        // stories with different fixes (permissions vs. disk full vs. SMB).
-                        navLog("transfer FAILED: “\(src.lastPathComponent)” → \(dest.path) — \(e.localizedDescription) (first attempt: \(error.localizedDescription))")
-                        failures.append((src.lastPathComponent, e.localizedDescription))
-                        iterationFailed = true
-                    }
-                }
-                // The incoming item either landed or it did not; only now is it safe to throw
-                // the old one away.
-                if iterationFailed { restoreReplaced(replacedBackup, src.lastPathComponent) } else { discardReplaced(replacedBackup, src.lastPathComponent) }
-                base += sizes[i]
-                if !useBytes, i % step == 0 || i == total - 1 {
-                    let n = src.lastPathComponent, frac = total > 0 ? Double(i + 1) / Double(total) : 0
-                    let d = i + 1
-                    DispatchQueue.main.async { progress.current = n; progress.fraction = frac; progress.done = d }
-                } else if useBytes {
-                    let d = i + 1
-                    DispatchQueue.main.async { progress.done = d }
-                }
-            }
+                }, log: { navLog($0) })
+            let moved = result.moved, copied = result.copied
+            let failures = result.failures, skipped = result.skipped
             navLog(TransferLogLine.summary(move: move, moved: moved.count, copied: copied.count,
                                           failed: failures.count, skipped: skipped, total: total,
                                           cancelled: progress.cancelled, target: dir.path))

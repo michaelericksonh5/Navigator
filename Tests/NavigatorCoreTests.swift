@@ -6827,3 +6827,315 @@ final class WalkStreamTests: XCTestCase {
         XCTAssertThrowsError(try reader.receive(row) { _ in XCTFail("Row after completion accepted") })
     }
 }
+
+final class TransferPlanTests: XCTestCase {
+    private func u(_ p: String) -> URL { URL(fileURLWithPath: p) }
+
+    func testPoliciesAreAppliedPerFileAndUndoIsExplicit() {
+        let sources = [u("/one/a"), u("/two/b"), u("/three/c"), u("/four/d")]
+        var asked: [URL] = []
+        let plan = Transfer.plan(sources: sources, into: u("/target"), move: false,
+                                 conflictNames: ["a", "b", "c"]) { conflict in
+            asked.append(conflict.source)
+            XCTAssertEqual(conflict.destination, self.u("/target/" + conflict.source.lastPathComponent))
+            return conflict.source.lastPathComponent == "a" ? .skip : conflict.source.lastPathComponent == "b" ? .keepBoth : .replace
+        }
+        XCTAssertEqual(asked, Array(sources.prefix(3)))
+        XCTAssertEqual(plan.map { $0.source }, sources)
+        XCTAssertEqual(plan.map { $0.intent }, [.skip, .renameToUnique(numbered: false), .replaceWithStaging, .copy])
+        XCTAssertNil(plan[0].undo)
+        XCTAssertEqual(plan[2].undo, .removeDestination)
+        let moves = Transfer.plan(sources: sources, into: u("/target"), move: true, conflictNames: []) { _ in XCTFail(); return nil }
+        XCTAssertEqual(moves.map { $0.intent }, Array(repeating: .move, count: 4))
+        XCTAssertEqual(moves[1].undo, .restoreSource(sources[1]))
+    }
+
+    func testSelfDuplicateBypassesDecisionAndUsesNumberedName() {
+        let plan = Transfer.plan(sources: [u("/target/a.txt")], into: u("/target"), move: false,
+                                 conflictNames: ["a.txt"]) { _ in XCTFail(); return nil }
+        XCTAssertEqual(plan[0].intent, .renameToUnique(numbered: true))
+        XCTAssertEqual(Transfer.previewDestination(plan[0], occupiedPaths: ["/target/a (1).txt", "/target/a (2).txt"]), u("/target/a (3).txt"))
+    }
+
+    func testUniqueNamesPreserveExtensionsAndExtensionlessNames() {
+        for name in ["a.txt", "folder"] {
+            let plan = Transfer.plan(sources: [u("/source/" + name)], into: u("/target"), move: false,
+                                     conflictNames: [name]) { _ in .keepBoth }
+            let second = name == "a.txt" ? "a 2.txt" : "folder 2"
+            let third = name == "a.txt" ? "a 3.txt" : "folder 3"
+            XCTAssertEqual(Transfer.previewDestination(plan[0], occupiedPaths: ["/target/" + name, "/target/" + second]), u("/target/" + third))
+            XCTAssertEqual(Transfer.previewDestination(plan[0], occupiedPaths: []), u("/target/" + name))
+        }
+    }
+
+    func testPromptCancellationDiscardsTheEntirePlan() {
+        let plan = Transfer.plan(sources: [u("/one/a"), u("/two/b")], into: u("/target"), move: true,
+                                 conflictNames: ["b"]) { _ in nil }
+        XCTAssertTrue(plan.isEmpty, "Even preceding nonconflicting files must not execute")
+    }
+
+    func testSameNamesFromSeveralParentsKeepOriginalConflictScanSemantics() {
+        let sources = [u("/one/a"), u("/two/a")]
+        let plan = Transfer.plan(sources: sources, into: u("/target"), move: false, conflictNames: []) { _ in XCTFail(); return nil }
+        XCTAssertEqual(plan.map { $0.intent }, [.copy, .copy])
+        XCTAssertEqual(plan.map { $0.source }, sources)
+        // The second is a late-arriving conflict during execution, not a new prompt.
+        XCTAssertEqual(plan[0].destination, plan[1].destination)
+    }
+}
+
+final class TransferExecutionTests: XCTestCase {
+    private let fm = FileManager.default
+    private var root: URL!
+    private var source: URL { root.appendingPathComponent("source") }
+    private var target: URL { root.appendingPathComponent("target") }
+    override func setUpWithError() throws {
+        root = fm.temporaryDirectory.appendingPathComponent("NavigatorTransfer-\(UUID().uuidString)")
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try fm.createDirectory(at: target, withIntermediateDirectories: false)
+    }
+    override func tearDownWithError() throws { try fm.removeItem(at: root) }
+    @discardableResult private func write(_ dir: URL, _ name: String, _ bytes: String) throws -> URL {
+        let url = dir.appendingPathComponent(name)
+        try Data(bytes.utf8).write(to: url)
+        return url
+    }
+    private func bytes(_ url: URL) throws -> String { try String(contentsOf: url, encoding: .utf8) }
+    private func plan(_ sources: [URL], move: Bool = false, conflicts: Set<String> = [], policy: ConflictPolicy = .keepBoth) -> [Transfer.Item] {
+        Transfer.plan(sources: sources, into: target, move: move, conflictNames: conflicts) { _ in policy }
+    }
+
+    func testCopyAndMoveRecordOnlyTheirActualUndo() throws {
+        let a = try write(source, "a", "copy bytes"), b = try write(source, "b", "move bytes")
+        let result = Transfer.execute(plan([a]) + plan([b], move: true))
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.copied, .moved])
+        XCTAssertEqual(try bytes(target.appendingPathComponent("a")), "copy bytes")
+        XCTAssertEqual(try bytes(a), "copy bytes")
+        XCTAssertFalse(fm.fileExists(atPath: b.path))
+        XCTAssertEqual(result.copied, [target.appendingPathComponent("a")])
+        XCTAssertEqual(result.moved.map { $0.from }, [b])
+        XCTAssertEqual(result.outcomes[1].undo, .moveBack(from: target.appendingPathComponent("b"), to: b))
+    }
+
+    func testSkipDoesNotTouchEitherFile() throws {
+        let a = try write(source, "a", "incoming"), old = try write(target, "a", "original")
+        let result = Transfer.execute(plan([a], conflicts: ["a"], policy: .skip))
+        XCTAssertEqual(result.outcomes[0].status, .skipped)
+        XCTAssertEqual(result.skipped, 1)
+        XCTAssertNil(result.outcomes[0].undo)
+        XCTAssertEqual(try bytes(a), "incoming")
+        XCTAssertEqual(try bytes(old), "original")
+    }
+
+    func testKeepBothAndSelfDuplicateResolveNamesAgainstRealDisk() throws {
+        let a = try write(source, "a.txt", "incoming")
+        let old = try write(target, "a.txt", "original")
+        try write(target, "a 2.txt", "occupied")
+        let kept = Transfer.execute(plan([a], move: true, conflicts: ["a.txt"]))
+        XCTAssertEqual(kept.outcomes[0].destination.lastPathComponent, "a 3.txt")
+        XCTAssertEqual(kept.outcomes[0].status, .moved)
+        XCTAssertEqual(try bytes(kept.outcomes[0].destination), "incoming")
+        let dupPlan = Transfer.plan(sources: [old, old], into: target, move: false, conflictNames: []) { _ in XCTFail(); return nil }
+        let duplicates = Transfer.execute(dupPlan)
+        XCTAssertEqual(duplicates.copied.map { $0.lastPathComponent }, ["a (1).txt", "a (2).txt"])
+        for url in duplicates.copied { XCTAssertEqual(try bytes(url), "original") }
+    }
+
+    func testSuccessfulReplaceDiscardsStashAfterIncomingLands() throws {
+        for move in [false, true] {
+            let name = move ? "move" : "copy"
+            let a = try write(source, name, "incoming")
+            let old = try write(target, name, "original")
+            let result = Transfer.execute(plan([a], move: move, conflicts: [name], policy: .replace))
+            XCTAssertEqual(result.outcomes[0].status, move ? .moved : .copied)
+            XCTAssertEqual(try bytes(old), "incoming")
+            XCTAssertTrue(result.failures.isEmpty)
+        }
+        XCTAssertFalse(try fm.contentsOfDirectory(atPath: target.path).contains { $0.hasPrefix(".navigator-replacing-") })
+    }
+
+    func testFailureAtNContinuesProcessingFollowingFiles() throws {
+        let a = try write(source, "a", "first"), missing = source.appendingPathComponent("missing"), c = try write(source, "c", "third")
+        for move in [false, true] {
+            if move { try fm.removeItem(at: target.appendingPathComponent("a")); try fm.removeItem(at: target.appendingPathComponent("c")) }
+            let result = Transfer.execute(plan([a, missing, c], move: move))
+            XCTAssertEqual(result.outcomes.map { $0.status }, [move ? .moved : .copied, .failed, move ? .moved : .copied])
+            XCTAssertEqual(result.failures.map { $0.name }, ["missing"])
+            XCTAssertNil(result.outcomes[1].undo)
+            XCTAssertEqual(try bytes(target.appendingPathComponent("a")), "first")
+            XCTAssertEqual(try bytes(target.appendingPathComponent("c")), "third")
+        }
+    }
+
+    func testFailedReplacementRestoresOriginalBytesWithoutAHole() throws {
+        for useBytes in [false, true] {
+            let old = try write(target, "missing", "irreplaceable original")
+            let result = Transfer.execute(plan([source.appendingPathComponent("missing")], conflicts: ["missing"], policy: .replace), useBytes: useBytes)
+            XCTAssertEqual(result.outcomes[0].status, .failed)
+            XCTAssertEqual(result.failures.count, 1)
+            XCTAssertEqual(try bytes(old), "irreplaceable original")
+            XCTAssertNil(result.outcomes[0].undo)
+            XCTAssertEqual(try fm.contentsOfDirectory(atPath: target.path), ["missing"])
+        }
+    }
+
+    func testOccupiedRollbackKeepsOriginalBytesInReportedStash() throws {
+        let old = try write(target, "missing", "irreplaceable original")
+        var checks = 0
+        let result = Transfer.execute(plan([source.appendingPathComponent("missing")], conflicts: ["missing"], policy: .replace), isCancelled: {
+            checks += 1
+            // A real competing destination appears after the first incoming copy fails.
+            if checks == 2 {
+                do { try self.write(self.target, "missing", "other process") } catch { XCTFail("\(error)") }
+            }
+            return false
+        })
+        XCTAssertEqual(result.outcomes[0].status, .failed)
+        XCTAssertEqual(try bytes(old), "other process")
+        let stash = try XCTUnwrap(try fm.contentsOfDirectory(at: target, includingPropertiesForKeys: nil).first { $0.lastPathComponent.hasPrefix(".navigator-replacing-") })
+        XCTAssertEqual(try bytes(stash), "irreplaceable original")
+        XCTAssertEqual(result.failures.count, 2)
+        XCTAssertTrue(result.failures[1].reason.contains(stash.lastPathComponent))
+        XCTAssertNil(result.outcomes[0].undo)
+    }
+
+    func testCancelBetweenFilesStopsSubsequentFiles() throws {
+        let a = try write(source, "a", "first"), b = try write(source, "b", "second")
+        var cancelled = false
+        let result = Transfer.execute(plan([a, b], move: true), isCancelled: { cancelled }, onFinish: { _ in cancelled = true })
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.moved, .notProcessed])
+        XCTAssertEqual(result.moved.count, 1)
+        XCTAssertEqual(try bytes(b), "second")
+        XCTAssertFalse(fm.fileExists(atPath: target.appendingPathComponent("b").path))
+        XCTAssertNil(restoreItems(result.moved.map { (from: $0.to, to: $0.from) }))
+        XCTAssertEqual(try bytes(a), "first")
+    }
+
+    func testCancellationFailureLeavesDestinationAsMessageClaims() throws {
+        let a = try write(source, "a", "incoming"), b = try write(source, "b", "next")
+        try fm.removeItem(at: a)
+        var checks = 0
+        let result = Transfer.execute(plan([a, b]), useBytes: true, isCancelled: {
+            checks += 1
+            if checks == 1 { return false }
+            // Cancellation races with another writer after the incoming copy fails.
+            do { try self.write(self.target, "a", "incomplete or competing bytes") }
+            catch { XCTFail("\(error)") }
+            return true
+        })
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.cancelled, .notProcessed])
+        let dest = target.appendingPathComponent("a")
+        XCTAssertEqual(try bytes(dest), "incomplete or competing bytes")
+        XCTAssertTrue(result.failures[0].reason.contains(dest.path))
+        XCTAssertTrue(result.failures[0].reason.contains("any incomplete destination was left"))
+        XCTAssertTrue(result.copied.isEmpty)
+        XCTAssertEqual(try bytes(b), "next")
+        XCTAssertFalse(fm.fileExists(atPath: target.appendingPathComponent("b").path))
+    }
+
+    func testLateDestinationIsRefusedAndFollowingFileStillRuns() throws {
+        let a = try write(source, "a", "incoming"), b = try write(source, "b", "next")
+        let items = plan([a, b])
+        let old = try write(target, "a", "arrived after scan")
+        let result = Transfer.execute(items)
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.failed, .copied])
+        XCTAssertEqual(result.failures[0].reason, "destination appeared after the conflict check; retry the transfer")
+        XCTAssertEqual(try bytes(old), "arrived after scan")
+    }
+
+    func testSameNameSourcesWithoutInitialConflictStillFailSecond() throws {
+        let a = try write(source, "a", "first")
+        let other = root.appendingPathComponent("other")
+        try fm.createDirectory(at: other, withIntermediateDirectories: false)
+        let b = try write(other, "a", "second")
+        let result = Transfer.execute(plan([a, b]))
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.copied, .failed])
+        XCTAssertEqual(try bytes(target.appendingPathComponent("a")), "first")
+        XCTAssertEqual(result.copied.count, 1)
+    }
+
+    func testUndoPartialTransferUsesOnlySuccessfulOutcomes() throws {
+        let oldDefaults = TrashOrigins.defaults
+        let suite = "NavigatorTransferUndo-\(UUID().uuidString)"
+        TrashOrigins.defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { TrashOrigins.defaults.removePersistentDomain(forName: suite); TrashOrigins.defaults = oldDefaults }
+
+        let a = try write(source, "a", "move me"), b = try write(source, "b", "copy me")
+        let untouched = try write(target, "untouched", "leave me")
+        let result = Transfer.execute(plan([a], move: true) + plan([source.appendingPathComponent("missing"), b]))
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.moved, .failed, .copied])
+        let stack = UndoStack()
+        stack.push("Move", undo: { restoreItems(result.moved.map { (from: $0.to, to: $0.from) }) }, redo: { restoreItems(result.moved) })
+        var trashed: [(from: URL, to: URL)] = []
+        defer { for pair in trashed { try? fm.removeItem(at: pair.from) } }
+        stack.push("Copy", undo: {
+            let r = trashItems(result.copied); trashed = r.restores; return r.problem
+        }, redo: { restoreItems(trashed) })
+        stack.undo()
+        XCTAssertFalse(fm.fileExists(atPath: target.appendingPathComponent("b").path))
+        XCTAssertEqual(trashed.count, 1)
+        stack.undo()
+        XCTAssertEqual(try bytes(a), "move me")
+        XCTAssertEqual(try bytes(b), "copy me")
+        XCTAssertEqual(try bytes(untouched), "leave me")
+        XCTAssertFalse(fm.fileExists(atPath: source.appendingPathComponent("missing").path))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: target.path), ["untouched"])
+    }
+
+    func testPermissionFailureAtNStillCopiesNineOfTenFiles() throws {
+        let sources = try (0..<10).map { try write(source, "file\($0)", "bytes \($0)") }
+        try fm.setAttributes([.posixPermissions: 0], ofItemAtPath: sources[4].path)
+        defer { try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sources[4].path) }
+        XCTAssertThrowsError(try Data(contentsOf: sources[4]), "The fixture must actually deny reads")
+        let result = Transfer.execute(plan(sources), useBytes: true)
+        XCTAssertEqual(result.outcomes.map { $0.status }, (0..<10).map { $0 == 4 ? .failed : .copied })
+        XCTAssertEqual(result.copied.count, 9)
+        XCTAssertEqual(result.failures.map { $0.name }, ["file4"])
+        for i in 0..<10 where i != 4 {
+            XCTAssertEqual(try bytes(target.appendingPathComponent("file\(i)")), "bytes \(i)")
+        }
+    }
+
+    func testCancelledReplacementRestoresOriginalAndStopsNextFile() throws {
+        let old = try write(target, "missing", "original")
+        let next = try write(source, "next", "next bytes")
+        var checks = 0
+        let result = Transfer.execute(plan([source.appendingPathComponent("missing"), next], conflicts: ["missing"], policy: .replace), isCancelled: {
+            checks += 1
+            return checks > 1
+        })
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.cancelled, .notProcessed])
+        XCTAssertEqual(try bytes(old), "original")
+        XCTAssertEqual(try bytes(next), "next bytes")
+        XCTAssertTrue(result.copied.isEmpty)
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: target.path), ["missing"])
+    }
+
+    func testFailedStagingLeavesSourceAndProcessesNextFile() throws {
+        let a = try write(source, "a", "incoming"), b = try write(source, "b", "next")
+        // The scanned conflict disappeared before execution: staging must fail, not copy.
+        let result = Transfer.execute(plan([a, b], conflicts: ["a"], policy: .replace))
+        XCTAssertEqual(result.outcomes.map { $0.status }, [.failed, .copied])
+        XCTAssertTrue(result.failures[0].reason.hasPrefix("could not replace the existing item:"))
+        XCTAssertEqual(try bytes(a), "incoming")
+        XCTAssertFalse(fm.fileExists(atPath: target.appendingPathComponent("a").path))
+    }
+
+    func testDirectoryCopyAndByteCopyPreserveContents() throws {
+        let folder = source.appendingPathComponent("folder")
+        try fm.createDirectory(at: folder, withIntermediateDirectories: false)
+        try write(folder, "nested", "nested bytes")
+        let file = try write(source, "file", String(repeating: "payload", count: 10000))
+        let folders = Transfer.execute(plan([folder]))
+        let files = Transfer.execute(plan([file]), useBytes: true)
+        XCTAssertEqual(folders.outcomes[0].status, .copied)
+        XCTAssertEqual(files.outcomes[0].status, .copied)
+        XCTAssertEqual(try bytes(target.appendingPathComponent("folder/nested")), "nested bytes")
+        XCTAssertEqual(try Data(contentsOf: file), try Data(contentsOf: files.copied[0]))
+    }
+
+    func testEmptyPlanDoesNoWork() {
+        let result = Transfer.execute([], onStart: { _ in XCTFail() })
+        XCTAssertTrue(result.outcomes.isEmpty)
+    }
+}

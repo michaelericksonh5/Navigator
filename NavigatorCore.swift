@@ -5405,3 +5405,171 @@ func copyWithProgress(_ src: URL, _ dst: URL,
     }
 }
 
+
+// MARK: - Transfer planning and execution
+
+enum ConflictPolicy { case keepBoth, replace, skip }
+
+enum Transfer {
+    struct Conflict { let source: URL; let destination: URL }
+    enum Intent: Equatable {
+        case skip, copy, move, renameToUnique(numbered: Bool), replaceWithStaging
+    }
+    enum UndoRecord: Equatable {
+        case removeCreated(URL), moveBack(from: URL, to: URL)
+    }
+    enum UndoIntent: Equatable { case removeDestination, restoreSource(URL) }
+    struct Item {
+        let source: URL
+        let destination: URL
+        let move: Bool
+        let intent: Intent
+        // A template: execution records the actual destination and handles move's
+        // copy-only fallback. Replacement deliberately does not retain the old file for Undo.
+        var undo: UndoIntent? {
+            intent == .skip ? nil : (move ? .restoreSource(source) : .removeDestination)
+        }
+    }
+
+    // conflictNames is the worker's original scan, not a filesystem query here.
+    // Unique names remain an intent: resolving them on disk at execution time preserves
+    // races and name reuse after a previous failure. previewDestination is pure too.
+    static func plan(sources: [URL], into directory: URL, move: Bool,
+                     conflictNames: Set<String>, decide: (Conflict) -> ConflictPolicy?) -> [Item] {
+        var items: [Item] = []
+        for source in sources {
+            let destination = directory.appendingPathComponent(source.lastPathComponent)
+            let intent: Intent
+            if !move && source.deletingLastPathComponent().path == directory.path {
+                intent = .renameToUnique(numbered: true)
+            } else if conflictNames.contains(source.lastPathComponent) {
+                guard let policy = decide(Conflict(source: source, destination: destination)) else { return [] }
+                switch policy {
+                case .skip: intent = .skip
+                case .keepBoth: intent = .renameToUnique(numbered: false)
+                case .replace: intent = .replaceWithStaging
+                }
+            } else { intent = move ? .move : .copy }
+            items.append(Item(source: source, destination: destination, move: move, intent: intent))
+        }
+        return items
+    }
+
+    static func previewDestination(_ item: Item, occupiedPaths: Set<String>) -> URL {
+        destination(item, exists: { occupiedPaths.contains($0) })
+    }
+
+    private static func destination(_ item: Item, exists: (String) -> Bool) -> URL {
+        guard case .renameToUnique(let numbered) = item.intent else { return item.destination }
+        let dir = item.destination.deletingLastPathComponent(), name = item.source.lastPathComponent
+        return numbered ? PathRules.numberedCopyDest(dir, name, exists: exists)
+                        : PathRules.uniqueDest(dir, name, exists: exists)
+    }
+
+    enum Status: Equatable { case notProcessed, skipped, copied, moved, failed, cancelled }
+    struct Outcome {
+        let item: Item
+        var destination: URL
+        var status: Status = .notProcessed
+        var failures: [String] = []
+        var undo: UndoRecord? {
+            switch status {
+            case .copied: return .removeCreated(destination)
+            case .moved: return .moveBack(from: destination, to: item.source)
+            default: return nil
+            }
+        }
+    }
+    struct Result {
+        var outcomes: [Outcome]
+        var moved: [(from: URL, to: URL)] {
+            outcomes.compactMap { if case .moveBack(let from, let to) = $0.undo { return (to, from) }; return nil }
+        }
+        var copied: [URL] {
+            outcomes.compactMap { if case .removeCreated(let url) = $0.undo { return url }; return nil }
+        }
+        var failures: [(name: String, reason: String)] {
+            outcomes.flatMap { o in o.failures.map { (o.item.source.lastPathComponent, $0) } }
+        }
+        var skipped: Int { outcomes.filter { $0.status == .skipped }.count }
+    }
+
+    static func execute(_ plan: [Item], useBytes: Bool = false,
+                        isCancelled: @escaping () -> Bool = { false },
+                        onStart: (Int) -> Void = { _ in },
+                        onBytes: @escaping (Int, Int64) -> Void = { _, _ in },
+                        onFinish: (Int) -> Void = { _ in },
+                        log: (String) -> Void = { _ in }) -> Result {
+        let fm = FileManager.default
+        var result = Result(outcomes: plan.map { Outcome(item: $0, destination: $0.destination) })
+        for (i, item) in plan.enumerated() {
+            if isCancelled() { break }
+            onStart(i)
+            let src = item.source, target = item.destination, name = src.lastPathComponent
+            let dest = destination(item, exists: { fm.fileExists(atPath: $0) })
+            result.outcomes[i].destination = dest
+            var backup: URL?
+            func restoreReplaced() {
+                guard let stash = backup else { return }
+                do { try fm.moveItem(at: stash, to: target) }
+                catch {
+                    log("transfer ROLLBACK FAILED for “\(name)”: original is still at \(stash.path) — \(error.localizedDescription)")
+                    result.outcomes[i].failures.append("could not restore the original; it is in this folder as “\(stash.lastPathComponent)”")
+                }
+            }
+            switch item.intent {
+            case .skip:
+                result.outcomes[i].status = .skipped
+                continue
+            case .copy, .move:
+                if fm.fileExists(atPath: target.path) {
+                    result.outcomes[i].status = .failed
+                    result.outcomes[i].failures.append("destination appeared after the conflict check; retry the transfer")
+                    continue
+                }
+            case .replaceWithStaging:
+                let stash = target.deletingLastPathComponent().appendingPathComponent(".navigator-replacing-\(UUID().uuidString)")
+                do { try fm.moveItem(at: target, to: stash); backup = stash }
+                catch {
+                    log("transfer SKIPPED “\(name)”: could not set the existing item aside — \(error.localizedDescription)")
+                    result.outcomes[i].status = .failed
+                    result.outcomes[i].failures.append("could not replace the existing item: \(error.localizedDescription)")
+                    continue
+                }
+            case .renameToUnique: break
+            }
+            do {
+                if item.move { try fm.moveItem(at: src, to: dest) }
+                else if useBytes { try copyWithProgress(src, dest, isCancelled: isCancelled, onBytes: { onBytes(i, $0) }) }
+                else { try fm.copyItem(at: src, to: dest) }
+                result.outcomes[i].status = item.move ? .moved : .copied
+            } catch {
+                if isCancelled() {
+                    result.outcomes[i].status = .cancelled
+                    result.outcomes[i].failures.append("cancelled; any incomplete destination was left at “\(dest.path)” to avoid deleting another process's file")
+                    restoreReplaced()
+                    break
+                }
+                do {
+                    try fm.copyItem(at: src, to: dest)
+                    result.outcomes[i].status = .copied
+                    if item.move {
+                        do { try fm.removeItem(at: src); result.outcomes[i].status = .moved }
+                        catch { result.outcomes[i].failures.append("copied, but the source could not be removed: \(error.localizedDescription)") }
+                    }
+                } catch let second {
+                    log("transfer FAILED: “\(name)” → \(dest.path) — \(second.localizedDescription) (first attempt: \(error.localizedDescription))")
+                    result.outcomes[i].status = .failed
+                    result.outcomes[i].failures.append(second.localizedDescription)
+                }
+            }
+            if result.outcomes[i].status == .failed { restoreReplaced() }
+            else if let stash = backup {
+                do { try fm.removeItem(at: stash) }
+                catch { log("transfer: replaced copy of “\(name)” left behind at \(stash.path) — \(error.localizedDescription)") }
+            }
+            onFinish(i)
+        }
+        return result
+    }
+}
