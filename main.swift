@@ -14,6 +14,53 @@ import Network   // loopback listener for the Vertex sign-in callback
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
 import os
 
+// Dispatch before any app globals: a worker must never initialise the GUI or
+// mistake an ordinary file-open argument for an internal command.
+if CommandLine.arguments.dropFirst().first == WalkStream.subcommand {
+    let args = CommandLine.arguments
+    guard args.count == 4,
+          let token = ProcessInfo.processInfo.environment[WalkStream.tokenKey],
+          UUID(uuidString: token) != nil, args[2] == token,
+          let data = Data(base64Encoded: args[3]),
+          let request = try? JSONDecoder().decode(WalkStream.Request.self, from: data),
+          request.root.isFileURL, request.cap > 0, request.cap <= Browser.searchResultCap else { exit(64) }
+    do { try runWalkChild(request); exit(0) } catch { exit(74) }
+}
+
+private func runWalkChild(_ request: WalkStream.Request) throws {
+    let keys = Browser.itemKeys
+    let wantedKeys = Set(keys)
+    // Packages remain single results, just as in Finder and the previous walk.
+    var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
+    if !request.showHidden { options.insert(.skipsHiddenFiles) }
+    var readFailed = false
+    let enumerator = FileManager.default.enumerator(at: request.root,
+        includingPropertiesForKeys: keys, options: options,
+        errorHandler: { _, _ in readFailed = true; return true })
+    if enumerator == nil { readFailed = true }
+    var writer = WalkStream.Writer<FileItem>(cap: request.cap) {
+        try FileHandle.standardOutput.write(contentsOf: $0)
+    }
+    var hitCap = false
+    while let url = enumerator?.nextObject() as? URL {
+        let ext = url.pathExtension
+        guard SearchQueryRules.matchesFile(name: url.lastPathComponent, ext: ext,
+                                           tokens: request.tokens) else { continue }
+        let values: URLResourceValues
+        do { values = try url.resourceValues(forKeys: wantedKeys) }
+        catch { readFailed = true; continue }
+        let item = Browser.item(from: url, values)
+        guard SearchBackendRules.matchesKind(tree: request.kindTree, isDirectory: item.isDirectory, fileTypeMatches: { tree in
+            guard let wanted = UTType(tree), let actual = UTType(filenameExtension: ext.lowercased()) else { return false }
+            return actual.conforms(to: wanted)
+        }) else { continue }
+        guard request.filters.matches(modified: item.modified, size: item.size,
+                                      isDirectory: item.isDirectory, now: request.now) else { continue }
+        if try !writer.append(item) { hitCap = true; break }
+    }
+    try writer.finish(hitCap: hitCap, readFailed: readFailed)
+}
+
 // Perf logging — view in Console.app (or `log stream`) filtered by
 // subsystem "com.merickson.navigator". Records how long SMB enumeration and
 // metadata enrichment actually take, so slow folders are diagnosable.
@@ -5121,10 +5168,13 @@ final class Browser: ObservableObject, Identifiable {
     private var searchQuery: NSMetadataQuery?
     /// One fallback per search, so an unindexed folder can't ping-pong.
     private var spotlightFellBack = false
-    @Synchronized private var searchGen = 0   // cancels an in-flight recursive walk when a new search / clear starts
+    @Synchronized private var searchGen = 0   // rejects late batches after a new search / clear starts
 
-    /// Process-wide: a walk parked in a blocking nextObject() is a leaked THREAD, and threads
-    /// are not per-Browser. See WalkAdmission for why cancellation cannot reach them.
+    private var walkCancellation: ExternalProcess.Cancellation?
+
+    deinit { walkCancellation?.cancel() }
+
+    /// Process-wide backstop until cancelled children have actually been reaped.
     static let walkAdmission = WalkAdmission()
     private var typeBuffer = ""
     private var lastTypeAt = Date.distantPast
@@ -5999,6 +6049,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         searchTruncation = nil
         searchDebounce?.cancel(); searchDebounce = nil
         searchGen += 1
+        walkCancellation?.cancel(); walkCancellation = nil
         loadGeneration += 1; cancelPendingDetails()
         stopMetadataQuery(&searchQuery)
         stopMetadataQuery(&recentsQuery)
@@ -6142,19 +6193,21 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // Recursive filesystem search for SMB and unindexed local folders.
     // Matches a name substring OR a file extension
     // (so "png", ".png", or "logo" all work). Streams matches in as they're found,
-    // on a background thread, cancellable via searchGen.
+    // from a child process so cancellation can terminate blocked enumeration.
     private func walkSearch(_ raw: String, root: URL, gen: Int) {
-        // Same rules the Spotlight path uses, so the two backends can't disagree about what
-        // matches. They used to: this walk did a single `lowercased()` substring test while
-        // Spotlight folded diacritics too, and neither handled multiple words.
-        let tokens = SearchQueryRules.tokens(raw)
-        let kindTree = searchKind.typeTree   // optional kind constraint (Images, etc.)
-        let showHidden = self.showHidden
-        // Snapshot the filters (and "now") once, off the main thread's back: a walk of a
-        // big tree can straddle midnight, and re-deriving "Today" per file would then
-        // change the answer halfway through the results.
-        let filters = self.searchFilters
-        let now = Date()
+        walkCancellation?.cancel()
+        let cancellation = ExternalProcess.Cancellation()
+        walkCancellation = cancellation
+        let request = WalkStream.Request(root: root, tokens: SearchQueryRules.tokens(raw),
+            kindTree: searchKind.typeTree, showHidden: showHidden, filters: searchFilters,
+            now: Date(), cap: Browser.searchResultCap)
+        // Keep admission until reaping; a delayed kernel exit still consumes a slot.
+        guard Browser.walkAdmission.begin() else {
+            isSearching = false
+            status = "This volume is not responding — \(Browser.walkAdmission.limit) earlier searches here have not finished. Reconnect it, or search somewhere else."
+            navLog("walkSearch REFUSED: \(Browser.walkAdmission.current) walks still outstanding on \(root.path)")
+            return
+        }
         let buffer = SearchResultBuffer<FileItem>()
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 0.1, repeating: 0.1)
@@ -6166,58 +6219,27 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 self.status = "Searching… \(self.items.count) found"
             }
         }
-        // Refuse rather than park another thread behind walks that are never coming back.
-        guard Browser.walkAdmission.begin() else {
-            timer.cancel()
-            isSearching = false
-            status = "This volume is not responding — \(Browser.walkAdmission.limit) earlier searches here have not finished. Reconnect it, or search somewhere else."
-            navLog("walkSearch REFUSED: \(Browser.walkAdmission.current) walks still outstanding on \(root.path)")
-            return
-        }
         timer.resume()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            // end() on EVERY exit, including the cancellation return in the loop below - a
-            // path that forgets it silently burns a slot for the life of the process.
             defer { Browser.walkAdmission.end() }
             defer { DispatchQueue.main.async { timer.cancel() } }
-            let keys = Browser.itemKeys
-            let wantedKeys = Set(keys)   // hoisted out of the per-file loop below
-            // skipsPackageDescendants: without it the walk climbs inside every .app and
-            // .bundle it meets and reports their internals as results — searching anywhere near
-            // /Applications buried the real hits under thousands of framework files. Finder
-            // treats a package as one item; so does this now.
-            var opts: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
-            if !showHidden { opts.insert(.skipsHiddenFiles) }
-            var readFailed = false
-            let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: opts,
-                errorHandler: { _, _ in readFailed = true; return true })
-            if en == nil { readFailed = true }
-            var total = 0
-            var hitCap = false
-            while let u = en?.nextObject() as? URL {
-                guard let self, gen == self.searchGen else { return }   // cancelled
-                let name = u.lastPathComponent
-                let ext = u.pathExtension
-                // Empty token list = filter-only search, so every name qualifies.
-                guard SearchQueryRules.matchesFile(name: name, ext: ext, tokens: tokens) else { continue }
-                let values: URLResourceValues
-                do { values = try u.resourceValues(forKeys: wantedKeys) }
-                catch { readFailed = true; continue }
-                let item = Browser.item(from: u, values)
-                let matchesKind = SearchBackendRules.matchesKind(tree: kindTree, isDirectory: item.isDirectory) { tree in
-                    guard let wanted = UTType(tree), let actual = UTType(filenameExtension: ext.lowercased()) else { return false }
-                    return actual.conforms(to: wanted)
-                }
-                guard matchesKind else { continue }
-                guard filters.matches(modified: item.modified, size: item.size,
-                                      isDirectory: item.isDirectory, now: now) else { continue }
-                // Only an extra matching item proves there are more than the cap.
-                if total == Browser.searchResultCap { hitCap = true; break }
-                buffer.append(item)
-                total += 1
-            }
-            let capped = hitCap
-            let incomplete = readFailed
+            var reader = WalkStream.Reader<FileItem>(cap: Browser.searchResultCap)
+            var failed = false
+            if let executable = Bundle.main.executableURL,
+               let data = try? JSONEncoder().encode(request) {
+                let token = UUID().uuidString
+                var environment = ProcessInfo.processInfo.environment
+                environment[WalkStream.tokenKey] = token
+                let result = ExternalProcess.run(executable.path,
+                    arguments: [WalkStream.subcommand, token, data.base64EncodedString()],
+                    environment: environment, timeout: nil, cancellation: cancellation, receiveStdout: { data in
+                        do { try reader.receive(data) { buffer.append($0) } }
+                        catch { failed = true; cancellation.cancel() }
+                    })
+                if case .success = result {} else { failed = true }
+            } else { failed = true }
+            let capped = reader.hitCap
+            let incomplete = failed || !reader.complete || reader.readFailed
             DispatchQueue.main.async { [weak self] in
                 timer.cancel()
                 guard let self, gen == self.searchGen, self.isSearching else { return }

@@ -6644,3 +6644,186 @@ extension ExternalProcessTests {
             onLaunch: { _ in XCTFail("failed launch called onLaunch") })
     }
 }
+
+final class WalkStreamTests: XCTestCase {
+    private func fixture(_ data: Data) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try data.write(to: url)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    private func stream(_ rows: [String], cap: Int) throws -> Data {
+        var data = Data()
+        var writer = WalkStream.Writer<String>(cap: cap) { data.append($0) }
+        var hitCap = false
+        for row in rows {
+            if try !writer.append(row) { hitCap = true; break }
+        }
+        try writer.finish(hitCap: hitCap, readFailed: false)
+        return data
+    }
+
+    func testManyRowsStreamWithoutCapturingStdout() throws {
+        let rows = (0..<5000).map { "/folder/\($0)-" + String(repeating: "x", count: 80) }
+        let url = try fixture(stream(rows, cap: 5000))
+        var reader = WalkStream.Reader<String>(cap: 5000)
+        var received = [String]()
+        var chunks = 0
+        let result = ExternalProcess.run("/bin/cat", arguments: [url.path], timeout: 5,
+            receiveStdout: { data in
+                chunks += 1
+                do { try reader.receive(data) { received.append($0) } }
+                catch { XCTFail("Invalid stream: \(error)") }
+            })
+        guard case .success(let output) = result else { return XCTFail("Child failed") }
+        XCTAssertTrue(output.stdout.isEmpty)
+        XCTAssertGreaterThan(chunks, 1)
+        XCTAssertEqual(received, rows)
+        XCTAssertTrue(reader.complete)
+        XCTAssertFalse(reader.hitCap, "Exactly the cap is not truncation")
+    }
+
+    func testEscapedPathsAndEverySplitBoundary() throws {
+        let rows = ["/folder/new\nline", "/folder/\"quote\"'", "/Café/猫😀", "/back\\slash"]
+        let data = try stream(rows, cap: 10)
+        for split in 0...data.count {
+            var reader = WalkStream.Reader<String>(cap: 10)
+            var received = [String]()
+            try reader.receive(Data(data.prefix(split))) { received.append($0) }
+            try reader.receive(Data(data.dropFirst(split))) { received.append($0) }
+            XCTAssertEqual(received, rows)
+            XCTAssertTrue(reader.complete)
+        }
+        let url = try fixture(data)
+        var reader = WalkStream.Reader<String>(cap: 10)
+        var received = [String]()
+        let result = ExternalProcess.run("/bin/cat", arguments: [url.path], timeout: 5,
+            receiveStdout: { chunk in
+                // Split even the multi-byte UTF-8 characters, independently of pipe buffering.
+                for byte in chunk {
+                    do { try reader.receive(Data([byte])) { received.append($0) } }
+                    catch { XCTFail("Invalid stream: \(error)") }
+                }
+            })
+        guard case .success = result else { return XCTFail("Child failed") }
+        XCTAssertEqual(received, rows)
+        XCTAssertTrue(reader.complete)
+    }
+
+    func testEmptyChildCannotClaimCompletedSearch() {
+        var reader = WalkStream.Reader<String>(cap: 10)
+        let result = ExternalProcess.run("/usr/bin/true", timeout: 5, receiveStdout: { data in
+            do { try reader.receive(data) { _ in XCTFail("Unexpected row") } }
+            catch { XCTFail("Unexpected bytes") }
+        })
+        guard case .success = result else { return XCTFail("Child failed") }
+        XCTAssertEqual(reader.count, 0)
+        XCTAssertFalse(reader.complete, "EOF alone cannot mean the traversal succeeded")
+    }
+
+    func testEmptyCompletedSearchAndExceededCap() throws {
+        for rows in [[], ["one", "two", "three", "four"]] {
+            let url = try fixture(stream(rows, cap: 3))
+            var reader = WalkStream.Reader<String>(cap: 3)
+            var received = [String]()
+            let result = ExternalProcess.run("/bin/cat", arguments: [url.path], timeout: 5,
+                receiveStdout: { data in
+                    do { try reader.receive(data) { received.append($0) } }
+                    catch { XCTFail("Invalid stream: \(error)") }
+                })
+            guard case .success = result else { return XCTFail("Child failed") }
+            XCTAssertEqual(received, Array(rows.prefix(3)))
+            XCTAssertTrue(reader.complete)
+            XCTAssertEqual(reader.hitCap, rows.count > 3)
+        }
+    }
+
+    func testCancellationKillsAndReapsMidRecordDespiteIgnoredTERM() throws {
+        let whole = try WalkStream.encode(WalkStream.Record<String>.row("complete"))
+        let partial = try WalkStream.encode(WalkStream.Record<String>.row("must not arrive"))
+        let bytes = whole + partial.prefix(partial.count - 2)
+        let url = try fixture(bytes)
+        let pidFile = try fixture(Data())
+        let cancellation = ExternalProcess.Cancellation()
+        var reader = WalkStream.Reader<String>(cap: 10)
+        var received = [String]()
+        var byteCount = 0
+        let started = Date()
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c",
+            "trap '' TERM; printf '%s' $$ > \"$1\"; /bin/cat \"$2\"; while :; do :; done",
+            "walk-test", pidFile.path, url.path], timeout: 10, cancellation: cancellation,
+            receiveStdout: { data in
+                byteCount += data.count
+                do { try reader.receive(data) { received.append($0) } }
+                catch { XCTFail("Invalid stream: \(error)") }
+                if byteCount == bytes.count { cancellation.cancel() }
+            })
+        guard case .cancelled(let output) = result else { return XCTFail("Child was not cancelled") }
+        XCTAssertEqual(output.status, SIGKILL)
+        XCTAssertThrowsError(try result.completed())
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        XCTAssertEqual(received, ["complete"])
+        XCTAssertFalse(reader.complete)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: pidFile, encoding: .utf8)))
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH, "Stopping reads alone leaves the process alive")
+        var status: Int32 = 0
+        XCTAssertEqual(waitpid(pid, &status, WNOHANG), -1)
+        XCTAssertEqual(errno, ECHILD, "The child must also have been reaped")
+    }
+
+    func testCancellationOfQuietChildAndBeforeLaunch() throws {
+        let pidFile = try fixture(Data())
+        let cancellation = ExternalProcess.Cancellation()
+        let started = Date()
+        let result = ExternalProcess.run("/bin/sh", arguments: ["-c",
+            "printf '%s' $$ > \"$1\"; exec /bin/sleep 30", "walk-test", pidFile.path], timeout: nil,
+            onLaunch: { _ in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { cancellation.cancel() }
+            }, cancellation: cancellation, receiveStdout: { _ in XCTFail("Quiet child wrote output") })
+        guard case .cancelled = result else { return XCTFail("Quiet child was not cancelled") }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        let pid = try XCTUnwrap(Int32(String(contentsOf: pidFile, encoding: .utf8)))
+        XCTAssertEqual(kill(pid, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+        let preCancelled = ExternalProcess.run("/bin/echo", timeout: 5,
+            onLaunch: { _ in XCTFail("Cancelled work launched") }, cancellation: cancellation)
+        guard case .failedToLaunch = preCancelled else { return XCTFail("Pre-cancellation ignored") }
+    }
+
+    func testChildSendingPastCapIsRejected() throws {
+        var bytes = Data()
+        for row in ["one", "two", "three", "extra"] {
+            bytes.append(try WalkStream.encode(WalkStream.Record<String>.row(row)))
+        }
+        let url = try fixture(bytes)
+        var reader = WalkStream.Reader<String>(cap: 3)
+        var received = [String]()
+        var rejected = false
+        let cancellation = ExternalProcess.Cancellation()
+        _ = ExternalProcess.run("/bin/cat", arguments: [url.path], timeout: 5,
+            cancellation: cancellation, receiveStdout: { data in
+                do { try reader.receive(data) { received.append($0) } }
+                catch { rejected = true; cancellation.cancel() }
+            })
+        XCTAssertTrue(rejected)
+        XCTAssertEqual(received, ["one", "two", "three"])
+        XCTAssertFalse(reader.complete)
+    }
+
+    func testMalformedOversizedAndOverCapRecordsAreRejected() throws {
+        var reader = WalkStream.Reader<String>(cap: 1)
+        XCTAssertThrowsError(try reader.receive(Data([255, 255, 255, 255])) { _ in })
+        reader = WalkStream.Reader<String>(cap: 1)
+        XCTAssertThrowsError(try reader.receive(Data([0, 0, 0, 1, 0])) { _ in })
+        reader = WalkStream.Reader<String>(cap: 1)
+        let row = try WalkStream.encode(WalkStream.Record<String>.row("one"))
+        try reader.receive(row) { _ in }
+        XCTAssertThrowsError(try reader.receive(row) { _ in XCTFail("Cap bypassed") })
+        reader = WalkStream.Reader<String>(cap: 1)
+        try reader.receive(WalkStream.encode(WalkStream.Record<String>.finished(hitCap: false, readFailed: true))) { _ in }
+        XCTAssertTrue(reader.readFailed)
+        XCTAssertThrowsError(try reader.receive(row) { _ in XCTFail("Row after completion accepted") })
+    }
+}

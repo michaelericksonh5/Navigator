@@ -28,6 +28,7 @@ enum ExternalProcess {
         case success(Output)
         case nonZero(Output)
         case timedOut(Output)
+        case cancelled(Output)
         case failedToLaunch(Error)
 
         // Callers keep their command-specific exit messages; launch and timeout
@@ -36,6 +37,8 @@ enum ExternalProcess {
             switch self {
             case .success(let output), .nonZero(let output): return output
             case .failedToLaunch(let error): throw error
+            case .cancelled:
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ECANCELED))
             case .timedOut:
                 throw NSError(domain: "Navigator.ExternalProcess", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "The command timed out."])
@@ -43,33 +46,50 @@ enum ExternalProcess {
         }
     }
 
+    // Only the worker owns the PID. Cancellation before launch and after exit cannot
+    // accidentally signal a reused PID, and the UI never waits for a child to exit.
+    final class Cancellation: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        func cancel() { lock.lock(); value = true; lock.unlock() }
+    }
+
     private final class Capture {
         var data = Data()
 
-        func drain(_ handle: FileHandle, until deadline: DispatchTime) {
+        func drain(_ handle: FileHandle, until deadline: DispatchTime,
+                   cancellation: Cancellation?, receive: ((Data) -> Void)?) {
             let fd = handle.fileDescriptor
             _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
             var buffer = [UInt8](repeating: 0, count: 16384)
             // Descendants can inherit the pipe after the direct child exits. A
             // bounded, nonblocking read prevents those descriptors defeating timeout.
-            while DispatchTime.now() < deadline {
+            while DispatchTime.now() < deadline && cancellation?.isCancelled != true {
                 var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
                 let ready = poll(&descriptor, 1, 50)
                 if ready < 0 && errno != EINTR { break }
                 guard ready > 0 else { continue }
                 let count = read(fd, &buffer, buffer.count)
-                if count > 0 { data.append(contentsOf: buffer.prefix(count)) }
+                if count > 0 {
+                    let chunk = Data(buffer.prefix(count))
+                    if let receive { receive(chunk) } else { data.append(chunk) }
+                }
                 else if count == 0 { break }
                 else if errno != EINTR && errno != EAGAIN { break }
             }
         }
     }
 
+    // Streaming callbacks run serially on the stdout drain and finish before return.
+    // A nil timeout lets searches run until completion or explicit cancellation.
     static func run(_ executable: String, arguments: [String] = [],
                     directory: URL? = nil, environment: [String: String]? = nil,
-                    timeout: TimeInterval = 3600,
-                    onLaunch: ((@escaping () -> Bool) -> Void)? = nil) -> Result {
-        guard timeout.isFinite, timeout > 0 else {
+                    timeout: TimeInterval? = 3600,
+                    onLaunch: ((@escaping () -> Bool) -> Void)? = nil,
+                    cancellation: Cancellation? = nil,
+                    receiveStdout: ((Data) -> Void)? = nil) -> Result {
+        if let timeout, !timeout.isFinite || timeout <= 0 {
             return .failedToLaunch(NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL)))
         }
         let process = Process()
@@ -82,23 +102,33 @@ enum ExternalProcess {
         process.standardError = stderr
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }
+        if cancellation?.isCancelled == true {
+            return .failedToLaunch(NSError(domain: NSPOSIXErrorDomain, code: Int(ECANCELED)))
+        }
         do { try process.run() } catch { return .failedToLaunch(error) }
-        let deadline = DispatchTime.now() + timeout
+        let deadline = timeout.map { DispatchTime.now() + $0 } ?? .distantFuture
+        let drainDeadline = timeout == nil ? DispatchTime.distantFuture : deadline + 0.5
         let drains = DispatchGroup()
         let out = Capture(), err = Capture()
         for (capture, pipe) in [(out, stdout), (err, stderr)] {
             drains.enter()
             DispatchQueue.global(qos: .utility).async {
-                capture.drain(pipe.fileHandleForReading, until: deadline + 0.5)
+                capture.drain(pipe.fileHandleForReading, until: drainDeadline,
+                              cancellation: cancellation, receive: pipe === stdout ? receiveStdout : nil)
                 drains.leave()
             }
         }
         // The callback returns immediately; it can observe liveness without
         // taking ownership of the process or replacing our termination handler.
         onLaunch?({ process.isRunning })
-        let timedOut = drains.wait(timeout: deadline) == .timedOut ||
-            exited.wait(timeout: deadline) == .timedOut
-        if timedOut && process.isRunning {
+        while cancellation?.isCancelled != true && DispatchTime.now() < deadline {
+            if drains.wait(timeout: .now() + 0.025) == .success && !process.isRunning { break }
+            // Quiet pipes must not hide cancellation behind a read-to-end wait.
+            if process.isRunning { _ = exited.wait(timeout: .now() + 0.025) }
+        }
+        let cancelled = cancellation?.isCancelled == true
+        let timedOut = !cancelled && DispatchTime.now() >= deadline
+        if (timedOut || cancelled) && process.isRunning {
             process.terminate()
             // SIGTERM can be ignored. Escalate so timeout still reaps the child.
             if exited.wait(timeout: .now() + 0.25) == .timedOut && process.isRunning {
@@ -108,8 +138,101 @@ enum ExternalProcess {
         drains.wait()
         process.waitUntilExit()
         let output = Output(stdout: out.data, stderr: err.data, status: process.terminationStatus)
+        if cancelled { return .cancelled(output) }
         if timedOut { return .timedOut(output) }
         return output.status == 0 ? .success(output) : .nonZero(output)
+    }
+}
+
+// JSON escapes filename newlines; the four-byte big-endian length also lets a
+// killed writer leave an incomplete record without turning it into a result.
+enum WalkStream {
+    static let subcommand = "--navigator-internal-walk-v1"
+    static let tokenKey = "NAVIGATOR_INTERNAL_WALK_TOKEN"
+    static let maxRecordBytes = 1_048_576
+
+    struct Request: Codable {
+        let root: URL
+        let tokens: [String]
+        let kindTree: String?
+        let showHidden: Bool
+        let filters: SearchFilters
+        let now: Date
+        let cap: Int
+    }
+
+    enum Record<Row: Codable>: Codable {
+        case row(Row)
+        case finished(hitCap: Bool, readFailed: Bool)
+    }
+
+    static func encode<Row>(_ record: Record<Row>) throws -> Data {
+        let payload = try JSONEncoder().encode(record)
+        guard payload.count <= maxRecordBytes else { throw CocoaError(.fileWriteOutOfSpace) }
+        let count = UInt32(payload.count)
+        var data = Data([UInt8(count >> 24), UInt8((count >> 16) & 255),
+                         UInt8((count >> 8) & 255), UInt8(count & 255)])
+        data.append(payload)
+        return data
+    }
+
+    struct Reader<Row: Codable> {
+        private var pending = Data()
+        private(set) var finished = false
+        private(set) var hitCap = false
+        private(set) var readFailed = false
+        private(set) var count = 0
+        let cap: Int
+
+        init(cap: Int) { self.cap = cap }
+
+        var complete: Bool { finished && pending.isEmpty }
+
+        mutating func receive(_ data: Data, row: (Row) -> Void) throws {
+            pending.append(data)
+            while pending.count >= 4 {
+                guard !finished else { throw CocoaError(.fileReadCorruptFile) }
+                let length = pending.prefix(4).reduce(0) { ($0 << 8) | Int($1) }
+                guard length > 0, length <= WalkStream.maxRecordBytes else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                guard pending.count >= 4 + length else { return }
+                let record = try JSONDecoder().decode(Record<Row>.self,
+                    from: Data(pending.dropFirst(4).prefix(length)))
+                pending = Data(pending.dropFirst(4 + length))
+                switch record {
+                case .row(let value):
+                    guard count < cap else { throw CocoaError(.fileReadCorruptFile) }
+                    count += 1
+                    row(value)
+                case .finished(let capped, let failed):
+                    guard !capped || count == cap else { throw CocoaError(.fileReadCorruptFile) }
+                    finished = true; hitCap = capped; readFailed = failed
+                }
+            }
+        }
+    }
+
+    struct Writer<Row: Codable> {
+        let cap: Int
+        let write: (Data) throws -> Void
+        private(set) var count = 0
+
+        init(cap: Int, write: @escaping (Data) throws -> Void) {
+            self.cap = cap; self.write = write
+        }
+
+        // An extra matching row, not merely reaching the limit, proves truncation.
+        mutating func append(_ row: Row) throws -> Bool {
+            guard count < cap else { return false }
+            try write(WalkStream.encode(Record<Row>.row(row)))
+            count += 1
+            return true
+        }
+
+        func finish(hitCap: Bool, readFailed: Bool) throws {
+            try write(WalkStream.encode(Record<Row>.finished(hitCap: hitCap, readFailed: readFailed)))
+        }
     }
 }
 
@@ -2799,7 +2922,7 @@ enum SearchSizeFilter: String, CaseIterable, Codable {
 /// separate implementations is how a filter ends up silently ignored on one path —
 /// and Spotlight's own index can be stale about size, so the re-check is not
 /// redundant even where the predicate already ran.
-struct SearchFilters {
+struct SearchFilters: Codable {
     var date: SearchDateFilter = .any
     var size: SearchSizeFilter = .any
     var customDateFrom: Date?
@@ -5115,18 +5238,8 @@ final class SearchResultBuffer<Row>: @unchecked Sendable {
     }
 }
 
-/// Bounds how many recursive search walks can be outstanding at once.
-///
-/// Cancelling a walk sets a generation counter, and the walk notices by checking it at the top
-/// of its loop - AFTER `nextObject()` has returned. On a wedged mount `nextObject()` does not
-/// return, so the worker outlives its own cancellation, and the next search starts another one.
-/// Nothing reaps them: search a dead share, cancel, search again, and the threads accumulate
-/// for the life of the process.
-///
-/// This cannot be fixed by checking cancellation more often - the thread is inside a blocking
-/// syscall, and Foundation gives no way to interrupt it. So the count is bounded instead: past
-/// the limit a new walk is refused with a message, rather than silently parking another thread.
-/// A refusal the user can see beats an invisible leak.
+/// Bounds outstanding child walks if the OS delays exit even after SIGKILL.
+/// Admission is released after reaping, never merely after requesting cancellation.
 final class WalkAdmission: @unchecked Sendable {
     private let lock = NSLock()
     private var outstanding = 0
