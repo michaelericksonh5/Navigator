@@ -586,6 +586,16 @@ enum Prefs {
     /// remembered of its own. Default on, like Explorer — and off in one checkbox,
     /// because a guess about your folders is precisely the kind of help some people
     /// want nothing to do with.
+    /// Open images at 100%, not scaled to the window.
+    ///
+    /// The viewer always fitted, and fit SCALES UP as readily as down - so a 500px symbol
+    /// opened blown up to fill a 940px window, soft and misleading when the whole point of
+    /// looking at it is to judge the art. Defaults on; Fit is still one click away.
+    static var imageViewerActualSize: Bool {
+        get { d.object(forKey: "imageViewerActualSize") == nil ? true : d.bool(forKey: "imageViewerActualSize") }
+        set { d.set(newValue, forKey: "imageViewerActualSize") }
+    }
+
     static var inferFolderView: Bool {
         get { d.object(forKey: "inferFolderView") == nil ? true : d.bool(forKey: "inferFolderView") }
         set { d.set(newValue, forKey: "inferFolderView") }
@@ -13900,8 +13910,23 @@ final class ZoomView: NSView {
         _image = img
         _cgImage = img?.cgImage(forProposedRect: nil, context: nil, hints: nil)
         offset = .zero; didFit = false; rotation = 0; flipH = false
-        if bounds.width > 0, bounds.height > 0 { fit() } else { needsDisplay = true }
+        guard bounds.width > 0, bounds.height > 0 else { needsDisplay = true; return }
+        applyInitialZoom()
     }
+    /// The zoom a freshly loaded image starts at.
+    ///
+    /// TWO callers must agree: setImage when the view already has a size, and layout() when it
+    /// did not yet. They used to disagree - layout() always fitted - so which one won was a
+    /// race on load timing: a 3000x2000 image arriving before layout opened fitted at 31%
+    /// while a 400x300 image arriving after opened at 100%.
+    private func applyInitialZoom() {
+        guard Prefs.imageViewerActualSize else { fit(); return }
+        // Set _zoom directly rather than calling actualSize(): that routes through zoomAt(),
+        // which early-returns when the zoom does not change, and _zoom is already 1 on a fresh
+        // view - so needsDisplay was never set and the image never got its first paint.
+        _zoom = 1; offset = .zero; didFit = true; needsDisplay = true; report()
+    }
+
     private var pixelSize: CGSize {
         guard let rep = _image?.representations.first else { return _image?.size ?? .zero }
         return CGSize(width: rep.pixelsWide, height: rep.pixelsHigh)
@@ -13942,7 +13967,7 @@ final class ZoomView: NSView {
     }
     override func layout() {
         super.layout()
-        if !didFit, _image != nil, bounds.width > 0, bounds.height > 0 { fit() } else { clampOffset() }
+        if !didFit, _image != nil, bounds.width > 0, bounds.height > 0 { applyInitialZoom() } else { clampOffset() }
     }
     override func draw(_ dirtyRect: NSRect) {
         // Clear to transparent (not black) so the viewer's checkerboard shows
@@ -14632,7 +14657,18 @@ struct ImageViewerView: View {
                 Button { zoomCtl.flipHorizontal() } label: { Image(systemName: "arrow.left.and.right") }
                     .buttonStyle(.plain).help("Flip Horizontal")
                 Button { zoomCtl.actualSize() } label: { Text("1:1").font(.callout.monospacedDigit()) }
-                    .buttonStyle(.plain).help("Actual Size (100%)")
+                    .buttonStyle(.plain)
+                    .help("Actual Size (100%) — right-click to change what images open at")
+                    // The default lives on the control it governs. A viewer preference buried
+                    // in a settings pane is one nobody finds from the window it applies to.
+                    .contextMenu {
+                        Toggle("Open Images at 100%", isOn: Binding(
+                            get: { Prefs.imageViewerActualSize },
+                            set: { Prefs.imageViewerActualSize = $0 }))
+                        Toggle("Open Images Fitted to the Window", isOn: Binding(
+                            get: { !Prefs.imageViewerActualSize },
+                            set: { Prefs.imageViewerActualSize = !$0 }))
+                    }
                 Button { zoomCtl.fit() } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }
                     .buttonStyle(.plain).help("Fit to Window (⌘0)")
                 Button { zoomCtl.zoomBy(0.8) } label: { Image(systemName: "minus.magnifyingglass") }
