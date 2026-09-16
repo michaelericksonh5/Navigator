@@ -1114,19 +1114,23 @@ final class SelectionCycleTests: XCTestCase {
 // MARK: - Clipboard text forms ("Copy as Path" and the extended-menu variants)
 
 final class PathTextTests: XCTestCase {
+    // These three previously asserted DOUBLE-quote wrapping. That was the bug, not the
+    // contract: `$` and a backtick are legal in a macOS filename and stay active inside
+    // double quotes, so `report $(id).png` executed when pasted into a shell. Single
+    // quotes interpret nothing, so they are the only safe wrapping for arbitrary names.
     func testQuotedWrapsSoSpacesSurviveAShell() {
-        XCTAssertEqual(PathText.quoted(["/Users/me/My Files/a.txt"]), "\"/Users/me/My Files/a.txt\"")
+        XCTAssertEqual(PathText.quoted(["/Users/me/My Files/a.txt"]), "'/Users/me/My Files/a.txt'")
     }
 
-    // A double quote is legal in a POSIX filename and would end the quoted run early,
-    // handing the shell a command split in the wrong place.
-    func testQuotedEscapesQuotesAndBackslashes() {
-        XCTAssertEqual(PathText.quoted(["/tmp/a\"b"]), "\"/tmp/a\\\"b\"")
-        XCTAssertEqual(PathText.quoted(["/tmp/a\\b"]), "\"/tmp/a\\\\b\"")
+    // Inside single quotes a double quote and a backslash are both ordinary characters,
+    // so neither needs escaping - and escaping them would corrupt the path.
+    func testQuotedLeavesQuotesAndBackslashesLiteral() {
+        XCTAssertEqual(PathText.quoted(["/tmp/a\"b"]), "'/tmp/a\"b'")
+        XCTAssertEqual(PathText.quoted(["/tmp/a\\b"]), "'/tmp/a\\b'")
     }
 
     func testQuotedJoinsAMultiSelectionOnePerLine() {
-        XCTAssertEqual(PathText.quoted(["/a", "/b"]), "\"/a\"\n\"/b\"")
+        XCTAssertEqual(PathText.quoted(["/a", "/b"]), "'/a'\n'/b'")
     }
 
     func testFileURLsPercentEncodeSpaces() {
@@ -5655,5 +5659,38 @@ final class GoogleDrivePortablePathTests: XCTestCase {
         XCTAssertNil(PathRules.googleDrivePortablePath("/Users/x/Library/CloudStorage/iCloudDrive/Art"))
         XCTAssertNil(PathRules.googleDrivePortablePath("/Volumes/Share/Art"))
         XCTAssertNil(PathRules.googleDrivePortablePath(""))
+    }
+}
+
+// "Copy as Path (Quoted)" advertises shell use, so it has to be safe for any filename a
+// macOS filesystem will accept. The double-quoted version it replaced was not: `$` and a
+// backtick are legal in a filename and still live inside double quotes, so a file named
+// `report $(id).png` executed the substitution when the path was pasted into a shell.
+final class ShellQuotingTests: XCTestCase {
+
+    func testWrapsInSingleQuotes() {
+        XCTAssertEqual(PathText.quoted(["/tmp/my file.png"]), "'/tmp/my file.png'")
+    }
+
+    // The actual exploit: these must come back inert.
+    func testNeutralisesShellMetacharacters() {
+        XCTAssertEqual(PathText.quoted(["/tmp/report $(id).png"]), "'/tmp/report $(id).png'")
+        XCTAssertEqual(PathText.quoted(["/tmp/report `id`.png"]),  "'/tmp/report `id`.png'")
+        XCTAssertEqual(PathText.quoted(["/tmp/$HOME.png"]),        "'/tmp/$HOME.png'")
+        XCTAssertEqual(PathText.quoted(["/tmp/a;rm -rf b.png"]),   "'/tmp/a;rm -rf b.png'")
+    }
+
+    // A single quote cannot be escaped inside single quotes — it has to be closed, escaped
+    // and reopened, or the quoting silently breaks apart.
+    func testHandlesAnApostropheInTheName() {
+        XCTAssertEqual(PathText.quoted(["/tmp/Mike's art.png"]), "'/tmp/Mike'\\''s art.png'")
+    }
+
+    func testBackslashIsLiteralAndNeedsNoEscaping() {
+        XCTAssertEqual(PathText.quoted(["/tmp/back\\slash.png"]), "'/tmp/back\\slash.png'")
+    }
+
+    func testMultiplePathsOnePerLine() {
+        XCTAssertEqual(PathText.quoted(["/a b", "/c d"]), "'/a b'\n'/c d'")
     }
 }

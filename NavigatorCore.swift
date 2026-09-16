@@ -899,16 +899,21 @@ func trashItems(_ urls: [URL]) -> (restores: [(from: URL, to: URL)], problem: St
 /// `Copy Path`, so the plain and the quoted item differ ONLY in the quoting.
 enum PathText {
 
-    /// Windows' "Copy as path": the path wrapped in double quotes so pasting it into a
-    /// shell survives spaces. Backslash and double quote are escaped because those are
-    /// the two characters a POSIX filename may legally contain that a double-quoted
-    /// shell word still interprets — leaving a raw `"` in would end the quoted run
-    /// early and hand the shell a mangled command.
+    /// Windows' "Copy as path": the path quoted so pasting it into a shell survives spaces.
+    ///
+    /// SINGLE quotes, not double. The previous version wrapped in double quotes and escaped
+    /// only backslash and double quote, on the stated belief that those are the only two
+    /// characters a POSIX filename may contain that a double-quoted shell word interprets.
+    /// That is wrong: `$` and a backtick are both legal in a macOS filename and both still
+    /// active inside double quotes. A file genuinely named `report $(id).png` pasted into a
+    /// shell therefore RAN the substitution. Inside single quotes nothing is interpreted at
+    /// all, which is the only wrapping that is safe for arbitrary filenames.
+    ///
+    /// A literal single quote cannot appear inside single quotes, so it is closed, escaped
+    /// and reopened — the standard `'\''` dance, exactly what shlex.quote emits.
     static func quoted(_ paths: [String]) -> String {
         paths.map { p in
-            let esc = p.replacingOccurrences(of: "\\", with: "\\\\")
-                       .replacingOccurrences(of: "\"", with: "\\\"")
-            return "\"\(esc)\""
+            "'" + p.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }.joined(separator: "\n")
     }
 

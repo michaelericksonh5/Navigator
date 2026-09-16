@@ -4900,6 +4900,49 @@ final class Browser: ObservableObject, Identifiable {
     @Published var searchText: String = ""
     @Published var isSearching = false
     @Published var searchThisMac = false
+
+    /// Explorer searches AS YOU TYPE. Navigator only ran on Return, which is the single
+    /// biggest reason its search felt broken: you typed ".png", nothing happened, and the
+    /// box looked dead. Debounced so a fast typist starts ONE query rather than one per
+    /// keystroke - each new keystroke cancels the previous pending run.
+    private var searchDebounce: DispatchWorkItem?
+    static let searchDebounceInterval: TimeInterval = 0.25
+    /// One character matches most of the disk, so the query costs far more than it returns
+    /// and the first useful result is buried. Two is the floor; Return still forces any length.
+    static let searchMinChars = 2
+
+    func searchTextChanged() {
+        searchDebounce?.cancel(); searchDebounce = nil
+        let q = searchText.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty {
+            // Emptying the box ends the search ONLY if no filter is armed - "everything
+            // modified today" is still a search with nothing typed in it.
+            if isSearching { if searchFilters.isActive { runSearch() } else { clearSearch() } }
+            return
+        }
+        guard q.count >= Browser.searchMinChars else { return }
+        let work = DispatchWorkItem { [weak self] in self?.runSearch() }
+        searchDebounce = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Browser.searchDebounceInterval, execute: work)
+    }
+
+    /// Return runs immediately at any length, cancelling whatever the debounce had queued.
+    func searchSubmitted() {
+        searchDebounce?.cancel(); searchDebounce = nil
+        runSearch()
+    }
+
+    /// Explorer's "Open file location": go to the folder the item actually lives in and
+    /// select it there. Distinct from Reveal in Finder, which leaves Navigator entirely.
+    /// Reuses pendingRevealPaths, the same mechanism background ops use to select a file
+    /// once the new listing contains it.
+    func openContainingFolder(_ ids: Set<String>) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }) else { NSSound.beep(); return }
+        let parent = it.url.deletingLastPathComponent()
+        guard parent.path != it.url.path else { NSSound.beep(); return }
+        pendingRevealPaths = [it.id]
+        navigate(to: parent)
+    }
     @Published var searchKind: SearchKind = .any
     /// Date Modified + Size narrowing, applied identically by both search backends —
     /// see SearchFilters in NavigatorCore.
@@ -6158,6 +6201,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     func clearSearch() {
+        searchDebounce?.cancel(); searchDebounce = nil
         stopMetadataQuery(&searchQuery)
         searchGen += 1   // cancel any in-flight recursive walk
         searchText = ""; isSearching = false
@@ -8013,17 +8057,58 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             let useBytes = !move && !anyDir && totalBytes > 0
             var base: Int64 = 0
             var lastFrac = -1.0
+            /// Replace is staged, not destructive: the existing destination is renamed aside and
+            /// only discarded once the incoming item has actually landed. Removing it up front
+            /// meant a disk-full, a source read error or a cancel part-way through left the user
+            /// with NEITHER the old file nor the new one, and nothing in Undo to get it back.
+            func restoreReplaced(_ b: (stash: URL, original: URL)?, _ name: String) {
+                guard let b else { return }
+                try? fm.removeItem(at: b.original)      // bin the partial/failed incoming file first
+                do { try fm.moveItem(at: b.stash, to: b.original) }
+                catch {
+                    // The worst outcome this routine has: the incoming item failed AND the
+                    // original could not be put back. It still exists, under the stash name -
+                    // staying silent here would look exactly like the data loss this staging
+                    // was added to prevent.
+                    navLog("transfer ROLLBACK FAILED for “\(name)”: original is still at \(b.stash.path) — \(error.localizedDescription)")
+                    failures.append((name, "could not restore the original; it is in this folder as “\(b.stash.lastPathComponent)”"))
+                }
+            }
+            func discardReplaced(_ b: (stash: URL, original: URL)?, _ name: String) {
+                guard let b else { return }
+                do { try fm.removeItem(at: b.stash) }
+                catch { navLog("transfer: replaced copy of “\(name)” left behind at \(b.stash.path) — \(error.localizedDescription)") }
+            }
             for (i, src) in sources.enumerated() {
                 if progress.cancelled { break }
                 if useBytes { let n = src.lastPathComponent; DispatchQueue.main.async { progress.current = n } }
                 let target = dir.appendingPathComponent(src.lastPathComponent)
                 var dest = target
+                var replacedBackup: (stash: URL, original: URL)? = nil
+                var iterationFailed = false
                 if isSelfDup(src) {
                     dest = self.numberedCopyDest(dir, src.lastPathComponent)
                 } else if conflictNames.contains(src.lastPathComponent) {
                     switch policy {
                     case .skip: base += sizes[i]; skipped += 1; continue
-                    case .replace: try? fm.removeItem(at: target)
+                    case .replace:
+                        // Same volume, so this rename is atomic and instant. Leading dot keeps it
+                        // out of the listing for the moment it exists.
+                        // FIXED length (21 + 36 = 57 chars), deliberately NOT including the
+                        // original filename: a 204-character name - legal on APFS - plus the
+                        // marker and a UUID came to 262, over the 255-character limit, so
+                        // replacing a long-named file would have failed outright.
+                        let stash = dir.appendingPathComponent(".navigator-replacing-\(UUID().uuidString)")
+                        do {
+                            try fm.moveItem(at: target, to: stash)
+                            replacedBackup = (stash: stash, original: target)
+                        } catch {
+                            // Could not set the old file aside - refuse rather than destroy it.
+                            navLog("transfer SKIPPED “\(src.lastPathComponent)”: could not set the existing item aside — \(error.localizedDescription)")
+                            failures.append((src.lastPathComponent, "could not replace the existing item: \(error.localizedDescription)"))
+                            base += sizes[i]
+                            continue
+                        }
                     case .keepBoth: dest = self.uniqueDest(dir, src.lastPathComponent)
                     }
                 }
@@ -8041,12 +8126,12 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                         try Browser.copyWithProgress(src, dest, isCancelled: { progress.cancelled }, onBytes: onBytes)
                         // A cancelled copyfile leaves a truncated file behind — bin it
                         // rather than leaving a corrupt partial copy in the folder.
-                        if progress.cancelled { try? fm.removeItem(at: dest); break }
+                        if progress.cancelled { try? fm.removeItem(at: dest); restoreReplaced(replacedBackup, src.lastPathComponent); break }
                         copied.append(dest)
                     }
                     else { try fm.copyItem(at: src, to: dest); copied.append(dest) }   // APFS clones this too
                 } catch {
-                    if progress.cancelled { try? fm.removeItem(at: dest); break }
+                    if progress.cancelled { try? fm.removeItem(at: dest); restoreReplaced(replacedBackup, src.lastPathComponent); break }
                     // Cross-volume move (rename fails) or a copyfile hiccup → plain copy.
                     do {
                         try fm.copyItem(at: src, to: dest)
@@ -8061,8 +8146,12 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                         // stories with different fixes (permissions vs. disk full vs. SMB).
                         navLog("transfer FAILED: “\(src.lastPathComponent)” → \(dest.path) — \(e.localizedDescription) (first attempt: \(error.localizedDescription))")
                         failures.append((src.lastPathComponent, e.localizedDescription))
+                        iterationFailed = true
                     }
                 }
+                // The incoming item either landed or it did not; only now is it safe to throw
+                // the old one away.
+                if iterationFailed { restoreReplaced(replacedBackup, src.lastPathComponent) } else { discardReplaced(replacedBackup, src.lastPathComponent) }
                 base += sizes[i]
                 if !useBytes, i % step == 0 || i == total - 1 {
                     let n = src.lastPathComponent, frac = total > 0 ? Double(i + 1) / Double(total) : 0
@@ -10162,15 +10251,8 @@ struct ControlBar: View {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.caption)
                     TextField("Search “\(folderName)”", text: $browser.searchText)
                         .textFieldStyle(.plain).focused($searchFocused)
-                        .onSubmit { browser.runSearch() }
-                        .onChange(of: browser.searchText) {
-                            // Emptying the text ends the search ONLY if no filter is
-                            // armed — "everything modified today" is still a search
-                            // with no text in the box.
-                            if browser.searchText.isEmpty && browser.isSearching {
-                                if browser.searchFilters.isActive { browser.runSearch() } else { browser.clearSearch() }
-                            }
-                        }
+                        .onSubmit { browser.searchSubmitted() }
+                        .onChange(of: browser.searchText) { browser.searchTextChanged() }
                     if !browser.searchText.isEmpty {
                         Button { browser.clearSearch() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("Clear Search")
                     }
@@ -10877,6 +10959,13 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             let selURLs = browser.items.filter { ids.contains($0.id) }.map { $0.url }
             if selURLs.contains(where: { !$0.hasDirectoryPath }) { OpenWithMenu(urls: selURLs.filter { !$0.hasDirectoryPath }) }
             Button("Quick Look") { QuickLook.shared.show(browser.items.filter { ids.contains($0.id) }.map { $0.url }) }
+            // Only when the item is somewhere else - in an ordinary folder listing every
+            // item's containing folder IS the folder you are looking at, and the item would
+            // be dead weight on every right-click.
+            if ids.count == 1, let sel = browser.items.first(where: { $0.id == ids.first }),
+               sel.url.deletingLastPathComponent().path != browser.currentURL.path {
+                Button("Open Containing Folder") { browser.openContainingFolder(ids) }
+            }
             Button("Reveal in Finder") { browser.revealInFinder(ids) }
             Divider()
             if ids.count == 1 { Button("Rename…") { promptRename(browser, ids.first!) } }
