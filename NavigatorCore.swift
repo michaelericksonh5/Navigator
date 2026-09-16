@@ -39,14 +39,22 @@ enum PathRules {
         return d == s || d.hasPrefix(s.hasSuffix("/") ? s : s + "/")
     }
 
+    // UI hover/menu checks cannot resolve symlinks on a stalled mount. Transfers
+    // still use the resolved check above, on their worker, before writing anything.
+    static func isLexicalSelfOrDescendant(_ dir: URL, of src: URL) -> Bool {
+        let s = lexicalPath(src.path)
+        let d = lexicalPath(dir.path)
+        return d == s || d.hasPrefix(s.hasSuffix("/") ? s : s + "/")
+    }
+
     /// The deepest of `roots` that contains `url`, or nil if none do.
     ///
     /// Used to answer "which mounted volume is this folder actually on?" for Eject.
     /// Deepest, not first match: "/" contains every path, and a volume can be
     /// mounted inside another one — the longer mount point is always the real owner.
     static func deepestRoot(containing url: URL, among roots: [URL]) -> URL? {
-        roots.filter { isSelfOrDescendant(url, of: $0) }
-             .max { $0.standardizedFileURL.path.count < $1.standardizedFileURL.path.count }
+        roots.filter { isLexicalSelfOrDescendant(url, of: $0) }
+             .max { lexicalPath($0.path).count < lexicalPath($1.path).count }
     }
 
     /// A favourite's location beneath its volume root:
@@ -772,7 +780,11 @@ final class UndoStack {
     }
 
     /// One place that retires entries, so a new death point cannot forget to run cleanup.
-    private func retire(_ entries: [Entry]) { for e in entries { e.cleanup?() } }
+    private func retire(_ entries: [Entry]) {
+        for e in entries {
+            if let cleanup = e.cleanup { execute({ cleanup(); return nil }, { _ in }) }
+        }
+    }
 
     /// 200, not the old 50: an entry is two closures over a handful of URLs, a few
     /// hundred bytes, so history is essentially free and the old cap threw away a
@@ -789,13 +801,19 @@ final class UndoStack {
     var onEmpty: () -> Void = {}
     var onFailure: (_ summary: String, _ detail: String) -> Void = { _, _ in }
 
-    var canUndo: Bool { !undoStack.isEmpty }
-    var canRedo: Bool { !redoStack.isEmpty }
+    // The app executes file actions on a worker and completes on main. Tests keep
+    // synchronous execution; stack ownership never moves onto the I/O thread.
+    var execute: (@escaping UndoAction, @escaping (String?) -> Void) -> Void = { action, done in done(action()) }
+    private(set) var isPerforming = false
+    private var revision = 0
+    var canUndo: Bool { !isPerforming && !undoStack.isEmpty }
+    var canRedo: Bool { !isPerforming && !redoStack.isEmpty }
     var topDescription: String? { undoStack.last?.desc }
     var topRedoDescription: String? { redoStack.last?.desc }
 
     func push(_ desc: String, undo: @escaping UndoAction, redo: @escaping UndoAction,
               cleanup: (() -> Void)? = nil) {
+        revision += 1
         undoStack.append(Entry(desc: desc, undo: undo, redo: redo, cleanup: cleanup))
         if undoStack.count > Self.limit { retire([undoStack.removeFirst()]) }
         // Any NEW operation invalidates every pending redo. Those closures hold paths
@@ -805,27 +823,36 @@ final class UndoStack {
         retire(redoStack); redoStack.removeAll()
     }
 
-    func undo() {
-        guard let e = undoStack.popLast() else { onEmpty(); return }
-        // A failed half DROPS the entry (popLast already removed it and we return
-        // without re-filing it): its recorded state is demonstrably wrong now, and
-        // offering to replay it would only compound the mess.
-        if let problem = e.undo() { retire([e]); onFailure("Couldn’t undo \(e.desc)", problem); return }
-        redoStack.append(e)
-        if redoStack.count > Self.limit { retire([redoStack.removeFirst()]) }
-    }
+    func undo() { replay(redo: false) }
+    func redo() { replay(redo: true) }
 
-    func redo() {
-        guard let e = redoStack.popLast() else { onEmpty(); return }
-        if let problem = e.redo() { retire([e]); onFailure("Couldn’t redo \(e.desc)", problem); return }
-        // Straight append, NOT push(): push() clears the redo stack, which would make
-        // a redo wipe out every remaining redo behind it.
-        undoStack.append(e)
-        if undoStack.count > Self.limit { undoStack.removeFirst() }
+    private func replay(redo: Bool) {
+        guard !isPerforming else { return }
+        guard let entry = redo ? redoStack.popLast() : undoStack.popLast() else { onEmpty(); return }
+        isPerforming = true
+        let started = revision
+        execute(redo ? entry.redo : entry.undo) { [self] problem in
+            isPerforming = false
+            if let problem {
+                retire([entry])
+                onFailure("Couldn’t \(redo ? "redo" : "undo") \(entry.desc)", problem)
+                return
+            }
+            // A new operation while I/O was pending invalidates this old replay path.
+            // Re-inserting it would offer Redo against files the new operation changed.
+            guard revision == started else { retire([entry]); return }
+            if redo {
+                undoStack.append(entry)
+                if undoStack.count > Self.limit { retire([undoStack.removeFirst()]) }
+            } else {
+                redoStack.append(entry)
+                if redoStack.count > Self.limit { retire([redoStack.removeFirst()]) }
+            }
+        }
     }
 
     /// Only for tests and for a fresh app state — the app never discards history.
-    func clear() { undoStack.removeAll(); redoStack.removeAll() }
+    func clear() { revision += 1; undoStack.removeAll(); redoStack.removeAll() }
 }
 
 /// Sequence a batch of moves so none of them lands on a path another move in the same
@@ -1512,9 +1539,23 @@ enum SearchQueryRules {
 enum SearchTruncation: Equatable {
     case complete(Int)
     case capped(shown: Int, cap: Int)
+    indirect case incomplete(SearchTruncation, Reason)
+
+    enum Reason: Equatable {
+        case indexCoverageUnknown, traversalErrors
+
+        var text: String {
+            switch self {
+            case .indexCoverageUnknown: return "Spotlight results only — unindexed files may be missing"
+            case .traversalErrors: return "incomplete — some locations or file details couldn’t be read"
+            }
+        }
+    }
 
     var statusText: String {
         switch self {
+        case .incomplete(let results, let reason):
+            return results.statusText + " — " + reason.text
         case .complete(let n):
             return "\(n) found"
         case .capped(let shown, let cap):
@@ -1524,8 +1565,9 @@ enum SearchTruncation: Equatable {
         }
     }
 
-    static func of(shown: Int, cap: Int, hitCap: Bool) -> SearchTruncation {
-        hitCap ? .capped(shown: shown, cap: cap) : .complete(shown)
+    static func of(shown: Int, cap: Int, hitCap: Bool, reason: Reason? = nil) -> SearchTruncation {
+        let results: SearchTruncation = hitCap ? .capped(shown: shown, cap: cap) : .complete(shown)
+        return reason.map { .incomplete(results, $0) } ?? results
     }
 }
 
@@ -2023,12 +2065,12 @@ enum SpringRules {
         // history entry and re-runs a directory read over what may be a slow SMB mount.
         // Compared as PATHS, never as URLs: "file:///tmp/a/" and "file:///tmp/a" are the
         // same folder but two different URL values, and URL equality is string equality.
-        let f = folder.standardizedFileURL.resolvingSymlinksInPath().path
-        if f == current.standardizedFileURL.resolvingSymlinksInPath().path { return false }
+        let f = lexicalPath(folder.path)
+        if f == lexicalPath(current.path) { return false }
         // Dragging a folder into itself or its own subtree can never be dropped (see
         // PathRules.isSelfOrDescendant), so opening it would strand the user inside the
         // thing they are carrying, with the drag still live and nowhere valid to release.
-        return !sources.contains { PathRules.isSelfOrDescendant(folder, of: $0) }
+        return !sources.contains { PathRules.isLexicalSelfOrDescendant(folder, of: $0) }
     }
 }
 
@@ -2100,7 +2142,10 @@ struct ViewOptions: Codable, Equatable {
 /// `photos` are one folder and two records for them is the mistake people actually hit. On a
 /// case-SENSITIVE volume two genuinely different folders then share one record — a view arriving
 /// wrong, never a file touched, which is much the cheaper of the two mistakes.
-func folderKey(_ path: String) -> String {
+func folderKey(_ path: String) -> String { lexicalPath(path).lowercased() }
+
+// Preserve case for operational paths: two names can differ only by case on APFS.
+func lexicalPath(_ path: String) -> String {
     guard !path.isEmpty else { return "" }
     // Foundation's path APIs are NOT usable here. `resolvingSymlinksInPath()` obviously reads the
     // disk, but `standardizedFileURL` does too - measured: standardizing
@@ -2128,7 +2173,7 @@ func folderKey(_ path: String) -> String {
     for root in ["/tmp", "/var", "/etc"] {
         if joined == root || joined.hasPrefix(root + "/") { joined = "/private" + joined; break }
     }
-    return joined.lowercased()
+    return joined
 }
 
 /// Whether a path may live on a volume that can stop answering — decided from the STRING ALONE.
@@ -2593,6 +2638,14 @@ enum SearchSizeFilter: String, CaseIterable, Codable {
     case huge = "Huge (> 1 GB)"
     case custom = "Custom Range…"
 
+    // Typed exponents, infinity and huge values must not trap during Int64 conversion.
+    static func bytes(megabytes text: String) -> Int64? {
+        guard let value = Double(text), value.isFinite, value >= 0 else { return nil }
+        let bytes = value * Double(mb)
+        guard bytes < Double(Int64.max) else { return nil }
+        return Int64(bytes)
+    }
+
     static let kb: Int64 = 1_000
     static let mb: Int64 = 1_000_000
     static let gb: Int64 = 1_000_000_000
@@ -2928,23 +2981,27 @@ enum DSStore {
 enum TrashOrigins {
     static let key = "trashOrigins"
     private static let limit = 500
+    private static let lock = NSLock()
     /// Injected in tests; UserDefaults.standard in the app.
     static var defaults: UserDefaults = .standard
 
     static func record(_ pairs: [(from: URL, to: URL)]) {
         guard !pairs.isEmpty else { return }
-        var map = defaults.dictionary(forKey: key) as? [String: String] ?? [:]
-        for p in pairs { map[p.from.path] = p.to.path }
-        // Drop entries whose trashed item is gone (emptied, or put back already);
-        // that both prunes and keeps the map honest about what it can still restore.
-        map = map.filter { FileManager.default.fileExists(atPath: $0.key) }
-        // Age = when the item entered the Trash, which is exactly what
-        // .addedToDirectoryDate records. An unreadable date sorts oldest, so an entry
-        // we can no longer date is the first to go rather than the last.
-        map = evict(map, limit: limit) {
-            (try? URL(fileURLWithPath: $0).resourceValues(forKeys: [.addedToDirectoryDateKey]))?
+        let snapshot = defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+        let existing = snapshot.filter { FileManager.default.fileExists(atPath: $0.key) }
+        let present = pairs.filter { FileManager.default.fileExists(atPath: $0.from.path) }
+        var ages: [String: Date] = [:]
+        for path in Set(existing.keys).union(present.map { $0.from.path }) {
+            ages[path] = (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.addedToDirectoryDateKey]))?
                 .addedToDirectoryDate ?? .distantPast
         }
+        lock.lock(); defer { lock.unlock() }
+        var map = defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+        // Merge into the latest map: another completed transfer may have recorded an
+        // origin while the age reads were waiting on a share. Never erase that entry.
+        for (path, origin) in snapshot where existing[path] == nil && map[path] == origin { map[path] = nil }
+        for p in present { map[p.from.path] = p.to.path }
+        map = evict(map, limit: limit) { ages[$0] ?? .distantFuture }
         defaults.set(map, forKey: key)
     }
 
@@ -2973,6 +3030,7 @@ enum TrashOrigins {
     }
 
     static func forget(_ trashedPaths: [String]) {
+        lock.lock(); defer { lock.unlock() }
         guard var map = defaults.dictionary(forKey: key) as? [String: String], !map.isEmpty else { return }
         for p in trashedPaths { map[p] = nil }
         defaults.set(map, forKey: key)

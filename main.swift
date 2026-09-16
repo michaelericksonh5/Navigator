@@ -671,12 +671,11 @@ final class RecentFolders: ObservableObject {
     static let shared = RecentFolders()
     @Published var urls: [URL]
     private let cap = 30
-    private let fm = FileManager.default
-    init() { urls = Prefs.recentFolders.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) } }
+    // A remembered share may be offline; probing it here can prevent the first window.
+    init() { urls = Prefs.recentFolders.map { URL(fileURLWithPath: $0, isDirectory: true) } }
     func record(_ url: URL) {
-        let std = url.standardizedFileURL
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: std.path, isDirectory: &isDir), isDir.boolValue else { return }
+        // Callers record successful operations in a known directory; no stat is needed.
+        let std = URL(fileURLWithPath: lexicalPath(url.path), isDirectory: true)
         if std.path == "/" { return }
         urls.removeAll { $0.path == std.path }
         urls.insert(std, at: 0)
@@ -686,7 +685,7 @@ final class RecentFolders: ObservableObject {
     // Drop one entry (sidebar context menu) — a folder you visited once by mistake
     // shouldn't cost you the whole list to get rid of.
     func remove(_ url: URL) {
-        let p = url.standardizedFileURL.path
+        let p = lexicalPath(url.path)
         urls.removeAll { $0.path == p }
         Prefs.recentFolders = urls.map { $0.path }
     }
@@ -970,9 +969,10 @@ final class NetworkReconnector {
             // which makes the sidebar entry look dead. Runs even when nothing needed
             // mounting, so a stale path is corrected on the very next sweep.
             DispatchQueue.main.async {
-                let moved = FavoritesStore.shared.reanchorNetworkPaths()
-                if moved || reason == "launch" {
-                    NotificationCenter.default.post(name: .navigatorShareReconnected, object: nil)
+                FavoritesStore.shared.reanchorNetworkPaths { moved in
+                    if moved || reason == "launch" {
+                        NotificationCenter.default.post(name: .navigatorShareReconnected, object: nil)
+                    }
                 }
             }
         }
@@ -4447,8 +4447,7 @@ func promptCustomSizeRange(from: Int64?, to: Int64?) -> (from: Int64?, to: Int64
     guard a.runModal() == .alertFirstButtonReturn else { return nil }
     func bytes(_ s: String) -> Int64? {
         let t = s.trimmingCharacters(in: .whitespaces)
-        guard !t.isEmpty, let mb = Double(t), mb >= 0 else { return nil }
-        return Int64(mb * Double(SearchSizeFilter.mb))
+        return SearchSizeFilter.bytes(megabytes: t)
     }
     let lo = bytes(box.fromText), hi = bytes(box.toText)
     // Both blank is not a filter — refuse rather than arm a "custom" that matches
@@ -4542,7 +4541,7 @@ final class FavoritesStore: ObservableObject {
             persist()
         }
     }
-    func contains(_ url: URL) -> Bool { items.contains { $0.path == url.standardizedFileURL.path } }
+    func contains(_ url: URL) -> Bool { items.contains { $0.path == lexicalPath(url.path) } }
 
     // Point network favorites at where their share ACTUALLY is right now.
     //
@@ -4556,28 +4555,37 @@ final class FavoritesStore: ObservableObject {
     // rewrite the path onto the real mountpoint, keeping the same sub-folder. This
     // is self-healing in both directions — when the share later returns on its
     // proper name, the paths follow it back. Returns true if anything changed.
-    @discardableResult
-    func reanchorNetworkPaths() -> Bool {
-        let fm = FileManager.default
-        var updated = items
-        var changed = false
-        for i in updated.indices {
-            guard let m = updated[i].mountURL, let share = URL(string: m) else { continue }
-            let stored = updated[i].path
-            if fm.fileExists(atPath: stored) { continue }              // already correct
-            guard let mp = Browser.mountedPath(forShare: share) else { continue }   // share not mounted
-            let rel = Browser.shareRelativePath(stored)                // "artSource", "Tools", or ""
-            let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
-            guard target != stored, fm.fileExists(atPath: target) else { continue }
-            navLog("favorite “\(updated[i].label)” re-anchored: \(stored) → \(target)")
-            updated[i].path = target
-            changed = true
+    func reanchorNetworkPaths(completion: @escaping (Bool) -> Void) {
+        let snapshot = items
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            var replacements: [(Favorite, String)] = []
+            for item in snapshot {
+                guard let m = item.mountURL, let share = URL(string: m),
+                      !fm.fileExists(atPath: item.path),
+                      let mp = Browser.mountedPath(forShare: share) else { continue }
+                let rel = Browser.shareRelativePath(item.path)
+                let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
+                guard target != item.path, fm.fileExists(atPath: target) else { continue }
+                replacements.append((item, target))
+            }
+            DispatchQueue.main.async {
+                var changed = false
+                for (old, target) in replacements {
+                    // A removed or edited favorite must not be resurrected by slow I/O.
+                    guard let i = self.items.firstIndex(where: {
+                        $0.path == old.path && $0.label == old.label && $0.mountURL == old.mountURL
+                    }) else { continue }
+                    self.items[i].path = target
+                    changed = true
+                }
+                if changed { self.persist() }
+                completion(changed)
+            }
         }
-        if changed { items = updated; persist() }
-        return changed
     }
     func add(_ url: URL, label: String? = nil, mountURL: String? = nil) {
-        let s = url.standardizedFileURL
+        let s = URL(fileURLWithPath: lexicalPath(url.path), isDirectory: true)
         if label == nil, contains(s) { return }   // dedupe plain drag-adds; named drives may share a path
         // Derive the mount URL when the caller didn't supply one and this is a network folder.
         // Without it, "Pin to Sidebar" on a share produced a favorite with nothing to reconnect
@@ -4626,7 +4634,7 @@ final class FavoritesStore: ObservableObject {
     }
 
     func remove(label: String, path: String) { items.removeAll { $0.label == label && $0.path == path }; persist() }
-    func remove(url: URL) { let p = url.standardizedFileURL.path; items.removeAll { $0.path == p }; persist() }
+    func remove(url: URL) { let p = lexicalPath(url.path); items.removeAll { $0.path == p }; persist() }
     private func persist() { if let d = try? JSONEncoder().encode(items) { UserDefaults.standard.set(d, forKey: "favoritesV2") } }
 
     // Export/import favorites as JSON — so a shared set (e.g. team network
@@ -4792,8 +4800,40 @@ func disconnectVolume(_ url: URL, isNetwork: Bool) {
     }
 }
 
+// Volume metadata can block on SMB even during menu validation. Keep one cached
+// snapshot, refreshed off-main when mounts change, so rendering never stats a share.
+final class VolumeLocations: ObservableObject {
+    static let shared = VolumeLocations()
+    @Published private(set) var items: [SidebarLocation] = []
+    private var refreshing = false
+    private var refreshPending = false
+    init() {
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification,
+                     NSWorkspace.didRenameVolumeNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.refresh()
+            }
+        }
+        refresh()
+    }
+    private func refresh() {
+        guard !refreshing else { refreshPending = true; return }
+        refreshing = true
+        refreshPending = false
+        DispatchQueue.global(qos: .utility).async {
+            let result = readVolumeLocations()
+            DispatchQueue.main.async {
+                self.refreshing = false
+                self.items = result
+                if self.refreshPending { self.refresh() }
+            }
+        }
+    }
+}
+func volumeLocations() -> [SidebarLocation] { VolumeLocations.shared.items }
+
 // Real mounted volumes via the system API (no /Volumes symlink duplicates).
-func volumeLocations() -> [SidebarLocation] {
+private func readVolumeLocations() -> [SidebarLocation] {
     let fm = FileManager.default
     let keys: Set<URLResourceKey> = [.volumeLocalizedNameKey, .volumeIsEjectableKey,
                                      .volumeIsRemovableKey, .volumeIsLocalKey, .volumeIsRootFileSystemKey]
@@ -5214,8 +5254,10 @@ final class Browser: ObservableObject, Identifiable {
         viewMode = ViewMode(rawValue: o.viewMode) ?? .list
         iconSize = max(Browser.minIconSize, min(Browser.maxIconSize, CGFloat(o.iconSize)))
         groupBy = GroupBy(rawValue: o.groupBy) ?? .none
+        // Before load has classified the volume, a conservative path check avoids
+        // stat-ing a stalled share while constructing its first view.
         let seedSort = saved == nil
-            ? NetworkColumnRules.seedSortKey(isNetwork: Browser.isNetworkURL(currentURL),
+            ? NetworkColumnRules.seedSortKey(isNetwork: VolumePathRules.mayBlockOnIO(currentURL.path),
                                              localDefault: o.sortKey)
             : o.sortKey
         sortOrder = [Browser.comparator(forColumn: seedSort, ascending: o.sortAscending)]
@@ -5225,7 +5267,7 @@ final class Browser: ObservableObject, Identifiable {
         // (NetworkColumnRules).
         let fallbackColumns = Set(o.columns.isEmpty ? defaultVisibleColumnIDs : o.columns)
         visibleColumns = saved == nil
-            ? NetworkColumnRules.seed(isNetwork: Browser.isNetworkURL(currentURL), localDefaults: fallbackColumns)
+            ? NetworkColumnRules.seed(isNetwork: VolumePathRules.mayBlockOnIO(currentURL.path), localDefaults: fallbackColumns)
             : fallbackColumns
         applyingViewOptions = false
     }
@@ -5889,13 +5931,18 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         var rows: [FileItem] = []
         let total = q.resultCount
         var i = 0
-        while i < total, rows.count < cap {
+        while i < total {
             defer { i += 1 }
             guard let mi = q.result(at: i) as? NSMetadataItem,
                   let path = mi.value(forAttribute: NSMetadataItemPathKey) as? String else { continue }
-            if let row = accept(mi, URL(fileURLWithPath: path, isDirectory: false)) { rows.append(row) }
+            if let row = accept(mi, URL(fileURLWithPath: path, isDirectory: false)) {
+                // Unexamined metadata rows may all fail the filters; only a kept row
+                // beyond the cap proves that more matching files were found.
+                if rows.count == cap { return (rows, true) }
+                rows.append(row)
+            }
         }
-        return (rows, rows.count >= cap && i < total)
+        return (rows, false)
     }
 
     // "Recents" in Favorites works like Finder's: recently used / changed FILES
@@ -5948,7 +5995,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
 
     // A result view owns the list. Old walks, debounce callbacks and directory completions
     // must lose ownership before the new view can publish, even if their I/O is still stuck.
+    private var searchTruncation: SearchTruncation?
+
     private func stopResultProducers() {
+        searchTruncation = nil
         searchDebounce?.cancel(); searchDebounce = nil
         searchGen += 1
         loadGeneration += 1; cancelPendingDetails()
@@ -6129,7 +6179,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             // treats a package as one item; so does this now.
             var opts: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
             if !showHidden { opts.insert(.skipsHiddenFiles) }
-            let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: opts)
+            var readFailed = false
+            let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: opts,
+                errorHandler: { _, _ in readFailed = true; return true })
+            if en == nil { readFailed = true }
             var total = 0
             var hitCap = false
             while let u = en?.nextObject() as? URL {
@@ -6138,7 +6191,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 let ext = u.pathExtension
                 // Empty token list = filter-only search, so every name qualifies.
                 guard SearchQueryRules.matchesFile(name: name, ext: ext, tokens: tokens) else { continue }
-                let item = Browser.item(from: u, try? u.resourceValues(forKeys: wantedKeys))
+                let values: URLResourceValues
+                do { values = try u.resourceValues(forKeys: wantedKeys) }
+                catch { readFailed = true; continue }
+                let item = Browser.item(from: u, values)
                 let matchesKind = SearchBackendRules.matchesKind(tree: kindTree, isDirectory: item.isDirectory) { tree in
                     guard let wanted = UTType(tree), let actual = UTType(filenameExtension: ext.lowercased()) else { return false }
                     return actual.conforms(to: wanted)
@@ -6146,17 +6202,21 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 guard matchesKind else { continue }
                 guard filters.matches(modified: item.modified, size: item.size,
                                       isDirectory: item.isDirectory, now: now) else { continue }
+                // Only an extra matching item proves there are more than the cap.
+                if total == Browser.searchResultCap { hitCap = true; break }
                 buffer.append(item)
                 total += 1
-                if total >= Browser.searchResultCap { hitCap = true; break }
             }
             let capped = hitCap
+            let incomplete = readFailed
             DispatchQueue.main.async { [weak self] in
                 timer.cancel()
                 guard let self, gen == self.searchGen, self.isSearching else { return }
                 self.items.append(contentsOf: buffer.drain())
-                self.status = SearchTruncation.of(shown: self.items.count,
-                                                 cap: Browser.searchResultCap, hitCap: capped).statusText
+                self.searchTruncation = SearchTruncation.of(shown: self.items.count,
+                                                 cap: Browser.searchResultCap, hitCap: capped,
+                                                 reason: incomplete ? .traversalErrors : nil)
+                self.updateStatus()
             }
         }
     }
@@ -6184,7 +6244,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // switched off, and a folder-scoped Spotlight query there returns zero rather than an
         // error — which would silently look like "no such file" while a plain walk finds it.
         // So an empty first gather on a FOLDER scope falls back to the recursive walk once.
-        // (This Mac scope is exempt: zero there really does mean zero.)
+        // (This Mac has no bounded fallback; its index coverage remains unknown.)
         if rows.isEmpty, !searchThisMac, !spotlightFellBack,
            note.name == .NSMetadataQueryDidFinishGathering {
             spotlightFellBack = true
@@ -6202,9 +6262,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         // Say so when the list is cut short. A bare "5000 items" is indistinguishable from a
         // complete answer, so a file that WAS found but fell past the cap looks like it
         // doesn't exist at all.
-        status = SearchTruncation.of(shown: rows.count,
+        searchTruncation = SearchTruncation.of(shown: rows.count,
                                      cap: Browser.searchResultCap,
-                                     hitCap: stoppedEarly).statusText
+                                     hitCap: stoppedEarly, reason: .indexCoverageUnknown)
+        updateStatus()
         // NOT stopped — enableUpdates keeps it live.
         q.enableUpdates()
     }
@@ -6311,6 +6372,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // main thread would freeze the UI. Results are applied on the main thread,
     // and stale loads (superseded by a newer navigation) are discarded.
     func load() {
+        // Undo/redo performs disk work off-main; publishing a listing still belongs here.
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.load() }
+            return
+        }
         stopResultProducers()
         isRecents = false
         isSearching = false
@@ -6715,14 +6781,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 // Publish for everyone else. Only after a COMPLETE sweep — a partial listing
                 // would spread wrong data — and throttled, since the write costs ~5 s.
                 if enumerateCompleted, !committed.isEmpty {
-                    let existing = Browser.readShareIndex(for: dir)?.savedAt
-                    if ShareIndexRules.shouldWrite(existingSavedAt: existing,
-                                                   now: Date().timeIntervalSince1970,
-                                                   dirChanged: existing == nil,
-                                                   entryCount: committed.count) {
-                        DispatchQueue.global(qos: .utility).async {
-                            Browser.writeShareIndex(committed, for: dir, dirMtime: dirMtime?.timeIntervalSince1970)
-                        }
+                    DispatchQueue.global(qos: .utility).async {
+                        let existing = Browser.readShareIndex(for: dir)?.savedAt
+                        if ShareIndexRules.shouldWrite(existingSavedAt: existing,
+                                                       now: Date().timeIntervalSince1970,
+                                                       dirChanged: existing == nil,
+                                                       entryCount: committed.count) {
+                                Browser.writeShareIndex(committed, for: dir, dirMtime: dirMtime?.timeIntervalSince1970)
+                            }
                     }
                 }   // store folder mtime for conditional revalidation
                 self.items = committed
@@ -6791,6 +6857,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     func updateStatus() {
+        // Selection changes must not erase the warning that this search is incomplete.
+        if isSearching {
+            if let result = searchTruncation {
+                status = result.statusText
+                if !selection.isEmpty { status += " — \(selection.count) selected" }
+            }
+            return
+        }
         let count = items.count
         if selection.isEmpty {
             status = "\(count) item\(count == 1 ? "" : "s")"
@@ -6894,24 +6968,17 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             let t0 = Date()
             let mounted = Browser.mountShare(smb)
             navLog("favorite: NetFS mount \(smb.absoluteString) -> \(mounted ?? "FAILED") in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+            let destination: String?
+            if self.fm.fileExists(atPath: path) { destination = path }
+            else if let mp = mounted {
+                let rel = Browser.shareRelativePath(path)
+                let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
+                destination = self.fm.fileExists(atPath: target) ? target : mp
+            } else { destination = nil }
             DispatchQueue.main.async {
                 self.busy = false; self.busyText = ""
-                // 1) Stored path present (share mounted where we expected)? Go there.
-                if self.fm.fileExists(atPath: path) {
-                    self.navigate(to: URL(fileURLWithPath: path))
-                } else if let mp = mounted {
-                    // 2) The share mounted somewhere else than the stored path — a
-                    // clash (…-1), or the coworker had it mounted under a different
-                    // name. Re-anchor the favorite's sub-path onto the ACTUAL
-                    // mountpoint so we still land inside the target folder.
-                    let rel = Browser.shareRelativePath(path)
-                    let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
-                    if self.fm.fileExists(atPath: target) {
-                        self.navigate(to: URL(fileURLWithPath: target))
-                    } else {
-                        self.navigate(to: URL(fileURLWithPath: mp))   // last resort: share root
-                    }
-                } else { NSSound.beep() }
+                if let destination { self.navigate(to: URL(fileURLWithPath: destination, isDirectory: true)) }
+                else { NSSound.beep() }
             }
         }
     }
@@ -6929,16 +6996,25 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     // table: f_mntfromname "//user@host/share" → smb://user@host/share, plus the
     // volume's mountpoint. nil for local disks.
     static func shareMountInfo(for url: URL) -> (volume: String, share: URL)? {
-        var s = statfs()
-        guard statfs(url.path, &s) == 0 else { return nil }
-        let from = withUnsafeBytes(of: &s.f_mntfromname) { raw -> String in
-            String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+        // Reconnect must work WHEN statfs cannot answer. MNT_NOWAIT reads cached
+        // mount records, and our own buffer avoids getmntinfo's shared storage.
+        let count = getfsstat(nil, 0, MNT_NOWAIT)
+        guard count > 0 else { return nil }
+        var mounts = Array(repeating: statfs(), count: Int(count))
+        let read = mounts.withUnsafeMutableBufferPointer {
+            getfsstat($0.baseAddress, Int32($0.count * MemoryLayout<statfs>.stride), MNT_NOWAIT)
         }
-        let on = withUnsafeBytes(of: &s.f_mntonname) { raw -> String in
-            String(cString: raw.baseAddress!.assumingMemoryBound(to: CChar.self))
+        guard read > 0 else { return nil }
+        var best: (volume: String, from: String)?
+        for var mount in mounts.prefix(Int(read)) {
+            let on = withUnsafeBytes(of: &mount.f_mntonname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            guard PathRules.isLexicalSelfOrDescendant(url, of: URL(fileURLWithPath: on, isDirectory: true)) else { continue }
+            let from = withUnsafeBytes(of: &mount.f_mntfromname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            guard on.count > (best?.volume.count ?? -1) else { continue }
+            best = (on, from)
         }
-        guard from.hasPrefix("//"), let u = URL(string: "smb:" + from) else { return nil }
-        return (on, u)
+        guard let best, best.from.hasPrefix("//"), let share = URL(string: "smb:" + best.from) else { return nil }
+        return (best.volume, share)
     }
 
     // Force-unmount a wedged share and mount it again, then return to the same
@@ -6962,6 +7038,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             du.arguments = ["unmount", "force", info.volume]
             try? du.run(); du.waitUntilExit()
             let attempt = Browser.mountShareReporting(info.share)
+            let target = attempt.mountPoint.map { rel.isEmpty ? $0 : ($0 as NSString).appendingPathComponent(rel) }
+            let destination = target.flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : attempt.mountPoint }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.busy = false; self.busyText = ""; self.slowNetwork = false
@@ -6983,9 +7061,8 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 }
                 // The share can come back under a different mountpoint (…-1) if a
                 // stale folder is holding the old name — re-anchor onto the new one.
-                let target = rel.isEmpty ? mp : (mp as NSString).appendingPathComponent(rel)
-                Browser.invalidateCache(target)
-                self.navigate(to: URL(fileURLWithPath: self.fm.fileExists(atPath: target) ? target : mp))
+                Browser.invalidateCache(target ?? mp)
+                self.navigate(to: URL(fileURLWithPath: destination ?? mp, isDirectory: true))
             }
         }
     }
@@ -7184,14 +7261,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func breadcrumbs() -> [(name: String, url: URL)] {
         if isRecents { return [("Recents", currentURL)] }
         var crumbs: [(String, URL)] = []
-        var u = currentURL.standardizedFileURL
+        var u = URL(fileURLWithPath: lexicalPath(currentURL.path), isDirectory: true)
         var guardCount = 0
         while guardCount < 256 {
             guardCount += 1
             let name = u.path == "/" ? "Macintosh HD" : u.lastPathComponent
             crumbs.append((name, u))
             if u.path == "/" || u.path.isEmpty { break }
-            let parent = u.deletingLastPathComponent().standardizedFileURL
+            let parent = u.deletingLastPathComponent()
             if parent.path == u.path { break }
             u = parent
         }
@@ -7253,7 +7330,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func revealInApp(_ url: URL) {
         let dir = url.deletingLastPathComponent()
         pendingRevealPaths = [url.path]
-        if currentURL.standardizedFileURL.path == dir.standardizedFileURL.path { refresh() }
+        if lexicalPath(currentURL.path) == lexicalPath(dir.path) { refresh() }
         else { navigate(to: dir) }
     }
     func refreshAndReveal(_ url: URL) { refreshAndReveal([url]) }
@@ -7617,61 +7694,76 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             a.addButton(withTitle: "Move to Trash"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
-        var restores: [(from: URL, to: URL)] = []   // where it landed in the Trash → where it came from
-        var failures: [(url: URL, reason: String)] = []
-        for u in urls {
-            var out: NSURL?
-            do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((from: t, to: u)) } }
-            catch { failures.append((u, error.localizedDescription)) }
+        let dir = currentURL
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var restores: [(from: URL, to: URL)] = []   // where it landed in the Trash → where it came from
+            var failures: [(url: URL, reason: String)] = []
+            for u in urls {
+                var out: NSURL?
+                do { try fm.trashItem(at: u, resultingItemURL: &out); if let t = out as URL? { restores.append((from: t, to: u)) } }
+                catch { failures.append((u, error.localizedDescription)) }
+            }
+            TrashOrigins.record(restores)
+            DispatchQueue.main.async {
+                if !restores.isEmpty {
+                    RecentFolders.shared.record(dir)
+                    UndoStack.shared.push("Move to Trash", undo: { [weak self] in
+                        let problem = restoreItems(restores)
+                        // The items are out of the Trash again, so their origin records name
+                        // paths that no longer exist. Left behind they would be handed to the
+                        // next thing that lands on the same Trash path (same name, same
+                        // collision suffix) as ITS origin — a Put Back to the wrong folder.
+                        TrashOrigins.forget(restores.map { $0.from.path })
+                        self?.load()
+                        return problem
+                    }, redo: { [weak self] in
+                        // Re-trashing lands at a DIFFERENT path each round (the Trash renames
+                        // collisions), so the undo half has to be re-pointed at where the items
+                        // actually went this time.
+                        let r = trashItems(restores.map { $0.to })
+                        restores = r.restores
+                        self?.load()
+                        return r.problem
+                    })
+                }
+                // Surface failures instead of silently doing nothing (e.g. protected
+                // folders like ~/Pictures need Full Disk Access to trash).
+                if !failures.isEmpty {
+                    let a = NSAlert()
+                    a.alertStyle = .warning
+                    a.messageText = failures.count == 1
+                        ? "“\(failures[0].url.lastPathComponent)” couldn't be moved to the Trash"
+                        : "\(failures.count) items couldn't be moved to the Trash"
+                    a.informativeText = (failures.first?.reason ?? "")
+                        + "\n\nItems in protected folders (like Pictures, Documents, or Desktop) may need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
+                    a.addButton(withTitle: "OK")
+                    a.runModal()
+                }
+                Browser.invalidateCache(dir.path)
+                load()
+            }
         }
-        if !restores.isEmpty {
-            TrashOrigins.record(restores)   // powers Put Back in the Trash view; see trashItems()
-            RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Move to Trash", undo: { [weak self] in
-                let problem = restoreItems(restores)
-                // The items are out of the Trash again, so their origin records name
-                // paths that no longer exist. Left behind they would be handed to the
-                // next thing that lands on the same Trash path (same name, same
-                // collision suffix) as ITS origin — a Put Back to the wrong folder.
-                TrashOrigins.forget(restores.map { $0.from.path })
-                self?.load()
-                return problem
-            }, redo: { [weak self] in
-                // Re-trashing lands at a DIFFERENT path each round (the Trash renames
-                // collisions), so the undo half has to be re-pointed at where the items
-                // actually went this time.
-                let r = trashItems(restores.map { $0.to })
-                restores = r.restores
-                self?.load()
-                return r.problem
-            })
-        }
-        // Surface failures instead of silently doing nothing (e.g. protected
-        // folders like ~/Pictures need Full Disk Access to trash).
-        if !failures.isEmpty {
-            let a = NSAlert()
-            a.alertStyle = .warning
-            a.messageText = failures.count == 1
-                ? "“\(failures[0].url.lastPathComponent)” couldn't be moved to the Trash"
-                : "\(failures.count) items couldn't be moved to the Trash"
-            a.informativeText = (failures.first?.reason ?? "")
-                + "\n\nItems in protected folders (like Pictures, Documents, or Desktop) may need Navigator to have Full Disk Access — see the Navigator menu → “Grant Full Disk Access…”."
-            a.addButton(withTitle: "OK")
-            a.runModal()
-        }
-        Browser.invalidateCache(currentURL.path)
-        load()
     }
     func newFolder() {
-        let target = uniqueDest(currentURL, "New Folder")
-        do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
-        catch { reportFileError("Couldn't create the folder", error.localizedDescription); return }
-        RecentFolders.shared.record(currentURL)
-        pushCreation("New Folder", [target])
-        // Reveal it selected and immediately ready to type a name, like Explorer/Finder.
-        pendingRevealPaths = [target.path]
-        pendingRenamePath = target.path
-        load()
+        let dir = currentURL
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let target = uniqueDest(dir, "New Folder")
+            do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
+            catch {
+                DispatchQueue.main.async { reportFileError("Couldn't create the folder", error.localizedDescription) }
+                return
+            }
+            DispatchQueue.main.async {
+                RecentFolders.shared.record(dir)
+                pushCreation("New Folder", [target])
+                // Reveal it selected and immediately ready to type a name, like Explorer/Finder.
+                if currentURL == dir {
+                    pendingRevealPaths = [target.path]
+                    pendingRenamePath = target.path
+                }
+                load()
+            }
+        }
     }
     func newTextFile() { newEmptyFile("New Text File.txt", Data(), desc: "New Text File") }
 
@@ -7685,14 +7777,19 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     private func newEmptyFile(_ name: String, _ contents: Data, desc: String) {
-        let target = uniqueDest(currentURL, name)
-        guard fm.createFile(atPath: target.path, contents: contents) else {
-            reportFileError("Couldn't create “\(name)”",
-                            "Navigator couldn't write to “\(currentURL.lastPathComponent)”."); return
+        let dir = currentURL
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let target = uniqueDest(dir, name)
+            guard fm.createFile(atPath: target.path, contents: contents) else {
+                DispatchQueue.main.async { reportFileError("Couldn't create “\(name)”",
+                                "Navigator couldn't write to “\(dir.lastPathComponent)”.") }; return
+            }
+            DispatchQueue.main.async {
+                RecentFolders.shared.record(dir)
+                pushCreation(desc, [target])
+                load()
+            }
         }
-        RecentFolders.shared.record(currentURL)
-        pushCreation(desc, [target])
-        load()
     }
 
     // Finder's "New Folder with Selection": make a folder here and move the selected
@@ -7700,7 +7797,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     //
     // The moves are done inline rather than through performTransfer, and that's the
     // point: every source is already IN this folder, so each move is a same-directory
-    // rename — instant, and impossible to collide inside a folder created empty a line
+    // rename, with no name collisions inside a folder created empty a line
     // earlier. That also lets undo be ONE step (put the items back AND remove the
     // folder we made); handing the moves to performTransfer would push its own "Move"
     // entry and leave an orphaned empty folder behind after a single ⌘Z.
@@ -7708,47 +7805,56 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         let sources = urls(ids)
         guard !sources.isEmpty else { NSSound.beep(); return }
         let dir = currentURL
-        let target = uniqueDest(dir, sources.count == 1 ? "New Folder With Item" : "New Folder With Items")
-        do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
-        catch { reportFileError("Couldn't create the folder", error.localizedDescription); return }
-        var moved: [(from: URL, to: URL)] = []
-        var failures: [String] = []
-        for src in sources {
-            let dest = target.appendingPathComponent(src.lastPathComponent)
-            do { try fm.moveItem(at: src, to: dest); moved.append((from: src, to: dest)) }
-            catch { failures.append("• \(src.lastPathComponent): \(error.localizedDescription)") }
-        }
-        // Nothing made it in — bin the folder rather than leaving an empty stray behind.
-        if moved.isEmpty {
-            try? fm.removeItem(at: target)
-            reportFileError("Couldn't move the items into a new folder", failures.joined(separator: "\n"))
-            return
-        }
-        if !failures.isEmpty {
-            reportFileError(failures.count == 1 ? "1 item couldn't be moved into the new folder"
-                                                : "\(failures.count) items couldn't be moved into the new folder",
-                            failures.prefix(5).joined(separator: "\n"))
-        }
-        RecentFolders.shared.record(dir)
-        UndoStack.shared.push("New Folder with Selection", undo: { [weak self] in
-            let problem = restoreItems(moved.map { (from: $0.to, to: $0.from) })
-            // Only remove it if it's genuinely empty: the user may have dropped
-            // something else in since, and deleting that would be data loss.
-            if (try? FileManager.default.contentsOfDirectory(atPath: target.path))?.isEmpty == true {
-                try? FileManager.default.removeItem(at: target)
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let target = uniqueDest(dir, sources.count == 1 ? "New Folder With Item" : "New Folder With Items")
+            do { try fm.createDirectory(at: target, withIntermediateDirectories: false) }
+            catch {
+                DispatchQueue.main.async { reportFileError("Couldn't create the folder", error.localizedDescription) }
+                return
             }
-            self?.load()
-            return problem
-        }, redo: { [weak self] in
-            try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
-            let problem = restoreItems(moved)
-            self?.load()
-            return problem
-        })
-        Browser.invalidateCache(dir.path)
-        pendingRevealPaths = [target.path]
-        pendingRenamePath = target.path
-        load()
+            var moved: [(from: URL, to: URL)] = []
+            var failures: [String] = []
+            for src in sources {
+                let dest = target.appendingPathComponent(src.lastPathComponent)
+                do { try fm.moveItem(at: src, to: dest); moved.append((from: src, to: dest)) }
+                catch { failures.append("• \(src.lastPathComponent): \(error.localizedDescription)") }
+            }
+            // Nothing made it in — bin the folder rather than leaving an empty stray behind.
+            if moved.isEmpty {
+                try? fm.removeItem(at: target)
+                DispatchQueue.main.async { reportFileError("Couldn't move the items into a new folder", failures.joined(separator: "\n")) }
+                return
+            }
+            DispatchQueue.main.async {
+                if !failures.isEmpty {
+                    reportFileError(failures.count == 1 ? "1 item couldn't be moved into the new folder"
+                                                        : "\(failures.count) items couldn't be moved into the new folder",
+                                    failures.prefix(5).joined(separator: "\n"))
+                }
+                RecentFolders.shared.record(dir)
+                UndoStack.shared.push("New Folder with Selection", undo: { [weak self] in
+                    let problem = restoreItems(moved.map { (from: $0.to, to: $0.from) })
+                    // Only remove it if it's genuinely empty: the user may have dropped
+                    // something else in since, and deleting that would be data loss.
+                    if (try? FileManager.default.contentsOfDirectory(atPath: target.path))?.isEmpty == true {
+                        try? FileManager.default.removeItem(at: target)
+                    }
+                    self?.load()
+                    return problem
+                }, redo: { [weak self] in
+                    try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+                    let problem = restoreItems(moved)
+                    self?.load()
+                    return problem
+                })
+                Browser.invalidateCache(dir.path)
+                if currentURL == dir {
+                    pendingRevealPaths = [target.path]
+                    pendingRenamePath = target.path
+                }
+                load()
+            }
+        }
     }
 
     // File clipboard. STATIC, not per-Browser: the pasteboard is system-wide, and
@@ -7983,25 +8089,6 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
 
     private func performTransfer(_ sources: [URL], into dir: URL, move: Bool, resetCut: Bool) {
         let fm = FileManager.default
-        // Refuse folder-into-itself before touching the disk (Finder does the same).
-        //
-        // Note there is deliberately NO isDirectory check here. It would be a stat
-        // per source on the MAIN thread — a round trip each over SMB, which is
-        // exactly what the comment below says never to do, and a drop of a hundred
-        // files from a slow share would freeze the UI. It's also unnecessary: a
-        // destination directory can never equal, nor live inside, a FILE's path, so
-        // path comparison alone can only ever flag a real folder.
-        let recursive = sources.filter { Browser.isSelfOrDescendant(dir, of: $0) }
-        if !recursive.isEmpty {
-            let names = recursive.map { "“\($0.lastPathComponent)”" }.joined(separator: ", ")
-            navLog("transfer REFUSED: \(DropRejection.selfOrDescendant(count: recursive.count).reason) — \(names) → \(dir.path)")
-            reportFileError(recursive.count == 1 ? "\(names) can’t be \(move ? "moved" : "copied") into itself"
-                                                : "\(recursive.count) folders can’t be \(move ? "moved" : "copied") into themselves",
-                            "A folder can’t be \(move ? "moved" : "copied") into itself or into one of its own subfolders. Pick a destination outside \(names).",
-                            permissionHint: false)
-            if resetCut { Browser.cutMode = false }
-            return
-        }
         // A copy whose source already lives in the destination is an in-place
         // duplicate ("paste into same folder") — it gets a numbered name silently,
         // so it's never treated as a conflict.
@@ -8018,6 +8105,23 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
+            // Resolving symlinks is disk I/O too. Keep the recursion guard on this
+            // worker so a stalled share cannot freeze the drop handler.
+            let recursive = sources.filter { Browser.isSelfOrDescendant(dir, of: $0) }
+            if !recursive.isEmpty {
+                DispatchQueue.main.async {
+                    slowHint.cancel(); TransferProgressController.shared.hide()
+                    self.busy = false; self.busyText = ""; self.slowNetwork = false
+                    let names = recursive.map { "“\($0.lastPathComponent)”" }.joined(separator: ", ")
+                    navLog("transfer REFUSED: \(DropRejection.selfOrDescendant(count: recursive.count).reason) — \(names) → \(dir.path)")
+                    reportFileError(recursive.count == 1 ? "\(names) can’t be \(move ? "moved" : "copied") into itself"
+                                                    : "\(recursive.count) folders can’t be \(move ? "moved" : "copied") into themselves",
+                                "A folder can’t be \(move ? "moved" : "copied") into itself or into one of its own subfolders. Pick a destination outside \(names).",
+                                permissionHint: false)
+                    if resetCut { Browser.cutMode = false }
+                }
+                return
+            }
             // Conflict scan runs HERE, on the background thread — fileExists over
             // SMB is a round-trip and must never block the main thread. The prompt
             // (which must be on the main thread) hops over and back via a semaphore.
@@ -8248,22 +8352,28 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     func makeAlias(_ ids: Set<String>) {
-        var created: [URL] = []
-        var failure: String?
-        for it in items.filter({ ids.contains($0.id) }) {
-            let aliasURL = uniqueDest(currentURL, it.url.deletingPathExtension().lastPathComponent + " alias")
-            do {
-                let data = try it.url.bookmarkData(options: .suitableForBookmarkFile, includingResourceValuesForKeys: nil, relativeTo: nil)
-                try URL.writeBookmarkData(data, to: aliasURL)
-                created.append(aliasURL)
-            } catch { failure = failure ?? error.localizedDescription }
+        let dir = currentURL
+        let selected = items.filter { ids.contains($0.id) }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var created: [URL] = []
+            var failure: String?
+            for it in selected {
+                let aliasURL = uniqueDest(dir, it.url.deletingPathExtension().lastPathComponent + " alias")
+                do {
+                    let data = try it.url.bookmarkData(options: .suitableForBookmarkFile, includingResourceValuesForKeys: nil, relativeTo: nil)
+                    try URL.writeBookmarkData(data, to: aliasURL)
+                    created.append(aliasURL)
+                } catch { failure = failure ?? error.localizedDescription }
+            }
+            DispatchQueue.main.async {
+                if let failure { reportFileError("Couldn't make an alias", failure) }
+                if !created.isEmpty {
+                    RecentFolders.shared.record(dir)
+                    pushCreation("Make Alias", created)
+                }
+                load()
+            }
         }
-        if let failure { reportFileError("Couldn't make an alias", failure) }
-        if !created.isEmpty {
-            RecentFolders.shared.record(currentURL)
-            pushCreation("Make Alias", created)
-        }
-        load()
     }
 
     // Writes Finder tags via the com.apple.metadata:_kMDItemUserTags xattr (the
@@ -8293,19 +8403,22 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         for it in affected {
             var t = it.tags
             if let idx = t.firstIndex(of: tag) { t.remove(at: idx) } else { t.append(tag) }
-            Browser.writeTags(it.url, t)
             redoData.append((it.url, t))
         }
-        pushTags(undoData, redoData)
-        load()
+        let updates = redoData
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            for (url, tags) in updates { Browser.writeTags(url, tags) }
+            DispatchQueue.main.async { pushTags(undoData, updates); load() }
+        }
     }
     func setTags(_ ids: Set<String>, tags: [String]) {
         let affected = items.filter { ids.contains($0.id) }
         guard !affected.isEmpty else { return }
         let undoData: [(URL, [String])] = affected.map { ($0.url, $0.tags) }
-        for it in affected { Browser.writeTags(it.url, tags) }
-        pushTags(undoData, affected.map { ($0.url, tags) })
-        load()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            for it in affected { Browser.writeTags(it.url, tags) }
+            DispatchQueue.main.async { pushTags(undoData, affected.map { ($0.url, tags) }); load() }
+        }
     }
     func setComment(id: String, _ comment: String) {
         guard let it = items.first(where: { $0.id == id }) else { return }
@@ -8332,47 +8445,61 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     func applyRenames(_ pairs: [(url: URL, newName: String)]) {
-        var undo: [(from: URL, to: URL)] = []   // renamed → original
-        var failure: String?
-        for (url, newName) in pairs {
-            let n = newName.trimmingCharacters(in: .whitespaces)
-            guard !n.isEmpty, n != url.lastPathComponent else { continue }
-            let dest = url.deletingLastPathComponent().appendingPathComponent(n)
-            guard !fm.fileExists(atPath: dest.path) else { continue }
-            do { try fm.moveItem(at: url, to: dest); undo.append((from: dest, to: url)) }
-            catch { failure = failure ?? error.localizedDescription }
+        let dir = currentURL
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var undo: [(from: URL, to: URL)] = []   // renamed → original
+            var failure: String?
+            for (url, newName) in pairs {
+                let n = newName.trimmingCharacters(in: .whitespaces)
+                guard !n.isEmpty, n != url.lastPathComponent else { continue }
+                if let why = PathRules.invalidNameReason(n) { failure = failure ?? why; continue }
+                let dest = url.deletingLastPathComponent().appendingPathComponent(n)
+                guard !fm.fileExists(atPath: dest.path) else { continue }
+                do { try fm.moveItem(at: url, to: dest); undo.append((from: dest, to: url)) }
+                catch { failure = failure ?? error.localizedDescription }
+            }
+            DispatchQueue.main.async {
+                if let failure { reportFileError("Some items couldn't be renamed", failure) }
+                if !undo.isEmpty { RecentFolders.shared.record(dir) }
+                if !undo.isEmpty {
+                    UndoStack.shared.push("Batch Rename", undo: { [weak self] in
+                        let problem = restoreItems(undo)
+                        self?.load()
+                        return problem
+                    }, redo: { [weak self] in
+                        let problem = restoreItems(undo.map { (from: $0.to, to: $0.from) })
+                        self?.load()
+                        return problem
+                    })
+                }
+                load()
+            }
         }
-        if let failure { reportFileError("Some items couldn't be renamed", failure) }
-        if !undo.isEmpty { RecentFolders.shared.record(currentURL) }
-        if !undo.isEmpty {
-            UndoStack.shared.push("Batch Rename", undo: { [weak self] in
-                let problem = restoreItems(undo)
-                self?.load()
-                return problem
-            }, redo: { [weak self] in
-                let problem = restoreItems(undo.map { (from: $0.to, to: $0.from) })
-                self?.load()
-                return problem
-            })
-        }
-        load()
     }
 
     func makeSymlink(_ ids: Set<String>) {
-        var created: [URL] = []
-        for it in items.filter({ ids.contains($0.id) }) {
-            let base = it.url.deletingPathExtension().lastPathComponent
-            let ext = it.url.pathExtension
-            let linkName = ext.isEmpty ? "\(base) symlink" : "\(base) symlink.\(ext)"
-            let linkURL = uniqueDest(currentURL, linkName)
-            do { try fm.createSymbolicLink(at: linkURL, withDestinationURL: it.url); created.append(linkURL) }
-            catch { reportFileError("Couldn't create the symbolic link", error.localizedDescription) }
+        let dir = currentURL
+        let selected = items.filter { ids.contains($0.id) }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var failure: String?
+            var created: [URL] = []
+            for it in selected {
+                let base = it.url.deletingPathExtension().lastPathComponent
+                let ext = it.url.pathExtension
+                let linkName = ext.isEmpty ? "\(base) symlink" : "\(base) symlink.\(ext)"
+                let linkURL = uniqueDest(dir, linkName)
+                do { try fm.createSymbolicLink(at: linkURL, withDestinationURL: it.url); created.append(linkURL) }
+                catch { failure = failure ?? error.localizedDescription }
+            }
+            DispatchQueue.main.async {
+                if let failure { reportFileError("Couldn't create the symbolic link", failure) }
+                if !created.isEmpty {
+                    RecentFolders.shared.record(dir)
+                    pushCreation("Make Symbolic Link", created)
+                }
+                load()
+            }
         }
-        if !created.isEmpty {
-            RecentFolders.shared.record(currentURL)
-            pushCreation("Make Symbolic Link", created)
-        }
-        load()
     }
 
     /// Do these two paths name the SAME item on disk? File identity, not a string
@@ -8431,69 +8558,83 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         let oldURL = item.url
         let dir = oldURL.deletingLastPathComponent()
-        var dest = dir.appendingPathComponent(n)
-        // The item displaced by Replace, so Undo can put it back.
-        var replaced: URL?
-        if PathRules.renameCollides(dest: dest.path,
-                                    exists: { self.fm.fileExists(atPath: $0) },
-                                    isSameItem: { Browser.isSameItem($0, as: oldURL) }) {
-            switch askConflictPolicy("“\(n)” already exists in “\(dir.lastPathComponent)”",
-                                     informative: "Choose how to handle items with the same name.",
-                                     options: [.keepBoth, .replace]) {
-            case .keepBoth:
-                dest = uniqueDest(dir, n)
-            case .replace:
-                replaced = dest
-            default:
-                return   // Cancel — the original name stands
+        let name = n
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var dest = dir.appendingPathComponent(name)
+            // The item displaced by Replace, so Undo can put it back.
+            var replaced: URL?
+            if PathRules.renameCollides(dest: dest.path,
+                                        exists: { self.fm.fileExists(atPath: $0) },
+                                        isSameItem: { Browser.isSameItem($0, as: oldURL) }) {
+                let policy = DispatchQueue.main.sync { askConflictPolicy("“\(name)” already exists in “\(dir.lastPathComponent)”",
+                                         informative: "Choose how to handle items with the same name.",
+                                         options: [.keepBoth, .replace]) }
+                switch policy {
+                case .keepBoth:
+                    dest = uniqueDest(dir, name)
+                case .replace:
+                    replaced = dest
+                default:
+                    return   // Cancel — the original name stands
+                }
+            }
+            let finalDest = dest
+            func applyRename() throws {
+                if let stash = try renameItem(oldURL, to: finalDest, replacing: replaced != nil) {
+                    replaced = stash
+                }
+            }
+            do {
+                try applyRename()
+                DispatchQueue.main.async {
+                    RecentFolders.shared.record(dir)
+                    UndoStack.shared.push("Rename", undo: { [weak self] in
+                        var problem = restoreItems([(from: finalDest, to: oldURL)])
+                        if let r = replaced { problem = problem ?? restoreItems([(from: r, to: finalDest)]) }
+                        self?.load()
+                        return problem
+                    }, redo: { [weak self] in
+                        var problem: String?
+                        do { try applyRename() } catch { problem = error.localizedDescription }
+                        self?.load()
+                        return problem
+                    }, cleanup: {
+                        // The entry can never be replayed now, so the displaced original is
+                        // unreachable through Undo - bin the stash rather than leaving a hidden
+                        // file in the user's folder for good.
+                        if let r = replaced { try? FileManager.default.removeItem(at: r) }
+                    })
+                    load()
+                }
+            } catch {
+                DispatchQueue.main.async { reportFileError("Couldn't rename “\(item.name)”", error.localizedDescription) }
             }
         }
-        let finalDest = dest
-        func applyRename() throws {
-            if let stash = try renameItem(oldURL, to: finalDest, replacing: replaced != nil) {
-                replaced = stash
-            }
-        }
-        do {
-            try applyRename()
-            RecentFolders.shared.record(currentURL)
-            UndoStack.shared.push("Rename", undo: { [weak self] in
-                var problem = restoreItems([(from: finalDest, to: oldURL)])
-                if let r = replaced { problem = problem ?? restoreItems([(from: r, to: finalDest)]) }
-                self?.load()
-                return problem
-            }, redo: { [weak self] in
-                var problem: String?
-                do { try applyRename() } catch { problem = error.localizedDescription }
-                self?.load()
-                return problem
-            }, cleanup: {
-                // The entry can never be replayed now, so the displaced original is
-                // unreachable through Undo - bin the stash rather than leaving a hidden
-                // file in the user's folder for good.
-                if let r = replaced { try? FileManager.default.removeItem(at: r) }
-            })
-            load()
-        } catch { reportFileError("Couldn't rename “\(item.name)”", error.localizedDescription) }
     }
 
     func duplicate(_ ids: Set<String>) {
-        var created: [URL] = []
-        var failure: String?
-        for it in items.filter({ ids.contains($0.id) }) {
-            let ext = it.url.pathExtension
-            let base = it.url.deletingPathExtension().lastPathComponent
-            let name = ext.isEmpty ? "\(base) copy" : "\(base) copy.\(ext)"
-            let dest = uniqueDest(currentURL, name)
-            do { try fm.copyItem(at: it.url, to: dest); created.append(dest) }
-            catch { failure = failure ?? error.localizedDescription }
+        let dir = currentURL
+        let selected = items.filter { ids.contains($0.id) }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var created: [URL] = []
+            var failure: String?
+            for it in selected {
+                let ext = it.url.pathExtension
+                let base = it.url.deletingPathExtension().lastPathComponent
+                let name = ext.isEmpty ? "\(base) copy" : "\(base) copy.\(ext)"
+                let dest = uniqueDest(dir, name)
+                do { try fm.copyItem(at: it.url, to: dest); created.append(dest) }
+                catch { failure = failure ?? error.localizedDescription }
+            }
+            DispatchQueue.main.async {
+                if let failure { reportFileError("Couldn't duplicate", failure) }
+                if !created.isEmpty {
+                    RecentFolders.shared.record(dir)
+                    pushCreation("Duplicate", created)
+                }
+                load()
+            }
         }
-        if let failure { reportFileError("Couldn't duplicate", failure) }
-        if !created.isEmpty {
-            RecentFolders.shared.record(currentURL)
-            pushCreation("Duplicate", created)
-        }
-        load()
     }
 
     func infoText(_ ids: Set<String>) -> String {
@@ -8505,7 +8646,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
         let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
         let sizeStr = it.isDirectory ? "Folder" : ByteCountFormatter.string(fromByteCount: it.size, countStyle: .file)
-        let created = (try? it.url.resourceValues(forKeys: [.creationDateKey]))?.creationDate
+        let created: Date? = it.created
         return """
         Name:      \(it.name)
         Kind:      \(it.kind)
@@ -8519,12 +8660,13 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     func compress(_ ids: Set<String>) {
         let sel = items.filter { ids.contains($0.id) }
         guard !sel.isEmpty else { return }
-        guard let inputs = PathRules.archiveInputs(sel.map { $0.url }) else { return }
         let zipName = sel.count == 1 ? (sel[0].url.deletingPathExtension().lastPathComponent + ".zip") : "Archive.zip"
-        let dest = uniqueDest(currentURL, zipName)
         let dir = currentURL
         busy = true; busyText = "Compressing…"
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            guard let inputs = PathRules.archiveInputs(sel.map { $0.url }) else { return }
+            let dest = self.uniqueDest(dir, zipName)
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
             p.arguments = ["-r", "-q", dest.path] + inputs.entries
@@ -8532,17 +8674,17 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var runError: String?
             do { try p.run(); p.waitUntilExit() } catch { runError = error.localizedDescription }
             let ok = runError == nil && p.terminationStatus == 0
+            if !ok { try? FileManager.default.removeItem(at: dest) }
             DispatchQueue.main.async {
-                self?.busy = false; self?.busyText = ""
+                self.busy = false; self.busyText = ""
                 if ok {
                     RecentFolders.shared.record(dir)
-                    self?.pushCreation("Compress", [dest])
+                    self.pushCreation("Compress", [dest])
                 } else {
-                    try? FileManager.default.removeItem(at: dest)   // clean up partial archive
                     reportFileError("Couldn't create the archive",
                                     runError ?? "zip exited with code \(p.terminationStatus).")
                 }
-                self?.load()
+                self.load()
             }
         }
     }
@@ -8592,15 +8734,19 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
 
     func emptyTrash() {
         let trash = Browser.trashURL
-        guard let entries = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
-        var failure: String?
-        var gone: [String] = []
-        for e in entries {
-            do { try fm.removeItem(at: e); gone.append(e.path) } catch { failure = failure ?? error.localizedDescription }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            guard let entries = try? fm.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil) else { return }
+            var failure: String?
+            var gone: [String] = []
+            for e in entries {
+                do { try fm.removeItem(at: e); gone.append(e.path) } catch { failure = failure ?? error.localizedDescription }
+            }
+            DispatchQueue.main.async {
+                TrashOrigins.forget(gone)
+                if let failure { reportFileError("Some items couldn't be removed from the Trash", failure) }
+                if isTrash { load() }
+            }
         }
-        TrashOrigins.forget(gone)
-        if let failure { reportFileError("Some items couldn't be removed from the Trash", failure) }
-        if isTrash { load() }
     }
 
     // MARK: Trash browsing & Put Back
@@ -8610,7 +8756,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     /// True only for the Trash ITSELF, not folders inside it: put-back is recorded for
     /// the top-level item that was trashed, so a file three levels down inside a
     /// trashed folder has no origin of its own and must not be offered one.
-    var isTrash: Bool { currentURL.standardizedFileURL.path == Browser.trashURL.standardizedFileURL.path }
+    var isTrash: Bool { lexicalPath(currentURL.path) == lexicalPath(Browser.trashURL.path) }
 
     /// Finder's put-back records for the Trash, read once per visit. Keyed by the
     /// item's name inside the Trash.
@@ -8648,51 +8794,56 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     /// the user has no way to know it happened.
     func putBack(_ ids: Set<String>) {
         let sel = items.filter { ids.contains($0.id) }
-        var moves: [(from: URL, to: URL)] = []
-        var unresolved: [String] = []
-        var missingFolders: [String] = []
-        for it in sel {
-            guard let origin = trashOrigin(of: it) else { unresolved.append(it.name); continue }
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: origin.directory, isDirectory: &isDir), isDir.boolValue else {
-                missingFolders.append("• \(it.name) → \(origin.directory)")
-                continue
+        let origins = sel.map { trashOrigin(of: $0) }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var moves: [(from: URL, to: URL)] = []
+            var unresolved: [String] = []
+            var missingFolders: [String] = []
+            for (it, storedOrigin) in zip(sel, origins) {
+                guard let origin = storedOrigin else { unresolved.append(it.name); continue }
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: origin.directory, isDirectory: &isDir), isDir.boolValue else {
+                    missingFolders.append("• \(it.name) → \(origin.directory)")
+                    continue
+                }
+                // Something already lives at the original path. Keep Both rather than
+                // clobber: the file at the destination is one the user still has, and
+                // silently replacing it with a deleted version is unrecoverable.
+                let dest = fm.fileExists(atPath: origin.url.path)
+                    ? uniqueDest(URL(fileURLWithPath: origin.directory), origin.name)
+                    : origin.url
+                moves.append((from: it.url, to: dest))
             }
-            // Something already lives at the original path. Keep Both rather than
-            // clobber: the file at the destination is one the user still has, and
-            // silently replacing it with a deleted version is unrecoverable.
-            let dest = fm.fileExists(atPath: origin.url.path)
-                ? uniqueDest(URL(fileURLWithPath: origin.directory), origin.name)
-                : origin.url
-            moves.append((from: it.url, to: dest))
-        }
-        if !moves.isEmpty {
             let problem = restoreItems(moves)
             TrashOrigins.forget(moves.map { $0.from.path })
-            let undoPairs = moves.map { (from: $0.to, to: $0.from) }
-            UndoStack.shared.push("Put Back", undo: { [weak self] in
-                let p = restoreItems(undoPairs)
-                TrashOrigins.record(undoPairs.map { (from: $0.to, to: $0.from) })
-                self?.load(); return p
-            }, redo: { [weak self] in
-                let p = restoreItems(moves)
-                TrashOrigins.forget(moves.map { $0.from.path })
-                self?.load(); return p
-            })
-            load()
-            if let problem { reportFileError("Some items couldn't be put back", problem) }
-        }
-        if !missingFolders.isEmpty {
-            reportFileError("The original folder no longer exists",
-                            missingFolders.prefix(5).joined(separator: "\n")
-                            + "\n\nUse “Move to…” to choose somewhere else.", permissionHint: false)
-        }
-        if !unresolved.isEmpty {
-            reportFileError(unresolved.count == 1
-                            ? "Navigator doesn't know where “\(unresolved[0])” came from"
-                            : "\(unresolved.count) items have no recorded original location",
-                            "macOS only records an item's original location when it's moved to the Trash, and that record can be missing for items trashed by other apps or on an earlier system.\n\nUse “Move to…” to put them somewhere you choose.",
-                            permissionHint: false)
+            DispatchQueue.main.async {
+                if !moves.isEmpty {
+                    let undoPairs = moves.map { (from: $0.to, to: $0.from) }
+                    UndoStack.shared.push("Put Back", undo: { [weak self] in
+                        let p = restoreItems(undoPairs)
+                        TrashOrigins.record(undoPairs.map { (from: $0.to, to: $0.from) })
+                        self?.load(); return p
+                    }, redo: { [weak self] in
+                        let p = restoreItems(moves)
+                        TrashOrigins.forget(moves.map { $0.from.path })
+                        self?.load(); return p
+                    })
+                    load()
+                    if let problem { reportFileError("Some items couldn't be put back", problem) }
+                }
+                if !missingFolders.isEmpty {
+                    reportFileError("The original folder no longer exists",
+                                    missingFolders.prefix(5).joined(separator: "\n")
+                                    + "\n\nUse “Move to…” to choose somewhere else.", permissionHint: false)
+                }
+                if !unresolved.isEmpty {
+                    reportFileError(unresolved.count == 1
+                                    ? "Navigator doesn't know where “\(unresolved[0])” came from"
+                                    : "\(unresolved.count) items have no recorded original location",
+                                    "macOS only records an item's original location when it's moved to the Trash, and that record can be missing for items trashed by other apps or on an earlier system.\n\nUse “Move to…” to put them somewhere you choose.",
+                                    permissionHint: false)
+                }
+            }
         }
     }
 
@@ -8707,17 +8858,21 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         p.canChooseDirectories = true
         p.canCreateDirectories = true
         guard p.runModal() == .OK, let dir = p.url else { return }
-        let moves = sel.map { (from: $0.url, to: uniqueDest(dir, $0.name)) }
-        let problem = restoreItems(moves)
-        TrashOrigins.forget(moves.map { $0.from.path })
-        let undoPairs = moves.map { (from: $0.to, to: $0.from) }
-        UndoStack.shared.push("Move Out of Trash", undo: { [weak self] in
-            let p = restoreItems(undoPairs); self?.load(); return p
-        }, redo: { [weak self] in
-            let p = restoreItems(moves); self?.load(); return p
-        })
-        load()
-        if let problem { reportFileError("Some items couldn't be moved", problem) }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let moves = sel.map { (from: $0.url, to: uniqueDest(dir, $0.name)) }
+            let problem = restoreItems(moves)
+            TrashOrigins.forget(moves.map { $0.from.path })
+            DispatchQueue.main.async {
+                let undoPairs = moves.map { (from: $0.to, to: $0.from) }
+                UndoStack.shared.push("Move Out of Trash", undo: { [weak self] in
+                    let p = restoreItems(undoPairs); self?.load(); return p
+                }, redo: { [weak self] in
+                    let p = restoreItems(moves); self?.load(); return p
+                })
+                load()
+                if let problem { reportFileError("Some items couldn't be moved", problem) }
+            }
+        }
     }
 
     /// Permanent delete of selected Trash items. Not undoable, hence the confirmation
@@ -8733,15 +8888,19 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         a.informativeText = "This can't be undone."
         a.addButton(withTitle: "Delete"); a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { return }
-        var failure: String?
-        var gone: [String] = []
-        for it in sel {
-            do { try fm.removeItem(at: it.url); gone.append(it.url.path) }
-            catch { failure = failure ?? "• \(it.name): \(error.localizedDescription)" }
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            var failure: String?
+            var gone: [String] = []
+            for it in sel {
+                do { try fm.removeItem(at: it.url); gone.append(it.url.path) }
+                catch { failure = failure ?? "• \(it.name): \(error.localizedDescription)" }
+            }
+            TrashOrigins.forget(gone)
+            DispatchQueue.main.async {
+                load()
+                if let failure { reportFileError("Some items couldn't be deleted", failure) }
+            }
         }
-        TrashOrigins.forget(gone)
-        load()
-        if let failure { reportFileError("Some items couldn't be deleted", failure) }
     }
 }
 
@@ -9580,8 +9739,8 @@ final class SpringLoader {
         guard SpringRules.canSpring(into: folder, from: browser.currentURL,
                                     dragging: Self.draggedFiles()) else { cancel(); return }
         watch.start { [weak self] in self?.finish() }
-        let path = folder.standardizedFileURL.path
-        if armed?.standardizedFileURL.path == path { return }
+        let path = lexicalPath(folder.path)
+        if armed.map({ lexicalPath($0.path) }) == path { return }
         // A different folder: restart the countdown from zero. THIS is what stops a drag
         // that merely sweeps across a folder on the way somewhere else from opening it.
         cancel()
@@ -9609,7 +9768,7 @@ final class SpringLoader {
     /// SwiftUI reports the NEW cell as targeted BEFORE the old one un-targets, so an
     /// unconditional cancel here would kill the countdown the next cell just armed.
     func leave(_ folder: URL) {
-        if armed?.standardizedFileURL.path == folder.standardizedFileURL.path { cancel() }
+        if armed.map({ lexicalPath($0.path) }) == lexicalPath(folder.path) { cancel() }
     }
 
     /// Unconditional — for surfaces that report "the drag left me entirely" (the table's
@@ -9802,7 +9961,10 @@ final class TabDrag {
 /// segment): builds the FileItem from the URL itself, since showInfo() can only look
 /// ids up in browser.items, which only ever holds the CURRENT folder's contents.
 func showFolderInfo(_ url: URL, browser: Browser) {
-    GetInfoController.shared.show(browser, Browser.item(from: url, try? url.resourceValues(forKeys: Set(Browser.itemKeys))))
+    DispatchQueue.global(qos: .userInitiated).async {
+        let item = Browser.item(from: url, try? url.resourceValues(forKeys: Set(Browser.itemKeys)))
+        DispatchQueue.main.async { GetInfoController.shared.show(browser, item) }
+    }
 }
 
 struct SidebarView: View {
@@ -9811,6 +9973,7 @@ struct SidebarView: View {
     @ObservedObject var recents = RecentFolders.shared
     @ObservedObject var network = NetworkBrowser.shared
     @ObservedObject var favStore = FavoritesStore.shared
+    @ObservedObject private var volumesStore = VolumeLocations.shared
     @State private var favNodes: [SidebarNode] = []
     @State private var recentsTargeted = false
     @State private var cloudNodes: [SidebarNode] = []
@@ -9930,7 +10093,7 @@ struct SidebarView: View {
                     // Drop a folder on its own row (or on a row inside it) and there
                     // is nothing sane to do — dropInto would alert about copying a
                     // folder into itself for what was obviously just a missed aim.
-                    let safe = urls.filter { !PathRules.isSelfOrDescendant(folder, of: $0) }
+                    let safe = urls.filter { !PathRules.isLexicalSelfOrDescendant(folder, of: $0) }
                     guard !safe.isEmpty else {
                         DropLog.refused(surface, urls, target: folder,
                                         DropRejection.forFileDrop(items: urls.count, fileURLs: DropLog.usable(urls))
@@ -9998,7 +10161,7 @@ struct SidebarView: View {
             // Show a pushpin on top-level pinned favorites (Windows 11 Quick Access
             // style). Home stays a fixed anchor with no pin. Click the pin to unpin.
             let isTop = n.id == node.id
-            let isHome = n.url.standardizedFileURL.path == FileManager.default.homeDirectoryForCurrentUser.path
+            let isHome = lexicalPath(n.url.path) == FileManager.default.homeDirectoryForCurrentUser.path
             let pinned = removable && isTop && !isHome
             HStack(spacing: 4) {
                 Button { browser.openFavorite(n.url.path, mountURL: n.mountURL) } label: {
@@ -10045,7 +10208,7 @@ struct SidebarView: View {
     }
 
     var body: some View {
-        let volumes = volumeLocations()
+        let volumes = volumesStore.items
         List {
             Section("Favorites") {
                 // Recents sits above the first favorite, so it's exactly where you let
@@ -12443,7 +12606,7 @@ private final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTab
         if let hit = folderRow(under: info, in: tableView) {
             // Never drop a folder into itself or its own subtree — FileManager will
             // happily recurse into the copy it's creating. PathRules has the rule.
-            let safe = urls.filter { !PathRules.isSelfOrDescendant(hit.url, of: $0) }
+            let safe = urls.filter { !PathRules.isLexicalSelfOrDescendant(hit.url, of: $0) }
             guard !safe.isEmpty else {
                 // The beep was the only feedback this ever gave, and a beep does not say which
                 // of the two possible reasons it was.
@@ -13963,50 +14126,57 @@ struct ImageViewerView: View {
     private func deleteCurrent() {
         guard urls.indices.contains(index) else { return }
         let target = urls[index]
+        let wasAt = index
+        let vid = viewerID
         let perform = {
-            // trashItems, not fm.trashItem: the helper records where this came from, so
-            // Put Back works on an image deleted here. A bare trashItem left it in the
-            // Trash with no origin at all.
-            let r = trashItems([target])
-            guard let landed = r.restores.first?.from else {
-                reportFileError("Couldn't move “\(target.lastPathComponent)” to the Trash.", r.problem ?? "")
-                return
-            }
-            var trashed: URL? = landed   // re-pointed by redo; the Trash path changes each round
-            // Where it was in THIS viewer's list, captured now: the closures below run
-            // long after `index` has moved on to the next picture.
-            let wasAt = index
-            let vid = viewerID
-            // Undoing the delete used to put the file back on disk and nothing else, so
-            // the picture stayed missing from the viewer you deleted it in until you
-            // closed and reopened the folder — the one place the user is looking.
-            //
-            // Posted rather than written straight into `urls`: this closure outlives the
-            // window (the undo stack is app-wide, and the viewer closes itself when the
-            // last image goes), and writing into a torn-down @State is a SwiftUI warning
-            // and a silently dropped update. A notification nobody is listening for is
-            // simply nothing.
-            let tell = { (insert: Bool) in
-                NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
-                                                userInfo: ["viewer": vid, "url": target,
-                                                           "index": wasAt, "insert": insert])
-            }
-            UndoStack.shared.push("Delete “\(target.lastPathComponent)”", undo: {
-                guard let t = trashed else { return nil }
-                if let problem = restoreItems([(from: t, to: target)]) { return problem }
-                tell(true)
-                return nil
-            }, redo: {
-                // Fresh Trash path on every re-bin, so point the undo half at it.
+            DispatchQueue.global(qos: .userInitiated).async {
+                // trashItems, not fm.trashItem: the helper records where this came from, so
+                // Put Back works on an image deleted here. A bare trashItem left it in the
+                // Trash with no origin at all.
                 let r = trashItems([target])
-                trashed = r.restores.first?.from
-                if r.problem == nil { tell(false) }
-                return r.problem
-            })
-            urls.remove(at: index)
-            if urls.isEmpty { NSApp.keyWindow?.close(); return }
-            if index >= urls.count { index = urls.count - 1 }
-            loadInfo()
+                guard let landed = r.restores.first?.from else {
+                    DispatchQueue.main.async { reportFileError("Couldn't move “\(target.lastPathComponent)” to the Trash.", r.problem ?? "") }
+                    return
+                }
+                DispatchQueue.main.async {
+                    var trashed: URL? = landed   // re-pointed by redo; the Trash path changes each round
+                    // Where it was in THIS viewer's list, captured now: the closures below run
+                    // long after `index` has moved on to the next picture.
+                    // Undoing the delete used to put the file back on disk and nothing else, so
+                    // the picture stayed missing from the viewer you deleted it in until you
+                    // closed and reopened the folder — the one place the user is looking.
+                    //
+                    // Posted rather than written straight into `urls`: this closure outlives the
+                    // window (the undo stack is app-wide, and the viewer closes itself when the
+                    // last image goes), and writing into a torn-down @State is a SwiftUI warning
+                    // and a silently dropped update. A notification nobody is listening for is
+                    // simply nothing.
+                    let tell = { (insert: Bool) in
+                        DispatchQueue.main.async {
+                            NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
+                                                            userInfo: ["viewer": vid, "url": target,
+                                                                       "index": wasAt, "insert": insert])
+                        }
+                    }
+                    UndoStack.shared.push("Delete “\(target.lastPathComponent)”", undo: {
+                        guard let t = trashed else { return nil }
+                        if let problem = restoreItems([(from: t, to: target)]) { return problem }
+                        tell(true)
+                        return nil
+                    }, redo: {
+                        // Fresh Trash path on every re-bin, so point the undo half at it.
+                        let r = trashItems([target])
+                        trashed = r.restores.first?.from
+                        if r.problem == nil { tell(false) }
+                        return r.problem
+                    })
+                    guard let at = urls.firstIndex(of: target) else { return }
+                    urls.remove(at: at)
+                    if urls.isEmpty { NSApp.keyWindow?.close(); return }
+                    if index >= urls.count { index = urls.count - 1 }
+                    loadInfo()
+                }
+            }
         }
         guard Prefs.warnImageDelete else { perform(); return }
         let a = NSAlert()
@@ -14044,25 +14214,29 @@ struct ImageViewerView: View {
         // and it scales with pixels) to satisfy consumers that read TIFF but not PNG, which in
         // practice is nothing modern. Anything else is decoded once and offers both, because at
         // that point the TIFF is already in hand.
-        let png: Data?
-        let tiff: Data?
-        if u.pathExtension.lowercased() == "png" {
-            png = try? Data(contentsOf: u)
-            tiff = nil
-        } else {
-            tiff = NSImage(contentsOf: u)?.tiffRepresentation
-            png = tiff.flatMap { NSBitmapImageRep(data: $0) }
-                      .flatMap { $0.representation(using: .png, properties: [:]) }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let png: Data?
+            let tiff: Data?
+            if u.pathExtension.lowercased() == "png" {
+                png = try? Data(contentsOf: u)
+                tiff = nil
+            } else {
+                tiff = NSImage(contentsOf: u)?.tiffRepresentation
+                png = tiff.flatMap { NSBitmapImageRep(data: $0) }
+                          .flatMap { $0.representation(using: .png, properties: [:]) }
+            }
+            DispatchQueue.main.async {
+                guard png != nil || tiff != nil else { NSSound.beep(); return }
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                var types: [NSPasteboard.PasteboardType] = []
+                if png != nil { types.append(.png) }
+                if tiff != nil { types.append(.tiff) }
+                pb.declareTypes(types, owner: nil)
+                if let png { pb.setData(png, forType: .png) }
+                if let tiff { pb.setData(tiff, forType: .tiff) }
+            }
         }
-        guard png != nil || tiff != nil else { NSSound.beep(); return }
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        var types: [NSPasteboard.PasteboardType] = []
-        if png != nil { types.append(.png) }
-        if tiff != nil { types.append(.tiff) }
-        pb.declareTypes(types, owner: nil)
-        if let png { pb.setData(png, forType: .png) }
-        if let tiff { pb.setData(tiff, forType: .tiff) }
     }
     // Put the file itself on the clipboard as a file reference, so ⌘V pastes the
     // actual file into any Navigator (or Finder) folder. Matches copyFiles().
@@ -14097,31 +14271,39 @@ struct ImageViewerView: View {
             reportFileError("The name “\(newName)” can’t be used.", why, permissionHint: false); return
         }
         let dest = u.deletingLastPathComponent().appendingPathComponent(newName)
-        guard !FileManager.default.fileExists(atPath: dest.path) else {
-            reportFileError("“\(newName)” already exists here.",
-                            "Pick a different name.", permissionHint: false); return
-        }
-        do {
-            try FileManager.default.moveItem(at: u, to: dest)
-        } catch {
-            reportFileError("Couldn’t rename “\(u.lastPathComponent)”.", error.localizedDescription); return
-        }
-        if let at = urls.firstIndex(of: u) { urls[at] = dest }
-        loadInfo()
-        // Captured values, not self: this is a struct, and these closures outlive the window
-        // anyway because the undo stack is app-wide. Same mechanism deleteCurrent uses.
         let vid = viewerID
-        UndoStack.shared.push("Rename", undo: {
-            do { try FileManager.default.moveItem(at: dest, to: u) } catch { return error.localizedDescription }
-            NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
-                                            userInfo: ["viewer": vid, "url": dest, "replaceWith": u])
-            return nil
-        }, redo: {
-            do { try FileManager.default.moveItem(at: u, to: dest) } catch { return error.localizedDescription }
-            NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
-                                            userInfo: ["viewer": vid, "url": u, "replaceWith": dest])
-            return nil
-        })
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard !FileManager.default.fileExists(atPath: dest.path) else {
+                DispatchQueue.main.async { reportFileError("“\(newName)” already exists here.",
+                                "Pick a different name.", permissionHint: false) }; return
+            }
+            do {
+                try FileManager.default.moveItem(at: u, to: dest)
+            } catch {
+                DispatchQueue.main.async { reportFileError("Couldn’t rename “\(u.lastPathComponent)”.", error.localizedDescription) }; return
+            }
+            DispatchQueue.main.async {
+                if let at = urls.firstIndex(of: u) { urls[at] = dest }
+                loadInfo()
+                // Captured values, not self: this is a struct, and these closures outlive the window
+                // anyway because the undo stack is app-wide. Same mechanism deleteCurrent uses.
+                UndoStack.shared.push("Rename", undo: {
+                    do { try FileManager.default.moveItem(at: dest, to: u) } catch { return error.localizedDescription }
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
+                                                        userInfo: ["viewer": vid, "url": dest, "replaceWith": u])
+                    }
+                    return nil
+                }, redo: {
+                    do { try FileManager.default.moveItem(at: u, to: dest) } catch { return error.localizedDescription }
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .navigatorImageViewerUndo, object: nil,
+                                                        userInfo: ["viewer": vid, "url": u, "replaceWith": dest])
+                    }
+                    return nil
+                })
+            }
+        }
     }
 
     /// Save a converted COPY. Three things this must never do: overwrite the original, write a
@@ -14133,32 +14315,35 @@ struct ImageViewerView: View {
     private func exportCopy(_ format: ExportRules.Format) {
         guard let u = currentURL else { NSSound.beep(); return }
         let dir = u.deletingLastPathComponent()
-        let fm = FileManager.default
         let panel = NSSavePanel()
         panel.directoryURL = dir
         panel.nameFieldStringValue = ExportRules.suggestedName(
             sourceName: u.lastPathComponent, format: format,
-            taken: { fm.fileExists(atPath: dir.appendingPathComponent($0).path) })
+            taken: { $0 == u.lastPathComponent })
+        // NSSavePanel handles destination collisions; scanning the share here
+        // would freeze the dialog before it appeared.
         panel.message = "Save a \(format.menuTitle) copy — the original is left untouched"
         guard panel.runModal() == .OK, let out = panel.url else { return }
 
-        // Belt and braces. The panel's default can't collide, but the name is editable, and the
-        // panel's own "replace?" prompt would happily let someone overwrite the source.
-        // Symlinks resolved first: the inode check below can't see through one (verified — it
-        // compares the LINK's identifier, not the target's), and the raw paths differ, so a save
-        // onto a symlink pointing at the original would have slipped past both checks.
-        if ExportRules.isSameFile(out.resolvingSymlinksInPath().path, u.resolvingSymlinksInPath().path)
-            || sameFileOnDisk(out, u) {
-            reportFileError("That would overwrite the original.",
-                            "Pick a different name — “Save a Copy” never replaces the file you're viewing.",
-                            permissionHint: false)
-            return
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Belt and braces. The default differs from the source, but the name is editable, and the
+            // panel's own "replace?" prompt would happily let someone overwrite the source.
+            // Symlinks resolved first: the inode check below can't see through one (verified — it
+            // compares the LINK's identifier, not the target's), and the raw paths differ, so a save
+            // onto a symlink pointing at the original would have slipped past both checks.
+            if ExportRules.isSameFile(out.resolvingSymlinksInPath().path, u.resolvingSymlinksInPath().path)
+                || sameFileOnDisk(out, u) {
+                DispatchQueue.main.async { reportFileError("That would overwrite the original.",
+                                "Pick a different name — “Save a Copy” never replaces the file you're viewing.",
+                                permissionHint: false) }
+                return
+            }
+            if let err = writeConverted(u, to: out, format: format) {
+                DispatchQueue.main.async { reportFileError("Couldn’t save “\(out.lastPathComponent)”.", err) }
+                return
+            }
+            DispatchQueue.main.async { revealNewImage(out) }
         }
-        if let err = writeConverted(u, to: out, format: format) {
-            reportFileError("Couldn’t save “\(out.lastPathComponent)”.", err)
-            return
-        }
-        revealNewImage(out)
     }
 
     /// Same file via a HARD link, which no amount of path resolution reveals — two real
@@ -17016,6 +17201,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         Prefs.didRunSetup = true
         // The undo stack is pure logic in NavigatorCore (so it can be unit-tested and
         // never reaches for AppKit); these hook its two user-visible outcomes back up.
+        UndoStack.shared.execute = { action, done in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let problem = action()
+                DispatchQueue.main.async { done(problem) }
+            }
+        }
         UndoStack.shared.onEmpty = { NSSound.beep() }
         UndoStack.shared.onFailure = { reportFileError($0, $1, permissionHint: false) }
         // Remembered so menu commands still find the right window when a panel takes

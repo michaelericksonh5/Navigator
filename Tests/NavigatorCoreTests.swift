@@ -5914,3 +5914,97 @@ final class UndoStackCleanupTests: XCTestCase {
         XCTAssertEqual(cleaned, 0)
     }
 }
+
+final class RemainingAuditTests: XCTestCase {
+    func testIncompleteSearchNeverClaimsUnknownTotal() {
+        for reason in [SearchTruncation.Reason.indexCoverageUnknown, .traversalErrors] {
+            for count in [0, 42] {
+                let result = SearchTruncation.of(shown: count, cap: 500, hitCap: false, reason: reason)
+                XCTAssertEqual(result, .incomplete(.complete(count), reason))
+                XCTAssertFalse(result.statusText.contains("more than"))
+                XCTAssertNotEqual(result.statusText, "\(count) found")
+            }
+            let capped = SearchTruncation.of(shown: 500, cap: 500, hitCap: true, reason: reason)
+            XCTAssertEqual(capped, .incomplete(.capped(shown: 500, cap: 500), reason))
+            XCTAssertTrue(capped.statusText.contains(reason.text))
+        }
+    }
+
+    func testTransferStillRefusesSymlinkIntoSource() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("link", isDirectory: true)
+        try fm.createSymbolicLink(at: link, withDestinationURL: source)
+        XCTAssertTrue(PathRules.isSelfOrDescendant(link, of: source))
+        // Hover can be decided without following the link; the transfer worker is
+        // still the final authority before any recursive filesystem operation.
+        XCTAssertFalse(PathRules.isLexicalSelfOrDescendant(link, of: source))
+    }
+
+    func testLexicalPathsPreserveCaseAndBoundaries() {
+        XCTAssertEqual(lexicalPath("/Volumes/Offline/a/../B//."), "/Volumes/Offline/B")
+        XCTAssertNotEqual(lexicalPath("/Volumes/Disk/A"), lexicalPath("/Volumes/Disk/a"))
+        XCTAssertEqual(lexicalPath("/tmp/a"), "/private/tmp/a")
+        let source = URL(fileURLWithPath: "/Volumes/Offline/a", isDirectory: true)
+        XCTAssertTrue(PathRules.isLexicalSelfOrDescendant(source.appendingPathComponent("b"), of: source))
+        XCTAssertFalse(PathRules.isLexicalSelfOrDescendant(URL(fileURLWithPath: "/Volumes/Offline/ab", isDirectory: true), of: source))
+    }
+
+    func testSizeInputCannotOverflow() {
+        for text in ["inf", "nan", "1e300", "-1", "9223372036854.776"] {
+            XCTAssertNil(SearchSizeFilter.bytes(megabytes: text), text)
+        }
+        XCTAssertEqual(SearchSizeFilter.bytes(megabytes: "0"), 0)
+        XCTAssertEqual(SearchSizeFilter.bytes(megabytes: "1.25"), 1_250_000)
+    }
+}
+
+final class DeferredUndoTests: XCTestCase {
+    func testPendingActionPreventsReentryAndPublishesOnCompletion() {
+        let stack = UndoStack()
+        var run: (() -> Void)?
+        var calls = 0
+        stack.execute = { action, done in run = { done(action()) } }
+        stack.push("Move", undo: { calls += 1; return nil }, redo: { nil })
+        stack.undo()
+        XCTAssertTrue(stack.isPerforming)
+        XCTAssertFalse(stack.canUndo)
+        XCTAssertFalse(stack.canRedo)
+        stack.undo(); stack.redo()
+        XCTAssertEqual(calls, 0)
+        run?()
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(stack.canRedo)
+        XCTAssertFalse(stack.isPerforming)
+    }
+
+    func testNewOperationDuringUndoDoesNotResurrectRedo() {
+        let stack = UndoStack()
+        var finish: ((String?) -> Void)?
+        stack.execute = { _, done in finish = done }
+        stack.push("Old", undo: { nil }, redo: { nil })
+        stack.undo()
+        stack.push("New", undo: { nil }, redo: { nil })
+        finish?(nil)
+        XCTAssertFalse(stack.canRedo)
+        XCTAssertEqual(stack.topDescription, "New")
+    }
+
+    func testDeferredFailureIsReportedAndDropsEntry() {
+        let stack = UndoStack()
+        var finish: ((String?) -> Void)?
+        var problem: String?
+        stack.execute = { _, done in finish = done }
+        stack.onFailure = { _, detail in problem = detail }
+        stack.push("Move", undo: { nil }, redo: { nil })
+        stack.undo()
+        finish?("Permission denied")
+        XCTAssertEqual(problem, "Permission denied")
+        XCTAssertFalse(stack.canUndo)
+        XCTAssertFalse(stack.canRedo)
+        XCTAssertFalse(stack.isPerforming)
+    }
+}
