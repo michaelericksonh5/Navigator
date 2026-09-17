@@ -5628,6 +5628,54 @@ enum ChromaKeyOutputRules {
         return bias
     }
 
+    /// Copy source RGB into the pixels the matte calls (near-)opaque. Returns nil when there is
+    /// nothing to change or the images cannot be read in a compatible form, in which case the
+    /// caller keeps the keyed image exactly as it is.
+    ///
+    /// Works on the RAW bytes, in the image's own alpha format. An earlier version rasterised
+    /// both images through a premultiplied CGContext, which re-quantised the SOFT pixels by a
+    /// fraction of a level (48.188 became 47.937) — and the soft pixels are precisely the ones
+    /// Keylight's despill is working on, so they must come through untouched.
+    static func restoreOpaqueInterior(keyed: CGImage, source: CGImage) throws -> CGImage? {
+        let w = keyed.width, h = keyed.height
+        guard source.width == w, source.height == h,
+              keyed.bitsPerComponent == 8, keyed.bitsPerPixel == 32,
+              source.bitsPerComponent == 8, source.bitsPerPixel == 32,
+              keyed.alphaInfo == .last, source.alphaInfo == .last,
+              let kData = keyed.dataProvider?.data as Data?,
+              let sData = source.dataProvider?.data as Data? else { return nil }
+        let kRow = keyed.bytesPerRow, sRow = source.bytesPerRow
+        // 250, not 255. Measured on the sparkle's white core: of 126 neutral pixels, 110 keyed
+        // to alpha 255 but 16 landed on 252-254, and a strict test left exactly those 16 still
+        // reading rgb(255,255,143).
+        //
+        // ponytail: at alpha 250 the backing still contributes 5/255 = 2% of the pixel, so
+        // taking the source colour is approximate there rather than exact — bounded at about
+        // 5 levels, against the 112 it removes. Below 250 the approximation stops being worth
+        // it and Keylight's despill is left alone. Solving F = (C - B(1-a))/a exactly would
+        // need the backing colour plumbed back from the JSX, which is the upgrade if this
+        // ceiling ever matters.
+        let opaqueEnough: UInt8 = 250
+        var bytes = [UInt8](kData)
+        var restored = 0
+        for y in 0..<h {
+            for x in 0..<w {
+                let k = y*kRow + x*4, sp = y*sRow + x*4
+                guard bytes[k+3] >= opaqueEnough else { continue }
+                // Alpha is at or near full on both sides, so the channels carry the same
+                // meaning and copy across directly.
+                if bytes[k] != sData[sp] || bytes[k+1] != sData[sp+1] || bytes[k+2] != sData[sp+2] { restored += 1 }
+                bytes[k] = sData[sp]; bytes[k+1] = sData[sp+1]; bytes[k+2] = sData[sp+2]
+            }
+        }
+        guard restored > 0 else { return nil }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: kRow, space: keyed.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: keyed.bitmapInfo, provider: provider,
+                       decode: nil, shouldInterpolate: false, intent: keyed.renderingIntent)
+    }
+
     static func publish(rendered: URL, source: URL) throws -> URL {
         let input = try load(source), image = try load(rendered)
         guard image.width == input.width, image.height == input.height else {
@@ -5636,11 +5684,24 @@ enum ChromaKeyOutputRules {
         guard [.last, .first, .premultipliedLast, .premultipliedFirst].contains(image.alphaInfo) else {
             throw failure("After Effects rendered without an alpha channel")
         }
+        // Restore the colour of fully-opaque pixels from the source.
+        //
+        // Where the matte is fully opaque the pixel contains NO backing at all — the
+        // compositing equation there is C = F*1 + B*0, so F = C exactly, and despill has
+        // nothing to correct. Keylight despills it anyway, and with Despill Bias set to
+        // protect a coloured subject that drags neutral highlights toward the bias colour.
+        // Measured on the yellow sparkle: 126 core pixels that are rgb(255,255,255) in the
+        // source came out rgb(255,255,143). Removing the bias is not the answer — without it
+        // the sparkle's own yellow is stripped to grey across 89,800 pixels
+        // (rgb(255,255,142) -> rgb(174,174,174)), so the bias is doing necessary work on the
+        // SOFT pixels, which is where Keylight earns its place. This only touches the
+        // interior, and only where the answer is arithmetically certain.
+        let final = try restoreOpaqueInterior(keyed: image, source: input) ?? image
         let data = NSMutableData()
         guard let encoder = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
             throw failure("Could not encode PNG")
         }
-        CGImageDestinationAddImage(encoder, image, nil)
+        CGImageDestinationAddImage(encoder, final, nil)
         guard CGImageDestinationFinalize(encoder) else { throw failure("Could not finish PNG") }
         let out = source.deletingLastPathComponent().appendingPathComponent(source.deletingPathExtension().lastPathComponent + "_rmbg.png")
         // Validate before atomic replacement, so an AE failure preserves an earlier output.

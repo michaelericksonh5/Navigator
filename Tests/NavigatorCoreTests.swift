@@ -4662,6 +4662,65 @@ final class AfterEffectsPrefsRulesTests: XCTestCase {
     }
 }
 
+final class RestoreOpaqueInteriorTests: XCTestCase {
+    /// STRAIGHT alpha (.last), the way a decoded PNG arrives — not a premultiplied context.
+    /// restoreOpaqueInterior edits raw bytes in that format precisely so the soft pixels are
+    /// never re-quantised, so a premultiplied fixture would not exercise the real path.
+    private func image(_ w: Int, _ h: Int, _ fill: (Int, Int) -> (UInt8, UInt8, UInt8, UInt8)) -> CGImage {
+        var b = [UInt8](repeating: 0, count: w*h*4)
+        for y in 0..<h { for x in 0..<w {
+            let (r, g, bl, a) = fill(x, y); let i = (y*w+x)*4
+            b[i] = r; b[i+1] = g; b[i+2] = bl; b[i+3] = a
+        }}
+        let provider = CGDataProvider(data: Data(b) as CFData)!
+        return CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w*4,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+    }
+    private func pixel(_ img: CGImage, _ x: Int, _ y: Int) -> (UInt8, UInt8, UInt8, UInt8) {
+        let d = img.dataProvider!.data! as Data
+        let i = y*img.bytesPerRow + x*4
+        return (d[i], d[i+1], d[i+2], d[i+3])
+    }
+
+    /// The measured defect: a white core pixel that is rgb(255,255,255) in the source came out
+    /// rgb(255,255,143) because despill dragged it toward the bias colour. Fully opaque means
+    /// no backing is present, so the source colour is exactly right there.
+    func testOpaquePixelsTakeTheSourceColour() throws {
+        let source = image(4, 4) { _, _ in (255, 255, 255, 255) }
+        let keyed  = image(4, 4) { _, _ in (255, 255, 143, 255) }
+        let out = try XCTUnwrap(ChromaKeyOutputRules.restoreOpaqueInterior(keyed: keyed, source: source))
+        let p = pixel(out, 2, 2)
+        XCTAssertEqual([p.0, p.1, p.2, p.3], [255, 255, 255, 255])
+    }
+
+    /// Soft pixels are where Keylight earns its place — despill there is doing real work and
+    /// must NOT be overwritten, or the whole edge treatment is thrown away.
+    func testPartiallyTransparentPixelsAreLeftAlone() throws {
+        let source = image(4, 4) { _, _ in (255, 255, 255, 255) }
+        let keyed  = image(4, 4) { x, _ in x == 0 ? (200, 200, 100, 255) : (100, 100, 50, 128) }
+        let out = try XCTUnwrap(ChromaKeyOutputRules.restoreOpaqueInterior(keyed: keyed, source: source))
+        XCTAssertEqual([pixel(out, 0, 1).0, pixel(out, 0, 1).1, pixel(out, 0, 1).2], [255, 255, 255],
+                       "the opaque column takes the source colour")
+        let soft = pixel(out, 2, 1)
+        XCTAssertEqual([soft.0, soft.1, soft.2, soft.3], [100, 100, 50, 128],
+                       "the soft pixel keeps Keylight's despilled value untouched")
+    }
+
+    /// Nothing to correct means nothing to rewrite — the caller keeps the original image.
+    func testNoChangeReturnsNil() throws {
+        let same = image(4, 4) { _, _ in (10, 20, 30, 255) }
+        XCTAssertNil(try ChromaKeyOutputRules.restoreOpaqueInterior(keyed: same, source: same))
+    }
+
+    func testMismatchedSizesAreRefused() throws {
+        let a = image(4, 4) { _, _ in (1, 2, 3, 255) }
+        let b = image(8, 8) { _, _ in (9, 9, 9, 255) }
+        XCTAssertNil(try ChromaKeyOutputRules.restoreOpaqueInterior(keyed: a, source: b))
+    }
+}
+
 final class ChromaKeyOutputRulesTests: XCTestCase {
     func write(_ bytes: [UInt8], width: Int, height: Int, to url: URL) throws {
         let provider = try XCTUnwrap(CGDataProvider(data: Data(bytes) as CFData))
@@ -4737,7 +4796,7 @@ final class ChromaKeyOutputRulesTests: XCTestCase {
         for c in 0..<3 { XCTAssertEqual(badRGB[c] * badAlpha + backing[c] * (1 - badAlpha), flat[c], accuracy: 0.00001) }
     }
 
-    func testPublishPreservesStraightColourSoftAlphaSizeAndExistingOutputOnFailure() throws {
+    func testPublishKeepsSoftColourTakesOpaqueFromSourceAndPreservesOutputOnFailure() throws {
         let fm = FileManager.default, dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: dir) }
@@ -4749,9 +4808,24 @@ final class ChromaKeyOutputRulesTests: XCTestCase {
         XCTAssertEqual(out.lastPathComponent, "source_rmbg.png")
         let image = try ChromaKeyOutputRules.load(out)
         XCTAssertEqual(image.width, 3); XCTAssertEqual(image.height, 2)
+        // publish no longer passes colour through untouched: a pixel the matte calls
+        // near-opaque contains no backing, so its colour is taken from the source (see
+        // restoreOpaqueInterior — it is what stops the sparkle's white core reading yellow).
+        // The SOFT pixels are the ones that must survive intact, because that is where
+        // Keylight's despill is doing the work.
         let expected = try premultiplied(ChromaKeyOutputRules.load(render)), actual = try premultiplied(image)
-        XCTAssertEqual(actual, expected)
-        XCTAssertEqual(foregroundShift(expected, actual).worst, 0)
+        for i in stride(from: 0, to: expected.count, by: 4) where expected[i+3] < 250 {
+            XCTAssertEqual(Array(actual[i..<i+4]), Array(expected[i..<i+4]),
+                           "soft pixel at \(i/4) must keep Keylight's despilled colour")
+        }
+        // The fixture's source is white, so the near-opaque pixels take white.
+        for i in stride(from: 0, to: expected.count, by: 4) where expected[i+3] >= 250 {
+            let a = actual[i+3]
+            for c in 0..<3 {
+                XCTAssertEqual(actual[i+c], a, accuracy: 1.0,
+                               "near-opaque pixel at \(i/4) must take the source colour")
+            }
+        }
         let saved = try Data(contentsOf: out)
         try write([255,255,255,128], width: 1, height: 1, to: render)
         XCTAssertThrowsError(try ChromaKeyOutputRules.publish(rendered: render, source: source))
