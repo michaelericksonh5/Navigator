@@ -7139,3 +7139,54 @@ final class TransferExecutionTests: XCTestCase {
         XCTAssertTrue(result.outcomes.isEmpty)
     }
 }
+
+// A silent refresh used to re-read all ten attributes for every row. Measured on a real SMB
+// share that is ~246 ms per entry, so a 672-entry folder spent about 165 seconds to notice one
+// new file. These pin the rule that decides what actually has to be re-read.
+final class RefreshRulesTests: XCTestCase {
+
+    func testNothingChangedMeansNoAttributeWorkAtAll() {
+        let p = RefreshRules.plan(existing: ["a", "b", "c"], fresh: ["a", "b", "c"])
+        XCTAssertEqual(p.fetch, [], "an unchanged folder must not re-read a single attribute")
+        XCTAssertEqual(p.reuse, ["a", "b", "c"])
+        XCTAssertEqual(p.dropped, [])
+        XCTAssertTrue(p.isUnchanged)
+    }
+
+    // The common case: someone else drops one file into a big folder.
+    func testOnlyTheNewNameIsFetched() {
+        let existing = (1...500).map { "file\($0)" }
+        let p = RefreshRules.plan(existing: existing, fresh: existing + ["brand-new"])
+        XCTAssertEqual(p.fetch, ["brand-new"], "500 unchanged rows must cost nothing")
+        XCTAssertEqual(p.reuse.count, 500)
+        XCTAssertFalse(p.isUnchanged)
+    }
+
+    func testRemovalIsReportedAndNothingIsFetched() {
+        let p = RefreshRules.plan(existing: ["a", "b", "c"], fresh: ["a", "c"])
+        XCTAssertEqual(p.dropped, ["b"])
+        XCTAssertEqual(p.fetch, [])
+        XCTAssertEqual(p.reuse, ["a", "c"])
+    }
+
+    // A rename is an add and a remove at once, and only the new name costs anything.
+    func testRenameFetchesOnlyTheNewName() {
+        let p = RefreshRules.plan(existing: ["old", "keep"], fresh: ["keep", "new"])
+        XCTAssertEqual(p.fetch, ["new"])
+        XCTAssertEqual(p.dropped, ["old"])
+        XCTAssertEqual(p.reuse, ["keep"])
+    }
+
+    // The fresh listing is authoritative for ORDER, or a renamed row would stay where it was.
+    func testFreshOrderIsPreserved() {
+        let p = RefreshRules.plan(existing: ["b", "a"], fresh: ["a", "b", "c"])
+        XCTAssertEqual(p.reuse, ["a", "b"], "reuse follows the fresh listing, not the old one")
+        XCTAssertEqual(p.fetch, ["c"])
+    }
+
+    func testEmptyCases() {
+        XCTAssertEqual(RefreshRules.plan(existing: [], fresh: ["a"]).fetch, ["a"])
+        XCTAssertEqual(RefreshRules.plan(existing: ["a"], fresh: []).dropped, ["a"])
+        XCTAssertTrue(RefreshRules.plan(existing: [], fresh: []).isUnchanged)
+    }
+}

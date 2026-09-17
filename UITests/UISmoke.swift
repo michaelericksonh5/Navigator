@@ -115,33 +115,57 @@ func navigatorPID() -> pid_t? {
 
 /// Point Navigator at a folder through the address bar, which is the only entry point that
 /// does not depend on the current selection or view mode.
+/// Point Navigator at a folder through the address bar, retrying until the tab actually
+/// changes.
+///
+/// One attempt is not enough. The address bar needs time to open, and how much time depends on
+/// what the app is busy with - a tab left pointing at a share that has since been unmounted
+/// makes everything slower, and a fixed 0.6s delay silently dropped the typed path. The suite
+/// then failed for a reason that had nothing to do with the build under test.
 func goTo(_ path: String, _ app: AX) {
-    guard let win = app.children().first(where: { $0.role == kAXWindowRole as String }) else { return }
-    _ = win
-    let src = """
-    tell application "System Events" to tell process "Navigator"
-      keystroke "l" using {command down}
-      delay 0.6
-      keystroke "\(path)"
-      delay 0.4
-      key code 36
-    end tell
-    """
-    var err: NSDictionary?
-    NSAppleScript(source: src)?.executeAndReturnError(&err)
-    // Wait for the listing to reflect the new folder rather than assuming a fixed delay.
     let leaf = (path as NSString).lastPathComponent
-    waitUntil("navigation to \(leaf)") {
-        app.children().contains { $0.role == kAXWindowRole as String && $0.title == (leaf.isEmpty ? "Macintosh HD" : leaf) }
+    let want = leaf.isEmpty ? "Macintosh HD" : leaf
+    func arrived() -> Bool {
+        app.children().contains { $0.role == kAXWindowRole as String && $0.title == want }
     }
-    settle(0.6)
+    for attempt in 1...4 {
+        if arrived() { settle(0.5); return }
+        let src = """
+        tell application "Navigator" to activate
+        delay 0.8
+        tell application "System Events" to tell process "Navigator"
+          keystroke "l" using {command down}
+          delay \(0.8 * Double(attempt))
+          keystroke "\(path)"
+          delay 0.5
+          key code 36
+        end tell
+        """
+        var err: NSDictionary?
+        NSAppleScript(source: src)?.executeAndReturnError(&err)
+        if waitUntil("navigation to \(want) (attempt \(attempt))", timeout: 12, arrived) {
+            settle(0.6); return
+        }
+    }
+    print("  (never reached \(want) after 4 attempts)")
 }
 
-/// The file list, wherever it is. Navigator keeps more than one window, and the browser is
-/// not reliably the first - taking children().first picked the wrong one and found no rows.
+/// The file list, wherever it is.
+///
+/// Depth-first, stopping at the FIRST table rather than materialising every descendant: a flat
+/// breadth-first cap silently truncated once the window had several tabs and a populated
+/// sidebar, so the table existed but was never reached.
 func fileTable(_ app: AX) -> AX? {
+    func find(_ node: AX, depth: Int) -> AX? {
+        if depth > 24 { return nil }
+        for c in node.children() {
+            if c.role == kAXTableRole as String { return c }
+            if let hit = find(c, depth: depth + 1) { return hit }
+        }
+        return nil
+    }
     for win in app.children() where win.role == kAXWindowRole as String {
-        if let t = win.descendants().first(where: { $0.role == kAXTableRole as String }) { return t }
+        if let t = find(win, depth: 0) { return t }
     }
     return nil
 }
@@ -210,13 +234,20 @@ _ = sem.wait(timeout: .now() + 20)
 guard waitUntil("Navigator to start", { navigatorPID() != nil }),
       let pid = navigatorPID() else { print("Navigator did not start"); exit(1) }
 let app = AX.app(pid: pid)
-// A window alone is not enough - the browser is only usable once its file table exists.
-guard waitUntil("the file browser to be ready", timeout: 40, { fileTable(AX.app(pid: pid)) != nil }) else {
-    print("Navigator started but never presented a file table"); exit(1)
+// Do NOT require a table before navigating. Navigator restores TABS, and the active tab at
+// launch may be one that legitimately has no table - a folder on a share that has since been
+// unmounted shows an empty pane. Waiting for a table first made the whole suite fail for a
+// reason that had nothing to do with the build under test. Wait for a window, navigate to our
+// own fixture, and require the table THERE.
+guard waitUntil("a Navigator window", timeout: 40, { !AX.app(pid: pid).children().isEmpty }) else {
+    print("Navigator started but never presented a window"); exit(1)
 }
 print("Navigator pid \(pid)\nfixture \(fixture)\n")
 
 goTo(fixture, app)
+guard waitUntil("the fixture folder's file table", timeout: 40, { fileTable(app) != nil }) else {
+    print("navigated to the fixture but no file table appeared"); exit(1)
+}
 
 // ---- 1. commands must not offer themselves when they cannot act ----
 // Every one of these shipped ENABLED with an empty selection and silently did nothing.

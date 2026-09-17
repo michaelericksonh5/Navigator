@@ -34,8 +34,20 @@ private func runWalkChild(_ request: WalkStream.Request) throws {
     var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
     if !request.showHidden { options.insert(.skipsHiddenFiles) }
     var readFailed = false
+    // Enumerate with NO prefetch. The name test on the next line rejects almost everything,
+    // and prefetching attributes for a file that is about to be discarded is the single most
+    // expensive thing this loop can do on a share. Measured on //CORP-DC01/Games/artSource,
+    // 672 entries, same folder, with the prefetching run second and cache-warmed so the
+    // comparison favoured it:
+    //
+    //   no prefetch keys, cold : 62,475 ms =  93.0 ms/entry
+    //   the ten itemKeys, warm : 165,052 ms = 245.6 ms/entry
+    //
+    // So prefetching cost about 100 seconds across that one folder, essentially all of it
+    // spent on files that never matched. Attributes are now read below, after the name and
+    // extension have already qualified the file.
     let enumerator = FileManager.default.enumerator(at: request.root,
-        includingPropertiesForKeys: keys, options: options,
+        includingPropertiesForKeys: [], options: options,
         errorHandler: { _, _ in readFailed = true; return true })
     if enumerator == nil { readFailed = true }
     var writer = WalkStream.Writer<FileItem>(cap: request.cap) {
@@ -6346,19 +6358,50 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard !isSearching, !isRecents else { return }
         let dir = currentURL, sh = showHidden
         let isNet = currentIsNetwork
+        let visible = visibleColumns
         let cacheKey = dir.path + (sh ? "\u{1}h" : "")
         loadGeneration += 1; cancelPendingDetails()
         let gen = loadGeneration
+        // Snapshot what is already on screen, on the main thread, so the worker can reuse the
+        // details of rows whose names have not changed. See RefreshRules for the measurements:
+        // re-reading every row costs ~246 ms/entry on SMB, which is ~165 seconds in a
+        // 672-entry folder just to notice one new file.
+        let known: [String: FileItem] = isNet
+            ? Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            : [:]
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let keys = Browser.itemKeys
             var opts: FileManager.DirectoryEnumerationOptions = [.skipsSubdirectoryDescendants]
             if !sh { opts.insert(.skipsHiddenFiles) }
-            let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
-            let wanted = Set(keys)   // hoisted out of the per-file loop
             var result: [FileItem] = []
-            while let u = en?.nextObject() as? URL {
-                guard let self, gen == self.loadGeneration else { return }
-                result.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
+
+            if isNet {
+                // Names first: ~93 ms/entry against ~246 ms/entry with attributes, and a folder
+                // where nothing was added needs no attribute read at all. LOCAL volumes keep the
+                // exact path below - they are cheap, and exactness is worth more there.
+                let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [], options: opts)
+                var freshURLs: [String: URL] = [:]
+                var freshOrder: [String] = []
+                while let u = en?.nextObject() as? URL {
+                    guard let self, gen == self.loadGeneration else { return }
+                    freshURLs[u.path] = u; freshOrder.append(u.path)
+                }
+                let plan = RefreshRules.plan(existing: Array(known.keys), fresh: freshOrder)
+                let wanted = Set(Browser.networkKeys(visible: visible))
+                let needed = Set(plan.fetch)
+                for id in freshOrder {
+                    guard let self, gen == self.loadGeneration else { return }
+                    if !needed.contains(id), let had = known[id] { result.append(had); continue }
+                    guard let u = freshURLs[id] else { continue }
+                    result.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
+                }
+            } else {
+                let keys = Browser.itemKeys
+                let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts)
+                let wanted = Set(keys)   // hoisted out of the per-file loop
+                while let u = en?.nextObject() as? URL {
+                    guard let self, gen == self.loadGeneration else { return }
+                    result.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
+                }
             }
             let final = result
             // stat(), not resourceValues — a URL caches those, so the value stored
@@ -6580,15 +6623,24 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             // attributes). Skipped when a detailed seed is already on screen, so we
             // never replace real sizes/dates with blanks.
             var quickWasEmpty = true
-            // Normally phase 1 is skipped when a detailed seed is already on screen, so we
-            // never replace real sizes with blanks. But when nothing on screen needs
-            // per-file data, phase 1 is the whole job — and it must still run, seed or not,
-            // or a cached listing would never pick up added and deleted files.
-            if !hadSeed || !needsDetails {
-                let quick = Browser.namesOnlyItems(dir, showHidden: showHidden)
-                if !quick.isEmpty {
-                    quickWasEmpty = false
-                    guard let self, gen == self.loadGeneration else { return }
+            // Phase 1 now always RUNS; what the seed controls is whether it is PUBLISHED.
+            //
+            // It used to be skipped entirely when a detailed seed was on screen, to avoid
+            // replacing real sizes with blanks. But skipping it also left quickWasEmpty true,
+            // and that is what gates the share-index branch below - so a revisit to a folder
+            // that had actually changed could never consult the index and fell straight into
+            // the full metadata sweep. A revisit was therefore MORE expensive than a first
+            // visit, which is backwards.
+            //
+            // Getting the names is the cheap half: ~93 ms/entry measured, against ~246 ms/entry
+            // with attributes. Paying that to ENABLE the index, and to reconcile against the
+            // cached rows, is worth it - the sweep it avoids is the expensive half.
+            let quick = Browser.namesOnlyItems(dir, showHidden: showHidden)
+            if !quick.isEmpty {
+                quickWasEmpty = false
+                guard let self, gen == self.loadGeneration else { return }
+                // Publish only when there is no detailed seed to protect, exactly as before.
+                if !hadSeed || !needsDetails {
                     let sorted = quick
                     DispatchQueue.main.async { [weak self] in
                         guard let self, gen == self.loadGeneration else { return }

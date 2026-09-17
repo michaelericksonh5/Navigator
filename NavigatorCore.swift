@@ -5573,3 +5573,53 @@ enum Transfer {
         return result
     }
 }
+
+/// What a refresh actually has to re-read.
+///
+/// A refresh is triggered by the directory's mtime changing, which on these filesystems means
+/// an add, a remove or a rename - NOT a file's contents being rewritten. So the thing that
+/// changed is the set of NAMES, and a row whose name is still there can keep the details it
+/// already has.
+///
+/// This matters because of what attributes cost on SMB. Measured on //CORP-DC01/Games/artSource,
+/// 672 entries, same folder, with the attribute run second and cache-warmed so the comparison
+/// favoured it:
+///
+///   enumeration with no prefetch keys, cold : 62,475 ms =  93.0 ms/entry
+///   enumeration with the ten itemKeys, warm : 165,052 ms = 245.6 ms/entry
+///
+/// Re-reading every row therefore costs about 165 seconds in that folder to notice one new
+/// file. Reading names and fetching details only for the names that are actually new costs
+/// about 62 seconds when something changed, and nothing at all per existing row.
+///
+/// The trade is that a file whose CONTENTS changed without the directory changing keeps its
+/// previous size and date until the next full load. That is the same thing Finder does, it
+/// only applies to the silent background refresh, and an explicit Refresh still re-reads
+/// everything.
+enum RefreshRules {
+
+    struct Plan: Equatable {
+        /// Names present before and still present: keep the details already held.
+        var reuse: [String]
+        /// Names that appeared since the last listing: these need their attributes read.
+        var fetch: [String]
+        /// Names that are gone.
+        var dropped: [String]
+        /// Nothing appeared and nothing left, so no attribute work is needed at all.
+        var isUnchanged: Bool { fetch.isEmpty && dropped.isEmpty }
+    }
+
+    /// `fresh` is the authoritative order - the listing is rebuilt in it, so a rename that
+    /// moves a row does not leave it stranded at its old position.
+    static func plan(existing: [String], fresh: [String]) -> Plan {
+        let had = Set(existing), now = Set(fresh)
+        var reuse: [String] = [], fetch: [String] = []
+        reuse.reserveCapacity(fresh.count)
+        for name in fresh {
+            if had.contains(name) { reuse.append(name) } else { fetch.append(name) }
+        }
+        // Dropped keeps the ORDER it had, so a caller reporting "3 items removed" lists them
+        // the way the user last saw them rather than in hash order.
+        return Plan(reuse: reuse, fetch: fetch, dropped: existing.filter { !now.contains($0) })
+    }
+}
