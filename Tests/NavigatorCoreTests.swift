@@ -4640,6 +4640,37 @@ final class ShareURLRulesTests: XCTestCase {
 
 // MARK: - Why a mount failed
 
+final class ListingTrustRulesTests: XCTestCase {
+    /// The case this exists for: a VPN drop mid-refresh. The enumeration just stops yielding
+    /// names, with no error anywhere, so the folder looks emptied.
+    func testAShrunkenListingFromAnUnreadableVolumeIsNotBelieved() {
+        XCTAssertFalse(ListingTrustRules.trustShrunken(fresh: 0, onScreen: 671, volumeReadable: false))
+        XCTAssertFalse(ListingTrustRules.trustShrunken(fresh: 118, onScreen: 671, volumeReadable: false))
+        XCTAssertFalse(ListingTrustRules.trustShrunken(fresh: 670, onScreen: 671, volumeReadable: false))
+    }
+
+    /// Deletions are real and must still land. A share that answers is telling the truth.
+    func testAShrunkenListingFromAReadableVolumeIsBelieved() {
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 0, onScreen: 671, volumeReadable: true))
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 670, onScreen: 671, volumeReadable: true))
+    }
+
+    /// Growth costs nothing to accept, and is never worth an opendir to double-check —
+    /// the readability test is the expensive part (86-175 ms on a healthy share, measured).
+    func testGrowthAndStasisAreAlwaysTrustedWithoutCheckingTheVolume() {
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 671, onScreen: 671, volumeReadable: false))
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 672, onScreen: 671, volumeReadable: false))
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 1, onScreen: 0, volumeReadable: false))
+    }
+
+    /// An empty folder that is genuinely empty stays empty — this rule must not make it
+    /// impossible to ever show one.
+    func testAnEmptyFolderStaysEmpty() {
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 0, onScreen: 0, volumeReadable: false))
+        XCTAssertTrue(ListingTrustRules.trustShrunken(fresh: 0, onScreen: 0, volumeReadable: true))
+    }
+}
+
 final class MountFailureNeedsUITests: XCTestCase {
     /// The whole point of the silent-first mount: a share whose password is already in the
     /// keychain mounts with no window, and only a failure a person could answer is worth a

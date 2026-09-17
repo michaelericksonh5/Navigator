@@ -75,6 +75,23 @@ struct MountGate {
         }
     }
 
+    /// Can this volume be read AT ALL, right now?
+    ///
+    /// One opendir on the volume root — the only call measured to tell the truth on a dead
+    /// mount (see probeRecovered). Costs 86-175 ms on a healthy share, so it is asked ONLY
+    /// when a result already looks wrong: an empty folder, or a listing that shrank. Never
+    /// on the happy path.
+    ///
+    /// The volume ROOT, not the folder in hand: /Volumes/Games/Sound answers EACCES even on
+    /// a perfectly healthy share because it is genuinely restricted, so asking about the
+    /// current folder would condemn shares that are fine.
+    var isReadable: Bool {
+        guard let root else { return true }              // local: not the question
+        guard let dir = opendir(root) else { return false }
+        closedir(dir)
+        return true
+    }
+
     /// The recovery probe: can this share actually be READ again?
     ///
     /// It has to ask something the SERVER must answer, which is a sharper requirement than
@@ -6569,6 +6586,13 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 }
             }
             let final = result
+            // A share that goes away mid-read does not error — it stops yielding names, and the
+            // result looks like "someone deleted most of this folder". The volume is only
+            // consulted when the count actually went DOWN, so a normal refresh pays nothing.
+            let onScreen = known.count
+            let trusted = !isNet
+                || ListingTrustRules.trustShrunken(fresh: final.count, onScreen: onScreen,
+                                                   volumeReadable: MountGate(dir).isReadable)
             // stat(), not resourceValues — a URL caches those, so the value stored
             // alongside the cached listing would be the mtime from an earlier read.
             var dst = stat()
@@ -6577,9 +6601,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self, gen == self.loadGeneration else { return }
-                // A share that went away mid-read enumerates as empty. Replacing a good
-                // listing with nothing looks exactly like "someone deleted everything".
-                if final.isEmpty, isNet, !self.items.isEmpty { return }
+                guard trusted else {
+                    // Keep what is on screen and SAY so, rather than silently serving a listing
+                    // nobody can tell is stale. staleListing already drives that indicator.
+                    navLog("refresh discarded: \(dir.lastPathComponent) returned \(final.count) of "
+                           + "\(onScreen) row(s) and the volume does not read — keeping the listing")
+                    self.staleListing = true
+                    return
+                }
                 Browser.dirCache[cacheKey] = final
                 if isNet, !final.isEmpty { DiskCache.put(cacheKey, final, dirModified: mtime) }
                 self.items = final
@@ -6802,6 +6831,22 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             // Paying that to ENABLE the index, and to reconcile against the cached rows, is
             // worth it - the sweep it avoids is the expensive half.
             let quick = Browser.namesOnlyItems(dir, showHidden: showHidden)
+            // "Empty" on a share that cannot be read is not an empty folder, it is a share that
+            // is not answering — and on a dead mount readdir fails INSTANTLY (EACCES, measured
+            // 0 ms on a live VPN drop), so the 15-second stall timer above never fires: it
+            // requires `busy`, and an instant failure clears that. Without this the folder just
+            // renders empty with nothing said, which is the OS's lie passed straight through.
+            if quick.isEmpty, !MountGate(dir).isReadable {
+                navLog("network load \(dir.lastPathComponent): volume does not read — not an empty folder, showing the way-out panel")
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, gen == self.loadGeneration else { return }
+                    self.busy = false; self.busyText = ""
+                    self.slowNetwork = false
+                    self.networkStalled = true
+                    self.updateStatus()
+                }
+                return
+            }
             if !quick.isEmpty {
                 quickWasEmpty = false
                 guard let self, gen == self.loadGeneration else { return }
@@ -7530,6 +7575,18 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             }
             var isDir: ObjCBool = false
             let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+            // "No such file or directory" is what a dead mount says about a folder that is
+            // sitting right there — measured on a live VPN drop: an unvisited path on a share
+            // that was still in the mount table answered ENOENT in 0 ms. Beeping at someone who
+            // typed a path they use every day, because the OS said it was missing, sends them
+            // to Finder to find out what is actually wrong. Asked only when the path did NOT
+            // resolve, so a normal navigation never pays for it.
+            let unreachableHost: String? = exists
+                ? nil
+                : { let u = URL(fileURLWithPath: path)
+                    guard let info = Browser.shareMountInfo(for: u), !MountGate(u).isReadable
+                    else { return nil }
+                    return info.share.host }()
             DispatchQueue.main.async {
                 guard let self else { return }
                 if exists, isDir.boolValue { self.navigate(to: URL(fileURLWithPath: path)) }
@@ -7538,6 +7595,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 // never obvious, and the answer is usually "this account has never opened it, so
                 // Drive has not indexed it here".
                 else if let link = driveLink { self.reportUnresolvedDriveLink(link) }
+                else if let host = unreachableHost {
+                    self.pathText = self.addressString(for: self.currentURL)
+                    reportMountFailure(cause: .unreachable, host: host)
+                }
                 else { NSSound.beep(); self.pathText = self.addressString(for: self.currentURL) }
             }
         }

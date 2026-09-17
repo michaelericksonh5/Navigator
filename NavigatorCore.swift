@@ -2539,6 +2539,25 @@ struct VolumeHealthRules {
     }
 }
 
+/// What a listing that came back SHORTER than what is on screen actually means.
+///
+/// A share that has gone does not report an error. Measured on a real VPN drop with the
+/// mounts still in the table: opendir on the volume root answered EACCES in 0 ms and an
+/// unvisited path answered ENOENT in 0 ms, both instantly. So a folder that is merely
+/// unreachable is indistinguishable, at the call site, from a folder someone just emptied —
+/// and publishing that reading deletes rows off the screen for a share that is fine.
+enum ListingTrustRules {
+    /// Is this result safe to put on screen in place of what is already there?
+    ///
+    /// Growth is always trustworthy: nothing can be lost by accepting it, and a share that
+    /// is answering enough to return MORE names is answering. A result that shrank is only
+    /// believed when the volume itself still reads — that is the difference between "these
+    /// files were deleted" and "this share stopped talking halfway through".
+    static func trustShrunken(fresh: Int, onScreen: Int, volumeReadable: Bool) -> Bool {
+        fresh >= onScreen || volumeReadable
+    }
+}
+
 /// Per-folder view options keyed by path, with a hard cap and least-recently-used
 /// eviction.
 ///
