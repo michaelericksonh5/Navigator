@@ -37,9 +37,16 @@ struct MountGate {
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// Has this volume already been found unreachable? Cheap — no syscall, no I/O.
+    ///
+    /// This is also where a mount whose calls simply never return gets marked: the deadline
+    /// check inside isUnreachable is what catches a hang, since a call that never comes back
+    /// never reports a failure of its own.
     var isDead: Bool {
-        guard root != nil else { return false }
-        return VolumePathRules.health.isUnreachable(root: root, now: now)
+        guard let root else { return false }
+        let known = VolumePathRules.health.peekUnreachable(root: root)
+        let dead = VolumePathRules.health.isUnreachable(root: root, now: now)
+        if dead && !known { navLog("mount health: \(root) UNREACHABLE — a call passed the deadline without returning; per-file attribute work suspended") }
+        return dead
     }
 
     /// Run a per-file attribute read under the gate.
@@ -58,32 +65,60 @@ struct MountGate {
             VolumePathRules.health.end(ticket, failure: nil, now: now)
             return value
         } catch {
-            VolumePathRules.health.end(ticket, failure: VolumeHealthRules.failure(error as NSError), now: now)
+            let cause = VolumeHealthRules.failure(error as NSError)
+            let known = VolumePathRules.health.peekUnreachable(root: root)
+            VolumePathRules.health.end(ticket, failure: cause, now: now)
+            if !known, VolumePathRules.health.peekUnreachable(root: root) {
+                navLog("mount health: \(root) UNREACHABLE (\(cause)) — per-file attribute work suspended")
+            }
             return nil
         }
     }
 
-    /// The recovery probe: one cheap syscall whose job is to answer "is this volume back".
+    /// The recovery probe: can this share actually be READ again?
     ///
-    /// Returns nil when the backoff says it is not time to ask yet — so the caller does
-    /// nothing rather than queueing another stat onto a connection that is not answering.
-    /// Only a TRANSPORT failure counts against the volume; a stat that fails with ENOENT
-    /// says the folder is gone, which is a fact about the folder, not about the server.
-    func probe(_ body: () -> Bool) -> Bool? {
-        guard let root else { return body() }               // local: no bookkeeping at all
+    /// It has to ask something the SERVER must answer, which is a sharper requirement than
+    /// it sounds. Measured with the VPN pulled while the mounts were still in the table:
+    ///
+    ///   stat("/Volumes/Games")    ok, 0 ms      (answered from cache)
+    ///   statfs("/Volumes/Games")  ok, 0 ms
+    ///   opendir("/Volumes/Games") FAIL, 0 ms    errno 13, EACCES
+    ///
+    /// The first version of this probe used stat() on the folder being viewed, and so
+    /// declared the share recovered 95 seconds into an outage that had another two minutes
+    /// to run — logged, live, as "answering again" while the server was still unreachable.
+    /// A probe that a cache can satisfy is not a probe. opendir is the one that told the
+    /// truth, and it is still just one syscall.
+    ///
+    /// Returns nil when the backoff says it is not time to ask yet, so the caller does
+    /// nothing rather than queueing more work onto a connection that is not answering.
+    func probeRecovered() -> Bool? {
+        guard let root else { return nil }                  // local: nothing to recover
         guard let ticket = VolumePathRules.health.begin(root: root, operation: .probe, now: now) else {
             return nil
         }
         errno = 0
-        let ok = body()
-        let cause: MountFailureRules.Cause? = ok ? nil : MountFailureRules.cause(errno: errno)
+        let dir = opendir(root)
+        let ok = dir != nil
+        if let dir { closedir(dir) }
+        // Any failure means "still not readable". Not just a transport errno: the live
+        // outage answered EACCES, which on its own means "permission denied" and would
+        // have been taken as a fact about the folder rather than about the server.
+        let cause: MountFailureRules.Cause? = ok ? nil : .unreachable
+        let known = VolumePathRules.health.peekUnreachable(root: root)
         VolumePathRules.health.end(ticket, failure: cause, now: now)
+        if known, ok, !VolumePathRules.health.peekUnreachable(root: root) {
+            navLog("mount health: \(root) readable again — attribute work resumed")
+        }
         return ok
     }
 
     /// A share that just mounted is a new session; whatever the old one was doing to it
     /// says nothing about this one.
     static func reconnected(mountPoint: String) {
+        if VolumePathRules.health.peekUnreachable(root: mountPoint) {
+            navLog("mount health: \(mountPoint) remounted — clearing the unreachable flag")
+        }
         VolumePathRules.health.reconnected(root: mountPoint)
     }
 }
@@ -992,10 +1027,23 @@ final class NetworkPollCoordinator {
             // kept handing back the mtime from the first one and the folder never
             // appeared to change. (Measured: files added on an SMB share, the shell saw
             // the new mtime immediately, the poll saw the original value forever.)
+            // Two different questions, and they must not be answered by the same call: while
+            // the volume is marked unreachable the only one worth asking is "can I read this
+            // share yet", and the folder mtime is meaningless until that says yes.
             var st = stat()
-            let mtime: Date? = gate.probe { stat(dir.path, &st) == 0 } == true
-                ? Date(timeIntervalSince1970: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9)
-                : nil
+            let mtime: Date?
+            if probing {
+                // Only once the share is readable again is the folder's own mtime worth
+                // anything — and it has to be read for real, or the signature stored below
+                // is garbage and the very next poll reports a change that never happened.
+                mtime = (gate.probeRecovered() == true && stat(dir.path, &st) == 0)
+                    ? Date(timeIntervalSince1970: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9)
+                    : nil
+            } else {
+                mtime = stat(dir.path, &st) == 0
+                    ? Date(timeIntervalSince1970: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9)
+                    : nil
+            }
             DispatchQueue.main.async {
                 guard let self, let browser else { return }
                 var s = self.state[key] ?? State(path: dir.path)

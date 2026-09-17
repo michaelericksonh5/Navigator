@@ -2473,6 +2473,14 @@ struct VolumeHealthRules {
         return .other
     }
 
+    /// The stored flag, without the deadline check that can flip it. Exists so a caller can
+    /// tell a state it already knew about from one this call just discovered, which is the
+    /// difference between logging a transition once and logging it per file.
+    func peekUnreachable(root: String?) -> Bool {
+        guard let root else { return false }
+        return volumes[root]?.unreachable ?? false
+    }
+
     mutating func isUnreachable(root: String?, now: TimeInterval) -> Bool {
         guard let root, var s = volumes[root] else { return false }
         if !s.unreachable, s.pending.values.contains(where: { now - $0 >= Self.timeout }) {
