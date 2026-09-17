@@ -4640,6 +4640,66 @@ final class ShareURLRulesTests: XCTestCase {
 
 // MARK: - Why a mount failed
 
+final class AfterEffectsPrefsRulesTests: XCTestCase {
+    /// The exact form found in After Effects 26.5's preferences file on this machine.
+    func testReadsTheDisabledValueAsWritten() {
+        let text = "[\"Main Pref Section v2\"]\t\"Pref_PURGE_EVERY_N_FRAMES\" = \"0\"\t\"Pref_SCRIPTING_FILE_NETWORK_SECURITY\" = \"0\"\t\"Pref_SEQUENCE_ZEROS\" = \"5\""
+        XCTAssertEqual(AfterEffectsPrefsRules.scriptingFileAccessEnabled(prefsText: text), false)
+    }
+
+    func testReadsTheEnabledValue() {
+        let text = #""Pref_SCRIPTING_FILE_NETWORK_SECURITY" = "1""#
+        XCTAssertEqual(AfterEffectsPrefsRules.scriptingFileAccessEnabled(prefsText: text), true)
+    }
+
+    /// After Effects writes this file on quit. A fresh install that has never been quit has
+    /// no value at all, and reporting that as "off" would send someone to fix a setting that
+    /// might already be right.
+    func testAbsentKeyIsUnknownNotOff() {
+        XCTAssertNil(AfterEffectsPrefsRules.scriptingFileAccessEnabled(prefsText: #""Pref_SEQUENCE_ZEROS" = "5""#))
+        XCTAssertNil(AfterEffectsPrefsRules.scriptingFileAccessEnabled(prefsText: ""))
+    }
+}
+
+final class ChromaKeyOutputRulesTests: XCTestCase {
+    /// The exact listing left behind by After Effects 26.5 rendering one still with the frame
+    /// token off. The script looked for "green_test_rmbg.tif", which is the one name NOT there.
+    func testFindsTheFrameNumberedRenderAfterEffectsActuallyWrote() {
+        let names = ["green_test_rmbg.tif00000", "AEtemp-AC866A-green_test_rmbg.tif"]
+        XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names),
+                       "green_test_rmbg.tif00000")
+    }
+
+    func testPrefersTheExactNameWhenAfterEffectsObliges() {
+        let names = ["green_test_rmbg.tif", "green_test_rmbg.tif00000", "AEtemp-X-green_test_rmbg.tif"]
+        XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names),
+                       "green_test_rmbg.tif")
+    }
+
+    /// When the rename never happened the bytes are only in the temp file.
+    func testFallsBackToTheInFlightTempFile() {
+        let names = ["AEtemp-AC866A-green_test_rmbg.tif"]
+        XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names),
+                       "AEtemp-AC866A-green_test_rmbg.tif")
+    }
+
+    func testIgnoresUnrelatedFilesAndTheSourcePNG() {
+        let names = ["green_test.png", "notes.txt", "other_rmbg.tif"]
+        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names))
+    }
+
+    /// Every intermediate has to go: leaving a 281 KB TIFF and a 0-byte stub next to the PNG
+    /// in someone's art folder is its own bug.
+    func testLeftoversCoverEveryIntermediateButNotThePNG() {
+        let names = ["green_test.png", "green_test_rmbg.png", "green_test_rmbg.tif00000",
+                     "AEtemp-AC866A-green_test_rmbg.tif"]
+        let junk = Set(ChromaKeyOutputRules.leftovers(base: "green_test_rmbg", names: names))
+        XCTAssertEqual(junk, ["green_test_rmbg.tif00000", "AEtemp-AC866A-green_test_rmbg.tif"])
+        XCTAssertFalse(junk.contains("green_test_rmbg.png"), "the deliverable is a PNG and must survive")
+        XCTAssertFalse(junk.contains("green_test.png"), "the source must survive")
+    }
+}
+
 final class TransferFallbackTests: XCTestCase {
     private func tempDir() throws -> URL {
         let d = URL(fileURLWithPath: NSTemporaryDirectory())

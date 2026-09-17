@@ -1827,8 +1827,57 @@ enum PhotoshopIcon {
 
 // After Effects' own icon + location, for the Chroma Key menu items. Resolved
 // once; menu items are hidden when After Effects isn't installed.
+//
+// The bundle identifier is NOT a constant across versions. After Effects 2026 (26.5.0,
+// verified on this machine) is "com.adobe.AfterEffects.application"; older builds were
+// "com.adobe.AfterEffects". Navigator hard-coded the old one everywhere, and
+// urlForApplication returned nil for it — so with After Effects sitting in /Applications,
+// every Chroma Key menu item was hidden as "not installed", the Setup row probed a bundle
+// that does not exist, and macOS was never asked for the Automation grant. That is the whole
+// reason the feature appeared unconnected. Resolved by trying the known identifiers in turn,
+// so a future rename is one entry rather than another silent disappearance.
+enum AfterEffectsApp {
+    static let candidates = ["com.adobe.AfterEffects.application", "com.adobe.AfterEffects"]
+    /// The identifier that actually resolves on this Mac, for both launching and the
+    /// `tell application id` target. nil when After Effects genuinely isn't installed.
+    static let bundleID: String? = candidates.first {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil
+    }
+    static let url: URL? = bundleID.flatMap {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)
+    }
+}
+extension AfterEffectsApp {
+    /// The newest "Adobe After Effects <ver> Prefs.txt" After Effects has written. It writes
+    /// these on QUIT, so a copy that has never been quit has none — which reads as Unknown
+    /// rather than Off, because those are genuinely different answers.
+    static var prefsFile: URL? {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Preferences/Adobe/After Effects")
+        guard let versions = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return nil }
+        let candidates = versions.compactMap { dir -> URL? in
+            guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return nil }
+            return files.first { $0.lastPathComponent.hasSuffix("Prefs.txt") }
+        }
+        return candidates.max { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            return da < db
+        }
+    }
+
+    static func scriptingFileAccess() -> PermissionState {
+        guard let f = prefsFile, let text = try? String(contentsOf: f, encoding: .utf8) else { return .unknown }
+        switch AfterEffectsPrefsRules.scriptingFileAccessEnabled(prefsText: text) {
+        case .some(true):  return .granted
+        case .some(false): return .denied
+        case nil:          return .unknown
+        }
+    }
+}
+
 enum AfterEffectsIcon {
-    static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.AfterEffects")
+    static let url: URL? = AfterEffectsApp.url
     static let image: NSImage? = url.map { menuIcon(NSWorkspace.shared.icon(forFile: $0.path)) }
 }
 @ViewBuilder func aeLabel(_ title: String) -> some View {
@@ -4103,12 +4152,12 @@ func chromaKeyOnce(cfgPath: String, src: URL, attempts: Int = 3,
         guard !isLast else { break }
         navLog("chroma key: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
         if i == attempts - 2, !recovery.used, AdobeRecoveryRules.looksWedged(last.message),
-           let aeURL = AfterEffectsIcon.url {
+           let aeURL = AfterEffectsApp.url, let aeID = AfterEffectsApp.bundleID {
             // Plain retries exhausted AND the failure looks like an unresponsive app rather
             // than a file After Effects refused. A restart cannot fix a bad file, and its
             // force-quit fallback can take unsaved work with it. (AdobeRecoveryRules)
             recovery.markUsed()
-            restartAdobeApp(bundleID: "com.adobe.AfterEffects", appURL: aeURL)
+            restartAdobeApp(bundleID: aeID, appURL: aeURL)
         } else {
             Thread.sleep(forTimeInterval: 1.0 + Double(i))
         }
@@ -4244,6 +4293,17 @@ func assembleLayerFolders(_ dirs: [URL], onDone: (([URL]) -> Void)? = nil) {
     }
 }
 
+/// TIFF (or whatever still After Effects rendered) to PNG, keeping the alpha that the whole
+/// chroma key exists to produce. Replaces the script's `sips` shell-out — see the config in
+/// chromaKeyForImages for why that could not be relied on.
+func convertStillToPNG(_ src: URL, _ dst: URL) -> Bool {
+    guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return false }
+    guard let out = CGImageDestinationCreateWithURL(dst as CFURL, "public.png" as CFString, 1, nil) else { return false }
+    CGImageDestinationAddImage(out, image, nil)
+    return CGImageDestinationFinalize(out)
+}
+
 // Chroma Key for several PNGs in one hidden After Effects session (single still
 // script per file). Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
@@ -4258,20 +4318,46 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             let folder = src.deletingLastPathComponent()
             let base = src.deletingPathExtension().lastPathComponent
             let out = folder.appendingPathComponent("\(base)_rmbg.png")
+            // TIFF, not PNG, and the intermediate is kept.
+            //
+            // Asking the script for PNG made it shell out to `sips` through
+            // system.callSystem, which After Effects refuses unless Preferences ▸ Scripting
+            // & Expressions ▸ "Allow Scripts to Write Files and Access Network" is on:
+            //   ReferenceError: Permission denied (is Preferences > Scripting & Expressions >
+            //   Allow Scripts to Write Files and Access Network enabled?)
+            // The script turned that into a thrown error, After Effects raised it as a modal,
+            // and because Navigator keeps After Effects hidden nobody could see or answer it —
+            // the job simply hung. Rendering to TIFF takes that whole path out: After Effects
+            // writes TIFF with alpha natively, and Navigator converts it here, which is work an
+            // image browser should not have been delegating to a compositor in the first place.
             let cfg: [String: Any] = [
                 "sourceFile": src.path, "outputFolder": folder.path, "outputName": "\(base)_rmbg",
                 "automationMode": true, "showUi": false, "appendFrameToken": false,
-                "renderImmediately": true, "finalOutputFormat": "png",
-                "deleteIntermediateRender": true, "keyMode": "auto"
+                "renderImmediately": true, "finalOutputFormat": "tif",
+                "deleteIntermediateRender": false, "keyMode": "auto"
             ]
             guard let cfgPath = writeChromaConfig(cfg) else { errors.append("\(src.lastPathComponent): couldn’t write config"); continue }
+            let before = Set((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
             let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: false, recovery: recovery)
             try? FileManager.default.removeItem(atPath: cfgPath)
-            if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
+            if r.ok {
+                let after = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+                let fresh = after.filter { !before.contains($0) }
+                if let rendered = ChromaKeyOutputRules.renderedStill(base: "\(base)_rmbg", names: fresh),
+                   convertStillToPNG(folder.appendingPathComponent(rendered), out) {
+                    for junk in ChromaKeyOutputRules.leftovers(base: "\(base)_rmbg", names: fresh) {
+                        try? FileManager.default.removeItem(at: folder.appendingPathComponent(junk))
+                    }
+                    outs.append(out)
+                } else {
+                    errors.append("\(src.lastPathComponent): After Effects reported success but left no readable render")
+                    navLog("chroma key: \(src.lastPathComponent) — no usable render among \(fresh.sorted())")
+                }
+            } else { errors.append("\(src.lastPathComponent): \(r.message)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
         DispatchQueue.main.async {
-            hideApp(bundleID: "com.adobe.AfterEffects")
+            hideApp(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects")
             BGJobProgress.shared.finish("Keyed \(outs.count) of \(pngs.count) image\(pngs.count == 1 ? "" : "s")")
             if !errors.isEmpty { showBGSummary(app: "After Effects", done: outs.count, total: pngs.count, errors: errors) }
             if !outs.isEmpty { onDone?(outs) }
@@ -4379,10 +4465,38 @@ func restartAdobeApp(bundleID: String, appURL: URL) {
 // While the command is running, keep `bundleID` hidden — opening a document can un-hide
 // an app, so we re-hide it (only if it actually became visible, so no flicker
 // when it's already hidden). Runs on a background queue; returns immediately.
-func keepHidden(while isRunning: @escaping () -> Bool, bundleID: String) {
+/// How long a hidden Adobe app may run before Navigator stops hiding it.
+///
+/// Adobe apps report problems as MODAL dialogs, and a hidden app's modal cannot be seen or
+/// answered — so the run stops dead and waits. Observed end to end with After Effects 26.5:
+/// the render finished, After Effects raised "An unexpected error occurred while exporting a
+/// composition. Error Code: 784. Please restart After Effects and retry the export.", and
+/// because Navigator re-hid the app every 0.5 s that dialog was invisible. The job then sat
+/// there with no output and no error until the hour-long timeout. `sample` showed it parked
+/// in UI_MessageBox::RunModal() the whole time.
+///
+/// 90 seconds is well past a single still, so anything still running has stopped being a
+/// render and started being a question for a person.
+let adobeRevealAfter: TimeInterval = 90
+
+func keepHidden(while isRunning: @escaping () -> Bool, bundleID: String,
+                revealAfter: TimeInterval? = nil) {
     DispatchQueue.global(qos: .utility).async {
+        let start = Date()
+        var revealed = false
         while isRunning() {
-            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
+            if let revealAfter, !revealed, Date().timeIntervalSince(start) > revealAfter {
+                revealed = true
+                navLog("\(bundleID): still running after \(Int(revealAfter))s — showing it, in case it is "
+                       + "waiting on a dialog that cannot be answered while hidden")
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) {
+                    app.unhide()
+                    app.activate()
+                }
+            }
+            if !revealed {
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
+            }
             Thread.sleep(forTimeInterval: 0.5)
         }
     }
@@ -4497,12 +4611,15 @@ func runAfterEffectsScript(resource: String, globals: [String: String], reportEr
     for (k, v) in globals { source += "$.global.\(k) = \"\(jsEsc(v))\";\n" }
     source += fileSource
     // No `activate` — launch After Effects hidden and keep it hidden.
-    if let aeURL = AfterEffectsIcon.url { launchHidden(bundleID: "com.adobe.AfterEffects", appURL: aeURL) }
+    guard let aeID = AfterEffectsApp.bundleID else {
+        return ScriptResult(ok: false, message: "After Effects isn’t installed")
+    }
+    if let aeURL = AfterEffectsApp.url { launchHidden(bundleID: aeID, appURL: aeURL) }
     let appleScript = """
     on run argv
         set jsxSource to item 1 of argv
         with timeout of 3600 seconds
-            tell application id "com.adobe.AfterEffects"
+            tell application id "\(aeID)"
                 DoScript jsxSource
             end tell
         end timeout
@@ -4510,8 +4627,10 @@ func runAfterEffectsScript(resource: String, globals: [String: String], reportEr
     """
     do {
         let output = try ExternalProcess.run("/usr/bin/osascript",
-            arguments: ["-e", appleScript, source], timeout: 3660,
-            onLaunch: { keepHidden(while: $0, bundleID: "com.adobe.AfterEffects") }).completed()
+            // 600s, not an hour. One still does not take ten minutes, and the old hour meant a
+            // wedged After Effects held the job — and its progress row — for the whole hour.
+            arguments: ["-e", appleScript, source], timeout: 600,
+            onLaunch: { keepHidden(while: $0, bundleID: aeID, revealAfter: adobeRevealAfter) }).completed()
         let stdout = output.out.trimmingCharacters(in: .whitespacesAndNewlines)
         let stderr = output.err
         if output.status != 0 {
@@ -4561,7 +4680,7 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
         try? FileManager.default.removeItem(atPath: cfgPath)
         DispatchQueue.main.async {
             guard r.ok else { return }       // failure already surfaced; leave AE visible
-            hideApp(bundleID: "com.adobe.AfterEffects")
+            hideApp(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects")
             onDone?(out)
         }
     }
@@ -16998,10 +17117,21 @@ struct SetupItem: Identifiable {
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
             SetupItem(id: "automation-ae", title: "Control After Effects",
                       why: "Used for Chroma Key BG. A separate Automation grant again — allowing Photoshop does not cover After Effects.",
-                      probe: { _ in PermissionProbe.appAutomation(bundleID: "com.adobe.AfterEffects") },
+                      probe: { _ in PermissionProbe.appAutomation(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects") },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch Adobe After Effects on underneath it.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
+            // Not a macOS permission — After Effects' own. It gets a row because of how it
+            // fails: OFF, a script's system.callSystem is refused and After Effects raises the
+            // refusal as a MODAL dialog. Navigator runs it hidden, so nobody could see or
+            // answer that dialog and Chroma Key simply stopped with no output and no error.
+            SetupItem(id: "ae-scripting", title: "After Effects: allow scripts to write files",
+                      why: "After Effects' own setting, not a macOS permission, and it is OFF by default.\n\nWith it off, a script that needs to run a helper or write alongside its render is refused, and After Effects reports that as a dialog. Navigator runs After Effects hidden so that dialog can't be answered — which is how a Chroma Key ends up producing nothing and saying nothing. Navigator no longer depends on it for Chroma Key itself, but anything else scripted through After Effects will.\n\nRead from After Effects' own preferences file, which it writes when it QUITS. If this says Unknown, quit After Effects once and reopen this window.",
+                      probe: { _ in AfterEffectsApp.scriptingFileAccess() },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "Open After Effects",
+                      afterOpening: "Then, in After Effects: Settings ▸ Scripting & Expressions ▸ tick “Allow Scripts to Write Files and Access Network”. Quit After Effects afterwards so the setting is written and this row can read it.",
+                      openSettings: { if let u = AfterEffectsApp.url { NSWorkspace.shared.openApplication(at: u, configuration: NSWorkspace.OpenConfiguration()) { _, _ in } } }),
             // No API exists to query either of the two below, so both report Unknown and
             // lead with what BREAKS when they're off. A row that can only say "Unknown" still
             // earns its place if it tells you the symptom you'd otherwise misdiagnose.
@@ -17670,7 +17800,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private struct FinderQA { let title: String; let action: String; let requires: String?; let acceptsFolders: Bool }
     private static let finderQuickActions: [FinderQA] = [
         .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
-        .init(title: "Chroma Key BG",          action: "chromakey",    requires: "com.adobe.AfterEffects", acceptsFolders: true),
+        // Resolved, not hard-coded: the identifier changed in After Effects 2026, and the
+        // stale one meant this Quick Action was never installed in Finder either.
+        .init(title: "Chroma Key BG",          action: "chromakey",    requires: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects", acceptsFolders: true),
         .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: true),
     ]
     // Older names to clean up so we don't leave stale duplicates behind (includes

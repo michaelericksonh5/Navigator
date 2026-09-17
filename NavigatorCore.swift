@@ -5548,6 +5548,70 @@ func copyWithProgress(_ src: URL, _ dst: URL,
 }
 
 
+/// After Effects' "Allow Scripts to Write Files and Access Network", read from its own
+/// preferences file.
+///
+/// Worth a row of its own because of how it fails: with it OFF, a script's
+/// `system.callSystem` is refused with
+///   ReferenceError: Permission denied (is Preferences > Scripting & Expressions >
+///   Allow Scripts to Write Files and Access Network enabled?)
+/// and After Effects raises that as a MODAL dialog. Navigator runs After Effects hidden, so
+/// the dialog could not be seen or answered and the job simply stopped. Verified on 26.5.0,
+/// where the preferences file held Pref_SCRIPTING_FILE_NETWORK_SECURITY = "0".
+enum AfterEffectsPrefsRules {
+    /// nil when the key isn't present — After Effects writes this file on QUIT, so a fresh
+    /// install that has never been quit has nothing to read, which is not the same as "off".
+    static func scriptingFileAccessEnabled(prefsText: String) -> Bool? {
+        guard let r = prefsText.range(of: "\"Pref_SCRIPTING_FILE_NETWORK_SECURITY\"") else { return nil }
+        let tail = prefsText[r.upperBound...].prefix(40)
+        guard let eq = tail.firstIndex(of: "=") else { return nil }
+        // Values appear as "1"/"0" or as the bare 01/00 form this file also uses.
+        let value = tail[tail.index(after: eq)...].prefix(8)
+        if value.contains("1") { return true }
+        if value.contains("0") { return false }
+        return nil
+    }
+}
+
+/// Finding the still After Effects actually rendered.
+///
+/// After Effects does not write the filename the script asked for. Measured on 26.5.0
+/// rendering one still to "green_test_rmbg.tif" with the frame token switched OFF, the
+/// output folder ended up holding:
+///
+///   green_test_rmbg.tif00000          — the frame number appended anyway
+///   AEtemp-AC866A-green_test_rmbg.tif — where the bytes were written during the render
+///
+/// The script looked for exactly "green_test_rmbg.tif", found nothing, and threw — which
+/// After Effects raised as a modal, invisible because Navigator keeps it hidden, and the
+/// whole job then hung. So the render is located by pattern rather than by exact name.
+enum ChromaKeyOutputRules {
+    /// Candidates in the order they should be trusted, given the base name the render was
+    /// asked to use ("green_test_rmbg"). `names` is a plain directory listing.
+    static func renderedStill(base: String, names: [String]) -> String? {
+        let tiffish = names.filter { n in
+            let l = n.lowercased()
+            return l.contains(base.lowercased()) && (l.contains(".tif") || l.contains(".tiff"))
+        }
+        // Exactly what was asked for, when After Effects happens to oblige.
+        if let exact = tiffish.first(where: { $0 == base + ".tif" || $0 == base + ".tiff" }) { return exact }
+        // The frame-numbered form: "<base>.tif00000".
+        if let numbered = tiffish.filter({ $0.hasPrefix(base + ".tif") }).sorted().first { return numbered }
+        // The in-flight temp, which is where the bytes actually are when the rename never happened.
+        if let temp = tiffish.filter({ $0.hasPrefix("AEtemp-") }).sorted().first { return temp }
+        return tiffish.sorted().first
+    }
+
+    /// Everything this render scattered, so none of it is left in the user's folder.
+    static func leftovers(base: String, names: [String]) -> [String] {
+        names.filter { n in
+            let l = n.lowercased()
+            guard l.contains(".tif") || l.contains(".tiff") else { return false }
+            return l.contains(base.lowercased()) || n.hasPrefix("AEtemp-")
+        }
+    }
+}
+
 /// macOS names the WRONG volume when a destination is read-only.
 ///
 /// Verified against a read-only SMB share: NSCocoaErrorDomain 642, real destination volume
