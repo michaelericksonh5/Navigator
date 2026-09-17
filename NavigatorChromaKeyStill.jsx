@@ -1,5 +1,5 @@
 /*
-Chroma Key Still Export for After Effects (manual footage workflow)
+Chroma Key Still Export for Navigator / After Effects
 =========================================
 
 Purpose:
@@ -26,9 +26,6 @@ Notes:
   - Keylight is designed primarily for green/blue screen work. The script can
     set magenta/cyan as screen colours, but those must be tested on your AE
     install and asset style.
-  - Navigator uses native minimum-opacity extraction for uniform-backed still FX.
-    Its blue/magenta outputs were opaque when automation selected green, and
-    saturation keying eroded soft rays. This manual footage keyer is not that path.
 */
 
 (function chromaKeyStillExport() {
@@ -55,7 +52,6 @@ Notes:
         // better when the generated "green" is slightly off from exact #00FF00.
         // If false, auto mode snaps to the nearest preset key color.
         useSampleAverage: true,
-        sampleAutoInAutomation: false,
 
         // In auto mode, "corners" works like an automatic eyedropper: sample
         // the matte colour from the image corners, where generated symbols
@@ -67,15 +63,16 @@ Notes:
 
         // Conservative defaults for generated flat backgrounds. Tune per test.
         keylight: {
-            screenGain: null,
-            screenBalance: null,
-            clipBlack: null,
-            clipWhite: null,
-            screenPreblur: null
+            screenGain: 100,
+            screenBalance: 50,
+            clipBlack: 0,
+            clipWhite: 100,
+            screenPreblur: 0,
+            despillBias: [0.5, 0.5, 0.5]
         },
 
-        addKeyCleaner: true,
-        addAdvancedSpillSuppressor: true,
+        addKeyCleaner: false,
+        addAdvancedSpillSuppressor: false,
 
         compName: "H5G_Chroma_Key_Still",
         compDuration: 1 / 24,
@@ -85,6 +82,7 @@ Notes:
         // them in order and logs which one worked.
         renderSettingsTemplate: "Best Settings",
         outputModuleTemplates: [
+            "Navigator Straight RGBA",
             "PNG Sequence with Alpha",
             "TIFF Sequence with Alpha"
         ],
@@ -571,8 +569,7 @@ Notes:
         }
 
         if (samples.length === 0) {
-            log("WARNING: No valid color samples; falling back to green.");
-            return PRESET_COLORS.green;
+            throw new Error("No valid backing colour samples; refusing to guess green.");
         }
 
         // Pick the most representative sample by finding the colour with the
@@ -655,10 +652,6 @@ Notes:
         if (mode !== "auto" && PRESET_COLORS[mode]) {
             return { name: mode, color: PRESET_COLORS[mode] };
         }
-        if (isAutomation(config) && !config.sampleAutoInAutomation) {
-            log("Automation auto mode using green fallback; set sampleAutoInAutomation=true to use expression sampling.");
-            return { name: "green", color: PRESET_COLORS.green };
-        }
 
         var sampled;
         try {
@@ -668,8 +661,7 @@ Notes:
                 sampled = estimateCornerColor(comp, layer, config);
             }
         } catch (e) {
-            log("WARNING: Auto key sampling failed; falling back to green: " + e.toString());
-            return { name: "green", color: PRESET_COLORS.green };
+            throw new Error("Auto key sampling failed: " + e.toString());
         }
         if (config.useSampleAverage) {
             return { name: "sampleAverage", color: sampled };
@@ -743,51 +735,37 @@ Notes:
                 log("Set " + prop.name + " = " + value);
                 return true;
             } catch (e) {
-                log("Could not set " + prop.name + ": " + e.toString());
-                return false;
+                throw new Error("Could not set " + prop.name + ": " + e.toString());
             }
         }
-        log("Could not find Keylight property: " + names.join(" / "));
-        return false;
-    }
-
-    function keylightColorValue(color) {
-        var epsilon = 0.001;
-        function clamp(v) {
-            return Number(Math.max(epsilon, Math.min(1 - epsilon, v)));
-        }
-        return new Array(clamp(color[0]), clamp(color[1]), clamp(color[2]));
+        throw new Error("Could not find Keylight property: " + names.join(" / "));
     }
 
     function setKeylightScreenColor(keylight, color) {
-        var value = keylightColorValue(color);
-        if (color[0] === 0 && color[1] === 1 && color[2] === 0) {
-            value = [0.001, 0.999, 0.001];
-        }
+        // AE 26.5 setValue on pure Screen Colours throws "invalid numeric result".
+        // A constant RGBA expression retains the EXACT backing (no epsilon tint).
         var prop = keylight.property("Keylight 906-0004");
-        try {
-            log("Screen Colour target = " + value[0] + "," + value[1] + "," + value[2]);
-            prop.setValue(value);
-            log("Set Screen Colour = " + value);
-            return true;
-        } catch (directErr) {
-            log("Direct Screen Colour set failed: " + directErr.toString());
-            try {
-                prop.expression = "[" + value[0] + "," + value[1] + "," + value[2] + ",1]";
-                prop.expressionEnabled = true;
-                log("Set Screen Colour expression fallback = " + prop.expression);
-                return true;
-            } catch (expressionErr) {
-                log("Screen Colour expression fallback failed: " + expressionErr.toString());
-                return setIfFound(keylight, ["Screen Colour", "Screen Color"], value);
-            }
-        }
+        prop.expression = "[" + color[0] + "," + color[1] + "," + color[2] + ",1]";
+        prop.expressionEnabled = true;
+        log("Screen Colour expression = " + prop.expression);
     }
 
     function applyKeylight(layer, keyInfo, config) {
         var effects = layer.property("ADBE Effect Parade");
         var keylight = effects.addProperty("Keylight 906");
 
+        // Foundry Keylight 1.2 guide pp. 24-28: gain above 100 erodes detail;
+        // clipping hardens soft edges. Glows need the entire 0..100 matte range.
+        // Key Cleaner and a second despiller damaged these mostly-partial-alpha assets.
+        keylight.property("Keylight 906-0002").setValue(11); // Final Result, not unmodified source RGB.
+        keylight.property("Keylight 906-0003").setValue(1); // AE expects unpremultiplied effect output.
+        var bias = config.keylight.despillBias;
+        // Foundry pp. 16-24 recommends a predominant foreground sample. Navigator
+        // supplies a source-only, near-opaque sample; neutral is used when none exists.
+        // Index lookup avoids AE 26.5's numeric exception for named bias-property access.
+        // Linked biases are the plugin default; setting Despill Bias updates both.
+        keylight.property(7).setValue([Number(bias[0]), Number(bias[1]), Number(bias[2])]);
+        log("Despill Bias RGB = " + bias.join(","));
         setKeylightScreenColor(keylight, keyInfo.color);
         keylight.name = "Keylight - " + keyInfo.name;
 
@@ -851,13 +829,20 @@ Notes:
                     log("Rejected output template: " + templates[i] + " " + settings.Format + " " + settings.Channels);
                     continue;
                 }
+                // Template names do not guarantee unmatted RGB or native dimensions.
+                rqItem.outputModule(1).setSettings({Crop: "false", Resize: "false"});
+                var verified = rqItem.outputModule(1).getSettings(GetSettingsFormat.STRING);
+                if (verified.Channels !== "RGB + Alpha" || verified.Color !== "Straight (Unmatted)" ||
+                    verified.Crop !== "false" || verified.Resize !== "false") {
+                    throw new Error("Output module must provide straight RGBA at native size: " + verified.toSource());
+                }
                 log("Applied output module template: " + templates[i]);
                 return templates[i];
             } catch (e) {
-                log("Output template failed: " + templates[i]);
+                log("Output template failed: " + templates[i] + ": " + e.toString());
             }
         }
-        throw new Error("No configured alpha output module template is available. Available templates: " + available.join(", "));
+        throw new Error("Create an output template named Navigator Straight RGBA in Edit > Templates > Output Module: TIFF or PNG Sequence, RGB + Alpha, Straight (Unmatted). Available templates: " + available.join(", "));
     }
 
     function queueRender(comp, outputFolder, outputBaseName, config) {
@@ -976,7 +961,7 @@ Notes:
     } catch (e) {
         // Return the error as a status string (osascript stdout) so Navigator can
         // surface it — no blocking alert (invisible when the user is in Navigator).
-        RESULT = "ERROR: " + e.toString();
+        RESULT = "ERROR: " + e.toString() + " (line " + e.line + ")";
     } finally {
         // Always — success or failure. The rendered PNG is already on disk by this
         // point (Navigator reads it from the filesystem, not from AE), so

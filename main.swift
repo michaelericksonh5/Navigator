@@ -3886,7 +3886,7 @@ func batchRemoveBackgroundFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
     removeBackgroundForImages(imgs) { _ in onDone?() }
 }
 
-// Batch Chroma Key on a FOLDER (native) — same per-file routing.
+// Batch Chroma Key on a FOLDER (After Effects + Keylight) — same per-file routing.
 func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
     let pngs = batchImageURLs(in: folder).filter { $0.pathExtension.lowercased() == "png" }
     guard !pngs.isEmpty else {
@@ -4284,17 +4284,24 @@ func assembleLayerFolders(_ dirs: [URL], onDone: (([URL]) -> Void)? = nil) {
     }
 }
 
-// Native uniform-backing extraction shared by single-image and folder actions. Non-blocking "N of M" progress + end-of-run summary.
+// After Effects + Keylight shared by single-image and folder actions. Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     let pngs = srcs.filter { $0.pathExtension.lowercased() == "png" }
     guard !pngs.isEmpty else { NSSound.beep(); return }
+    guard let bundleID = AfterEffectsApp.bundleID, let appURL = AfterEffectsApp.url,
+          let scriptURL = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
+        reportFileError("Chroma Key needs After Effects", "Install After Effects and ensure NavigatorChromaKeyStill.jsx is bundled in Navigator.")
+        return
+    }
     DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying", total: pngs.count) }
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
         var errors: [String] = []
         for src in pngs {
             do {
-                let out = try ChromaKeyOutputRules.exportPNG(source: src)
+                launchHidden(bundleID: bundleID, appURL: appURL)
+                let out = try ChromaKeyOutputRules.exportPNG(source: src, scriptURL: scriptURL, bundleID: bundleID,
+                    onLaunch: { keepHidden(while: $0, bundleID: bundleID, revealAfter: adobeRevealAfter) })
                 outs.append(out)
             } catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
@@ -4530,7 +4537,7 @@ func reportAdobeAutomationFailure(_ appName: String, _ raw: String) {
     }
 }
 
-// Single-image native uniform-backing extraction. Writes "<base>_rmbg.png" next to the source. Original is untouched.
+// Single-image After Effects + Keylight. Writes "<base>_rmbg.png" next to the source. Original is untouched.
 func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard src.pathExtension.lowercased() == "png" else {
         DispatchQueue.main.async { reportFileError("Chroma Key needs a PNG", "Chroma Key processes PNG images with a uniform backing colour.") }
@@ -16971,7 +16978,7 @@ struct SetupItem: Identifiable {
                       afterOpening: "Then: find Navigator in that list and switch Adobe Photoshop on underneath it.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
             SetupItem(id: "automation-ae", title: "Control After Effects",
-                      why: "Optional After Effects scripting. Chroma Key BG runs natively and needs no Adobe permission.",
+                      why: "Chroma Key BG uses After Effects + Keylight and needs permission to control After Effects.",
                       probe: { _ in PermissionProbe.appAutomation(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects") },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch Adobe After Effects on underneath it.",
@@ -16981,7 +16988,7 @@ struct SetupItem: Identifiable {
             // refusal as a MODAL dialog. Navigator runs it hidden, so nobody could see or
             // answer that dialog and Chroma Key simply stopped with no output and no error.
             SetupItem(id: "ae-scripting", title: "After Effects: allow scripts to write files",
-                      why: "After Effects' own setting, not a macOS permission, and it is OFF by default.\n\nWith it off, a script that needs to run a helper or write alongside its render is refused, and After Effects reports that as a dialog. Navigator runs After Effects hidden so that dialog can't be answered — which is how a Chroma Key ends up producing nothing and saying nothing. Navigator no longer depends on it for Chroma Key itself, but anything else scripted through After Effects will.\n\nRead from After Effects' own preferences file, which it writes when it QUITS. If this says Unknown, quit After Effects once and reopen this window.",
+                      why: "After Effects' setting for scripts that run external helpers. Chroma Key BG renders in After Effects and converts the still to PNG in Navigator, so it does not require shell access.\n\nRead from the preferences file After Effects writes when it quits.",
                       probe: { _ in AfterEffectsApp.scriptingFileAccess() },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Open After Effects",

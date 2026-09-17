@@ -5574,16 +5574,28 @@ enum AfterEffectsPrefsRules {
     }
 }
 
-/// A known backing still leaves four unknowns (RGB and alpha) in three equations.
-/// Choose the smallest alpha for which recovered foreground RGB stays in gamut:
-/// C = aF + (1-a)B. This preserves light falloff without Keylight's saturation/clipping.
-/// Smith & Blinn, Blue Screen Matting (1996). This is a minimum-opacity estimate,
-/// not a claim to recover arbitrary original alpha (burstWhite measured MAE 5.60/255).
+/// Keylight owns RGB/alpha recovery. The previous minimum-opacity extraction shifted
+/// burstWhite's foreground green by +37.40/255 despite a near-perfect round trip.
+/// Swift only converts AE's straight RGBA still and publishes the validated PNG.
 enum ChromaKeyOutputRules {
-    static func pixels(_ image: CGImage) throws -> [UInt8] {
+    // AE has one project/render queue; simultaneous Finder and folder jobs must serialize.
+    private static let renderLock = NSLock()
+
+    static func failure(_ message: String) -> NSError {
+        NSError(domain: "ChromaKey", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    static func load(_ url: URL) throws -> CGImage {
+        guard let decoder = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(decoder, 0, nil) else {
+            throw failure("Could not decode image: \(url.lastPathComponent)")
+        }
+        return image
+    }
+
+    static func foregroundBias(_ image: CGImage) throws -> [Double] {
         var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
-        let ok = bytes.withUnsafeMutableBytes { raw -> Bool in
-            // Keep the encoded RGB space: linearising an encoded-space flatten changes its matte.
+        let decoded = bytes.withUnsafeMutableBytes { raw -> Bool in
             let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
             guard let context = CGContext(data: raw.baseAddress, width: image.width, height: image.height,
                 bitsPerComponent: 8, bytesPerRow: image.width * 4, space: space,
@@ -5592,69 +5604,94 @@ enum ChromaKeyOutputRules {
             context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
             return true
         }
-        guard ok else { throw failure("Could not decode image pixels") }
-        return bytes
-    }
-
-    static func failure(_ message: String) -> NSError {
-        NSError(domain: "ChromaKey", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-    }
-
-    static func exportPNG(source: URL) throws -> URL {
-        guard let decoder = CGImageSourceCreateWithURL(source as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(decoder, 0, nil) else {
-            throw failure("Could not read PNG")
-        }
-        var bytes = try pixels(image)
-        // Already transparent artwork must not be keyed a second time.
-        if stride(from: 3, to: bytes.count, by: 4).allSatisfy({ bytes[$0] == 255 }) {
-            let corners = [0, (image.width - 1) * 4,
-                           (image.height - 1) * image.width * 4, bytes.count - 4]
-            let backing = (0..<3).map { c in corners.map { bytes[$0 + c] }.sorted()[1] }
-            guard corners.filter({ i in (0..<3).allSatisfy { bytes[i + $0] == backing[$0] } }).count >= 3 else {
-                throw failure("Chroma Key needs a uniform backing visible in at least three corners")
+        guard decoded else { throw failure("Could not sample foreground colour") }
+        let corners = [0, (image.width - 1) * 4, (image.height - 1) * image.width * 4, bytes.count - 4]
+        let backing = (0..<3).map { c in Double(corners.map { bytes[$0 + c] }.sorted()[1]) }
+        var bias = [0.5, 0.5, 0.5], bestDistance = 0.0
+        for i in stride(from: 0, to: bytes.count, by: 4) where bytes[i + 3] == 255 {
+            var distance = 0.0, opaque = false
+            for c in 0..<3 {
+                let value = Double(bytes[i + c]), b = backing[c], delta = value - b
+                distance += delta * delta
+                // Only sample pixels requiring >=99% opacity in at least one channel.
+                // Otherwise the bias contains backing: green rays never reach full opacity.
+                if delta > 0 && delta >= 0.99 * (255 - b) { opaque = true }
+                if delta < 0 && -delta >= 0.99 * b { opaque = true }
             }
-            for i in stride(from: 0, to: bytes.count, by: 4) {
-                var alpha = 0.0
-                for c in 0..<3 {
-                    let b = Double(backing[c]), v = Double(bytes[i + c])
-                    if v > b { alpha = max(alpha, (v - b) / (255 - b)) }
-                    if v < b { alpha = max(alpha, (b - v) / b) }
-                }
-                let a = UInt8(min(255, max(0, (alpha * 255).rounded())))
-                // Recover STRAIGHT colour using the alpha actually stored in the PNG.
-                // Colour-only spill suppression previously left blue/magenta inputs opaque.
-                for c in 0..<3 {
-                    let foreground = a == 0 ? 0 : (Double(bytes[i + c]) - (1 - Double(a) / 255) * Double(backing[c])) * 255 / Double(a)
-                    bytes[i + c] = UInt8(min(255, max(0, foreground.rounded())))
-                }
-                bytes[i + 3] = a
-            }
-        } else {
-            for i in stride(from: 0, to: bytes.count, by: 4) where bytes[i + 3] > 0 {
-                for c in 0..<3 {
-                    bytes[i + c] = UInt8(min(255, (Double(bytes[i + c]) * 255 / Double(bytes[i + 3])).rounded()))
-                }
+            if opaque && distance > bestDistance {
+                bestDistance = distance
+                // Bias is a colour ratio; keep values away from plugin endpoint setters.
+                bias = (0..<3).map { max(1, Double(bytes[i + $0])) / 510 }
             }
         }
-        let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
-        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
-              let keyed = CGImage(width: image.width, height: image.height, bitsPerComponent: 8,
-                bitsPerPixel: 32, bytesPerRow: image.width * 4, space: space,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider,
-                decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
-            throw failure("Could not create keyed image")
+        // Samples only select Keylight's bias. No RGB or alpha extraction occurs in Swift.
+        return bias
+    }
+
+    static func publish(rendered: URL, source: URL) throws -> URL {
+        let input = try load(source), image = try load(rendered)
+        guard image.width == input.width, image.height == input.height else {
+            throw failure("After Effects changed the image dimensions")
+        }
+        guard [.last, .first, .premultipliedLast, .premultipliedFirst].contains(image.alphaInfo) else {
+            throw failure("After Effects rendered without an alpha channel")
         }
         let data = NSMutableData()
         guard let encoder = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
             throw failure("Could not encode PNG")
         }
-        // Native pixel dimensions bypass both AE output presets and Prep for AI's 1.2x padding.
-        CGImageDestinationAddImage(encoder, keyed, nil)
+        CGImageDestinationAddImage(encoder, image, nil)
         guard CGImageDestinationFinalize(encoder) else { throw failure("Could not finish PNG") }
         let out = source.deletingLastPathComponent().appendingPathComponent(source.deletingPathExtension().lastPathComponent + "_rmbg.png")
+        // Validate before atomic replacement, so an AE failure preserves an earlier output.
         try (data as Data).write(to: out, options: .atomic)
         return out
+    }
+
+    static func exportPNG(source: URL, scriptURL: URL, bundleID: String,
+                          onLaunch: ((@escaping () -> Bool) -> Void)? = nil) throws -> URL {
+        renderLock.lock()
+        defer { renderLock.unlock() }
+        guard source.pathExtension.lowercased() == "png" else { throw failure("Chroma Key needs a PNG") }
+        let bias = try foregroundBias(load(source))
+        let script = try String(contentsOf: scriptURL, encoding: .utf8)
+        let fm = FileManager.default
+        let scratch = fm.temporaryDirectory.appendingPathComponent("NavigatorKeylight-" + UUID().uuidString)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: scratch) }
+        let statusFile = scratch.appendingPathComponent("result.txt")
+        let logFile = scratch.appendingPathComponent("keylight.log")
+        let config: [String: Any] = ["sourceFile": source.path, "outputFolder": scratch.path,
+            "outputName": "keyed", "automationMode": true, "showUi": false, "keyMode": "auto",
+            "useSampleAverage": true, "keylight": ["despillBias": bias],
+            "resultFile": statusFile.path, "logFile": logFile.path]
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: config), as: UTF8.self)
+        // DoScriptFile is refused by AE's scripting security; DoScript SOURCE works.
+        // No system.callSystem: TIFF-to-PNG conversion is entirely in ImageIO above.
+        let jsx = "$.global.H5G_CHROMA_KEY_CONFIG = " + json + ";\n" + script
+        guard ["com.adobe.AfterEffects.application", "com.adobe.AfterEffects"].contains(bundleID) else {
+            throw failure("Unrecognised After Effects bundle identifier")
+        }
+        let appleScript = """
+        on run argv
+            with timeout of 3600 seconds
+                tell application id "\(bundleID)" to DoScript item 1 of argv
+            end timeout
+        end run
+        """
+        let result = try ExternalProcess.run("/usr/bin/osascript", arguments: ["-e", appleScript, jsx],
+                                            timeout: 3660, onLaunch: onLaunch).completed()
+        guard result.status == 0 else { throw failure(result.err) }
+        // AE DoScript returns 0 even when JSX fails: require its explicit completion file.
+        let status = (try? String(contentsOf: statusFile, encoding: .utf8)) ?? "No completion status from After Effects"
+        let log = (try? String(contentsOf: logFile, encoding: .utf8)) ?? ""
+        guard status.hasPrefix("OK: ") else { throw failure(status + "\n" + log) }
+        let rendered = URL(fileURLWithPath: String(status.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines))
+        guard rendered.deletingLastPathComponent().standardizedFileURL == scratch.standardizedFileURL,
+              ["tif", "png"].contains(rendered.pathExtension.lowercased()) else {
+            throw failure("After Effects reported an unexpected output path")
+        }
+        return try publish(rendered: rendered, source: source)
     }
 }
 
