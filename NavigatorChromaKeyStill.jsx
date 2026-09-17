@@ -1,5 +1,5 @@
 /*
-Chroma Key Still Export for After Effects
+Chroma Key Still Export for After Effects (manual footage workflow)
 =========================================
 
 Purpose:
@@ -26,8 +26,9 @@ Notes:
   - Keylight is designed primarily for green/blue screen work. The script can
     set magenta/cyan as screen colours, but those must be tested on your AE
     install and asset style.
-  - For fully automated still-image production, the Python/OpenCV keyer should
-    be the default. This AE script is the premium fallback/calibration path.
+  - Navigator uses native minimum-opacity extraction for uniform-backed still FX.
+    Its blue/magenta outputs were opaque when automation selected green, and
+    saturation keying eroded soft rays. This manual footage keyer is not that path.
 */
 
 (function chromaKeyStillExport() {

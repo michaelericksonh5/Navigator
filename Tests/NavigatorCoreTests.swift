@@ -4663,67 +4663,150 @@ final class AfterEffectsPrefsRulesTests: XCTestCase {
 }
 
 final class ChromaKeyOutputRulesTests: XCTestCase {
-    func testAcceptsOnlyOneCompletedSequenceFrame() {
-        let base = "green_test_rmbg"
-        for ext in ["png", "tif", "tiff"] {
-            let frame = base + "_00000." + ext
-            XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: base, names: [frame]), frame)
-        }
-        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: base, names: [
-            base + ".tif00000", "AEtemp-X-" + base + ".tif", "other_00000.tif", base + ".png"
-        ]))
-        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: base, names: [base + "_00000.tif", base + "_00001.tif"]))
-        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: "a.b", names: ["axb_00000.tif"]))
+    func load(_ url: URL) throws -> CGImage {
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        return try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
     }
 
-    func testExportsAlphaPNGAndRemovesStaging() throws {
+    func write(_ bytes: [UInt8], width: Int, height: Int, to url: URL) throws {
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(bytes) as CFData))
+        let image = try XCTUnwrap(CGImage(width: width, height: height, bitsPerComponent: 8,
+            bitsPerPixel: 32, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider,
+            decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+        let encoder = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+        CGImageDestinationAddImage(encoder, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(encoder))
+    }
+
+    func testSoftMatteRoundTripAndFailurePreservesOutput() throws {
         let fm = FileManager.default
         let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: dir) }
-        let source = dir.appendingPathComponent("disc.png")
-        let context = try XCTUnwrap(CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8,
-            bytesPerRow: 8, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
-        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
-        context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
-        var work: URL?
-        let out = try ChromaKeyOutputRules.exportPNG(source: source) { cfg in
-            work = URL(fileURLWithPath: try XCTUnwrap(cfg["outputFolder"] as? String))
-            let frame = work!.appendingPathComponent("disc_rmbg_00000.tif")
-            let encoder = try XCTUnwrap(CGImageDestinationCreateWithURL(frame as CFURL, "public.tiff" as CFString, 1, nil))
-            CGImageDestinationAddImage(encoder, try XCTUnwrap(context.makeImage()), nil)
-            XCTAssertTrue(CGImageDestinationFinalize(encoder))
-            try "OK: rendered".write(toFile: try XCTUnwrap(cfg["resultFile"] as? String), atomically: true, encoding: .utf8)
+        // Non-square canvas catches accidental resizing; every alpha level catches hard cuts.
+        for (n, backing) in [[0, 0, 255], [0, 255, 0], [255, 0, 255], [37, 91, 123]].enumerated() {
+            let source = dir.appendingPathComponent("sample\(n).png")
+            var bytes = [UInt8]()
+            for y in 0..<3 {
+                for x in 0..<258 {
+                    let alpha = y == 1 && x > 0 && x < 257 ? x - 1 : 0
+                    for b in backing { bytes.append(UInt8((Double(alpha) + Double(255 - alpha) * Double(b) / 255).rounded())) }
+                    bytes.append(255)
+                }
+            }
+            try write(bytes, width: 258, height: 3, to: source)
+            let out = try ChromaKeyOutputRules.exportPNG(source: source)
+            let image = try load(out)
+            XCTAssertEqual(image.width, 258); XCTAssertEqual(image.height, 3)
+            let pixels = try ChromaKeyOutputRules.pixels(image)
+            for x in 1..<257 {
+                XCTAssertEqual(Double(pixels[(258 + x) * 4 + 3]), Double(x - 1), accuracy: n == 3 ? 1 : 0)
+            }
+            for i in stride(from: 0, to: pixels.count, by: 4) {
+                for c in 0..<3 {
+                    let composite = Double(pixels[i + c]) + (1 - Double(pixels[i + 3]) / 255) * Double(backing[c])
+                    XCTAssertEqual(composite, Double(bytes[i + c]), accuracy: 1)
+                }
+            }
+            let saved = try Data(contentsOf: out)
+            try Data("invalid".utf8).write(to: source)
+            XCTAssertThrowsError(try ChromaKeyOutputRules.exportPNG(source: source))
+            XCTAssertEqual(try Data(contentsOf: out), saved)
         }
-        let decoded = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil))
-        XCTAssertEqual(CGImageSourceGetType(decoded) as String?, "public.png")
-        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(decoded, 0, nil))
-        XCTAssertEqual(image.width, 2)
-        XCTAssertTrue([CGImageAlphaInfo.first, .last, .premultipliedFirst, .premultipliedLast].contains(image.alphaInfo))
-        XCTAssertEqual(try fm.contentsOfDirectory(atPath: dir.path), ["disc_rmbg.png"])
-        XCTAssertFalse(fm.fileExists(atPath: try XCTUnwrap(work).path))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: dir.path).count, 8)
+        // Optional external corpus uses the same exporter; ordinary runs remain self-contained.
+        if let path = ProcessInfo.processInfo.environment["NAV_CHROMA_FIXTURES"] {
+            try compareFixtures(URL(fileURLWithPath: path))
+        }
     }
 
-    func testFailedRenderCleansPrivateFilesAndPreservesDeliverable() throws {
+    func testExistingAlphaAndNonuniformBacking() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = dir.appendingPathComponent("alpha.png")
+        try write([255,255,255,32, 255,255,255,128, 0,0,0,0, 255,255,255,255], width: 2, height: 2, to: source)
+        let out = try ChromaKeyOutputRules.exportPNG(source: source)
+        XCTAssertEqual(try ChromaKeyOutputRules.pixels(load(source)), try ChromaKeyOutputRules.pixels(load(out)))
+        try write([255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255], width: 2, height: 2, to: source)
+        XCTAssertThrowsError(try ChromaKeyOutputRules.exportPNG(source: source))
+    }
+
+    // PNG fixtures decode to straight RGBA. Read those bytes for floating-point round trips:
+    // an 8-bit premultiplied CGContext rounds sub-byte errors away before measurement.
+    func straightPixels(_ image: CGImage) throws -> [UInt8] {
+        XCTAssertEqual(image.bitsPerComponent, 8)
+        XCTAssertEqual(image.bitsPerPixel, 32)
+        XCTAssertEqual(image.alphaInfo, .last)
+        let data = try XCTUnwrap(image.dataProvider?.data) as Data
+        return (0..<image.height).flatMap { y in
+            Array(data[(y * image.bytesPerRow)..<(y * image.bytesPerRow + image.width * 4)])
+        }
+    }
+
+    // Run: NAV_CHROMA_FIXTURES=/tmp/navigator-chroma-review swift test --filter ChromaKeyOutputRulesTests
+    // Inputs are ALREADY padded 1.2x by Prep for AI. Compare on that canvas, never resize
+    // either keyed output. Odd sparkle padding leaves a half-pixel registration uncertainty.
+    func compareFixtures(_ dir: URL) throws {
         let fm = FileManager.default
-        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: dir) }
-        let source = dir.appendingPathComponent("green_test.png")
-        let destination = dir.appendingPathComponent("green_test_rmbg.png")
-        try Data("existing PNG".utf8).write(to: destination)
-        var work: URL?
-        XCTAssertThrowsError(try ChromaKeyOutputRules.exportPNG(source: source) { cfg in
-            XCTAssertEqual(cfg["appendFrameToken"] as? Bool, true)
-            work = URL(fileURLWithPath: try XCTUnwrap(cfg["outputFolder"] as? String))
-            XCTAssertNotEqual(work, dir)
-            try "OK: rendered".write(toFile: try XCTUnwrap(cfg["resultFile"] as? String), atomically: true, encoding: .utf8)
-            try Data().write(to: work!.appendingPathComponent("green_test_rmbg_00000.tif"))
-            try Data("unfinished".utf8).write(to: work!.appendingPathComponent("AEtemp-X-green_test_rmbg.tif"))
-        })
-        XCTAssertFalse(fm.fileExists(atPath: try XCTUnwrap(work).path))
-        XCTAssertEqual(try Data(contentsOf: destination), Data("existing PNG".utf8))
-        XCTAssertEqual(try fm.contentsOfDirectory(atPath: dir.path), ["green_test_rmbg.png"])
+        let after = dir.appendingPathComponent("after")
+        try fm.createDirectory(at: after, withIntermediateDirectories: true)
+        for (name, colour) in [("fx_sparkleYellow_upres_polar_1024_v01", "blue"),
+                               ("fx_rays4_upres_polar_2048_v01", "green"),
+                               ("fx_burstWhite_upres_polar_2048_v01", "magenta")] {
+            let stem = name + "_BG" + colour
+            let source = dir.appendingPathComponent(stem + ".png")
+            let copy = after.appendingPathComponent(stem + ".png")
+            try Data(contentsOf: source).write(to: copy, options: .atomic)
+            let input = try load(copy), original = try load(dir.appendingPathComponent(name + ".png"))
+            let flat = try ChromaKeyOutputRules.pixels(input), orig = try ChromaKeyOutputRules.pixels(original)
+            let w = input.width, h = input.height, count = w * h
+            let dx = (w - original.width) / 2, dy = (h - original.height) / 2
+            XCTAssertGreaterThanOrEqual(dx, 0); XCTAssertGreaterThanOrEqual(dy, 0)
+            var truth = [UInt8](repeating: 0, count: count)
+            for y in 0..<original.height {
+                for x in 0..<original.width { truth[(y + dy) * w + x + dx] = orig[(y * original.width + x) * 4 + 3] }
+            }
+            let partialTruth = Double(truth.filter { $0 > 0 && $0 < 255 }.count) * 100 / Double(count)
+            print("CHROMA \(colour) original=\(original.width)x\(original.height) input=\(w)x\(h) padded-reference-partial=\(partialTruth)%")
+            let keyed = try ChromaKeyOutputRules.exportPNG(source: copy)
+            for (label, url) in [("before", dir.appendingPathComponent(stem + "_rmbg.png")), ("after", keyed)] {
+                let image = try load(url)
+                XCTAssertEqual(image.width, w); XCTAssertEqual(image.height, h)
+                guard image.width == w && image.height == h else { continue }
+                let pixels = try straightPixels(image)
+                var alphaError = 0.0, rgbError = 0.0, partial = 0
+                var centrePatch = 0, referencePatch = 0
+                var artAlphaError = 0.0, artPartial = 0
+                for j in 0..<count {
+                    let i = j * 4, a = pixels[i + 3]
+                    alphaError += abs(Double(a) - Double(truth[j]))
+                    if a > 0 && a < 255 { partial += 1 }
+                    if j % w >= dx && j % w < dx + original.width && j / w >= dy && j / w < dy + original.height {
+                        artAlphaError += abs(Double(a) - Double(truth[j]))
+                        if a > 0 && a < 255 { artPartial += 1 }
+                    }
+                    for c in 0..<3 {
+                        rgbError += abs(Double(pixels[i + c]) * Double(a) / 255 + (1 - Double(a) / 255) * Double(flat[c]) - Double(flat[i + c]))
+                    }
+                    if abs(j % w - w / 2) <= 32 && abs(j / w - h / 2) <= 32 {
+                        centrePatch += Int(a); referencePatch += Int(truth[j])
+                    }
+                }
+                alphaError /= Double(count); rgbError /= Double(count * 3)
+                let fraction = Double(partial) * 100 / Double(count)
+                let centre = (h / 2 * w + w / 2)
+                print(String(format: "CHROMA %@ %@ %dx%d alphaMAE=%.6f partial=%.6f%% RGBroundtripMAE=%.6f centre=%d reference=%d patchSum=%d referencePatch=%d", colour, label, w, h, alphaError, fraction, rgbError, pixels[centre * 4 + 3], truth[centre], centrePatch, referencePatch))
+                print(String(format: "CHROMA %@ %@ original-footprint alphaMAE=%.6f partial=%.6f%%", colour, label, artAlphaError / Double(original.width * original.height), Double(artPartial) * 100 / Double(original.width * original.height)))
+                if label == "after" {
+                    XCTAssertLessThan(alphaError, 6)
+                    XCTAssertEqual(fraction, partialTruth, accuracy: 1)
+                    XCTAssertLessThan(rgbError, 0.6)
+                    XCTAssertGreaterThanOrEqual(Double(centrePatch), Double(referencePatch) * 0.8)
+                }
+            }
+        }
     }
 }
 

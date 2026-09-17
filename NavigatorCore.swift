@@ -5574,58 +5574,88 @@ enum AfterEffectsPrefsRules {
     }
 }
 
-/// Error 784 left an AEtemp TIFF and a zero-byte stub. Neither is a completed render.
-/// Keep every AE output in a private directory, and publish only a decoded PNG atomically.
+/// A known backing still leaves four unknowns (RGB and alpha) in three equations.
+/// Choose the smallest alpha for which recovered foreground RGB stays in gamut:
+/// C = aF + (1-a)B. This preserves light falloff without Keylight's saturation/clipping.
+/// Smith & Blinn, Blue Screen Matting (1996). This is a minimum-opacity estimate,
+/// not a claim to recover arbitrary original alpha (burstWhite measured MAE 5.60/255).
 enum ChromaKeyOutputRules {
-    static func renderedStill(base: String, names: [String]) -> String? {
-        let pattern = "^" + NSRegularExpression.escapedPattern(for: base) + "_[0-9]+\\.(tif|tiff|png)$"
-        let frames = names.filter { $0.range(of: pattern, options: .regularExpression) != nil }
-        return frames.count == 1 ? frames[0] : nil
+    static func pixels(_ image: CGImage) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let ok = bytes.withUnsafeMutableBytes { raw -> Bool in
+            // Keep the encoded RGB space: linearising an encoded-space flatten changes its matte.
+            let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
+            guard let context = CGContext(data: raw.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.setBlendMode(.copy)
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        guard ok else { throw failure("Could not decode image pixels") }
+        return bytes
     }
 
-    static func exportPNG(source: URL, render: ([String: Any]) throws -> Void) throws -> URL {
-        let fm = FileManager.default
-        let work = fm.temporaryDirectory.appendingPathComponent("nav-chroma-\(UUID().uuidString)")
-        try fm.createDirectory(at: work, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: work) }
-        let base = source.deletingPathExtension().lastPathComponent + "_rmbg"
-        let result = work.appendingPathComponent("result.txt")
-        try render([
-            "resultFile": result.path,
-            "sourceFile": source.path, "outputFolder": work.path, "outputName": base,
-            "automationMode": true, "showUi": false, "appendFrameToken": true,
-            "renderImmediately": true, "finalOutputFormat": "tif", "keyMode": "auto"
-        ])
-        let status = (try? String(contentsOf: result, encoding: .utf8)) ?? "After Effects did not report completion"
-        guard status.hasPrefix("OK: ") else {
-            throw NSError(domain: "ChromaKey", code: 5, userInfo: [NSLocalizedDescriptionKey: status])
+    static func failure(_ message: String) -> NSError {
+        NSError(domain: "ChromaKey", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
+    static func exportPNG(source: URL) throws -> URL {
+        guard let decoder = CGImageSourceCreateWithURL(source as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(decoder, 0, nil) else {
+            throw failure("Could not read PNG")
         }
-        let names = try fm.contentsOfDirectory(atPath: work.path)
-        guard let frame = renderedStill(base: base, names: names) else {
-            throw NSError(domain: "ChromaKey", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "After Effects left no single completed still"])
+        var bytes = try pixels(image)
+        // Already transparent artwork must not be keyed a second time.
+        if stride(from: 3, to: bytes.count, by: 4).allSatisfy({ bytes[$0] == 255 }) {
+            let corners = [0, (image.width - 1) * 4,
+                           (image.height - 1) * image.width * 4, bytes.count - 4]
+            let backing = (0..<3).map { c in corners.map { bytes[$0 + c] }.sorted()[1] }
+            guard corners.filter({ i in (0..<3).allSatisfy { bytes[i + $0] == backing[$0] } }).count >= 3 else {
+                throw failure("Chroma Key needs a uniform backing visible in at least three corners")
+            }
+            for i in stride(from: 0, to: bytes.count, by: 4) {
+                var alpha = 0.0
+                for c in 0..<3 {
+                    let b = Double(backing[c]), v = Double(bytes[i + c])
+                    if v > b { alpha = max(alpha, (v - b) / (255 - b)) }
+                    if v < b { alpha = max(alpha, (b - v) / b) }
+                }
+                let a = UInt8(min(255, max(0, (alpha * 255).rounded())))
+                // Recover STRAIGHT colour using the alpha actually stored in the PNG.
+                // Colour-only spill suppression previously left blue/magenta inputs opaque.
+                for c in 0..<3 {
+                    let foreground = a == 0 ? 0 : (Double(bytes[i + c]) - (1 - Double(a) / 255) * Double(backing[c])) * 255 / Double(a)
+                    bytes[i + c] = UInt8(min(255, max(0, foreground.rounded())))
+                }
+                bytes[i + 3] = a
+            }
+        } else {
+            for i in stride(from: 0, to: bytes.count, by: 4) where bytes[i + 3] > 0 {
+                for c in 0..<3 {
+                    bytes[i + c] = UInt8(min(255, (Double(bytes[i + c]) * 255 / Double(bytes[i + 3])).rounded()))
+                }
+            }
         }
-        let out = source.deletingLastPathComponent().appendingPathComponent(base + ".png")
-        guard convertStillToPNG(work.appendingPathComponent(frame), out) else {
-            throw NSError(domain: "ChromaKey", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "Could not write the rendered still as PNG with alpha"])
+        let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let keyed = CGImage(width: image.width, height: image.height, bitsPerComponent: 8,
+                bitsPerPixel: 32, bytesPerRow: image.width * 4, space: space,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue), provider: provider,
+                decode: nil, shouldInterpolate: false, intent: .defaultIntent) else {
+            throw failure("Could not create keyed image")
         }
+        let data = NSMutableData()
+        guard let encoder = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
+            throw failure("Could not encode PNG")
+        }
+        // Native pixel dimensions bypass both AE output presets and Prep for AI's 1.2x padding.
+        CGImageDestinationAddImage(encoder, keyed, nil)
+        guard CGImageDestinationFinalize(encoder) else { throw failure("Could not finish PNG") }
+        let out = source.deletingLastPathComponent().appendingPathComponent(source.deletingPathExtension().lastPathComponent + "_rmbg.png")
+        try (data as Data).write(to: out, options: .atomic)
         return out
     }
-}
-
-/// AE's scripting security refuses shell conversion. ImageIO preserves alpha and an
-/// atomic write keeps an existing deliverable intact if decoding or encoding fails.
-func convertStillToPNG(_ src: URL, _ dst: URL) -> Bool {
-    guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
-          let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
-          [.first, .last, .premultipliedFirst, .premultipliedLast].contains(image.alphaInfo) else { return false }
-    let data = NSMutableData()
-    guard let out = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return false }
-    CGImageDestinationAddImage(out, image, nil)
-    guard CGImageDestinationFinalize(out) else { return false }
-    do { try (data as Data).write(to: dst, options: .atomic); return true }
-    catch { return false }
 }
 
 /// Which Photoshop to drive when more than one is installed.

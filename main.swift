@@ -1858,7 +1858,7 @@ enum PhotoshopIcon {
     }.labelStyle(.titleAndIcon)
 }
 
-// After Effects' own icon + location, for the Chroma Key menu items. Resolved
+// After Effects location for optional Setup probes. Resolved
 // once; menu items are hidden when After Effects isn't installed.
 //
 // The bundle identifier is NOT a constant across versions. After Effects 2026 (26.5.0,
@@ -1913,14 +1913,6 @@ enum AfterEffectsIcon {
     static let url: URL? = AfterEffectsApp.url
     static let image: NSImage? = url.map { menuIcon(NSWorkspace.shared.icon(forFile: $0.path)) }
 }
-@ViewBuilder func aeLabel(_ title: String) -> some View {
-    Label {
-        Text(title)
-    } icon: {
-        if let img = AfterEffectsIcon.image { Image(nsImage: img) }
-    }.labelStyle(.titleAndIcon)
-}
-
 // "Prep for AI" → pick an aspect ratio (Auto = nearest, the default; or a
 // specific NB2 ratio with a shape icon), then a fill color. `action` receives
 // the color and the chosen ratio (nil = Auto). Selecting a ratio just opens its
@@ -3894,7 +3886,7 @@ func batchRemoveBackgroundFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
     removeBackgroundForImages(imgs) { _ in onDone?() }
 }
 
-// Batch Chroma Key on a FOLDER (After Effects) — same per-file routing.
+// Batch Chroma Key on a FOLDER (native) — same per-file routing.
 func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
     let pngs = batchImageURLs(in: folder).filter { $0.pathExtension.lowercased() == "png" }
     guard !pngs.isEmpty else {
@@ -4164,40 +4156,6 @@ func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) 
     }
 }
 
-// One chroma-key script run with bounded retries — the After Effects twin of
-// removeBackgroundOnce, for the same two failure modes: a transient refusal (plain
-// retry fixes it) and a wedged host app (only a restart fixes it, once per run).
-// The render overwrites its own output, so retrying is idempotent; the config file
-// is reused across attempts and deleted by the caller after the last one.
-func chromaKeyOnce(cfgPath: String, src: URL, attempts: Int = 3,
-                   reportFinalError: Bool, recovery: AdobeRecovery? = nil) -> ScriptResult {
-    let recovery = recovery ?? AdobeRecovery()
-    var last = ScriptResult(ok: false, message: "not attempted")
-    for i in 0..<attempts {
-        let isLast = (i == attempts - 1)
-        last = runAfterEffectsScript(resource: "NavigatorChromaKeyStill",
-                                     globals: ["H5G_CHROMA_KEY_CONFIG": cfgPath],
-                                     reportError: reportFinalError && isLast)
-        if last.ok {
-            if i > 0 { navLog("chroma key: \(src.lastPathComponent) succeeded on attempt \(i + 1)") }
-            return last
-        }
-        guard !isLast else { break }
-        navLog("chroma key: \(src.lastPathComponent) attempt \(i + 1) failed — \(last.message); retrying")
-        if i == attempts - 2, !recovery.used, AdobeRecoveryRules.looksWedged(last.message),
-           let aeURL = AfterEffectsApp.url, let aeID = AfterEffectsApp.bundleID {
-            // Plain retries exhausted AND the failure looks like an unresponsive app rather
-            // than a file After Effects refused. A restart cannot fix a bad file, and its
-            // force-quit fallback can take unsaved work with it. (AdobeRecoveryRules)
-            recovery.markUsed()
-            restartAdobeApp(bundleID: aeID, appURL: aeURL)
-        } else {
-            Thread.sleep(forTimeInterval: 1.0 + Double(i))
-        }
-    }
-    return last
-}
-
 // True when Photoshop's Quick Export as PNG applies to this file — the layered
 // Photoshop formats. Plain images don't need Photoshop to become a PNG.
 func isPhotoshopDocument(_ url: URL) -> Bool {
@@ -4326,8 +4284,7 @@ func assembleLayerFolders(_ dirs: [URL], onDone: (([URL]) -> Void)? = nil) {
     }
 }
 
-// Chroma Key for several PNGs in one hidden After Effects session (single still
-// script per file). Non-blocking "N of M" progress + end-of-run summary.
+// Native uniform-backing extraction shared by single-image and folder actions. Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     let pngs = srcs.filter { $0.pathExtension.lowercased() == "png" }
     guard !pngs.isEmpty else { NSSound.beep(); return }
@@ -4335,29 +4292,16 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
         var errors: [String] = []
-        let recovery = AdobeRecovery()   // at most one After Effects restart for the whole batch
         for src in pngs {
             do {
-                let out = try ChromaKeyOutputRules.exportPNG(source: src) { cfg in
-                    guard let cfgPath = writeChromaConfig(cfg) else {
-                        throw NSError(domain: "ChromaKey", code: 3,
-                                      userInfo: [NSLocalizedDescriptionKey: "Couldn’t write config"])
-                    }
-                    defer { try? FileManager.default.removeItem(atPath: cfgPath) }
-                    let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: false, recovery: recovery)
-                    guard r.ok else {
-                        throw NSError(domain: "ChromaKey", code: 4,
-                                      userInfo: [NSLocalizedDescriptionKey: r.message])
-                    }
-                }
+                let out = try ChromaKeyOutputRules.exportPNG(source: src)
                 outs.append(out)
             } catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
         DispatchQueue.main.async {
-            hideApp(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects")
             BGJobProgress.shared.finish("Keyed \(outs.count) of \(pngs.count) image\(pngs.count == 1 ? "" : "s")")
-            if !errors.isEmpty { showBGSummary(app: "After Effects", done: outs.count, total: pngs.count, errors: errors) }
+            if !errors.isEmpty { showBGSummary(app: "Chroma Key", done: outs.count, total: pngs.count, errors: errors, verb: "keyed") }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
@@ -4586,81 +4530,13 @@ func reportAdobeAutomationFailure(_ appName: String, _ raw: String) {
     }
 }
 
-// Runs a bundled After Effects .jsx via AppleScript DoScript, after setting the
-// given ExtendScript string globals (e.g. a config-file path the script reads).
-// DoScript blocks until AE finishes (render included), so callers run this off
-// the main thread. Never fails silently.
-@discardableResult
-func runAfterEffectsScript(resource: String, globals: [String: String], reportError: Bool = true) -> ScriptResult {
-    guard AfterEffectsIcon.url != nil else {
-        if reportError { DispatchQueue.main.async { reportFileError("After Effects isn’t installed", "Install Adobe After Effects to use Chroma Key BG.") } }
-        return ScriptResult(ok: false, message: "After Effects isn’t installed")
-    }
-    guard let scriptURL = Bundle.main.url(forResource: resource, withExtension: "jsx"),
-          let fileSource = try? String(contentsOf: scriptURL, encoding: .utf8) else {
-        if reportError { DispatchQueue.main.async { reportFileError("After Effects script missing", "\(resource).jsx isn’t bundled in Navigator.app.") } }
-        return ScriptResult(ok: false, message: "\(resource).jsx isn’t bundled")
-    }
-    func jsEsc(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
-    // Prepend the string globals (e.g. the config-file path), then the script's
-    // own source. The whole thing is passed to DoScript as an osascript argv item,
-    // so there's no AppleScript file coercion (-1728) and no literal escaping.
-    var source = ""
-    for (k, v) in globals { source += "$.global.\(k) = \"\(jsEsc(v))\";\n" }
-    source += fileSource
-    // No `activate` — launch After Effects hidden and keep it hidden.
-    guard let aeID = AfterEffectsApp.bundleID else {
-        return ScriptResult(ok: false, message: "After Effects isn’t installed")
-    }
-    if let aeURL = AfterEffectsApp.url { launchHidden(bundleID: aeID, appURL: aeURL) }
-    let appleScript = """
-    on run argv
-        set jsxSource to item 1 of argv
-        with timeout of 3600 seconds
-            tell application id "\(aeID)"
-                DoScript jsxSource
-            end tell
-        end timeout
-    end run
-    """
-    do {
-        let output = try ExternalProcess.run("/usr/bin/osascript",
-            // 600s, not an hour. One still does not take ten minutes, and the old hour meant a
-            // wedged After Effects held the job — and its progress row — for the whole hour.
-            arguments: ["-e", appleScript, source], timeout: 600,
-            onLaunch: { keepHidden(while: $0, bundleID: aeID, revealAfter: adobeRevealAfter) }).completed()
-        let stdout = output.out.trimmingCharacters(in: .whitespacesAndNewlines)
-        let stderr = output.err
-        if output.status != 0 {
-            if reportError { DispatchQueue.main.async { reportAdobeAutomationFailure("After Effects", stderr) } }
-            return ScriptResult(ok: false, message: stderr.trimmingCharacters(in: .whitespacesAndNewlines))
-        } else if stdout.contains("ERROR") {
-            if reportError { DispatchQueue.main.async { reportFileError("After Effects couldn’t finish Chroma Key", stdout) } }
-            return ScriptResult(ok: false, message: stdout)
-        }
-        return ScriptResult(ok: true, message: stdout)
-    } catch {
-        if reportError { DispatchQueue.main.async { reportFileError("Couldn’t launch After Effects", error.localizedDescription) } }
-        return ScriptResult(ok: false, message: error.localizedDescription)
-    }
-}
-
-// Write a chroma-key config dict to a temp JSON file the AE scripts read. Path returned.
-func writeChromaConfig(_ dict: [String: Any]) -> String? {
-    guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("nav_chroma_\(UUID().uuidString).json")
-    do { try data.write(to: url); return url.path } catch { return nil }
-}
-
-// Single-image chroma key (green/cyan/magenta screen → transparent PNG via AE
-// Keylight). Writes "<base>_rmbg.png" next to the source. Original is untouched.
+// Single-image native uniform-backing extraction. Writes "<base>_rmbg.png" next to the source. Original is untouched.
 func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard src.pathExtension.lowercased() == "png" else {
-        DispatchQueue.main.async { reportFileError("Chroma Key needs a PNG", "The After Effects chroma-key workflow processes green/cyan/magenta-screen PNG images.") }
+        DispatchQueue.main.async { reportFileError("Chroma Key needs a PNG", "Chroma Key processes PNG images with a uniform backing colour.") }
         return
     }
-    // Both entry points must use the host conversion: the old single-image path still
-    // requested the shell-based PNG conversion that AE's scripting security refuses.
+    // One implementation keeps single-image and folder results identical.
     chromaKeyForImages([src]) { outs in
         if let out = outs.first { onDone?(out) }
     }
@@ -7835,7 +7711,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         upscaleImagesViaFal(urls, option: option) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
-    // Chroma Key BG (After Effects) on the selected PNG(s) — one or many.
+    // Chroma Key BG on the selected PNG(s) — one or many.
     func chromaKeyBackground(_ ids: Set<String>) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
@@ -7846,8 +7722,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
     }
 
-    // Batch Chroma Key BG (folder): AE keys every PNG in the folder, writing
-    // transparent "<name>_rmbg" PNGs into a "_rmbg" subfolder. Originals untouched.
+    // Batch Chroma Key BG writes each <name>_rmbg.png next to its source.
     func batchChromaKeyBackground(_ ids: Set<String>) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
         batchChromaKeyFolder(it.url) { [weak self] in self?.refresh() }
@@ -11453,14 +11328,14 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                     Button { browser.exportPNG(ids) } label: { psLabel(psdCount == 1 ? "Quick Export as PNG" : "Quick Export as PNG (\(psdCount) PSDs)") }
                 }
             }
-            if AfterEffectsIcon.image != nil {
+            do {
                 let sel = browser.items.filter { ids.contains($0.id) }
                 let pngCount = sel.filter { !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.count
                 let dirs = sel.filter { $0.isDirectory }
                 if pngCount >= 1 {
-                    Button { browser.chromaKeyBackground(ids) } label: { aeLabel(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)") }
+                    Button { browser.chromaKeyBackground(ids) } label: { Label(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)", systemImage: "eyedropper.halffull") }
                 } else if dirs.count == 1, sel.count == 1 {
-                    Button { browser.batchChromaKeyBackground(ids) } label: { aeLabel("Batch Chroma Key BG") }
+                    Button { browser.batchChromaKeyBackground(ids) } label: { Label("Batch Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
             }
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
@@ -14888,13 +14763,13 @@ struct ImageViewerView: View {
                     serviceLabel("Layerize (AI)…", ServiceIcon.fal)
                 }
             }
-            if (PhotoshopIcon.image != nil || AfterEffectsIcon.image != nil), let u = currentURL {
+            if let u = currentURL {
                 Divider()
                 if PhotoshopIcon.image != nil {
                     Button { removeBackgroundForImage(u) { out in revealNewImage(out) } } label: { psLabel("Remove BG") }
                 }
-                if AfterEffectsIcon.image != nil, u.pathExtension.lowercased() == "png" {
-                    Button { chromaKeyForImage(u) { out in revealNewImage(out) } } label: { aeLabel("Chroma Key BG") }
+                if u.pathExtension.lowercased() == "png" {
+                    Button { chromaKeyForImage(u) { out in revealNewImage(out) } } label: { Label("Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
             }
             if currentURL != nil {
@@ -17096,7 +16971,7 @@ struct SetupItem: Identifiable {
                       afterOpening: "Then: find Navigator in that list and switch Adobe Photoshop on underneath it.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
             SetupItem(id: "automation-ae", title: "Control After Effects",
-                      why: "Used for Chroma Key BG. A separate Automation grant again — allowing Photoshop does not cover After Effects.",
+                      why: "Optional After Effects scripting. Chroma Key BG runs natively and needs no Adobe permission.",
                       probe: { _ in PermissionProbe.appAutomation(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects") },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch Adobe After Effects on underneath it.",
@@ -17780,9 +17655,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private struct FinderQA { let title: String; let action: String; let requires: String?; let acceptsFolders: Bool }
     private static let finderQuickActions: [FinderQA] = [
         .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
-        // Resolved, not hard-coded: the identifier changed in After Effects 2026, and the
-        // stale one meant this Quick Action was never installed in Finder either.
-        .init(title: "Chroma Key BG",          action: "chromakey",    requires: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects", acceptsFolders: true),
+        // Native extraction is available even without After Effects installed.
+        .init(title: "Chroma Key BG",          action: "chromakey",    requires: nil, acceptsFolders: true),
         .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: true),
     ]
     // Older names to clean up so we don't leave stale duplicates behind (includes
