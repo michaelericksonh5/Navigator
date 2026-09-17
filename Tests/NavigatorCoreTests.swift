@@ -4,6 +4,7 @@
 // a naive implementation gets wrong. Run with ./runtests.sh.
 
 import XCTest
+import ImageIO
 @testable import NavigatorCore
 
 final class SelfOrDescendantTests: XCTestCase {
@@ -4662,41 +4663,108 @@ final class AfterEffectsPrefsRulesTests: XCTestCase {
 }
 
 final class ChromaKeyOutputRulesTests: XCTestCase {
-    /// The exact listing left behind by After Effects 26.5 rendering one still with the frame
-    /// token off. The script looked for "green_test_rmbg.tif", which is the one name NOT there.
-    func testFindsTheFrameNumberedRenderAfterEffectsActuallyWrote() {
-        let names = ["green_test_rmbg.tif00000", "AEtemp-AC866A-green_test_rmbg.tif"]
-        XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names),
-                       "green_test_rmbg.tif00000")
+    func testAcceptsOnlyOneCompletedSequenceFrame() {
+        let base = "green_test_rmbg"
+        for ext in ["png", "tif", "tiff"] {
+            let frame = base + "_00000." + ext
+            XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: base, names: [frame]), frame)
+        }
+        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: base, names: [
+            base + ".tif00000", "AEtemp-X-" + base + ".tif", "other_00000.tif", base + ".png"
+        ]))
+        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: base, names: [base + "_00000.tif", base + "_00001.tif"]))
+        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: "a.b", names: ["axb_00000.tif"]))
     }
 
-    func testPrefersTheExactNameWhenAfterEffectsObliges() {
-        let names = ["green_test_rmbg.tif", "green_test_rmbg.tif00000", "AEtemp-X-green_test_rmbg.tif"]
-        XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names),
-                       "green_test_rmbg.tif")
+    func testExportsAlphaPNGAndRemovesStaging() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let source = dir.appendingPathComponent("disc.png")
+        let context = try XCTUnwrap(CGContext(data: nil, width: 2, height: 2, bitsPerComponent: 8,
+            bytesPerRow: 8, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.setFillColor(CGColor(red: 1, green: 0, blue: 0, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+        var work: URL?
+        let out = try ChromaKeyOutputRules.exportPNG(source: source) { cfg in
+            work = URL(fileURLWithPath: try XCTUnwrap(cfg["outputFolder"] as? String))
+            let frame = work!.appendingPathComponent("disc_rmbg_00000.tif")
+            let encoder = try XCTUnwrap(CGImageDestinationCreateWithURL(frame as CFURL, "public.tiff" as CFString, 1, nil))
+            CGImageDestinationAddImage(encoder, try XCTUnwrap(context.makeImage()), nil)
+            XCTAssertTrue(CGImageDestinationFinalize(encoder))
+            try "OK: rendered".write(toFile: try XCTUnwrap(cfg["resultFile"] as? String), atomically: true, encoding: .utf8)
+        }
+        let decoded = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil))
+        XCTAssertEqual(CGImageSourceGetType(decoded) as String?, "public.png")
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(decoded, 0, nil))
+        XCTAssertEqual(image.width, 2)
+        XCTAssertTrue([CGImageAlphaInfo.first, .last, .premultipliedFirst, .premultipliedLast].contains(image.alphaInfo))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: dir.path), ["disc_rmbg.png"])
+        XCTAssertFalse(fm.fileExists(atPath: try XCTUnwrap(work).path))
     }
 
-    /// When the rename never happened the bytes are only in the temp file.
-    func testFallsBackToTheInFlightTempFile() {
-        let names = ["AEtemp-AC866A-green_test_rmbg.tif"]
-        XCTAssertEqual(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names),
-                       "AEtemp-AC866A-green_test_rmbg.tif")
+    func testFailedRenderCleansPrivateFilesAndPreservesDeliverable() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let source = dir.appendingPathComponent("green_test.png")
+        let destination = dir.appendingPathComponent("green_test_rmbg.png")
+        try Data("existing PNG".utf8).write(to: destination)
+        var work: URL?
+        XCTAssertThrowsError(try ChromaKeyOutputRules.exportPNG(source: source) { cfg in
+            XCTAssertEqual(cfg["appendFrameToken"] as? Bool, true)
+            work = URL(fileURLWithPath: try XCTUnwrap(cfg["outputFolder"] as? String))
+            XCTAssertNotEqual(work, dir)
+            try "OK: rendered".write(toFile: try XCTUnwrap(cfg["resultFile"] as? String), atomically: true, encoding: .utf8)
+            try Data().write(to: work!.appendingPathComponent("green_test_rmbg_00000.tif"))
+            try Data("unfinished".utf8).write(to: work!.appendingPathComponent("AEtemp-X-green_test_rmbg.tif"))
+        })
+        XCTAssertFalse(fm.fileExists(atPath: try XCTUnwrap(work).path))
+        XCTAssertEqual(try Data(contentsOf: destination), Data("existing PNG".utf8))
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: dir.path), ["green_test_rmbg.png"])
+    }
+}
+
+final class PhotoshopChoiceRulesTests: XCTestCase {
+    /// The situation on this machine: both builds claim com.adobe.Photoshop, and the Beta is
+    /// the HIGHER version. The released build must still win.
+    func testReleasedBeatsABetaEvenWhenTheBetaIsNewer() {
+        let candidates = [(name: "Adobe Photoshop (Beta)", version: "27.11.0"),
+                          (name: "Adobe Photoshop 2026",   version: "27.10.0")]
+        XCTAssertEqual(PhotoshopChoiceRules.preferred(candidates), 1)
     }
 
-    func testIgnoresUnrelatedFilesAndTheSourcePNG() {
-        let names = ["green_test.png", "notes.txt", "other_rmbg.tif"]
-        XCTAssertNil(ChromaKeyOutputRules.renderedStill(base: "green_test_rmbg", names: names))
+    /// Someone who only installed the Beta must still get a working Remove BG.
+    func testABetaOnlyMachineStillWorks() {
+        XCTAssertEqual(PhotoshopChoiceRules.preferred([(name: "Adobe Photoshop (Beta)", version: "27.11.0")]), 0)
     }
 
-    /// Every intermediate has to go: leaving a 281 KB TIFF and a 0-byte stub next to the PNG
-    /// in someone's art folder is its own bug.
-    func testLeftoversCoverEveryIntermediateButNotThePNG() {
-        let names = ["green_test.png", "green_test_rmbg.png", "green_test_rmbg.tif00000",
-                     "AEtemp-AC866A-green_test_rmbg.tif"]
-        let junk = Set(ChromaKeyOutputRules.leftovers(base: "green_test_rmbg", names: names))
-        XCTAssertEqual(junk, ["green_test_rmbg.tif00000", "AEtemp-AC866A-green_test_rmbg.tif"])
-        XCTAssertFalse(junk.contains("green_test_rmbg.png"), "the deliverable is a PNG and must survive")
-        XCTAssertFalse(junk.contains("green_test.png"), "the source must survive")
+    /// The point of not naming a year anywhere: a future release is preferred automatically.
+    func testTheNewestReleasedBuildWins() {
+        let candidates = [(name: "Adobe Photoshop 2026", version: "27.10.0"),
+                          (name: "Adobe Photoshop 2027", version: "28.0.0"),
+                          (name: "Adobe Photoshop (Beta)", version: "29.0.0")]
+        XCTAssertEqual(PhotoshopChoiceRules.preferred(candidates), 1)
+    }
+
+    /// "27.10.0" is newer than "27.9.0". Compared as strings it is not, which is the whole
+    /// reason this compares components as numbers.
+    func testVersionsCompareNumericallyNotAlphabetically() {
+        XCTAssertTrue(PhotoshopChoiceRules.isOlder("27.9.0", than: "27.10.0"))
+        XCTAssertFalse(PhotoshopChoiceRules.isOlder("27.10.0", than: "27.9.0"))
+        XCTAssertFalse(PhotoshopChoiceRules.isOlder("27.10.0", than: "27.10.0"))
+        XCTAssertTrue(PhotoshopChoiceRules.isOlder("27.10", than: "27.10.1"))
+    }
+
+    func testNoPhotoshopAtAll() {
+        XCTAssertNil(PhotoshopChoiceRules.preferred([]))
+    }
+
+    func testPrereleaseDetection() {
+        XCTAssertTrue(PhotoshopChoiceRules.isPrerelease("Adobe Photoshop (Beta)"))
+        XCTAssertFalse(PhotoshopChoiceRules.isPrerelease("Adobe Photoshop 2026"))
     }
 }
 

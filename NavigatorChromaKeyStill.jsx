@@ -37,6 +37,7 @@ Notes:
         outputName: "",
         configFile: "",
         logFile: "",
+        resultFile: "",
 
         // Automation mode never opens dialogs or alerts. Set showUi=false for
         // command-line runs that provide source/output in JSON.
@@ -84,8 +85,7 @@ Notes:
         renderSettingsTemplate: "Best Settings",
         outputModuleTemplates: [
             "PNG Sequence with Alpha",
-            "TIFF Sequence with Alpha",
-            "Lossless with Alpha"
+            "TIFF Sequence with Alpha"
         ],
 
         // Sequence output. AE expects bracket tokens for image sequences.
@@ -94,10 +94,9 @@ Notes:
         renderImmediately: true,
         failOnImageSignatureMismatch: true,
 
-        // AE installations do not always include a PNG-with-alpha output module.
-        // When AE falls back to TIFF-with-alpha, convert rendered frames to PNG.
-        finalOutputFormat: "png",
-        deleteIntermediateRender: true
+        // Navigator converts completed TIFFs with ImageIO; AE's shell access is refused
+        // on installations with scripting network/file security disabled.
+        finalOutputFormat: "tif"
     };
 
     var PRESET_COLORS = {
@@ -827,8 +826,8 @@ Notes:
         }
     }
 
-    function applyOutputTemplate(om, templates) {
-        var available = om.templates;
+    function applyOutputTemplate(rqItem, templates) {
+        var available = rqItem.outputModule(1).templates;
         log("Available output templates: " + available.join(", "));
         for (var i = 0; i < templates.length; i++) {
             var templateAvailable = false;
@@ -843,7 +842,14 @@ Notes:
                 continue;
             }
             try {
-                om.applyTemplate(templates[i]);
+                rqItem.outputModule(1).applyTemplate(templates[i]);
+                // The guide documents invalidation after OM edits; inspect a fresh reference.
+                var settings = rqItem.outputModule(1).getSettings(GetSettingsFormat.STRING);
+                if ((settings.Format !== "PNG Sequence" && settings.Format !== "TIFF Sequence") ||
+                    settings.Channels !== "RGB + Alpha") {
+                    log("Rejected output template: " + templates[i] + " " + settings.Format + " " + settings.Channels);
+                    continue;
+                }
                 log("Applied output module template: " + templates[i]);
                 return templates[i];
             } catch (e) {
@@ -851,92 +857,6 @@ Notes:
             }
         }
         throw new Error("No configured alpha output module template is available. Available templates: " + available.join(", "));
-    }
-
-    function powerShellQuote(text) {
-        return "'" + String(text).replace(/'/g, "''") + "'";
-    }
-
-    function shQuote(text) {
-        return "'" + String(text).replace(/'/g, "'\\''") + "'";
-    }
-
-    // Cross-platform TIFF->PNG fallback (used only when AE lacks a PNG-with-alpha
-    // output module and falls back to TIFF). Windows: PowerShell/System.Drawing.
-    // macOS: sips, which ships with the OS and preserves alpha.
-    function convertImageToPng(inputFile, outputFile) {
-        var command, scriptFile = null;
-        log("Converting to PNG: " + inputFile.fsName + " -> " + outputFile.fsName);
-        if (File.fs === "Windows") {
-            scriptFile = File(outputFile.parent.fsName + "/h5g_convert_to_png.ps1");
-            var script =
-                "$ErrorActionPreference = 'Stop'\n" +
-                "Add-Type -AssemblyName System.Drawing\n" +
-                "$src = " + powerShellQuote(inputFile.fsName) + "\n" +
-                "$dst = " + powerShellQuote(outputFile.fsName) + "\n" +
-                "$img = [System.Drawing.Image]::FromFile($src)\n" +
-                "try { $img.Save($dst, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $img.Dispose() }\n";
-            scriptFile.open("w");
-            scriptFile.write(script);
-            scriptFile.close();
-            command = 'cmd.exe /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + scriptFile.fsName + '"';
-        } else {
-            command = "sips -s format png " + shQuote(inputFile.fsName) + " --out " + shQuote(outputFile.fsName);
-        }
-        var result = system.callSystem(command);
-        for (var i = 0; i < 20 && !outputFile.exists; i++) {
-            $.sleep(250);
-        }
-        if (outputFile.exists) {
-            if (scriptFile) { try { scriptFile.remove(); } catch (cleanupErr) {} }
-            return outputFile;
-        }
-        throw new Error("PNG conversion failed for " + inputFile.fsName + ". Command: " + command + " Result: " + result);
-    }
-
-    function renderedFilesForPattern(outputFolder, outputBaseName, ext, appendFrameToken) {
-        if (appendFrameToken) {
-            return outputFolder.getFiles(outputBaseName + "_*." + ext);
-        }
-        var single = File(outputFolder.fsName + "/" + outputBaseName + "." + ext);
-        return single.exists ? [single] : [];
-    }
-
-    function convertRenderedOutputs(renderInfo, config) {
-        var finalFormat = String(config.finalOutputFormat || "").toLowerCase();
-        if (finalFormat !== "png") {
-            return [renderInfo.outputPath];
-        }
-        if (renderInfo.ext === "png") {
-            log("Final output is already PNG.");
-            return [renderInfo.outputPath];
-        }
-        if (renderInfo.ext !== "tif" && renderInfo.ext !== "tiff") {
-            log("WARNING: Cannot auto-convert ." + renderInfo.ext + " render output to PNG.");
-            return [renderInfo.outputPath];
-        }
-
-        var rendered = renderedFilesForPattern(renderInfo.outputFolder, renderInfo.outputBaseName, renderInfo.ext, config.appendFrameToken);
-        if (rendered.length === 0) {
-            throw new Error("No rendered TIFF files found to convert to PNG.");
-        }
-
-        var outputs = [];
-        for (var i = 0; i < rendered.length; i++) {
-            var source = rendered[i];
-            var pngName = source.name.replace(/\.(tif|tiff)$/i, ".png");
-            var pngFile = File(source.parent.fsName + "/" + pngName);
-            outputs.push(convertImageToPng(source, pngFile).fsName);
-            if (config.deleteIntermediateRender) {
-                try {
-                    source.remove();
-                    log("Deleted intermediate render: " + source.fsName);
-                } catch (deleteErr) {
-                    log("WARNING: Could not delete intermediate render: " + deleteErr.toString());
-                }
-            }
-        }
-        return outputs;
     }
 
     function queueRender(comp, outputFolder, outputBaseName, config) {
@@ -948,31 +868,42 @@ Notes:
         } catch (e) {
             log("Render settings template failed: " + config.renderSettingsTemplate);
         }
-        try {
-            rqItem.timeSpanStart = 0;
-            rqItem.timeSpanDuration = 1 / (Number(config.compFps) || 24);
-            log("Render time span: one frame.");
-        } catch (spanErr) {
-            log("WARNING: Could not set one-frame render time span: " + spanErr.toString());
-        }
-
-        var om = rqItem.outputModule(1);
-        var templateUsed = applyOutputTemplate(om, config.outputModuleTemplates);
-
-        // OutputModule can be invalidated after template changes; reacquire it.
-        om = rqItem.outputModule(1);
-
-        var ext = config.outputExtension;
-        if (templateUsed && templateUsed.toLowerCase().indexOf("tiff") >= 0) {
-            ext = "tif";
-        }
-        var fileName = outputBaseName + (config.appendFrameToken ? "_[#####]" : "") + "." + ext;
-        var outputPath = outputFolder.fsName + "/" + fileName;
-        om.file = File(outputPath);
-        log("Output path: " + outputPath);
+        rqItem.timeSpanStart = 0;
+        rqItem.timeSpanDuration = comp.frameDuration;
+        var templateUsed = applyOutputTemplate(rqItem, config.outputModuleTemplates);
+        var settings = rqItem.outputModule(1).getSettings(GetSettingsFormat.STRING);
+        var ext = settings.Format === "PNG Sequence" ? "png" : "tif";
+        // AE 26.5 fails with error 784 for name.tif without a token. Adobe's still-image
+        // export docs require [#####] even when timeSpanDuration is only one frame.
+        var outputPath = outputFolder.fsName + "/" + outputBaseName + "_[#####]." + ext;
+        rqItem.outputModule(1).file = File(outputPath);
+        log("Output settings: " + rqItem.outputModule(1).getSettings(GetSettingsFormat.STRING).toSource());
 
         if (config.renderImmediately) {
-            app.project.renderQueue.render();
+            var paused = [];
+            try {
+                // render() runs the whole queue, including unrelated user jobs unless disabled.
+                for (var i = 1; i <= app.project.renderQueue.numItems; i++) {
+                    var other = app.project.renderQueue.item(i);
+                    if (other !== rqItem && other.status === RQItemStatus.QUEUED) {
+                        paused.push(other);
+                        other.render = false;
+                    }
+                }
+                app.project.renderQueue.render();
+                if (rqItem.status !== RQItemStatus.DONE) {
+                    throw new Error("Still render did not complete: " + rqItem.status);
+                }
+            } finally {
+                for (var j = 0; j < paused.length; j++) { paused[j].render = true; }
+            }
+            var escaped = outputBaseName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            var pattern = new RegExp("^" + escaped + "_[0-9]+\\." + ext + "$", "i");
+            var frames = outputFolder.getFiles(function (f) {
+                return f instanceof File && pattern.test(File.decode(f.name)) && f.length > 0;
+            });
+            if (frames.length !== 1) { throw new Error("Expected one completed still, found " + frames.length); }
+            outputPath = frames[0].fsName;
         }
         return {
             outputPath: outputPath,
@@ -1033,7 +964,7 @@ Notes:
         }
 
         var renderInfo = queueRender(made.comp, outputFolder, outputName, CONFIG);
-        var finalOutputs = CONFIG.renderImmediately ? convertRenderedOutputs(renderInfo, CONFIG) : [renderInfo.outputPath];
+        var finalOutputs = [renderInfo.outputPath];
         log("Done. Final output: " + finalOutputs.join(", "));
         return finalOutputs.join(", ");
     }
@@ -1047,7 +978,7 @@ Notes:
         RESULT = "ERROR: " + e.toString();
     } finally {
         // Always — success or failure. The rendered PNG is already on disk by this
-        // point (convertRenderedOutputs reads it from the filesystem, not from AE), so
+        // point (Navigator reads it from the filesystem, not from AE), so
         // removing the project items can't affect the output.
         try { cleanupCreatedItems(); } catch (cleanErr) {}
         try {
@@ -1056,9 +987,18 @@ Notes:
             }
         } catch (endErr) {
         }
+        // AE 26.5 DoScript returns 0 over AppleScript even when JSX returns a string.
+        // Navigator must read completion from a file, not treat that 0 as render success.
+        if (ACTIVE_CONFIG && ACTIVE_CONFIG.resultFile) {
+            var resultFile = makeFile(ACTIVE_CONFIG.resultFile);
+            if (resultFile.open("w")) {
+                resultFile.write(RESULT);
+                resultFile.close();
+            }
+        }
         if (ACTIVE_CONFIG && ACTIVE_CONFIG.quitWhenDone) {
             app.quit();
         }
     }
-    RESULT;  // returned to osascript stdout
+    return RESULT;  // returned to osascript stdout
 })();

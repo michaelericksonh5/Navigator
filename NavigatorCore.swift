@@ -10,6 +10,7 @@ import Foundation
 // CoreGraphics only — no AppKit. The pixel sampling behind the adaptive backing colour
 // lives here so `swift test` exercises the SHIPPED code rather than a copy of it.
 import CoreGraphics
+import ImageIO
 
 import Darwin
 
@@ -5573,42 +5574,102 @@ enum AfterEffectsPrefsRules {
     }
 }
 
-/// Finding the still After Effects actually rendered.
-///
-/// After Effects does not write the filename the script asked for. Measured on 26.5.0
-/// rendering one still to "green_test_rmbg.tif" with the frame token switched OFF, the
-/// output folder ended up holding:
-///
-///   green_test_rmbg.tif00000          — the frame number appended anyway
-///   AEtemp-AC866A-green_test_rmbg.tif — where the bytes were written during the render
-///
-/// The script looked for exactly "green_test_rmbg.tif", found nothing, and threw — which
-/// After Effects raised as a modal, invisible because Navigator keeps it hidden, and the
-/// whole job then hung. So the render is located by pattern rather than by exact name.
+/// Error 784 left an AEtemp TIFF and a zero-byte stub. Neither is a completed render.
+/// Keep every AE output in a private directory, and publish only a decoded PNG atomically.
 enum ChromaKeyOutputRules {
-    /// Candidates in the order they should be trusted, given the base name the render was
-    /// asked to use ("green_test_rmbg"). `names` is a plain directory listing.
     static func renderedStill(base: String, names: [String]) -> String? {
-        let tiffish = names.filter { n in
-            let l = n.lowercased()
-            return l.contains(base.lowercased()) && (l.contains(".tif") || l.contains(".tiff"))
-        }
-        // Exactly what was asked for, when After Effects happens to oblige.
-        if let exact = tiffish.first(where: { $0 == base + ".tif" || $0 == base + ".tiff" }) { return exact }
-        // The frame-numbered form: "<base>.tif00000".
-        if let numbered = tiffish.filter({ $0.hasPrefix(base + ".tif") }).sorted().first { return numbered }
-        // The in-flight temp, which is where the bytes actually are when the rename never happened.
-        if let temp = tiffish.filter({ $0.hasPrefix("AEtemp-") }).sorted().first { return temp }
-        return tiffish.sorted().first
+        let pattern = "^" + NSRegularExpression.escapedPattern(for: base) + "_[0-9]+\\.(tif|tiff|png)$"
+        let frames = names.filter { $0.range(of: pattern, options: .regularExpression) != nil }
+        return frames.count == 1 ? frames[0] : nil
     }
 
-    /// Everything this render scattered, so none of it is left in the user's folder.
-    static func leftovers(base: String, names: [String]) -> [String] {
-        names.filter { n in
-            let l = n.lowercased()
-            guard l.contains(".tif") || l.contains(".tiff") else { return false }
-            return l.contains(base.lowercased()) || n.hasPrefix("AEtemp-")
+    static func exportPNG(source: URL, render: ([String: Any]) throws -> Void) throws -> URL {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("nav-chroma-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+        let base = source.deletingPathExtension().lastPathComponent + "_rmbg"
+        let result = work.appendingPathComponent("result.txt")
+        try render([
+            "resultFile": result.path,
+            "sourceFile": source.path, "outputFolder": work.path, "outputName": base,
+            "automationMode": true, "showUi": false, "appendFrameToken": true,
+            "renderImmediately": true, "finalOutputFormat": "tif", "keyMode": "auto"
+        ])
+        let status = (try? String(contentsOf: result, encoding: .utf8)) ?? "After Effects did not report completion"
+        guard status.hasPrefix("OK: ") else {
+            throw NSError(domain: "ChromaKey", code: 5, userInfo: [NSLocalizedDescriptionKey: status])
         }
+        let names = try fm.contentsOfDirectory(atPath: work.path)
+        guard let frame = renderedStill(base: base, names: names) else {
+            throw NSError(domain: "ChromaKey", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "After Effects left no single completed still"])
+        }
+        let out = source.deletingLastPathComponent().appendingPathComponent(base + ".png")
+        guard convertStillToPNG(work.appendingPathComponent(frame), out) else {
+            throw NSError(domain: "ChromaKey", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not write the rendered still as PNG with alpha"])
+        }
+        return out
+    }
+}
+
+/// AE's scripting security refuses shell conversion. ImageIO preserves alpha and an
+/// atomic write keeps an existing deliverable intact if decoding or encoding fails.
+func convertStillToPNG(_ src: URL, _ dst: URL) -> Bool {
+    guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
+          let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+          [.first, .last, .premultipliedFirst, .premultipliedLast].contains(image.alphaInfo) else { return false }
+    let data = NSMutableData()
+    guard let out = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return false }
+    CGImageDestinationAddImage(out, image, nil)
+    guard CGImageDestinationFinalize(out) else { return false }
+    do { try (data as Data).write(to: dst, options: .atomic); return true }
+    catch { return false }
+}
+
+/// Which Photoshop to drive when more than one is installed.
+///
+/// Photoshop 2026 and Photoshop (Beta) claim the SAME bundle identifier,
+/// "com.adobe.Photoshop" — verified on this machine, versions 27.10.0 and 27.11.0 living in
+/// separate folders. So urlForApplication(withBundleIdentifier:) answers with whichever
+/// LaunchServices happens to rank first, which was the Beta, and Remove BG drove a different
+/// Photoshop from the one that was open on screen.
+///
+/// Nothing here names a year or a version. A future Photoshop is picked up by being newer,
+/// and a machine with only the Beta installed still works — it is only ever preferred when
+/// it is the only thing there.
+enum PhotoshopChoiceRules {
+    /// The index of the build to drive, or nil when there are none.
+    ///
+    /// Released beats prerelease; among equals, the highest version wins. Version strings
+    /// are compared component by component as NUMBERS, because "27.10.0" is newer than
+    /// "27.9.0" and a string comparison says the opposite.
+    static func preferred(_ candidates: [(name: String, version: String)]) -> Int? {
+        guard !candidates.isEmpty else { return nil }
+        let indices = candidates.indices
+        let released = indices.filter { !isPrerelease(candidates[$0].name) }
+        let pool = released.isEmpty ? Array(indices) : released
+        return pool.max { a, b in
+            isOlder(candidates[a].version, than: candidates[b].version)
+        }
+    }
+
+    /// Adobe marks these in the application NAME — "Adobe Photoshop (Beta)". There is no flag
+    /// in the bundle that says prerelease, so the name is what there is to go on.
+    static func isPrerelease(_ name: String) -> Bool {
+        let l = name.lowercased()
+        return l.contains("beta") || l.contains("prerelease") || l.contains("(b)")
+    }
+
+    static func isOlder(_ lhs: String, than rhs: String) -> Bool {
+        let a = lhs.split(separator: ".").map { Int($0) ?? 0 }
+        let b = rhs.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0, y = i < b.count ? b[i] : 0
+            if x != y { return x < y }
+        }
+        return false
     }
 }
 

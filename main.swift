@@ -1813,8 +1813,41 @@ enum GoogleDriveIcon {
 
 // Photoshop's own icon + location, for the Remove-BG menu items. Resolved once;
 // `image` is nil (and the menu items are hidden) when Photoshop isn't installed.
+// WHICH Photoshop, when more than one is installed.
+//
+// Photoshop 2026 and Photoshop (Beta) both claim "com.adobe.Photoshop" — verified here,
+// 27.10.0 and 27.11.0 in separate folders — so urlForApplication answers with whichever
+// LaunchServices ranks first. That was the Beta, which meant Remove BG quietly drove a
+// different Photoshop from the one open on screen. urlsForApplications returns every
+// candidate, so the choice can be made deliberately (see PhotoshopChoiceRules: released
+// beats prerelease, newest wins among equals, and a Beta-only machine still works).
+enum PhotoshopApp {
+    static let bundleID = "com.adobe.Photoshop"
+
+    static let url: URL? = {
+        let all = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleID)
+        guard !all.isEmpty else { return nil }
+        let described = all.map { u -> (name: String, version: String) in
+            let info = Bundle(url: u)?.infoDictionary
+            let name = (info?["CFBundleName"] as? String) ?? u.deletingPathExtension().lastPathComponent
+            let version = (info?["CFBundleShortVersionString"] as? String) ?? "0"
+            return (name: name, version: version)
+        }
+        guard let pick = PhotoshopChoiceRules.preferred(described) else { return nil }
+        return all[pick]
+    }()
+
+    /// The AppleScript target. `tell application id "com.adobe.Photoshop"` is AMBIGUOUS when
+    /// two builds share the identifier — it is the same coin-toss that picked the wrong one
+    /// in the first place — so the chosen bundle is named by its path instead.
+    static var tellTarget: String {
+        guard let url else { return "id \"\(bundleID)\"" }
+        return "\"\(url.path)\""
+    }
+}
+
 enum PhotoshopIcon {
-    static let url: URL? = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.Photoshop")
+    static let url: URL? = PhotoshopApp.url
     static let image: NSImage? = url.map { menuIcon(NSWorkspace.shared.icon(forFile: $0.path)) }
 }
 @ViewBuilder func psLabel(_ title: String) -> some View {
@@ -4293,17 +4326,6 @@ func assembleLayerFolders(_ dirs: [URL], onDone: (([URL]) -> Void)? = nil) {
     }
 }
 
-/// TIFF (or whatever still After Effects rendered) to PNG, keeping the alpha that the whole
-/// chroma key exists to produce. Replaces the script's `sips` shell-out — see the config in
-/// chromaKeyForImages for why that could not be relied on.
-func convertStillToPNG(_ src: URL, _ dst: URL) -> Bool {
-    guard let source = CGImageSourceCreateWithURL(src as CFURL, nil),
-          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return false }
-    guard let out = CGImageDestinationCreateWithURL(dst as CFURL, "public.png" as CFString, 1, nil) else { return false }
-    CGImageDestinationAddImage(out, image, nil)
-    return CGImageDestinationFinalize(out)
-}
-
 // Chroma Key for several PNGs in one hidden After Effects session (single still
 // script per file). Non-blocking "N of M" progress + end-of-run summary.
 func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
@@ -4315,45 +4337,21 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
         var errors: [String] = []
         let recovery = AdobeRecovery()   // at most one After Effects restart for the whole batch
         for src in pngs {
-            let folder = src.deletingLastPathComponent()
-            let base = src.deletingPathExtension().lastPathComponent
-            let out = folder.appendingPathComponent("\(base)_rmbg.png")
-            // TIFF, not PNG, and the intermediate is kept.
-            //
-            // Asking the script for PNG made it shell out to `sips` through
-            // system.callSystem, which After Effects refuses unless Preferences ▸ Scripting
-            // & Expressions ▸ "Allow Scripts to Write Files and Access Network" is on:
-            //   ReferenceError: Permission denied (is Preferences > Scripting & Expressions >
-            //   Allow Scripts to Write Files and Access Network enabled?)
-            // The script turned that into a thrown error, After Effects raised it as a modal,
-            // and because Navigator keeps After Effects hidden nobody could see or answer it —
-            // the job simply hung. Rendering to TIFF takes that whole path out: After Effects
-            // writes TIFF with alpha natively, and Navigator converts it here, which is work an
-            // image browser should not have been delegating to a compositor in the first place.
-            let cfg: [String: Any] = [
-                "sourceFile": src.path, "outputFolder": folder.path, "outputName": "\(base)_rmbg",
-                "automationMode": true, "showUi": false, "appendFrameToken": false,
-                "renderImmediately": true, "finalOutputFormat": "tif",
-                "deleteIntermediateRender": false, "keyMode": "auto"
-            ]
-            guard let cfgPath = writeChromaConfig(cfg) else { errors.append("\(src.lastPathComponent): couldn’t write config"); continue }
-            let before = Set((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-            let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: false, recovery: recovery)
-            try? FileManager.default.removeItem(atPath: cfgPath)
-            if r.ok {
-                let after = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
-                let fresh = after.filter { !before.contains($0) }
-                if let rendered = ChromaKeyOutputRules.renderedStill(base: "\(base)_rmbg", names: fresh),
-                   convertStillToPNG(folder.appendingPathComponent(rendered), out) {
-                    for junk in ChromaKeyOutputRules.leftovers(base: "\(base)_rmbg", names: fresh) {
-                        try? FileManager.default.removeItem(at: folder.appendingPathComponent(junk))
+            do {
+                let out = try ChromaKeyOutputRules.exportPNG(source: src) { cfg in
+                    guard let cfgPath = writeChromaConfig(cfg) else {
+                        throw NSError(domain: "ChromaKey", code: 3,
+                                      userInfo: [NSLocalizedDescriptionKey: "Couldn’t write config"])
                     }
-                    outs.append(out)
-                } else {
-                    errors.append("\(src.lastPathComponent): After Effects reported success but left no readable render")
-                    navLog("chroma key: \(src.lastPathComponent) — no usable render among \(fresh.sorted())")
+                    defer { try? FileManager.default.removeItem(atPath: cfgPath) }
+                    let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: false, recovery: recovery)
+                    guard r.ok else {
+                        throw NSError(domain: "ChromaKey", code: 4,
+                                      userInfo: [NSLocalizedDescriptionKey: r.message])
+                    }
                 }
-            } else { errors.append("\(src.lastPathComponent): \(r.message)") }
+                outs.append(out)
+            } catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
         DispatchQueue.main.async {
@@ -4538,7 +4536,7 @@ func runPhotoshopScript(resource: String, arguments: [String], reportError: Bool
     on run argv
         set jsxSource to item 1 of argv
         with timeout of 3600 seconds
-            tell application id "com.adobe.Photoshop"
+            tell application \(PhotoshopApp.tellTarget)
                 do javascript jsxSource with arguments {\(argRefs)}
             end tell
         end timeout
@@ -4661,28 +4659,10 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
         DispatchQueue.main.async { reportFileError("Chroma Key needs a PNG", "The After Effects chroma-key workflow processes green/cyan/magenta-screen PNG images.") }
         return
     }
-    let folder = src.deletingLastPathComponent()
-    let base = src.deletingPathExtension().lastPathComponent
-    let out = folder.appendingPathComponent("\(base)_rmbg.png")
-    DispatchQueue.global(qos: .userInitiated).async {
-        let cfg: [String: Any] = [
-            "sourceFile": src.path, "outputFolder": folder.path, "outputName": "\(base)_rmbg",
-            "automationMode": true, "showUi": false, "appendFrameToken": false,
-            "renderImmediately": true, "finalOutputFormat": "png",
-            "deleteIntermediateRender": true, "keyMode": "auto"
-        ]
-        guard let cfgPath = writeChromaConfig(cfg) else {
-            DispatchQueue.main.async { reportFileError("Couldn’t start Chroma Key", "Failed to write the temporary config.") }; return
-        }
-        // Same bounded retry + wedged-app restart as the batch path — previously the
-        // single-image path had no retry at all, so one transient AE refusal failed it.
-        let r = chromaKeyOnce(cfgPath: cfgPath, src: src, reportFinalError: true)
-        try? FileManager.default.removeItem(atPath: cfgPath)
-        DispatchQueue.main.async {
-            guard r.ok else { return }       // failure already surfaced; leave AE visible
-            hideApp(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects")
-            onDone?(out)
-        }
+    // Both entry points must use the host conversion: the old single-image path still
+    // requested the shell-based PNG conversion that AE's scripting security refuses.
+    chromaKeyForImages([src]) { outs in
+        if let out = outs.first { onDone?(out) }
     }
 }
 
