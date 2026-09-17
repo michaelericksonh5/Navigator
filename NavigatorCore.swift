@@ -5581,16 +5581,16 @@ enum Transfer {
 /// changed is the set of NAMES, and a row whose name is still there can keep the details it
 /// already has.
 ///
-/// This matters because of what attributes cost on SMB. Measured on //CORP-DC01/Games/artSource,
-/// 672 entries, same folder, with the attribute run second and cache-warmed so the comparison
-/// favoured it:
+/// This matters because of what per-file attributes cost on a share. NetworkColumnRules has
+/// the full picture; the short version is 73-106 ms PER ENTRY, and it does not matter which
+/// API asks - resourceValues, raw lstat, concurrent lstat and getattrlistbulk all land in the
+/// same band, because macOS's SMB client queries each file rather than using the metadata
+/// SMB2 already returned with the directory listing. Independently re-measured at 92.9
+/// ms/entry (getattrlistbulk) and 98.3 ms/entry (Foundation) across five folders on
+/// //corp-pure02/data, against 4.7 ms/entry for a names-only readdir of the same folders.
 ///
-///   enumeration with no prefetch keys, cold : 62,475 ms =  93.0 ms/entry
-///   enumeration with the ten itemKeys, warm : 165,052 ms = 245.6 ms/entry
-///
-/// Re-reading every row therefore costs about 165 seconds in that folder to notice one new
-/// file. Reading names and fetching details only for the names that are actually new costs
-/// about 62 seconds when something changed, and nothing at all per existing row.
+/// So re-reading every row to notice one new file costs about a minute in a 672-entry folder,
+/// and reading names to find out WHICH rows are new costs about three seconds.
 ///
 /// The trade is that a file whose CONTENTS changed without the directory changing keeps its
 /// previous size and date until the next full load. That is the same thing Finder does, it

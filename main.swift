@@ -34,20 +34,26 @@ private func runWalkChild(_ request: WalkStream.Request) throws {
     var options: FileManager.DirectoryEnumerationOptions = [.skipsPackageDescendants]
     if !request.showHidden { options.insert(.skipsHiddenFiles) }
     var readFailed = false
-    // Enumerate with NO prefetch. The name test on the next line rejects almost everything,
-    // and prefetching attributes for a file that is about to be discarded is the single most
-    // expensive thing this loop can do on a share. Measured on //CORP-DC01/Games/artSource,
-    // 672 entries, same folder, with the prefetching run second and cache-warmed so the
-    // comparison favoured it:
+    // Prefetch the keys on the enumerator, as before.
     //
-    //   no prefetch keys, cold : 62,475 ms =  93.0 ms/entry
-    //   the ten itemKeys, warm : 165,052 ms = 245.6 ms/entry
+    // An earlier change removed this on the theory that prefetching attributes for candidates
+    // the name test then rejects was wasted work. MEASURED across six cold folders on
+    // //CORP-DC01/Games/artSource, alternating so neither mode got the easier ones:
     //
-    // So prefetching cost about 100 seconds across that one folder, essentially all of it
-    // spent on files that never matched. Attributes are now read below, after the name and
-    // extension have already qualified the file.
+    //   no prefetch : median 317 ms/entry (n=6)
+    //   prefetching : median 313 ms/entry (n=5)
+    //
+    // Indistinguishable. The justification for removing it was a single pair of readings I
+    // misread - in that pair the WARM run came out slower than the COLD one, which is
+    // backwards for caching and should have told me it was share variance, not prefetch cost.
+    //
+    // The reason it cannot help is in NetworkColumnRules: per-file attributes cost ~73-106
+    // ms/entry on these shares whichever API asks for them, because macOS's SMB client issues
+    // a query per file rather than using the metadata SMB2 returns with the directory listing.
+    // Prefetching does not add a round trip, so removing it does not save one - it only moves
+    // the same fetch later, and costs an extra one for every file that DOES match.
     let enumerator = FileManager.default.enumerator(at: request.root,
-        includingPropertiesForKeys: [], options: options,
+        includingPropertiesForKeys: keys, options: options,
         errorHandler: { _, _ in readFailed = true; return true })
     if enumerator == nil { readFailed = true }
     var writer = WalkStream.Writer<FileItem>(cap: request.cap) {
@@ -6364,8 +6370,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         let gen = loadGeneration
         // Snapshot what is already on screen, on the main thread, so the worker can reuse the
         // details of rows whose names have not changed. See RefreshRules for the measurements:
-        // re-reading every row costs ~246 ms/entry on SMB, which is ~165 seconds in a
-        // 672-entry folder just to notice one new file.
+        // re-reading every row costs 90-100 ms/entry on SMB - re-measured at 98.3 ms/entry
+        // (Foundation) and 92.9 (getattrlistbulk) - which is about a minute in a 672-entry
+        // folder just to notice one added file. Reading names to find out WHICH rows are new
+        // costs 4.7 ms/entry.
         let known: [String: FileItem] = isNet
             ? Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
             : [:]
@@ -6375,9 +6383,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var result: [FileItem] = []
 
             if isNet {
-                // Names first: ~93 ms/entry against ~246 ms/entry with attributes, and a folder
-                // where nothing was added needs no attribute read at all. LOCAL volumes keep the
-                // exact path below - they are cheap, and exactness is worth more there.
+                // Names first. A names-only readdir of these folders measured 4.7 ms/entry
+                // against 90-98 ms/entry once any per-file attribute is wanted, and a folder
+                // where nothing was added needs no attribute read at all. LOCAL volumes keep
+                // the exact path below - they are cheap, and exactness is worth more there.
                 let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [], options: opts)
                 var freshURLs: [String: URL] = [:]
                 var freshOrder: [String] = []
@@ -6632,9 +6641,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             // the full metadata sweep. A revisit was therefore MORE expensive than a first
             // visit, which is backwards.
             //
-            // Getting the names is the cheap half: ~93 ms/entry measured, against ~246 ms/entry
-            // with attributes. Paying that to ENABLE the index, and to reconcile against the
-            // cached rows, is worth it - the sweep it avoids is the expensive half.
+            // Getting the names is the cheap half: 4.7 ms/entry measured for a names-only
+            // readdir, against 90-98 ms/entry the moment any per-file attribute is wanted.
+            // Paying that to ENABLE the index, and to reconcile against the cached rows, is
+            // worth it - the sweep it avoids is the expensive half.
             let quick = Browser.namesOnlyItems(dir, showHidden: showHidden)
             if !quick.isEmpty {
                 quickWasEmpty = false
