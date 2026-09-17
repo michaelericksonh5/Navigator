@@ -3583,6 +3583,25 @@ func reportMountFailure(cause: MountFailureRules.Cause, host: String, retry: (()
     a.runModal()
 }
 
+/// Mount a server/share address and hand back where it landed.
+///
+/// Never NSWorkspace.open(smb://…): that hands the whole job to Finder, which launches
+/// Finder, shows Finder's connect window, and leaves the mount belonging to Finder. Every
+/// address Navigator connects to goes through here instead.
+func connectAndOpen(_ url: URL, open: @escaping (URL) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let attempt = Browser.mountShareReporting(url)
+        DispatchQueue.main.async {
+            if let mp = attempt.mountPoint {
+                open(URL(fileURLWithPath: mp, isDirectory: true))
+            } else {
+                reportMountFailure(cause: MountFailureRules.cause(errno: attempt.rc),
+                                   host: url.host ?? "the server") { connectAndOpen(url, open: open) }
+            }
+        }
+    }
+}
+
 func promptVertexSetup() {
     let a = NSAlert(); a.alertStyle = .informational
     a.messageText = "Set up Vertex on this Mac"
@@ -7256,12 +7275,18 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         }
     }
 
-    static func mountShareSilently(_ url: URL) -> String? {
+    /// One NetFS mount attempt. `ui` is kNAUIOptionNoUI or kNAUIOptionAllowUI.
+    private static func netfsMount(_ url: URL, ui: String) -> (mountPoint: String?, rc: Int32) {
         let opts = NSMutableDictionary()
-        opts[kNAUIOptionKey] = kNAUIOptionNoUI
+        opts[kNAUIOptionKey] = ui
         var pts: Unmanaged<CFArray>?
-        guard NetFSMountURLSync(url as CFURL, nil, nil, nil, opts as CFMutableDictionary, nil, &pts) == 0 else { return nil }
-        return (pts?.takeRetainedValue() as? [String])?.first
+        let rc = NetFSMountURLSync(url as CFURL, nil, nil, nil, opts as CFMutableDictionary, nil, &pts)
+        guard rc == 0 else { return (nil, rc) }
+        return ((pts?.takeRetainedValue() as? [String])?.first, 0)
+    }
+
+    static func mountShareSilently(_ url: URL) -> String? {
+        netfsMount(url, ui: kNAUIOptionNoUI).mountPoint
     }
 
     static func mountShare(_ url: URL) -> String? { mountShareReporting(url).mountPoint }
@@ -7269,17 +7294,37 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     /// Same mount, but hands back the failure code so callers can say WHY. Without this every
     /// failure got the same "check the address and that you're on the VPN" guess, which tells a
     /// coworker to doubt the thing they got right — see MountFailureRules.
+    ///
+    /// Silent FIRST. This used to pass AllowUI straight away, and NetFS then shows its
+    /// "Connecting to…" / authenticate window even when the keychain already has the
+    /// password — which is the Finder-looking dialog that appeared on every reconnect of a
+    /// share that needed no input at all. The overwhelmingly common case (stored
+    /// credentials, server reachable) now mounts with no window of any kind, and UI is
+    /// spent only on a failure a person could actually answer (see MountFailureRules.needsUI).
     static func mountShareReporting(_ url: URL) -> (mountPoint: String?, rc: Int32) {
-        let openOpts = NSMutableDictionary()
-        openOpts[kNAUIOptionKey] = kNAUIOptionAllowUI
-        var pts: Unmanaged<CFArray>?
-        let rc = NetFSMountURLSync(url as CFURL, nil, nil, nil,
-                                   openOpts as CFMutableDictionary, nil, &pts)
-        guard rc == 0 else {
-            navLog("mount: \(url.host ?? "?") failed rc=\(rc) (\(MountFailureRules.cause(errno: rc)))")
-            return (nil, rc)
+        let t0 = Date()
+        let quiet = netfsMount(url, ui: kNAUIOptionNoUI)
+        if quiet.mountPoint != nil {
+            navLog("mount: \(url.host ?? "?") mounted silently in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+            return quiet
         }
-        return ((pts?.takeRetainedValue() as? [String])?.first, 0)
+        // Already mounted is a success wearing a failure's clothes — see
+        // MountFailureRules.isAlreadyMounted. Read the mountpoint out of the mount table
+        // rather than asking NetFS again, which would be a second round trip to say
+        // exactly the same thing.
+        if MountFailureRules.isAlreadyMounted(errno: quiet.rc), let mp = mountedPath(forShare: url) {
+            navLog("mount: \(url.host ?? "?") already mounted at \(mp)")
+            return (mp, 0)
+        }
+        guard MountFailureRules.needsUI(errno: quiet.rc) else {
+            navLog("mount: \(url.host ?? "?") failed rc=\(quiet.rc) (\(MountFailureRules.cause(errno: quiet.rc))) — not asking, nothing to type")
+            return quiet
+        }
+        let asked = netfsMount(url, ui: kNAUIOptionAllowUI)
+        if asked.mountPoint == nil {
+            navLog("mount: \(url.host ?? "?") failed rc=\(asked.rc) (\(MountFailureRules.cause(errno: asked.rc))) after asking")
+        }
+        return asked
     }
 
     func goUp() {
@@ -10224,16 +10269,19 @@ struct SidebarView: View {
             if !network.servers.isEmpty {
                 Section("Network") {
                     ForEach(network.servers) { s in
-                        Button { NSWorkspace.shared.open(s.url) } label: {
+                        Button { connectAndOpen(s.url) { browser.navigate(to: $0) } } label: {
                             Label(s.name, systemImage: "network").frame(maxWidth: .infinity, alignment: .leading)
                         }.buttonStyle(.plain).help("Connect to \(s.url.absoluteString)")
                         // Deliberately NOT the shared locationMenu: a discovered
-                        // server is an smb:// address, not a mounted folder, so
-                        // "New Tab"/"Second Pane"/"Reveal in Finder" would all be
-                        // handed a URL no file API can open. Once it IS mounted it
-                        // appears under Locations, which has the full menu.
+                        // server is an smb:// address, not a mounted folder, so the
+                        // commands that take a file URL ("Second Pane", "Reveal in
+                        // Finder") have nothing to be handed until it is mounted.
+                        // Open/New Tab work because they mount FIRST and then use the
+                        // real mountpoint. Once mounted it also appears under
+                        // Locations, which has the full menu.
                         .contextMenu {
-                            Button("Open") { NSWorkspace.shared.open(s.url) }
+                            Button("Open") { connectAndOpen(s.url) { browser.navigate(to: $0) } }
+                            Button("Open in New Tab") { connectAndOpen(s.url) { model.newTab(at: $0) } }
                             Button("Copy Address") {
                                 NSPasteboard.general.clearContents()
                                 NSPasteboard.general.setString(s.url.absoluteString, forType: .string)
@@ -18560,12 +18608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if alert.runModal() == .alertFirstButtonReturn {
             let s = field.stringValue.trimmingCharacters(in: .whitespaces)
             if !s.isEmpty, let url = URL(string: s) {
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let mp = Browser.mountShare(url)   // direct mount, no Finder
-                    DispatchQueue.main.async {
-                        if let mp { self.openFolderTab(URL(fileURLWithPath: mp)) } else { NSSound.beep() }
-                    }
-                }
+                connectAndOpen(url) { self.openFolderTab($0) }
             }
         }
     }

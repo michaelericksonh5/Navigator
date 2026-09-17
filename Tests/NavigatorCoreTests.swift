@@ -4640,6 +4640,56 @@ final class ShareURLRulesTests: XCTestCase {
 
 // MARK: - Why a mount failed
 
+final class MountFailureNeedsUITests: XCTestCase {
+    /// The whole point of the silent-first mount: a share whose password is already in the
+    /// keychain mounts with no window, and only a failure a person could answer is worth a
+    /// second attempt with UI.
+    func testOnlyAnswerableFailuresEarnADialog() {
+        for rc in [EAUTH, EACCES, EPERM] {
+            XCTAssertTrue(MountFailureRules.needsUI(errno: rc), "errno \(rc) is answerable")
+        }
+        // NetFS's own codes (password expired, unsupported auth mechanism, a bare server
+        // URL that needs a share picked) are all `.other`, and all answerable.
+        XCTAssertTrue(MountFailureRules.needsUI(errno: 9999))
+    }
+
+    func testHopelessFailuresNeverOpenADialog() {
+        for rc in [ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, ETIMEDOUT, ECONNREFUSED, ECONNABORTED] {
+            XCTAssertFalse(MountFailureRules.needsUI(errno: rc),
+                           "errno \(rc): off-VPN. Asking spends a second full SMB timeout to show a worse message.")
+        }
+        for rc in [ENOENT, ENODEV] {
+            XCTAssertFalse(MountFailureRules.needsUI(errno: rc), "errno \(rc): no typing fixes a share that isn't there")
+        }
+        // The user already closed a sheet on purpose. Putting it straight back up is the
+        // one behaviour guaranteed to feel broken.
+        XCTAssertFalse(MountFailureRules.needsUI(errno: ECANCELED))
+    }
+
+    /// Measured live against smb://<server>/<share> while it was mounted: NetFS answers
+    /// rc=17 (EEXIST) with NO mountpoint. Reading that as a failure is what made "Add
+    /// Network Drive" claim it couldn't connect to a drive that was already connected.
+    func testAlreadyMountedIsNotAFailure() {
+        XCTAssertTrue(MountFailureRules.isAlreadyMounted(errno: EEXIST))
+        XCTAssertFalse(MountFailureRules.isAlreadyMounted(errno: 0))
+        for rc in [EAUTH, ETIMEDOUT, ENOENT, ECANCELED] {
+            XCTAssertFalse(MountFailureRules.isAlreadyMounted(errno: rc), "errno \(rc)")
+        }
+    }
+
+    /// needsUI must stay in step with cause(): a new Cause added without a decision here
+    /// would silently inherit whatever the switch's last case happened to be.
+    func testEveryCauseHasADeliberateAnswer() {
+        let answerable: [MountFailureRules.Cause: Bool] =
+            [.credentials: true, .other: true, .unreachable: false, .noSuchShare: false, .cancelled: false]
+        let sample: [MountFailureRules.Cause: Int32] =
+            [.credentials: EAUTH, .other: 9999, .unreachable: ETIMEDOUT, .noSuchShare: ENOENT, .cancelled: ECANCELED]
+        for (cause, want) in answerable {
+            XCTAssertEqual(MountFailureRules.needsUI(errno: sample[cause]!), want, "\(cause)")
+        }
+    }
+}
+
 final class MountFailureRulesTests: XCTestCase {
 
     /// Off-VPN is the common case for a new coworker, and it looks like an unanswering server.

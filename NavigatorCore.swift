@@ -4377,6 +4377,35 @@ enum MountFailureRules {
         }
     }
 
+    /// NetFS's way of saying "that share is already mounted".
+    ///
+    /// It comes back as a FAILURE — rc=EEXIST with no mountpoint attached (measured against
+    /// both live shares: rc=17 in ~0.8s) — so a caller that only looks at the mountpoint
+    /// reads "already connected" as "couldn't connect", and either beeps at a drive that is
+    /// sitting right there or puts up a connection-failed alert. It is a success; the
+    /// mountpoint has to be read back out of the mount table.
+    static func isAlreadyMounted(errno rc: Int32) -> Bool { rc == EEXIST }
+
+    /// Is this failure one a human could actually answer? Only then is it worth a second
+    /// mount attempt with UI.
+    ///
+    /// The silent attempt comes first because NetFS with AllowUI puts up its
+    /// "Connecting to…"/authenticate window even when the keychain already holds the
+    /// password — the Finder-looking dialog that appeared on every single reconnect.
+    /// A server that is simply unreachable, or a share name that doesn't exist, cannot be
+    /// fixed by typing: retrying those with UI only spends a second full SMB timeout before
+    /// showing a dialog we can write better ourselves.
+    static func needsUI(errno rc: Int32) -> Bool {
+        switch cause(errno: rc) {
+        case .credentials: return true
+        // NetFS's own error codes (password expired, no supported auth mechanism, a bare
+        // server URL that needs a share picked) all land here, and every one of them is
+        // answerable.
+        case .other:       return true
+        case .unreachable, .noSuchShare, .cancelled: return false
+        }
+    }
+
     /// Headline and detail for the alert. `host` is shown so it's obvious which server is meant.
     static func message(for cause: Cause, host: String) -> (title: String, detail: String)? {
         switch cause {
