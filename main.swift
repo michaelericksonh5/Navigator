@@ -8479,6 +8479,10 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 }, log: { navLog($0) })
             let moved = result.moved, copied = result.copied
             let failures = result.failures, skipped = result.skipped
+            // Warnings are NOT failures and must not raise the error dialog: the file arrived
+            // intact, it just could not bring its Finder tags to a destination that has
+            // nowhere to put them. The log is where that belongs.
+            for w in result.warnings { navLog("transfer WARNING: \(w.name) — \(w.reason)") }
             navLog(TransferLogLine.summary(move: move, moved: moved.count, copied: copied.count,
                                           failed: failures.count, skipped: skipped, total: total,
                                           cancelled: progress.cancelled, target: dir.path))

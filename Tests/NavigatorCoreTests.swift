@@ -4640,6 +4640,162 @@ final class ShareURLRulesTests: XCTestCase {
 
 // MARK: - Why a mount failed
 
+final class TransferFallbackTests: XCTestCase {
+    private func tempDir() throws -> URL {
+        let d = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("navxfer-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    /// The last-resort copy for a destination that cannot hold Mac metadata. It has to move
+    /// the bytes; losing a Finder tag is not a reason to lose the file.
+    func testDataOnlyCopyMovesTheBytes() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("a.txt"), dst = dir.appendingPathComponent("b.txt")
+        try "the bytes that matter".write(to: src, atomically: true, encoding: .utf8)
+        XCTAssertTrue(copyDataOnly(src, dst))
+        XCTAssertEqual(try String(contentsOf: dst, encoding: .utf8), "the bytes that matter")
+    }
+
+    /// COPYFILE_EXCL. This runs as a fallback after an attempt that may have raced with
+    /// another process, so it must never overwrite a file it did not create.
+    func testDataOnlyCopyRefusesToOverwrite() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("a.txt"), dst = dir.appendingPathComponent("b.txt")
+        try "new".write(to: src, atomically: true, encoding: .utf8)
+        try "SOMEONE ELSE'S FILE".write(to: dst, atomically: true, encoding: .utf8)
+        XCTAssertFalse(copyDataOnly(src, dst))
+        XCTAssertEqual(try String(contentsOf: dst, encoding: .utf8), "SOMEONE ELSE'S FILE")
+    }
+
+    /// macOS blames the startup disk for a read-only network share. Verified live against a
+    /// read-only SMB mount: code 642, real volume "Games", message naming "Macintosh HD".
+    func testReadOnlyVolumeFailureNamesTheRealVolume() {
+        XCTAssertTrue(TransferErrorRules.isReadOnlyVolume(domain: NSCocoaErrorDomain, code: 642))
+        XCTAssertFalse(TransferErrorRules.isReadOnlyVolume(domain: NSPOSIXErrorDomain, code: 642))
+        XCTAssertFalse(TransferErrorRules.isReadOnlyVolume(domain: NSCocoaErrorDomain, code: 4))
+        let m = TransferErrorRules.readOnlyMessage(name: "normal.txt", volume: "Games")
+        XCTAssertTrue(m.contains("Games"))
+        XCTAssertFalse(m.contains("Macintosh HD"))
+    }
+
+    /// Any other error keeps macOS's own wording — this replaces one specific lie, it does
+    /// not take over error reporting.
+    func testOtherFailuresKeepTheSystemWording() {
+        let e = NSError(domain: NSCocoaErrorDomain, code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "The file doesn’t exist."])
+        XCTAssertEqual(describeTransferFailure(e, at: URL(fileURLWithPath: "/tmp/x")),
+                       "The file doesn’t exist.")
+    }
+
+    /// The sidecar leak: on SMB/exFAT the extended attributes live in a separate "._" file,
+    /// and removing the file it belongs to leaves it orphaned. Every failed copy used to
+    /// drop one of these on the share.
+    func testRemovingAFileAlsoRemovesItsAppleDoubleSidecar() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let f = dir.appendingPathComponent(".navigator-incoming-ABCD1234")
+        let sidecar = dir.appendingPathComponent("._.navigator-incoming-ABCD1234")
+        try "data".write(to: f, atomically: true, encoding: .utf8)
+        try "xattrs".write(to: sidecar, atomically: true, encoding: .utf8)
+        removeWithAppleDouble(f)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sidecar.path), "the sidecar was orphaned")
+    }
+
+    /// It must not go hunting for a sidecar OF a sidecar, which would be a different file
+    /// belonging to someone else.
+    func testRemovingASidecarDoesNotChaseAFurtherSidecar() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let sidecar = dir.appendingPathComponent("._thing")
+        let decoy = dir.appendingPathComponent(".._thing")
+        try "a".write(to: sidecar, atomically: true, encoding: .utf8)
+        try "b".write(to: decoy, atomically: true, encoding: .utf8)
+        removeWithAppleDouble(sidecar)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sidecar.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: decoy.path))
+    }
+
+    /// The guard that decides whether a failed copy nonetheless landed the file. It is the
+    /// only thing standing between "report the truth" and "call another process's file ours",
+    /// so it has to be strict.
+    func testArrivedCompleteRequiresAnExactSizeMatch() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("a.txt"), dst = dir.appendingPathComponent("b.txt")
+        try "exactly these bytes".write(to: src, atomically: true, encoding: .utf8)
+
+        try "exactly these bytes".write(to: dst, atomically: true, encoding: .utf8)
+        XCTAssertTrue(arrivedComplete(src, dst))
+
+        // A competing process's file of a different length must never be claimed as ours.
+        try "someone else wrote something longer".write(to: dst, atomically: true, encoding: .utf8)
+        XCTAssertFalse(arrivedComplete(src, dst))
+
+        // A truncated result is not a copy.
+        try "exactly".write(to: dst, atomically: true, encoding: .utf8)
+        XCTAssertFalse(arrivedComplete(src, dst))
+    }
+
+    /// A directory's own size says nothing about whether its contents arrived, so a folder
+    /// whose copy died halfway must never be reported as copied.
+    func testArrivedCompleteRejectsDirectories() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = dir.appendingPathComponent("a"), b = dir.appendingPathComponent("b")
+        try FileManager.default.createDirectory(at: a, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: b, withIntermediateDirectories: true)
+        try "content".write(to: a.appendingPathComponent("inside.txt"), atomically: true, encoding: .utf8)
+        XCTAssertFalse(arrivedComplete(a, b), "b is empty; only the directory entries match")
+    }
+
+    func testArrivedCompleteIsFalseWhenNothingLanded() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("a.txt")
+        try "x".write(to: src, atomically: true, encoding: .utf8)
+        XCTAssertFalse(arrivedComplete(src, dir.appendingPathComponent("nope.txt")))
+    }
+
+    /// A warning must never reach the error dialog. `failures` is what raises it, so a file
+    /// that arrived intact minus its extended attributes has to report through `warnings`
+    /// and leave `failures` empty — otherwise a successful copy tells the user it failed,
+    /// which is exactly the bug this came from.
+    func testWarningsAreSeparateFromFailures() {
+        let item = Transfer.Item(source: URL(fileURLWithPath: "/tmp/a.txt"),
+                                 destination: URL(fileURLWithPath: "/tmp/dst/a.txt"),
+                                 move: false, intent: .copy)
+        var outcome = Transfer.Outcome(item: item, destination: item.destination)
+        outcome.status = .copied
+        outcome.warnings = ["could not keep its Finder tags"]
+        let result = Transfer.Result(outcomes: [outcome])
+        XCTAssertTrue(result.failures.isEmpty, "a warning must not raise the failure dialog")
+        XCTAssertEqual(result.warnings.count, 1)
+        XCTAssertEqual(result.warnings.first?.name, "a.txt")
+        XCTAssertEqual(result.copied.count, 1, "and it still counts as copied, with an undo entry")
+    }
+
+    /// An ordinary copy on a filesystem that handles metadata fine must stay silent.
+    func testANormalCopyProducesNoWarnings() throws {
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let src = dir.appendingPathComponent("a.txt")
+        try "x".write(to: src, atomically: true, encoding: .utf8)
+        let into = dir.appendingPathComponent("into")
+        try FileManager.default.createDirectory(at: into, withIntermediateDirectories: true)
+        let plan = Transfer.plan(sources: [src], into: into, move: false,
+                                 conflictNames: [], decide: { _ in .keepBoth })
+        let r = Transfer.execute(plan)
+        XCTAssertEqual(r.outcomes.first?.status, .copied)
+        XCTAssertTrue(r.warnings.isEmpty)
+        XCTAssertTrue(r.failures.isEmpty)
+    }
+}
+
 final class ListingTrustRulesTests: XCTestCase {
     /// The case this exists for: a VPN drop mid-refresh. The enumeration just stops yielding
     /// names, with no error anywhere, so the folder looks emptied.
@@ -7092,7 +7248,13 @@ final class TransferExecutionTests: XCTestCase {
         XCTAssertEqual(try bytes(a), "first")
     }
 
-    func testCancellationFailureLeavesDestinationAsMessageClaims() throws {
+    /// Renamed from testCancellationFailureLeavesDestinationAsMessageClaims. The contract is
+    /// unchanged in substance — a file this transfer did not create must survive untouched —
+    /// but the message is now accurate about WHY it is still there. Copies are written to a
+    /// staging name and renamed into place only when whole, so a cancelled transfer never
+    /// leaves anything of its own at the real name; anything sitting there belongs to someone
+    /// else, and the message says exactly that.
+    func testCancellationLeavesACompetingDestinationUntouchedAndSaysSo() throws {
         let a = try write(source, "a", "incoming"), b = try write(source, "b", "next")
         try fm.removeItem(at: a)
         var checks = 0
@@ -7108,7 +7270,8 @@ final class TransferExecutionTests: XCTestCase {
         let dest = target.appendingPathComponent("a")
         XCTAssertEqual(try bytes(dest), "incomplete or competing bytes")
         XCTAssertTrue(result.failures[0].reason.contains(dest.path))
-        XCTAssertTrue(result.failures[0].reason.contains("any incomplete destination was left"))
+        XCTAssertTrue(result.failures[0].reason.contains("this transfer did not create it"),
+                      "got: \(result.failures[0].reason)")
         XCTAssertTrue(result.copied.isEmpty)
         XCTAssertEqual(try bytes(b), "next")
         XCTAssertFalse(fm.fileExists(atPath: target.appendingPathComponent("b").path))

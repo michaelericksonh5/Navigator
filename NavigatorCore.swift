@@ -5548,6 +5548,76 @@ func copyWithProgress(_ src: URL, _ dst: URL,
 }
 
 
+/// macOS names the WRONG volume when a destination is read-only.
+///
+/// Verified against a read-only SMB share: NSCocoaErrorDomain 642, real destination volume
+/// "Games", and the message reads «You can't save the file "normal.txt" because the volume
+/// "Macintosh HD" is read only». Someone told that goes and inspects their startup disk,
+/// which is fine, and learns nothing about the share that actually refused them.
+enum TransferErrorRules {
+    static let readOnlyVolumeCode = 642      // NSFileWriteVolumeReadOnlyError
+
+    static func isReadOnlyVolume(domain: String, code: Int) -> Bool {
+        domain == NSCocoaErrorDomain && code == readOnlyVolumeCode
+    }
+
+    static func readOnlyMessage(name: String, volume: String) -> String {
+        "“\(volume)” is read-only, so “\(name)” can’t be written there. On a network share "
+        + "this usually means you have read access to it but not write access."
+    }
+}
+
+/// The failure text to show for a transfer error — macOS's own wording, except where it is
+/// actively misleading (see TransferErrorRules).
+func describeTransferFailure(_ error: Error, at destination: URL) -> String {
+    let ns = error as NSError
+    guard TransferErrorRules.isReadOnlyVolume(domain: ns.domain, code: ns.code) else {
+        return error.localizedDescription
+    }
+    let dir = destination.deletingLastPathComponent()
+    let volume = (try? dir.resourceValues(forKeys: [.volumeNameKey]))?.volumeName
+    return TransferErrorRules.readOnlyMessage(name: destination.lastPathComponent,
+                                              volume: volume ?? dir.path)
+}
+
+/// Remove a file together with the AppleDouble "._" sidecar that carries its extended
+/// attributes on a filesystem which cannot store them natively (SMB, exFAT, FAT).
+///
+/// Removing the file does NOT take the sidecar with it. Measured on a non-Mac volume: every
+/// failed copy left a hidden 4 KB "._.navigator-incoming-XXXX" behind, and on a shared drive
+/// those accumulate forever with nobody able to guess what they were.
+func removeWithAppleDouble(_ url: URL) {
+    let fm = FileManager.default
+    try? fm.removeItem(at: url)
+    let name = url.lastPathComponent
+    guard !name.hasPrefix("._") else { return }
+    try? fm.removeItem(at: url.deletingLastPathComponent().appendingPathComponent("._" + name))
+}
+
+/// Did a failed copy nonetheless put the whole file at the destination?
+///
+/// Regular files only: a directory's own size says nothing about whether its contents were
+/// copied, so a half-copied folder must never pass this.
+func arrivedComplete(_ src: URL, _ dst: URL) -> Bool {
+    let fm = FileManager.default
+    guard let s = try? fm.attributesOfItem(atPath: src.path),
+          let d = try? fm.attributesOfItem(atPath: dst.path),
+          (s[.type] as? FileAttributeType) == .typeRegular,
+          (d[.type] as? FileAttributeType) == .typeRegular,
+          let sSize = (s[.size] as? NSNumber)?.int64Value,
+          let dSize = (d[.size] as? NSNumber)?.int64Value else { return false }
+    return sSize == dSize
+}
+
+/// Copy just the bytes and the mode/timestamps — no extended attributes, no ACLs.
+///
+/// The fallback for a destination that cannot hold Mac metadata. COPYFILE_EXCL so it can
+/// never overwrite something that appeared in the meantime.
+func copyDataOnly(_ src: URL, _ dst: URL) -> Bool {
+    copyfile(src.path, dst.path, nil,
+             copyfile_flags_t(COPYFILE_DATA | COPYFILE_STAT | COPYFILE_EXCL)) == 0
+}
+
 // MARK: - Transfer planning and execution
 
 enum ConflictPolicy { case keepBoth, replace, skip }
@@ -5573,6 +5643,13 @@ enum Transfer {
         }
     }
 
+    // PRECONDITION: `sources` must not contain a folder that `directory` lives inside. A
+    // folder copied into its own subtree recurses until the path length breaks — measured,
+    // it produced a 117 KB tree before failing with a truncated-filename error. The check
+    // needs symlink resolution, which is disk I/O, so it is enforced once on the worker
+    // thread in performTransfer (Browser.isSelfOrDescendant) rather than here, where plan()
+    // is meant to be pure. A new caller of plan() must do the same.
+    //
     // conflictNames is the worker's original scan, not a filesystem query here.
     // Unique names remain an intent: resolving them on disk at execution time preserves
     // races and name reuse after a previous failure. previewDestination is pure too.
@@ -5614,6 +5691,11 @@ enum Transfer {
         var destination: URL
         var status: Status = .notProcessed
         var failures: [String] = []
+        /// The transfer SUCCEEDED but something about it is worth saying — currently only
+        /// "the bytes are there, the Mac metadata is not". Deliberately separate from
+        /// `failures`, which raises an error dialog: a file that arrived intact must not be
+        /// reported to the user as a failure.
+        var warnings: [String] = []
         var undo: UndoRecord? {
             switch status {
             case .copied: return .removeCreated(destination)
@@ -5634,6 +5716,9 @@ enum Transfer {
             outcomes.flatMap { o in o.failures.map { (o.item.source.lastPathComponent, $0) } }
         }
         var skipped: Int { outcomes.filter { $0.status == .skipped }.count }
+        var warnings: [(name: String, reason: String)] {
+            outcomes.flatMap { o in o.warnings.map { (o.item.source.lastPathComponent, $0) } }
+        }
     }
 
     static func execute(_ plan: [Item], useBytes: Bool = false,
@@ -5680,35 +5765,121 @@ enum Transfer {
                 }
             case .renameToUnique: break
             }
+            // A COPY is written to a staging name in the destination folder and renamed into
+            // place only once it is whole.
+            //
+            // Publishing straight to the final name is what left a 0-BYTE file sitting under
+            // the right name when a copy failed late — measured on a destination that cannot
+            // hold the "._" sidecar for a 254-character name: FileManager creates the file,
+            // then fails, and the data never arrives. That leftover is indistinguishable from
+            // a file a competing process created a moment earlier, so it could neither be
+            // trusted nor safely deleted, and the retry on top of it failed with "an item
+            // with the same name already exists" — a message about a file this app had just
+            // created, which buried the real reason. Staging removes the question entirely:
+            // anything at the staging name is ours.
+            //
+            // A MOVE is deliberately NOT staged. Same-volume it is already atomic, and a
+            // cross-volume one that fails leaves the source where it is; staging it would
+            // instead park the data under a hidden name with the source already gone.
+            let staged: URL? = item.move ? nil
+                : dest.deletingLastPathComponent()
+                      .appendingPathComponent(".navigator-incoming-\(UUID().uuidString.prefix(8))")
+            let writeTo = staged ?? dest
+            func discardStaging() { if let staged { removeWithAppleDouble(staged) } }
+            var warning: String?
             do {
                 if item.move { try fm.moveItem(at: src, to: dest) }
-                else if useBytes { try copyWithProgress(src, dest, isCancelled: isCancelled, onBytes: { onBytes(i, $0) }) }
-                else { try fm.copyItem(at: src, to: dest) }
-                result.outcomes[i].status = item.move ? .moved : .copied
+                else if useBytes { try copyWithProgress(src, writeTo, isCancelled: isCancelled, onBytes: { onBytes(i, $0) }) }
+                else { try fm.copyItem(at: src, to: writeTo) }
             } catch {
                 if isCancelled() {
+                    discardStaging()
                     result.outcomes[i].status = .cancelled
-                    result.outcomes[i].failures.append("cancelled; any incomplete destination was left at “\(dest.path)” to avoid deleting another process's file")
+                    // Nothing half-written is ever published under the real name, so the only
+                    // thing that can be at the destination is something we did not put there.
+                    result.outcomes[i].failures.append(
+                        fm.fileExists(atPath: dest.path)
+                        ? "cancelled; “\(dest.path)” was left alone — this transfer did not create it"
+                        : "cancelled before it finished; nothing was left at the destination")
                     restoreReplaced()
                     break
                 }
+                discardStaging()                       // ours, unambiguously
                 do {
-                    try fm.copyItem(at: src, to: dest)
-                    result.outcomes[i].status = .copied
-                    if item.move {
-                        do { try fm.removeItem(at: src); result.outcomes[i].status = .moved }
-                        catch { result.outcomes[i].failures.append("copied, but the source could not be removed: \(error.localizedDescription)") }
-                    }
+                    try fm.copyItem(at: src, to: writeTo)
                 } catch let second {
-                    log("transfer FAILED: “\(name)” → \(dest.path) — \(second.localizedDescription) (first attempt: \(error.localizedDescription))")
-                    result.outcomes[i].status = .failed
-                    result.outcomes[i].failures.append(second.localizedDescription)
+                    discardStaging()
+                    // Last resort: the bytes without the Mac metadata. A destination that
+                    // cannot hold extended attributes — a Samba share with them turned off, or
+                    // a name whose "._" sidecar would exceed 255 characters — fails every
+                    // other attempt for a tagged or downloaded file. Losing a Finder tag is
+                    // not a reason to lose the file. COPYFILE_EXCL, so it cannot overwrite
+                    // anything that appeared in the meantime.
+                    guard copyDataOnly(src, writeTo) else {
+                        discardStaging()
+                        log("transfer FAILED: “\(name)” → \(dest.path) — \(second.localizedDescription) (first attempt: \(error.localizedDescription))")
+                        result.outcomes[i].status = .failed
+                        result.outcomes[i].failures.append(describeTransferFailure(second, at: dest))
+                        restoreReplaced()
+                        continue
+                    }
+                    warning = "copied, but “\(dest.lastPathComponent)” could not keep its Finder tags or other extended attributes — the destination does not support them"
+                    log("transfer: “\(name)” copied WITHOUT extended attributes — \(second.localizedDescription)")
                 }
+            }
+            // Publish. The destination is checked again here because the whole point of
+            // staging is that this is the first moment the real name is touched.
+            if let staged {
+                guard !fm.fileExists(atPath: dest.path) else {
+                    discardStaging()
+                    result.outcomes[i].status = .failed
+                    result.outcomes[i].failures.append("destination appeared after the conflict check; retry the transfer")
+                    restoreReplaced()
+                    continue
+                }
+                do { try fm.moveItem(at: staged, to: dest) }
+                catch {
+                    discardStaging()
+                    log("transfer FAILED: “\(name)” copied but could not be put in place at \(dest.path) — \(error.localizedDescription)")
+                    result.outcomes[i].status = .failed
+                    result.outcomes[i].failures.append(describeTransferFailure(error, at: dest))
+                    restoreReplaced()
+                    continue
+                }
+                // The rename moves the file; its AppleDouble sidecar does not always follow —
+                // measured, the sidecar for a 254-character destination would need a 256-
+                // character name, so it stays behind under the staging name. The file is in
+                // place and correct, but its extended attributes did not arrive, and a hidden
+                // "._.navigator-incoming-XXXX" is now litter on a shared drive.
+                let orphan = staged.deletingLastPathComponent()
+                    .appendingPathComponent("._" + staged.lastPathComponent)
+                if fm.fileExists(atPath: orphan.path) {
+                    try? fm.removeItem(at: orphan)
+                    if warning == nil {
+                        warning = "copied, but “\(dest.lastPathComponent)” could not keep its Finder tags or other extended attributes — the destination does not support them"
+                        log("transfer: “\(name)” arrived without its extended attributes — the destination could not name their sidecar")
+                    }
+                }
+            }
+            if let warning { result.outcomes[i].warnings.append(warning) }
+            if item.move, fm.fileExists(atPath: src.path) {
+                // The fallback path copied instead of moving, so the source is still there.
+                do { try fm.removeItem(at: src); result.outcomes[i].status = .moved }
+                catch {
+                    result.outcomes[i].status = .copied
+                    result.outcomes[i].failures.append("copied, but the source could not be removed: \(error.localizedDescription)")
+                }
+            } else {
+                result.outcomes[i].status = item.move ? .moved : .copied
             }
             if result.outcomes[i].status == .failed { restoreReplaced() }
             else if let stash = backup {
-                do { try fm.removeItem(at: stash) }
-                catch { log("transfer: replaced copy of “\(name)” left behind at \(stash.path) — \(error.localizedDescription)") }
+                // Same AppleDouble trap as the staging name: removing the stash alone leaves
+                // "._navigator-replacing-XXXX" on the share forever.
+                removeWithAppleDouble(stash)
+                if fm.fileExists(atPath: stash.path) {
+                    log("transfer: replaced copy of “\(name)” left behind at \(stash.path)")
+                }
             }
             onFinish(i)
         }

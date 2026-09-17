@@ -122,14 +122,21 @@ func navigatorPID() -> pid_t? {
 /// what the app is busy with - a tab left pointing at a share that has since been unmounted
 /// makes everything slower, and a fixed 0.6s delay silently dropped the typed path. The suite
 /// then failed for a reason that had nothing to do with the build under test.
-func goTo(_ path: String, _ app: AX) {
+/// Returns whether it actually arrived.
+///
+/// It used to return regardless, printing a note, so a navigation that never happened was
+/// reported by the NEXT assertion instead — "Go > Enclosing Folder disabled at /" failing
+/// when Enclosing Folder was fine and the window had simply never reached /. A check that
+/// blames the wrong thing is worse than no check.
+@discardableResult
+func goTo(_ path: String, _ app: AX) -> Bool {
     let leaf = (path as NSString).lastPathComponent
     let want = leaf.isEmpty ? "Macintosh HD" : leaf
     func arrived() -> Bool {
         app.children().contains { $0.role == kAXWindowRole as String && $0.title == want }
     }
     for attempt in 1...4 {
-        if arrived() { settle(0.5); return }
+        if arrived() { settle(0.5); return true }
         let src = """
         tell application "Navigator" to activate
         delay 0.8
@@ -144,10 +151,11 @@ func goTo(_ path: String, _ app: AX) {
         var err: NSDictionary?
         NSAppleScript(source: src)?.executeAndReturnError(&err)
         if waitUntil("navigation to \(want) (attempt \(attempt))", timeout: 12, arrived) {
-            settle(0.6); return
+            settle(0.6); return true
         }
     }
     print("  (never reached \(want) after 4 attempts)")
+    return false
 }
 
 /// The file list, wherever it is.
@@ -277,8 +285,9 @@ if let table = fileTable(app), let first = rows(app).first(where: { rowName($0).
 
 // ---- 3. Up at the filesystem root ----
 print("\nnavigation bounds:")
-goTo("/", app)
-if let up = app.menuItem(menu: "Go", item: "Enclosing Folder") {
+let atRoot = goTo("/", app)
+check("navigated to /", atRoot)
+if atRoot, let up = app.menuItem(menu: "Go", item: "Enclosing Folder") {
     check("Go > Enclosing Folder disabled at /", !up.enabled)
 } else { check("Go > Enclosing Folder exists", false) }
 goTo(fixture, app)
