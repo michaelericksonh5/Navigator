@@ -14,6 +14,80 @@ import Network   // loopback listener for the Vertex sign-in callback
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
 import os
 
+/// The dead-mount gate for ONE listing or walk, resolved once and carried.
+///
+/// Resolving which volume a path sits on costs 64.8 us — two getfsstat calls and a 43 KB
+/// statfs array, measured. The operation it guards costs 0.8 us on a local disk, so doing
+/// it per file is an 80x tax that adds 0.65 s to a 10,000-file local folder with no share
+/// in it at all. It is therefore resolved ONCE per listing, and a local listing carries a
+/// nil root and pays nothing from here on.
+///
+/// The point of the gate: on a share whose server has gone, every per-file attribute read
+/// blocks for the SMB timeout, so a 300-entry folder pays 300 timeouts while the window
+/// sits there with no table in it. One call discovers the mount is dead; the rest are
+/// skipped until it answers again.
+struct MountGate {
+    /// nil for a local volume: nothing below does anything, at no cost.
+    let root: String?
+
+    /// shareMountInfo already answers this — it returns nil unless the path sits on a
+    /// mount whose source is "//server/share", which is exactly "not a local disk".
+    init(_ url: URL) { root = Browser.shareMountInfo(for: url)?.volume }
+
+    private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// Has this volume already been found unreachable? Cheap — no syscall, no I/O.
+    var isDead: Bool {
+        guard root != nil else { return false }
+        return VolumePathRules.health.isUnreachable(root: root, now: now)
+    }
+
+    /// Run a per-file attribute read under the gate.
+    ///
+    /// Returns nil when the mount is known dead (so the caller skips it without paying a
+    /// timeout) and ALSO when the read itself fails. Deliberately the same nil for both:
+    /// every caller here already had to handle a failed read, and a folder must never be
+    /// truncated or have a file silently dropped because one entry would not answer.
+    func read<T>(_ body: () throws -> T) -> T? {
+        guard let root else { return try? body() }          // local: no bookkeeping at all
+        guard let ticket = VolumePathRules.health.begin(root: root, operation: .attributes, now: now) else {
+            return nil                                       // already known dead
+        }
+        do {
+            let value = try body()
+            VolumePathRules.health.end(ticket, failure: nil, now: now)
+            return value
+        } catch {
+            VolumePathRules.health.end(ticket, failure: VolumeHealthRules.failure(error as NSError), now: now)
+            return nil
+        }
+    }
+
+    /// The recovery probe: one cheap syscall whose job is to answer "is this volume back".
+    ///
+    /// Returns nil when the backoff says it is not time to ask yet — so the caller does
+    /// nothing rather than queueing another stat onto a connection that is not answering.
+    /// Only a TRANSPORT failure counts against the volume; a stat that fails with ENOENT
+    /// says the folder is gone, which is a fact about the folder, not about the server.
+    func probe(_ body: () -> Bool) -> Bool? {
+        guard let root else { return body() }               // local: no bookkeeping at all
+        guard let ticket = VolumePathRules.health.begin(root: root, operation: .probe, now: now) else {
+            return nil
+        }
+        errno = 0
+        let ok = body()
+        let cause: MountFailureRules.Cause? = ok ? nil : MountFailureRules.cause(errno: errno)
+        VolumePathRules.health.end(ticket, failure: cause, now: now)
+        return ok
+    }
+
+    /// A share that just mounted is a new session; whatever the old one was doing to it
+    /// says nothing about this one.
+    static func reconnected(mountPoint: String) {
+        VolumePathRules.health.reconnected(root: mountPoint)
+    }
+}
+
 // Dispatch before any app globals: a worker must never initialise the GUI or
 // mistake an ordinary file-open argument for an internal command.
 if CommandLine.arguments.dropFirst().first == WalkStream.subcommand {
@@ -60,13 +134,21 @@ private func runWalkChild(_ request: WalkStream.Request) throws {
         try FileHandle.standardOutput.write(contentsOf: $0)
     }
     var hitCap = false
+    // This process has its own address space, so it keeps its own health state. That is
+    // enough: the cost being avoided is this walk paying one SMB timeout per matching file,
+    // and the parent discovers the same dead mount on its own next listing.
+    // ponytail: no cross-process channel for it; add one if a dead mount is ever found
+    // FIRST by a search rather than by the listing that had to happen to start the search.
+    let gate = MountGate(request.root)
     while let url = enumerator?.nextObject() as? URL {
         let ext = url.pathExtension
         guard SearchQueryRules.matchesFile(name: url.lastPathComponent, ext: ext,
                                            tokens: request.tokens) else { continue }
-        let values: URLResourceValues
-        do { values = try url.resourceValues(forKeys: wantedKeys) }
-        catch { readFailed = true; continue }
+        guard let values = gate.read({ try url.resourceValues(forKeys: wantedKeys) }) else {
+            readFailed = true
+            if gate.isDead { break }
+            continue
+        }
         let item = Browser.item(from: url, values)
         guard SearchBackendRules.matchesKind(tree: request.kindTree, isDirectory: item.isDirectory, fileTypeMatches: { tree in
             guard let wanted = UTType(tree), let actual = UTType(filenameExtension: ext.lowercased()) else { return false }
@@ -840,15 +922,10 @@ final class NetworkPollCoordinator {
     /// seconds, short enough that a file someone else drops in a shared folder shows
     /// up while you're still looking at the folder.
     private let interval: TimeInterval = 4
-    /// A stat slower than this means the share is struggling — back off rather than
-    /// queue up more work on a connection that can't keep up.
-    private let slowStatBudget: TimeInterval = 2
 
     private struct State {
         var path: String = ""
         var signature: Date?
-        var strikes = 0
-        var quietUntil: Date?
         var statInFlight = false
     }
     private var state: [ObjectIdentifier: State] = [:]
@@ -889,8 +966,14 @@ final class NetworkPollCoordinator {
         // makes both slower.
         // staleListing included deliberately: without it this watchdog kept re-entering a folder
         // whose refresh was wedged, and every visit started another automount attempt.
-        guard !browser.busy, !browser.slowNetwork, !browser.networkStalled,
-              !browser.staleListing else { return }
+        // When the volume is already marked unreachable this poll IS the probe that finds
+        // out whether it came back — so it must be allowed through the stall guards that
+        // otherwise (correctly) keep it away. VolumeHealthRules.begin(operation:.probe)
+        // enforces the backoff, so this is one stat a minute, not one every four seconds.
+        let gate = MountGate(browser.currentURL)
+        let probing = gate.isDead
+        guard probing || (!browser.busy && !browser.slowNetwork && !browser.networkStalled
+                          && !browser.staleListing) else { return }
         let key = ObjectIdentifier(browser)
         var s = state[key] ?? State()
         let path = browser.currentURL.path
@@ -899,12 +982,10 @@ final class NetworkPollCoordinator {
         // reload of a listing that was just loaded.
         if s.path != path { s = State(path: path); state[key] = s }
         if s.statInFlight { return }                                  // previous stat still outstanding
-        if let q = s.quietUntil, q > Date() { return }                // backing off
 
         s.statInFlight = true
         state[key] = s
         let dir = browser.currentURL
-        let t0 = Date()
         DispatchQueue.global(qos: .utility).async { [weak self, weak browser] in
             // POSIX stat, NOT URL.resourceValues: a URL CACHES its resource values, and
             // every copy of `currentURL` shares that cache — so the second poll onwards
@@ -912,10 +993,9 @@ final class NetworkPollCoordinator {
             // appeared to change. (Measured: files added on an SMB share, the shell saw
             // the new mtime immediately, the poll saw the original value forever.)
             var st = stat()
-            let mtime: Date? = stat(dir.path, &st) == 0
+            let mtime: Date? = gate.probe { stat(dir.path, &st) == 0 } == true
                 ? Date(timeIntervalSince1970: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9)
                 : nil
-            let elapsed = Date().timeIntervalSince(t0)
             DispatchQueue.main.async {
                 guard let self, let browser else { return }
                 var s = self.state[key] ?? State(path: dir.path)
@@ -925,15 +1005,19 @@ final class NetworkPollCoordinator {
                 guard s.path == dir.path, browser.currentURL.path == dir.path else {
                     self.state[key] = s; return
                 }
-                if mtime == nil || elapsed > self.slowStatBudget {
-                    s.strikes += 1
-                    // 15s, 30s, 45s, 60s… capped. An unreachable mount gets a stat a
-                    // minute instead of one every four seconds.
-                    s.quietUntil = Date().addingTimeInterval(min(60, 15 * Double(s.strikes)))
-                    self.state[key] = s
-                    return
+                // The backoff lives in VolumeHealthRules now — it is shared by every path
+                // that touches this volume, which is the whole point: the listing, the
+                // search and this poll all back off together instead of each discovering
+                // the same dead mount separately.
+                guard mtime != nil else { self.state[key] = s; return }
+                if probing {
+                    // It answered. Recovery goes through the reconnect notification that
+                    // already exists (it re-checks the path and reloads only a window that
+                    // is empty or stalled) — NOT a refresh from here. Refreshing a wedged
+                    // folder from the watchdog is what used to start a fresh automount on
+                    // every visit; see the staleListing note above.
+                    NotificationCenter.default.post(name: .navigatorShareReconnected, object: nil)
                 }
-                s.strikes = 0; s.quietUntil = nil
                 let previous = s.signature
                 s.signature = mtime
                 self.state[key] = s
@@ -6416,11 +6500,16 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 let plan = RefreshRules.plan(existing: Array(known.keys), fresh: freshOrder)
                 let wanted = Set(Browser.networkKeys(visible: visible))
                 let needed = Set(plan.fetch)
+                let gate = MountGate(dir)
                 for id in freshOrder {
                     guard let self, gen == self.loadGeneration else { return }
                     if !needed.contains(id), let had = known[id] { result.append(had); continue }
                     guard let u = freshURLs[id] else { continue }
-                    result.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
+                    // The mount died partway through. Keep what the names pass already
+                    // established rather than paying a timeout for each remaining entry —
+                    // the row is still correct about existing, just not about its size.
+                    if gate.isDead, let had = known[id] { result.append(had); continue }
+                    result.append(Browser.item(from: u, gate.read { try u.resourceValues(forKeys: wanted) }))
                 }
             } else {
                 let keys = Browser.itemKeys
@@ -6697,11 +6786,17 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 enumerateCompleted = false
                 guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: keys, options: opts) else { return [] }
                 let wanted = Set(keys)   // hoisted out of the loop
+                let gate = MountGate(dir)
                 var out: [FileItem] = []
                 var sinceFlush = 0
                 while let u = en.nextObject() as? URL {
                     guard let self, gen == self.loadGeneration else { return out }
-                    out.append(Browser.item(from: u, try? u.resourceValues(forKeys: wanted)))
+                    // Stop, rather than time out once per remaining entry. This is the pass
+                    // that made the whole app sluggish and left the window with no table:
+                    // it is exactly one attribute read per file, and on a dead mount each one
+                    // blocks for the full SMB timeout.
+                    if gate.isDead { break }
+                    out.append(Browser.item(from: u, gate.read { try u.resourceValues(forKeys: wanted) }))
                     sinceFlush += 1
                     // 25, not 100: at 89 ms/entry on a DFS share the first batch of 100
                     // lands at 15.2 s but 25 lands at 7.8 s (measured), and the flush is
@@ -6725,7 +6820,9 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                         }
                     }
                 }
-                enumerateCompleted = true
+                // A pass cut short by a dead mount has NOT completed — saying otherwise would
+                // cache the truncated listing and write it into the shared index.
+                enumerateCompleted = !gate.isDead
                 return out
             }
             // The shared index. Presence has already been established by phase 1's readdir; this
@@ -6765,8 +6862,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                         if !mustFetch.isEmpty {
                             let missing = Set(mustFetch)
                             let wanted = Set(keys)
+                            let gate = MountGate(dir)
                             let fresh = enriched.filter { missing.contains($0.name) }
-                                .map { Browser.item(from: $0.url, try? $0.url.resourceValues(forKeys: wanted)) }
+                                .map { row in
+                                    Browser.item(from: row.url, gate.read { try row.url.resourceValues(forKeys: wanted) })
+                                }
                             let byID = Dictionary(fresh.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
                             let finalRows = enriched.map { byID[$0.id] ?? $0 }
                             DispatchQueue.main.async { [weak self] in
@@ -6811,11 +6911,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                                 // Repair statting shares the sweep queue: it is background work
                                 // and must not compete with a foreground folder's listing.
                                 Browser.sweepQueue.sync {
+                                let gate = MountGate(dir)
                                 for n in liveNames {
                                     guard let row = byName[n] else { continue }
-                                    if plan.mustStat.contains(n) {
+                                    // A repair pass on a dead mount would write timed-out rows
+                                    // into the index every other person on this share reads.
+                                    if plan.mustStat.contains(n), !gate.isDead {
                                         repaired.append(Browser.item(from: row.url,
-                                                                     try? row.url.resourceValues(forKeys: wanted)))
+                                                                     gate.read { try row.url.resourceValues(forKeys: wanted) }))
                                     } else {
                                         repaired.append(row)
                                     }
@@ -7286,7 +7389,9 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     static func mountShareSilently(_ url: URL) -> String? {
-        netfsMount(url, ui: kNAUIOptionNoUI).mountPoint
+        guard let mp = netfsMount(url, ui: kNAUIOptionNoUI).mountPoint else { return nil }
+        MountGate.reconnected(mountPoint: mp)
+        return mp
     }
 
     static func mountShare(_ url: URL) -> String? { mountShareReporting(url).mountPoint }
@@ -7304,8 +7409,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     static func mountShareReporting(_ url: URL) -> (mountPoint: String?, rc: Int32) {
         let t0 = Date()
         let quiet = netfsMount(url, ui: kNAUIOptionNoUI)
-        if quiet.mountPoint != nil {
+        if let mp = quiet.mountPoint {
             navLog("mount: \(url.host ?? "?") mounted silently in \(Int(Date().timeIntervalSince(t0) * 1000))ms")
+            // A fresh mount is a new SMB session. Whatever the dead one was doing says
+            // nothing about this one, so it must not inherit the unreachable flag.
+            MountGate.reconnected(mountPoint: mp)
             return quiet
         }
         // Already mounted is a success wearing a failure's clothes — see
@@ -7321,6 +7429,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             return quiet
         }
         let asked = netfsMount(url, ui: kNAUIOptionAllowUI)
+        if let mp = asked.mountPoint { MountGate.reconnected(mountPoint: mp) }
         if asked.mountPoint == nil {
             navLog("mount: \(url.host ?? "?") failed rc=\(asked.rc) (\(MountFailureRules.cause(errno: asked.rc))) after asking")
         }

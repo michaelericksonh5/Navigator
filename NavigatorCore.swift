@@ -2440,8 +2440,94 @@ func lexicalPath(_ path: String) -> String {
 /// app that would not open. The boot volume is "/" and is unaffected, which is where most browsing
 /// happens.
 enum VolumePathRules {
+    @Synchronized static var health = VolumeHealthRules()
     static func mayBlockOnIO(_ path: String) -> Bool {
         path == "/Volumes" || path.hasPrefix("/Volumes/")
+    }
+}
+
+/// SMB attributes cost 90–100 ms per entry when healthy; an unreachable server instead
+/// costs a timeout per entry. One transport failure is sufficient evidence, whereas a
+/// slow SUCCESS only backs off polling. Time is supplied by the caller, including for
+/// a syscall that never returns (the same admission principle as WalkAdmission).
+struct VolumeHealthRules {
+    enum Operation { case attributes, probe }
+    struct Ticket {
+        let root: String
+        let id: Int
+    }
+    private struct State {
+        var unreachable = false
+        var strikes = 0
+        var lastFailure = 0
+        var quietUntil: TimeInterval = 0
+        var pending: [Int: TimeInterval] = [:]
+    }
+    static let timeout: TimeInterval = 15
+    private var volumes: [String: State] = [:]
+    private var serial = 0
+
+    static func failure(_ error: NSError) -> MountFailureRules.Cause {
+        if error.domain == NSPOSIXErrorDomain { return MountFailureRules.cause(errno: Int32(error.code)) }
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError { return failure(underlying) }
+        return .other
+    }
+
+    mutating func isUnreachable(root: String?, now: TimeInterval) -> Bool {
+        guard let root, var s = volumes[root] else { return false }
+        if !s.unreachable, s.pending.values.contains(where: { now - $0 >= Self.timeout }) {
+            s.unreachable = true
+            s.strikes += 1
+            s.quietUntil = now + min(60, 15 * Double(s.strikes))
+            volumes[root] = s
+        }
+        return s.unreachable
+    }
+
+    mutating func begin(root: String?, operation: Operation, now: TimeInterval) -> Ticket? {
+        // nil means a local volume, determined from the cached mount table, NOT /Volumes.
+        guard let root else { return Ticket(root: "", id: 0) }
+        let dead = isUnreachable(root: root, now: now)
+        var s = volumes[root] ?? State()
+        if dead && (operation != .probe || now < s.quietUntil || !s.pending.isEmpty) { return nil }
+        if operation == .probe && (now < s.quietUntil || !s.pending.isEmpty) { return nil }
+        serial += 1
+        s.pending[serial] = now
+        volumes[root] = s
+        return Ticket(root: root, id: serial)
+    }
+
+    // A successful NEW mount replaces the old session. Its abandoned callbacks must
+    // not poison the replacement, and EEXIST alone is not evidence of recovery.
+    mutating func reconnected(root: String) { volumes[root] = nil }
+
+    mutating func end(_ ticket: Ticket, failure: MountFailureRules.Cause?, now: TimeInterval) {
+        guard var s = volumes[ticket.root], let start = s.pending.removeValue(forKey: ticket.id) else { return }
+        if failure == .unreachable {
+            s.unreachable = true
+            s.lastFailure = max(s.lastFailure, ticket.id)
+            s.strikes += 1
+            s.quietUntil = now + min(60, 15 * Double(s.strikes))
+        } else if failure == nil {
+            // A late success may clear a deadline-based suspicion. An older concurrent
+            // completion cannot erase a newer failure while other calls are still stuck.
+            if s.pending.isEmpty && ticket.id > s.lastFailure { s.unreachable = false }
+            if s.unreachable {
+                volumes[ticket.root] = s
+                return
+            }
+            if now - start > 2 {
+                s.strikes += 1
+                s.quietUntil = now + min(60, 15 * Double(s.strikes))
+            } else {
+                s.strikes = 0
+                s.quietUntil = 0
+            }
+        } else {
+            // Permissions and missing files say nothing about transport health.
+            s.quietUntil = now + 15
+        }
+        volumes[ticket.root] = s
     }
 }
 

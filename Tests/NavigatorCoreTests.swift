@@ -7240,3 +7240,144 @@ final class RefreshRulesTests: XCTestCase {
         XCTAssertTrue(RefreshRules.plan(existing: [], fresh: []).isUnchanged)
     }
 }
+
+final class VolumeHealthRulesTests: XCTestCase {
+    private let root = "/Volumes/Games"
+
+    func testDeadMountCostsOneDiscoveryFor300Entries() throws {
+        var health = VolumeHealthRules()
+        var discoveries = 0
+        var now: TimeInterval = 0
+        for _ in 0..<300 {
+            if let ticket = health.begin(root: root, operation: .attributes, now: now) {
+                discoveries += 1
+                now = 15
+                health.end(ticket, failure: MountFailureRules.cause(errno: ETIMEDOUT), now: now)
+            }
+        }
+        XCTAssertEqual(discoveries, 1)
+        XCTAssertTrue(health.isUnreachable(root: root, now: 15))
+        // Expiring backoff permits a probe, never 300 new per-file discoveries.
+        XCTAssertNil(health.begin(root: root, operation: .attributes, now: 1000))
+    }
+
+    func testUnfinishedCallSuppressesLaterWorkWithoutEnd() throws {
+        var health = VolumeHealthRules()
+        _ = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        XCTAssertFalse(health.isUnreachable(root: root, now: 14.9))
+        for _ in 0..<300 {
+            XCTAssertNil(health.begin(root: root, operation: .attributes, now: 15))
+        }
+        XCTAssertNil(health.begin(root: root, operation: .probe, now: 1000),
+                     "A syscall still in the kernel must not acquire a second timeout")
+    }
+
+    func testRecoveryProbeClearsFlagAndAttributesResume() throws {
+        var health = VolumeHealthRules()
+        let failed = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        health.end(failed, failure: .unreachable, now: 1)
+        XCTAssertNil(health.begin(root: root, operation: .probe, now: 15.9))
+        let probe = try XCTUnwrap(health.begin(root: root, operation: .probe, now: 16))
+        XCTAssertNil(health.begin(root: root, operation: .probe, now: 16))
+        XCTAssertNil(health.begin(root: root, operation: .attributes, now: 16))
+        health.end(probe, failure: nil, now: 16.1)
+        XCTAssertFalse(health.isUnreachable(root: root, now: 16.1))
+        XCTAssertNotNil(health.begin(root: root, operation: .attributes, now: 16.1))
+    }
+
+    func testSlowSuccessfulResponseOnlyBacksOffPoll() throws {
+        var health = VolumeHealthRules()
+        let ticket = try XCTUnwrap(health.begin(root: root, operation: .probe, now: 0))
+        health.end(ticket, failure: nil, now: 3)
+        XCTAssertFalse(health.isUnreachable(root: root, now: 3))
+        XCTAssertNil(health.begin(root: root, operation: .probe, now: 4))
+        XCTAssertNotNil(health.begin(root: root, operation: .attributes, now: 4))
+    }
+
+    func testLateSuccessClearsDeadlineSuspicion() throws {
+        var health = VolumeHealthRules()
+        let ticket = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        XCTAssertTrue(health.isUnreachable(root: root, now: 15))
+        health.end(ticket, failure: nil, now: 20)
+        XCTAssertFalse(health.isUnreachable(root: root, now: 20))
+        XCTAssertNotNil(health.begin(root: root, operation: .attributes, now: 20))
+    }
+
+    func testLocalVolumesAndOtherSharesAreUnaffected() throws {
+        var health = VolumeHealthRules()
+        let remote = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        health.end(remote, failure: .unreachable, now: 1)
+        // The mount-table adapter supplies nil for BOTH the boot disk and local USB disks.
+        for _ in 0..<300 {
+            let local = try XCTUnwrap(health.begin(root: nil, operation: .attributes, now: 2))
+            health.end(local, failure: .unreachable, now: 3)
+        }
+        XCTAssertFalse(health.isUnreachable(root: nil, now: 1000))
+        XCTAssertNotNil(health.begin(root: "/Volumes/Games Extra", operation: .attributes, now: 2))
+    }
+
+    func testOnlyTransportFailuresPoisonVolume() throws {
+        for code in [EACCES, EPERM, ENOENT, ENODEV, ECANCELED, EIO] {
+            var health = VolumeHealthRules()
+            let ticket = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+            let underlying = NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+            let error = NSError(domain: NSCocoaErrorDomain, code: 256,
+                                userInfo: [NSUnderlyingErrorKey: underlying])
+            health.end(ticket, failure: VolumeHealthRules.failure(error), now: 1)
+            XCTAssertFalse(health.isUnreachable(root: root, now: 1), "errno \(code)")
+            XCTAssertNotNil(health.begin(root: root, operation: .attributes, now: 1))
+        }
+        let timeout = NSError(domain: NSCocoaErrorDomain, code: 256, userInfo: [
+            NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ETIMEDOUT))])
+        XCTAssertEqual(VolumeHealthRules.failure(timeout), .unreachable)
+    }
+
+    func testRepeatedProbeFailuresUseExistingCappedBackoff() throws {
+        var health = VolumeHealthRules()
+        var now: TimeInterval = 0
+        var ticket = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: now))
+        for strike in 1...6 {
+            health.end(ticket, failure: .unreachable, now: now)
+            let next = now + min(60, 15 * Double(strike))
+            XCTAssertNil(health.begin(root: root, operation: .probe, now: next - 0.01))
+            ticket = try XCTUnwrap(health.begin(root: root, operation: .probe, now: next))
+            now = next
+        }
+    }
+}
+
+extension VolumeHealthRulesTests {
+    func testOlderSuccessCannotEraseNewerTransportFailure() throws {
+        var health = VolumeHealthRules()
+        let older = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        let newer = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        health.end(newer, failure: .unreachable, now: 1)
+        health.end(older, failure: nil, now: 1.1)
+        XCTAssertTrue(health.isUnreachable(root: root, now: 1.1))
+        XCTAssertNil(health.begin(root: root, operation: .probe, now: 2))
+        XCTAssertNotNil(health.begin(root: root, operation: .probe, now: 16))
+    }
+
+    func testNewMountIgnoresAbandonedSessionCallbacks() throws {
+        var health = VolumeHealthRules()
+        let abandoned = try XCTUnwrap(health.begin(root: root, operation: .attributes, now: 0))
+        XCTAssertTrue(health.isUnreachable(root: root, now: 15))
+        health.reconnected(root: root)
+        health.end(abandoned, failure: .unreachable, now: 100)
+        XCTAssertFalse(health.isUnreachable(root: root, now: 100))
+        XCTAssertNotNil(health.begin(root: root, operation: .attributes, now: 100))
+    }
+
+    func testConcurrentRecoveryAdmitsOnlyOneProbe() throws {
+        let health = Synchronized(wrappedValue: VolumeHealthRules())
+        let first = try XCTUnwrap(health.wrappedValue.begin(root: root, operation: .attributes, now: 0))
+        health.wrappedValue.end(first, failure: .unreachable, now: 1)
+        let admitted = Synchronized(wrappedValue: 0)
+        DispatchQueue.concurrentPerform(iterations: 300) { _ in
+            if health.wrappedValue.begin(root: root, operation: .probe, now: 16) != nil {
+                admitted.wrappedValue += 1
+            }
+        }
+        XCTAssertEqual(admitted.wrappedValue, 1)
+    }
+}
