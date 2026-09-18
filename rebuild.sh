@@ -5,10 +5,8 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 APP="/Applications/Navigator.app"
 "$DIR/check-shared-jsx.sh"
 echo "Compiling (universal: arm64 + x86_64)..."
-SWIFT_ARGS=(-swift-version 5 "$DIR/main.swift" "$DIR/NavigatorCore.swift" \
-  -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers -framework NetFS -framework Security -framework FinderSync)
-/usr/bin/swiftc "${SWIFT_ARGS[@]}" -target arm64-apple-macos14.4  -o "$DIR/Navigator-arm64"
-/usr/bin/swiftc "${SWIFT_ARGS[@]}" -target x86_64-apple-macos14.4 -o "$DIR/Navigator-x86_64"
+TARGET=arm64-apple-macos14.4  "$DIR/compile.sh" "$DIR/Navigator-arm64"
+TARGET=x86_64-apple-macos14.4 "$DIR/compile.sh" "$DIR/Navigator-x86_64"
 lipo -create "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64" -output "$DIR/Navigator.bin"
 rm -f "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64"
 
