@@ -3896,6 +3896,115 @@ func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
     chromaKeyForImages(pngs) { _ in onDone?() }
 }
 
+// ===== FX Alpha Upscale =====
+//
+// Radial FX — sparkles, rays, bursts — arrive as tiny soft alpha mattes, often 128px. They
+// cannot be upscaled. Their only real high frequency is the ANGULAR edge of each ray;
+// everything radial is a smooth gradient. A conventional resampler blurs those edges, an AI
+// upscaler invents detail in the gradient (Topaz Transparent was tried on these and was
+// visibly wrong), and sharpening a resampled raster just amplifies the staircase already
+// baked into the source. Reconstructing from the source was tried too and only worked for
+// clean starbursts, failing on ring-shaped FX.
+//
+// So this does not upscale at all. It REGENERATES the artwork at 2K or 4K and then keys the
+// backing out, which is the route the owner found by hand and which works because the detail
+// is drawn at the target size rather than invented from 128 pixels.
+//
+// Every step already existed and is reused rather than re-implemented: the adaptive backing
+// (KeyColorRules picks a colour far from everything in the art, so the key cannot eat the
+// subject — it chooses blue for a yellow sparkle), the identity "Detect" that describes what
+// must be preserved, Nano Banana 2, and the After Effects chroma key.
+let fxAlphaUpscaleStyleText = "create a new version of this without any pixelation"
+
+/// Per-image price, matching RestyleSheet's own cost hint.
+func fxAlphaUpscaleCost(size: String) -> Double { size == "4K" ? 0.15 : 0.10 }
+
+/// Regenerate each FX at `size` on an adaptive backing, then key that backing out.
+/// Writes "<name>_fxupres.png" beside the source. No dialog — the only prompt is the
+/// spend confirmation, because this spends real money per image.
+func fxAlphaUpscale(_ srcs: [URL], size: String, onDone: (([URL]) -> Void)? = nil) {
+    let pngs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_fxupres") }
+    guard !pngs.isEmpty else { NSSound.beep(); return }
+    guard AfterEffectsApp.bundleID != nil else {
+        reportFileError("FX Alpha Upscale needs After Effects",
+                        "The backing colour is removed with After Effects. Install it, then try again.")
+        return
+    }
+    guard confirmUpscale(count: pngs.count, label: "FX Alpha Upscale \(size)",
+                         perImage: fxAlphaUpscaleCost(size: size)) else { return }
+
+    DispatchQueue.main.async { BGJobProgress.shared.start("FX Alpha Upscale", total: pngs.count) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []
+        var errors: [String] = []
+        var spent = 0.0
+        for src in pngs {
+            let base = src.deletingPathExtension().lastPathComponent
+            // 1. What must survive the regeneration. Same call the Restyle sheet's Detect makes.
+            let identity = downscaledPNG(src).flatMap { analyzeIdentity(sourcePNG: $0).text } ?? ""
+            // 2. Adaptive backing. nil colour means "work it out from the image".
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("navigator-fxupres-\(UUID().uuidString).png")
+            guard let padded = fillBackgroundForImage(src, color: nil, suffix: "auto", ratio: nil, dest: tmp) else {
+                errors.append("\(src.lastPathComponent): couldn’t prepare a backing")
+                DispatchQueue.main.async { BGJobProgress.shared.advance() }
+                continue
+            }
+            defer { try? FileManager.default.removeItem(at: padded) }
+            // 3. Regenerate at the requested size.
+            let prompt = RestyleRules.prompt(mode: .editWithStyleText, contents: identity,
+                                             styleText: fxAlphaUpscaleStyleText)
+            let r = runRestyle(source: padded, prompt: prompt, modelFlag: "nb2", aspect: "auto",
+                               size: size, nameAfter: src, identity: identity,
+                               sendSourceImage: true, modeLabel: "FX Alpha Upscale \(size)")
+            guard let restyled = r.saved else {
+                errors.append("\(src.lastPathComponent): \(r.error ?? "generation failed")")
+                DispatchQueue.main.async { BGJobProgress.shared.advance() }
+                continue
+            }
+            spent += r.cost ?? 0
+            // 4. Key the backing out, synchronously, so the batch stays in step.
+            do {
+                guard let bundleID = AfterEffectsApp.bundleID, let appURL = AfterEffectsApp.url,
+                      let scriptURL = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
+                    throw NSError(domain: "FXAlphaUpscale", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "After Effects or the keying script is missing"])
+                }
+                launchHidden(bundleID: bundleID, appURL: appURL)
+                let keyed = try ChromaKeyOutputRules.exportPNG(
+                    source: restyled, scriptURL: scriptURL, bundleID: bundleID,
+                    onLaunch: { keepHidden(while: $0, bundleID: bundleID, revealAfter: adobeRevealAfter) })
+                // 5. One deliverable, named for the source. The generated-on-backing file and
+                // the keyer's own output are working files and do not belong in the folder.
+                let final = PathRules.uniqueDest(src.deletingLastPathComponent(), "\(base)_fxupres.png") {
+                    FileManager.default.fileExists(atPath: $0)
+                }
+                try? FileManager.default.removeItem(at: final)
+                try FileManager.default.moveItem(at: keyed, to: final)
+                try? FileManager.default.removeItem(at: restyled)
+                outs.append(final)
+                navLog("FX Alpha Upscale: \(src.lastPathComponent) → \(final.lastPathComponent) at \(size)")
+            } catch {
+                // The regenerated image survived even though keying failed — leaving it is
+                // more use than deleting the thing that cost money.
+                errors.append("\(src.lastPathComponent): generated, but keying failed — \(error.localizedDescription). The generated file is “\(restyled.lastPathComponent)”.")
+            }
+            DispatchQueue.main.async { BGJobProgress.shared.advance() }
+        }
+        let total = spent
+        DispatchQueue.main.async {
+            hideApp(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects")
+            BGJobProgress.shared.finish(String(format: "FX Alpha Upscale: %d of %d · $%.2f",
+                                               outs.count, pngs.count, total))
+            if !errors.isEmpty {
+                showBGSummary(app: "FX Alpha Upscale", done: outs.count, total: pngs.count,
+                              errors: errors, verb: "upscaled")
+            }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
 // Price warning shown before ANY upscale — it's one PAID AI call per image.
 // Returns true to proceed. `perImage` is a known $/image (Imagen) or nil (fal —
 // cost varies by image size). Runs modally; callers invoke on the main thread.
@@ -11343,6 +11452,30 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                     Button { browser.chromaKeyBackground(ids) } label: { Label(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)", systemImage: "eyedropper.halffull") }
                 } else if dirs.count == 1, sel.count == 1 {
                     Button { browser.batchChromaKeyBackground(ids) } label: { Label("Batch Chroma Key BG", systemImage: "eyedropper.halffull") }
+                }
+            }
+            // FX Alpha Upscale — regenerate + key, one action. A submenu only because
+            // 2K and 4K are different prices; there is nothing else to configure.
+            do {
+                let fxURLs = browser.items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map(\.url)
+                if !fxURLs.isEmpty {
+                    Menu {
+                        ForEach(["2K", "4K"], id: \.self) { size in
+                            Button {
+                                fxAlphaUpscale(fxURLs, size: size) { outs in
+                                    // Same mechanism every other background op uses to land
+                                    // the selection on what it just made.
+                                    browser.pendingRevealPaths = outs.map(\.path)
+                                    browser.load()
+                                }
+                            } label: {
+                                Text(String(format: "%@ · ~$%.2f each", size, fxAlphaUpscaleCost(size: size)))
+                            }
+                        }
+                    } label: {
+                        Label(fxURLs.count == 1 ? "FX Alpha Upscale" : "FX Alpha Upscale (\(fxURLs.count) images)",
+                              systemImage: "sparkles")
+                    }
                 }
             }
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
