@@ -5072,7 +5072,13 @@ let thumbnailExtensions: Set<String> = imageExtensions.union(videoExtensions).un
 func isThumbnailable(_ url: URL) -> Bool { thumbnailExtensions.contains(url.pathExtension.lowercased()) }
 
 let archiveExtensions: Set<String> = ["zip","tar","tgz","gz","bz2","xz","tbz","txz"]
-func isArchive(_ url: URL) -> Bool { archiveExtensions.contains(url.pathExtension.lowercased()) }
+func isArchive(_ url: URL) -> Bool {
+    // An AppleDouble sidecar wears the original's extension, so "._thing.zip" passes an
+    // extension test and is not an archive. Answering here covers both callers at once:
+    // the Extract command and the menu item that offers it.
+    !PathRules.isAppleDouble(url.lastPathComponent)
+        && archiveExtensions.contains(url.pathExtension.lowercased())
+}
 
 // Cloud providers mounted as folders under ~/Library/CloudStorage, plus iCloud Drive.
 func cloudLocations() -> [SidebarLocation] {
@@ -6138,6 +6144,15 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             }
             if name == "." || name == ".." { continue }
             if !showHidden && name.hasPrefix(".") { continue }
+            // This path is readdir, which returns AppleDouble sidecars; the detail pass is
+            // Foundation, which folds them into the file they belong to and never returns
+            // them. Without this the two passes disagree: "._thing.zip" appears in the fast
+            // listing and vanishes when the detail pass lands. On a share slow enough that
+            // the fast listing is what you actually work from, it is there long enough to
+            // be caught by Select All — which is how a resource fork ended up in an
+            // Extract and failed with "ditto: Couldn't read PKZip signature". Finder shows
+            // these to nobody, even with hidden files on.
+            if PathRules.isAppleDouble(name) { continue }
             // Most filesystems fill in d_type and this is free. Some SMB servers return
             // DT_UNKNOWN, and trusting it then would render every folder as a FILE until the
             // detail pass landed — wrong icons, wrong folders-first grouping. Measured 0
@@ -8958,7 +8973,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var created: [URL] = []
-            var failures: [(name: String, reason: String)] = []
+            var failures: [(name: String, reason: String, explained: Bool)] = []
             for it in sel {
                 var base = it.url.deletingPathExtension().lastPathComponent
                 if (base as NSString).pathExtension.lowercased() == "tar" { base = (base as NSString).deletingPathExtension }
@@ -8967,7 +8982,7 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 let dest: URL
                 do { dest = try FileOperations.newFolder(in: dir, name: base) }
                 catch {
-                    failures.append((it.url.lastPathComponent, error.localizedDescription))
+                    failures.append((it.url.lastPathComponent, error.localizedDescription, false))
                     continue
                 }
                 let isZip = it.url.pathExtension.lowercased() == "zip"
@@ -8975,8 +8990,21 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     let output = try ExternalProcess.run(isZip ? "/usr/bin/ditto" : "/usr/bin/tar",
                         arguments: isZip ? ["-x", "-k", it.url.path, dest.path] : ["-xf", it.url.path, "-C", dest.path]).completed()
                     if output.status == 0 { created.append(dest) }
-                    else { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, "The archive couldn't be expanded (code \(output.status)).")) }
-                } catch { try? FileManager.default.removeItem(at: dest); failures.append((it.url.lastPathComponent, error.localizedDescription)) }
+                    else {
+                        try? FileManager.default.removeItem(at: dest)
+                        // ditto and tar say WHY on stderr — "Couldn't read PKZip signature"
+                        // for a file that is not an archive at all. Throwing that away left
+                        // "(code 1)", which explains nothing and then collected a Full Disk
+                        // Access paragraph that pointed at the wrong problem entirely.
+                        let why = output.err.trimmingCharacters(in: .whitespacesAndNewlines)
+                        failures.append((it.url.lastPathComponent,
+                                         why.isEmpty ? "The archive couldn't be expanded (code \(output.status))." : why,
+                                         !why.isEmpty))
+                    }
+                } catch {
+                    try? FileManager.default.removeItem(at: dest)
+                    failures.append((it.url.lastPathComponent, error.localizedDescription, false))
+                }
             }
             DispatchQueue.main.async {
                 self.busy = false; self.busyText = ""
@@ -8987,7 +9015,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 self.load()
                 if !failures.isEmpty {
                     let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
-                    reportFileError(failures.count == 1 ? "Couldn't extract “\(failures[0].name)”" : "\(failures.count) archives couldn't be extracted", detail)
+                    // The permissions paragraph is for failures we cannot explain. When
+                    // the tool has told us exactly what was wrong, adding "check Full Disk
+                    // Access" is a guess that reads as an answer.
+                    reportFileError(failures.count == 1 ? "Couldn't extract “\(failures[0].name)”" : "\(failures.count) archives couldn't be extracted",
+                                    detail, permissionHint: !failures.allSatisfy { $0.explained })
                 }
             }
         }

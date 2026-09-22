@@ -9160,6 +9160,34 @@ final class AntiPatternTests: XCTestCase {
     }
 }
 
+final class AppleDoubleTests: XCTestCase {
+
+    /// The file from the report. It ends in .zip and is not an archive.
+    func testSidecarOfAZipIsNotAnArchive() {
+        XCTAssertTrue(PathRules.isAppleDouble("._CNY_Sept22_Review.zip"))
+        XCTAssertTrue(PathRules.isAppleDouble("._notes.tar.gz"))
+        XCTAssertTrue(PathRules.isAppleDouble("._"))
+    }
+
+    /// The names that must keep working. A leading dot alone is not AppleDouble —
+    /// ".zshrc" and a dotfolder's archive are ordinary hidden files.
+    func testOrdinaryNamesAreNotSidecars() {
+        for n in ["CNY_Sept22_Review.zip", ".zshrc", ".hidden.zip", "_private.zip",
+                  "a._b.zip", "photo._1.zip", ""] {
+            XCTAssertFalse(PathRules.isAppleDouble(n), n)
+        }
+    }
+
+    /// The rule is about the file's own name, not the path it sits in: a folder called
+    /// "._stuff" does not make the archives inside it sidecars.
+    func testOnlyTheLastComponentDecides() {
+        let u = URL(fileURLWithPath: "/Volumes/stick/._backups/2026.zip")
+        XCTAssertFalse(PathRules.isAppleDouble(u.lastPathComponent))
+        XCTAssertTrue(PathRules.isAppleDouble(
+            URL(fileURLWithPath: "/Volumes/stick/backups/._2026.zip").lastPathComponent))
+    }
+}
+
 final class AddendumGDDTests: XCTestCase {
 
     /// The literal sentence from 4230 DaVinci PB, which six Power Bet GDDs share.

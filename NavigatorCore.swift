@@ -252,6 +252,22 @@ enum PathRules {
         }
     }
 
+    /// An AppleDouble sidecar: the "._name" file macOS writes beside "name" to carry a
+    /// resource fork and extended attributes onto a filesystem that has nowhere to put
+    /// them (exFAT, FAT, most SMB shares, many USB sticks).
+    ///
+    /// It matters here because the sidecar copies the original's WHOLE name, extension
+    /// and all. So "._CNY_Sept22_Review.zip" ends in .zip while containing an AppleDouble
+    /// header, and every extension-based check calls it an archive. Extracting a folder
+    /// of zips off a USB stick then failed on half the selection with
+    /// "ditto: Couldn't read PKZip signature" — a real error about a file that was never
+    /// an archive and that the user never meant to select.
+    ///
+    /// Matching the name, not the bytes, is deliberate: the answer has to be the same for
+    /// a file on an unreadable volume as for one in front of us, and "._" is a reserved
+    /// convention rather than a guess.
+    static func isAppleDouble(_ name: String) -> Bool { name.hasPrefix("._") }
+
     // Search selections can span parents; bare names would archive unrelated siblings.
     static func archiveInputs(_ urls: [URL]) -> (directory: URL, entries: [String])? {
         guard let first = urls.first, urls.allSatisfy({ $0.isFileURL }) else { return nil }
