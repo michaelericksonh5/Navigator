@@ -6457,6 +6457,18 @@ public struct DriveStub: Equatable, Hashable, Sendable {
         return URL(string: s)
     }
 
+    /// The document as a PERSON opens it, which is not the export endpoint.
+    ///
+    /// `exportURL` answers with a .docx download; handing that to a browser downloads a
+    /// file instead of showing the document. The whole point of opening a GDD from the
+    /// window is to read it, so this is the /edit page.
+    public var viewURL: URL? {
+        guard !kind.segment.isEmpty else { return nil }
+        var s = "https://docs.google.com/\(kind.segment)/d/\(id)/edit"
+        if !resourceKey.isEmpty { s += "?resourcekey=\(resourceKey)" }
+        return URL(string: s)
+    }
+
     /// The extension the downloaded file must be saved under for its reader to work.
     public var fileExtension: String { kind.export?.fileExtension ?? "bin" }
 
@@ -8611,10 +8623,40 @@ enum GDDSymbolPlausibility {
         return out
     }
 
+    /// Whether the document says, in its own words, that it only covers what a feature
+    /// ADDS to a game that already shipped.
+    ///
+    /// Six Power Bet GDDs in the folder carry the same sentence: "<game> is already a
+    /// released product, so this GDD will only focus on the new additions to the game."
+    /// 4230 DaVinci PB then lists five symbols — three wilds, a bonus, a jackpot — and
+    /// nothing else, because the low and high pays shipped with the base game years ago.
+    /// The document is complete; it is just not a whole game.
+    ///
+    /// Without this, the window called that document incomplete and told the user to
+    /// check it against the art list, which reads as "the tool could not read this" when
+    /// the truth is "the tool read all of it, and this is all there is".
+    static func declaresItselfAnAddendum(_ gddText: String) -> Bool {
+        let t = gddText.lowercased()
+        // Long, distinctive sentences only. A short token like "base game" appears in
+        // every GDD in the folder and would mark all of them.
+        return t.contains("already a released product")
+            || t.contains("only focus on the new additions")
+            || t.contains("consists of the base game rules from")
+    }
+
     /// One sentence for the user, or nil when the set looks normal.
-    static func warning(_ symbols: [SlotSymbol], inferred: Bool) -> String? {
+    static func warning(_ symbols: [SlotSymbol], inferred: Bool,
+                        gddText: String = "") -> String? {
         let c = concerns(symbols)
         guard !c.isEmpty else { return nil }
+        if declaresItselfAnAddendum(gddText) {
+            let n = symbols.filter { $0.role.needsArt }.count
+            return "This document only covers what the feature ADDS to a game that "
+                 + "already shipped — it says so itself. So \(c.joined(separator: " and "))"
+                 + " is expected here, not a failure to read it: these \(n) are the new "
+                 + "symbols. The rest of the set belongs to the base game, so take its "
+                 + "art list or its own GDD for those."
+        }
         let head = inferred
             ? "This document has no symbol list, and what could be read from it looks incomplete: "
             : "This symbol set looks incomplete: "

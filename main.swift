@@ -22020,7 +22020,8 @@ final class GDDToAssetsRun: ObservableObject {
         parseProblems = read.problems
         symbolsInferred = false
         undeclared = []
-        plausibilityWarning = GDDSymbolPlausibility.warning(read.symbols, inferred: false)
+        plausibilityWarning = GDDSymbolPlausibility.warning(read.symbols, inferred: false,
+                                                            gddText: text)
 
         // A document that does not describe its symbols is not the end of the road: the
         // game's shipped art does. Only consulted when the document has failed to give a
@@ -22031,7 +22032,8 @@ final class GDDToAssetsRun: ObservableObject {
             if shipped.count > read.symbols.count {
                 symbols = shipped
                 fromShippedArt = true
-                plausibilityWarning = GDDSymbolPlausibility.warning(shipped, inferred: false)
+                plausibilityWarning = GDDSymbolPlausibility.warning(shipped, inferred: false,
+                                                                    gddText: text)
             }
         }
         // No symbol set means no plan — not "no symbols, but here are two backgrounds".
@@ -22204,7 +22206,8 @@ final class GDDToAssetsRun: ObservableObject {
                 }
                 self.symbols = found
                 self.symbolsInferred = true
-                self.plausibilityWarning = GDDSymbolPlausibility.warning(found, inferred: true)
+                self.plausibilityWarning = GDDSymbolPlausibility.warning(found, inferred: true,
+                                                                         gddText: text)
                 self.jobs = AssetPlanRules.symbolJobs(found, size: size, aspect: symbolAspect)
                     + AssetPlanRules.backgroundJobs(gddText: text, size: backgroundSize,
                                                     aspect: backgroundAspect)
@@ -22791,6 +22794,17 @@ struct GDDToAssetsSheet: View {
                 .frame(maxWidth: 520)
                 .onChange(of: pickedGDD) { loadGDD() }
                 .disabled(run.busy || run.running)
+
+                // Read it yourself. The window says what it found in the document; this
+                // is how you check whether that is the whole document or the whole
+                // truth — without it the only way to see a .gdoc was to go hunting for
+                // it in Drive by name.
+                if let e = pickedGDD {
+                    Button("Open") { openPickedGDD(e) }
+                        .help(e.stub == nil
+                              ? "Open this document in its usual app"
+                              : "Open this document in Google Docs")
+                }
             }
             if !run.symbols.isEmpty {
                 Text(symbolSummary
@@ -23426,6 +23440,17 @@ struct GDDToAssetsSheet: View {
             run.status = "Couldn’t make the folder: \(error.localizedDescription)"
             return nil
         }
+    }
+
+    /// Open the chosen GDD for reading.
+    ///
+    /// A .gdoc on disk is a ~190-byte JSON pointer. Handing that file to the system does
+    /// work when Drive for Desktop has registered its handler, but that is not something
+    /// to depend on, and it fails silently when it is not there. The stub already gives
+    /// the document id, so the browser gets the real address instead.
+    private func openPickedGDD(_ e: GDDLibrary.Entry) {
+        if let stub = e.stub, let url = stub.viewURL { NSWorkspace.shared.open(url) }
+        else { NSWorkspace.shared.open(e.url) }
     }
 
     private func loadGDD() {

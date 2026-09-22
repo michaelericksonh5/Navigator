@@ -9160,6 +9160,92 @@ final class AntiPatternTests: XCTestCase {
     }
 }
 
+final class AddendumGDDTests: XCTestCase {
+
+    /// The literal sentence from 4230 DaVinci PB, which six Power Bet GDDs share.
+    private let davinci = "DaVinci is already a released product, so this GDD will "
+                        + "only focus on the new additions to the game."
+
+    /// The set that document declares: three wilds, a bonus, a jackpot. No LP, no HP,
+    /// because those shipped with the base game. The old wording called this incomplete.
+    private let addendumSet: [SlotSymbol] = [
+        ("WD1", SlotSymbolRole.wild), ("WD2", .wild), ("WD3", .wild),
+        ("BO1", .bonus), ("JP1", .jackpot),
+    ].enumerated().map {
+        SlotSymbol(code: $0.element.0, index: $0.offset, role: $0.element.1,
+                   tier: nil, note: "")
+    }
+
+    func testDaVinciSentenceIsRecognised() {
+        XCTAssertTrue(GDDSymbolPlausibility.declaresItselfAnAddendum(davinci))
+        XCTAssertTrue(GDDSymbolPlausibility.declaresItselfAnAddendum(
+            "Eagles Flight Power Bet consists of the base game rules from Eagles Flight "
+            + "with an added Jackpot and 2 Power Bets."))
+    }
+
+    /// The guard that matters. "Base game" alone appears in nearly every GDD in the
+    /// folder; matching it would excuse a genuinely truncated set in all of them.
+    func testOrdinaryGDDLanguageIsNotAnAddendum() {
+        for t in ["The base game is played on a 5x3 matrix.",
+                  "Wins are evaluated in the base game and the bonus game.",
+                  "This product is released quarterly.",
+                  ""] {
+            XCTAssertFalse(GDDSymbolPlausibility.declaresItselfAnAddendum(t), t)
+        }
+    }
+
+    func testAddendumWarningSaysExpectedNotIncomplete() {
+        let w = GDDSymbolPlausibility.warning(addendumSet, inferred: false, gddText: davinci)
+        let m = try! XCTUnwrap(w)
+        XCTAssertTrue(m.contains("already shipped"), m)
+        XCTAssertTrue(m.contains("expected"), m)
+        XCTAssertFalse(m.contains("looks incomplete"), m)
+        // Still names what is absent — this softens the framing, it does not hide it.
+        XCTAssertTrue(m.contains("no low pays"), m)
+        XCTAssertTrue(m.contains("no high pays"), m)
+    }
+
+    /// The same short set in a document that claims to be a whole game is still suspect.
+    func testSameSetWithoutTheSentenceStillWarnsHard() {
+        let w = GDDSymbolPlausibility.warning(addendumSet, inferred: false,
+                                              gddText: "A complete five-reel slot game.")
+        XCTAssertTrue(try XCTUnwrap(w).contains("looks incomplete"))
+    }
+
+    /// A complete set says nothing, addendum sentence or not.
+    func testAddendumSentenceDoesNotSuppressAHealthySet() {
+        let full = (1...5).map { SlotSymbol(code: "LP\($0)", index: $0, role: .lowPay,
+                                            tier: $0, note: "") }
+                 + (1...4).map { SlotSymbol(code: "HP\($0)", index: 5 + $0, role: .highPay,
+                                            tier: $0, note: "") }
+                 + [SlotSymbol(code: "WD1", index: 10, role: .wild, tier: 1, note: "")]
+        XCTAssertNil(GDDSymbolPlausibility.warning(full, inferred: false, gddText: davinci))
+    }
+}
+
+final class DriveStubViewURLTests: XCTestCase {
+
+    /// The export URL downloads a .docx; a person opening a GDD wants to READ it.
+    func testViewURLIsTheEditPageNotTheExport() {
+        let d = DriveStub(id: "1abcXYZ", kind: .document)
+        XCTAssertEqual(d.viewURL?.absoluteString,
+                       "https://docs.google.com/document/d/1abcXYZ/edit")
+        XCTAssertTrue(d.exportURL!.absoluteString.contains("export?format=docx"))
+    }
+
+    func testResourceKeyIsCarried() {
+        let d = DriveStub(id: "1abc", resourceKey: "0-KeY", kind: .spreadsheet)
+        XCTAssertEqual(d.viewURL?.absoluteString,
+                       "https://docs.google.com/spreadsheets/d/1abc/edit?resourcekey=0-KeY")
+    }
+
+    /// No docs.google.com page exists for these, so the caller falls back to the file.
+    func testKindsWithNoDocumentPage() {
+        XCTAssertNil(DriveStub(id: "1abc", kind: .form).viewURL)
+        XCTAssertNil(DriveStub(id: "1abc", kind: .site).viewURL)
+    }
+}
+
 final class SymbolPlausibilityTests: XCTestCase {
     // 2690 Supercoco has no symbol-set section. Its only codes appear in prose and
     // inside a SOUND CUE — "when WD1 has been consumed" — so reading it produced a
