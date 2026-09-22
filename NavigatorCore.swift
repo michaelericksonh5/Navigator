@@ -268,6 +268,27 @@ enum PathRules {
     /// convention rather than a guess.
     static func isAppleDouble(_ name: String) -> Bool { name.hasPrefix("._") }
 
+    /// How long to allow an archive job that moves `bytes` before calling it hung.
+    ///
+    /// ExternalProcess defaults to an hour, which is right for a command that should
+    /// answer in seconds and wrong for expanding a 793 MB zip onto an SMB share: that
+    /// one was measured at roughly 84 minutes, so it would be killed at 60 and the
+    /// half-written destination DELETED, reporting "the command timed out" after an
+    /// hour of real work. A timeout that destroys the output has to be slower than the
+    /// slowest honest run, not faster than it.
+    ///
+    /// 20 KB/s is the floor, not an estimate. The same share measured 13 MB/s reading
+    /// and 2.4 MB/s writing, and ditto managed about 0.15 MB/s of output through it
+    /// because every entry costs SMB round trips. The floor sits well under the worst
+    /// of that so a slow share is never mistaken for a dead one, while an archive that
+    /// truly hangs still ends instead of pinning the UI on "Extracting…" forever.
+    ///
+    /// ponytail: a fixed floor rate, not progress-driven. If a share is ever slower
+    /// than this, watch ditto's output for movement instead of guessing from size.
+    static func archiveTimeout(bytes: Int64) -> TimeInterval {
+        max(3600, Double(bytes) / 20_000)
+    }
+
     // Search selections can span parents; bare names would archive unrelated siblings.
     static func archiveInputs(_ urls: [URL]) -> (directory: URL, entries: [String])? {
         guard let first = urls.first, urls.allSatisfy({ $0.isFileURL }) else { return nil }

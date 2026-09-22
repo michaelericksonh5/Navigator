@@ -9160,6 +9160,34 @@ final class AntiPatternTests: XCTestCase {
     }
 }
 
+final class ArchiveTimeoutTests: XCTestCase {
+
+    /// The measured case. A 793 MB zip onto an SMB share took about 84 minutes, so an
+    /// hour's timeout killed it at 60 and deleted the destination.
+    func testTheArchiveThatUsedToBeKilledNowFits() {
+        let measured: TimeInterval = 84 * 60
+        XCTAssertGreaterThan(PathRules.archiveTimeout(bytes: 793_402_336), measured)
+        XCTAssertLessThan(3600, PathRules.archiveTimeout(bytes: 793_402_336))
+    }
+
+    /// Small archives keep the old hour — the floor only ever extends it.
+    func testSmallArchivesKeepTheHourFloor() {
+        XCTAssertEqual(PathRules.archiveTimeout(bytes: 0), 3600)
+        XCTAssertEqual(PathRules.archiveTimeout(bytes: 10_000_000), 3600)
+        // The floor stops mattering once size alone exceeds an hour at 20 KB/s.
+        XCTAssertEqual(PathRules.archiveTimeout(bytes: 72_000_000), 3600)
+        XCTAssertGreaterThan(PathRules.archiveTimeout(bytes: 100_000_000), 3600)
+    }
+
+    /// It must still END. An unbounded wait pins the window on "Extracting…" forever
+    /// when a share dies mid-job.
+    func testItStaysBounded() {
+        let t = PathRules.archiveTimeout(bytes: 50_000_000_000)
+        XCTAssertTrue(t.isFinite)
+        XCTAssertGreaterThan(t, 0)
+    }
+}
+
 final class AppleDoubleTests: XCTestCase {
 
     /// The file from the report. It ends in .zip and is not an archive.

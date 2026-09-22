@@ -8946,8 +8946,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
             var runError: String?
             var status: Int32 = -1
             do {
+                // Compressing runs the same risk in the other direction, and it deletes
+                // its half-written archive on failure exactly as extract does.
+                let total = sel.reduce(Int64(0)) {
+                    $0 + Int64((try? $1.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+                }
                 status = try ExternalProcess.run("/usr/bin/zip", arguments: ["-r", "-q", dest.path] + inputs.entries,
-                                                 directory: inputs.directory).completed().status
+                                                 directory: inputs.directory,
+                                                 timeout: PathRules.archiveTimeout(bytes: total)).completed().status
             } catch { runError = error.localizedDescription }
             let ok = runError == nil && status == 0
             if !ok { try? FileManager.default.removeItem(at: dest) }
@@ -8986,9 +8992,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     continue
                 }
                 let isZip = it.url.pathExtension.lowercased() == "zip"
+                let size = (try? it.url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { Int64($0) } ?? 0
                 do {
                     let output = try ExternalProcess.run(isZip ? "/usr/bin/ditto" : "/usr/bin/tar",
-                        arguments: isZip ? ["-x", "-k", it.url.path, dest.path] : ["-xf", it.url.path, "-C", dest.path]).completed()
+                        arguments: isZip ? ["-x", "-k", it.url.path, dest.path] : ["-xf", it.url.path, "-C", dest.path],
+                        timeout: PathRules.archiveTimeout(bytes: size)).completed()
                     if output.status == 0 { created.append(dest) }
                     else {
                         try? FileManager.default.removeItem(at: dest)
