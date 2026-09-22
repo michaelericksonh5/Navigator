@@ -12,6 +12,7 @@ import FinderSync   // detect / offer to enable the Finder menu extension
 import Carbon.HIToolbox   // RegisterEventHotKey — the ONLY permission-free global hotkey
 import Network   // loopback listener for the Vertex sign-in callback
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
+import WebKit   // the signed-in Google session behind GDD to Assets
 import os
 
 /// The dead-mount gate for ONE listing or walk, resolved once and carried.
@@ -2809,11 +2810,12 @@ private func borderTransparentFraction(_ url: URL) -> (border: Double, overall: 
 /// Non-blocking: one long cloud call per image, so everything runs off the main thread behind
 /// the shared progress bar, with the Photoshop pass chained on at the end.
 func layerizeImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    // Every exit calls back — see chromaKeyForImages.
     let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_Layers") }
-    guard !imgs.isEmpty else { NSSound.beep(); return }
+    guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
     let look = APIKeys.lookup("fal.ai")
     guard let key = look.key else {
-        DispatchQueue.main.async { promptAddFalKey(accessDenied: look.accessDenied) }
+        DispatchQueue.main.async { promptAddFalKey(accessDenied: look.accessDenied); onDone?([]) }
         return
     }
 
@@ -4243,8 +4245,9 @@ func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
 // proven single script per file). Shows non-blocking "N of M" progress and an
 // end-of-run summary (per-file errors collapsed into one dialog).
 func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    // Every exit calls back, including the failures — see chromaKeyForImages.
     let imgs = srcs.filter { isImageFile($0) }
-    guard !imgs.isEmpty else { NSSound.beep(); return }
+    guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
     DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds", total: imgs.count) }
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = []
@@ -4260,7 +4263,7 @@ func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) 
             hideApp(bundleID: "com.adobe.Photoshop")
             BGJobProgress.shared.finish("Removed \(outs.count) of \(imgs.count) background\(imgs.count == 1 ? "" : "s")")
             if !errors.isEmpty { showBGSummary(app: "Photoshop", done: outs.count, total: imgs.count, errors: errors) }
-            if !outs.isEmpty { onDone?(outs) }
+            onDone?(outs)
         }
     }
 }
@@ -4394,12 +4397,19 @@ func assembleLayerFolders(_ dirs: [URL], onDone: (([URL]) -> Void)? = nil) {
 }
 
 // After Effects + Keylight shared by single-image and folder actions. Non-blocking "N of M" progress + end-of-run summary.
-func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+func chromaKeyForImages(_ srcs: [URL],
+                        profile: ChromaKeyOutputRules.KeylightProfile = .softFX,
+                        onDone: (([URL]) -> Void)? = nil) {
+    // EVERY exit calls back, including the ones that fail. A caller cannot tell "still
+    // working" from "gave up" otherwise, and both early returns here used to be silent:
+    // a machine without After Effects left FX Alpha Upscale's completion hanging, and so
+    // did a run where every single image failed to key.
     let pngs = srcs.filter { $0.pathExtension.lowercased() == "png" }
-    guard !pngs.isEmpty else { NSSound.beep(); return }
+    guard !pngs.isEmpty else { NSSound.beep(); onDone?([]); return }
     guard let bundleID = AfterEffectsApp.bundleID, let appURL = AfterEffectsApp.url,
           let scriptURL = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
         reportFileError("Chroma Key needs After Effects", "Install After Effects and ensure NavigatorChromaKeyStill.jsx is bundled in Navigator.")
+        onDone?([])
         return
     }
     DispatchQueue.main.async { BGJobProgress.shared.start("Chroma keying", total: pngs.count) }
@@ -4410,6 +4420,7 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             do {
                 launchHidden(bundleID: bundleID, appURL: appURL)
                 let out = try ChromaKeyOutputRules.exportPNG(source: src, scriptURL: scriptURL, bundleID: bundleID,
+                    profile: profile,
                     onLaunch: { keepHidden(while: $0, bundleID: bundleID, revealAfter: adobeRevealAfter) })
                 outs.append(out)
             } catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
@@ -4418,7 +4429,7 @@ func chromaKeyForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
         DispatchQueue.main.async {
             BGJobProgress.shared.finish("Keyed \(outs.count) of \(pngs.count) image\(pngs.count == 1 ? "" : "s")")
             if !errors.isEmpty { showBGSummary(app: "Chroma Key", done: outs.count, total: pngs.count, errors: errors, verb: "keyed") }
-            if !outs.isEmpty { onDone?(outs) }
+            onDone?(outs)
         }
     }
 }
@@ -7828,14 +7839,11 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     // Chroma Key BG on the selected PNG(s) — one or many.
-    func chromaKeyBackground(_ ids: Set<String>) {
+    func chromaKeyBackground(_ ids: Set<String>,
+                             profile: ChromaKeyOutputRules.KeylightProfile = .softFX) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
-        if urls.count == 1 {
-            chromaKeyForImage(urls[0]) { [weak self] out in self?.refreshAndReveal(out) }
-        } else {
-            chromaKeyForImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
-        }
+        chromaKeyForImages(urls, profile: profile) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
 
     // Batch Chroma Key BG writes each <name>_rmbg.png next to its source.
@@ -11449,7 +11457,25 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 let pngCount = sel.filter { !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.count
                 let dirs = sel.filter { $0.isDirectory }
                 if pngCount >= 1 {
-                    Button { browser.chromaKeyBackground(ids) } label: { Label(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)", systemImage: "eyedropper.halffull") }
+                    // Two jobs, two settings. Keylight is a chroma key: it decides
+                    // transparency from nearness to the backing colour and then DESPILLS,
+                    // pulling that colour back out of everything it kept. On soft FX that
+                    // is exactly right. On a solid subject whose own colours share channels
+                    // with the backing it is destructive — a gold-and-crimson symbol on
+                    // magenta came back uniformly green, because suppressing magenta means
+                    // suppressing red and blue. The solid setting clips the matte so the
+                    // interior goes fully opaque, and an opaque interior is restored to its
+                    // original colour instead of keeping the despilled version.
+                    Menu {
+                        Button { browser.chromaKeyBackground(ids, profile: .softFX) } label: {
+                            Label("Soft FX — keep transparency", systemImage: "sparkles")
+                        }
+                        Button { browser.chromaKeyBackground(ids, profile: .solidSymbol) } label: {
+                            Label("Solid subject — opaque interior", systemImage: "square.fill")
+                        }
+                    } label: {
+                        Label(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)", systemImage: "eyedropper.halffull")
+                    }
                 } else if dirs.count == 1, sel.count == 1 {
                     Button { browser.batchChromaKeyBackground(ids) } label: { Label("Batch Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
@@ -16737,73 +16763,93 @@ struct SettingsView: View {
     // Must match Prefs.pickerTeleportEnabled's default, or the checkbox shown here and the
     // hot key actually registered disagree about whether the feature is on.
     @AppStorage("pickerTeleportEnabled") private var pickerTeleportEnabled = true
+    // Default true = 100%, matching Prefs.imageViewerActualSize. If these two disagree
+    // the window shows one thing and the viewer does another.
+    @AppStorage("imageViewerActualSize") private var imageViewerActualSize = true
     var body: some View {
-        Form {
-            Section("Defaults for new windows & tabs") {
-                Picker("View", selection: $viewMode) {
-                    Text("Details").tag("list"); Text("Icons").tag("icon")
-                    Text("Gallery").tag("gallery")
-                }
-                Picker("Sort by", selection: $sortKey) {
-                    Text("Name").tag("name"); Text("Date Modified").tag("modified")
-                    Text("Size").tag("size"); Text("Kind").tag("kind")
-                }
-                Toggle("Ascending order", isOn: $sortAscending)
-                Toggle("Show hidden files", isOn: $showHidden)
-            }
-            Section("Behavior") {
-                Toggle("Open image folders in large icons", isOn: $inferFolderView)
-                    .help("Folders you haven't arranged yourself open in large icons when they're mostly images or video. Off: every such folder uses the default view above.")
-                Toggle("Confirm before moving to Trash", isOn: $confirmTrash)
-                Toggle("Warn before changing a file extension", isOn: $warnExtensionChange)
-                Picker("Thumbnails", selection: $thumbnailMode) {
-                    Text("All files").tag("all")
-                    Text("Images only").tag("images")
-                    Text("Off (fastest on slow drives)").tag("off")
-                }
-                Toggle("Search inside file contents", isOn: $searchFileContents)
-                    .help("Off: search matches file and folder NAMES, which is what Explorer does and what people usually mean. On: also matches text inside documents — useful, but it finds files whose names have nothing to do with what you typed, and roughly doubles how long a search takes.")
-            }
-            // Wordier than the rest of this window on purpose: this section reaches into
-            // another app's dialog, replaces the clipboard, and optionally leans on a
-            // permission macOS revokes behind the user's back. None of that should be
-            // discovered by surprise.
-            Section("Open/Save dialogs in other apps") {
-                Toggle("Global shortcut to copy this folder’s path", isOn: $pickerHotkeyEnabled)
-                Picker("Shortcut", selection: $pickerHotkeyChord) {
-                    ForEach(PickerBridgeRules.chords, id: \.id) { Text($0.display).tag($0.id) }
-                }
-                .disabled(!pickerHotkeyEnabled)
-                Text("Press it in any app — Navigator needn’t be in front — then ⌘⇧G, ⌘V, Return in the Open or Save dialog. One selected item copies that item; several copy their folder; none copies the folder you’re browsing.")
-                    .font(.callout).foregroundStyle(.secondary)
-                Text("A Google Drive path or link already on the clipboard — a coworker’s “Google Drive/Shared drives/…”, a path from their Mac, or a drive.google.com link — is converted to this Mac’s Drive folder and used instead, since a dialog can’t open any of those as they stand.")
-                    .font(.callout).foregroundStyle(.secondary)
-                Toggle("One keystroke: also send ⌘⇧G, paste and Return to the frontmost app",
-                       isOn: $pickerTeleportEnabled)
-                    .disabled(!pickerHotkeyEnabled)
-                // The note and its remedy live in ONE row, and the link shows whenever the
-                // permission is missing rather than only while the toggle is on: as a
-                // separate Form row it was the first thing to fall off the bottom of the
-                // window — the button that fixes the problem, invisible.
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(teleportNote)
-                    if !AXIsProcessTrusted() {
-                        Button("Open Accessibility Settings…") {
-                            PermissionProbe.openPane(PermissionProbe.accessibilityPane)
-                        }
-                        .buttonStyle(.link)
+        // The Form keeps its intrinsic height INSIDE a ScrollView, which then clips and
+        // scrolls it. Order is the whole trick: a grouped Form given a hard height clips
+        // its own content instead of scrolling, and a ScrollView wrapped round a Form
+        // that has NOT been fixed-size does nothing — the Form expands to whatever height
+        // it is offered, so there is never any overflow to scroll. Fixed-size first, then
+        // the viewport.
+        ScrollView {
+            Form {
+                Section("Defaults for new windows & tabs") {
+                    Picker("View", selection: $viewMode) {
+                        Text("Details").tag("list"); Text("Icons").tag("icon")
+                        Text("Gallery").tag("gallery")
                     }
+                    Picker("Sort by", selection: $sortKey) {
+                        Text("Name").tag("name"); Text("Date Modified").tag("modified")
+                        Text("Size").tag("size"); Text("Kind").tag("kind")
+                    }
+                    Toggle("Ascending order", isOn: $sortAscending)
+                    Toggle("Show hidden files", isOn: $showHidden)
                 }
-                .font(.callout).foregroundStyle(.secondary)
+                // The viewer's own right-click menu has carried this since it shipped, and
+                // nobody found it — a preference reachable only by right-clicking one small
+                // button is a preference that does not exist. It stays there AND lives here.
+                Section("Images") {
+                    Picker("Open images at", selection: $imageViewerActualSize) {
+                        Text("Actual size (100%)").tag(true)
+                        Text("Fitted to the window").tag(false)
+                    }
+                    .help("Actual size shows every pixel and may need scrolling. Fitted always "
+                        + "shows the whole image. Either way ⌘0 fits and 1:1 goes to 100%.")
+                }
+                Section("Behavior") {
+                    Toggle("Open image folders in large icons", isOn: $inferFolderView)
+                        .help("Folders you haven't arranged yourself open in large icons when they're mostly images or video. Off: every such folder uses the default view above.")
+                    Toggle("Confirm before moving to Trash", isOn: $confirmTrash)
+                    Toggle("Warn before changing a file extension", isOn: $warnExtensionChange)
+                    Picker("Thumbnails", selection: $thumbnailMode) {
+                        Text("All files").tag("all")
+                        Text("Images only").tag("images")
+                        Text("Off (fastest on slow drives)").tag("off")
+                    }
+                    Toggle("Search inside file contents", isOn: $searchFileContents)
+                        .help("Off: search matches file and folder NAMES, which is what Explorer does and what people usually mean. On: also matches text inside documents — useful, but it finds files whose names have nothing to do with what you typed, and roughly doubles how long a search takes.")
+                }
+                // Wordier than the rest of this window on purpose: this section reaches into
+                // another app's dialog, replaces the clipboard, and optionally leans on a
+                // permission macOS revokes behind the user's back. None of that should be
+                // discovered by surprise.
+                Section("Open/Save dialogs in other apps") {
+                    Toggle("Global shortcut to copy this folder’s path", isOn: $pickerHotkeyEnabled)
+                    Picker("Shortcut", selection: $pickerHotkeyChord) {
+                        ForEach(PickerBridgeRules.chords, id: \.id) { Text($0.display).tag($0.id) }
+                    }
+                    .disabled(!pickerHotkeyEnabled)
+                    Text("Press it in any app — Navigator needn’t be in front — then ⌘⇧G, ⌘V, Return in the Open or Save dialog. One selected item copies that item; several copy their folder; none copies the folder you’re browsing.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("A Google Drive path or link already on the clipboard — a coworker’s “Google Drive/Shared drives/…”, a path from their Mac, or a drive.google.com link — is converted to this Mac’s Drive folder and used instead, since a dialog can’t open any of those as they stand.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Toggle("One keystroke: also send ⌘⇧G, paste and Return to the frontmost app",
+                           isOn: $pickerTeleportEnabled)
+                        .disabled(!pickerHotkeyEnabled)
+                    // The note and its remedy live in ONE row, and the link shows whenever the
+                    // permission is missing rather than only while the toggle is on: as a
+                    // separate Form row it was the first thing to fall off the bottom of the
+                    // window — the button that fixes the problem, invisible.
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(teleportNote)
+                        if !AXIsProcessTrusted() {
+                            Button("Open Accessibility Settings…") {
+                                PermissionProbe.openPane(PermissionProbe.accessibilityPane)
+                            }
+                            .buttonStyle(.link)
+                        }
+                    }
+                    .font(.callout).foregroundStyle(.secondary)
+                }
             }
+            .formStyle(.grouped)
+            .frame(width: 460)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity)          // centre it when the window is widened
         }
-        .formStyle(.grouped)
-        // Width fixed, height derived from the content. NOT a hard height: a grouped Form
-        // pinned to one CLIPS instead of scrolling (a ScrollView doesn't help — the Form
-        // still takes the whole height offered), and what fell off the bottom was the
-        // dialog-bridge section's Accessibility warning and the button that resolves it.
-        .frame(width: 460)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
         // Every one of these three changes the registered hot keys, so they all go
         // through the one re-registration path rather than each doing its own thing.
         .onChange(of: pickerHotkeyEnabled) { _, _ in PickerBridge.shared.reload() }
@@ -17186,6 +17232,26 @@ struct SetupItem: Identifiable {
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "API Keys…",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) }),
+            SetupItem(id: "themehub", title: "Team theme hub (GDD to Assets)",
+                      why: "Where GDD to Assets gets its themes and art direction. Two parts: the hub's address, stored once on this Mac, and a Google sign-in.\n\nThe hub sits behind Google's Identity-Aware Proxy, so Navigator opens it in a sign-in window the first time and reuses that session afterwards — the same account you already use in the browser. Navigator never sees your password.\n\n"
+                         + (GoogleWebSession.themeHubURL == nil
+                            ? "No address set yet. Ask Michael for it, then use the button."
+                            : "Address is set. Open GDD to Assets and press Reload to check the sign-in."),
+                      probe: { _ in GoogleWebSession.themeHubURL == nil ? .notAsked : .granted },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "GDD to Assets…",
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.gddToAssetsAction(_:)), to: nil, from: nil) }),
+            SetupItem(id: "gddfolder", title: "Game design documents folder",
+                      why: "The Drive folder your GDDs live in. Google Drive for Desktop already keeps it on this Mac, so Navigator lists the documents straight off disk and only goes to the network for a document's text.\n\n"
+                         + (GDDLibrary.folder.map { "Set to “\($0.path)”." }
+                            ?? "Not chosen yet — pick it once inside GDD to Assets."),
+                      probe: { _ in
+                          guard let f = GDDLibrary.folder else { return .notAsked }
+                          return FileManager.default.fileExists(atPath: f.path) ? .granted : .denied
+                      },
+                      probeMayPrompt: false, canAsk: false, optional: true,
+                      settingsLabel: "GDD to Assets…",
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.gddToAssetsAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "openaikey", title: "OpenAI API key",
                       why: "Not used by anything yet — reserved for future gpt-image surfaces. Nothing in Navigator needs it today, so an empty row here is expected.",
                       probe: { _ in PermissionProbe.keyStored(account: "openai") },
@@ -18363,6 +18429,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
         let aiItem = NSMenuItem(); mainMenu.addItem(aiItem)
         let aiMenu = NSMenu(title: "AI"); aiItem.submenu = aiMenu
+        let gddItem = aiMenu.addItem(withTitle: "GDD to Assets…",
+                                     action: #selector(gddToAssetsAction(_:)), keyEquivalent: "")
+        gddItem.target = self
+        aiMenu.addItem(NSMenuItem.separator())
         let keysItem = aiMenu.addItem(withTitle: "API Keys…", action: #selector(apiKeysAction(_:)), keyEquivalent: "")
         keysItem.target = self
         let fxItem = aiMenu.addItem(withTitle: "Finder Menu…", action: #selector(finderExtensionAction(_:)), keyEquivalent: "")
@@ -18386,6 +18456,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         setupItem.target = self
 
         NSApp.mainMenu = mainMenu
+    }
+
+    // AI → GDD to Assets… — read a game design document, take a theme from the team
+    // hub, and generate the game's whole symbol set and backgrounds.
+    @objc func gddToAssetsAction(_ sender: Any?) {
+        Task { @MainActor in GDDToAssetsWindow.open() }
     }
 
     // AI → API Keys… — paste/store the fal.ai key (Keychain-backed).
@@ -18890,26 +18966,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var settingsWindow: NSWindow?
     @objc func showSettingsAction(_ sender: Any?) {
         if settingsWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 360),
-                             styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            // Sized to the SCREEN, not to the content. The pane is taller than a laptop
+            // display and growing the window to fit it put whole sections behind the Dock
+            // — the dialog-bridge section and, latterly, everything below Images. The view
+            // scrolls now, so the window only has to be a sensible viewport onto it.
+            let vis = (NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900))
+            let h = min(720, max(420, vis.height - 80))
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: h),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                             backing: .buffered, defer: false)
             w.title = "Settings"
-            w.contentView = NSHostingView(rootView: SettingsView())
+            let host = NSHostingView(rootView: SettingsView())
+            // Without this the hosting view asks for its full intrinsic height again and
+            // drags the window back off screen, scroll view or no scroll view.
+            host.translatesAutoresizingMaskIntoConstraints = false
+            w.contentView = host
+            NSLayoutConstraint.activate([
+                host.widthAnchor.constraint(equalTo: w.contentView!.widthAnchor),
+                host.heightAnchor.constraint(equalTo: w.contentView!.heightAnchor),
+            ])
+            w.contentMinSize = NSSize(width: 480, height: 320)
             w.isReleasedWhenClosed = false
             w.center()
             settingsWindow = w
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        // center() above ran against the 440x360 placeholder; the hosting view then resizes
-        // the window to whatever its content needs, growing DOWNWARD from that origin. With
-        // the taller pane that put the last rows below the screen edge and behind the Dock —
-        // including the Accessibility warning and its button. Re-centre once the real height
-        // is known, and only when the window doesn't fit where it is.
+        // A window remembered from a previous, taller screen can still be off the current
+        // one — re-centre only when it does not fit where it is.
         DispatchQueue.main.async { [weak self] in
             guard let w = self?.settingsWindow,
-                  let vis = (w.screen ?? NSScreen.main)?.visibleFrame,
-                  !vis.contains(w.frame) else { return }
-            w.center()
+                  let vis = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
+            if w.frame.height > vis.height - 40 {
+                w.setContentSize(NSSize(width: w.frame.width, height: vis.height - 80))
+            }
+            if !vis.contains(w.frame) { w.center() }
         }
     }
 
@@ -19216,23 +19307,113 @@ enum H5GService {
     /// this requires TEXT and fails if it gets an image back. Model is pinned
     /// server-side (gemini-3.5-flash-lite) — not client-selectable, so there's no
     /// modelID parameter here.
-    static func describe(prompt: String, systemPrompt: String?, imagePNG: Data)
+    /// `imagePNG` is optional: /v1/vision answers a text-only question perfectly well,
+    /// and that is how the symbol-set designer in GDD to Assets reaches Gemini. Sending
+    /// an EMPTY image instead of omitting the key is not the same thing — it posts a
+    /// zero-byte attachment rather than a plain question.
+    ///
+    /// The model is pinned service-side (gemini-3.5-flash-lite) and is NOT selectable:
+    /// posting `model`, `model_id`, `text_model`, `vision_model` or `gemini_model` all
+    /// come back echoing that same id, so a newer text model cannot be requested from
+    /// here until the metering service itself offers one.
+    /// The text/vision model Navigator ASKS for.
+    ///
+    /// gemini-3.8-flash — GA on Vertex since 2 September 2026. This is the model that
+    /// reads the reference art and designs the symbol set, and it is markedly stronger at
+    /// multi-step reasoning than the one the service currently runs.
+    ///
+    /// The request is sent on every call under every field name the API might use. As of
+    /// 21 September 2026 the deployed metering service IGNORES all of them: probing
+    /// /v1/vision with model, model_id, text_model, vision_model and gemini_model all
+    /// returned `"model":"gemini-3.5-flash-lite"`, and so did a deliberately invalid id,
+    /// which is how we know the field is dropped rather than rejected. /v1/me lists no
+    /// vision.model.* capability either — only image.model.* ones.
+    ///
+    /// So this cannot be fixed in the app: the service must be redeployed to honour it
+    /// (DEVOP-8733). Navigator asks anyway, so the day it lands nothing needs changing,
+    /// and reports the mismatch rather than quietly using a lesser model.
+    nonisolated(unsafe) static var wantedVisionModel = "gemini-3.8-flash"
+
+    /// The model id the service reported for the last /v1/vision call.
+    nonisolated(unsafe) static var lastVisionModel: String?
+    /// True when the service answered with a model other than the one asked for.
+    nonisolated(unsafe) static var visionModelOverridden = false
+
+    /// Raw GET against the service, for looking at its schema rather than guessing it.
+    static func rawGET(_ path: String) -> String {
+        guard let base = baseURL, let url = URL(string: base + path) else { return "no URL" }
+        guard let token else { return "not signed in" }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 60
+        var out = "no response"
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { d, resp, e in
+            defer { sem.signal() }
+            if let e { out = "error: \(e.localizedDescription)"; return }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            out = "HTTP \(code)\n" + (d.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+        }.resume()
+        sem.wait()
+        return out
+    }
+
+    /// Raw POST, for probing which model ids an endpoint will accept.
+    static func rawPOST(_ path: String, _ body: [String: Any]) -> String {
+        guard let base = baseURL, let url = URL(string: base + path) else { return "no URL" }
+        guard let token else { return "not signed in" }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        req.timeoutInterval = 120
+        var out = "no response"
+        let sem = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: req) { d, resp, e in
+            defer { sem.signal() }
+            if let e { out = "error: \(e.localizedDescription)"; return }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            out = "HTTP \(code) " + String((d.flatMap { String(data: $0, encoding: .utf8) } ?? "").prefix(600))
+        }.resume()
+        sem.wait()
+        return out
+    }
+
+    /// How hard the model should think. Gemini 3.x takes a discrete level, not a token
+    /// budget; MEDIUM is the documented default and MINIMAL is a validation error on 3.8.
+    nonisolated(unsafe) static var thinkingLevel: String?
+    /// A JSON schema for the reply. Documented structured output is responseMimeType AND
+    /// responseSchema together — MIME alone is "a strong hint" that can still come back
+    /// malformed, which a planner cannot recover from.
+    nonisolated(unsafe) static var responseSchema: [String: Any]?
+
+    static func describe(prompt: String, systemPrompt: String?, imagePNG: Data?)
         -> (text: String?, cost: Double?, error: String?) {
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
         guard let token else {
             return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
         }
         guard let url = URL(string: base + "/v1/vision") else { return (nil, nil, "bad service URL") }
-        var body: [String: Any] = [
-            "prompt": prompt,
-            "input_images": [["mime": "image/png", "base64": imagePNG.base64EncodedString()]],
-        ]
+        var body: [String: Any] = ["prompt": prompt]
+        // Ask under every field name the service might read. Extra keys are ignored by
+        // an API that does not know them, and the one that IS read wins.
+        for k in ["model", "model_id", "text_model", "vision_model"] {
+            body[k] = Self.wantedVisionModel
+        }
+        if let imagePNG, !imagePNG.isEmpty {
+            body["input_images"] = [["mime": "image/png", "base64": imagePNG.base64EncodedString()]]
+        }
         if let systemPrompt, !systemPrompt.isEmpty { body["system_prompt"] = systemPrompt }
+        if let t = Self.thinkingLevel { body["thinking_level"] = t }
+        if let sc = Self.responseSchema { body["response_schema"] = sc }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 60
+        // The symbol-set designer sends the whole plan in one request and gets a long
+        // JSON answer back; 60s was sized for a one-line image description.
+        req.timeoutInterval = 180
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         var out: (String?, Double?, String?) = (nil, nil, "no response")
         let sem = DispatchSemaphore(value: 0)
@@ -19247,6 +19428,15 @@ enum H5GService {
             guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let t = j["text"] as? String else {
                 out = (nil, nil, "unexpected response: " + String(text.prefix(300))); return
+            }
+            // Whatever the service names the model, so the planner's quality is
+            // attributable. It pins this server-side; the app cannot choose.
+            for k in ["model", "model_id", "text_model", "vision_model"] {
+                if let m = j[k] as? String, !m.isEmpty {
+                    Self.lastVisionModel = m
+                    Self.visionModelOverridden = (m != Self.wantedVisionModel)
+                    break
+                }
             }
             out = (t, j["cost_usd"] as? Double, nil)
         }.resume()
@@ -19271,18 +19461,20 @@ func downscaledPNG(_ url: URL, maxDim: CGFloat = 768) -> Data? {
 
 /// Ask Gemini (via /v1/vision) to name the SOURCE image's persistent identity —
 /// species/type, face, markings, worn items — as an anchor for the restyle prompt.
-func analyzeIdentity(sourcePNG png: Data) -> (text: String?, error: String?) {
+func analyzeIdentity(sourcePNG png: Data) -> (text: String?, cost: Double?, error: String?) {
     let r = H5GService.describe(prompt: "Describe the identity to preserve.",
                                 systemPrompt: RestyleRules.identitySystemPrompt, imagePNG: png)
-    return (r.text, r.error)
+    return (r.text, r.cost, r.error)
 }
 
 /// Ask Gemini (via /v1/vision) to extract the REFERENCE image's art style as
 /// subject-free text, for the single-image restyle path.
-func analyzeStyle(referencePNG png: Data) -> (text: String?, error: String?) {
+/// These are PAID vision calls, so the cost comes back with the text. It used to be
+/// dropped on the floor, which made any running total that included them quietly wrong.
+func analyzeStyle(referencePNG png: Data) -> (text: String?, cost: Double?, error: String?) {
     let r = H5GService.describe(prompt: "Extract the transferable art style.",
                                 systemPrompt: RestyleRules.styleSystemPrompt, imagePNG: png)
-    return (r.text, r.error)
+    return (r.text, r.cost, r.error)
 }
 
 /// True when the image actually has see-through pixels.
@@ -20329,6 +20521,435 @@ struct RestyleSheet: View {
 }
 
 let app = NSApplication.shared
+
+// Headless GDD export:  Navigator --export-gdds <out-dir> [<gdd-folder>]
+//
+// The parser has to be checked against the documents it will actually meet, and
+// forty-nine of the sixty are Google Docs — a .gdoc on disk is a 186-byte pointer, so
+// Drive being installed does not put their text anywhere a script can read it.
+// Navigator already follows that pointer for a single document; this runs the same
+// reader over the whole folder without opening a window, using the Google session this
+// app is already signed into.
+// Art-style comparison:  Navigator --style-test <out-dir> [<theme name>]
+//
+// Draws ONE symbol — the same subject, the same role, the same everything — once per art
+// style, through the real prompt builder and the real service. The only thing that
+// changes between images is the style, so the folder answers a question no amount of
+// reading the keyword lists can: do these styles actually render differently.
+//
+// Files are named "<nn> <Style Name>.png" so the folder sorts into the order the picker
+// shows, and "00 Original — <theme>.png" is the theme's own reference-art style.
+// Service schema probe:  Navigator --service-info
+//
+// Prints exactly what the deployed metering service says it supports. Written because a
+// shallow probe of one endpoint was mistaken for the whole API surface: the official
+// client has no /v1/vision at all, and /v1/me carries the capability list that says
+// which models are actually reachable.
+if CommandLine.arguments.contains("--service-info") {
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.global().async {
+        print("──── GET /v1/me\n\(H5GService.rawGET("/v1/me"))\n")
+        // Does /v1/vision honour a model choice at all? Try every field name the API
+        // might use, and a model id that is NOT the default, and see what comes back.
+        let want = "gemini-3.8-flash"
+        for key in ["model", "model_id", "text_model", "vision_model", "gemini_model"] {
+            let r = H5GService.rawPOST("/v1/vision",
+                                       ["prompt": "Reply with the single word OK.", key: want])
+            print("──── POST /v1/vision  \(key)=\(want)\n\(r)\n")
+        }
+        // ...and what an unmistakably invalid id does. If a bad id is accepted silently,
+        // the field is being ignored rather than honoured.
+        let r = H5GService.rawPOST("/v1/vision",
+                                   ["prompt": "Reply with the single word OK.",
+                                    "model": "definitely-not-a-model-xyz"])
+        print("──── POST /v1/vision  model=definitely-not-a-model-xyz\n\(r)\n")
+        exit(0)
+    }
+    app.run()
+}
+
+// Timing:  Navigator --timing [<theme>]
+if CommandLine.arguments.contains("--timing") {
+    let args = CommandLine.arguments
+    let theme = args.firstIndex(of: "--timing").flatMap {
+        $0 + 1 < args.count && !args[$0 + 1].hasPrefix("--") ? args[$0 + 1] : nil
+    } ?? "Piggy Banks"
+    app.setActivationPolicy(.accessory)
+    func mark(_ label: String, _ t0: Date) {
+        print(String(format: "  %-34s %6.2fs", label, Date().timeIntervalSince(t0)))
+        fflush(stdout)
+    }
+    DispatchQueue.main.async {
+        let a = Date()
+        ThemeHubClient.themes { list, _ in
+            mark("theme list (112 themes)", a)
+            let b = Date()
+            ThemeHubClient.art(forThemeNamed: theme) { urls, _ in
+                mark("art fetch, 1 theme (\(urls.count) img)", b)
+                let c = Date()
+                ThemeHubClient.art(forThemeNamed: theme) { _, _ in
+                    mark("art fetch, SAME theme again", c)
+                    let d = Date()
+                    let entries = GDDLibrary.folder.map { GDDLibrary.entries(in: $0) } ?? []
+                    mark("list GDD folder (\(entries.count))", d)
+                    guard let e = entries.first(where: { $0.name.contains("4490") }) else { exit(0) }
+                    let f = Date()
+                    GDDLibrary.text(of: e) { _, _ in
+                        mark("fetch one .docx GDD", f)
+                        if let g = entries.first(where: { $0.stub != nil }) {
+                            let h = Date()
+                            GDDLibrary.text(of: g) { _, _ in
+                                mark("fetch one .gdoc GDD", h)
+                                exit(0)
+                            }
+                        } else { exit(0) }
+                    }
+                }
+            }
+        }
+    }
+    app.run()
+}
+
+// Reference-art audit:  Navigator --art-audit
+if CommandLine.arguments.contains("--art-audit") {
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async {
+        ThemeHubClient.artAudit { rows, err in
+            guard err == nil else { print("FAILED: \(err!)"); exit(1) }
+            let none = rows.filter { $0.2 == 0 }
+            let partial = rows.filter { $0.2 > 0 && $0.2 < $0.1 }
+            let multi = rows.filter { $0.2 > 1 }
+            print("themes: \(rows.count)")
+            print("  with at least one fetchable image: \(rows.count - none.count)")
+            print("  with MORE THAN ONE:                \(multi.count)")
+            print("  images present but unfetchable:    \(partial.count)")
+            print("  no image at all:                   \(none.count)")
+            for (n, p, o) in partial { print("    partial: \(n) — \(o) of \(p)") }
+            for (n, _, _) in none.prefix(12) { print("    none: \(n)") }
+            let total = rows.reduce(0) { $0 + $1.2 }
+            print("  total fetchable reference images:  \(total)")
+            exit(none.isEmpty ? 0 : 1)
+        }
+    }
+    app.run()
+}
+
+// Planner check:  Navigator --plan-test <gdd-text-file> <theme name>
+//
+// Exercises the call that actually decides the art: read a GDD, pick a theme, and have
+// the model assign every symbol a subject and silhouette. Reports which model the
+// service ran and what the call cost, because both changed when /v1/vision stopped
+// pinning itself to the lite tier.
+if let flag = CommandLine.arguments.firstIndex(of: "--plan-test") {
+    let args = CommandLine.arguments
+    guard flag + 2 < args.count else {
+        FileHandle.standardError.write("usage: Navigator --plan-test <gdd.txt> <theme>\n"
+            .data(using: .utf8)!)
+        exit(2)
+    }
+    let gddPath = args[flag + 1], wantTheme = args[flag + 2]
+    // --vision-model <id>: plan with a specific model, for comparing them head to head.
+    if let mi = args.firstIndex(of: "--vision-model"), mi + 1 < args.count {
+        H5GService.wantedVisionModel = args[mi + 1]
+    }
+    guard let gdd = try? String(contentsOfFile: gddPath, encoding: .utf8) else {
+        print("couldn’t read \(gddPath)"); exit(1)
+    }
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async {
+        ThemeHubClient.themes { list, err in
+            guard let list, let theme = list.first(where: {
+                $0.name.localizedCaseInsensitiveContains(wantTheme) }) else {
+                print("theme not found: \(err ?? "no match")"); exit(1)
+            }
+            let run = GDDToAssetsRun()
+            run.theme = theme
+            run.load(gddText: gdd, gameName: (gddPath as NSString).lastPathComponent,
+                     size: "2K", symbolAspect: "1:1",
+                     backgroundAspect: "3:4", backgroundSize: "4K")
+            print("GDD: \(run.symbols.count) symbols · \(run.jobs.count) images to plan")
+            guard !run.jobs.isEmpty else { print("nothing to plan"); exit(1) }
+            run.readThemeStyle {
+                let styleCost = run.spent
+                print("style read: $\(String(format: "%.5f", styleCost))  "
+                    + "model \(H5GService.lastVisionModel ?? "?")")
+                run.designSet {
+                    let planCost = run.spent - styleCost
+                    print("\nplanner: model \(H5GService.lastVisionModel ?? "?")"
+                        + "   cost $\(String(format: "%.4f", planCost))"
+                        + (H5GService.visionModelOverridden ? "   ** OVERRIDDEN **" : ""))
+                    print("status: \(run.status)\n")
+                    for j in run.jobs.prefix(24) {
+                        let sub = j.subject.isEmpty ? "(not filled)" : j.subject
+                        print("  \(j.id.padding(toLength: 6, withPad: " ", startingAt: 0))"
+                            + "\(j.role.label.padding(toLength: 14, withPad: " ", startingAt: 0))"
+                            + String(sub.prefix(84)))
+                    }
+                    let filled = run.jobs.filter { !$0.subject.isEmpty }.count
+                    print("\n\(filled) of \(run.jobs.count) filled")
+                    // --generate <dir>: run the REAL parallel pool, and time it. The
+                    // style sweep loops sequentially and calls the service directly, so
+                    // it measures the harness rather than generate().
+                    if let gi = args.firstIndex(of: "--generate"), gi + 1 < args.count {
+                        let dir = URL(fileURLWithPath: args[gi + 1])
+                        try? FileManager.default.createDirectory(
+                            at: dir, withIntermediateDirectories: true)
+                        // 1K keeps the measurement cheap; size is fixed at build time.
+                        run.jobs = run.jobs.map { j in
+                            AssetJob(id: j.id, kind: j.kind, role: j.role, tier: j.tier,
+                                     title: j.title, subject: j.subject,
+                                     silhouette: j.silhouette, aspect: j.aspect, size: "1K",
+                                     hasFrame: j.hasFrame)
+                        }
+                        let started = Date()
+                        print("\ngenerating \(run.jobs.count) images, pool of "
+                            + "\(ImageRequestPolicy.concurrency)…")
+                        run.generate(into: dir, removeBackground: false) { urls in
+                            let secs = Date().timeIntervalSince(started)
+                            let w = run.parallelWidth
+                            print(String(format: "\n%d images in %.0fs — %.1fs each, $%.2f",
+                                         urls.count, secs,
+                                         secs / Double(max(1, urls.count)), run.spent))
+                            print("  pool ended at width \(w) of "
+                                + "\(ImageRequestPolicy.concurrency)"
+                                + (w < ImageRequestPolicy.concurrency
+                                   ? "  ** the service pushed back **" : "  (no pushback)"))
+                            if !run.failures.isEmpty {
+                                print("  failures: \(run.failures.count) — "
+                                    + run.failures.keys.sorted().joined(separator: ", "))
+                            }
+                            exit(0)
+                        }
+                        return
+                    }
+                    if let ji = args.firstIndex(of: "--json"), ji + 1 < args.count {
+                        let rows = run.jobs.map { j in
+                            ["id": j.id, "role": j.role.label, "subject": j.subject,
+                             "silhouette": j.silhouette]
+                        }
+                        let out: [String: Any] = [
+                            "model": H5GService.lastVisionModel ?? "?",
+                            "cost": planCost, "filled": filled, "total": run.jobs.count,
+                            "clashes": run.clashes.mapValues { $0 },
+                            "jobs": rows,
+                        ]
+                        if let d = try? JSONSerialization.data(withJSONObject: out,
+                                                               options: [.prettyPrinted]) {
+                            try? d.write(to: URL(fileURLWithPath: args[ji + 1]))
+                        }
+                    }
+                    exit(filled == run.jobs.count ? 0 : 1)
+                }
+            }
+        }
+    }
+    app.run()
+}
+
+// Theme hub check:  Navigator --theme-test [<theme name>]
+if CommandLine.arguments.contains("--theme-test") {
+    let args = CommandLine.arguments
+    let wanted = args.firstIndex(of: "--theme-test").flatMap {
+        $0 + 1 < args.count && !args[$0 + 1].hasPrefix("--") ? args[$0 + 1] : nil
+    } ?? "Wild Wolves"
+    app.setActivationPolicy(.accessory)
+    let started = Date()
+    DispatchQueue.main.async {
+        ThemeHubClient.themes { list, err in
+            guard let list else { print("FAILED: \(err ?? "no themes")"); exit(1) }
+            let secs = Date().timeIntervalSince(started)
+            let withArt = list.filter(\.hasArt).count
+            let noLook = list.filter { $0.look.isEmpty }.count
+            let noWhy = list.filter { $0.why.isEmpty }.count
+            let noCat = list.filter { $0.category.isEmpty }.count
+            let noTier = list.filter { $0.tier.isEmpty }.count
+            let noStatus = list.filter { $0.status.isEmpty }.count
+            let withNotes = list.filter { !$0.notes.isEmpty }.count
+            let withVotes = list.filter { $0.votes > 0 }.count
+            print(String(format: "list loaded in %.1fs", secs))
+            print("themes: \(list.count)   with art: \(withArt)   with notes: \(withNotes)"
+                + "   with votes: \(withVotes)")
+            print("missing — look: \(noLook)  why: \(noWhy)  category: \(noCat)  "
+                + "tier: \(noTier)  status badge: \(noStatus)")
+            guard let t = list.first(where: {
+                $0.name.localizedCaseInsensitiveContains(wanted) }) else {
+                print("no theme matching “\(wanted)”"); exit(1)
+            }
+            print("\n\(t.name) [\(t.tier)] — \(t.category)")
+            print("  comparables: \(t.comparables)")
+            print("  why:  \(t.why.prefix(90))")
+            print("  look: \(t.look.prefix(90))")
+            print("  status: \(t.status)   votes: \(t.votes)   hasArt: \(t.hasArt)")
+            print("  notes: \(t.notes.isEmpty ? "(none)" : t.notes)")
+            // Read the style off the artwork too — this is the description the symbol
+            // prompts are built from, and the only way to see whether it states the
+            // edge treatment is to look at it.
+            let run = GDDToAssetsRun()
+            run.theme = t
+            run.readThemeStyle {
+                let st = run.theme?.styleFromArt ?? ""
+                if st.isEmpty {
+                    print("  style read FAILED — \(run.status)")
+                } else {
+                    let imgs = run.theme?.artDataURLs.count ?? 0
+                    print("  artwork: \(imgs) reference image(s)"
+                        + (imgs > 1 ? "  — the window cycles through them" : ""))
+                    print("  style read (\(st.split(separator: " ").count) words):")
+                    print("  \u{201C}\(st)\u{201D}")
+                    let inked = GDDAssetPrompts.wantsLineWork(run.theme!)
+                    print("  -> reads as line-work art: \(inked) "
+                        + "(edge suppression \(inked ? "OFF" : "ON"))")
+                    print("  -> asked for \(H5GService.wantedVisionModel); service ran "
+                        + (H5GService.lastVisionModel ?? "(not reported)")
+                        + (H5GService.visionModelOverridden ? "  ** OVERRIDDEN **" : ""))
+                }
+                exit(0)
+            }
+        }
+    }
+    app.run()
+}
+
+if let flag = CommandLine.arguments.firstIndex(of: "--style-test") {
+    let args = CommandLine.arguments
+    guard flag + 1 < args.count else {
+        FileHandle.standardError.write(
+            "usage: Navigator --style-test <out-dir> [<theme name>]\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let out = URL(fileURLWithPath: args[flag + 1])
+    let wanted = flag + 2 < args.count ? args[flag + 2] : "Jack and the Beanstalk"
+    try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    app.setActivationPolicy(.accessory)
+
+    // One fixed job. HP1 is the game's most valuable symbol, so it is the one with the
+    // most rendering in it — the best place to see a style land or fail.
+    var job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1,
+                       title: "High pay 1",
+                       subject: "the giant from the beanstalk tale, a huge bearded figure "
+                              + "in a tunic, shown from the chest up, one fist raised",
+                       silhouette: "giant bust", aspect: "1:1", size: "1K")
+    job.hasFrame = true
+    let backing = SlotBackingRules.candidates[2]
+    let model = NanoBananaModel.byFlag("nb2").id
+
+    // --short uses the ~200-word brief; --reps N repeats each style for a real sample.
+    let useShort = args.contains("--short")
+    let reps = args.firstIndex(of: "--reps").flatMap {
+        $0 + 1 < args.count ? Int(args[$0 + 1]) : nil } ?? 1
+
+    func draw(_ label: String, _ theme: GameTheme, _ index: Int) -> Double {
+        let prompt = useShort
+            ? GDDAssetPrompts.imageShort(job: job, theme: theme, backing: backing)
+            : GDDAssetPrompts.image(job: job, theme: theme, backing: backing)
+        let r = H5GService.image(prompt: prompt, modelID: model, inputPNGs: [],
+                                 aspect: "1:1", size: "1K")
+        let safe = GDDOutputRules.safe(label)
+        if let png = r.png {
+            let name = String(format: "%02d %@.png", index, safe)
+            try? png.write(to: out.appendingPathComponent(name))
+            print(String(format: "[%02d] %@  $%.3f", index, label, r.cost ?? 0))
+        } else {
+            print("[\(index)] \(label)  FAILED: \(r.error ?? "no image")")
+        }
+        fflush(stdout)
+        return r.cost ?? 0
+    }
+
+    DispatchQueue.main.async {
+        ThemeHubClient.themes { list, err in
+            guard let list, let base = list.first(where: {
+                $0.name.localizedCaseInsensitiveContains(wanted)
+            }) else {
+                print("Couldn’t find theme “\(wanted)”: \(err ?? "not on the hub")")
+                exit(1)
+            }
+            print("Theme: \(base.name) — \(base.look.prefix(90))…")
+            // Read the reference art once. Every image below is drawn against the SAME
+            // theme, so the only variable is the style.
+            let run = GDDToAssetsRun()
+            run.theme = base
+            run.readThemeStyle {
+                var theme = run.theme ?? base
+                var spent = 0.0
+                if theme.styleFromArt.isEmpty {
+                    print("NOTE: no reference-art style was read — “Original” will be the "
+                        + "written look only.")
+                }
+                // --limit N: smoke-test a couple before committing to the whole sweep.
+                // --styles a,b,c: exactly these style ids, for an A/B against a baseline.
+                var styles = SlotArtStyles.all
+                if let si = args.firstIndex(of: "--styles"), si + 1 < args.count {
+                    let want = args[si + 1].split(separator: ",").map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }
+                    styles = want.compactMap { SlotArtStyles.byID($0) }
+                    let missing = want.filter { SlotArtStyles.byID($0) == nil }
+                    if !missing.isEmpty {
+                        print("unknown style ids: \(missing.joined(separator: ", "))")
+                        exit(2)
+                    }
+                } else if let li = args.firstIndex(of: "--limit"), li + 1 < args.count,
+                          let n = Int(args[li + 1]) {
+                    styles = Array(styles.prefix(n))
+                }
+                // The theme's own reference-art style, as image 00 — the baseline every
+                // chosen style is compared against. Dropped out when --reps was added.
+                var n = 0
+                if !args.contains("--no-original") {
+                    spent += draw("Original — \(theme.name)", theme, 0)
+                }
+                for (i, style) in styles.enumerated() {
+                    theme.chosenStyle = style
+                    for rep in 1...max(1, reps) {
+                        n += 1
+                        let tag = reps > 1 ? "\(style.name) r\(rep)" : style.name
+                        spent += draw(tag, theme, (i + 1) * 10 + rep)
+                    }
+                }
+                _ = n
+                print(String(format: "\ndone — %d images (%@), $%.2f, in %@",
+                             styles.count * max(1, reps),
+                             useShort ? "short prompt" : "full prompt", spent, out.path))
+                exit(0)
+            }
+        }
+    }
+    app.run()
+}
+
+if let flag = CommandLine.arguments.firstIndex(of: "--export-gdds") {
+    let args = CommandLine.arguments
+    guard flag + 1 < args.count else {
+        FileHandle.standardError.write(
+            "usage: Navigator --export-gdds <out-dir> [<gdd-folder>]\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let out = URL(fileURLWithPath: args[flag + 1])
+    let folder = flag + 2 < args.count ? URL(fileURLWithPath: args[flag + 2])
+                                       : GDDLibrary.folder
+    guard let folder else {
+        FileHandle.standardError.write("No GDD folder set, and none given.\n".data(using: .utf8)!)
+        exit(2)
+    }
+    try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    // .accessory, not .regular: no Dock icon and no menu bar, but WebKit still gets the
+    // run loop it needs to load a page.
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async {
+        GDDLibrary.exportAll(from: folder, into: out) { i, n, name in
+            print("[\(i)/\(n)] \(name)")
+            fflush(stdout)
+        } done: { written, failures in
+            print("\nwrote \(written) file\(written == 1 ? "" : "s") to \(out.path)")
+            for f in failures { print("FAILED  \(f)") }
+            exit(failures.isEmpty ? 0 : 1)
+        }
+    }
+    app.run()
+}
+
 app.setActivationPolicy(.regular)
 let delegate = AppDelegate()
 app.delegate = delegate
@@ -20358,5 +20979,2872 @@ final class RestyleController {
             windows.removeAll { $0 === w }
         }
         w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// ===== GDD to Assets: the signed-in Google session =====
+//
+// Two of the three sources this feature needs are Google-gated in ways Navigator's
+// existing Vertex sign-in cannot reach, because that token belongs to the metering
+// service and nothing else:
+//
+//   * the GDD itself, a Google Doc read through docs.google.com's plain-text export;
+//   * the theme hub, a Cloud Run app behind Identity-Aware Proxy.
+//
+// Both are things the user can already open in a browser, and both authenticate by
+// cookie. So Navigator keeps ONE persistent WebKit session: the user signs in to
+// Google once, in a real window, and afterwards an offscreen web view loads those
+// URLs with that session and hands back the text.
+//
+// Working through the web view rather than copying cookies into URLSession is
+// deliberate. Google serves its pages with a Content-Security-Policy that blocks
+// page-initiated cross-origin fetches — which is what defeated the first attempt at
+// this — but a top-level navigation is not subject to it, and letting WebKit own the
+// cookies avoids hand-rolling a second cookie jar that can disagree with the first.
+@MainActor
+final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate {
+    static let shared = GoogleWebSession()
+
+    /// Where the theme hub lives. Not a secret, but not ours to publish either, so it
+    /// is stored rather than committed — the same rule the Vertex service address follows.
+    nonisolated static var themeHubURL: String? {
+        get {
+            if let e = ProcessInfo.processInfo.environment["H5G_THEME_HUB_URL"], !e.isEmpty { return e }
+            guard let v = Prefs.d.string(forKey: "h5gThemeHubURL"), !v.isEmpty else { return nil }
+            return v
+        }
+        set { Prefs.d.set(newValue ?? "", forKey: "h5gThemeHubURL") }
+    }
+
+    private var worker: WKWebView?
+    private var host: NSWindow?
+
+    /// One request at a time, identified so a late callback from an abandoned one
+    /// cannot answer — or hang — the request that replaced it.
+    ///
+    /// The first cut of this kept two independent callback slots (one for a page, one
+    /// for a download) and no identity at all. Three separate ways to lose a caller
+    /// came out of that: a second request overwrote the first's slot so the first was
+    /// never answered; a request that timed out left its navigation running, so its
+    /// late download completed whichever request came next; and a failed download
+    /// answered its caller twice. Every terminal path now goes through `settle`, which
+    /// checks identity and clears state BEFORE calling anyone back.
+    private struct Pending {
+        let id: Int
+        let done: (WKWebView?, String?, URL?, String?) -> Void   // page, text, file, error
+    }
+    /// The extension a pending download should be saved under. Google answers an export
+    /// URL with a real file, and what that file IS depends on the format asked for — a
+    /// .docx read as a UTF-8 string is mojibake, so the caller says what it wants.
+    private var downloadExtension = "txt" {
+        didSet { Self.pendingExtension = downloadExtension }
+    }
+    /// True when the caller wants the downloaded FILE, not its text.
+    private var wantsFile = false {
+        didSet { Self.pendingWantsFile = wantsFile }
+    }
+    /// WKDownload's callbacks arrive before anything can hop to the main actor, so the
+    /// two values they need live here, written only while a request is being set up.
+    nonisolated(unsafe) static var pendingExtension = "txt"
+    nonisolated(unsafe) static var pendingDestination: URL?
+    nonisolated(unsafe) static var pendingWantsFile = false
+    private var pending: Pending?
+    private var nextID = 1
+    private var watchdog: DispatchWorkItem?
+    private var downloadDestination: URL?
+    private var downloadRequestID: Int?
+
+    /// A web view on the shared persistent store, parked offscreen.
+    ///
+    /// It lives in a real (zero-alpha, offscreen) window because WebKit will not
+    /// reliably run a page that is in no window at all — an unparented view can sit
+    /// at "loading" forever, which reads as a hang rather than an error.
+    private func makeWorker() -> WKWebView {
+        if let w = worker { return w }
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .default()            // persists across launches
+        let w = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 900), configuration: cfg)
+        w.navigationDelegate = self
+        let win = NSWindow(contentRect: w.frame, styleMask: [.borderless],
+                           backing: .buffered, defer: false)
+        win.alphaValue = 0
+        win.ignoresMouseEvents = true
+        win.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        win.contentView = w
+        win.orderBack(nil)
+        host = win; worker = w
+        return w
+    }
+
+    /// The one place a request ends. Ignores anything that is not the live request,
+    /// and clears every piece of per-request state before handing back.
+    private func settle(id: Int, web: WKWebView?, text: String?, file: URL? = nil,
+                        error: String?) {
+        guard let p = pending, p.id == id else { return }
+        pending = nil
+        watchdog?.cancel(); watchdog = nil
+        if downloadRequestID == id { downloadRequestID = nil; downloadDestination = nil }
+        wantsFile = false; downloadExtension = "txt"
+        p.done(web, text, file, error)
+    }
+
+    /// Start a request. Returns its id, or nil when one is already in flight.
+    @discardableResult
+    private func begin(_ url: URL, timeout: TimeInterval,
+                       done: @escaping (WKWebView?, String?, URL?, String?) -> Void) -> Int? {
+        guard pending == nil else {
+            done(nil, nil, nil, "Another Google request is already running.")
+            return nil
+        }
+        let id = nextID; nextID += 1
+        pending = Pending(id: id, done: done)
+        let w = makeWorker()
+        let wd = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            // Stop the abandoned navigation too, or its late download lands on
+            // whichever request comes next.
+            self.worker?.stopLoading()
+            self.settle(id: id, web: nil, text: nil,
+                        error: "Timed out loading \(url.host ?? "the page").")
+        }
+        watchdog = wd
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: wd)
+        w.load(URLRequest(url: url))
+        return id
+    }
+
+    private var liveID: Int? { pending?.id }
+
+    nonisolated func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        Task { @MainActor in
+            guard let id = self.liveID else { return }
+            self.settle(id: id, web: webView, text: nil, error: nil)
+        }
+    }
+    nonisolated func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        Task { @MainActor in
+            guard let id = self.liveID else { return }
+            if self.downloadRequestID == id { return }   // it became a download
+            let e = error as NSError
+            if e.domain == "WebKitErrorDomain" && e.code == 102 { return }
+            self.settle(id: id, web: nil, text: nil, error: error.localizedDescription)
+        }
+    }
+    nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+                             withError error: Error) {
+        Task { @MainActor in
+            guard let id = self.liveID else { return }
+            // A navigation that TURNS INTO a download fails with "frame load interrupted
+            // by a policy change" (WebKit 102). That is not an error — it is what
+            // success looks like when Google answers an export URL with a file instead
+            // of a page. Settling here killed every .docx export before its bytes
+            // arrived, with the download still running.
+            if self.downloadRequestID == id { return }
+            let e = error as NSError
+            if e.domain == "WebKitErrorDomain" && e.code == 102 { return }
+            if e.domain == NSURLErrorDomain && e.code == NSURLErrorCancelled { return }
+            self.settle(id: id, web: nil, text: nil, error: error.localizedDescription)
+        }
+    }
+
+    // Google may answer an export URL with a file download instead of an inline page.
+    // WebKit reports that by turning the navigation into a WKDownload, at which point
+    // the page never "finishes" — so without this the request would simply time out.
+    /// Turn the response into a download when the caller asked for a file.
+    ///
+    /// This method is the whole mechanism. WKNavigationDelegate.h: didBecomeDownload is
+    /// "called after using WKNavigationResponsePolicyDownload" — so without returning
+    /// .download here, no download is ever created. WebKit instead tried to DISPLAY the
+    /// .docx, failed, and reported "frame load interrupted", which read like a network
+    /// error and was actually the absence of this method.
+    ///
+    /// canShowMIMEType covers the rest: anything WebKit cannot render is a file, which
+    /// is what an export URL answers with whatever format was asked for.
+    nonisolated func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                             decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        let wants = Self.pendingWantsFile
+        if wants || !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+        } else {
+            decisionHandler(.allow)
+        }
+    }
+
+    nonisolated func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse,
+                             didBecome download: WKDownload) {
+        download.delegate = self
+        Task { @MainActor in self.downloadRequestID = self.liveID }
+    }
+    nonisolated func webView(_ webView: WKWebView, navigationAction: WKNavigationAction,
+                             didBecome download: WKDownload) {
+        download.delegate = self
+        Task { @MainActor in self.downloadRequestID = self.liveID }
+    }
+
+    nonisolated func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
+                              suggestedFilename: String,
+                              completionHandler: @escaping (URL?) -> Void) {
+        // WebKit refuses a destination that already exists, so this is always a fresh name.
+        // Read WITHOUT hopping actors: completionHandler has to be called now, and a
+        // destination handed over late is a download WebKit has already abandoned.
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("navigator-gdd-\(UUID().uuidString).\(Self.pendingExtension)")
+        Self.pendingDestination = dst
+        Task { @MainActor in self.downloadDestination = dst }
+        completionHandler(dst)
+    }
+
+    nonisolated func downloadDidFinish(_ download: WKDownload) {
+        Task { @MainActor in
+            guard let id = self.downloadRequestID else { return }
+            let dst = self.downloadDestination ?? Self.pendingDestination
+            // When the caller wants the FILE, it owns it and deletes it; only the
+            // text path throws its temporary away here.
+            if self.wantsFile {
+                guard let d = dst else {
+                    self.settle(id: id, web: nil, text: nil,
+                                error: "The download produced no file.")
+                    return
+                }
+                self.settle(id: id, web: nil, text: nil, file: d, error: nil)
+                return
+            }
+            defer { if let d = dst { try? FileManager.default.removeItem(at: d) } }
+            guard let d = dst, let text = try? String(contentsOf: d, encoding: .utf8) else {
+                self.settle(id: id, web: nil, text: nil, error: "The download could not be read.")
+                return
+            }
+            self.settle(id: id, web: nil, text: text, error: nil)
+        }
+    }
+
+    nonisolated func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        Task { @MainActor in
+            guard let id = self.downloadRequestID else { return }
+            self.settle(id: id, web: nil, text: nil, error: error.localizedDescription)
+        }
+    }
+
+    /// True when a load ended up on a Google sign-in page rather than the thing asked for.
+    private static func isSignInPage(_ url: URL?) -> Bool {
+        guard let h = url?.host else { return false }
+        return h.contains("accounts.google.com") || h.hasPrefix("login.")
+    }
+
+    /// The sentinel a caller checks for to know it should offer the sign-in window
+    /// rather than show a raw error.
+    static let signInNeeded = "Sign in to Google first."
+
+    /// Run JavaScript against a page and hand back whatever it evaluates to.
+    ///
+    /// `js` is a function BODY (it must `return`), which is what callAsyncJavaScript
+    /// takes and what lets the script use `await`.
+    func evaluate(url: URL, js: String, timeout: TimeInterval = 90,
+                  completion: @escaping (Any?, String?) -> Void) {
+        begin(url, timeout: timeout) { web, _, _, err in
+            guard let w = web else { completion(nil, err ?? "The page didn’t load."); return }
+            if Self.isSignInPage(w.url) { completion(nil, GoogleWebSession.signInNeeded); return }
+            w.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { res in
+                switch res {
+                case .success(let v): completion(v, nil)
+                case .failure(let e): completion(nil, e.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Download a URL to a real file and hand back where it landed.
+    ///
+    /// The caller owns the file and must delete it. This exists because Google's text
+    /// export is lossy — see DriveStub — and the fix is to ask for a real .docx and read
+    /// it with the same reader a local .docx goes through.
+    func fetchFile(url: URL, fileExtension: String, timeout: TimeInterval = 180,
+                   completion: @escaping (URL?, String?) -> Void) {
+        wantsFile = true
+        downloadExtension = fileExtension
+        begin(url, timeout: timeout) { web, _, file, err in
+            if let file { completion(file, nil); return }
+            if let w = web, Self.isSignInPage(w.url) {
+                completion(nil, GoogleWebSession.signInNeeded); return
+            }
+            // A page came back instead of a file. That is Google answering with HTML —
+            // almost always a permission or not-found page rather than the export.
+            completion(nil, err ?? "That document didn’t export — check it still exists "
+                                 + "and that this account can open it.")
+        }
+    }
+
+    /// Fetch a URL that answers with plain text — Google Docs' text export. WebKit
+    /// renders that inline, so the text comes out of the rendered document; if Google
+    /// instead answers with a download, the download path above supplies it directly.
+    func fetchPlainText(url: URL, timeout: TimeInterval = 120,
+                        completion: @escaping (String?, String?) -> Void) {
+        begin(url, timeout: timeout) { web, text, _, err in
+            if let text { completion(text, nil); return }          // arrived as a download
+            guard let w = web else { completion(nil, err ?? "The page didn’t load."); return }
+            if Self.isSignInPage(w.url) { completion(nil, GoogleWebSession.signInNeeded); return }
+            // Read the text from an ISOLATED content world, not the page's own.
+            // Google Docs serves a strict Content-Security-Policy, and evaluating in
+            // the page world is refused under it — "A JavaScript exception occurred",
+            // with the document sitting right there, fully loaded. An isolated world
+            // shares the same DOM but has its own script context, so the policy does
+            // not apply to it.
+            w.evaluateJavaScript("document.body ? document.body.innerText : ''",
+                                 in: nil, in: .defaultClient) { res in
+                switch res {
+                case .failure(let e): completion(nil, e.localizedDescription)
+                case .success(let v):
+                    let t = (v as? String) ?? ""
+                    completion(t.isEmpty ? nil : t, t.isEmpty ? "The page came back empty." : nil)
+                }
+            }
+        }
+    }
+
+
+    // MARK: - Sign in
+
+    private var signInWindow: NSWindow?
+
+    /// Show a real browser window on `url` so the user can sign in to Google normally.
+    ///
+    /// Navigator never sees the password: this is Google's own page inside a web view,
+    /// exactly as it would be in Safari, and the only thing kept is the session cookie
+    /// WebKit stores for itself.
+    func presentSignIn(startAt url: URL, onClose: @escaping () -> Void) {
+        presentWeb(url: url, title: "Sign in to Google", onClose: onClose)
+    }
+
+    /// Open a real browser window on the shared session. Used for signing in, and for
+    /// looking at the theme hub — the hub is a page people actually want to READ, with
+    /// the reference art on it, so "view it" is the useful button and setting its
+    /// address is the rare one.
+    func presentWeb(url: URL, title: String, onClose: @escaping () -> Void = {}) {
+        if let w = signInWindow { w.makeKeyAndOrderFront(nil); return }
+        let cfg = WKWebViewConfiguration()
+        cfg.websiteDataStore = .default()
+        let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 980, height: 760), configuration: cfg)
+        web.load(URLRequest(url: url))
+        let w = NSWindow(contentRect: web.frame,
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                         backing: .buffered, defer: false)
+        w.title = title
+        w.isReleasedWhenClosed = false
+        w.contentView = web
+        w.center()
+        signInWindow = w
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                                       object: w, queue: .main) { [weak self] _ in
+            if let t = token { NotificationCenter.default.removeObserver(t) }
+            Task { @MainActor in
+                self?.signInWindow = nil
+                // The worker holds the OLD session's state; drop it so the next request
+                // starts from the cookies that were just established.
+                self?.worker = nil; self?.host?.close(); self?.host = nil
+                onClose()
+            }
+        }
+        w.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// ===== GDD to Assets: the theme hub =====
+//
+// The hub renders its 111 themes server-side into the page, and exposes only the
+// live overlay (votes, tiers, notes) as JSON at /api/state — so the theme text has
+// to come out of the page itself. Rather than ship an HTML parser for a 16MB
+// document, the extraction runs as a few lines of JavaScript inside the page that is
+// already loaded and already authenticated, and hands back JSON.
+//
+// The selectors below were read off the live DOM, not guessed. `textContent` is used
+// rather than `innerText` on purpose: the "Theme & look" paragraph lives inside a
+// collapsed <details>, and innerText returns nothing for anything not rendered.
+enum ThemeHubClient {
+
+    /// Reads the CARDS only — every text field, and whether the card has artwork.
+    ///
+    /// Deliberately does NOT return the artwork. The hub inlines most reference images
+    /// as base64 data URLs, so returning them made this script hand back a single
+    /// ~16.5 MB string across WebKit's process boundary. That is where eight of the
+    /// hundred and nineteen themes were disappearing, and why cards whose art lives
+    /// behind /api/art/ came back with none at all: one oversized payload, unreliable
+    /// in a way that looked like the hub had no art on it.
+    ///
+    /// The text is ~80 KB. Art is fetched one image at a time, for the one theme the
+    /// user actually picked — see artJS.
+    static let extractionJS = """
+    // Wait for the grid to finish building before reading it.
+    //
+    // The hub renders its cards from JS, and extracting the moment the page reported
+    // "finished loading" caught it mid-build: the app listed 111 themes where the hub's
+    // own counter said 112. One missing theme is invisible unless you count them, and
+    // nobody counts 112 of anything.
+    const ready = async () => {
+      let last = -1;
+      for (let i = 0; i < 60; i++) {
+        const grid = document.querySelector('.grid.ready');
+        const n = document.querySelectorAll('.card[data-name]').length;
+        if (grid && n > 0 && n === last) return n;
+        last = n;
+        await new Promise(r => setTimeout(r, 100));
+      }
+      return document.querySelectorAll('.card[data-name]').length;
+    };
+    await ready();
+
+    const out = [];
+    for (const c of document.querySelectorAll('.card[data-name]')) {
+      // The hub marks superseded cards `hidden` and leaves them in the page; its own
+      // "All" counter excludes them, so an edited theme was being offered twice.
+      if (c.classList.contains('hidden')) continue;
+      const q = (sel) => { const e = c.querySelector(sel); return e ? e.textContent.trim() : ''; };
+      let look = '';
+      for (const d of c.querySelectorAll('details')) {
+        const s = d.querySelector('summary');
+        if (s && /theme/i.test(s.textContent)) {
+          const p = d.querySelector('p');
+          look = p ? p.textContent.trim() : '';
+        }
+      }
+      let why = q('p.why');
+      if (why.toLowerCase().startsWith('why:')) why = why.slice(4).trim();
+      // Team notes live in a second <details>, in a textarea rather than a <p>, so the
+      // "Theme & look" reader above cannot see them. They are the freshest thing on a
+      // card — status, who is on it, links — and were being dropped entirely.
+      let notes = '';
+      for (const d of c.querySelectorAll('details')) {
+        const s = d.querySelector('summary');
+        if (s && /note/i.test(s.textContent)) {
+          const ta = d.querySelector('textarea');
+          if (ta) notes = (ta.value || '').trim();
+          else { const p = d.querySelector('p'); notes = p ? p.textContent.trim() : ''; }
+        }
+      }
+      const voteEl = c.querySelector('button.vote, .vote');
+      const votes = voteEl ? parseInt((voteEl.textContent || '').replace(/[^0-9-]/g, ''), 10) : 0;
+      const im = c.querySelector('img');
+      const src = im ? (im.getAttribute('src') || '') : '';
+      out.push({
+        name: c.getAttribute('data-name') || q('h3'),
+        tier: c.getAttribute('data-tier') || '',
+        status: q('.badge'),
+        comparables: q('span.ex'),
+        category: q('div.cat'),
+        why: why,
+        look: look,
+        notes: notes,
+        votes: isNaN(votes) ? 0 : votes,
+        hasArt: src.length > 0
+      });
+    }
+    return JSON.stringify(out);
+    """
+
+    /// The reference artwork for ONE theme, as a data URL.
+    ///
+    /// Keyed by name rather than position: the hub re-orders and filters its own cards,
+    /// and an index captured during the list load would quietly fetch a different
+    /// game's art.
+    ///
+    /// Relative /api/art/ URLs are fetched here, inside the authenticated page, because
+    /// the app cannot reach them on its own — the hub is behind Google IAP.
+    static func artJS(themeNamed name: String) -> String {
+        let quoted = (try? JSONSerialization.data(withJSONObject: [name]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
+        return """
+        const want = \(quoted)[0];
+        const cards = document.querySelectorAll('.card[data-name]');
+        let card = null;
+        for (const c of cards) {
+          if (c.classList.contains('hidden')) continue;
+          if (c.getAttribute('data-name') === want) { card = c; break; }
+        }
+        if (!card) return '[]';
+        if (!card.querySelector('img')) return '[]';
+        // EVERY image on the card, not just the first. A card with three reference
+        // images shows a "+2" badge, and the other two are as much the approved art as
+        // the first one is.
+        const out = [];
+        for (const im of card.querySelectorAll('img')) {
+          const src = im.getAttribute('src') || '';
+          if (!src) continue;
+          if (src.indexOf('data:') === 0) { out.push(src); continue; }
+          try {
+            const resp = await fetch(src);
+            if (!resp.ok) continue;
+            const blob = await resp.blob();
+            const url = await new Promise(function (res) {
+              const fr = new FileReader();
+              fr.onloadend = function () { res(fr.result); };
+              fr.onerror = function () { res(''); };
+              fr.readAsDataURL(blob);
+            });
+            if (url) out.push(url);
+          } catch (e) { /* one bad image must not lose the others */ }
+        }
+        return JSON.stringify(out);
+        """
+    }
+
+    /// Every theme on the hub. Errors are strings the caller shows verbatim.
+    @MainActor
+    static func themes(completion: @escaping ([GameTheme]?, String?) -> Void) {
+        guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
+            completion(nil, "No theme hub address is set on this Mac."); return
+        }
+        GoogleWebSession.shared.evaluate(url: url, js: extractionJS) { v, err in
+            if let err { completion(nil, err); return }
+            guard let s = v as? String, let d = s.data(using: .utf8),
+                  let rows = (try? JSONSerialization.jsonObject(with: d)) as? [[String: Any]] else {
+                completion(nil, "The theme hub page didn’t look the way Navigator expects."); return
+            }
+            let themes = rows.compactMap { r -> GameTheme? in
+                guard let n = r["name"] as? String, !n.isEmpty else { return nil }
+                var t = GameTheme(name: n,
+                                  category: r["category"] as? String ?? "",
+                                  comparables: r["comparables"] as? String ?? "",
+                                  why: r["why"] as? String ?? "",
+                                  look: r["look"] as? String ?? "",
+                                  tier: r["tier"] as? String ?? "",
+                                  artDataURL: "")
+                t.hasArt = (r["hasArt"] as? Bool) ?? false
+                t.notes = r["notes"] as? String ?? ""
+                t.votes = (r["votes"] as? Int) ?? Int((r["votes"] as? Double) ?? 0)
+                t.status = r["status"] as? String ?? ""
+                return t
+            }
+            completion(themes.isEmpty ? nil : themes,
+                       themes.isEmpty ? "The theme hub returned no themes." : nil)
+        }
+    }
+
+    /// How many reference images every card actually yields, in one page load.
+    ///
+    /// Counting is not enough: an <img> can be present and its bytes unreachable. This
+    /// FETCHES each one and reports what came back, so "every theme has art" is a
+    /// measurement rather than a hope. Only counts cross the boundary, not the images —
+    /// returning the bytes for 112 cards is the 16.5 MB payload that lost eight themes.
+    @MainActor
+    static func artAudit(completion: @escaping ([(String, Int, Int)], String?) -> Void) {
+        guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
+            completion([], "No theme hub address is set on this Mac."); return
+        }
+        let js = """
+        const ready = async () => {
+          let last = -1;
+          for (let i = 0; i < 60; i++) {
+            const g = document.querySelector('.grid.ready');
+            const n = document.querySelectorAll('.card[data-name]').length;
+            if (g && n > 0 && n === last) return n;
+            last = n; await new Promise(r => setTimeout(r, 100));
+          }
+        };
+        await ready();
+        const out = [];
+        for (const c of document.querySelectorAll('.card[data-name]')) {
+          if (c.classList.contains('hidden')) continue;
+          const imgs = [...c.querySelectorAll('img')];
+          let ok = 0;
+          for (const im of imgs) {
+            const src = im.getAttribute('src') || '';
+            if (!src) continue;
+            if (src.indexOf('data:') === 0) { ok++; continue; }
+            try { const r = await fetch(src); if (r.ok && (await r.blob()).size > 0) ok++; }
+            catch (e) {}
+          }
+          out.push([c.getAttribute('data-name'), imgs.length, ok]);
+        }
+        return JSON.stringify(out);
+        """
+        GoogleWebSession.shared.evaluate(url: url, js: js, timeout: 600) { v, err in
+            if let err { completion([], err); return }
+            let raw = (v as? String) ?? "[]"
+            let rows = ((try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [[Any]]) ?? []
+            completion(rows.compactMap {
+                guard let n = $0.first as? String, $0.count >= 3,
+                      let present = $0[1] as? Int, let ok = $0[2] as? Int else { return nil }
+                return (n, present, ok)
+            }, nil)
+        }
+    }
+
+    /// Fetch one theme's reference artwork, as a data URL.
+    @MainActor
+    static func art(forThemeNamed name: String,
+                    completion: @escaping ([String], String?) -> Void) {
+        guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
+            completion([], "No theme hub address is set on this Mac."); return
+        }
+        GoogleWebSession.shared.evaluate(url: url, js: artJS(themeNamed: name)) { v, err in
+            if let err { completion([], err); return }
+            let raw = (v as? String) ?? "[]"
+            let urls = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String] ?? []
+            completion(urls, urls.isEmpty ? "no artwork on this theme’s card" : nil)
+        }
+    }
+}
+
+// ===== GDD to Assets: finding and reading a GDD =====
+//
+// The design documents live in a Drive folder that Drive for Desktop already streams
+// onto this Mac, so FINDING one is an ordinary directory listing — which is exactly
+// the thing Navigator is. Only the CONTENT needs the network: a .gdoc on disk is a
+// stub holding the document's id, and the text is fetched from Docs' plain-text
+// export through the signed-in session.
+enum GDDLibrary {
+
+    struct Entry: Identifiable, Hashable {
+        let url: URL
+        var id: URL { url }
+        var name: String { url.deletingPathExtension().lastPathComponent }
+        /// Set for a Drive stub. nil for a file whose bytes are already on disk.
+        let stub: DriveStub?
+        /// Stable identity for remembering things about this document. A Drive file
+        /// keeps its id through a rename; a local file has only its path.
+        var key: String { stub?.id ?? url.path }
+        /// Two files can share a name — the folder holds "3140 Milky Way GDD" as both a
+        /// .docx and a .gdoc. Anything writing per-document output needs them apart, or
+        /// one silently overwrites the other.
+        var uniqueName: String {
+            let ext = url.pathExtension.lowercased()
+            guard !ext.isEmpty else { return name }
+            // "Google Doc" rather than "gdoc": the point is to tell a synced Word file
+            // from the live document, and those are the words for it.
+            let kind = DriveStub.Kind(fileExtension: ext)?.label ?? ext.uppercased()
+            return "\(name) (\(kind))"
+        }
+    }
+
+    /// Results of the last scan of the GDD folder.
+    static var scanResults: [GDDScanResult] {
+        get { GDDScanRules.decode(Prefs.d.data(forKey: "gddScan")) }
+        set { Prefs.d.set(GDDScanRules.encode(newValue), forKey: "gddScan") }
+    }
+
+    /// Show every document, including the ones a scan found to declare nothing.
+    static var showEmptyDocuments: Bool {
+        get { Prefs.d.bool(forKey: "gddShowEmpty") }
+        set { Prefs.d.set(newValue, forKey: "gddShowEmpty") }
+    }
+
+    /// Read every document and record how many symbols it declares.
+    ///
+    /// Free — this is the Docs export and the parser, no image or model calls. Same
+    /// sequential walk as exportAll, for the same reason: Docs rate-limits a burst.
+    @MainActor
+    static func scanAll(from folder: URL,
+                        progress: @escaping (Int, Int, String) -> Void,
+                        done: @escaping ([GDDScanResult]) -> Void) {
+        let all = entries(in: folder)
+        var out: [GDDScanResult] = []
+        func step(_ i: Int) {
+            guard i < all.count else { done(out); return }
+            let e = all[i]
+            progress(i + 1, all.count, e.name)
+            text(of: e) { txt, err in
+                let n = txt.map { GDDSymbolSetRules.parse($0).count } ?? 0
+                out.append(GDDScanResult(key: e.key, name: e.name, symbolCount: n,
+                                         checkedAt: Date(),
+                                         failure: txt == nil ? (err ?? "couldn’t be read") : nil))
+                step(i + 1)
+            }
+        }
+        step(0)
+    }
+
+    /// Export every document in `folder` as plain text, through the SAME reader a single
+    /// document goes through.
+    ///
+    /// The parser was verified against seven .docx files because those are the only ones
+    /// readable without a Google session — and forty-nine of the sixty documents are
+    /// .gdoc stubs. Those are exactly the ones a regression would hide in. This writes
+    /// out what Navigator itself reads, so the corpus probe can check all of them.
+    ///
+    /// Sequential on purpose: Docs rate-limits a burst of exports, and a half-written
+    /// corpus is worse than a slow one.
+    @MainActor
+    static func exportAll(from folder: URL, into out: URL,
+                          progress: @escaping (Int, Int, String) -> Void,
+                          done: @escaping (Int, [String]) -> Void) {
+        let all = entries(in: folder)
+        var failures: [String] = []
+        var written = 0
+        func step(_ i: Int) {
+            guard i < all.count else { done(written, failures); return }
+            let e = all[i]
+            progress(i + 1, all.count, e.name)
+            text(of: e) { txt, err in
+                if let txt, !txt.isEmpty {
+                    let dst = out.appendingPathComponent(e.uniqueName + ".txt")
+                    if (try? txt.write(to: dst, atomically: true, encoding: .utf8)) != nil {
+                        written += 1
+                    } else {
+                        failures.append("\(e.name): couldn\u{2019}t write the file")
+                    }
+                } else {
+                    failures.append("\(e.name): \(err ?? "no text came back")")
+                }
+                step(i + 1)
+            }
+        }
+        step(0)
+    }
+
+    /// Folder of per-game production asset manifests, if there is one on this Mac.
+    ///
+    /// These are the plain-text lists of every PNG a game shipped, named
+    /// "<number>_<name>_production.txt". When a design document does not describe its
+    /// symbol set — and several do not — this is where the real answer is.
+    static var manifestFolder: URL? {
+        get {
+            guard let p = Prefs.d.string(forKey: "gddManifestFolder"), !p.isEmpty else { return nil }
+            return URL(fileURLWithPath: p)
+        }
+        set { Prefs.d.set(newValue?.path ?? "", forKey: "gddManifestFolder") }
+    }
+
+    /// The manifest for a game, by the number at the front of its document name.
+    static func manifestText(forGameNamed name: String) -> String? {
+        guard let folder = manifestFolder,
+              let number = GameAssetManifest.gameNumber(inName: name),
+              let files = try? FileManager.default.contentsOfDirectory(atPath: folder.path),
+              let match = GameAssetManifest.fileName(forGame: number, among: files) else { return nil }
+        return try? String(contentsOf: folder.appendingPathComponent(match), encoding: .utf8)
+    }
+
+    /// Where runs are written. The user picks this parent once; each run gets its own
+    /// folder inside it, named for the game and theme.
+    static var outputParent: URL? {
+        get {
+            guard let p = Prefs.d.string(forKey: "gddOutputParent"), !p.isEmpty else { return nil }
+            return URL(fileURLWithPath: p)
+        }
+        set { Prefs.d.set(newValue?.path ?? "", forKey: "gddOutputParent") }
+    }
+
+    /// The Drive folder the GDDs live in, remembered once. Any folder works — this is
+    /// only the starting point the picker opens on.
+    static var folder: URL? {
+        get {
+            guard let p = Prefs.d.string(forKey: "gddFolder"), !p.isEmpty else { return nil }
+            return URL(fileURLWithPath: p)
+        }
+        set { Prefs.d.set(newValue?.path ?? "", forKey: "gddFolder") }
+    }
+
+    /// Read a Drive stub off disk. See DriveStub for what these are and why the export
+    /// format is chosen per kind.
+    static func stub(at url: URL) -> DriveStub? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return DriveStub.parse(json: text, fileExtension: url.pathExtension)
+    }
+
+    /// Documents in `folder`, newest-looking name order. `.gdoc` stubs and plain text
+    /// files are both listed; anything else is left out rather than half-supported.
+    static func entries(in folder: URL) -> [Entry] {
+        let fm = FileManager.default
+        let items = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil,
+                                                 options: [.skipsHiddenFiles])) ?? []
+        return items.compactMap { u -> Entry? in
+            let ext = u.pathExtension.lowercased()
+            // Every Drive stub type, not just Documents: a GDD can as easily be a Sheet
+            // or a deck, and this folder is whatever the user points it at.
+            if DriveStub.Kind(fileExtension: ext) != nil { return Entry(url: u, stub: stub(at: u)) }
+            // Real bytes on disk. AppKit reads Office Open XML directly — no unzip.
+            if ["txt", "md", "docx", "rtf"].contains(ext) { return Entry(url: u, stub: nil) }
+            return nil
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// Text of a real file on disk — plain text, or a Word document read through AppKit.
+    static func localText(of url: URL) -> String? {
+        switch url.pathExtension.lowercased() {
+        case "docx", "rtf", "doc":
+            let type: NSAttributedString.DocumentType =
+                url.pathExtension.lowercased() == "rtf" ? .rtf : .officeOpenXML
+            return (try? NSAttributedString(url: url, options: [.documentType: type],
+                                            documentAttributes: nil))?.string
+        default:
+            return try? String(contentsOf: url, encoding: .utf8)
+        }
+    }
+
+    /// The document's plain text.
+    @MainActor
+    static func text(of entry: Entry, completion: @escaping (String?, String?) -> Void) {
+        guard let stub = entry.stub else {
+            // Already a real file on disk.
+            if let t = localText(of: entry.url) { completion(t, nil) }
+            else { completion(nil, "Couldn’t read \(entry.url.lastPathComponent).") }
+            return
+        }
+        if let why = stub.kind.cannotReadReason {
+            completion(nil, "\(entry.name) is a \(stub.kind.label) — \(why).")
+            return
+        }
+        guard let url = stub.exportURL else {
+            completion(nil, "\(entry.name) has an id Navigator couldn’t use.")
+            return
+        }
+        // Download the REAL file and read it with the same reader a local one goes
+        // through. Asking Docs for plain text instead loses every table, and a table is
+        // how most of these documents declare their symbols — see DriveStub.
+        GoogleWebSession.shared.fetchFile(url: url, fileExtension: stub.fileExtension) { file, err in
+            if let file {
+                defer { try? FileManager.default.removeItem(at: file) }
+                if let t = localText(of: file), !t.isEmpty { completion(t, nil); return }
+            }
+            // Sign-in is not something a different export format fixes.
+            if err == GoogleWebSession.signInNeeded { completion(nil, err); return }
+            guard let alt = stub.fallbackExportURL else {
+                completion(nil, err ?? "\(entry.name) exported, but came back empty.")
+                return
+            }
+            // Second chance, in the lossy format. A document read imperfectly beats a
+            // document not read — the loss is table structure, and the failure is total.
+            GoogleWebSession.shared.fetchPlainText(url: alt) { t, e2 in
+                guard let t, !t.isEmpty else { completion(nil, err ?? e2); return }
+                completion(t, nil)
+            }
+        }
+    }
+}
+
+// ===== GDD to Assets: the run =====
+
+/// Nano Banana 2's price per image, by resolution. Used only for the estimate shown
+/// BEFORE a run — every finished image reports its real cost from the service, and
+/// the total that gets shown at the end is the sum of those, never this table.
+/// A PNG's pixel dimensions, read from the header. Used to check what a model
+/// actually delivered against what was requested.
+/// Resize a PNG so its long edge is exactly `longEdge`, keeping the aspect.
+/// Returns nil when it is already at or below that size — nothing to do.
+func downsamplePNG(_ data: Data, longEdge: Int) -> Data? {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+          let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+    let w = cg.width, h = cg.height
+    guard max(w, h) > longEdge else { return nil }
+    let scale = Double(longEdge) / Double(max(w, h))
+    let nw = Int((Double(w) * scale).rounded()), nh = Int((Double(h) * scale).rounded())
+    guard let ctx = CGContext(data: nil, width: nw, height: nh, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: cg.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    ctx.interpolationQuality = .high
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: nw, height: nh))
+    guard let out = ctx.makeImage() else { return nil }
+    return encodePNG(out)
+}
+
+/// Put a trimmed cut-out back on the canvas its source was drawn on.
+///
+/// Photoshop trims to the subject, which breaks registration across a symbol set —
+/// see SymbolCanvasRules. Returns false (leaving the file alone) whenever the answer
+/// is not certain: a wrong offset is worse than a trimmed file, because it looks fine
+/// until the reel spins.
+@discardableResult
+func restoreSymbolCanvas(cutout: URL, source: URL, backing: RGB8) -> Bool {
+    guard let cSrc = CGImageSourceCreateWithURL(cutout as CFURL, nil),
+          let cut = CGImageSourceCreateImageAtIndex(cSrc, 0, nil),
+          let sSrc = CGImageSourceCreateWithURL(source as CFURL, nil),
+          let src = CGImageSourceCreateImageAtIndex(sSrc, 0, nil) else { return false }
+    let cw = src.width, ch = src.height
+    guard cut.width < cw || cut.height < ch else { return false }   // already full size
+
+    // Read the source into a buffer so the bounds scan is a plain array lookup.
+    var buf = [UInt8](repeating: 0, count: cw * ch * 4)
+    guard let sctx = CGContext(data: &buf, width: cw, height: ch, bitsPerComponent: 8,
+                               bytesPerRow: cw * 4, space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
+    sctx.draw(src, in: CGRect(x: 0, y: 0, width: cw, height: ch))
+    guard let bounds = SymbolCanvasRules.subjectBounds(width: cw, height: ch, backing: backing,
+              sample: { x, y in
+                  let i = (y * cw + x) * 4
+                  return RGB8(buf[i], buf[i + 1], buf[i + 2])
+              }) else { return false }
+    guard let at = SymbolCanvasRules.placement(cutout: (cut.width, cut.height), bounds: bounds,
+                                               canvas: (cw, ch)) else { return false }
+
+    guard let out = CGContext(data: nil, width: cw, height: ch, bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+    out.clear(CGRect(x: 0, y: 0, width: cw, height: ch))
+    // CoreGraphics counts y up from the bottom; the bounds were scanned top-down.
+    let flippedY = ch - at.y - cut.height
+    out.draw(cut, in: CGRect(x: at.x, y: flippedY, width: cut.width, height: cut.height))
+    guard let img = out.makeImage(), let png = encodePNG(img) else { return false }
+    do { try png.write(to: cutout); return true } catch { return false }
+}
+
+func pngPixelSize(_ data: Data) -> (w: Int, h: Int)? {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+          let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+          let w = p[kCGImagePropertyPixelWidth] as? Int,
+          let h = p[kCGImagePropertyPixelHeight] as? Int else { return nil }
+    return (w, h)
+}
+
+func nbEstimatedCost(size: String, modelFlag: String) -> Double {
+    if modelFlag == "nb-pro" {
+        switch size {
+        case "4K": return 0.240
+        case "2K": return 0.135     // measured on a live call
+        default: return 0.134
+        }
+    }
+    switch size {
+    case "4K": return 0.151
+    case "2K": return 0.101         // measured on a live call
+    default: return 0.067
+    }
+}
+
+@MainActor
+final class GDDToAssetsRun: ObservableObject {
+    @Published var jobs: [AssetJob] = []
+    @Published var theme: GameTheme?
+    @Published var gameName = ""
+    @Published var gddText = ""
+    @Published var symbols: [SlotSymbol] = []
+    /// Symbol-set lines the parser could not read. A dropped symbol is invisible
+    /// otherwise — it only shows up when someone counts the folder.
+    @Published var parseProblems: [String] = []
+    /// True when the symbols came from reading the document with a model rather than
+    /// from a symbol set it actually contains. That distinction has to survive all the
+    /// way to the screen: a document with no symbol list produced a believable-looking
+    /// two-symbol game, reported as if it were fact.
+    @Published var symbolsInferred = false
+    /// True when the set came from the game's shipped art rather than its document.
+    @Published var fromShippedArt = false
+    /// Why this symbol set may not be the real one.
+    @Published var plausibilityWarning: String?
+    /// Symbol codes the document mentions in prose but never declares.
+    @Published var undeclared: [String] = []
+    /// Reference art and style, kept by theme NAME.
+    ///
+    /// run.theme is a value type that gets reassigned from the pristine list copy
+    /// whenever the picker fires — and that copy carries no art and no style, so a
+    /// re-fire silently threw away everything fetched. The window then showed a spinner
+    /// that never resolved and "Not read yet", while the status bar still reported the
+    /// read that had succeeded. Caching by name makes reapplying it free and idempotent,
+    /// and re-picking a theme instant instead of a second paid round trip.
+    nonisolated(unsafe) static var artCache: [String: [String]] = [:]
+
+    /// The art style read off each theme's artwork, REMEMBERED between launches.
+    ///
+    /// The vision pass writes a fresh description every time, and whether it happens to
+    /// mention line art varies: Snow Queen read true/false/true and Dragon Fantasy
+    /// false/true/false across three reads of unchanged artwork. Whether the cartoon
+    /// contour gets suppressed was therefore decided by a coin toss on every launch.
+    ///
+    /// A theme's approved artwork changes rarely, so the style is read ONCE and kept. The
+    /// window offers "Re-read" for when the art on the hub actually changes. This also
+    /// stops paying for the same vision call repeatedly.
+    static var styleCache: [String: String] {
+        get {
+            guard let d = Prefs.d.data(forKey: "themeStyleCache"),
+                  let m = try? JSONDecoder().decode([String: String].self, from: d)
+            else { return [:] }
+            return m
+        }
+        set { Prefs.d.set(try? JSONEncoder().encode(newValue), forKey: "themeStyleCache") }
+    }
+
+    /// Put anything already known for this theme back on it.
+    func rehydrate() {
+        guard var t = theme else { return }
+        var changed = false
+        if t.artDataURLs.isEmpty, let art = Self.artCache[t.name], !art.isEmpty {
+            t.artDataURLs = art; t.artDataURL = art[0]; changed = true
+        }
+        if t.styleFromArt.isEmpty, let st = Self.styleCache[t.name], !st.isEmpty {
+            t.styleFromArt = st; styleRead = .ok; changed = true
+        }
+        if changed { theme = t }
+    }
+
+    /// Where the reference-art style read has got to.
+    ///
+    /// The window used to infer this from `styleFromArt.isEmpty`, which cannot tell
+    /// "not started" from "failed" from "this card has no art" — and said the wrong one.
+    enum StyleRead: Equatable {
+        case idle, fetchingArt, reading, ok, noArt, failed(String)
+    }
+    @Published var styleRead: StyleRead = .idle
+    @Published var palette: [RGB8] = []
+    @Published var backing = SlotBackingRules.candidates[2]
+    @Published var missing: [String] = []
+    @Published var status = ""
+    @Published var busy = false
+    @Published var running = false
+    @Published var doneCount = 0
+    @Published var spent: Double = 0
+    @Published var failures: [String: String] = [:]
+    @Published var produced: [URL] = []
+    /// What each finished image actually came back as, e.g. "2048x2048". Shown per
+    /// row because the requested size is not a promise — see GeneratedSizeRules.
+    @Published var delivered: [String: String] = [:]
+    /// Splitting frames off the symbols, after the cutout.
+    @Published var layering = false
+    /// Set by Stop. Checked between batches, so the requests already in flight are
+    /// finished and saved — they are paid for either way — and nothing new is sent.
+    @Published var stopRequested = false
+    /// The folder the last batch wrote into, so a retry lands beside its own set
+    /// instead of scattering one game across two folders.
+    @Published private(set) var lastFolder: URL?
+
+    /// After Effects is still keying, but the paid work is over and the window is free.
+    @Published var keying = false
+    /// Nano Banana 2 by default. Pro is offered because NB2 does not reliably honour
+    /// a 2K request and Pro did in testing.
+    @Published var modelFlag = "nb2"
+
+    /// Bumped whenever the inputs change. A planning answer that arrives after the
+    /// user has switched document or theme belongs to a game that is no longer on
+    /// screen, and installing it would pair one game's subjects with another's art
+    /// direction — which then gets generated and paid for.
+    private var revision = 0
+    func invalidate() { revision += 1 }
+
+    var clashes: [String: [String]] { GDDAssetPrompts.silhouetteClashes(jobs) }
+    var planned: Bool { !jobs.isEmpty && jobs.allSatisfy { !$0.subject.isEmpty } }
+
+    /// Read the GDD and work out what has to be drawn.
+    func load(gddText text: String, gameName name: String, size: String,
+              symbolAspect: String, backgroundAspect: String, backgroundSize: String) {
+        revision += 1
+        gddText = text; gameName = name
+        let read = GDDSymbolSetRules.parseWithProblems(text)
+        symbols = read.symbols
+        parseProblems = read.problems
+        symbolsInferred = false
+        undeclared = []
+        plausibilityWarning = GDDSymbolPlausibility.warning(read.symbols, inferred: false)
+
+        // A document that does not describe its symbols is not the end of the road: the
+        // game's shipped art does. Only consulted when the document has failed to give a
+        // credible set, so a good GDD is still the source of truth.
+        if plausibilityWarning != nil || read.symbols.isEmpty,
+           let manifest = GDDLibrary.manifestText(forGameNamed: name) {
+            let shipped = GameAssetManifest.symbols(fromManifest: manifest)
+            if shipped.count > read.symbols.count {
+                symbols = shipped
+                fromShippedArt = true
+                plausibilityWarning = GDDSymbolPlausibility.warning(shipped, inferred: false)
+            }
+        }
+        // No symbol set means no plan — not "no symbols, but here are two backgrounds".
+        // Scene names are found by looking for words like "free games" in the prose, so
+        // they turn up in ANY document, including ones that declare nothing at all. That
+        // put a pair of paid 4K backgrounds in front of the user under a message saying
+        // the document was unreadable.
+        jobs = symbols.isEmpty ? []
+            : AssetPlanRules.symbolJobs(symbols, size: size, aspect: symbolAspect)
+              + AssetPlanRules.backgroundJobs(gddText: text, size: backgroundSize,
+                                              aspect: backgroundAspect)
+        missing = []; palette = []
+        // Codes the document talks about but never declares. Reported, never added.
+        undeclared = GDDSymbolSetRules.mentionedButNotDeclared(in: text, symbols: symbols)
+
+        // Pass or fail, and say which. Nothing is inferred to paper over a failed read.
+        status = symbols.isEmpty
+            ? "This document doesn’t declare a symbol set — no symbol list, table or "
+            + "described list in it. Use “No GDD yet — type the set” to enter one."
+            : "\(symbols.count) symbols · \(jobs.count) images to make."
+              + (parseProblems.isEmpty ? ""
+                 : "  ⚠️ \(parseProblems.count) line\(parseProblems.count == 1 ? "" : "s") in the symbol set couldn’t be read — check the plan for missing symbols.")
+              + (GDDPayOrder.note(for: text, symbols: symbols).map { "  " + $0 } ?? "")
+    }
+
+    /// Read the rendering style off the theme's own reference artwork.
+    ///
+    /// Uses the same vision pass Restyle uses to lift a style from a reference image —
+    /// subject-free text describing HOW something is drawn. The art is deliberately not
+    /// sent to the image model as an input: with a single input image Nano Banana treats
+    /// it as the thing to EDIT, so a reference would come back restyled rather than
+    /// informing a new symbol. Turning it into words sidesteps that entirely.
+    func readThemeStyle(completion: (() -> Void)? = nil) {
+        guard let t0 = theme else { completion?(); return }
+        guard t0.styleFromArt.isEmpty else { styleRead = .ok; completion?(); return }
+        // A remembered STYLE must not skip fetching the ARTWORK. It did, and the window
+        // sat on a spinner that never resolved — the artwork is what the thumbnail shows,
+        // and it is fetched every session because it is never persisted. Only the paid
+        // vision call is skipped, further down, once the bytes are in hand.
+        // The artwork is fetched now, for this one theme, rather than shipped with the
+        // list. Sending all 119 images in the list made a 16.5 MB payload that lost both
+        // themes and artwork — see ThemeHubClient.extractionJS.
+        guard t0.artBase64 != nil else {
+            guard t0.hasArt else {
+                styleRead = .noArt
+                status = "\(t0.name) has no artwork on its hub card — its written look "
+                       + "will be used, or choose an art style."
+                completion?()
+                return
+            }
+            busy = true
+            styleRead = .fetchingArt
+            status = "Fetching \(t0.name)’s reference artwork…"
+            ThemeHubClient.art(forThemeNamed: t0.name) { [weak self] urls, err in
+                guard let self else { return }
+                self.busy = false
+                guard !urls.isEmpty, let t = self.theme, t.name == t0.name else {
+                    // A theme change mid-fetch is not a failure of this theme.
+                    if self.theme?.name == t0.name {
+                        self.styleRead = .failed(err ?? "the artwork could not be fetched")
+                        self.status = "Couldn’t fetch \(t0.name)’s reference artwork: "
+                                    + "\(err ?? "unknown error"). Its written look will be used."
+                    }
+                    completion?()
+                    return
+                }
+                _ = t
+                // Mutate in place. Assigning a captured copy back reverts anything
+                // else that changed while the fetch was running.
+                self.theme?.artDataURLs = urls
+                self.theme?.artDataURL = urls[0]
+                Self.artCache[t0.name] = urls
+                // Now the vision pass, with the bytes in hand.
+                self.readThemeStyle(completion: completion)
+            }
+            return
+        }
+        guard var t = theme, let b64 = t.artBase64,
+              let jpeg = Data(base64Encoded: b64) else { completion?(); return }
+        // Artwork is in hand. If the style was read before, reuse it: same answer as last
+        // time instead of a fresh roll, and no charge.
+        if let remembered = Self.styleCache[t.name], !remembered.isEmpty {
+            theme?.styleFromArt = remembered
+            styleRead = .ok
+            status = "Art style for \(t.name) — remembered from the last read."
+            completion?()
+            return
+        }
+        busy = true
+        styleRead = .reading
+        status = "Reading the art style from \(t.name)’s reference art…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            // The hub serves JPEG; the vision endpoint is told PNG, so re-encode rather
+            // than mislabel the bytes.
+            let png: Data
+            if let src = CGImageSourceCreateWithData(jpeg as CFData, nil),
+               let cg = CGImageSourceCreateImageAtIndex(src, 0, nil), let p = encodePNG(cg) {
+                png = p
+            } else { png = jpeg }
+            let r = analyzeStyle(referencePNG: png)
+            DispatchQueue.main.async {
+                self.busy = false
+                // Reading the reference art is a paid vision call. Dropping its cost made
+                // "Spent so far" quietly wrong, which is the one number that must not be.
+                self.spent += r.cost ?? 0
+                if let text = r.text, !text.isEmpty {
+                    self.theme?.styleFromArt = text
+                    var c = Self.styleCache; c[t.name] = text; Self.styleCache = c
+                    self.styleRead = .ok
+                    self.status = "Art style read from \(t.name)’s reference art."
+                } else {
+                    let why = r.error ?? "the model returned nothing"
+                    self.styleRead = .failed(why)
+                    self.status = "Couldn’t read \(t.name)’s reference art: \(why)"
+                }
+                completion?()
+            }
+        }
+    }
+
+    /// Build a plan from a symbol set typed by hand, for a game with no GDD yet.
+    func loadManual(_ spec: String, gameName name: String, size: String,
+                    symbolAspect: String, backgroundAspect: String, backgroundSize: String) {
+        revision += 1
+        let r = GDDSymbolSetRules.parseManual(spec)
+        gddText = ""                       // there is no document; say so rather than fake one
+        gameName = name.isEmpty ? "Untitled game" : name
+        symbols = r.symbols
+        parseProblems = r.problems
+        symbolsInferred = false; fromShippedArt = false
+        plausibilityWarning = GDDSymbolPlausibility.warning(r.symbols, inferred: false)
+        jobs = AssetPlanRules.symbolJobs(r.symbols, size: size, aspect: symbolAspect)
+            + AssetPlanRules.backgroundJobs(gddText: "base game and free spins bonus game",
+                                            size: backgroundSize, aspect: backgroundAspect)
+        missing = []; palette = []
+        status = r.symbols.isEmpty
+            ? "Type the symbols this game needs, e.g. \(GDDSymbolSetRules.typicalSet)"
+            : "\(r.symbols.count) symbols · \(jobs.count) images to make."
+              + (r.problems.isEmpty ? "" : "  Couldn’t read: \(r.problems.joined(separator: ", "))")
+    }
+
+    /// Read the symbol set out of a document the parsers could not.
+    ///
+    /// Runs only when the structured parses found nothing, so the common case still
+    /// costs nothing and stays deterministic.
+    func extractSymbolsWithModel(size: String, symbolAspect: String,
+                                 backgroundAspect: String, backgroundSize: String,
+                                 completion: (() -> Void)? = nil) {
+        guard symbols.isEmpty, !gddText.isEmpty else { completion?(); return }
+        busy = true
+        status = "No symbol list in that document — reading it with Gemini…"
+        let text = gddText
+        let rev = revision
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = H5GService.describe(prompt: GDDAssetPrompts.symbolExtraction(gddText: text),
+                                        systemPrompt: GDDAssetPrompts.symbolExtractionSystem,
+                                        imagePNG: nil)
+            DispatchQueue.main.async {
+                self.busy = false
+                self.spent += r.cost ?? 0
+                guard rev == self.revision else { completion?(); return }
+                guard let t = r.text, let j = GDDAssetPrompts.json(fromModelReply: t) else {
+                    self.status = "Couldn’t find a symbol set in that document."
+                    completion?(); return
+                }
+                let found = GDDAssetPrompts.symbols(fromExtraction: j)
+                guard !found.isEmpty else {
+                    self.status = "That document doesn’t describe a symbol set."
+                    completion?(); return
+                }
+                self.symbols = found
+                self.symbolsInferred = true
+                self.plausibilityWarning = GDDSymbolPlausibility.warning(found, inferred: true)
+                self.jobs = AssetPlanRules.symbolJobs(found, size: size, aspect: symbolAspect)
+                    + AssetPlanRules.backgroundJobs(gddText: text, size: backgroundSize,
+                                                    aspect: backgroundAspect)
+                self.status = "\(found.count) symbols read from the document · \(self.jobs.count) images to make. "
+                            + "Check them — this document had no symbol list, so these were inferred."
+                completion?()
+            }
+        }
+    }
+
+    /// The designer pass: one model call that assigns a subject to every slot.
+    func designSet(completion: (() -> Void)? = nil) {
+        guard let theme else { status = "Pick a theme first."; return }
+        guard !jobs.isEmpty else { status = "Load a GDD first."; return }
+        busy = true; status = "Designing the symbol set…"
+        let prompt = GDDAssetPrompts.planning(theme: theme, gameName: gameName, jobs: jobs,
+                                              gddText: gddText)
+        let sys = GDDAssetPrompts.planningSystem
+        // Thinking stays at the documented default (MEDIUM). HIGH was measured over three
+        // runs against the same GDD and did not improve adherence — frames rose 3.7->4.0
+        // but the low-pay subjects fell 3.0->2.0 and the named characters 5.0->4.7, at 8%
+        // more cost. The lever exists and is one line away if a harder document wants it.
+        H5GService.thinkingLevel = nil
+        // The ENVELOPE is constrained; subject and silhouette stay free text. Constraining
+        // the creative fields is the one thing the published work on forced structured
+        // output suggests costs quality, and it would buy nothing here.
+        H5GService.responseSchema = GDDAssetPrompts.planSchema(ids: jobs.map(\.id))
+        let snapshot = jobs
+        let rev = revision
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = H5GService.describe(prompt: prompt, systemPrompt: sys, imagePNG: nil)
+            DispatchQueue.main.async {
+                // Per-call settings, cleared so a later style read does not inherit them.
+                H5GService.thinkingLevel = nil
+                H5GService.responseSchema = nil
+                self.busy = false
+                // Count what the service charged BEFORE deciding whether the answer was
+                // usable. A billed reply that turns out not to be JSON still cost money,
+                // and dropping it made the running total quietly understate the spend.
+                self.spent += r.cost ?? 0
+                guard rev == self.revision else {
+                    self.status = "That plan was for a different game — design the set again."
+                    completion?(); return
+                }
+                if let e = r.error { self.status = "Couldn’t design the set: \(e)"; completion?(); return }
+                guard let text = r.text, let j = GDDAssetPrompts.json(fromModelReply: text) else {
+                    self.status = "The model didn’t answer with a plan. Try again."
+                    completion?(); return
+                }
+                let applied = GDDAssetPrompts.apply(planJSON: j, to: snapshot)
+                self.jobs = applied.jobs
+                self.missing = applied.missing
+                self.palette = applied.palette
+                self.backing = SlotBackingRules.choose(palette: applied.palette)
+                var s = "Set designed — \(applied.jobs.count - applied.missing.count) of \(applied.jobs.count) filled."
+                s += " Backing: \(self.backing.name)."
+                if !applied.missing.isEmpty { s += " Missing: \(applied.missing.joined(separator: ", "))." }
+                self.status = s
+                completion?()
+            }
+        }
+    }
+
+    var estimate: Double { estimate(for: nil) }
+
+    /// What a batch will cost. `ids` scopes it to a retry.
+    func estimate(for ids: Set<String>?) -> Double {
+        jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
+            .reduce(0) { $0 + nbEstimatedCost(size: $1.size, modelFlag: modelFlag) }
+    }
+
+    /// Generate every planned image into `folder`.
+    ///
+    /// Sequential on purpose: the service meters per user, and a failure partway
+    /// through a parallel fan-out leaves an unclear bill and a half-written folder.
+    /// Each image is saved the moment it arrives, so stopping early still leaves
+    /// everything that was paid for on disk.
+    /// Drops to one worker for the rest of a run once the service has pushed back.
+    private let widthLock = NSLock()
+    private var _parallelWidth = ImageRequestPolicy.concurrency
+    /// Consecutive successes since the pool was last narrowed.
+    private var _cleanRun = 0
+    var parallelWidth: Int {
+        get { widthLock.lock(); defer { widthLock.unlock() }; return _parallelWidth }
+        set { widthLock.lock(); _parallelWidth = newValue; widthLock.unlock() }
+    }
+
+    /// One request, with the documented retry policy around it.
+    ///
+    /// Google's API-errors page recommends retrying "no more than two times" with a
+    /// minimum one-second delay increasing exponentially, and names 429, 408 and
+    /// transient 5xx as the retryable statuses. An error carrying NO status is a
+    /// transport failure, and those are deliberately not retried: the image may already
+    /// have been generated and metered, so a blind replay would pay for it twice.
+    private func request(_ job: AssetJob, theme: GameTheme, backing: (name: String, rgb: RGB8),
+                         model: String, size: String) -> (png: Data?, cost: Double, error: String?) {
+        var cost = 0.0
+        let prompt = GDDAssetPrompts.image(job: job, theme: theme, backing: backing)
+        for attempt in 1...ImageRequestPolicy.maxAttempts {
+            let r = H5GService.image(prompt: prompt, modelID: model, inputPNGs: [],
+                                     aspect: job.aspect, size: size)
+            cost += r.cost ?? 0
+            if r.png != nil {
+                // Widen again after a run of clean results, so a single blip early in a
+                // batch does not cost the rest of it a worker.
+                widthLock.lock()
+                _cleanRun += 1
+                if _cleanRun >= ImageRequestPolicy.widenAfterSuccesses,
+                   _parallelWidth < ImageRequestPolicy.concurrency {
+                    _parallelWidth += 1
+                    _cleanRun = 0
+                }
+                widthLock.unlock()
+                return (r.png, cost, nil)
+            }
+            guard let e = r.error, ImageRequestPolicy.shouldRetry(errorMessage: e),
+                  attempt < ImageRequestPolicy.maxAttempts else { return (nil, cost, r.error) }
+            // Narrow by one rather than collapsing to serial. A single transient 429 used
+            // to pin the width at 1 for the remainder of the run, so one blip cost the
+            // whole batch its parallelism.
+            widthLock.lock()
+            _parallelWidth = max(1, _parallelWidth - 1)
+            _cleanRun = 0
+            widthLock.unlock()
+            Thread.sleep(forTimeInterval: ImageRequestPolicy.backoff(
+                forAttempt: attempt, jitter: Double.random(in: 0...1)))
+        }
+        return (nil, cost, "gave up after \(ImageRequestPolicy.maxAttempts) attempts")
+    }
+
+    /// Generate one asset and write it. Reports progress and cost on the main thread.
+    fileprivate func generateOne(job: AssetJob, theme: GameTheme,
+                                 backing: (name: String, rgb: RGB8),
+                                 model: String, folder: URL) {
+        DispatchQueue.main.async { self.status = "Generating \(job.id)…" }
+        var r = request(job, theme: theme, backing: backing, model: model, size: job.size)
+
+        // The requested size is not honoured reliably, so it is CHECKED, and a short
+        // answer is escalated rather than accepted. Google documents an exact
+        // size-by-aspect table and the short answers land exactly on its 1K row, so
+        // asking again at the same size is a coin flip; 4K is not. The result is scaled
+        // back to the size that was asked for. This applies to 4K jobs too — a 4K
+        // background came back 896x1200 once, and the first version of this skipped it.
+        var escalations = 0
+        while escalations < 2, let png = r.png, let d = pngPixelSize(png),
+              GeneratedSizeRules.isUndersized(longEdge: max(d.w, d.h), requested: job.size) {
+            escalations += 1
+            let again = request(job, theme: theme, backing: backing, model: model, size: "4K")
+            r.cost += again.cost
+            guard let p2 = again.png, let d2 = pngPixelSize(p2),
+                  max(d2.w, d2.h) > max(d.w, d.h) else { continue }
+            r.png = downsamplePNG(p2, longEdge: GeneratedSizeRules.targetLongEdge(job.size)) ?? p2
+        }
+
+        if let png = r.png {
+            if let d = pngPixelSize(png) {
+                let text = GeneratedSizeRules.describe(width: d.w, height: d.h)
+                DispatchQueue.main.async { self.delivered[job.id] = text }
+            }
+            let dst = folder.appendingPathComponent(job.filename)
+            do {
+                try png.write(to: dst)
+                DispatchQueue.main.async { self.produced.append(dst) }
+            } catch {
+                DispatchQueue.main.async { self.failures[job.id] = error.localizedDescription }
+            }
+        } else {
+            DispatchQueue.main.async { self.failures[job.id] = r.error ?? "no image returned" }
+        }
+        let c = r.cost
+        DispatchQueue.main.async { self.doneCount += 1; self.spent += c }
+    }
+
+    /// `only` restricts the batch to those job ids — what "Retry failed" uses. Without
+    /// it a single failure out of twenty-two could only be recovered by paying for all
+    /// twenty-two again.
+    func generate(into folder: URL, removeBackground: Bool, separateFrames: Bool = false,
+                  only: Set<String>? = nil,
+                  onFinished: @escaping ([URL]) -> Void) {
+        let todo = jobs.filter {
+            !$0.subject.isEmpty && (only == nil || only!.contains($0.id))
+        }
+        guard !todo.isEmpty, let theme else { return }
+        running = true; doneCount = 0; produced = []; delivered = [:]
+        stopRequested = false
+        parallelWidth = ImageRequestPolicy.concurrency   // a fresh run starts wide again
+        lastFolder = folder
+        // A retry clears only the rows it is retrying — the other failures are still
+        // failures and must stay on screen.
+        if let only { failures = failures.filter { !only.contains($0.key) } }
+        else { failures = [:] }
+        parallelWidth = ImageRequestPolicy.concurrency
+        status = "Generating 1 of \(todo.count)…"
+        let backing = self.backing
+        let model = NanoBananaModel.byFlag(self.modelFlag).id
+        // Two at a time, not one — and not more. Google documents no concurrency limit
+        // for online image generation, and this runs through a metering proxy whose own
+        // limits are invisible from here, so ImageRequestPolicy takes the smallest step
+        // above the sequential baseline that was already working, staggers the starts,
+        // and gives up the second worker at the first sign of pushback rather than
+        // discovering a hidden ceiling by failing twenty images at once.
+        DispatchQueue.global(qos: .userInitiated).async {
+            // A CONTINUOUS POOL, not batches behind a barrier.
+            //
+            // This used to take a slice of `width` jobs and group.wait() for all of them
+            // before starting the next slice. Image times vary a lot — 8 seconds against
+            // 20 is ordinary — so every slice ran at the speed of its slowest member and
+            // the other worker sat idle until it finished. A worker here takes the next
+            // job the moment it finishes its own, so the only idle time is at the very end.
+            let next = NSLock()
+            var cursor = 0
+            var stopped = false
+            func take() -> AssetJob? {
+                next.lock(); defer { next.unlock() }
+                guard cursor < todo.count else { return nil }
+                if DispatchQueue.main.sync(execute: { self.stopRequested }) {
+                    stopped = true
+                    return nil
+                }
+                defer { cursor += 1 }
+                return todo[cursor]
+            }
+            let group = DispatchGroup()
+            for w in 0..<max(1, ImageRequestPolicy.concurrency) {
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                    deadline: .now() + Double(w) * ImageRequestPolicy.staggerSeconds) {
+                    defer { group.leave() }
+                    while let job = take() {
+                        // A worker beyond the current width parks instead of exiting, so
+                        // the pool can widen again after the service stops pushing back.
+                        while w >= self.parallelWidth && !stopped {
+                            Thread.sleep(forTimeInterval: 0.5)
+                        }
+                        if stopped { return }
+                        self.generateOne(job: job, theme: theme, backing: backing,
+                                         model: model, folder: folder)
+                    }
+                }
+            }
+            group.wait()
+            let out = DispatchQueue.main.sync { self.produced }
+            DispatchQueue.main.async {
+                // `running` deliberately stays true until After Effects has finished too.
+                // Clearing it here let a second paid batch start while the first batch's
+                // files were still being read and rewritten, into the same filenames.
+                let ok = out.count, bad = self.failures.count
+                let skipped = todo.count - ok - bad
+                self.status = String(format: "Made %d of %d image%@%@%@ · $%.2f so far.",
+                                     ok, todo.count, todo.count == 1 ? "" : "s",
+                                     bad > 0 ? ", \(bad) failed" : "",
+                                     stopped && skipped > 0 ? ", \(skipped) not started (stopped)" : "",
+                                     self.spent)
+                // Only the symbols are keyed — a background is meant to stay opaque.
+                let symbolPNGs = out.filter { u in
+                    todo.first { $0.filename == u.lastPathComponent }?.kind == .symbol
+                }
+                // The run is FINISHED when the images are made and paid for. Background
+                // removal is a long local After Effects job with its own progress bar, and
+                // holding the window hostage for ten minutes of it — unable to start the
+                // next game, unable to see what arrived — is not what "done" should mean.
+                // Each run writes to its own folder, so a second run cannot tread on this
+                // one's files while they are being keyed.
+                self.running = false
+                onFinished(out)
+                // Photoshop, NOT the After Effects chroma key.
+                //
+                // Keylight is a CHROMA key: it decides transparency from how close a
+                // pixel is to the screen colour, and then despills — pulls that colour
+                // back out of everything it kept. On a magenta field that means removing
+                // red and blue from the whole symbol, which is why a gold-and-crimson
+                // giant came back uniformly green. Photoshop's background removal picks
+                // the SUBJECT instead, and never touches the colours inside it.
+                //
+                // Backgrounds are excluded by construction — symbolPNGs is filtered to
+                // kind == .symbol. A background IS the background; there is nothing to
+                // take off it.
+                if removeBackground && !symbolPNGs.isEmpty {
+                    self.keying = true
+                    self.status += "  Removing symbol backgrounds in Photoshop — carrying on in the background."
+                    let backingRGB = backing.rgb
+                    removeBackgroundForImages(symbolPNGs) { done in
+                        // Photoshop trims to the subject; a symbol SET has to register,
+                        // so each cut-out goes back on the canvas it was drawn on.
+                        var restored = 0
+                        for cut in done {
+                            let name = cut.lastPathComponent
+                                .replacingOccurrences(of: "_rmbg.png", with: ".png")
+                            let src = cut.deletingLastPathComponent().appendingPathComponent(name)
+                            if FileManager.default.fileExists(atPath: src.path),
+                               restoreSymbolCanvas(cutout: cut, source: src, backing: backingRGB) {
+                                restored += 1
+                            }
+                        }
+                        self.keying = false
+                        self.status = done.isEmpty
+                            ? "Background removal didn’t produce anything — check Photoshop."
+                            : "Backgrounds removed from \(done.count) of \(symbolPNGs.count) symbols"
+                              + (restored > 0 ? ", \(restored) put back on full canvas." : ".")
+                        // Frames were drawn WITH their symbols so the two would match. Splitting
+                        // them afterwards is what makes the frame reusable and the symbol
+                        // animatable — the old pipeline generated them apart and they never
+                        // lined up. Only the framed ones: a card royal has nothing to split.
+                        guard separateFrames else { return }
+                        let framed = done.filter { url in
+                            let base = url.lastPathComponent.replacingOccurrences(of: "_rmbg.png", with: "")
+                            return todo.first { $0.id == base }?.hasFrame == true
+                        }
+                        guard !framed.isEmpty else { return }
+                        self.layering = true
+                        self.status += "  Splitting frames off \(framed.count) symbols…"
+                        layerizeImages(framed) { layers in
+                            self.layering = false
+                            self.status = layers.isEmpty
+                                ? "Frame separation produced nothing — check the fal.ai key."
+                                : "Frames separated from \(framed.count) symbols."
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ===== GDD to Assets: the window =====
+
+struct GDDToAssetsSheet: View {
+    // Owned by the window, not the view, so the window's own close button can ask the
+    // same question the Close button asks. A paid batch must not be able to slip
+    // behind a closed window where nobody can see it, stop it, or learn what it spent.
+    @ObservedObject var run: GDDToAssetsRun
+    let onClose: () -> Void
+
+    @State private var gddFolder: URL? = GDDLibrary.folder
+    @State private var entries: [GDDLibrary.Entry] = []
+    @State private var exporting = false
+    @State private var scanning = false
+    /// false = use the style read from the theme's reference art; true = a chosen one.
+    @State private var styleMode = false
+    @State private var styleID = ""
+    @State private var styleQuery = ""
+    @State private var themeListOpen = false
+    /// Which reference image is showing, when a card carries several.
+    @State private var artIndex = 0
+    private let artTimer = Timer.publish(every: 3.5, on: .main, in: .common).autoconnect()
+
+    /// The image currently on show, decoded from its data URL.
+    private func artImage(_ t: GameTheme) -> NSImage? {
+        let urls = t.artDataURLs.isEmpty ? (t.artDataURL.isEmpty ? [] : [t.artDataURL])
+                                         : t.artDataURLs
+        guard !urls.isEmpty else { return nil }
+        let url = urls[artIndex % urls.count]
+        guard let r = url.range(of: ";base64,") else { return nil }
+        guard let d = Data(base64Encoded: String(url[r.upperBound...])) else { return nil }
+        return NSImage(data: d)
+    }
+    @State private var scan: [GDDScanResult] = GDDLibrary.scanResults
+    @State private var showEmpty = GDDLibrary.showEmptyDocuments
+
+    /// Documents a scan found to declare no symbol set. Not hidden until scanned, and
+    /// never hidden when the read FAILED — that is our problem, not the document's.
+    private var hiddenKeys: Set<String> { GDDScanRules.hiddenKeys(scan) }
+    private var visibleEntries: [GDDLibrary.Entry] {
+        showEmpty ? entries : entries.filter { !hiddenKeys.contains($0.key) }
+    }
+    private var hiddenCount: Int { entries.count - visibleEntries.count }
+
+    /// Search hits, always including whatever is currently selected. A Picker whose
+    /// selection is not among its own rows renders blank, so narrowing the search made
+    /// the chosen style look as though it had been lost.
+    private var searchResults: [SlotArtStyle] {
+        var r = SlotArtStyles.search(styleQuery)
+        if let sel = SlotArtStyles.byID(styleID), !r.contains(sel) { r.insert(sel, at: 0) }
+        return r
+    }
+    /// Names held by more than one file in the folder.
+    private var duplicateNames: Set<String> {
+        var seen = Set<String>(), dupes = Set<String>()
+        for e in entries where !seen.insert(e.name).inserted { dupes.insert(e.name) }
+        return dupes
+    }
+    @State private var pickedGDD: GDDLibrary.Entry?
+    @State private var themes: [GameTheme] = []
+    @State private var themeQuery = ""
+    @State private var pickedTheme: GameTheme?
+    @State private var outParent: URL? = GDDLibrary.outputParent
+    @State private var size = AssetPlanRules.defaultSize
+    @State private var symbolAspect = AssetPlanRules.symbolAspect
+    @State private var backgroundAspect = AssetPlanRules.backgroundAspect
+    @State private var backgroundSize = AssetPlanRules.backgroundSize
+    @State private var removeBG = true
+    @State private var separateFrames = false
+    @State private var loadingThemes = false
+    /// Which folder the in-app picker is choosing, if it is open.
+    @State private var picking: PickTarget?
+    /// Working from a document, or from a set typed by hand.
+    @State private var fromDocument = true
+    @State private var manualSpec = GDDSymbolSetRules.typicalSet
+    @State private var manualName = ""
+
+    enum PickTarget: Identifiable, Hashable { case gdds, output, manifests
+        var id: Int { self == .gdds ? 0 : self == .output ? 1 : 2 } }
+
+    /// Tier and votes as two fixed-width, right-aligned columns.
+    ///
+    /// Fixed widths are what makes every row line up: the tier column is as wide as "T1"
+    /// ever needs, the vote column as wide as a two-digit count, and a theme with no
+    /// tier or no votes still occupies them so the row below does not shift left.
+    @ViewBuilder private func themeColumns(_ t: GameTheme) -> some View {
+        HStack(spacing: 10) {
+            Text(t.tier).font(.callout.monospacedDigit())
+                .foregroundColor(.secondary)
+                .frame(width: 26, alignment: .trailing)
+            HStack(spacing: 3) {
+                if t.votes > 0 {
+                    Text("👍").font(.caption)
+                    Text("\(t.votes)").font(.callout.monospacedDigit())
+                }
+            }
+            .frame(width: 34, alignment: .trailing)
+        }
+    }
+
+    @ViewBuilder private var themeList: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(filteredThemes, id: \.name) { t in
+                        Button {
+                            pickedTheme = t
+                            themeListOpen = false
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(t.name).lineLimit(1)
+                                Spacer(minLength: 12)
+                                themeColumns(t)
+                            }
+                            .padding(.horizontal, 12).padding(.vertical, 5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(pickedTheme?.name == t.name
+                                        ? Color.accentColor.opacity(0.25) : .clear)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(width: 460, height: min(520, CGFloat(filteredThemes.count) * 26 + 16))
+        }
+    }
+
+    private var filteredThemes: [GameTheme] {
+        let q = themeQuery.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return themes }
+        return themes.filter {
+            $0.name.lowercased().contains(q) || $0.category.lowercased().contains(q)
+                || $0.look.lowercased().contains(q)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    step(1, fromDocument ? "Game design document" : "Symbols this game needs") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Picker("", selection: $fromDocument) {
+                                Text("Read a GDD").tag(true)
+                                Text("No GDD yet — type the set").tag(false)
+                            }
+                            .pickerStyle(.segmented).frame(width: 340)
+                            .disabled(run.busy || run.running)
+                            if fromDocument { gddStep } else { manualStep }
+                        }
+                    }
+                    step(2, "Theme and art direction") { themeStep }
+                    step(3, "Where it goes, and how big") { outputStep }
+                    if !run.jobs.isEmpty { step(4, "The asset plan") { planStep } }
+                }
+                .padding(20)
+            }
+            Divider()
+            footer
+        }
+        .frame(minWidth: 940, minHeight: 700)
+        .onAppear {
+            if let f = gddFolder { entries = GDDLibrary.entries(in: f) }
+            loadThemes()
+        }
+        .sheet(item: $picking) { which in
+            NavigatorFolderPicker(
+                title: which == .gdds ? "Choose the GDDs folder"
+                     : which == .manifests ? "Choose the folder of production asset lists"
+                     : "Choose where the art goes",
+                start: which == .gdds ? (gddFolder ?? GDDLibrary.folder)
+                     : which == .manifests ? GDDLibrary.manifestFolder
+                     : (outParent ?? GDDLibrary.outputParent),
+                onChoose: { u in
+                    picking = nil
+                    if which == .manifests {
+                        GDDLibrary.manifestFolder = u
+                        run.status = "Asset lists: \(u.lastPathComponent). Used when a document doesn’t describe its symbols."
+                    } else if which == .gdds {
+                        gddFolder = u; GDDLibrary.folder = u
+                        entries = GDDLibrary.entries(in: u)
+                        run.status = entries.isEmpty
+                            ? "No Google Docs or text files in that folder."
+                            : "\(entries.count) documents found."
+                    } else {
+                        outParent = u; GDDLibrary.outputParent = u
+                    }
+                },
+                onCancel: { picking = nil })
+        }
+    }
+
+    @ViewBuilder
+    private func step<C: View>(_ n: Int, _ title: String, @ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("\(n)").font(.caption.bold()).foregroundColor(.white)
+                    .frame(width: 18, height: 18).background(Circle().fill(Color.accentColor))
+                Text(title).font(.headline)
+            }
+            content().padding(.leading, 26)
+        }
+    }
+
+    // MARK: Step 1 — the GDD
+
+    @ViewBuilder private var gddStep: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(gddFolder?.lastPathComponent ?? "No folder chosen")
+                    .foregroundColor(gddFolder == nil ? .secondary : .primary)
+                Button("Choose folder…") { chooseGDDFolder() }
+                if gddFolder != nil {
+                    Text(hiddenCount > 0 ? "\(visibleEntries.count) of \(entries.count) documents"
+                                         : "\(entries.count) documents")
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button(GDDLibrary.manifestFolder == nil ? "Asset lists…" : "Asset lists ✓") {
+                    picking = .manifests
+                }
+                .help("Optional: a folder of <game>_production.txt asset lists. Used when a document doesn’t describe its symbols.")
+                Button(scanning ? "Checking…" : "Check documents…") { scanGDDs() }
+                    .disabled(entries.isEmpty || scanning || exporting)
+                    .help("Read every document and note which ones declare a symbol set. "
+                        + "The ones that declare none are hidden from the list. "
+                        + "Free; no image or model calls.")
+                Button("Export all as text…") { exportAllGDDs() }
+                    .disabled(entries.isEmpty || exporting || scanning)
+                    .help("Save every document in this folder as plain text — what "
+                        + "Navigator itself reads. Free; no image or model calls.")
+            }
+            if let summary = GDDScanRules.summary(scan) {
+                HStack(spacing: 8) {
+                    Text(summary).font(.caption).foregroundColor(.secondary)
+                    // Always a way back. A hidden document is a measurement, not a verdict.
+                    if hiddenCount > 0 || showEmpty {
+                        Toggle("Show all", isOn: $showEmpty)
+                            .toggleStyle(.checkbox).font(.caption)
+                            .onChange(of: showEmpty) { GDDLibrary.showEmptyDocuments = showEmpty }
+                    }
+                }
+            }
+            if gddFolder == nil {
+                Text("Point this at your Drive “GDDs” folder. Google Drive already keeps it on this Mac, so Navigator reads the list straight off disk.")
+                    .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if !entries.isEmpty {
+                Picker("Document", selection: $pickedGDD) {
+                    Text("Choose…").tag(GDDLibrary.Entry?.none)
+                    // Label with the file kind ONLY when two entries share a name —
+                    // the folder holds "3140 Milky Way GDD" as both a .docx and a
+                    // .gdoc, and the list showed it twice with nothing to tell them
+                    // apart, so picking one was a coin toss.
+                    ForEach(visibleEntries) { e in
+                        Text(duplicateNames.contains(e.name) ? e.uniqueName : e.name)
+                            .tag(GDDLibrary.Entry?.some(e))
+                    }
+                }
+                .frame(maxWidth: 520)
+                .onChange(of: pickedGDD) { loadGDD() }
+                .disabled(run.busy || run.running)
+            }
+            if !run.symbols.isEmpty {
+                Text(symbolSummary
+                     + (run.fromShippedArt
+                        ? "  — read from this game’s shipped art, because the document doesn’t list its symbols"
+                        : ""))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if H5GService.visionModelOverridden, let got = H5GService.lastVisionModel {
+                // Not a Navigator setting the user can change — the metering service
+                // pins it. Said plainly so the planner's quality is attributable.
+                Label("The AI service is running \(got) for planning and style reading, "
+                    + "not the requested \(H5GService.wantedVisionModel). Navigator asks "
+                    + "for it on every call; the service has to be redeployed to honour "
+                    + "it (DEVOP-8733).", systemImage: "exclamationmark.triangle")
+                    .font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            if !run.undeclared.isEmpty {
+                Label("This document also mentions \(run.undeclared.joined(separator: ", "))"
+                    + ", which \(run.undeclared.count == 1 ? "is" : "are") not in its symbol "
+                    + "set. Add \(run.undeclared.count == 1 ? "it" : "them") by hand if the "
+                    + "game needs \(run.undeclared.count == 1 ? "it" : "them").",
+                      systemImage: "info.circle")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let w = run.plausibilityWarning {
+                Label(w, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !run.parseProblems.isEmpty {
+                Label("\(run.parseProblems.count) line\(run.parseProblems.count == 1 ? "" : "s") in the symbol set couldn’t be read: "
+                      + run.parseProblems.prefix(3).joined(separator: " · "),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder private var manualStep: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("Game name", text: $manualName).frame(maxWidth: 260)
+                Button("Use a typical set") { manualSpec = GDDSymbolSetRules.typicalSet; applyManual() }
+            }
+            TextField("WD, HP1-4, MP1-4, LP1-5, SC, BO, JP1-4", text: $manualSpec, axis: .vertical)
+                .lineLimit(2...4)
+                .onSubmit { applyManual() }
+            HStack {
+                Button("Build the list") { applyManual() }
+                Text("Codes separated by commas or spaces. Ranges like HP1-4 expand.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            if !run.symbols.isEmpty {
+                Text(symbolSummary).font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !run.parseProblems.isEmpty {
+                Label("Couldn’t read: " + run.parseProblems.joined(separator: ", "),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundColor(.orange)
+            }
+        }
+        .disabled(run.busy || run.running)
+    }
+
+    private func applyManual() {
+        run.loadManual(manualSpec, gameName: manualName, size: size,
+                       symbolAspect: symbolAspect, backgroundAspect: backgroundAspect,
+                       backgroundSize: backgroundSize)
+    }
+
+    private var symbolSummary: String {
+        let byRole = Dictionary(grouping: run.symbols, by: \.role)
+        let parts = SlotSymbolRole.allCases.compactMap { r -> String? in
+            guard let n = byRole[r]?.count, n > 0 else { return nil }
+            return "\(n) \(r.label.lowercased())"
+        }
+        return "\(run.symbols.count) symbols — " + parts.joined(separator: ", ")
+    }
+
+    // MARK: Step 2 — the theme
+
+    @ViewBuilder private var themeStep: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("Search \(themes.count) themes…", text: $themeQuery).frame(maxWidth: 300)
+                Button("Reload") { loadThemes() }.disabled(loadingThemes)
+                if loadingThemes { ProgressView().controlSize(.small) }
+                Button("View hub") { viewHub() }
+                    .help("Open the team theme hub to browse the themes and their artwork")
+            }
+            if themes.isEmpty && !loadingThemes {
+                HStack(spacing: 6) {
+                    Text(GoogleWebSession.themeHubURL == nil
+                         ? "Navigator doesn’t know the team hub’s address yet."
+                         : "No themes loaded — use Reload, and sign in to Google if it asks.")
+                        .font(.caption).foregroundColor(.secondary)
+                    Button("Set address…") { askForHubURL() }.font(.caption)
+                }
+            }
+            if !themes.isEmpty {
+                // NOT a Picker.
+                //
+                // A SwiftUI Picker on macOS becomes an NSMenu, and a menu item sizes
+                // itself to its content: it ignores a Spacer, and it ignores the font
+                // modifier, so neither layout nor monospaced padding can line the columns
+                // up. Both were tried and both came out ragged. A list in a popover is
+                // ordinary SwiftUI layout, where a right-aligned column is just a frame.
+                Button {
+                    themeListOpen = true
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(pickedTheme?.name ?? "Choose…")
+                            .foregroundColor(pickedTheme == nil ? .secondary : .primary)
+                        Spacer(minLength: 8)
+                        if let t = pickedTheme {
+                            themeColumns(t)
+                        }
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.bordered)
+                .frame(maxWidth: 520)
+                .popover(isPresented: $themeListOpen, arrowEdge: .bottom) {
+                    themeList
+                }
+                .onChange(of: pickedTheme) {
+                    run.theme = pickedTheme
+                    // A style picked for the previous game is not a choice about this
+                    // one. Left set, the picker would still read "Choose a style" while
+                    // the new theme carried none, and the two would disagree.
+                    styleMode = false; styleID = ""; styleQuery = ""
+                    run.styleRead = .idle
+                    // Anything already fetched for this theme comes straight back, so a
+                    // re-fire of this handler cannot lose it and re-picking is instant.
+                    run.rehydrate()
+                    run.readThemeStyle()
+                    // Subjects were designed FOR the old theme. Keeping them would pair
+                    // one theme's subjects with another's art direction.
+                    // Just as true of a HALF-filled plan, which the old check let through.
+                    if run.jobs.contains(where: { !$0.subject.isEmpty }) { clearPlanSubjects() }
+                    run.invalidate()
+                }
+                .disabled(run.busy || run.running)
+            }
+            if let t = pickedTheme, !t.look.isEmpty {
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if !t.status.isEmpty || !t.comparables.isEmpty {
+                            HStack(spacing: 8) {
+                                if !t.status.isEmpty {
+                                    Text(t.status).font(.caption2).padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Capsule().fill(Color.accentColor.opacity(0.25)))
+                                }
+                                if !t.comparables.isEmpty {
+                                    Text("Like: \(t.comparables)").font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                if t.votes > 0 {
+                                    Text("👍 \(t.votes)").font(.caption2).foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        Text(t.look).font(.caption).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if !t.why.isEmpty {
+                            Text("Why: \(t.why)").font(.caption2).foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if !t.notes.isEmpty {
+                            Text("Notes: \(t.notes)").font(.caption2).foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+
+                    // The card's own artwork. This is what the style is read FROM, so
+                    // seeing it is how you know the read had the right picture.
+                    themeArt(t)
+                }
+                artStyleRow(t)
+            }
+        }
+    }
+
+    // MARK: Art style
+    //
+    // The theme says WHAT the world is. This says HOW it is drawn. Navigator reads the
+    // rendering off the theme's own approved reference artwork, which is the right
+    // default and was also completely invisible — the window said "Art style read from
+    // X's reference art" and never showed what it had read. Now it shows it, and it can
+    // be replaced by one of the styles the old tool carried.
+
+    /// The card's reference artwork, cycling when there is more than one.
+    @ViewBuilder private func themeArt(_ t: GameTheme) -> some View {
+        Group {
+            if let img = artImage(t) {
+                VStack(spacing: 4) {
+                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
+                        .frame(width: 148, height: 148).clipped()
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .id(artIndex)
+                        .transition(.opacity)
+                        .help("\(t.name)’s reference artwork, from the hub. The art style "
+                            + "is read from the first of these.")
+                    if t.artDataURLs.count > 1 {
+                        HStack(spacing: 5) {
+                            ForEach(0..<t.artDataURLs.count, id: \.self) { i in
+                                Circle()
+                                    .fill(i == artIndex % t.artDataURLs.count
+                                          ? Color.primary.opacity(0.75)
+                                          : Color.secondary.opacity(0.28))
+                                    .frame(width: 5, height: 5)
+                            }
+                        }
+                        .help("\(t.artDataURLs.count) reference images on this card")
+                    }
+                }
+                .onReceive(artTimer) { _ in
+                    guard t.artDataURLs.count > 1 else { return }
+                    withAnimation(.easeInOut(duration: 0.35)) {
+                        artIndex = (artIndex + 1) % t.artDataURLs.count
+                    }
+                }
+            } else if t.hasArt {
+                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08))
+                    .frame(width: 148, height: 148)
+                    .overlay(ProgressView().controlSize(.small))
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08))
+                    .frame(width: 148, height: 148)
+                    .overlay(Text("No art\non this card")
+                        .font(.caption2).multilineTextAlignment(.center)
+                        .foregroundColor(.secondary))
+            }
+        }
+    }
+
+    @ViewBuilder private func artStyleRow(_ t: GameTheme) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Text("Art style").bold()
+                Picker("", selection: $styleMode) {
+                    Text("From this theme’s reference art").tag(false)
+                    Text("Choose a style").tag(true)
+                }
+                .pickerStyle(.segmented).frame(width: 340).labelsHidden()
+                .disabled(run.busy || run.running)
+                .onChange(of: styleMode) { applyArtStyle() }
+                if !styleMode, run.busy {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+            }
+
+            if styleMode {
+                HStack(spacing: 8) {
+                    TextField("Search \(SlotArtStyles.all.count) styles…", text: $styleQuery)
+                        .frame(maxWidth: 260)
+                    Picker("", selection: $styleID) {
+                        Text("Choose…").tag("")
+                        // Grouped by category, and flat when a search has narrowed it —
+                        // 55 styles in one list is a scroll, 12 headed groups is a menu.
+                        if styleQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                            ForEach(SlotArtStyles.byCategory, id: \.category) { group in
+                                Section(group.category) {
+                                    ForEach(group.styles) { Text($0.name).tag($0.id) }
+                                }
+                            }
+                        } else {
+                            ForEach(searchResults) { Text($0.name).tag($0.id) }
+                        }
+                    }
+                    .frame(maxWidth: 320).labelsHidden()
+                    .disabled(run.busy || run.running)
+                    .onChange(of: styleID) { applyArtStyle() }
+                    Spacer()
+                }
+                if !styleQuery.trimmingCharacters(in: .whitespaces).isEmpty,
+                   SlotArtStyles.search(styleQuery).isEmpty {
+                    Text("No style matches “\(styleQuery)”.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+                if let picked = SlotArtStyles.byID(styleID) {
+                    styleText(picked.keywords,
+                              caption: "\(picked.name) — \(picked.category). "
+                                     + "This replaces the style read from the reference art.")
+                } else {
+                    Label("Pick a style, or switch back to use this theme’s own reference "
+                        + "art. Generate stays off until one of those is true.",
+                          systemImage: "exclamationmark.circle")
+                        .font(.caption).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                switch run.styleRead {
+                case .ok where !t.styleFromArt.isEmpty:
+                    VStack(alignment: .leading, spacing: 4) {
+                        styleText(t.styleFromArt,
+                                  caption: "Read from \(t.name)’s reference artwork on the hub.")
+                        Button("Re-read the artwork") { rereadStyle() }
+                            .font(.caption).buttonStyle(.link)
+                            .disabled(run.busy || run.running)
+                            .help("The style is read once and remembered, so it stays the "
+                                + "same every time. Use this when the art on the hub changes.")
+                    }
+                case .fetchingArt:
+                    Label("Fetching \(t.name)’s reference artwork…", systemImage: "arrow.down.circle")
+                        .font(.caption).foregroundColor(.secondary)
+                case .reading:
+                    Label("Reading the style from the artwork…", systemImage: "eye")
+                        .font(.caption).foregroundColor(.secondary)
+                case .noArt:
+                    Text("This theme has no artwork on its hub card, so only its written "
+                       + "look above will be used. Choose a style to be specific about "
+                       + "the rendering.")
+                        .font(.caption).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .failed(let why):
+                    HStack(spacing: 8) {
+                        Text("Couldn’t read the style: \(why)")
+                            .font(.caption).foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Try again") { run.readThemeStyle() }
+                            .font(.caption).disabled(run.busy || run.running)
+                    }
+                case .ok:
+                    // .ok with nothing to show means the theme was reassigned from a
+                    // pristine copy after the read. Recover rather than report a lie.
+                    Label("Reloading this theme’s art style…", systemImage: "arrow.clockwise")
+                        .font(.caption).foregroundColor(.secondary)
+                        .onAppear { run.rehydrate(); run.readThemeStyle() }
+                case .idle:
+                    Text("Not read yet.").font(.caption).foregroundColor(.secondary)
+                        .onAppear { run.readThemeStyle() }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func styleText(_ body: String, caption: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(caption).font(.caption2).foregroundColor(.secondary)
+            Text(body).font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+        }
+    }
+
+    // MARK: Step 3 — output
+
+    @ViewBuilder private var outputStep: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(outParent?.path ?? "No folder chosen")
+                    .lineLimit(1).truncationMode(.middle)
+                    .foregroundColor(outParent == nil ? .secondary : .primary)
+                Button("Choose…") { chooseOutFolder() }
+            }
+            if outParent != nil {
+                Text("Navigator makes a folder in there for this run: “\(runFolderName)”.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            HStack(spacing: 16) {
+                Picker("Model", selection: $run.modelFlag) {
+                    ForEach(NanoBananaModel.all.filter { $0.flag == "nb2" || $0.flag == "nb-pro" },
+                            id: \.flag) { Text($0.name).tag($0.flag) }
+                }.frame(width: 220)
+                Picker("Size", selection: $size) {
+                    ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
+                }.frame(width: 140)
+                Picker("Symbols", selection: $symbolAspect) {
+                    ForEach(AssetPlanRules.symbolAspects, id: \.self) { Text($0) }
+                }.frame(width: 150)
+                Picker("Backgrounds", selection: $backgroundAspect) {
+                    ForEach(AssetPlanRules.backgroundAspects, id: \.self) { Text($0) }
+                }.frame(width: 170)
+                Picker("", selection: $backgroundSize) {
+                    ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
+                }.frame(width: 80)
+            }
+            .disabled(run.busy || run.running)
+            .onChange(of: size) { reflow() }
+            .onChange(of: symbolAspect) { reflow() }
+            .onChange(of: backgroundAspect) { reflow() }
+            .onChange(of: backgroundSize) { reflow() }
+            Text(backgroundNote)
+                .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("Remove symbol backgrounds with Photoshop when the images are done", isOn: $removeBG)
+            Toggle("Then split frames off the framed symbols with Layerize", isOn: $separateFrames)
+                .disabled(!removeBG)
+                .help("Billed by fal.ai, separately from Vertex. Card royals have no frame "
+                    + "and are skipped.")
+            if run.modelFlag == "nb2" && size == "2K" {
+                // The one note that changes what the user should DO. Everything else that
+                // used to be printed here was explaining the implementation to someone who
+                // only wants to make art; it is in the code, where it belongs.
+                Text("2K often comes back at half size. Navigator retries at 4K and scales "
+                   + "down, which can cost more than the estimate — pick 4K or Pro to avoid it.")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: Step 4 — the plan
+
+    @ViewBuilder private var planStep: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Button(run.planned ? "Design the set again" : "Design the set") { run.designSet() }
+                    .disabled(run.busy || pickedTheme == nil || run.running)
+                if run.busy { ProgressView().controlSize(.small) }
+                if !run.palette.isEmpty {
+                    HStack(spacing: 3) {
+                        ForEach(Array(run.palette.enumerated()), id: \.offset) { _, c in
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color(red: Double(c.r) / 255, green: Double(c.g) / 255, blue: Double(c.b) / 255))
+                                .frame(width: 16, height: 16)
+                        }
+                    }
+                }
+            }
+            if !run.clashes.isEmpty {
+                Label("\(run.clashes.count) silhouette\(run.clashes.count == 1 ? "" : "s") used twice: "
+                      + run.clashes.map { "\($0.key) (\($0.value.joined(separator: ", ")))" }.joined(separator: "; "),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if !run.missing.isEmpty {
+                Label("No subject for: \(run.missing.joined(separator: ", ")). Those are skipped — design again, or type one in.",
+                      systemImage: "exclamationmark.circle")
+                    .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(run.jobs, id: \.id) { job in
+                HStack(alignment: .top, spacing: 8) {
+                    Text(job.id).font(.system(.caption, design: .monospaced)).bold()
+                        .frame(width: 54, alignment: .leading)
+                    Text(job.kind == .background ? "Background" : job.role.label)
+                        .font(.caption).foregroundColor(.secondary)
+                        .frame(width: 130, alignment: .leading)
+                    TextField("subject", text: field(job.id, \.subject))
+                        .font(.caption).textFieldStyle(.roundedBorder)
+                        .disabled(run.running || run.busy)
+                    TextField("silhouette", text: field(job.id, \.silhouette))
+                        .font(.caption).textFieldStyle(.roundedBorder).frame(width: 150)
+                        .disabled(run.running || run.busy)
+                    if let d = run.delivered[job.id] {
+                        Text(d).font(.caption2).foregroundColor(
+                            GeneratedSizeRules.isUndersized(
+                                longEdge: d.split(separator: "x").compactMap { Int($0) }.max() ?? 0,
+                                requested: job.size) ? .orange : .secondary)
+                            .frame(width: 78, alignment: .trailing)
+                    } else {
+                        Spacer().frame(width: 78)
+                    }
+                    statusDot(job.id)
+                    // Every row is a paid image. A scene the document named but this game
+                    // does not actually need should be removable without redesigning.
+                    Button {
+                        run.jobs.removeAll { $0.id == job.id }
+                        run.status = "Removed \(job.id). \(run.jobs.count) images to make."
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    // Also while PLANNING. "Design the set" holds a snapshot of the jobs
+                    // and installs it when the reply lands — a row removed in between came
+                    // back, and was then generated and charged for.
+                    .disabled(run.running || run.busy)
+                    .help(run.busy ? "Wait for the set to finish designing"
+                                   : "Don’t make this one")
+                }
+            }
+        }
+    }
+
+    /// A binding to one field of one job, found by IDENTITY rather than by position.
+    ///
+    /// Binding by array index crashed the app: SwiftUI keeps a binding alive across a
+    /// redraw, so the moment the job list got shorter — switching document, switching to
+    /// the typed-set mode, redesigning with fewer slots — a stale closure indexed past
+    /// the end and took the process with it. An id survives the list changing under it.
+    private func field(_ id: String, _ key: WritableKeyPath<AssetJob, String>) -> Binding<String> {
+        Binding(
+            get: { run.jobs.first { $0.id == id }?[keyPath: key] ?? "" },
+            set: { v in
+                guard let k = run.jobs.firstIndex(where: { $0.id == id }) else { return }
+                run.jobs[k][keyPath: key] = v
+            })
+    }
+
+    @ViewBuilder private func statusDot(_ id: String) -> some View {
+        if let e = run.failures[id] {
+            Image(systemName: "xmark.circle.fill").foregroundColor(.red).help(e)
+        } else if run.produced.contains(where: { $0.lastPathComponent == "\(id).png" }) {
+            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+        } else {
+            Image(systemName: "circle").foregroundColor(.secondary.opacity(0.35))
+        }
+    }
+
+    // MARK: Footer
+
+    @ViewBuilder private var footer: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(run.status).font(.caption)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                if run.spent > 0 {
+                    Text(String(format: "Spent so far: $%.3f (everything this window has charged, including designing the set)", run.spent))
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            Spacer()
+            if run.running { ProgressView().controlSize(.small) }
+            if run.running {
+                Button(run.stopRequested ? "Stopping…" : "Stop") { run.stopRequested = true }
+                    .disabled(run.stopRequested)
+                    .help("Finish the requests already sent and start no new ones. "
+                        + "Anything already generated is kept.")
+            }
+            // Recovering from a partial failure used to mean paying for the whole set
+            // again: Generate takes every row with a subject, including the ones that
+            // already succeeded.
+            if !run.running, !run.failures.isEmpty, run.lastFolder != nil {
+                Button("Retry \(run.failures.count) failed") { retryFailed() }
+                    .help("Generate only the images that failed, into the same folder")
+            }
+            Button("Close") { requestClose() }
+            Button(generateLabel) { startGenerate() }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canGenerate)
+        }
+        .padding(12)
+    }
+
+    /// What the chosen background format will actually produce, against the portrait
+    /// size the games are built to.
+    private var backgroundPixels: (w: Int, h: Int) {
+        let r = BackgroundFormatRules.ratios.first { $0.name == backgroundAspect }?.value ?? 0.75
+        return BackgroundFormatRules.pixels(ratio: r, size: backgroundSize)
+    }
+    private var backgroundCovers: Bool {
+        BackgroundFormatRules.covers(width: backgroundPixels.w, height: backgroundPixels.h)
+    }
+    private var backgroundNote: String {
+        let p = backgroundPixels
+        let t = BackgroundFormatRules.defaultTarget
+        return backgroundCovers
+            ? "Backgrounds come out about \(p.w)×\(p.h) — enough to cover the \(t.w)×\(t.h) portrait size."
+            : "Backgrounds would come out about \(p.w)×\(p.h), smaller than the \(t.w)×\(t.h) portrait size. \(BackgroundFormatRules.best().aspect) at \(BackgroundFormatRules.best().size) covers it."
+    }
+
+    private var readyJobs: Int { run.jobs.filter { !$0.subject.isEmpty }.count }
+    private var canGenerate: Bool {
+        !run.running && !run.busy && outParent != nil && pickedTheme != nil && readyJobs > 0
+            && !styleNotChosen
+    }
+    /// "Choose a style" is selected but no style has been picked. Generating here would
+    /// quietly use the reference-art style instead — the control would say one thing and
+    /// the prompt do another — so it blocks rather than guesses.
+    private var styleNotChosen: Bool { styleMode && SlotArtStyles.byID(styleID) == nil }
+    private var generateLabel: String {
+        guard readyJobs > 0 else { return "Generate" }
+        // "more", not a total: designing the set already cost something and it is
+        // already counted in "Spent so far" below, so calling this the total would
+        // double-count it or hide it depending on which number you believed.
+        return String(format: "Generate %d image%@ — about $%.2f more",
+                      readyJobs, readyJobs == 1 ? "" : "s", run.estimate)
+    }
+
+    // MARK: Actions
+
+    /// Drop subjects designed for a theme that is no longer selected.
+    private func clearPlanSubjects() {
+        run.jobs = run.jobs.map { var j = $0; j.subject = ""; j.silhouette = ""; return j }
+        run.missing = []
+        run.status = "Theme changed — design the set again."
+    }
+
+    private func reflow() {
+        guard !run.gddText.isEmpty else { return }
+        let keep = Dictionary(uniqueKeysWithValues: run.jobs.map { ($0.id, ($0.subject, $0.silhouette)) })
+        run.load(gddText: run.gddText, gameName: run.gameName, size: size,
+                 symbolAspect: symbolAspect, backgroundAspect: backgroundAspect,
+                 backgroundSize: backgroundSize)
+        run.jobs = run.jobs.map { j in
+            var j = j
+            if let (s, sil) = keep[j.id] { j.subject = s; j.silhouette = sil }
+            return j
+        }
+    }
+
+    // Navigator's own picker, not NSOpenPanel. See NavigatorFolderPicker.
+    private func chooseGDDFolder() { picking = .gdds }
+
+    private var runFolderName: String {
+        GDDOutputRules.folderName(game: run.gameName.isEmpty ? manualName : run.gameName,
+                                  theme: pickedTheme?.name ?? "")
+    }
+
+    private func chooseOutFolder() { picking = .output }
+
+    /// Make this run's folder inside the chosen parent, without writing over a
+    /// previous run of the same game and theme.
+    private func makeRunFolder() -> URL? {
+        guard let parent = outParent else { return nil }
+        let existing = Set((try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? [])
+        let name = GDDOutputRules.uniqueName(runFolderName, existing: existing)
+        let dst = parent.appendingPathComponent(name)
+        do {
+            try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+            return dst
+        } catch {
+            run.status = "Couldn’t make the folder: \(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    private func loadGDD() {
+        guard let e = pickedGDD else { return }
+        run.busy = true; run.status = "Reading \(e.name)…"
+        GDDLibrary.text(of: e) { text, err in
+            run.busy = false
+            guard let text else {
+                // Clear the old document plan. Leaving it meant the window showed one
+                // document name above another document symbols, ready to generate.
+                run.jobs = []; run.symbols = []; run.missing = []; run.gddText = ""
+                run.status = err == GoogleWebSession.signInNeeded
+                    ? "Sign in to Google to read this document."
+                    : "Couldn’t read that document: \(err ?? "unknown error")"
+                if err == GoogleWebSession.signInNeeded { offerSignIn { loadGDD() } }
+                return
+            }
+            run.load(gddText: text, gameName: e.name, size: size,
+                     symbolAspect: symbolAspect, backgroundAspect: backgroundAspect,
+                     backgroundSize: backgroundSize)
+            // No automatic fall back to asking a model what the symbols probably are.
+            //
+            // It read a document, produced a believable set, and labelled it "inferred" —
+            // and a believable-but-wrong set is worse than no set, because it gets
+            // designed, generated and paid for. 4490 came back with five activators and
+            // no medium pays from a document that lists its sixteen symbols by name.
+            //
+            // The parser reads every shape these documents are actually written in. If it
+            // reads nothing, the document does not declare a symbol set, and saying so is
+            // the honest answer — the typed-set mode is right there for that case.
+        }
+    }
+
+    private func loadThemes() {
+        guard GoogleWebSession.themeHubURL != nil else { return }
+        loadingThemes = true
+        ThemeHubClient.themes { list, err in
+            loadingThemes = false
+            if let list { themes = list; run.status = "\(list.count) themes loaded."; return }
+            if err == GoogleWebSession.signInNeeded {
+                run.status = "Sign in to Google to load the themes."
+                offerSignIn { loadThemes() }
+            } else {
+                run.status = "Couldn’t load themes: \(err ?? "unknown error")"
+            }
+        }
+    }
+
+    private func offerSignIn(then retry: @escaping () -> Void) {
+        guard let base = GoogleWebSession.themeHubURL, let u = URL(string: base) else { return }
+        GoogleWebSession.shared.presentSignIn(startAt: u) { retry() }
+    }
+
+    /// Open the hub itself, so the themes and their reference art can be browsed.
+    private func viewHub() {
+        guard let base = GoogleWebSession.themeHubURL, let u = URL(string: base) else {
+            askForHubURL(); return
+        }
+        GoogleWebSession.shared.presentWeb(url: u, title: "Team Theme Hub") { loadThemes() }
+    }
+
+    private func askForHubURL() {
+        let a = NSAlert()
+        a.messageText = "Team theme hub address"
+        a.informativeText = """
+            Navigator reads the game themes from High 5 Games' own team hub. Paste its \
+            address once — ask Michael if you don't have it. It is not a password, but it \
+            is not published either, so it is stored here rather than shipped in the app.
+            """
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
+        f.placeholderString = "https://…"
+        f.stringValue = GoogleWebSession.themeHubURL ?? ""
+        a.accessoryView = f
+        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = f
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        var v = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        while v.hasSuffix("/") { v = String(v.dropLast()) }
+        guard v.lowercased().hasPrefix("https://"), URL(string: v) != nil else { return }
+        GoogleWebSession.themeHubURL = v
+        loadThemes()
+    }
+
+    /// Forget the remembered style for this theme and read the artwork again.
+    private func rereadStyle() {
+        guard let t = run.theme else { return }
+        var c = GDDToAssetsRun.styleCache; c.removeValue(forKey: t.name)
+        GDDToAssetsRun.styleCache = c
+        GDDToAssetsRun.artCache.removeValue(forKey: t.name)
+        run.theme?.styleFromArt = ""
+        run.theme?.artDataURLs = []
+        run.theme?.artDataURL = ""
+        run.styleRead = .idle
+        run.readThemeStyle()
+    }
+
+    /// Put the art-style choice onto the theme, where all three prompts read it.
+    ///
+    /// Changing HOW the set is drawn does not change WHAT is in it, so the plan's
+    /// subjects are deliberately left alone — unlike changing the theme, which does
+    /// invalidate them. Re-running "Design the set" is not needed and would cost money
+    /// for no change.
+    private func applyArtStyle() {
+        guard var t = run.theme else { return }
+        let picked = styleMode ? SlotArtStyles.byID(styleID) : nil
+        guard t.chosenStyle != picked else { return }
+        t.chosenStyle = picked
+        run.theme = t
+        if let picked {
+            run.status = "Art style: \(picked.name). This replaces the reference-art style "
+                       + "for every image in this run."
+        } else if !t.styleFromArt.isEmpty {
+            run.status = "Art style: read from \(t.name)’s reference art."
+        } else {
+            // Switching back with nothing to switch back TO is a dead end unless the
+            // read is retried — the theme may have been picked before it finished, or
+            // the read may have failed.
+            run.readThemeStyle()
+        }
+    }
+
+    /// Read every document and record which ones declare a symbol set.
+    private func scanGDDs() {
+        guard let folder = gddFolder else { return }
+        scanning = true
+        GDDLibrary.scanAll(from: folder) { i, n, name in
+            run.status = "Checking \(i) of \(n) — \(name)"
+        } done: { results in
+            scanning = false
+            scan = results
+            GDDLibrary.scanResults = results
+            // If the picked document has just been hidden, stop showing its plan.
+            if let p = pickedGDD, GDDScanRules.hiddenKeys(results).contains(p.key), !showEmpty {
+                pickedGDD = nil
+            }
+            run.status = GDDScanRules.summary(results) ?? "Checked."
+        }
+    }
+
+    /// Write every document in the GDD folder out as plain text.
+    ///
+    /// Reads nothing new and costs nothing — it is the same Docs export a single
+    /// document goes through, run over all of them, so the parser can be checked
+    /// against the real corpus instead of against seven files that happened to be
+    /// .docx.
+    private func exportAllGDDs() {
+        guard let folder = gddFolder else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export Here"
+        panel.message = "Where should the plain text go?"
+        guard panel.runModal() == .OK, let out = panel.url else { return }
+        exporting = true
+        run.status = "Exporting…"
+        GDDLibrary.exportAll(from: folder, into: out) { i, n, name in
+            run.status = "Exporting \(i) of \(n) — \(name)"
+        } done: { written, failures in
+            exporting = false
+            run.status = "Exported \(written) document\(written == 1 ? "" : "s") as text."
+                + (failures.isEmpty ? "" : "  \(failures.count) couldn’t be read.")
+            if !failures.isEmpty {
+                let a = NSAlert()
+                a.messageText = "\(failures.count) document\(failures.count == 1 ? "" : "s") couldn’t be read"
+                a.informativeText = failures.prefix(12).joined(separator: "\n")
+                    + (failures.count > 12 ? "\n…and \(failures.count - 12) more." : "")
+                a.runModal()
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([out])
+        }
+    }
+
+    /// Retry only what failed, into the folder the batch already wrote to.
+    private func retryFailed() {
+        guard let folder = run.lastFolder else { return }
+        let ids = Set(run.failures.keys)
+        let a = NSAlert()
+        a.messageText = "Retry \(ids.count) failed image\(ids.count == 1 ? "" : "s")?"
+        a.informativeText = String(
+            format: "Only these are generated again: %@.\n\nEstimated cost: ~$%.2f. They are saved into the same folder as the rest of the set.",
+            ids.sorted().joined(separator: ", "), run.estimate(for: ids))
+        a.addButton(withTitle: "Retry"); a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        run.generate(into: folder, removeBackground: removeBG,
+                     separateFrames: separateFrames, only: ids) { _ in }
+    }
+
+    /// Closing while paid work is in flight used to dismiss the window and leave the
+    /// batch running where nobody could see it, stop it, or find out what it spent.
+    private func requestClose() {
+        guard run.running || run.keying || run.layering else { onClose(); return }
+        let a = NSAlert()
+        a.messageText = run.running ? "Images are still being generated."
+                                    : "Background work is still running."
+        a.informativeText = run.running
+            ? "Closing this window does not stop the run, and you will not see what it makes or what it costs. Stop it first, or leave the window open until it finishes."
+            : "Photoshop is still processing this set. Closing now leaves it to finish on its own."
+        a.addButton(withTitle: run.running ? "Keep Open" : "Close Anyway")
+        a.addButton(withTitle: run.running ? "Stop and Close" : "Keep Open")
+        let r = a.runModal()
+        if run.running {
+            if r == .alertSecondButtonReturn { run.stopRequested = true; onClose() }
+        } else if r == .alertFirstButtonReturn {
+            onClose()
+        }
+    }
+
+    private func startGenerate() {
+        guard outParent != nil else { return }
+        let n = readyJobs
+        let a = NSAlert()
+        a.messageText = "Generate \(n) image\(n == 1 ? "" : "s")?"
+        a.informativeText = String(
+            format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into a new folder “%@” as they arrive.",
+            NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName)
+        a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        guard let out = makeRunFolder() else { return }
+        run.generate(into: out, removeBackground: removeBG, separateFrames: separateFrames) { urls in
+            if let first = urls.first {
+                NSWorkspace.shared.activateFileViewerSelecting([first])
+            }
+        }
+    }
+}
+
+/// Refuses a window close while the run behind it is still generating.
+///
+/// The Close button asks first, but the window's own close button went straight to
+/// `close()` — so the one control every Mac user reaches for by reflex was the one that
+/// silently abandoned a paid batch.
+final class CloseGuard: NSObject, NSWindowDelegate {
+    private let run: GDDToAssetsRun
+    /// Set when the in-window Close button has already asked.
+    var force = false
+    init(run: GDDToAssetsRun) { self.run = run }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if force { return true }
+        guard run.running else { return true }
+        let a = NSAlert()
+        a.messageText = "Images are still being generated."
+        a.informativeText = "Closing does not stop the run, and you will not see what it "
+            + "makes or what it costs. Anything already generated is on disk either way."
+        a.addButton(withTitle: "Keep Open")
+        a.addButton(withTitle: "Stop and Close")
+        if a.runModal() == .alertSecondButtonReturn {
+            run.stopRequested = true
+            return true
+        }
+        return false
+    }
+}
+
+enum GDDToAssetsWindow {
+    private static var windows: [NSWindow] = []
+    private static var guards: [CloseGuard] = []
+    @MainActor static func open() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 740),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                         backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.minSize = NSSize(width: 940, height: 700)
+        w.title = "GDD to Assets"
+        let run = GDDToAssetsRun()
+        let guardian = CloseGuard(run: run)
+        w.delegate = guardian
+        guards.append(guardian)
+        w.contentView = NSHostingView(
+            rootView: GDDToAssetsSheet(run: run, onClose: { [weak w] in
+                guardian.force = true
+                w?.close()
+            }))
+        w.center(); windows.append(w)
+        // The token has to be kept and removed. A block observer that captures the
+        // window strongly keeps it — and its hosting view, and the whole run with its
+        // plan and images — alive for the life of the process, so opening the feature
+        // a few times accumulates every one of them.
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification,
+                                                       object: w, queue: .main) { [weak w] _ in
+            windows.removeAll { $0 === w }
+            guards.removeAll { $0 === guardian }
+            if let t = token { NotificationCenter.default.removeObserver(t) }
+        }
+        w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// ===== GDD to Assets: Navigator's own folder picker =====
+//
+// Navigator IS a file browser. Handing the job to NSOpenPanel — which is Finder's
+// picker wearing this app's title — means the one place the user is choosing a
+// destination is the one place Navigator stops being the thing they are using. It
+// also loses the sidebar they have already set up, which is where their drives and
+// project folders actually live.
+struct NavigatorFolderPicker: View {
+    let title: String
+    let start: URL?
+    let onChoose: (URL) -> Void
+    let onCancel: () -> Void
+
+    @State private var here: URL
+    @State private var folders: [URL] = []
+    @State private var selected: URL?
+    @State private var error: String?
+    @ObservedObject private var favorites = FavoritesStore.shared
+
+    init(title: String, start: URL?, onChoose: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
+        self.title = title; self.start = start; self.onChoose = onChoose; self.onCancel = onCancel
+        _here = State(initialValue: start ?? URL(fileURLWithPath: NSHomeDirectory()))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text(title).font(.headline)
+                Spacer()
+            }
+            .padding(.horizontal, 10).padding(.top, 10)
+            HStack(spacing: 8) {
+                Button { up() } label: { Image(systemName: "chevron.up") }
+                    .disabled(here.pathComponents.count <= 1)
+                    .help("Enclosing folder")
+                Text(displayPath).font(.callout).lineLimit(1).truncationMode(.head)
+                Spacer()
+                Button("New Folder…") { newFolder() }
+            }
+            .padding(10)
+            Divider()
+            HStack(spacing: 0) {
+                // The user's own sidebar, not a generic one.
+                List {
+                    Section("Favourites") {
+                        ForEach(favorites.items) { f in
+                            Button {
+                                here = f.url; selected = nil; reload()
+                            } label: {
+                                Label(f.label, systemImage: favoriteSymbol(f.url))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(width: 210)
+                Divider()
+                List(folders, id: \.self, selection: $selected) { f in
+                    Label(f.lastPathComponent, systemImage: "folder")
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { here = f; selected = nil; reload() }
+                        .onTapGesture { selected = f }
+                }
+                .overlay {
+                    if folders.isEmpty {
+                        Text(error ?? "No folders in here.")
+                            .foregroundColor(.secondary).font(.callout)
+                    }
+                }
+            }
+            Divider()
+            HStack {
+                Text(selected.map { "Into “\($0.lastPathComponent)”" }
+                     ?? "Into “\(here.lastPathComponent)”")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button("Cancel") { onCancel() }.keyboardShortcut(.cancelAction)
+                Button("Choose") { onChoose(selected ?? here) }.keyboardShortcut(.defaultAction)
+            }
+            .padding(10)
+        }
+        .frame(minWidth: 720, minHeight: 460)
+        .onAppear { reload() }
+    }
+
+    private var displayPath: String {
+        let home = NSHomeDirectory()
+        return here.path.hasPrefix(home)
+            ? "~" + String(here.path.dropFirst(home.count))
+            : here.path
+    }
+
+    private func up() {
+        guard here.pathComponents.count > 1 else { return }
+        here = here.deletingLastPathComponent(); selected = nil; reload()
+    }
+
+    private func reload() {
+        error = nil
+        do {
+            let items = try FileManager.default.contentsOfDirectory(
+                at: here, includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles])
+            folders = items.filter {
+                (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        } catch {
+            folders = []
+            self.error = "Can’t read this folder: \(error.localizedDescription)"
+        }
+    }
+
+    private func newFolder() {
+        let a = NSAlert()
+        a.messageText = "New folder in “\(here.lastPathComponent)”"
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        f.stringValue = "New Folder"
+        a.accessoryView = f
+        a.addButton(withTitle: "Create"); a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = f
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        let name = GDDOutputRules.safe(f.stringValue)
+        guard !name.isEmpty else { return }
+        let dst = here.appendingPathComponent(name)
+        do {
+            try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: false)
+            reload(); selected = dst
+        } catch {
+            self.error = "Couldn’t create it: \(error.localizedDescription)"
+        }
     }
 }

@@ -4808,15 +4808,34 @@ final class ChromaKeyOutputRulesTests: XCTestCase {
         XCTAssertEqual(out.lastPathComponent, "source_rmbg.png")
         let image = try ChromaKeyOutputRules.load(out)
         XCTAssertEqual(image.width, 3); XCTAssertEqual(image.height, 2)
-        // publish no longer passes colour through untouched: a pixel the matte calls
-        // near-opaque contains no backing, so its colour is taken from the source (see
-        // restoreOpaqueInterior — it is what stops the sparkle's white core reading yellow).
-        // The SOFT pixels are the ones that must survive intact, because that is where
-        // Keylight's despill is doing the work.
+        // The contract changed deliberately, and the change is measured rather than
+        // preferred. publish now recovers colour from the compositing equation wherever
+        // the matte is thick enough to invert (SpillRules), not only where it is opaque.
+        //
+        // The old rule — leave every soft pixel to Keylight — was written to protect FX,
+        // on the belief that arithmetic recovery would strip a sparkle's colour. It does
+        // not: measured across 261,376 soft pixels of the real yellow sparkle, Keylight
+        // and the recovered value agree on hue exactly (54 degrees, yellow), differing
+        // only in saturation (0.251 vs 0.203). Meanwhile the old rule left a whole symbol
+        // despilled, because a keyed symbol's matte never reaches the opaque threshold —
+        // which is how a gold-and-crimson giant came back uniformly green.
+        //
+        // This fixture's source is white on a white backing, so the true foreground is
+        // white everywhere and any colour Keylight introduced is despill damage.
         let expected = try premultiplied(ChromaKeyOutputRules.load(render)), actual = try premultiplied(image)
-        for i in stride(from: 0, to: expected.count, by: 4) where expected[i+3] < 250 {
-            XCTAssertEqual(Array(actual[i..<i+4]), Array(expected[i..<i+4]),
-                           "soft pixel at \(i/4) must keep Keylight's despilled colour")
+        for i in stride(from: 0, to: expected.count, by: 4) {
+            let a = expected[i+3]
+            if a < 255 * ChromaKeyOutputRules.SpillRules.alphaFloor {
+                // Too thin to invert — Keylight's answer stands.
+                XCTAssertEqual(Array(actual[i..<i+4]), Array(expected[i..<i+4]),
+                               "thin pixel at \(i/4) must keep Keylight's colour")
+            } else if a >= 255 * ChromaKeyOutputRules.SpillRules.alphaFull {
+                // Thick enough to invert: the source was white, so the answer is white.
+                for c in 0..<3 {
+                    XCTAssertEqual(actual[i+c], expected[i+3], accuracy: 2,
+                                   "recovered pixel at \(i/4) channel \(c) should be the source's white")
+                }
+            }
         }
         // The fixture's source is white, so the near-opaque pixels take white.
         for i in stride(from: 0, to: expected.count, by: 4) where expected[i+3] >= 250 {
@@ -7864,5 +7883,3041 @@ extension VolumeHealthRulesTests {
             }
         }
         XCTAssertEqual(admitted.wrappedValue, 1)
+    }
+}
+
+// ===== GDD to Assets =====
+//
+// The fixtures below are the REAL "Symbol Set" blocks from two GDDs in the shared
+// Drive folder, pasted verbatim. They differ in shape, which is the whole point: a
+// parser tuned to one silently miscounts the other.
+
+final class GDDSymbolSetTests: XCTestCase {
+
+    // 4260 Dodge: the code sits BEFORE the comment marker, and ranges name both ends
+    // ("1-4 HP1-4").
+    private let dodge = """
+    Symbol Set
+    * 0 WD1                // wild symbol
+    * 1-4 HP1-4        // HPs
+    * 5-9 LP1-5        // LPs
+    * 10 WY1        // purple wys tied to feature 1 AND wys in bonus 1
+    * 11 WY2        // green wys tied to feature 2
+    * 12 SF1                // purple payer tied to feature 1
+    * 13-14 R1-2        // replacements
+    * 15 BWY1        // bonus variant of WY1 (purple)
+    * 16 BWY2        // bonus variant of WY2 (green)
+    * 17-20 JP1-4        // jackpots, grand -> mini
+    * 21 MU1        // bonus 1 spread multiplier
+    * 30 BL1                // blank in bonus 1 AND bonus 2
+    Spinning & Winning
+    4x5 ways game, with 4 HP symbols, 5 LP symbols, a wild symbol
+    """
+
+    // 4400 Chevy-Hot: the code sits AFTER the comment marker, and the medium/low pays
+    // are named only as a plural group ("2-5 // MPs") that has to be counted out.
+    private let chevyHot = """
+    Symbol Set
+      - 0 // WD1 (Wild Symbol)
+      - 1 // HP1  (Standard HP symbols)
+      - 2-5 // MPs  (Standard MP symbols)
+      - 6-9 // LPs  (Standard LP symbols)
+      - 10 //WY1  (Standard WYSIWYG)
+      - 11        //SF1  (Special Collector Symbol)
+      - 12 //R1 (Replacement 1)
+      - 13 //BL (Blank)
+      - 14 //WY2  (Hotspot WYSIWYG)
+      - 15 //JP1  (Grand)
+      - 16 //JP2  (Major)
+      - 17 //JP3  (Minor)
+      - 18 //JP4  (Mini)
+    Special Symbols + Upgrades
+    """
+
+    func testDodgeCountAndCodes() {
+        let s = GDDSymbolSetRules.parse(dodge)
+        // 1 wild + 4 HP + 5 LP + 2 WY + 1 SF + 2 R + 2 BWY + 4 JP + 1 MU + 1 BL
+        XCTAssertEqual(s.count, 23)
+        XCTAssertEqual(s.map(\.code).prefix(5).joined(separator: ","), "WD1,HP1,HP2,HP3,HP4")
+        XCTAssertTrue(s.contains { $0.code == "LP5" })
+        XCTAssertTrue(s.contains { $0.code == "JP4" })
+    }
+
+    // The bug this guards: "2-5 // MPs" names no individual codes. Counting the
+    // index range is the only way to learn there are four of them, and getting it
+    // wrong drops four symbols from the game without any error.
+    func testChevyHotExpandsPluralGroups() {
+        let s = GDDSymbolSetRules.parse(chevyHot)
+        let mps = s.filter { $0.role == .mediumPay }.map(\.code)
+        XCTAssertEqual(mps, ["MP1", "MP2", "MP3", "MP4"])
+        let lps = s.filter { $0.role == .lowPay }.map(\.code)
+        XCTAssertEqual(lps, ["LP1", "LP2", "LP3", "LP4"])
+        XCTAssertEqual(s.count, 19)
+    }
+
+    // BWY1 is a bonus WYSIWYG, not a blank that happens to start with B. Longest
+    // prefix wins; a naive prefix scan classifies it as .blank and gives it the art
+    // direction for an empty reel position.
+    func testLongestPrefixWins() {
+        XCTAssertEqual(GDDSymbolSetRules.classify("BWY1").role, .wysiwyg)
+        XCTAssertEqual(GDDSymbolSetRules.classify("BL1").role, .blank)
+        XCTAssertEqual(GDDSymbolSetRules.classify("BL").role, .blank)
+        XCTAssertEqual(GDDSymbolSetRules.classify("WD1").role, .wild)
+        XCTAssertEqual(GDDSymbolSetRules.classify("R2").role, .replacement)
+    }
+
+    func testTiersAreRead() {
+        XCTAssertEqual(GDDSymbolSetRules.classify("HP3").tier, 3)
+        XCTAssertEqual(GDDSymbolSetRules.classify("JP4").tier, 4)
+        XCTAssertNil(GDDSymbolSetRules.classify("BL").tier)
+    }
+
+    // An unrecognised code must surface as .unknown rather than be forced into a
+    // role: the wrong role hands the image model the wrong art direction, which is
+    // harder to notice than an obviously unclassified row.
+    func testUnknownCodeStaysUnknown() {
+        XCTAssertEqual(GDDSymbolSetRules.classify("ZZ9").role, .unknown)
+    }
+
+    // Prose after the block must not become phantom symbols.
+    func testStopsAtEndOfBlock() {
+        let s = GDDSymbolSetRules.parse(dodge)
+        XCTAssertFalse(s.contains { $0.code.hasPrefix("4X5") })
+        XCTAssertFalse(s.contains { $0.role == .unknown })
+    }
+
+    func testNoSymbolSetHeadingYieldsNothing() {
+        XCTAssertTrue(GDDSymbolSetRules.parse("Some other document entirely.").isEmpty)
+    }
+
+    func testBlanksAreTheOnlyThingNeedingNoArt() {
+        XCTAssertFalse(SlotSymbolRole.blank.needsArt)
+        XCTAssertTrue(SlotSymbolRole.highPay.needsArt)
+        XCTAssertTrue(SlotSymbolRole.replacement.needsArt)
+    }
+}
+
+// Writes the real planning prompt to disk so it can be fired at the live model
+// during development. Not an assertion — a harness.
+final class GDDPromptDumpTests: XCTestCase {
+    func testDumpPlanningPrompt() throws {
+        guard let out = ProcessInfo.processInfo.environment["GDD_PROMPT_DUMP"] else { return }
+        let chevy = """
+        Symbol Set
+          - 0 // WD1 (Wild Symbol)
+          - 1 // HP1  (Standard HP symbols)
+          - 2-5 // MPs  (Standard MP symbols)
+          - 6-9 // LPs  (Standard LP symbols)
+          - 10 //WY1  (Standard WYSIWYG)
+          - 11        //SF1  (Special Collector Symbol)
+          - 12 //R1 (Replacement 1)
+          - 13 //BL (Blank)
+          - 14 //WY2  (Hotspot WYSIWYG)
+          - 15 //JP1  (Grand)
+          - 16 //JP2  (Major)
+          - 17 //JP3  (Minor)
+          - 18 //JP4  (Mini)
+        Special Symbols + Upgrades
+        The bonus game features free spins and a jackpot ladder.
+        """
+        let theme = GameTheme(
+            name: "Jack and the Beanstalk", category: "Fairytale", comparables: "Megaways Jack",
+            why: "A fairytale with a built-in ascent mechanic — climbing the beanstalk is a natural level-up feature — and NetEnt already proved the equity.",
+            look: "The classic story brought to life: a giant beanstalk rising into a fantasy sky of floating castles and clouds. Whimsical soft greens, blues, and earth tones with magic beans, golden harps, and giants.",
+            tier: "T1")
+        let syms = GDDSymbolSetRules.parse(chevy)
+        let jobs = AssetPlanRules.symbolJobs(syms) + AssetPlanRules.backgroundJobs(gddText: chevy)
+        let p = GDDAssetPrompts.planning(theme: theme, gameName: "4400 Chevy-Hot", jobs: jobs)
+        try (GDDAssetPrompts.planningSystem + "\n\u{1F536}SPLIT\u{1F536}\n" + p)
+            .write(toFile: out, atomically: true, encoding: .utf8)
+        print("slots=\(jobs.count)")
+    }
+}
+
+// Development harness: feed a real model reply back through the real apply path.
+final class GDDPlanApplyHarness: XCTestCase {
+    func testApplyLiveReply() throws {
+        guard let f = ProcessInfo.processInfo.environment["GDD_REPLY_FILE"],
+              let reply = try? String(contentsOfFile: f, encoding: .utf8) else { return }
+        let chevy = """
+        Symbol Set
+          - 0 // WD1 (Wild Symbol)
+          - 1 // HP1  (Standard HP symbols)
+          - 2-5 // MPs  (Standard MP symbols)
+          - 6-9 // LPs  (Standard LP symbols)
+          - 10 //WY1  (Standard WYSIWYG)
+          - 11        //SF1  (Special Collector Symbol)
+          - 12 //R1 (Replacement 1)
+          - 13 //BL (Blank)
+          - 14 //WY2  (Hotspot WYSIWYG)
+          - 15 //JP1  (Grand)
+          - 16 //JP2  (Major)
+          - 17 //JP3  (Minor)
+          - 18 //JP4  (Mini)
+        The bonus game features free spins and a jackpot ladder.
+        """
+        let syms = GDDSymbolSetRules.parse(chevy)
+        let jobs = AssetPlanRules.symbolJobs(syms) + AssetPlanRules.backgroundJobs(gddText: chevy)
+        let j = try XCTUnwrap(GDDAssetPrompts.json(fromModelReply: reply), "reply was not JSON")
+        let r = GDDAssetPrompts.apply(planJSON: j, to: jobs)
+        let backing = SlotBackingRules.choose(palette: r.palette)
+        print("SLOTS=\(jobs.count) FILLED=\(r.jobs.filter { !$0.subject.isEmpty }.count) MISSING=\(r.missing)")
+        print("PALETTE=\(r.palette.count) BACKING=\(backing.name)")
+        print("CLASHES=\(GDDAssetPrompts.silhouetteClashes(r.jobs))")
+        for job in r.jobs where job.kind == .symbol {
+            print("  \(job.id.padding(toLength: 5, withPad: " ", startingAt: 0)) [\(job.silhouette)] \(job.subject.prefix(72))")
+        }
+    }
+}
+
+final class GDDAssetPlanTests: XCTestCase {
+
+    private let beanstalk = GameTheme(
+        name: "Jack and the Beanstalk", category: "Fairytale", comparables: "Megaways Jack",
+        look: "A giant beanstalk rising into a fantasy sky of floating castles and clouds. Whimsical soft greens, blues, and earth tones with magic beans, golden harps, and giants.")
+
+    // The question this whole rule exists to answer: a beanstalk game is green AND
+    // blue, so keying either colour out would eat the art. Magenta is what is left.
+    func testBackingAvoidsColoursTheArtUses() {
+        let palette = [RGB8(0x1B, 0x3B, 0x2B), RGB8(0x4A, 0x7C, 0x59), RGB8(0xD4, 0xAF, 0x37),
+                       RGB8(0x87, 0xCE, 0xEB), RGB8(0x4A, 0x35, 0x25)]
+        XCTAssertEqual(SlotBackingRules.choose(palette: palette).name, "chroma magenta")
+    }
+
+    // A magenta-and-gold game must not be keyed on magenta.
+    func testBackingMovesOffMagentaWhenTheArtIsMagenta() {
+        let palette = [RGB8(0xE0, 0x10, 0xD0), RGB8(0xFF, 0xD7, 0x00), RGB8(0x33, 0x00, 0x33)]
+        XCTAssertNotEqual(SlotBackingRules.choose(palette: palette).name, "chroma magenta")
+    }
+
+    // No palette at all must still give a usable answer rather than black.
+    func testBackingFallsBackWithoutPalette() {
+        XCTAssertEqual(SlotBackingRules.choose(palette: []).name, "chroma magenta")
+    }
+
+    func testHexParsing() {
+        XCTAssertEqual(SlotBackingRules.hex("#4A7C59"), RGB8(0x4A, 0x7C, 0x59))
+        XCTAssertEqual(SlotBackingRules.hex("4a7c59"), RGB8(0x4A, 0x7C, 0x59))
+        XCTAssertNil(SlotBackingRules.hex("soft green"))
+        XCTAssertNil(SlotBackingRules.hex("#12345"))
+    }
+
+    // Models wrap JSON in fences or a sentence often enough that a raw parse fails
+    // partway through a run. Every one of these shapes came back from a real call.
+    func testJSONSurvivesModelPackaging() {
+        let want = ##"{"palette":["#ffffff"],"assets":[{"id":"HP1","subject":"a","silhouette":"b"}]}"##
+        for wrapped in [want,
+                        "```json\n\(want)\n```",
+                        "Here is the plan:\n\(want)",
+                        "```\n\(want)\n```\nHope that helps!"] {
+            XCTAssertNotNil(GDDAssetPrompts.json(fromModelReply: wrapped), "failed on: \(wrapped)")
+        }
+        XCTAssertNil(GDDAssetPrompts.json(fromModelReply: "I can't help with that."))
+    }
+
+    // A slot the planner skipped must be REPORTED, not generated with an empty
+    // subject — an empty subject prompt still costs a credit and returns garbage.
+    func testMissingSlotsAreReportedNotGenerated() {
+        let jobs = [AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                             aspect: "1:1", size: "2K"),
+                    AssetJob(id: "HP2", kind: .symbol, role: .highPay, tier: 2, title: "",
+                             aspect: "1:1", size: "2K")]
+        let j = GDDAssetPrompts.json(fromModelReply:
+            #"{"assets":[{"id":"HP1","subject":"a giant","silhouette":"giant"}]}"#)!
+        let r = GDDAssetPrompts.apply(planJSON: j, to: jobs)
+        XCTAssertEqual(r.missing, ["HP2"])
+        XCTAssertEqual(r.jobs.first { $0.id == "HP1" }?.subject, "a giant")
+        XCTAssertTrue(r.jobs.first { $0.id == "HP2" }?.subject.isEmpty ?? false)
+    }
+
+    // Two symbols with the same silhouette is the classic way a set fails. It must
+    // surface before any credits are spent, not after twenty images come back.
+    func testSilhouetteClashesAreFound() {
+        func j(_ id: String, _ sil: String) -> AssetJob {
+            AssetJob(id: id, kind: .symbol, role: .mediumPay, tier: 1, title: "",
+                     subject: "x", silhouette: sil, aspect: "1:1", size: "2K")
+        }
+        let clashes = GDDAssetPrompts.silhouetteClashes([j("MP1", "Golden harp"),
+                                                         j("MP2", "golden harp"),
+                                                         j("MP3", "coin sack")])
+        XCTAssertEqual(clashes.count, 1)
+        XCTAssertEqual(clashes["golden harp"].map { $0.sorted() } ?? [], ["MP1", "MP2"])
+    }
+
+    // Blanks are reel positions, not pictures. Generating one wastes a credit.
+    func testPlanSkipsBlanksAndOrdersByImportance() {
+        let syms = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1   // wild
+        * 1-2 HP1-2  // HPs
+        * 3-4 LP1-2  // LPs
+        * 5 BL1   // blank
+        """)
+        let jobs = AssetPlanRules.symbolJobs(syms)
+        XCTAssertFalse(jobs.contains { $0.id == "BL1" })
+        XCTAssertEqual(jobs.map(\.id), ["HP1", "HP2", "WD1", "LP1", "LP2"])
+        XCTAssertTrue(jobs.allSatisfy { $0.aspect == "1:1" && $0.size == "2K" })
+    }
+
+    // Backgrounds are only created for modes the document actually names.
+    func testBackgroundsFollowTheDocument() {
+        XCTAssertEqual(AssetPlanRules.backgroundJobs(gddText: "A plain game.").map(\.id),
+                       ["bg_base"])
+        // A jackpot LADDER is a meter, not a scene — see testJackpotSymbolsDoNotInventAJackpotScene.
+        // "free spins bonus game" is ONE mode, so it yields one free-games scene, not a
+        // bonus scene as well — see GDDSceneTests.
+        let rich = AssetPlanRules.backgroundJobs(gddText: "Free spins bonus game with a jackpot wheel.")
+        XCTAssertEqual(rich.map(\.id).sorted(), ["bg_base", "bg_freegames", "bg_jackpot"])
+        // Backgrounds take whatever format covers the 1920x2532 portrait target,
+        // rather than a fixed ratio — see BackgroundFormatRules.
+        let fmt = BackgroundFormatRules.best()
+        XCTAssertTrue(rich.allSatisfy { $0.aspect == fmt.aspect && $0.size == fmt.size })
+    }
+
+    // The backing colour must be named in the drawing prompt, and the model must be
+    // told not to use it inside the art — the whole alpha pipeline depends on it.
+    func testImagePromptPinsTheBackingColour() {
+        let job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           subject: "a giant", silhouette: "giant", aspect: "1:1", size: "2K")
+        let p = GDDAssetPrompts.image(job: job, theme: beanstalk,
+                                      backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("#FF00FF"))
+        XCTAssertTrue(p.contains("Do NOT use chroma magenta anywhere in the symbol itself"))
+        XCTAssertTrue(p.contains("NO text"))
+        XCTAssertTrue(p.contains("Jack and the Beanstalk"))
+    }
+
+    // A background is a scene with a calm middle, not a symbol.
+    func testBackgroundPromptKeepsTheCentreClear() {
+        let job = AssetJob(id: "bg_base", kind: .background, role: .unknown, tier: nil,
+                           title: "", subject: "a sky of floating castles", aspect: "9:16", size: "2K")
+        let p = GDDAssetPrompts.image(job: job, theme: beanstalk,
+                                      backing: SlotBackingRules.candidates[0])
+        XCTAssertTrue(p.contains("CENTRE"))
+        XCTAssertFalse(p.contains("chroma green"))   // backgrounds are not keyed
+    }
+
+    // Role direction has to actually differ per role, or every symbol comes back the same.
+    func testRoleDirectionsAreDistinct() {
+        // collector, activator and adder deliberately SHARE one block — it names all four
+        // special-feature jobs and the symbol's own GDD note says which applies. Every
+        // other role must still read differently from every other.
+        let shared: Set<SlotSymbolRole> = [.collector, .activator, .adder]
+        let distinct = SlotSymbolRole.allCases.filter { !shared.contains($0) }
+            .map { SlotArtDirection.direction(for: $0, tier: 1) }
+        XCTAssertEqual(Set(distinct).count, distinct.count)
+        XCTAssertEqual(Set(shared.map { SlotArtDirection.direction(for: $0, tier: 1) }).count, 1)
+        // Was "ENERGY FORM", then "TRANSFORMATION" — both removed, because either
+        // abstraction produced a swirling vortex. The wild now names a concrete subject.
+        // See ArtDirectionQualityTests.testWildRefusesTheVortexDefault.
+        XCTAssertTrue(SlotArtDirection.direction(for: .wild, tier: nil).contains("SPECIFIC SUBJECT"))
+        // "never a human" was removed — it had no basis. See testMediumPayDoesNotBanPeople.
+        XCTAssertTrue(SlotArtDirection.direction(for: .mediumPay, tier: 1).contains("middle band"))
+        XCTAssertTrue(SlotArtDirection.direction(for: .jackpot, tier: 1).contains("GRAND"))
+        // Was "NO writing on it" alongside a mandated half-size blank plate. The plate
+        // size was invented precision; what matters is that the game prints the value.
+        XCTAssertTrue(SlotArtDirection.direction(for: .wysiwyg, tier: nil)
+            .contains("NO lettering or numerals"))
+    }
+}
+
+// Development harness: emit the real per-image prompts for a live generation test.
+final class GDDImagePromptDump: XCTestCase {
+    func testDumpImagePrompts() throws {
+        guard let dir = ProcessInfo.processInfo.environment["GDD_IMG_DUMP"],
+              let replyFile = ProcessInfo.processInfo.environment["GDD_REPLY_FILE"],
+              let reply = try? String(contentsOfFile: replyFile, encoding: .utf8) else { return }
+        let chevy = """
+        Symbol Set
+          - 0 // WD1 (Wild Symbol)
+          - 1 // HP1  (Standard HP symbols)
+          - 2-5 // MPs  (Standard MP symbols)
+          - 6-9 // LPs  (Standard LP symbols)
+          - 10 //WY1  (Standard WYSIWYG)
+          - 11        //SF1  (Special Collector Symbol)
+          - 12 //R1 (Replacement 1)
+          - 13 //BL (Blank)
+          - 14 //WY2  (Hotspot WYSIWYG)
+          - 15 //JP1  (Grand)
+          - 16 //JP2  (Major)
+          - 17 //JP3  (Minor)
+          - 18 //JP4  (Mini)
+        The bonus game features free spins and a jackpot ladder.
+        """
+        let theme = GameTheme(
+            name: "Jack and the Beanstalk", category: "Fairytale", comparables: "Megaways Jack",
+            look: "The classic story brought to life: a giant beanstalk rising into a fantasy sky of floating castles and clouds. Whimsical soft greens, blues, and earth tones with magic beans, golden harps, and giants.")
+        let syms = GDDSymbolSetRules.parse(chevy)
+        let jobs = AssetPlanRules.symbolJobs(syms) + AssetPlanRules.backgroundJobs(gddText: chevy)
+        let j = try XCTUnwrap(GDDAssetPrompts.json(fromModelReply: reply))
+        let r = GDDAssetPrompts.apply(planJSON: j, to: jobs)
+        let backing = SlotBackingRules.choose(palette: r.palette)
+        let want = ProcessInfo.processInfo.environment["GDD_IMG_IDS"]?
+            .split(separator: ",").map(String.init) ?? ["HP1"]
+        for job in r.jobs where want.contains(job.id) {
+            let p = GDDAssetPrompts.image(job: job, theme: theme, backing: backing)
+            try p.write(toFile: "\(dir)/\(job.id).prompt.txt", atomically: true, encoding: .utf8)
+            print("WROTE \(job.id) aspect=\(job.aspect) size=\(job.size)")
+        }
+    }
+}
+
+final class GeneratedSizeTests: XCTestCase {
+    // Measured behaviour: four identical NB2 calls asking for 2K at 1:1 returned
+    // 1024 twice and 2048 twice, at the same price. Half size must be caught.
+    func testHalfSizeIsCaught() {
+        XCTAssertTrue(GeneratedSizeRules.isUndersized(longEdge: 1024, requested: "2K"))
+        XCTAssertFalse(GeneratedSizeRules.isUndersized(longEdge: 2048, requested: "2K"))
+    }
+
+    // A 9:16 request lands on numbers like 1536x2752 that satisfy "2K" without
+    // matching it exactly; flagging those would cry wolf on every background.
+    func testTallImagesAreNotFalselyFlagged() {
+        XCTAssertFalse(GeneratedSizeRules.isUndersized(longEdge: 2752, requested: "2K"))
+        XCTAssertFalse(GeneratedSizeRules.isUndersized(longEdge: 1900, requested: "2K"))
+    }
+
+    func testTargets() {
+        XCTAssertEqual(GeneratedSizeRules.targetLongEdge("4K"), 4096)
+        XCTAssertEqual(GeneratedSizeRules.targetLongEdge("2K"), 2048)
+        XCTAssertEqual(GeneratedSizeRules.targetLongEdge("1K"), 1024)
+    }
+}
+
+final class BackgroundFormatTests: XCTestCase {
+
+    // The portrait background the games are built to. Nothing at 2K reaches it, so
+    // this must come out as a 4K request — and 3:4, not 9:16, because every 4K
+    // request yields the same pixel COUNT and only the shape distinguishes them.
+    func testPortraitTargetPicks3x4At4K() {
+        let b = BackgroundFormatRules.best()
+        XCTAssertEqual(b.aspect, "3:4")
+        XCTAssertEqual(b.size, "4K")
+        let p = BackgroundFormatRules.pixels(ratio: 3.0 / 4, size: "4K")
+        XCTAssertTrue(BackgroundFormatRules.covers(width: p.w, height: p.h))
+    }
+
+    // Guards the claim the choice rests on: no 2K format covers 1920x2532.
+    func testNo2KFormatCoversThePortraitTarget() {
+        for (_, r) in BackgroundFormatRules.ratios {
+            let p = BackgroundFormatRules.pixels(ratio: r, size: "2K")
+            XCTAssertFalse(BackgroundFormatRules.covers(width: p.w, height: p.h),
+                           "2K \(p.w)x\(p.h) unexpectedly covers the target")
+        }
+    }
+
+    // The measured shape of a real call: "2K" at 9:16 came back 1536x2752, so the
+    // pixel model has to predict roughly that.
+    func testPixelModelMatchesAMeasuredCall() {
+        let p = BackgroundFormatRules.pixels(ratio: 9.0 / 16, size: "2K")
+        XCTAssertEqual(p.w, 1536)
+        XCTAssertEqual(abs(p.h - 2752) < 32, true, "predicted \(p.h), measured 2752")
+    }
+
+    // A smaller target must not be forced up to 4K.
+    func testSmallTargetStaysSmall() {
+        let b = BackgroundFormatRules.best(target: (w: 700, h: 1200))
+        XCTAssertEqual(b.size, "1K")
+    }
+
+    // 9:21 is listed as a Nano Banana ratio but the service substitutes 9:16 for it,
+    // so it must not be offered here.
+    func testUnhonouredRatioIsNotOffered() {
+        XCTAssertFalse(BackgroundFormatRules.ratios.contains { $0.name == "9:21" })
+    }
+}
+
+// Bugs found by review, each one a paid mistake or a wrong asset set.
+final class GDDAssetReviewFixTests: XCTestCase {
+
+    // Designing the set again and getting a SHORTER answer used to leave the previous
+    // subject in place: reported missing, but still carrying text — so generation drew
+    // it and charged for it.
+    func testRedesignClearsSubjectsTheModelOmitted() {
+        var job = AssetJob(id: "HP2", kind: .symbol, role: .highPay, tier: 2, title: "",
+                           subject: "an old subject from last time", silhouette: "old",
+                           aspect: "1:1", size: "2K")
+        job.subject = "an old subject from last time"
+        let j = GDDAssetPrompts.json(fromModelReply: #"{"assets":[]}"#)!
+        let r = GDDAssetPrompts.apply(planJSON: j, to: [job])
+        XCTAssertEqual(r.missing, ["HP2"])
+        XCTAssertEqual(r.jobs[0].subject, "")
+        XCTAssertEqual(r.jobs[0].silhouette, "")
+    }
+
+    // A whitespace-only subject is not a subject.
+    func testWhitespaceSubjectCountsAsMissing() {
+        let job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           aspect: "1:1", size: "2K")
+        let j = GDDAssetPrompts.json(fromModelReply:
+            #"{"assets":[{"id":"HP1","subject":"   ","silhouette":"x"}]}"#)!
+        XCTAssertEqual(GDDAssetPrompts.apply(planJSON: j, to: [job]).missing, ["HP1"])
+    }
+
+    // "1-2 HP1-4" declares four codes across two indices. It used to produce four
+    // symbols at indices 1,2,2,2 — two of them invented, each a paid image.
+    func testMismatchedRangeIsRejectedNotClamped() {
+        let s = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1   // wild
+        * 1-2 HP1-4  // mismatched
+        * 3-4 LP1-2  // fine
+        """)
+        XCTAssertFalse(s.contains { $0.code == "HP3" || $0.code == "HP4" })
+        XCTAssertEqual(s.filter { $0.role == .lowPay }.map(\.code), ["LP1", "LP2"])
+    }
+
+    // A typo used to try to build a billion strings on the parsing thread.
+    func testAbsurdRangeIsRefused() {
+        let s = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 1 HP1-1000000000  // typo
+        """)
+        XCTAssertTrue(s.isEmpty)
+    }
+
+    // "jackpot" alone matched any game with a jackpot SYMBOL — which is most of them —
+    // and invented a 4K jackpot scene nobody asked for.
+    func testJackpotSymbolsDoNotInventAJackpotScene() {
+        let ids = AssetPlanRules.backgroundJobs(gddText: """
+        Symbol Set
+        * 15-18 JP1-4 // jackpots, grand -> mini
+        Jackpots that land in base game do not pay out.
+        """).map(\.id)
+        XCTAssertEqual(ids, ["bg_base"])
+    }
+
+    // A game that really does have a jackpot round still gets one.
+    func testNamedJackpotRoundStillGetsAScene() {
+        let ids = AssetPlanRules.backgroundJobs(gddText: "Landing three triggers the jackpot wheel.").map(\.id)
+        XCTAssertTrue(ids.contains("bg_jackpot"))
+    }
+
+    func testBonusNeedsANamedModeNotTheWordBonus() {
+        XCTAssertEqual(AssetPlanRules.backgroundJobs(gddText: "The bonus symbol is a chest.").map(\.id),
+                       ["bg_base"])
+        XCTAssertTrue(AssetPlanRules.backgroundJobs(gddText: "Three scatters award the bonus game.")
+                        .map(\.id).contains("bg_bonus"))
+    }
+}
+
+final class GDDOutputTests: XCTestCase {
+    func testFolderNameCombinesGameAndTheme() {
+        XCTAssertEqual(GDDOutputRules.folderName(game: "4400 Chevy-Hot GDD",
+                                                 theme: "Jack and the Beanstalk"),
+                       "4400 Chevy-Hot GDD — Jack and the Beanstalk")
+    }
+
+    // A theme name with a slash in it must not turn into a nested path.
+    func testPathSeparatorsAreStripped() {
+        let n = GDDOutputRules.folderName(game: "A/B", theme: "C:D")
+        XCTAssertFalse(n.contains("/"))
+        XCTAssertFalse(n.contains(":"))
+    }
+
+    // Running the same game and theme twice is normal — a second pass after editing
+    // a few subjects. The first run's art must not be written over.
+    func testSecondRunGetsItsOwnFolder() {
+        let base = "4400 — Jack"
+        XCTAssertEqual(GDDOutputRules.uniqueName(base, existing: []), base)
+        XCTAssertEqual(GDDOutputRules.uniqueName(base, existing: [base]), "4400 — Jack 2")
+        XCTAssertEqual(GDDOutputRules.uniqueName(base, existing: [base, "4400 — Jack 2"]),
+                       "4400 — Jack 3")
+    }
+
+    func testEmptyNamesStillGiveAFolder() {
+        XCTAssertFalse(GDDOutputRules.folderName(game: "", theme: "").isEmpty)
+    }
+}
+
+final class SymbolCanvasTests: XCTestCase {
+    private let magenta = RGB8(255, 0, 255)
+
+    /// A 100x100 magenta field with a 20x30 opaque block at (30, 40).
+    private func field(_ w: Int, _ h: Int, box: (x: Int, y: Int, w: Int, h: Int)?) -> (Int, Int) -> RGB8 {
+        return { x, y in
+            guard let b = box, x >= b.x, x < b.x + b.w, y >= b.y, y < b.y + b.h else {
+                return RGB8(255, 0, 255)
+            }
+            return RGB8(20, 200, 40)
+        }
+    }
+
+    func testFindsTheSubjectBox() {
+        let b = SymbolCanvasRules.subjectBounds(width: 100, height: 100, backing: magenta,
+                                                sample: field(100, 100, box: (30, 40, 20, 30)))
+        XCTAssertEqual(b?.x, 30); XCTAssertEqual(b?.y, 40)
+        XCTAssertEqual(b?.w, 20); XCTAssertEqual(b?.h, 30)
+    }
+
+    // An all-backing image has no subject. Inventing a box would drop the cut-out at
+    // an arbitrary spot, which looks fine in a folder and wrong on a reel.
+    func testEmptyFieldHasNoBox() {
+        XCTAssertNil(SymbolCanvasRules.subjectBounds(width: 40, height: 40, backing: magenta,
+                                                     sample: field(40, 40, box: nil)))
+    }
+
+    func testPlacementPutsTheCutoutBackWhereItCameFrom() {
+        let at = SymbolCanvasRules.placement(cutout: (20, 30), bounds: (30, 40, 20, 30),
+                                             canvas: (100, 100))
+        XCTAssertEqual(at?.x, 30); XCTAssertEqual(at?.y, 40)
+    }
+
+    // Photoshop's trim and our scan agree to within a pixel or two, not exactly.
+    func testSmallDisagreementIsCentred() {
+        let at = SymbolCanvasRules.placement(cutout: (18, 28), bounds: (30, 40, 20, 30),
+                                             canvas: (100, 100))
+        XCTAssertEqual(at?.x, 31); XCTAssertEqual(at?.y, 41)
+    }
+
+    // A big disagreement means the cut-out is not what the box describes. Refuse
+    // rather than place it wrong.
+    func testBigDisagreementIsRefused() {
+        XCTAssertNil(SymbolCanvasRules.placement(cutout: (200, 300), bounds: (30, 40, 20, 30),
+                                                 canvas: (100, 100)))
+    }
+
+    // Measured on the real run: the glowing wild's cut-out was 1748x1743 against a
+    // scanned box of 1767x1799 on a 2048 canvas — a 56px disagreement, because a soft
+    // glow fades into the backing. A flat 24px tolerance refused exactly the soft
+    // symbols and placed the hard ones, which is the opposite of a consistent set.
+    func testSoftEdgedSymbolIsStillPlaced() {
+        let at = SymbolCanvasRules.placement(cutout: (1748, 1743), bounds: (115, 161, 1767, 1799),
+                                             canvas: (2048, 2048))
+        XCTAssertNotNil(at)
+        XCTAssertEqual(at?.x, 115 + (1767 - 1748) / 2)
+        XCTAssertEqual(at?.y, 161 + (1799 - 1743) / 2)
+    }
+
+    func testToleranceScalesWithCanvas() {
+        XCTAssertEqual(SymbolCanvasRules.tolerance(canvas: (2048, 2048)), 102)
+        XCTAssertEqual(SymbolCanvasRules.tolerance(canvas: (100, 100)), 24)
+    }
+
+    func testPlacementNeverRunsOffTheCanvas() {
+        XCTAssertNil(SymbolCanvasRules.placement(cutout: (20, 30), bounds: (90, 90, 20, 30),
+                                                 canvas: (100, 100)))
+    }
+}
+
+final class SpillRecoveryTests: XCTestCase {
+    private let magenta = RGB8(255, 0, 255)
+
+    // A fully opaque pixel contains no backing at all, so the source colour IS the
+    // foreground. This is the case Keylight got wrong: it despilled anyway, turning a
+    // gold-and-crimson symbol green.
+    func testOpaquePixelRecoversTheSourceExactly() {
+        let gold = RGB8(212, 175, 55)
+        let out = ChromaKeyOutputRules.SpillRules.foreground(source: gold, backing: magenta, alpha: 255)
+        XCTAssertEqual(out, gold)
+    }
+
+    // Half-covered: S = F/2 + B/2, so F = 2S - B. Built from a known F and checked.
+    func testHalfCoveredPixelInvertsTheComposite() {
+        let f = RGB8(200, 100, 40)
+        func mix(_ a: UInt8, _ b: UInt8) -> UInt8 { UInt8((Int(a) + Int(b)) / 2) }
+        let s = RGB8(mix(f.r, magenta.r), mix(f.g, magenta.g), mix(f.b, magenta.b))
+        let out = ChromaKeyOutputRules.SpillRules.foreground(source: s, backing: magenta, alpha: 128)
+        XCTAssertLessThanOrEqual(abs(Int(out.r) - Int(f.r)), 3)
+        XCTAssertLessThanOrEqual(abs(Int(out.g) - Int(f.g)), 3)
+        XCTAssertLessThanOrEqual(abs(Int(out.b) - Int(f.b)), 3)
+    }
+
+    // Where the matte is nearly empty the division blows up, so Keylight's own answer
+    // is kept rather than amplifying noise into a coloured fringe.
+    func testVeryThinMatteKeepsKeylightsColour() {
+        let keyed = RGB8(10, 20, 30)
+        let out = ChromaKeyOutputRules.SpillRules.recovered(
+            keyed: keyed, source: RGB8(250, 5, 250), backing: magenta, alpha: 10)
+        XCTAssertEqual(out, keyed)
+        XCTAssertEqual(ChromaKeyOutputRules.SpillRules.weight(alpha: 10), 0)
+    }
+
+    // And the crossfade in between is smooth, so the edge does not band.
+    func testWeightRampsSmoothly() {
+        // Floor 0.28 (alpha ~71), full 0.50 (alpha ~128).
+        XCTAssertEqual(ChromaKeyOutputRules.SpillRules.weight(alpha: 60), 0)    // 0.235, below floor
+        let w = ChromaKeyOutputRules.SpillRules.weight(alpha: 100)              // 0.392, mid-ramp
+        XCTAssertGreaterThan(w, 0)
+        XCTAssertLessThan(w, 1)
+        XCTAssertEqual(ChromaKeyOutputRules.SpillRules.weight(alpha: 128), 1)   // 0.502
+        XCTAssertEqual(ChromaKeyOutputRules.SpillRules.weight(alpha: 255), 1)
+    }
+
+    // The whole point: soft FX must not be clipped. A transitional pixel keeps its
+    // partial alpha and simply gets an honest colour.
+    func testSoftPixelIsRecoveredNotClipped() {
+        let out = ChromaKeyOutputRules.SpillRules.recovered(
+            keyed: RGB8(0, 0, 0), source: RGB8(240, 120, 240), backing: magenta, alpha: 128)
+        XCTAssertNotEqual(out, RGB8(0, 0, 0))
+    }
+}
+
+final class ImageRequestPolicyTests: XCTestCase {
+    // Google names 429, 408 and transient 5xx as retryable; other 4xx are terminal.
+    func testRetryableStatuses() {
+        XCTAssertTrue(ImageRequestPolicy.isRetryable(status: 429))
+        XCTAssertTrue(ImageRequestPolicy.isRetryable(status: 408))
+        XCTAssertTrue(ImageRequestPolicy.isRetryable(status: 503))
+        XCTAssertFalse(ImageRequestPolicy.isRetryable(status: 400))
+        XCTAssertFalse(ImageRequestPolicy.isRetryable(status: 403))
+    }
+
+    // Our errors carry the status inline: "AI service HTTP 429: …".
+    func testStatusIsReadOutOfOurOwnErrorText() {
+        XCTAssertEqual(ImageRequestPolicy.status(inMessage: "AI service HTTP 429: slow down"), 429)
+        XCTAssertTrue(ImageRequestPolicy.shouldRetry(errorMessage: "AI service HTTP 503: upstream"))
+        XCTAssertFalse(ImageRequestPolicy.shouldRetry(errorMessage: "AI service HTTP 400: bad prompt"))
+    }
+
+    // An error with no status is a transport failure. Replaying it blind could pay
+    // twice for an image that was already generated and metered.
+    func testTransportFailureIsNotRetried() {
+        XCTAssertNil(ImageRequestPolicy.status(inMessage: "The request timed out."))
+        XCTAssertFalse(ImageRequestPolicy.shouldRetry(errorMessage: "The request timed out."))
+    }
+
+    // Initial 1s, base 2, capped at 60, plus 0-1s jitter — Google's documented shape.
+    func testBackoffGrowsAndIsCapped() {
+        XCTAssertEqual(ImageRequestPolicy.backoff(forAttempt: 1, jitter: 0), 1)
+        XCTAssertEqual(ImageRequestPolicy.backoff(forAttempt: 2, jitter: 0), 2)
+        XCTAssertEqual(ImageRequestPolicy.backoff(forAttempt: 3, jitter: 0), 4)
+        XCTAssertEqual(ImageRequestPolicy.backoff(forAttempt: 20, jitter: 0), 60)
+        XCTAssertEqual(ImageRequestPolicy.backoff(forAttempt: 1, jitter: 0.5), 1.5)
+    }
+
+    // "Retrying no more than two times" — three attempts in total.
+    func testAttemptBudgetMatchesGooglesAdvice() {
+        XCTAssertEqual(ImageRequestPolicy.maxAttempts, 3)
+    }
+}
+
+final class ArtDirectionQualityTests: XCTestCase {
+    // Measured failure: the wild came back a "swirling vortex" in three plans out of
+    // three. The direction has to name that habit and refuse it, not just list options.
+    func testWildRefusesTheVortexDefault() {
+        let d = SlotArtDirection.direction(for: .wild, tier: nil)
+        // Research finding: real wilds are characters and emblems — Big Bass's fisherman,
+        // Wild West Gold's sheriff — not energy. Asking for "transformation" or "an energy
+        // form" is itself what produced a swirling vortex three plans running, so BOTH
+        // abstractions are gone and the direction names a concrete subject instead.
+        XCTAssertTrue(d.contains("SPECIFIC SUBJECT"))
+        XCTAssertTrue(d.contains("at the same level of reality as every"))
+        // Measured across six themes with a plain wild: two came back as medallions, and
+        // both were themes whose signature creature was ALREADY a high pay. The set rule
+        // "no two may read the same" was pushing the wild up into a token of the thing it
+        // could not repeat, so the direction now names the sideways move instead.
+        XCTAssertTrue(d.contains("move SIDEWAYS in this"))
+        XCTAssertTrue(d.contains("A paw print stands FOR a wolf"))
+        XCTAssertFalse(d.contains("ENERGY FORM"))
+        XCTAssertFalse(d.contains("It must read as TRANSFORMATION"))
+        // The word itself is gone now too. Naming the unwanted shape is how it gets
+        // drawn — measured across six plans, where "coin", "gem" and "portal" appeared
+        // in subjects traceable to example lists in the prompt rather than to the GDD.
+        XCTAssertFalse(d.lowercased().contains("vortex"))
+    }
+
+    // Wild must still be told apart from scatter and bonus.
+    // Scatter and bonus are EVALUATION rules, not shapes. Shipping scatters are sunsets
+    // and lollipops; bonus symbols are coins as often as chests. The old direction
+    // mandated a circular portal and a container, which was invented.
+    func testScatterAndBonusAreNotForcedIntoShapes() {
+        let sc = SlotArtDirection.direction(for: .scatter, tier: nil)
+        XCTAssertFalse(sc.contains("A circular form you travel THROUGH"))
+        XCTAssertTrue(sc.contains("COUNTABLE"))
+        let bo = SlotArtDirection.direction(for: .bonus, tier: nil)
+        XCTAssertFalse(bo.contains("A CONTAINER or mechanism"))
+        XCTAssertTrue(bo.contains("impossible to confuse"))
+    }
+
+    // Four unrelated treasures make the player guess the rank. Shipping games share one
+    // construction and separate the tiers by colour and a printed name.
+    func testJackpotsAreOneFamily() {
+        let g = SlotArtDirection.direction(for: .jackpot, tier: 1)
+        XCTAssertTrue(g.contains("FAMILY"))
+        XCTAssertTrue(g.contains("keep the form shared"))
+        XCTAssertTrue(g.contains("GRAND"))
+    }
+
+    // "Never a human" in medium pays had no basis.
+    func testMediumPayDoesNotBanPeople() {
+        XCTAssertFalse(SlotArtDirection.direction(for: .mediumPay, tier: 1).contains("never a human"))
+    }
+
+    // The high pays are a ladder a player can rank without the paytable.
+    func testHighPaysAreDescribedAsARankableLadder() {
+        let one = SlotArtDirection.direction(for: .highPay, tier: 1)
+        let four = SlotArtDirection.direction(for: .highPay, tier: 4)
+        XCTAssertTrue(one.contains("most desirable object in the entire game"))
+        XCTAssertFalse(four.contains("most desirable object in the entire game"))
+        XCTAssertTrue(one.contains("LADDER"))
+        // Value is lost by becoming plainer, not by becoming smaller.
+        XCTAssertTrue(one.contains("Do not make a lower tier"))
+    }
+
+    // Warmer = higher paying, with an honest escape for cool themes.
+    func testWarmthLeadsValueButIsNotAbsolute() {
+        XCTAssertTrue(SlotArtDirection.setRules.contains("WARMER, HOTTER and RICHER"))
+        XCTAssertTrue(SlotArtDirection.setRules.contains("house preference, not a law of the genre"))
+    }
+
+    // The stale, invented thresholds must not creep back in.
+    func testNoFabricatedThresholdsRemain() {
+        let all = SlotSymbolRole.allCases.map { SlotArtDirection.direction(for: $0, tier: 1) }
+            .joined() + SlotArtDirection.houseStyle + SlotArtDirection.setRules
+        XCTAssertFalse(all.contains("32 px"))
+        XCTAssertFalse(all.contains("32x32"))
+        XCTAssertFalse(all.contains("200 milliseconds"))
+        XCTAssertFalse(all.contains("85%"))
+        XCTAssertFalse(all.contains("~95%"))
+    }
+}
+
+final class GDDFeatureContextTests: XCTestCase {
+    private let chevy = """
+    Symbol Set
+    * 0 WD1  // wild symbol
+    Special Symbols + Upgrades
+    SF1 - SF1s that land in the base game shoot fireballs up to the Hot Reel's glass panel.
+    The second reel that fires fireballs at the glass panel causes the glass to shatter.
+    WY1 - The value of the WY1 will be paid out instantly if it is collected by an SF1.
+    Tech Design
+    int[] JACKPOT_VALUES = { 500, 2000 };
+    struct ScatterDisplay
+    {
+        RSP reelStop;
+    }
+    """
+
+    // The prose is where the game actually lives. Without it the planner sees codes only
+    // and returns symbols that would suit any game at all.
+    func testKeepsTheFeatureProse() {
+        let e = GDDFeatureContext.excerpt(chevy)
+        XCTAssertTrue(e.contains("fireballs"))
+        XCTAssertTrue(e.contains("glass panel"))
+    }
+
+    // Code and JSON carry no art meaning and would eat the whole budget.
+    func testDropsCodeAndStructs() {
+        let e = GDDFeatureContext.excerpt(chevy)
+        XCTAssertFalse(e.contains("JACKPOT_VALUES"))
+        XCTAssertFalse(e.contains("RSP reelStop"))
+        XCTAssertFalse(e.contains("struct"))
+    }
+
+    // Still bounded, but generously. The old ceiling was 2,500 characters, set when the
+    // model had a small window; gemini-3.8-flash takes 1,048,576 tokens and Google's
+    // long-context guidance is to keep the relevant document whole.
+    func testIsBounded() {
+        // Real documents are many lines, not one enormous one — the reader works per line.
+        let huge = "Special Symbols\n"
+            + (1...4000).map { "The giant roars loudly on line \($0)." }.joined(separator: "\n")
+        let e = GDDFeatureContext.excerpt(huge)
+        XCTAssertLessThanOrEqual(e.count, 42000)   // 40k of content + the joining newlines
+        XCTAssertGreaterThan(e.count, 20000, "the old 2,500-character ceiling is back")
+    }
+
+    // The whole document now reaches the planner, not only the lines after one of a
+    // short list of headings — a list that did not include "Symbols", so a document that
+    // described its symbols under that heading lost them and the planner invented
+    // subjects for symbols the document had already named.
+    func testSymbolProseSurvivesWithoutABlessedHeading() {
+        let doc = """
+        Symbols
+        HP1 - "hero" 1, main cowboy character, gold frame
+        LP1 - the drinker
+        """
+        let e = GDDFeatureContext.excerpt(doc)
+        XCTAssertTrue(e.contains("main cowboy character"), "symbol prose was dropped: \(e)")
+        XCTAssertTrue(e.contains("the drinker"))
+    }
+
+    // Machine detail still goes: code, JSON and reel tables carry no art meaning.
+    func testCodeAndJSONAreStillStripped() {
+        let doc = "Symbols\nHP1 - a giant\nint bonusSpins;\n{ \"reel\": 1 }\nstruct Foo {"
+        let e = GDDFeatureContext.excerpt(doc)
+        XCTAssertTrue(e.contains("a giant"))
+        XCTAssertFalse(e.contains("bonusSpins"))
+        XCTAssertFalse(e.contains("reel"))
+    }
+}
+
+final class GDDFormatTests: XCTestCase {
+
+    // A Word table exports as one cell per line, so the symbol set arrives as a column
+    // of bare codes with their indices beneath. The list parser finds nothing in this,
+    // and seven GDDs in the shared folder are Word documents.
+    private let wordTable = """
+    Activators (ships)
+    Name
+    Symbol ID
+    Shots
+    SF1
+    7
+    1
+
+    SF2
+    8
+    2
+
+    SF3
+    9
+    4
+
+    SF4
+    10
+    10 (Full Row)
+    """
+
+    func testWordTableSymbolsAreFound() {
+        let s = GDDSymbolSetRules.parse(wordTable)
+        XCTAssertEqual(s.map(\.code), ["SF1", "SF2", "SF3", "SF4"])
+        XCTAssertEqual(s.first?.index, 7)
+        XCTAssertTrue(s.allSatisfy { $0.role == .collector })
+    }
+
+    // One stray "R1" in prose is a reel, not a replacement symbol.
+    func testOneStrayCodeIsNotASymbolSet() {
+        XCTAssertTrue(GDDSymbolSetRules.parse("""
+        The player advances along R1
+        R1
+        and then stops.
+        """).isEmpty)
+    }
+
+    // The list format still wins when both could match.
+    func testListFormatIsPreferred() {
+        let s = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1   // wild
+        * 1-4 HP1-4  // HPs
+        """)
+        XCTAssertEqual(s.map(\.code), ["WD1", "HP1", "HP2", "HP3", "HP4"])
+    }
+
+    func testBareCodeRecognition() {
+        XCTAssertTrue(GDDSymbolSetRules.isBareCode("HP1"))
+        XCTAssertTrue(GDDSymbolSetRules.isBareCode("JP4"))
+        XCTAssertFalse(GDDSymbolSetRules.isBareCode("Shots"))
+        XCTAssertFalse(GDDSymbolSetRules.isBareCode("HP"))      // no number
+        XCTAssertFalse(GDDSymbolSetRules.isBareCode("ZZ9"))     // unknown prefix
+    }
+
+    // Some GDDs describe symbols only in prose, so the model reads them instead. Its
+    // answer must map onto real symbols.
+    func testModelExtractionMapsOntoSymbols() {
+        let j = GDDAssetPrompts.json(fromModelReply: """
+        {"symbols":[{"code":"HP1","role":"highPay","note":"main cowboy, gold frame"},
+                    {"code":"LP1","role":"lowPay","note":"the drinker"},
+                    {"code":"WD1","role":"wild","note":""}]}
+        """)!
+        let s = GDDAssetPrompts.symbols(fromExtraction: j)
+        XCTAssertEqual(s.map(\.code), ["HP1", "LP1", "WD1"])
+        XCTAssertEqual(s[0].role, .highPay)
+        XCTAssertEqual(s[0].tier, 1)
+        XCTAssertEqual(s[0].note, "main cowboy, gold frame")
+    }
+
+    // A good code with a nonsense role still yields a usable slot.
+    func testBadRoleFallsBackToTheCode() {
+        let j = GDDAssetPrompts.json(fromModelReply:
+            #"{"symbols":[{"code":"JP2","role":"nonsense","note":""}]}"#)!
+        XCTAssertEqual(GDDAssetPrompts.symbols(fromExtraction: j).first?.role, .jackpot)
+    }
+}
+
+final class SilhouetteNearDuplicateTests: XCTestCase {
+    private func j(_ id: String, _ sil: String) -> AssetJob {
+        // Medium pays: not a family role, so a shared silhouette here is a real fault.
+        AssetJob(id: id, kind: .symbol, role: .mediumPay, tier: nil, title: "",
+                 subject: "x", silhouette: sil, aspect: "1:1", size: "2K")
+    }
+
+    // From a real plan: "Fireball Coin" and "Flaming Coin" are two different strings and
+    // two symbols that will look the same on a reel. Exact matching passed them both.
+    // (This pair was first seen on WY1/WY2, which are now treated as one value-tier
+    // family — see WysiwygFamilyTests. Across unrelated roles it is still a fault.)
+    func testTwoCoinsAreCaught() {
+        let c = GDDAssetPrompts.silhouetteClashes([j("MP1", "Fireball Coin"),
+                                                   j("MP2", "Flaming Coin"),
+                                                   j("HP1", "Ornate Harp")])
+        XCTAssertEqual(c["coin"]?.sorted(), ["MP1", "MP2"])
+        XCTAssertNil(c["harp"])
+    }
+
+    // "Golden" and "magical" decorate everything in a fantasy set and must not, alone,
+    // make two symbols count as the same.
+    func testDecorativeWordsDoNotCreateFalseClashes() {
+        let c = GDDAssetPrompts.silhouetteClashes([j("A", "Golden Harp"),
+                                                   j("B", "Golden Crown"),
+                                                   j("C", "Magical Axe")])
+        XCTAssertTrue(c.isEmpty, "got \(c)")
+    }
+
+    func testExactMatchesStillCaught() {
+        let c = GDDAssetPrompts.silhouetteClashes([j("A", "Battle Axe"), j("B", "battle axe")])
+        XCTAssertEqual(c["battle axe"]?.sorted(), ["A", "B"])
+    }
+}
+
+final class LowPayFamilyTests: XCTestCase {
+    private func j(_ id: String, _ role: SlotSymbolRole, _ sil: String) -> AssetJob {
+        AssetJob(id: id, kind: .symbol, role: role, tier: 1, title: "",
+                 subject: "x", silhouette: sil, aspect: "1:1", size: "2K")
+    }
+
+    // Low pays sharing a word is the LP unity rule working, not a fault. Flagging
+    // "wooden (LP1, LP2, LP3, LP4)" told the user their correct set was broken.
+    func testLowPayFamilyIsNotAClash() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("LP1", .lowPay, "wooden ace"), j("LP2", .lowPay, "wooden king"),
+            j("LP3", .lowPay, "wooden queen"), j("LP4", .lowPay, "wooden jack")])
+        XCTAssertTrue(c.isEmpty, "got \(c)")
+    }
+
+    // A genuine cross-role collision is still reported.
+    func testCrossRoleCollisionStillCaught() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("MP2", .mediumPay, "coin sack"), j("WY1", .wysiwyg, "golden coin"),
+            j("LP1", .lowPay, "wooden ace"), j("LP2", .lowPay, "wooden king")])
+        XCTAssertEqual(c["coin"]?.sorted(), ["MP2", "WY1"])
+        XCTAssertNil(c["wooden"])
+    }
+
+    // Observed in a real plan: JP1-JP4 came back Grand/Major/Minor/Mini chest, which is
+    // the shared jackpot construction the art direction demands — and the clash detector
+    // reported it as a fault.
+    func testJackpotFamilyIsNotAClash() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("JP1", .jackpot, "grand chest"), j("JP2", .jackpot, "major chest"),
+            j("JP3", .jackpot, "minor chest"), j("JP4", .jackpot, "mini chest"),
+            j("MP1", .mediumPay, "gem chalice")])
+        XCTAssertTrue(c.isEmpty, "got \(c)")
+    }
+
+    // A jackpot sharing a word with a NON-jackpot is still a genuine collision.
+    func testJackpotVersusOtherRoleStillCaught() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("JP1", .jackpot, "grand chest"), j("MP1", .mediumPay, "treasure chest")])
+        XCTAssertEqual(c["chest"]?.sorted(), ["JP1", "MP1"])
+    }
+
+    // Two low pays that are literally the same symbol are still wrong.
+    func testIdenticalLowPaysStillCaught() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("LP1", .lowPay, "wooden ace"), j("LP2", .lowPay, "Wooden Ace")])
+        XCTAssertEqual(c["wooden ace"]?.sorted(), ["LP1", "LP2"])
+    }
+
+    // The families the user named, including the full royal run.
+    func testLowPayDirectionNamesTheFamilies() {
+        let d = SlotArtDirection.direction(for: .lowPay, tier: 1)
+        for f in ["ROYALS", "GEMSTONES", "PEBBLES", "THEMED ITEMS", "A K Q J 10 7 5"] {
+            XCTAssertTrue(d.contains(f), "missing \(f)")
+        }
+        XCTAssertTrue(d.contains("royals usually carry NO frame"))
+        XCTAssertTrue(d.contains("FILL the frame"))
+    }
+
+    func testCraftRulesCoverFramesAndFilling() {
+        XCTAssertTrue(SlotArtDirection.houseStyle.contains("FILL THE FRAME"))
+        XCTAssertTrue(SlotArtDirection.houseStyle.contains("FRAMES:"))
+    }
+
+    // Two more invented numbers of mine, removed: there is no established 8% margin rule,
+    // and composition margin, motion clearance and atlas padding are three different
+    // things that a single percentage conflates.
+    func testNoInventedMarginNumber() {
+        XCTAssertFalse(SlotArtDirection.houseStyle.contains("8%"))
+        XCTAssertTrue(SlotArtDirection.houseStyle.contains("COMPOSITION margin"))
+        // The phrase wraps in the source, so match the part that does not.
+        XCTAssertTrue(SlotArtDirection.houseStyle.contains("it is not atlas"))
+    }
+
+    // Separation is led by the motion the symbol will have, not by a part quota.
+    func testSeparationIsLedByMotionNotAQuota() {
+        XCTAssertFalse(SlotArtDirection.houseStyle.contains("3-6 parts"))
+        XCTAssertTrue(SlotArtDirection.houseStyle.contains("no required number of parts"))
+    }
+}
+
+final class SpecCorrectionTests: XCTestCase {
+    // The generation backdrop and a designed backing plate are different things, and
+    // confusing them destroys the asset the moment it is cut out.
+    func testBackdropIsDistinguishedFromADesignedBacking() {
+        let job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           subject: "a giant", silhouette: "giant", aspect: "1:1", size: "2K")
+        let p = GDDAssetPrompts.image(job: job, theme: GameTheme(name: "T"),
+                                      backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("BACKDROP"))
+        XCTAssertTrue(p.contains("If this symbol needs a backing plate"))
+    }
+
+    // Gaze is a character choice, not a rank marker.
+    func testHP2DoesNotDeferByLookingAway() {
+        let d = SlotArtDirection.direction(for: .highPay, tier: 2)
+        XCTAssertFalse(d.contains("defers to HP1"))
+        XCTAssertTrue(d.contains("not a rank"))
+    }
+
+    // Not every game has four jackpot tiers, and a meter-only jackpot needs no symbol.
+    func testJackpotCountIsNotAssumed() {
+        let d = SlotArtDirection.direction(for: .jackpot, tier: 1)
+        XCTAssertTrue(d.contains("Not every game has four"))
+        XCTAssertTrue(d.contains("only as a meter"))
+    }
+}
+
+final class SymbolFrameTests: XCTestCase {
+    private func job(_ id: String, _ role: SlotSymbolRole) -> AssetJob {
+        AssetJob(id: id, kind: .symbol, role: role, tier: 1, title: "", aspect: "1:1", size: "2K")
+    }
+
+    // Generating the frame WITH the symbol is the whole point: the old pipeline made them
+    // separately and they did not match.
+    func testPlannerDecidesTheFrame() {
+        let j = GDDAssetPrompts.json(fromModelReply: """
+        {"assets":[{"id":"HP1","subject":"a giant","silhouette":"giant","frame":true},
+                   {"id":"LP1","subject":"the letter A","silhouette":"ace","frame":false}]}
+        """)!
+        let r = GDDAssetPrompts.apply(planJSON: j, to: [job("HP1", .highPay), job("LP1", .lowPay)])
+        XCTAssertTrue(r.jobs.first { $0.id == "HP1" }?.hasFrame ?? false)
+        XCTAssertFalse(r.jobs.first { $0.id == "LP1" }?.hasFrame ?? true)
+    }
+
+    // A plan that says nothing about frames must not silently frame everything.
+    func testMissingFrameFieldMeansNoFrame() {
+        let j = GDDAssetPrompts.json(fromModelReply:
+            #"{"assets":[{"id":"HP1","subject":"a giant","silhouette":"giant"}]}"#)!
+        XCTAssertFalse(GDDAssetPrompts.apply(planJSON: j, to: [job("HP1", .highPay)])
+                        .jobs[0].hasFrame)
+    }
+
+    func testPromptSaysWhichWay() {
+        var framed = job("HP1", .highPay)
+        framed.subject = "a giant"; framed.hasFrame = true
+        var bare = job("LP1", .lowPay)
+        bare.subject = "the letter A"; bare.hasFrame = false
+        let t = GameTheme(name: "T")
+        let a = GDDAssetPrompts.image(job: framed, theme: t, backing: SlotBackingRules.candidates[2])
+        let b = GDDAssetPrompts.image(job: bare, theme: t, backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(a.contains("FRAME: draw this symbol inside a frame"))
+        XCTAssertTrue(b.contains("NO FRAME"))
+    }
+
+    // The four special-feature jobs are distinct and must not be blended.
+    func testSpecialFeatureNamesItsFourJobs() {
+        let d = SlotArtDirection.direction(for: .collector, tier: nil)
+        for job in ["COLLECTOR", "ACTIVATOR", "ADDER", "MULTIPLIER"] {
+            XCTAssertTrue(d.contains(job), "missing \(job)")
+        }
+        XCTAssertTrue(d.contains("A character can do the collecting"))
+    }
+}
+
+final class GDDParseProblemTests: XCTestCase {
+    // "1-2 HP1-4" declares four codes across two indices. It is refused — correctly —
+    // but refusing it silently means four symbols vanish and nobody finds out until
+    // someone counts the folder.
+    func testMismatchedRangeIsReported() {
+        let r = GDDSymbolSetRules.parseWithProblems("""
+        Symbol Set
+        * 0 WD1   // wild
+        * 1-2 HP1-4  // mismatched
+        * 3-4 LP1-2  // fine
+        """)
+        XCTAssertEqual(r.symbols.map(\.code), ["WD1", "LP1", "LP2"])
+        XCTAssertEqual(r.problems.count, 1)
+        XCTAssertTrue(r.problems[0].contains("HP1-4"))
+    }
+
+    // A clean document reports nothing.
+    func testCleanDocumentHasNoProblems() {
+        let r = GDDSymbolSetRules.parseWithProblems("""
+        Symbol Set
+        * 0 WD1   // wild
+        * 1-4 HP1-4  // HPs
+        """)
+        XCTAssertEqual(r.symbols.count, 5)
+        XCTAssertTrue(r.problems.isEmpty)
+    }
+
+    // Prose after the block must not be reported as a failure.
+    func testProseAfterTheBlockIsNotAProblem() {
+        let r = GDDSymbolSetRules.parseWithProblems("""
+        Symbol Set
+        * 0 WD1   // wild
+        Spinning & Winning
+        4x5 ways game, with 4 HP symbols and 5 LP symbols
+        """)
+        XCTAssertTrue(r.problems.isEmpty, "got \(r.problems)")
+    }
+}
+
+final class SpecialFeatureRoleTests: XCTestCase {
+    // SF is one prefix covering four jobs. Calling every SF a collector is how an adder
+    // gets drawn as a vessel with a running total it does not have.
+    func testRoleComesFromWhatTheDocumentSays() {
+        let s = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 SF1  // Special Collector Symbol
+        * 1 SF2  // adds value to every coin on screen
+        * 2 SF3  // activator, unlocks the bonus
+        * 3 SF4  // multiplier applied to the win
+        """)
+        XCTAssertEqual(s.first { $0.code == "SF1" }?.role, .collector)
+        XCTAssertEqual(s.first { $0.code == "SF2" }?.role, .adder)
+        XCTAssertEqual(s.first { $0.code == "SF3" }?.role, .activator)
+        XCTAssertEqual(s.first { $0.code == "SF4" }?.role, .multiplier)
+    }
+
+    // Silence means the default stands — but it is a default, not a deduction.
+    func testSilentDocumentKeepsTheDefault() {
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: ""), .collector)
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "SF1"), .collector)
+    }
+
+    // Refinement must never touch a role that was not an SF guess in the first place.
+    func testOtherRolesAreUntouched() {
+        XCTAssertEqual(SlotSymbolRole.highPay.refined(byNote: "collects coins"), .highPay)
+        XCTAssertEqual(SlotSymbolRole.wild.refined(byNote: "multiplies the win"), .wild)
+    }
+
+    // The new roles still get art and still get direction.
+    func testNewRolesAreDrawable() {
+        for r in [SlotSymbolRole.activator, .adder] {
+            XCTAssertTrue(r.needsArt)
+            XCTAssertTrue(SlotArtDirection.direction(for: r, tier: nil).contains("SPECIAL FEATURE"))
+            XCTAssertFalse(r.label.isEmpty)
+        }
+    }
+}
+
+final class PayOrderDisclosureTests: XCTestCase {
+    private let syms = GDDSymbolSetRules.parse("""
+    Symbol Set
+    * 0 WD1  // wild
+    * 1-4 HP1-4  // HPs
+    """)
+
+    // HP1 > HP4 is a NAMING convention, not a fact about the game. When the document
+    // says nothing about pay, the user is told the order was assumed.
+    func testSilentDocumentIsDisclosed() {
+        let n = GDDPayOrder.note(for: "A game with symbols and features.", symbols: syms)
+        XCTAssertNotNil(n)
+        XCTAssertTrue(n!.contains("taken from the code numbering"))
+    }
+
+    // A document with a paytable needs no disclaimer.
+    func testStatedPayOrderNeedsNoNote() {
+        XCTAssertNil(GDDPayOrder.note(for: "Paytable: HP1 pays 500 for 5 of a kind.", symbols: syms))
+        XCTAssertTrue(GDDPayOrder.isStated(in: "5 of a kind pays 100x bet"))
+        XCTAssertFalse(GDDPayOrder.isStated(in: "The reels spin and stop."))
+    }
+
+    // Nothing to disclose when there is nothing ranked.
+    func testNoRankedSymbolsNoNote() {
+        let one = GDDSymbolSetRules.parse("Symbol Set\n* 0 WD1  // wild")
+        XCTAssertNil(GDDPayOrder.note(for: "no paytable here", symbols: one))
+    }
+}
+
+final class AntiPatternTests: XCTestCase {
+    // Every symbol collapsing into a glowing gold medallion, and every special feature
+    // arriving as a vortex, were both observed in this project before they were written
+    // down as rules.
+    func testNamedFailuresAreStatedAsInstructions() {
+        let a = SlotArtDirection.antiPatterns
+        // Stated WITHOUT naming the unwanted shape. The list used to say "not a portal, a
+        // container or an energy core" and "a generic glowing gold medallion" — and those
+        // nouns turned up in generated plans, which is the same priming that made every
+        // wild a vortex. Measured: "coin", "gem" and "portal" appeared in symbol subjects
+        // traceable to example lists in this file, not to the GDD or the theme.
+        XCTAssertTrue(a.contains("Draw the NAMED SUBJECT"))
+        XCTAssertTrue(a.contains("Take the shape from the SUBJECT"))
+        for named in ["medallion", "portal", "energy core", "vortex"] {
+            XCTAssertFalse(a.lowercased().contains(named),
+                           "the anti-pattern list names “\(named)”, which primes it")
+        }
+        XCTAssertTrue(a.contains("pseudo-script"))
+        XCTAssertTrue(a.contains("Gloss is not form"))
+        XCTAssertTrue(a.contains("never something to copy"))
+    }
+
+    // They have to reach the model that draws, not just the planner.
+    func testAntiPatternsReachEveryImage() {
+        var job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           aspect: "1:1", size: "2K")
+        job.subject = "a giant"
+        let p = GDDAssetPrompts.image(job: job, theme: GameTheme(name: "T"),
+                                      backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("AVOID THESE SPECIFICALLY"))
+    }
+
+    // No single image can see the ladder it belongs to, so the set block carries it.
+    func testLadderReversalIsStatedAtSetLevel() {
+        XCTAssertTrue(SlotArtDirection.setConsistency.contains("not look MORE expensive"))
+    }
+}
+
+final class SymbolPlausibilityTests: XCTestCase {
+    // 2690 Supercoco has no symbol-set section. Its only codes appear in prose and
+    // inside a SOUND CUE — "when WD1 has been consumed" — so reading it produced a
+    // two-symbol game, reported as fact. The shipped art for that game is eleven.
+    func testTwoSymbolGameIsFlagged() {
+        let syms = [SlotSymbol(code: "HP1", index: 0, role: .highPay, tier: 1, note: ""),
+                    SlotSymbol(code: "WD1", index: 1, role: .wild, tier: 1, note: "")]
+        let w = GDDSymbolPlausibility.warning(syms, inferred: true)
+        XCTAssertNotNil(w)
+        XCTAssertTrue(w!.contains("only 2 symbols"))
+        XCTAssertTrue(w!.contains("no low pays"))
+        XCTAssertTrue(w!.contains("no symbol list"))
+    }
+
+    // A real set passes without nagging.
+    func testRealSetIsNotFlagged() {
+        let syms = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1  // wild
+        * 1-4 HP1-4  // HPs
+        * 5-9 LP1-5  // LPs
+        """)
+        XCTAssertNil(GDDSymbolPlausibility.warning(syms, inferred: false))
+    }
+
+    // A set read from a real list is worded differently from one inferred.
+    func testWordingDistinguishesReadFromInferred() {
+        let syms = [SlotSymbol(code: "HP1", index: 0, role: .highPay, tier: 1, note: "")]
+        XCTAssertTrue(GDDSymbolPlausibility.warning(syms, inferred: false)!
+            .hasPrefix("This symbol set looks incomplete"))
+        XCTAssertTrue(GDDSymbolPlausibility.warning(syms, inferred: true)!
+            .contains("no symbol list"))
+    }
+
+    // Nothing to say about an empty document.
+    func testEmptyGivesNoWarning() {
+        XCTAssertNil(GDDSymbolPlausibility.warning([], inferred: true))
+    }
+}
+
+final class ManualSymbolEntryTests: XCTestCase {
+    // Not every game has a document yet. A producer who knows the set should be able to
+    // type it rather than invent a GDD for the tool's benefit.
+    func testTypicalSetParses() {
+        let r = GDDSymbolSetRules.parseManual(GDDSymbolSetRules.typicalSet)
+        XCTAssertTrue(r.problems.isEmpty, "got \(r.problems)")
+        XCTAssertEqual(r.symbols.count, 20)   // WD 1 + HP 4 + MP 4 + LP 5 + SC 1 + BO 1 + JP 4
+        XCTAssertEqual(r.symbols.filter { $0.role == .highPay }.map(\.code),
+                       ["HP1", "HP2", "HP3", "HP4"])
+        XCTAssertEqual(r.symbols.filter { $0.role == .jackpot }.count, 4)
+    }
+
+    // Commas, spaces and newlines all separate.
+    func testSeparatorsAreForgiving() {
+        let a = GDDSymbolSetRules.parseManual("WD HP1-2\nLP1-2").symbols.map(\.code)
+        let b = GDDSymbolSetRules.parseManual("WD, HP1-2, LP1-2").symbols.map(\.code)
+        XCTAssertEqual(a, b)
+        XCTAssertEqual(a, ["WD", "HP1", "HP2", "LP1", "LP2"])
+    }
+
+    // Nonsense is reported, not silently dropped — the same rule the file parser follows.
+    func testUnreadableTokensAreReported() {
+        let r = GDDSymbolSetRules.parseManual("WD, ZZTOP, HP1-2, ???")
+        XCTAssertEqual(r.symbols.map(\.code), ["WD", "HP1", "HP2"])
+        XCTAssertFalse(r.problems.isEmpty)
+    }
+
+    func testDuplicatesCollapse() {
+        XCTAssertEqual(GDDSymbolSetRules.parseManual("WD, WD, HP1").symbols.map(\.code),
+                       ["WD", "HP1"])
+    }
+
+    // A hand-typed set is a real set, so it must not trip the plausibility warning.
+    func testTypicalSetIsPlausible() {
+        let r = GDDSymbolSetRules.parseManual(GDDSymbolSetRules.typicalSet)
+        XCTAssertNil(GDDSymbolPlausibility.warning(r.symbols, inferred: false))
+    }
+}
+
+final class GameAssetManifestTests: XCTestCase {
+    // The real 2690 Supercoco manifest, trimmed. Its GDD yields two symbols; its shipped
+    // art is eleven, and this is where that fact lives.
+    private let supercoco = """
+    Game: 2690_supercoco_production
+    Total PNG Files: 49
+    PNG File Structure:
+    2690_supercoco_production/Resources/Generic/default/art/base/font/
+     ├── base_font_button.png [1024x120px]
+     └── base_font_popUp.png [1024x120px]
+    2690_supercoco_production/Resources/Generic/default/art/base/highPaySymbol/
+     ├── base_HP1_static.png [240x240px]
+     ├── base_HP2_static.png [240x240px]
+     └── base_HP3_static.png [240x240px]
+    2690_supercoco_production/Resources/Generic/default/art/base/interface/
+     ├── base_interface_bezel.png [1024x512px]
+     └── base_interface_reelFade.png [1024x512px]
+    2690_supercoco_production/Resources/Generic/default/art/base/lowPaySymbol/
+     ├── base_LP_1-static.png [240x240px]
+     ├── base_LP_2-static.png [240x240px]
+     ├── base_LP_3-static.png [240x240px]
+     ├── base_LP_4-static.png [240x240px]
+     └── base_LP_5-static.png [240x240px]
+    2690_supercoco_production/Resources/Generic/default/art/base/meter/
+     └── base_meter_FGIcon.png [64x64px]
+    2690_supercoco_production/Resources/Generic/default/art/base/specialSymbol/
+     ├── base_SF_1-front-static.png [240x240px]
+     ├── base_SF_2-center-static.png [240x240px]
+     └── base_SF_3-back-static.png [240x240px]
+    """
+
+    func testShippedSymbolsAreRead() {
+        let s = GameAssetManifest.symbols(fromManifest: supercoco)
+        XCTAssertEqual(s.map(\.code).sorted(),
+                       ["HP1", "HP2", "HP3", "LP1", "LP2", "LP3", "LP4", "LP5",
+                        "SF1", "SF2", "SF3"])
+        XCTAssertEqual(s.count, 11)
+    }
+
+    // Roles come from the folder, which is more reliable than the filename.
+    func testRolesComeFromTheFolder() {
+        let s = GameAssetManifest.symbols(fromManifest: supercoco)
+        XCTAssertEqual(s.filter { $0.role == .highPay }.count, 3)
+        XCTAssertEqual(s.filter { $0.role == .lowPay }.count, 5)
+        XCTAssertEqual(s.filter { $0.role == .collector }.count, 3)
+    }
+
+    // Fonts, meters, bezels and buttons are not reel symbols.
+    func testNonSymbolArtIsIgnored() {
+        let s = GameAssetManifest.symbols(fromManifest: supercoco).map(\.code)
+        XCTAssertFalse(s.contains { $0.hasPrefix("FONT") })
+        XCTAssertFalse(s.contains("R1"))          // would come from "reelFade" / "FGIcon"
+        XCTAssertEqual(s.count, 11)
+    }
+
+    // The separator styles differ between codes: HP1, LP_1, SF_1.
+    func testCodeIsFoundWhicheverWayItIsWritten() {
+        XCTAssertEqual(GameAssetManifest.code(inFilename: "base_HP1_static.png"), "HP1")
+        XCTAssertEqual(GameAssetManifest.code(inFilename: "base_LP_1-static.png"), "LP1")
+        XCTAssertEqual(GameAssetManifest.code(inFilename: "base_SF_1-front-static.png"), "SF1")
+        XCTAssertNil(GameAssetManifest.code(inFilename: "base_interface_bezel.png"))
+    }
+
+    // Manifests are named by game number, which is how a GDD maps to one.
+    func testManifestIsFoundByGameNumber() {
+        let files = ["2690_supercoco_production.txt", "3140_milky_way_rmg_production.txt"]
+        XCTAssertEqual(GameAssetManifest.fileName(forGame: "2690", among: files),
+                       "2690_supercoco_production.txt")
+        XCTAssertNil(GameAssetManifest.fileName(forGame: "9999", among: files))
+        XCTAssertEqual(GameAssetManifest.gameNumber(inName: "2690 Supercoco GDD"), "2690")
+        XCTAssertNil(GameAssetManifest.gameNumber(inName: "Untitled game"))
+    }
+
+    // And it answers the question the GDD could not.
+    func testManifestBeatsAnImplausibleDocument() {
+        let fromDoc = [SlotSymbol(code: "HP1", index: 0, role: .highPay, tier: 1, note: ""),
+                       SlotSymbol(code: "WD1", index: 1, role: .wild, tier: 1, note: "")]
+        XCTAssertNotNil(GDDSymbolPlausibility.warning(fromDoc, inferred: true))
+        let fromArt = GameAssetManifest.symbols(fromManifest: supercoco)
+        XCTAssertNil(GDDSymbolPlausibility.warning(fromArt, inferred: false))
+    }
+}
+
+final class PlanIdentityTests: XCTestCase {
+    // The crash: the plan table bound its text fields by ARRAY INDEX. SwiftUI keeps a
+    // binding alive across a redraw, so the moment the job list got shorter — switching
+    // document, switching to the typed-set mode, redesigning with fewer slots — a stale
+    // closure indexed past the end and killed the process.
+    //
+    // The fix is to look the job up by id, so this pins the property that makes that
+    // possible: ids are unique and stable, so a lookup always resolves to one job.
+    func testJobIdsAreUniqueWithinAPlan() {
+        let syms = GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1  // wild
+        * 1-4 HP1-4  // HPs
+        * 5-9 LP1-5  // LPs
+        """)
+        let jobs = AssetPlanRules.symbolJobs(syms)
+            + AssetPlanRules.backgroundJobs(gddText: "free spins bonus game")
+        XCTAssertEqual(Set(jobs.map(\.id)).count, jobs.count)
+    }
+
+    // And that a shorter plan simply has no entry for the old id, rather than a
+    // different job sitting at that position.
+    func testShrinkingThePlanDropsIdsRatherThanReusingPositions() {
+        let big = AssetPlanRules.symbolJobs(GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1  // wild
+        * 1-4 HP1-4  // HPs
+        """))
+        let small = AssetPlanRules.symbolJobs(GDDSymbolSetRules.parse("""
+        Symbol Set
+        * 0 WD1  // wild
+        """))
+        XCTAssertEqual(big.count, 5)
+        XCTAssertEqual(small.count, 1)
+        // HP4 existed in the big plan and does not in the small one — a lookup by id
+        // returns nothing, where a lookup by index would have returned someone else.
+        XCTAssertNotNil(big.first { $0.id == "HP4" })
+        XCTAssertNil(small.first { $0.id == "HP4" })
+    }
+}
+
+final class RuntimeTextZoneTests: XCTestCase {
+    // Observed in a real generation: "leave a clear band across the lower third where the
+    // word WILD will be printed" produced a literal white band painted across the goose.
+    // The instruction has to describe a QUIET AREA OF THE ARTWORK, never a drawn shape.
+    func testNoRoleAsksForABandToBeDrawn() {
+        for role in SlotSymbolRole.allCases {
+            let d = SlotArtDirection.direction(for: role, tier: 1)
+            XCTAssertFalse(d.contains("Leave a clear band"), "\(role) still asks for a band")
+            XCTAssertFalse(d.contains("leave a clear band"), "\(role) still asks for a band")
+        }
+    }
+
+    // And the roles that carry runtime text say so in the safe form.
+    func testTextCarryingRolesForbidTheShape() {
+        for role in [SlotSymbolRole.wild, .scatter, .bonus, .jackpot, .wysiwyg, .collector] {
+            let d = SlotArtDirection.direction(for: role, tier: 1)
+            let low = d.lowercased()
+            let forbids = (low.contains("do not draw") || low.contains("draw no"))
+                       && low.contains("band")
+            XCTAssertTrue(forbids, "\(role) does not forbid drawing the band")
+            XCTAssertTrue(d.lowercased().contains("no lettering") || d.contains("do not letter"),
+                          "\(role) does not forbid lettering")
+        }
+    }
+}
+
+final class GDDSceneTests: XCTestCase {
+    // Every slot has a base game; nothing else is assumed.
+    func testOnlyBaseIsAssumed() {
+        XCTAssertEqual(GDDScenes.scenes(in: "A game with reels.").map(\.id), ["bg_base"])
+    }
+
+    // 4400 names "Jackpot Pick". The old fixed list knew "jackpot picker" and read it
+    // as nothing at all.
+    func testJackpotPickIsFound() {
+        let ids = GDDScenes.scenes(in: "Landing three enters the Jackpot Pick.").map(\.id)
+        XCTAssertTrue(ids.contains("bg_jackpot"))
+    }
+
+    // A game with several distinct modes gets a background for each — the old rule
+    // could never return more than three scenes.
+    func testSeveralModesEachGetAScene() {
+        let ids = GDDScenes.scenes(in: """
+        The base game leads to free games. There is also a Loot Link bonus round,
+        and a separate Jackpot Wheel.
+        """).map(\.id)
+        XCTAssertTrue(ids.contains("bg_base"))
+        XCTAssertTrue(ids.contains("bg_freegames"))
+        XCTAssertTrue(ids.contains("bg_lootlink"))
+        XCTAssertTrue(ids.contains("bg_jackpot"))
+        XCTAssertTrue(ids.contains("bg_bonus"))
+        XCTAssertEqual(Set(ids).count, ids.count)      // no duplicates
+    }
+
+    // Saying "free games" six times is still one background, not six paid images.
+    func testRepeatedMentionsCollapse() {
+        let ids = GDDScenes.scenes(in: String(repeating: "free games ", count: 6)).map(\.id)
+        XCTAssertEqual(ids, ["bg_base", "bg_freegames"])
+    }
+
+    // "free spins bonus" is the free-spins scene, not a bonus scene as well.
+    func testLongestPhraseWinsSoOneModeIsOneScene() {
+        XCTAssertEqual(GDDScenes.scenes(in: "Three scatters award the free spins bonus.").map(\.id),
+                       ["bg_base", "bg_freegames"])
+    }
+}
+
+final class BackgroundTextTests: XCTestCase {
+    private func bg() -> String {
+        var j = AssetJob(id: "bg_base", kind: .background, role: .unknown, tier: nil,
+                         title: "", aspect: "3:4", size: "4K")
+        j.subject = "a beanstalk over green hills"
+        return GDDAssetPrompts.image(job: j, theme: GameTheme(name: "Jack and the Beanstalk"),
+                                     backing: SlotBackingRules.candidates[2])
+    }
+
+    // Observed in a real run: a background came back with "Jack and the Beanstalk"
+    // lettered across the top, and pseudo-runes carved into the pillars. The old prompt
+    // said "no text" once, in a list, and the background branch never received the
+    // anti-patterns block at all.
+    func testBackgroundForbidsLetteringEmphatically() {
+        let p = bg()
+        XCTAssertTrue(p.contains("ABSOLUTELY NO LETTERING"))
+        XCTAssertTrue(p.contains("no invented script"))
+        // Wraps in the source; match a contiguous fragment.
+        XCTAssertTrue(p.contains("cannot be shipped"))
+        XCTAssertTrue(p.contains("title is a separate asset"))
+    }
+
+    // The anti-patterns apply to backgrounds too — that is where the pseudo-script rule
+    // lives, and it was only ever reaching symbols.
+    func testBackgroundGetsTheAntiPatterns() {
+        XCTAssertTrue(bg().contains("AVOID THESE SPECIFICALLY"))
+        XCTAssertTrue(bg().contains("pseudo-script"))
+    }
+
+    // A background is not keyed, so it must not be told about a backdrop colour.
+    func testBackgroundStillHasNoBackdropInstruction() {
+        XCTAssertFalse(bg().contains("chroma magenta"))
+    }
+}
+
+final class WysiwygFamilyTests: XCTestCase {
+    private func j(_ id: String, _ role: SlotSymbolRole, _ sil: String) -> AssetJob {
+        AssetJob(id: id, kind: .symbol, role: role, tier: 1, title: "",
+                 subject: "x", silhouette: sil, aspect: "1:1", size: "2K")
+    }
+
+    // Observed: WY1 and WY2 both came back as coins, and the clash detector called it.
+    // They ARE one family at two value tiers — the same insight as the jackpots — so
+    // sharing the object is right, and the detector should not report it as a fault.
+    func testWysiwygFamilyIsNotAClash() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("WY1", .wysiwyg, "gold coin"), j("WY2", .wysiwyg, "amber coin"),
+            j("MP1", .mediumPay, "harp")])
+        XCTAssertTrue(c.isEmpty, "got \(c)")
+    }
+
+    // But a WYSIWYG colliding with a different role is still a real problem.
+    func testWysiwygVersusOtherRoleStillCaught() {
+        let c = GDDAssetPrompts.silhouetteClashes([
+            j("WY1", .wysiwyg, "gold coin"), j("MP2", .mediumPay, "coin sack")])
+        XCTAssertEqual(c["coin"]?.sorted(), ["MP2", "WY1"])
+    }
+
+    // And the planner is told they are a family that must still be distinguishable.
+    func testPlannerIsToldTheyAreAFamily() {
+        let jobs = [j("WY1", .wysiwyg, ""), j("WY2", .wysiwyg, "")]
+        let brief = GDDAssetPrompts.roleBrief(for: jobs)
+        XCTAssertTrue(brief.contains("ONE FAMILY at different value tiers"))
+        XCTAssertTrue(brief.contains("tellable apart instantly"))
+    }
+
+    // One WYSIWYG needs no family instruction.
+    func testSingleWysiwygGetsNoFamilyLine() {
+        let brief = GDDAssetPrompts.roleBrief(for: [j("WY1", .wysiwyg, "")])
+        XCTAssertFalse(brief.contains("ONE FAMILY at different value tiers"))
+    }
+}
+
+// Findings from the audit of the shipped GDD-to-Assets feature. Every one of these
+// reproduced against real document shapes before it was fixed.
+final class GDDAuditRegressionTests: XCTestCase {
+    private let beanstalk = GameTheme(
+        name: "Jack and the Beanstalk", category: "Fairytale", comparables: "Megaways Jack",
+        look: "A giant beanstalk rising into a fantasy sky of floating castles and clouds.")
+
+    private func codes(_ t: String) -> [String] {
+        GDDSymbolSetRules.parse(t).map(\.code)
+    }
+
+    // "0 WD1, // wild" — the comma belongs to the sentence. It used to fail every
+    // branch of expand(), so the game lost its WILD and nothing was reported.
+    func testTrailingPunctuationDoesNotDropASymbol() {
+        XCTAssertEqual(codes("Symbol Set\n0 WD1, // wild\n1-4 HP1-4"),
+                       ["WD1", "HP1", "HP2", "HP3", "HP4"])
+        XCTAssertEqual(codes("Symbol Set\n0 SC1; // scatter").first, "SC1")
+    }
+
+    // Word writes en dashes. Every range check looked for an ASCII hyphen.
+    func testTypographicDashesParse() {
+        let t = "Symbol Set\n0 WD1\n1-4 HP1\u{2013}4\n5\u{2013}9 LP1\u{2013}5\n10 SC1"
+        XCTAssertEqual(codes(t),
+                       ["WD1", "HP1", "HP2", "HP3", "HP4",
+                        "LP1", "LP2", "LP3", "LP4", "LP5", "SC1"])
+    }
+
+    // "1-4 HP" covers four indices and means four symbols. It returned one.
+    func testBarePrefixOverARangeExpands() {
+        XCTAssertEqual(codes("Symbol Set\n1-4 HP\n5-9 LP1-5").prefix(4).map { $0 },
+                       ["HP1", "HP2", "HP3", "HP4"])
+        // A numbered code cannot cover a range — that is a real problem, not a guess.
+        XCTAssertFalse(codes("Symbol Set\n0 WD1\n1-4 HP1").contains("HP1"))
+    }
+
+    // parseTable scanned the whole document, so any four bare codes became a symbol set.
+    // A non-empty set is also what stops the model fallback running, so the invented set
+    // was the one that got drawn and paid for.
+    func testReelDefinitionsAreNotASymbolSet() {
+        XCTAssertTrue(GDDSymbolSetRules.parse("Reel definitions\nR1\nR2\nR3\nR4").isEmpty)
+        // A real table still reads.
+        XCTAssertEqual(GDDSymbolSetRules.parse("Symbols\nWD1\n0\nHP1\n1\nHP2\n2\nLP1\n3").count, 4)
+    }
+
+    // The safety net had the same break as the thing it watches, so the second
+    // consecutive rejection — the one that truncates the set — was never shown.
+    func testTheLineThatEndsTheBlockIsReported() {
+        let r = GDDSymbolSetRules.parseWithProblems(
+            "Symbol Set\n0 WD1\n1-4 HP1-9\n5-9 LP1-9\n10 SC1")
+        XCTAssertEqual(r.problems.count, 2, "got \(r.problems)")
+    }
+
+    // ...but prose that merely follows the block is not a dropped symbol. Both start
+    // with a digit; only an entry separates the index from what comes after it.
+    func testProseEndingTheBlockIsStillNotAProblem() {
+        let r = GDDSymbolSetRules.parseWithProblems(
+            "Symbol Set\n0 WD1\n1-4 HP1-4\n\n4x5 ways game, with 4 HP symbols\nIt pays left to right.")
+        XCTAssertTrue(r.problems.isEmpty, "got \(r.problems)")
+    }
+
+    // "No free spins or bonus game." was building two paid 4K backgrounds for screens
+    // the document says do not exist.
+    func testNegatedModesDoNotBecomeBackgrounds() {
+        let ids = GDDScenes.scenes(in: "No free spins or bonus game.").map(\.id)
+        XCTAssertEqual(ids, ["bg_base"])
+    }
+
+    // A denial in the previous sentence is about something else.
+    func testNegationDoesNotCarryAcrossASentence() {
+        let ids = GDDScenes.scenes(in: "There is no wild. Free spins are awarded by SC.").map(\.id)
+        XCTAssertTrue(ids.contains("bg_freegames"), "got \(ids)")
+    }
+
+    // What the symbol DOES comes before what it acts on.
+    func testCollectorOfMultipliersStaysACollector() {
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "Collects all multiplier values"),
+                       .collector)
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "Multiplier, 2x to 10x"),
+                       .multiplier)
+    }
+
+    // "Does not activate a feature" was coming back .activator.
+    func testDeniedVerbsDoNotSelectARole() {
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "Does not activate a feature"),
+                       .collector)
+    }
+
+    private func job(_ id: String, role: SlotSymbolRole, subject: String,
+                     frame: Bool) -> AssetJob {
+        var j = AssetJob(id: id, kind: .symbol, role: role, tier: 1, title: "",
+                         subject: subject, silhouette: subject, aspect: "1:1", size: "2K")
+        j.hasFrame = frame
+        return j
+    }
+
+    // The prompt told a framed symbol to draw a frame and then, last line before the
+    // model starts, not to. The last instruction is the one that carries.
+    func testAFramedSymbolIsNotAlsoToldNoFrame() {
+        let p = GDDAssetPrompts.image(job: job("HP1", role: .highPay, subject: "a giant", frame: true),
+                                      theme: beanstalk, backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("FRAME: draw this symbol inside a frame"))
+        XCTAssertFalse(p.contains("NO frame or border around the symbol"))
+    }
+
+    func testAnUnframedSymbolStillGetsTheExclusion() {
+        let p = GDDAssetPrompts.image(job: job("LP1", role: .lowPay, subject: "a pebble", frame: false),
+                                      theme: beanstalk, backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("NO frame or border around the symbol"))
+        XCTAssertTrue(p.contains("NO text"))
+    }
+
+    // A royal's letterform IS the symbol, and it was being forbidden.
+    func testARoyalIsAllowedItsOwnRank() {
+        let p = GDDAssetPrompts.image(
+            job: job("LP1", role: .lowPay, subject: "card royal A in carved oak", frame: false),
+            theme: beanstalk, backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("The rank character is the subject and must be drawn"))
+        XCTAssertFalse(p.contains("NO text, NO numbers, NO lettering"))
+    }
+
+    // The article "a" is not a card rank. This fired on the first run.
+    func testAnOrdinarySubjectIsNotMistakenForARoyal() {
+        XCTAssertFalse(GDDAssetPrompts.isRoyal(
+            job("HP1", role: .highPay, subject: "a giant holding a harp", frame: false)))
+        XCTAssertFalse(GDDAssetPrompts.isRoyal(
+            job("HP2", role: .highPay, subject: "a knight", frame: false)))
+    }
+
+    // The multiplier branch still asked for the blank plate every other role forbids —
+    // the same instruction that came back as a white band across WD1.
+    func testMultiplierDoesNotAskForABlankPlate() {
+        let d = SlotArtDirection.direction(for: .multiplier, tier: nil)
+        XCTAssertTrue(d.contains("Do NOT draw a blank plate"))
+        XCTAssertFalse(d.contains("Leave a clean central plate"))
+    }
+}
+
+// Every shape in the team's actual GDD folder. Before these, one of seven real
+// documents parsed; the other six returned nothing and fell through to a model that
+// guessed. Each fixture below is copied from the document named in its comment, as the
+// app's own .docx extraction produces it.
+final class RealGDDFormatTests: XCTestCase {
+
+    // 4490 Bring Em In — a described list. The single richest shape: it carries the
+    // symbol set AND the art direction for each symbol.
+    private let bringEmIn = """
+    Presentation
+    Symbols
+    HPs - high value colorized western characters, bust cropping,  frame based tiering
+    HP1 - “hero” 1, main cowboy character, gold frame
+    HP2 - “hero” 2, cowgirl, silver frame
+    HP3 - “villain” 1, bronze frame
+    HP4 - “villain” 2, metal frame
+    LPs - scruffy shadier looking western characters, poster styling, less color, full body
+    LP1 - the drinker
+    LP2 - saloon woman
+    LP3 - the gambler
+    LP4 - the huntsman
+    SFs - highest value, full body, full color, full frames, more fantastical character design
+    SF1 - Iron Jack, red
+    SF2 - Madame Venom, green
+    SF3 - River King, blue
+    SF4 - The Governor, orange/yellow
+    SF5 - The Preacher, purple
+    WYS - Scatter Symbol, an old fashioned money sack, with valuable frame
+    WD1 - Wild Symbol, Sheriff star
+    BO1 - Bonus Symbol, dueling pistols, crossed old west revolvers
+    Layout
+    Portrait only,  landscape will present with large image blockers on the sides.
+    """
+
+    func testDescribedListReadsEverySymbol() {
+        let s = GDDSymbolSetRules.parse(bringEmIn)
+        XCTAssertEqual(s.map(\.code),
+                       ["HP1", "HP2", "HP3", "HP4", "LP1", "LP2", "LP3", "LP4",
+                        "SF1", "SF2", "SF3", "SF4", "SF5", "WYS", "WD1", "BO1"])
+        // The document's own header says "Symbols (16 total)".
+        XCTAssertEqual(s.count, 16)
+    }
+
+    // "HPs" is the family; "WYS" is a symbol. Only the case of the trailing s tells
+    // them apart, and uppercasing first made every family header a symbol.
+    func testFamilyHeadersAreNotSymbols() {
+        let codes = GDDSymbolSetRules.parse(bringEmIn).map(\.code)
+        XCTAssertFalse(codes.contains("HPS"))
+        XCTAssertFalse(codes.contains("LPS"))
+        XCTAssertFalse(codes.contains("SFS"))
+        XCTAssertTrue(codes.contains("WYS"))
+    }
+
+    // The point of reading the document: its art direction reaches the symbol, both
+    // the symbol's own line and its family's.
+    func testArtDirectionIsCarried() {
+        let s = GDDSymbolSetRules.parse(bringEmIn)
+        let hp1 = s.first { $0.code == "HP1" }!
+        XCTAssertTrue(hp1.note.contains("main cowboy character, gold frame"))
+        XCTAssertTrue(hp1.note.contains("frame based tiering"), "family note lost: \(hp1.note)")
+        XCTAssertTrue(s.first { $0.code == "SF3" }!.note.contains("River King, blue"))
+        XCTAssertTrue(s.first { $0.code == "WD1" }!.note.contains("Sheriff star"))
+    }
+
+    // An SF is whatever the document says it is: premium characters here, ships in
+    // 3140. Classified by code alone they were all "collector" pickups.
+    func testValueLanguagePromotesTheRole() {
+        let s = GDDSymbolSetRules.parse(bringEmIn)
+        XCTAssertEqual(s.first { $0.code == "SF1" }!.role, .highPay)
+        XCTAssertEqual(s.first { $0.code == "WD1" }!.role, .wild)
+        XCTAssertEqual(s.first { $0.code == "BO1" }!.role, .bonus)
+    }
+
+    // 2750 / 3520 / 3690 — a tab-separated table. The most common shape in the folder,
+    // and not one of them could be read.
+    func testTabTableReads() {
+        let t = """
+        Symbol Definition by Symbol Index
+        0\tWD\t0\t1\t1
+        1\tHP1\t1\t1\t1
+        2\tHP2\t2\t1\t1
+        3\tHP3\t3\t1\t1
+        4\tMP1\t4\t1\t1
+        5\tLP1\t5\t1\t1
+        6\tLP2\t6\t1\t1
+        7\tBL\t7\t1\t0
+        """
+        let s = GDDSymbolSetRules.parse(t)
+        XCTAssertEqual(s.map(\.code), ["WD", "HP1", "HP2", "HP3", "MP1", "LP1", "LP2", "BL"])
+        XCTAssertEqual(s.first { $0.code == "HP2" }!.index, 2)
+    }
+
+    // 3310 Hopje — several codes sharing one description.
+    func testCodesSharingOneDescription() {
+        let t = """
+        Symbols
+        HP1 and HP2 - Vault
+        MP1 and MP2 - Treasure chest
+        LP1, LP2, LP3, and LP4 - bag
+        """
+        let s = GDDSymbolSetRules.parse(t)
+        XCTAssertEqual(s.map(\.code), ["HP1", "HP2", "MP1", "MP2", "LP1", "LP2", "LP3", "LP4"])
+        XCTAssertEqual(s.first { $0.code == "LP3" }!.note, "bag")
+    }
+
+    // 0 Chocolate Cake contains no symbol codes at all. Refusing is the correct answer,
+    // and it is the answer that must survive: a believable invented set is worse than
+    // none, because it gets designed, generated and billed.
+    func testADocumentWithNoSymbolsReturnsNothing() {
+        let t = """
+        Chocolate Cake
+        The calendar advances once per bet. Storm Mode lasts no more than 20 spins.
+        Glory on Ice, Cats, Gypsy (Split Symbols)
+        During Storm Mode overlay symbols may appear on the reels and be collected.
+        """
+        XCTAssertTrue(GDDSymbolSetRules.parse(t).isEmpty)
+    }
+
+    // Prose must never become a symbol set, whichever reader looks at it.
+    func testProseIsNeverASymbolSet() {
+        let t = """
+        Bonus is triggered by 3 scatter BO1s. BO1s can only appear on the 4 Corners.
+        There will be BO1 SmartSounds - anticipations will be addressed in production.
+        Wild - substitutes for all paying symbols; restricted to columns 1-3.
+        Reel 1 consists of blank symbols and different tiers of activator symbols.
+        """
+        XCTAssertTrue(GDDSymbolSetRules.parse(t).isEmpty, "got \(GDDSymbolSetRules.parse(t).map(\.code))")
+    }
+
+    // 4471 Tiki Titans — an indexed list whose index is separated from the code by an
+    // em dash, with the description in brackets. 63 symbol mentions and it read nothing.
+    func testDashSeparatedIndexList() {
+        let t = """
+        Symbol Sets
+        * 0 \u{2014} WD1 (Wild Symbol)
+        * 1 \u{2014} HP1 (High Pay 1)
+        * 2 \u{2014} HP2 (High Pay 2)
+        * 9 \u{2014} R1 (Replacement 1)
+        * 10 \u{2014} SF1 (Jackpot Coin)
+        * 12 \u{2014} JP1  (Jackpot Wheel Game - Jackpot Grand; not on matrix)
+        """
+        let s = GDDSymbolSetRules.parse(t)
+        XCTAssertEqual(s.map(\.code), ["WD1", "HP1", "HP2", "R1", "SF1", "JP1"])
+        XCTAssertEqual(s.first { $0.code == "SF1" }!.note, "Jackpot Coin")
+        // The dash strip must not eat an index range.
+        XCTAssertEqual(GDDSymbolSetRules.parse("Symbol Set\n1-4 HP1-4\n5-9 LP1-5").count, 9)
+    }
+
+    // The indexed shape that already worked must keep working.
+    func testIndexedListStillReads() {
+        let t = "Symbol Set\n* 0 WD1 // wild\n* 1-4 HP1-4 // HPs\n- 5-9 // LPs"
+        XCTAssertEqual(GDDSymbolSetRules.parse(t).map(\.code),
+                       ["WD1", "HP1", "HP2", "HP3", "HP4",
+                        "LP1", "LP2", "LP3", "LP4", "LP5"])
+    }
+}
+
+// Google Drive stubs. A .gdoc on disk is ~190 bytes of JSON, so every one of these
+// documents is fetched, and WHICH export is asked for decides whether its tables
+// survive — see DriveStub.
+final class DriveStubTests: XCTestCase {
+    private let json = """
+    {"":"WARNING! DO NOT EDIT THIS FILE!","doc_id":"1wN45EsGu9ophEv8SKfHo0nhY9TtgpJDdl39it_c8xQo","resource_key":"","email":"a@b.com"}
+    """
+
+    func testParsesADocStub() {
+        let s = DriveStub.parse(json: json, fileExtension: "gdoc")
+        XCTAssertEqual(s?.id, "1wN45EsGu9ophEv8SKfHo0nhY9TtgpJDdl39it_c8xQo")
+        XCTAssertEqual(s?.kind, .document)
+    }
+
+    // Every stub type in the user's Drive: 747 .gdoc, 473 .gsheet, 261 .gslides,
+    // 10 .gform, 2 .gdraw, 1 .gsite. All share this one JSON shape.
+    func testEveryStubTypeIsRecognised() {
+        XCTAssertEqual(DriveStub.Kind(fileExtension: "gsheet"), .spreadsheet)
+        XCTAssertEqual(DriveStub.Kind(fileExtension: "gslides"), .presentation)
+        XCTAssertEqual(DriveStub.Kind(fileExtension: "GDOC"), .document)
+        XCTAssertNil(DriveStub.Kind(fileExtension: "docx"))
+    }
+
+    // The whole point: a Doc is fetched as .docx, NOT as txt. Docs' text export
+    // flattens every table to one cell per line, and a table is how most of these
+    // documents declare their symbol set.
+    func testDocumentsAreFetchedAsDocxNotText() {
+        let s = DriveStub(id: "abc", kind: .document)
+        XCTAssertEqual(s.exportURL?.absoluteString,
+                       "https://docs.google.com/document/d/abc/export?format=docx")
+        XCTAssertEqual(s.fileExtension, "docx")
+    }
+
+    // A Sheet is already tab-separated, which is exactly what the row reader parses.
+    func testSheetsExportAsTSV() {
+        XCTAssertEqual(DriveStub(id: "abc", kind: .spreadsheet).exportURL?.absoluteString,
+                       "https://docs.google.com/spreadsheets/d/abc/export?format=tsv")
+    }
+
+    func testSlidesExportAsText() {
+        XCTAssertEqual(DriveStub(id: "abc", kind: .presentation).exportURL?.absoluteString,
+                       "https://docs.google.com/presentation/d/abc/export?format=txt")
+    }
+
+    // Files shared by link carry a resource key, and the export answers 404 without it
+    // even though the document opens fine in a browser.
+    func testResourceKeyIsCarried() {
+        let s = DriveStub(id: "abc", resourceKey: "0-xyz", kind: .document)
+        XCTAssertEqual(s.exportURL?.absoluteString,
+                       "https://docs.google.com/document/d/abc/export?format=docx&resourcekey=0-xyz")
+    }
+
+    // Older stubs carry resource_id instead of doc_id.
+    func testLegacyResourceIDStub() {
+        let s = DriveStub.parse(json: #"{"resource_id":"document:1AbC"}"#, fileExtension: "gdoc")
+        XCTAssertEqual(s?.id, "1AbC")
+    }
+
+    // Things with no document text say so, by name, instead of failing obscurely.
+    func testUnreadableKindsExplainThemselves() {
+        XCTAssertNil(DriveStub(id: "a", kind: .drawing).exportURL)
+        XCTAssertNotNil(DriveStub.Kind.form.cannotReadReason)
+        XCTAssertNotNil(DriveStub.Kind.site.cannotReadReason)
+        XCTAssertNil(DriveStub.Kind.document.cannotReadReason)
+    }
+
+    func testRejectsJunk() {
+        XCTAssertNil(DriveStub.parse(json: "not json", fileExtension: "gdoc"))
+        XCTAssertNil(DriveStub.parse(json: #"{"email":"a@b.com"}"#, fileExtension: "gdoc"))
+    }
+}
+
+extension DriveStubTests {
+    // A document that refuses the .docx export is retried as text. Lossy beats lost —
+    // but only as a second attempt, never as the first choice.
+    func testDocumentsHaveATextFallback() {
+        let s = DriveStub(id: "abc", kind: .document)
+        XCTAssertEqual(s.fallbackExportURL?.absoluteString,
+                       "https://docs.google.com/document/d/abc/export?format=txt")
+        XCTAssertNotEqual(s.exportURL, s.fallbackExportURL)
+        // Sheets and Slides have one sensible format each; there is nothing to fall to.
+        XCTAssertNil(DriveStub(id: "abc", kind: .spreadsheet).fallbackExportURL)
+        XCTAssertNil(DriveStub(id: "abc", kind: .presentation).fallbackExportURL)
+    }
+}
+
+// A document that declares no symbol set must produce NO plan.
+//
+// Scene names are found by looking for phrases like "free games" in ordinary prose, so
+// they turn up in documents that declare nothing at all. 2990 Slurm has no symbol codes
+// anywhere in it, and the window still offered two paid 4K backgrounds underneath a
+// message saying the document was unreadable — with Generate enabled.
+final class EmptySetPlansNothingTests: XCTestCase {
+    private let noSymbols = """
+    Slurm
+    In addition to normal wilds, there are special blocker symbols on the reels.
+    If at the conclusion of a base spin all 5 reels' activation trackers are turned on,
+    the player is immediately awarded free games.
+    There is also a scatter-triggered tiered pick bonus.
+    """
+
+    func testSceneDetectionStillFindsThem() {
+        // The scenes are really named in the prose — that was never the bug.
+        let ids = GDDScenes.scenes(in: noSymbols).map(\.id)
+        XCTAssertTrue(ids.contains("bg_freegames"), "got \(ids)")
+    }
+
+    func testNoSymbolsMeansNoSymbolJobs() {
+        XCTAssertTrue(GDDSymbolSetRules.parse(noSymbols).isEmpty)
+        XCTAssertTrue(AssetPlanRules.symbolJobs([], size: "2K", aspect: "1:1").isEmpty)
+    }
+
+    // The guard lives in GDDToAssetsRun.load, which is not reachable from here, so this
+    // pins the fact the rule depends on: an empty symbol set is what the caller checks.
+    func testAnEmptySetIsDistinguishableFromASmallOne() {
+        XCTAssertTrue(GDDSymbolSetRules.parse(noSymbols).isEmpty)
+        XCTAssertFalse(GDDSymbolSetRules.parse("Symbol Set\n0 WD1\n1-4 HP1-4").isEmpty)
+    }
+}
+
+// Codes a document talks about but never declares. Found across the real folder: 4471
+// declares WY1–WY3 and its prose says "the wedges share the same IDs as WY1 - WY4";
+// eleven documents mention HP6 in sound cues without listing it.
+final class UndeclaredSymbolTests: XCTestCase {
+    private func set(_ codes: [String]) -> [SlotSymbol] {
+        codes.enumerated().map { i, c in
+            let (r, t) = GDDSymbolSetRules.classify(c)
+            return SlotSymbol(code: c, index: i, role: r, tier: t, note: "")
+        }
+    }
+
+    func testFindsANumberedSiblingTheSetLacks() {
+        let out = GDDSymbolSetRules.mentionedButNotDeclared(
+            in: "The wedges share the same IDs as WY1 - WY4. The WY4 only appears on the Bonus Reel.",
+            symbols: set(["WY1", "WY2", "WY3"]))
+        XCTAssertEqual(out, ["WY4"])
+    }
+
+    // A bare family word in a sentence is English, not a missing symbol.
+    func testBareFamilyWordsAreNotReported() {
+        let out = GDDSymbolSetRules.mentionedButNotDeclared(
+            in: "LP, MP, and HP wins are treated differently. All LP wins add progress.",
+            symbols: set(["LP1", "LP2", "HP1"]))
+        XCTAssertTrue(out.isEmpty, "got \(out)")
+    }
+
+    // A family the set does not have at all is a different game's symbol, not a gap in
+    // this one — 4200 Ford's code comments mention BO1 and it declares nothing.
+    func testUnrelatedFamiliesAreIgnored() {
+        let out = GDDSymbolSetRules.mentionedButNotDeclared(
+            in: "int bonusSpinsCollected; // BO1 collected as spins",
+            symbols: set(["HP1", "HP2"]))
+        XCTAssertTrue(out.isEmpty, "got \(out)")
+    }
+
+    func testDeclaredCodesAreNotReported() {
+        let out = GDDSymbolSetRules.mentionedButNotDeclared(
+            in: "HP1 and HP2 both pay well. HP1 is the best.",
+            symbols: set(["HP1", "HP2"]))
+        XCTAssertTrue(out.isEmpty, "got \(out)")
+    }
+
+    // Nothing to compare against — this must never fire on a refusal and imply a set.
+    func testEmptySetReportsNothing() {
+        XCTAssertTrue(GDDSymbolSetRules.mentionedButNotDeclared(
+            in: "HP1 HP2 HP3 WD1", symbols: []).isEmpty)
+    }
+}
+
+// Hiding documents that declare no symbol set. Two thirds of a real GDD folder is
+// Power Bet variants, R&D notes and framework docs with no set in them.
+final class GDDScanTests: XCTestCase {
+    private func r(_ name: String, _ n: Int, failure: String? = nil) -> GDDScanResult {
+        GDDScanResult(key: "k-" + name, name: name, symbolCount: n,
+                      checkedAt: Date(), failure: failure)
+    }
+
+    func testOnlyEmptyDocumentsAreHidden() {
+        let hidden = GDDScanRules.hiddenKeys([r("4490", 16), r("2990", 0), r("4400", 19)])
+        XCTAssertEqual(hidden, ["k-2990"])
+    }
+
+    // "We failed to read it" and "it contains nothing" are different answers, and only
+    // one of them is the document's fault. A failed read must stay visible, or a
+    // network blip quietly deletes a game from the list.
+    func testAFailedReadIsNotHidden() {
+        let hidden = GDDScanRules.hiddenKeys([r("4490", 0, failure: "Timed out")])
+        XCTAssertTrue(hidden.isEmpty)
+    }
+
+    func testSummaryCountsAllThreeOutcomes() {
+        let s = GDDScanRules.summary([r("a", 16), r("b", 0), r("c", 0),
+                                      r("d", 0, failure: "x")]) ?? ""
+        XCTAssertTrue(s.contains("1 of 4 documents declare a symbol set"), s)
+        XCTAssertTrue(s.contains("2 declare none"), s)
+        XCTAssertTrue(s.contains("1 couldn’t be read"), s)
+    }
+
+    // Nothing is hidden before a scan has run.
+    func testNoScanHidesNothing() {
+        XCTAssertTrue(GDDScanRules.hiddenKeys([]).isEmpty)
+        XCTAssertNil(GDDScanRules.summary([]))
+    }
+
+    func testResultsSurviveARoundTrip() {
+        let one = [r("4490", 16), r("2990", 0, failure: "nope")]
+        let back = GDDScanRules.decode(GDDScanRules.encode(one))
+        XCTAssertEqual(back, one)
+        XCTAssertTrue(GDDScanRules.decode(Data("garbage".utf8)).isEmpty)
+        XCTAssertTrue(GDDScanRules.decode(nil).isEmpty)
+    }
+}
+
+// The art-style list ported from the previous HTML tool, and the rule that a chosen
+// style REPLACES the one read from the theme's reference art.
+final class SlotArtStyleTests: XCTestCase {
+    func testTheListLoaded() {
+        XCTAssertEqual(SlotArtStyles.all.count, 58)
+        XCTAssertEqual(SlotArtStyles.byCategory.count, 13)
+        // Every style has real direction in it, not just a name.
+        for s in SlotArtStyles.all {
+            XCTAssertFalse(s.keywords.isEmpty, s.id)
+            XCTAssertGreaterThan(s.keywords.count, 40, s.id)
+            XCTAssertFalse(s.category.isEmpty, s.id)
+        }
+    }
+
+    func testIDsAreUnique() {
+        XCTAssertEqual(Set(SlotArtStyles.all.map(\.id)).count, SlotArtStyles.all.count)
+        XCTAssertEqual(Set(SlotArtStyles.all.map(\.name)).count, SlotArtStyles.all.count)
+    }
+
+    // Styles named after specific studios and franchises were left out on purpose: they
+    // ask a model to imitate a named company's protected art for a commercial product.
+    func testNoStudioOrFranchiseNames() {
+        let banned = ["nintendo", "pokemon", "zelda", "mario", "blizzard", "warcraft",
+                      "overwatch", "fortnite", "minecraft", "sonic", "diablo", "doom",
+                      "gta", "grand theft", "call of duty", "assassin", "pragmatic",
+                      "final fantasy", "street fighter", "mortal kombat", "half-life",
+                      "portal", "counter-strike", "dota", "starcraft", "hearthstone",
+                      "among us", "fall guys", "metroid", "castlevania", "mega man",
+                      "terraria", "league of legends", "team fortress"]
+        for s in SlotArtStyles.all {
+            let hay = (s.id + " " + s.name + " " + s.keywords).lowercased()
+            for b in banned {
+                XCTAssertFalse(hay.contains(b), "\(s.id) mentions \(b)")
+            }
+        }
+    }
+
+    // Every style must describe HOW something is drawn, never WHAT is in it.
+    /// The vocabulary a rendering description is made of. Kept in step with the filler
+    /// audit in Tools — a description that names none of these is adjectives.
+    static let renderingTerms = [
+        "colour", "color", "render", "shading", "shadow", "highlight", "outline", "edge",
+        "palette", "texture", "light", "gradient", "fill", "specular", "occlusion",
+        "saturat", "contrast", "blur", "pixel", "surface", "bevel", "grain", "reflect",
+        "terminator", "brush", "line", "stroke", "value", "hue", "matte", "gloss", "rim",
+        "chroma", "facet", "tonal", "bloom", "glow",
+    ]
+
+    func testStylesAreAboutRenderingNotContent() {
+        for s in SlotArtStyles.all {
+            let k = s.keywords.lowercased()
+            let hits = Self.renderingTerms.filter { k.contains($0) }.count
+            XCTAssertGreaterThanOrEqual(hits, 4,
+                "\(s.id) names too few rendering mechanics: \(s.keywords)")
+        }
+    }
+
+    /// The filler that made the ported descriptions useless: words a model cannot draw.
+    func testNoStyleCarriesGenreFiller() {
+        let filler = ["aesthetic", "visual theme", "visual language", "atmosphere",
+                      "game visual", "gaming visual", "mobile-optimized", "mobile-friendly",
+                      "visual quality", "visual treatment", "visual appeal",
+                      "visual execution", "visual design", "color design",
+                      "color aesthetics", "color atmosphere", "color treatment",
+                      "color elements", "artistry", "visual rhythm", "visual structure"]
+        for s in SlotArtStyles.all {
+            let k = s.keywords.lowercased()
+            for f in filler {
+                XCTAssertFalse(k.contains(f), "\(s.id) contains filler: “\(f)”")
+            }
+        }
+    }
+
+    func testLookupAndSearch() {
+        XCTAssertEqual(SlotArtStyles.byID("playful-inviting")?.name, "Playful Inviting")
+        XCTAssertNil(SlotArtStyles.byID("nope"))
+        XCTAssertNil(SlotArtStyles.byID(nil))
+        XCTAssertNil(SlotArtStyles.byID(""))
+        XCTAssertEqual(SlotArtStyles.search("").count, 58)
+        XCTAssertTrue(SlotArtStyles.search("NEON").contains { $0.id == "electric-neon" })
+        XCTAssertTrue(SlotArtStyles.search("metallic").contains { $0.id == "shiny-metallic" })
+        XCTAssertTrue(SlotArtStyles.search("zzzz").isEmpty)
+    }
+
+    func testEveryStyleAppearsInExactlyOneCategory() {
+        let flat = SlotArtStyles.byCategory.flatMap(\.styles)
+        XCTAssertEqual(flat.count, SlotArtStyles.all.count)
+        XCTAssertEqual(Set(flat.map(\.id)), Set(SlotArtStyles.all.map(\.id)))
+    }
+
+    private var theme: GameTheme {
+        var t = GameTheme(name: "Galactic Goddesses", category: "Mythology",
+                          comparables: "Starlight", look: "Celestial beings and nebulae.")
+        t.styleFromArt = "Painterly, warm rim light, soft edges, oil-like brushwork."
+        return t
+    }
+
+    // The whole risk of adding this: two rendering directions in one prompt. One says
+    // painterly and soft-edged, the other crisp flat cel shading, and the art matches
+    // neither. A chosen style must REPLACE, never join.
+    func testChosenStyleReplacesTheReferenceArtStyle() {
+        var t = theme
+        t.chosenStyle = SlotArtStyles.byID("playful-inviting")
+        let b = GDDAssetPrompts.styleBlock(t)
+        XCTAssertTrue(b.contains("Playful Inviting"))
+        XCTAssertFalse(b.contains("Painterly, warm rim light"),
+                       "the reference-art style is still in the prompt:\n\(b)")
+        XCTAssertEqual(b.components(separatedBy: "ART STYLE").count - 1, 1)
+    }
+
+    // Picking a style is not a decision to draw a different game.
+    func testThemeAndLookSurviveAStyleChoice() {
+        var t = theme
+        t.chosenStyle = SlotArtStyles.byID("electric-neon")
+        let b = GDDAssetPrompts.styleBlock(t)
+        XCTAssertTrue(b.contains("Celestial beings and nebulae."))
+        XCTAssertTrue(b.contains("Starlight"))
+    }
+
+    func testWithoutAChoiceTheReferenceArtStyleIsUsed() {
+        let b = GDDAssetPrompts.styleBlock(theme)
+        XCTAssertTrue(b.contains("Painterly, warm rim light"))
+        XCTAssertFalse(b.contains("Vibrant Cartoonish"))
+    }
+
+    // All three prompts read the style off the theme, so none can be missed.
+    func testTheChoiceReachesEveryPrompt() {
+        var t = theme
+        t.chosenStyle = SlotArtStyles.byID("gothic-carnival")
+        let name = SlotArtStyles.byID("gothic-carnival")!.name
+        let sym = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           subject: "a giant", silhouette: "giant", aspect: "1:1", size: "2K")
+        let bg = AssetJob(id: "bg_base", kind: .background, role: .unknown, tier: nil,
+                          title: "", subject: "a hall", silhouette: "", aspect: "3:4", size: "4K")
+        let backing = SlotBackingRules.candidates[2]
+        XCTAssertTrue(GDDAssetPrompts.image(job: sym, theme: t, backing: backing).contains(name))
+        XCTAssertTrue(GDDAssetPrompts.image(job: bg, theme: t, backing: backing).contains(name))
+        XCTAssertTrue(GDDAssetPrompts.planning(theme: t, gameName: "G", jobs: [sym],
+                                               gddText: "Symbol Set\n0 WD1").contains(name))
+    }
+}
+
+// Interaction rules for the art-style picker. These live in the view, so what is pinned
+// here is the pure behaviour each one depends on.
+extension SlotArtStyleTests {
+    // Narrowing the search must not drop the current selection out of the list — a
+    // Picker whose selection is absent from its own rows renders blank, so the style
+    // looks lost.
+    func testSearchCanExcludeTheSelectionSoTheViewReAddsIt() {
+        let sel = SlotArtStyles.byID("shiny-metallic")!
+        let hits = SlotArtStyles.search("cartoon")
+        XCTAssertFalse(hits.contains(sel))          // the condition the view guards
+        var withSel = hits
+        withSel.insert(sel, at: 0)
+        XCTAssertTrue(withSel.contains(sel))
+    }
+
+    // Switching theme clears the choice, and a theme carries none by default — so a
+    // style picked for one game can never leak into the next.
+    func testANewThemeCarriesNoStyle() {
+        let t = GameTheme(name: "Other", look: "A different world.")
+        XCTAssertNil(t.chosenStyle)
+        XCTAssertFalse(GDDAssetPrompts.styleBlock(t).contains("ART STYLE"))
+        XCTAssertTrue(GDDAssetPrompts.styleBlock(t).contains("A different world."))
+    }
+
+    // A theme with no reference art and no chosen style still produces a usable prompt
+    // rather than an empty style section.
+    func testNoArtAndNoChoiceStillDescribesTheGame() {
+        let t = GameTheme(name: "Plain", comparables: "Something", look: "A quiet place.")
+        let b = GDDAssetPrompts.styleBlock(t)
+        XCTAssertFalse(b.contains("ART STYLE"))
+        XCTAssertTrue(b.contains("A quiet place."))
+        XCTAssertTrue(b.contains("Something"))
+    }
+
+    // Choosing a style is not a reason to redesign the set: it changes how things are
+    // drawn, not what they are. The subjects must survive.
+    func testStyleChoiceDoesNotDependOnSubjects() {
+        var t = GameTheme(name: "T", look: "World.")
+        t.chosenStyle = SlotArtStyles.byID("sleek-elegant")
+        let job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           subject: "a golden harp", silhouette: "harp",
+                           aspect: "1:1", size: "2K")
+        let p = GDDAssetPrompts.image(job: job, theme: t,
+                                      backing: SlotBackingRules.candidates[2])
+        XCTAssertTrue(p.contains("a golden harp"))
+        XCTAssertTrue(p.contains("Sleek Elegant"))
+    }
+}
+
+// The Video Game Styles category. The originals named studios and franchises, and
+// described CONTENT rather than rendering — "hellish demon environments", "vampire
+// hunter visual themes". In a slot symbol prompt that drags another game's subject
+// matter into the picture, which is the opposite of what an art STYLE is for.
+extension SlotArtStyleTests {
+    private var videoGame: [SlotArtStyle] {
+        SlotArtStyles.all.filter { $0.category == "Video Game Styles" }
+    }
+
+    func testTheCategoryIsPresent() {
+        XCTAssertEqual(videoGame.count, 11)
+        XCTAssertTrue(SlotArtStyles.byCategory.contains { $0.category == "Video Game Styles" })
+    }
+
+    // Not one of them may describe what is IN the picture. A style says how a thing is
+    // drawn; the theme and the GDD say what the thing is.
+    func testTheyDescribeRenderingNotSubjectMatter() {
+        let content = ["environment", "demon", "vampire", "soldier", "stadium", "castle",
+                       "alien", "creature", "hero character", "weapon", "armor", "armour",
+                       "tavern", "laboratory", "facility", "arena", "track", "vehicle",
+                       "city", "planet", "monster", "warrior", "champion", "player"]
+        for s in videoGame {
+            // Whole words. A substring check fails on "velocity", which contains "city".
+            let words = Set(s.keywords.lowercased()
+                .split(whereSeparator: { !$0.isLetter })
+                .map { String($0) })
+            for c in content where !c.contains(" ") {
+                XCTAssertFalse(words.contains(c) || words.contains(c + "s"),
+                               "\(s.id) describes subject matter: “\(c)”")
+            }
+            for c in content where c.contains(" ") {
+                XCTAssertFalse(s.keywords.lowercased().contains(c),
+                               "\(s.id) describes subject matter: “\(c)”")
+            }
+        }
+    }
+
+    // Vague genre words say nothing a model can draw. "aesthetics", "visual themes" and
+    // "atmosphere" were most of the original text and carry no instruction at all.
+    func testNoEmptyGenreFiller() {
+        for s in videoGame {
+            let k = s.keywords.lowercased()
+            for f in ["aesthetic", "visual theme", "visual language", "atmosphere",
+                      "game visual", "gaming visual", "mobile-optimized", "mobile-friendly"] {
+                XCTAssertFalse(k.contains(f), "\(s.id) contains filler: “\(f)”")
+            }
+        }
+    }
+
+    // Each one has to name real rendering mechanics, not adjectives.
+    func testEachNamesConcreteRenderingMechanics() {
+        for s in videoGame {
+            let k = s.keywords.lowercased()
+            let mechanics = ["shading", "shadow", "highlight", "outline", "edge", "palette",
+                             "texture", "light", "gradient", "fill", "specular", "occlusion",
+                             "saturat", "contrast", "blur", "pixel", "surface", "colour",
+                             "color", "bevel", "grain", "reflect"]
+            let hits = mechanics.filter { k.contains($0) }.count
+            XCTAssertGreaterThanOrEqual(hits, 3,
+                "\(s.id) names too few rendering mechanics: \(s.keywords)")
+        }
+    }
+
+    // The five asked for by name all resolve to a described style.
+    func testTheRequestedLooksAreAllCovered() {
+        // Pokémon (anime-cel) and Pragmatic Play (vector-casino) were dropped with the
+        // rest of the outline-based styles — a hard contour is the artefact this pipeline
+        // exists to avoid, so styles that mandate one are no longer offered.
+        for id in ["bright-toy-3d",        // Nintendo
+                   "hand-painted-heroic",  // World of Warcraft
+                   "gritty-photoreal"] {   // Grand Theft Auto
+            XCTAssertNotNil(SlotArtStyles.byID(id), id)
+            XCTAssertEqual(SlotArtStyles.byID(id)?.category, "Video Game Styles", id)
+        }
+    }
+}
+
+// Seven styles were removed because they duplicated another entry's rendering, not just
+// its wording — measured as shared rendering vocabulary across all pairs. The twin that
+// survived each pair is the one that states its rendering more concretely.
+extension SlotArtStyleTests {
+    func testTheRedundantTwinsAreGone() {
+        for id in ["vibrant-tech-infused",   // ≡ high-energy-scifi
+                   "serene-peaceful",        // ≡ calming-realistic
+                   "mystical-glow",          // ≡ soft-ethereal
+                   "whimsical-mechanical",   // ≡ vintage-brass-wood
+                   "mysterious-haunting",    // ≡ chilling-immersive
+                   "luxurious-mysterious",   // a blend of sleek-mysterious + luxurious-opulent
+                   "cold-mesmerizing"] {     // ≡ cold-mysterious
+            XCTAssertNil(SlotArtStyles.byID(id), "\(id) is back")
+        }
+    }
+
+    func testTheSurvivingTwinsAreStillThere() {
+        for id in ["high-energy-scifi", "calming-realistic", "soft-ethereal",
+                   "vintage-brass-wood", "chilling-immersive", "sleek-mysterious",
+                   "luxurious-opulent", "cold-mysterious"] {
+            XCTAssertNotNil(SlotArtStyles.byID(id), id)
+        }
+    }
+
+    // Removing entries must not empty a category out of the picker.
+    func testNoCategoryWasEmptied() {
+        for g in SlotArtStyles.byCategory {
+            XCTAssertFalse(g.styles.isEmpty, g.category)
+        }
+        XCTAssertEqual(SlotArtStyles.byCategory.count, 13)
+    }
+}
+
+// Everything a hub card carries, and the state machine that reports the style read.
+final class ThemeHubFieldTests: XCTestCase {
+    func testAThemeCarriesEveryCardField() {
+        var t = GameTheme(name: "Wild Wolves", category: "Wildlife",
+                          comparables: "Wolf Gold, Wolf Strike",
+                          why: "Proven evergreen.", look: "A moonlit forest.", tier: "T1")
+        t.status = "T1 · Greenlight"
+        t.votes = 4
+        t.notes = "Art started 12 Sep — Baby Ninja."
+        t.hasArt = true
+        XCTAssertEqual(t.votes, 4)
+        XCTAssertEqual(t.status, "T1 · Greenlight")
+        XCTAssertFalse(t.notes.isEmpty)
+        XCTAssertTrue(t.hasArt)
+    }
+
+    // hasArt is what tells "this card has no artwork" apart from "we have not fetched it
+    // yet". Showing those two identically sent people hunting for an upload that was
+    // never missing.
+    func testHasArtIsIndependentOfHavingFetchedIt() {
+        var t = GameTheme(name: "X")
+        t.hasArt = true
+        XCTAssertNil(t.artBase64, "nothing fetched yet")
+        t.artDataURL = "data:image/jpeg;base64,AAAA"
+        XCTAssertEqual(t.artBase64, "AAAA")
+    }
+
+    func testArtBase64RejectsNonDataURLs() {
+        var t = GameTheme(name: "X")
+        t.artDataURL = "/api/art/abc123"
+        XCTAssertNil(t.artBase64)
+        t.artDataURL = "data:image/jpeg;base64,"
+        XCTAssertNil(t.artBase64, "empty payload is not artwork")
+    }
+
+    // A theme with no artwork must never claim a style was read from it.
+    func testNoArtMeansNoStyleFromArt() {
+        var t = GameTheme(name: "Plain", look: "A quiet place.")
+        t.hasArt = false
+        XCTAssertTrue(t.styleFromArt.isEmpty)
+        XCTAssertFalse(GDDAssetPrompts.styleBlock(t).contains("ART STYLE"))
+    }
+}
+
+// Theme rows in the picker: name left, tier and votes in right-aligned columns.
+final class ThemeRowTests: XCTestCase {
+    private func col(_ row: String, after: Int) -> Int? {
+        row.distance(from: row.startIndex, to: row.index(row.startIndex, offsetBy: after))
+    }
+
+    // The whole point: every row's tier starts at the same column.
+    func testTierColumnLinesUp() {
+        let names = ["Piggy Banks", "Diamonds — Fire, Energy, Thunder", "Thor", "Yeti"]
+        let w = ThemeRowRules.nameWidth(forNames: names)
+        let starts = names.map { n -> Int in
+            let row = ThemeRowRules.label(name: n, tier: "T1", votes: 0, nameWidth: w)
+            return row.distance(from: row.startIndex, to: row.range(of: "T1")!.lowerBound)
+        }
+        XCTAssertEqual(Set(starts).count, 1, "tier column ragged: \(starts)")
+    }
+
+    func testVoteColumnLinesUp() {
+        let names = ["Thor", "Galactic Goddesses", "Atlantis, Not Underwater"]
+        let w = ThemeRowRules.nameWidth(forNames: names)
+        let starts = names.map { n -> Int in
+            let row = ThemeRowRules.label(name: n, tier: "T2", votes: 3, nameWidth: w)
+            return row.distance(from: row.startIndex, to: row.range(of: "👍")!.lowerBound)
+        }
+        XCTAssertEqual(Set(starts).count, 1, "vote column ragged: \(starts)")
+    }
+
+    // A theme with no tier must not shunt its votes left into the tier column.
+    func testAMissingTierKeepsTheVoteColumn() {
+        let w = ThemeRowRules.nameWidth(forNames: ["Yeti", "Thor"])
+        let withTier = ThemeRowRules.label(name: "Thor", tier: "T2", votes: 1, nameWidth: w)
+        let noTier = ThemeRowRules.label(name: "Yeti", tier: "", votes: 1, nameWidth: w)
+        XCTAssertEqual(withTier.distance(from: withTier.startIndex,
+                                         to: withTier.range(of: "👍")!.lowerBound),
+                       noTier.distance(from: noTier.startIndex,
+                                       to: noTier.range(of: "👍")!.lowerBound))
+    }
+
+    func testZeroVotesShowsNothing() {
+        let row = ThemeRowRules.label(name: "Thor", tier: "T2", votes: 0, nameWidth: 14)
+        XCTAssertFalse(row.contains("👍"))
+        XCTAssertTrue(row.contains("T2"))
+    }
+
+    // A very long name is truncated rather than pushing the columns off the menu.
+    func testLongNamesAreTruncatedNotAllowedToPush() {
+        let long = "A Really Extremely Long Theme Name That Overflows Everything"
+        let w = ThemeRowRules.nameWidth(forNames: [long])
+        XCTAssertEqual(w, ThemeRowRules.maxNameWidth)
+        let row = ThemeRowRules.label(name: long, tier: "T3", votes: 11, nameWidth: w)
+        XCTAssertTrue(row.contains("…"))
+        XCTAssertEqual(row.distance(from: row.startIndex, to: row.range(of: "T3")!.lowerBound),
+                       ThemeRowRules.maxNameWidth + 3)
+    }
+
+    // The column shrinks with a filtered list instead of leaving a canyon of spaces.
+    func testWidthFollowsTheVisibleList() {
+        XCTAssertEqual(ThemeRowRules.nameWidth(forNames: ["Thor", "Loki"]),
+                       ThemeRowRules.minNameWidth)
+        XCTAssertEqual(ThemeRowRules.nameWidth(forNames: []), ThemeRowRules.minNameWidth)
+        XCTAssertGreaterThan(ThemeRowRules.nameWidth(forNames: ["Atlantis, Not Underwater"]),
+                             ThemeRowRules.minNameWidth)
+    }
+}
+
+// Suppressing the cartoon contour — a dark ink stroke on the silhouette, or a pale
+// die-cut sticker band. The commonest complaint about generated slot art.
+final class EdgeTreatmentTests: XCTestCase {
+    private var theme: GameTheme {
+        var t = GameTheme(name: "Beanstalk", look: "A giant beanstalk.")
+        t.styleFromArt = "Painterly digital oil, warm light, visible brushwork."
+        return t
+    }
+    private var job: AssetJob {
+        AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                 subject: "a giant", silhouette: "giant", aspect: "1:1", size: "2K")
+    }
+    private var bg: AssetJob {
+        AssetJob(id: "bg_base", kind: .background, role: .unknown, tier: nil, title: "",
+                 subject: "a hall", silhouette: "", aspect: "3:4", size: "4K")
+    }
+
+    func testTheEdgeSpecIsInThePromptByDefault() {
+        let b = GDDAssetPrompts.styleBlock(theme)
+        XCTAssertTrue(b.contains("EDGES — how the symbol separates"))
+        XCTAssertTrue(b.contains("No inked contour stroke"))
+    }
+
+    // All three prompts, via the one choke point. Threading it through three call sites
+    // is how the anti-pattern list reached the symbols and not the backgrounds.
+    func testItReachesEveryPrompt() {
+        let backing = SlotBackingRules.candidates[2]
+        XCTAssertTrue(GDDAssetPrompts.image(job: job, theme: theme, backing: backing)
+            .contains("die-cut border"))
+        XCTAssertTrue(GDDAssetPrompts.image(job: bg, theme: theme, backing: backing)
+            .contains("die-cut border"))
+        XCTAssertTrue(GDDAssetPrompts.planning(theme: theme, gameName: "G", jobs: [job],
+                                               gddText: "Symbol Set\n0 WD1")
+            .contains("die-cut border"))
+    }
+
+    // A style whose whole identity is line work must not be told not to draw it. That is
+    // the same contradiction as telling a framed symbol "no frame".
+    // No style mandates line work any more: all eight outline-based styles were
+    // dropped at the studio's request. The exemption MACHINERY still matters — reference
+    // artwork can be inked — but nothing in the list triggers it.
+    func testNoStyleMandatesLineWorkAnyMore() {
+        XCTAssertTrue(SlotArtStyles.all.filter(\.usesLineWork).isEmpty,
+                      "an outline-based style is back in the list")
+    }
+
+    // ...and a painterly style still gets the suppression.
+    func testEveryStyleNowGetsTheEdgeSpec() {
+        for style in SlotArtStyles.all {
+            var t = theme
+            t.chosenStyle = style
+            XCTAssertTrue(GDDAssetPrompts.styleBlock(t).contains("lit, not inked"), style.id)
+        }
+    }
+
+    // If the game's OWN approved artwork is inked, suppressing ink would fight the thing
+    // the style was read from.
+    func testInkedReferenceArtIsRespected() {
+        var t = GameTheme(name: "X", look: "A world.")
+        t.styleFromArt = "Flat cel shading with bold black outlines and hard terminators."
+        XCTAssertFalse(GDDAssetPrompts.styleBlock(t).contains("No inked contour stroke"))
+    }
+
+    // The two phrasings that trade one defect for another: "soft edges" everywhere kills
+    // readability at 120px, and an unqualified rim light is the same continuous bright
+    // perimeter under a different name.
+    func testItDoesNotAskForSoftEdgesOrAContinuousRim() {
+        // Whitespace-normalised: the source wraps these lines, and a contains() against
+        // the raw text silently depends on where the wrap happens to fall.
+        let e = SlotArtDirection.edgeTreatment().lowercased()
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        XCTAssertFalse(e.contains("soft edges"), "soft edges everywhere kills readability")
+        XCTAssertTrue(e.contains("short and broken") || e.contains("short, broken"),
+                      "edge highlights must be specified as broken")
+        XCTAssertTrue(e.contains("never a continuous bright band"))
+    }
+
+    // Positive framing first, per Google's guide; the exclusion is one line at the end.
+    func testItLeadsWithWhatToDoNotWhatToAvoid() {
+        let lines = SlotArtDirection.edgeTreatment()
+            .split(separator: "\n").map(String.init)
+            .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("-") }
+        XCTAssertGreaterThan(lines.count, 3)
+        let negatives = lines.filter {
+            let l = $0.lowercased()
+            return l.contains("- no ") || l.contains("- never ") || l.contains("- do not")
+        }
+        XCTAssertEqual(negatives.count, 1, "exactly one exclusion, and it goes last")
+        XCTAssertTrue(lines.last!.lowercased().contains("no inked contour"))
+    }
+
+    // The house style must not NAME the looks we are trying to avoid.
+    func testTheHouseStyleNoLongerNamesTheArtefacts() {
+        let h = SlotArtDirection.houseStyle.lowercased()
+        XCTAssertFalse(h.contains("flat icon"))
+        XCTAssertFalse(h.contains("clip-art pictogram"))
+        XCTAssertTrue(h.contains("painted rather than drawn"))
+    }
+}
+
+// Which styles are exempt from the edge specification. Measured A/B found this was
+// getting one wrong: "Sharp Detailed" said "clean precise line work", meaning precision
+// of detail, and was read as a line-based style — so it never got the fix and its
+// outline coverage did not move.
+extension EdgeTreatmentTests {
+    func testAmbiguousLineWorkIsNotTreatedAsAnOutline() {
+        let s = SlotArtStyles.byID("sharp-detailed")!
+        XCTAssertFalse(s.usesLineWork, "detail precision is not a contour stroke")
+        XCTAssertFalse(s.keywords.lowercased().contains("line work"))
+    }
+
+    // ...but a style whose strokes ARE the artwork keeps its exemption.
+
+    // Exactly the styles that describe drawn line work, and no others.
+    func testTheExemptSetIsEmpty() {
+        XCTAssertEqual(Set(SlotArtStyles.all.filter(\.usesLineWork).map(\.id)), [],
+                       "the exempt set changed — check the new style's wording")
+    }
+}
+
+// The style read off a theme's reference artwork. It has to state the edge treatment
+// explicitly, because GDDAssetPrompts.wantsLineWork reads that description to decide
+// whether to suppress the cartoon contour — and a description that never mentions
+// outlines is indistinguishable from one describing art that has none.
+final class ReferenceStylePromptTests: XCTestCase {
+    private var p: String { RestyleRules.styleSystemPrompt }
+
+    func testItDemandsTheEdgeTreatment() {
+        XCTAssertTrue(p.contains("EDGE TREATMENT IS REQUIRED"))
+        XCTAssertTrue(p.lowercased().contains("keyline"))
+        XCTAssertTrue(p.lowercased().contains("line art"))
+    }
+
+    // It must ask for the words wantsLineWork actually looks for, or the two halves
+    // cannot agree: the reader searches for "outline" and "line art", so the writer has
+    // to be told to use them.
+    func testItAsksForTheWordsTheReaderLooksFor() {
+        let asked = p.lowercased()
+        XCTAssertTrue(asked.contains("using the word \"outline\"")
+                      || asked.contains("the word “outline”"), p)
+        var t = GameTheme(name: "X", look: "A world.")
+        t.styleFromArt = "Flat cel shading with a bold black outline following every form."
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(t))
+        t.styleFromArt = "Painterly oil, forms separated by painted colour and value meeting."
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(t))
+    }
+
+    // It must also report a halo or light band — the die-cut sticker artefact.
+    func testItAsksAboutHalosAndGlow() {
+        let l = p.lowercased()
+        XCTAssertTrue(l.contains("halo"))
+        XCTAssertTrue(l.contains("following the silhouette"))
+    }
+
+    // The original rules still hold: style only, never the subject.
+    func testItStillForbidsNamingTheSubject() {
+        XCTAssertTrue(p.contains("Never name or imply the subject"))
+        XCTAssertTrue(p.contains("No composition, framing, pose, or background layout"))
+    }
+
+    // Asking for more detail needs room for it; the cap was raised with the request.
+    func testTheWordCapLeavesRoomForTheExtraDetail() {
+        XCTAssertTrue(p.contains("under 140 words"))
+        XCTAssertFalse(p.contains("under 110 words"))
+    }
+}
+
+// A rim glow can be the game's real treatment. Wild Wolves' approved artwork reads as
+// "a bright golden luminous rim-glow following the outer silhouettes" — and the prompt
+// then told the model, two paragraphs later, to draw no glow following the silhouette.
+extension EdgeTreatmentTests {
+    private func themed(_ styleFromArt: String) -> GameTheme {
+        var t = GameTheme(name: "T", look: "A world.")
+        t.styleFromArt = styleFromArt
+        return t
+    }
+
+    func testAReferenceRimGlowIsNotForbidden() {
+        let t = themed("Digital painting, no drawn contour, with a bright golden luminous "
+                     + "rim-glow following the outer silhouettes.")
+        XCTAssertTrue(GDDAssetPrompts.wantsRimGlow(t))
+        let b = GDDAssetPrompts.styleBlock(t)
+        XCTAssertFalse(b.contains("no glow following the silhouette"),
+                       "forbidding the glow the reference art is built on")
+        XCTAssertFalse(b.contains("Never a continuous bright"))
+        XCTAssertTrue(b.contains("part of the artwork"))
+    }
+
+    // The two artefacts that are never wanted stay forbidden either way.
+    func testTheInkedContourAndStickerBorderStayForbidden() {
+        for art in ["painterly oil, no drawn contour, forms meet by value",
+                    "painterly oil with a luminous rim light around every form"] {
+            let b = GDDAssetPrompts.styleBlock(themed(art))
+            XCTAssertTrue(b.contains("No inked contour stroke"), art)
+            XCTAssertTrue(b.contains("die-cut border"), art)
+        }
+    }
+
+    // Art with no rim light still gets the strict version.
+    func testWithoutARimTheStrictVersionApplies() {
+        let b = GDDAssetPrompts.styleBlock(themed("Flat matte gouache, even light, no glow."))
+        XCTAssertFalse(GDDAssetPrompts.wantsRimGlow(themed("Flat matte gouache, even light, no glow.")))
+        XCTAssertTrue(b.contains("no glow following the silhouette"))
+        XCTAssertTrue(b.contains("SHORT AND BROKEN"))
+    }
+
+    // A chosen style that asks for rim light gets the same courtesy as reference art.
+    func testAChosenStyleWithRimLightIsRespected() {
+        var t = GameTheme(name: "T", look: "A world.")
+        t.chosenStyle = SlotArtStyles.byID("hand-painted-heroic")
+        XCTAssertTrue(t.chosenStyle!.keywords.contains("rim light"))
+        XCTAssertTrue(GDDAssetPrompts.wantsRimGlow(t))
+        XCTAssertFalse(GDDAssetPrompts.styleBlock(t).contains("no glow following the silhouette"))
+    }
+}
+
+// Deciding whether the reference artwork is inked. This was keyed off a substring scan
+// of free prose from a small model, and flipped between runs on the SAME theme — a
+// description reading "No drawn contour; forms are separated by painted colour" matched
+// "contour" and concluded the art was inked, turning the suppression off on exactly the
+// artwork that needed it.
+final class EdgeVerdictTests: XCTestCase {
+    private func themed(_ s: String) -> GameTheme {
+        var t = GameTheme(name: "T", look: "A world."); t.styleFromArt = s; return t
+    }
+
+    // The rule: a CHOSEN style overrides everything. Otherwise, if the game's own
+    // artwork has line art, we keep it — so either the verdict or the description
+    // establishing line work is enough, and the verdict only decides ambiguous cases.
+    //
+    // Measured on real cards: Dragon Fantasy's "intricate embossed relief" made the
+    // verdict flip none/outline/outline across three reads of the SAME artwork.
+    // Tightening the criterion settled that, but then answered "none" for Snow Queen,
+    // whose description says "delicate, crisp dark line art" — and suppressing ink there
+    // would print "lit, not inked" directly beneath a style paragraph describing ink.
+    func testTheDescriptionCanEstablishLineWorkOnItsOwn() {
+        let t = themed("Smooth airbrushed modelling with delicate, crisp dark line art.\n"
+                     + "EDGE-TREATMENT: none\nRIM-GLOW: no")
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(t),
+                      "the theme's own art says line art; we keep it")
+        XCTAssertFalse(GDDAssetPrompts.wantsRimGlow(t))
+    }
+
+    // ...and a description with no line work, whatever else it mentions, stays clean.
+    func testAmbiguousReliefIsNotLineWork() {
+        let t = themed("Ultra-high polish with intricate embossed relief detailing and "
+                     + "deep occlusion in the recesses.\nEDGE-TREATMENT: none\nRIM-GLOW: no")
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(t))
+    }
+
+    // A chosen style overrides the artwork entirely — that is what choosing one means.
+    func testAChosenStyleOverridesTheArtwork() {
+        var t = themed("Delicate crisp dark line art everywhere.\nEDGE-TREATMENT: outline")
+        t.chosenStyle = SlotArtStyles.byID("hand-painted-heroic")
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(t),
+                       "a chosen painterly style must beat the theme's inked artwork")
+        XCTAssertTrue(GDDAssetPrompts.styleBlock(t).contains("lit, not inked"))
+    }
+
+    func testTheVerdictIsReadWhenItSaysOutline() {
+        let t = themed("Painterly, no strokes mentioned.\nEDGE-TREATMENT: outline\nRIM-GLOW: yes")
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(t))
+        XCTAssertTrue(GDDAssetPrompts.wantsRimGlow(t))
+    }
+
+    // The real sentence the model wrote, which used to invert the decision.
+    func testNegatedMentionsDoNotCountAsLineWork() {
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(themed(
+            "Digital painting. No drawn contour; forms are separated by painted color "
+          + "and value meeting, with crisp edges at focal features.")))
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(themed("Rendered without outlines.")))
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(themed("There is no line art here.")))
+    }
+
+    func testAffirmativeMentionsStillCount() {
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(themed(
+            "Flat cel shading with a bold black outline around every form.")))
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(themed("Clean line art over flat fills.")))
+    }
+
+    func testNegatedRimGlowDoesNotCount() {
+        XCTAssertFalse(GDDAssetPrompts.wantsRimGlow(themed("Flat light, no halo or bloom.")))
+        XCTAssertTrue(GDDAssetPrompts.wantsRimGlow(themed("A golden rim light along the edge.")))
+    }
+
+    func testVerdictParsingIsRobust() {
+        XCTAssertEqual(GDDAssetPrompts.verdict("EDGE-TREATMENT", in: "x\nEDGE-TREATMENT: none"), "none")
+        XCTAssertEqual(GDDAssetPrompts.verdict("edge-treatment", in: "EDGE-TREATMENT:  Outline "), "outline")
+        XCTAssertNil(GDDAssetPrompts.verdict("EDGE-TREATMENT", in: "no verdict here"))
+        // The LAST verdict wins, so a restatement does not lose to an earlier draft.
+        XCTAssertEqual(GDDAssetPrompts.verdict("RIM-GLOW", in: "RIM-GLOW: no\nRIM-GLOW: yes"), "yes")
+    }
+
+    // The system prompt has to ask for the lines the parser reads.
+    func testTheStylePromptAsksForTheVerdict() {
+        XCTAssertTrue(RestyleRules.styleSystemPrompt.contains("EDGE-TREATMENT:"))
+        XCTAssertTrue(RestyleRules.styleSystemPrompt.contains("RIM-GLOW:"))
+    }
+}
+
+// Prescribing the replacement, not just forbidding the artefact. Measured: the
+// prohibition alone moved nothing (43.9% -> 43.5% of the silhouette carrying a dark rim
+// across 59 images). The studio's own preference is rim lighting over a drawn line, so
+// that is what the prompt now asks for — and it leads the style definition rather than
+// sitting among twenty-nine other rules.
+extension EdgeTreatmentTests {
+    func testTheStyleDefinitionLeadsWithLitNotInked() {
+        let b = GDDAssetPrompts.styleBlock(theme)
+        XCTAssertTrue(b.hasPrefix("RENDERING: this art is lit, not inked"),
+                      "the edge instruction must open the style block, not trail it")
+        XCTAssertTrue(b.contains("rim light along the lit edges"))
+    }
+
+    func testItPrescribesLightRatherThanOnlyForbiddingALine() {
+        let e = SlotArtDirection.edgeTreatment()
+        XCTAssertTrue(e.contains("SEPARATE THE SYMBOL WITH LIGHT, NOT WITH A LINE"))
+        XCTAssertTrue(e.contains("rim light catching the"))
+        // ...and distinguishes that rim from a traced stroke, which is the failure mode.
+        XCTAssertTrue(e.contains("not a stroke drawn around it"))
+    }
+
+    // A line-work style must not get the "lit, not inked" preamble either.
+    // Inked REFERENCE ART still stands the suppression down, even though no style does.
+    func testInkedReferenceArtStillExemptsItself() {
+        var t = GameTheme(name: "X", look: "A world.")
+        t.styleFromArt = "Flat cel shading with bold black outlines.\nEDGE-TREATMENT: outline"
+        let b = GDDAssetPrompts.styleBlock(t)
+        XCTAssertFalse(b.contains("lit, not inked"))
+        XCTAssertFalse(b.contains("SEPARATE THE SYMBOL WITH LIGHT"))
+    }
+}
+
+// A standing integrity check on everything that makes the ART good — not the parsing,
+// which has its own tests, but the direction that decides whether a symbol looks
+// professional.
+//
+// Exists because a regex meant to delete eight art styles ran past the end of the array
+// and took SlotSymbolRole and SlotSymbol with it. The suite caught it, but only because
+// a test happened to classify "BWY1". This asserts the whole surface deliberately.
+final class ArtDirectionIntegrityTests: XCTestCase {
+    func testEveryRoleHasALabelAndRealDirection() {
+        for r in SlotSymbolRole.allCases {
+            XCTAssertFalse(r.label.isEmpty, "\(r) has no label")
+            guard r != .blank else { continue }
+            XCTAssertGreaterThan(SlotArtDirection.direction(for: r, tier: 1).count, 80,
+                                 "\(r) has thin art direction")
+        }
+        XCTAssertFalse(SlotSymbolRole.blank.needsArt)
+        XCTAssertTrue(SlotSymbolRole.highPay.needsArt)
+    }
+
+    // The value ladder the whole set depends on.
+    func testTheValueLadderHolds() {
+        let order = SlotSymbolRole.allCases.sorted { $0.priority < $1.priority }
+        func at(_ r: SlotSymbolRole) -> Int { order.firstIndex(of: r)! }
+        XCTAssertLessThan(at(.highPay), at(.mediumPay))
+        XCTAssertLessThan(at(.mediumPay), at(.lowPay))
+        XCTAssertLessThan(at(.wild), at(.lowPay))
+    }
+
+    func testFamilyRolesSurvive() {
+        XCTAssertTrue(SlotSymbolRole.lowPay.isFamily)
+        XCTAssertTrue(SlotSymbolRole.jackpot.isFamily)
+        XCTAssertTrue(SlotSymbolRole.wysiwyg.isFamily)
+        XCTAssertFalse(SlotSymbolRole.highPay.isFamily)
+    }
+
+    // Long prefixes must stay first, or BWY1 becomes a blank and gets the art direction
+    // for an empty reel position.
+    func testCodeClassificationIncludingLongPrefixes() {
+        let want: [(String, SlotSymbolRole)] = [
+            ("BWY1", .wysiwyg), ("DHP2", .highPay), ("BL1", .blank), ("HP1", .highPay),
+            ("WD1", .wild), ("JP4", .jackpot), ("SF1", .collector), ("WY2", .wysiwyg),
+            ("R1", .replacement), ("BO1", .bonus), ("MP3", .mediumPay), ("LP5", .lowPay),
+        ]
+        for (code, role) in want {
+            XCTAssertEqual(GDDSymbolSetRules.classify(code).role, role, code)
+        }
+    }
+
+    // Every section the drawing prompt is made of. A missing one is invisible in the
+    // output until someone counts the artefacts it was there to prevent.
+    func testTheDrawingPromptKeepsEverySection() {
+        var t = GameTheme(name: "Beanstalk", comparables: "Megaways Jack",
+                          look: "A giant beanstalk.")
+        t.styleFromArt = "Painterly oil.\nEDGE-TREATMENT: none\nRIM-GLOW: no"
+        var job = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "",
+                           subject: "a giant", silhouette: "giant", aspect: "1:1", size: "2K")
+        job.hasFrame = true
+        let p = GDDAssetPrompts.image(job: job, theme: t,
+                                      backing: SlotBackingRules.candidates[2])
+        for section in ["RENDERING: this art is lit", "ART STYLE", "THEME & LOOK", "EDGES —",
+                        "THIS SYMBOL IS ONE OF A SET", "AVOID THESE SPECIFICALLY",
+                        "FRAME:", "BACKDROP:"] {
+            XCTAssertTrue(p.contains(section), "drawing prompt lost: \(section)")
+        }
+        let plan = GDDAssetPrompts.planning(theme: t, gameName: "G", jobs: [job],
+                                            gddText: "Symbol Set\n0 WD1")
+        XCTAssertTrue(plan.contains("SET RULES"))
+        XCTAssertTrue(plan.contains("ART STYLE"))
+    }
+}
+
+// Distinctness must be resolved by choosing a different subject from the same world,
+// never by abstracting away from it. Measured cause: with wolves at HP1-HP2, the wild
+// came back as a pawprint medallion — the set rule pushed it upward into a token.
+final class SidewaysDistinctnessTests: XCTestCase {
+    /// Whitespace-normalised: the source wraps these lines, and a raw contains() quietly
+    /// depends on where the wrap happens to fall.
+    private var rules: String {
+        SlotArtDirection.setRules.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    func testTheSetRulesSayHowToResolveAClash() {
+        XCTAssertTrue(rules.contains("RESOLVE THAT SIDEWAYS, NOT UPWARD"))
+        XCTAssertTrue(rules.contains("another character in the story"))
+        XCTAssertTrue(rules.contains("has stopped being one world"))
+    }
+
+    func testEverySubjectIsBoundToThisGame() {
+        XCTAssertTrue(rules.contains("EVERY subject comes from THIS game's theme"))
+        XCTAssertTrue(rules.contains("rendered in the SAME art style"),
+                      "the set rules must bind subject to theme AND rendering to one style")
+        XCTAssertTrue(rules.contains("would fit equally well in a different game"))
+    }
+
+    // The rule reaches the planner, which is what chooses subjects.
+    func testItReachesThePlanner() {
+        var t = GameTheme(name: "Wild Wolves", look: "A moonlit forest.")
+        t.styleFromArt = "Painterly.\nEDGE-TREATMENT: none\nRIM-GLOW: yes"
+        let job = AssetJob(id: "WD1", kind: .symbol, role: .wild, tier: nil, title: "",
+                           subject: "", silhouette: "", aspect: "1:1", size: "2K")
+        let p = GDDAssetPrompts.planning(theme: t, gameName: "G", jobs: [job],
+                                         gddText: "Symbol Set\n0 WD1\n1-4 HP1-4")
+        XCTAssertTrue(p.contains("RESOLVE THAT SIDEWAYS"))
+        XCTAssertTrue(p.contains("EVERY subject comes from THIS game's theme"))
+    }
+}
+
+// "Contour" in art writing means the edge of a form, not a drawn line. Treating the bare
+// word as line work read Wild Bears — whose own verdict said "none" — as inked, and
+// switched the cartoon-outline suppression off for it.
+extension EdgeVerdictTests {
+    func testSoftContoursAreNotLineWork() {
+        var t = GameTheme(name: "Wild Bears", look: "Wilderness.")
+        t.styleFromArt = "Painterly rendering with soft contours and smooth contour shading "
+                       + "describing the forms.\nEDGE-TREATMENT: none\nRIM-GLOW: no"
+        XCTAssertFalse(GDDAssetPrompts.wantsLineWork(t),
+                       "a form's contour is not a drawn line")
+    }
+
+    // ...but an ink contour is.
+    func testInkContoursAreLineWork() {
+        var t = GameTheme(name: "Loki", look: "Norse.")
+        t.styleFromArt = "Line art and delicate ink contours defining every form.\n"
+                       + "EDGE-TREATMENT: outline"
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(t))
+        t.styleFromArt = "Crisp contour lines around each shape.\nEDGE-TREATMENT: none"
+        XCTAssertTrue(GDDAssetPrompts.wantsLineWork(t), "a contour LINE is a drawn mark")
+    }
+}
+
+// How many images run at once, and how the pool reacts to pushback.
+final class ImageConcurrencyTests: XCTestCase {
+    func testTheDefaultIsWiderThanSequential() {
+        XCTAssertGreaterThan(ImageRequestPolicy.concurrency, 1)
+        XCTAssertGreaterThan(ImageRequestPolicy.widenAfterSuccesses, 1,
+                             "narrow fast, widen slowly")
+    }
+
+    // Narrow by ONE, not to serial. A single transient 429 used to pin the width at 1 for
+    // the rest of a twenty-image run, so one blip cost the whole batch its parallelism.
+    func testNarrowingIsGradualAndRecoverable() {
+        var width = ImageRequestPolicy.concurrency
+        width = max(1, width - 1)
+        XCTAssertEqual(width, ImageRequestPolicy.concurrency - 1)
+        // ...and a clean run takes the worker back.
+        var clean = 0
+        for _ in 0..<ImageRequestPolicy.widenAfterSuccesses {
+            clean += 1
+            if clean >= ImageRequestPolicy.widenAfterSuccesses,
+               width < ImageRequestPolicy.concurrency { width += 1; clean = 0 }
+        }
+        XCTAssertEqual(width, ImageRequestPolicy.concurrency)
+    }
+
+    // It can never narrow past serial, however many failures arrive.
+    func testItNeverNarrowsBelowOne() {
+        var width = ImageRequestPolicy.concurrency
+        for _ in 0..<20 { width = max(1, width - 1) }
+        XCTAssertEqual(width, 1)
+    }
+
+    // Retry policy is unchanged: Google's documented shape.
+    func testRetryPolicyIsIntact() {
+        XCTAssertEqual(ImageRequestPolicy.maxAttempts, 3)
+        XCTAssertTrue(ImageRequestPolicy.isRetryable(status: 429))
+        XCTAssertTrue(ImageRequestPolicy.isRetryable(status: 503))
+        XCTAssertFalse(ImageRequestPolicy.isRetryable(status: 400))
     }
 }

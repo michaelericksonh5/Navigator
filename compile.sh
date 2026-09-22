@@ -14,4 +14,4 @@ TARGET="${TARGET:-arm64-apple-macos14.4}"
 /usr/bin/swiftc -swift-version 5 -target "$TARGET" -o "$OUT" \
   "$DIR/main.swift" "$DIR/NavigatorCore.swift" \
   -framework SwiftUI -framework AppKit -framework UniformTypeIdentifiers \
-  -framework NetFS -framework Security -framework FinderSync
+  -framework NetFS -framework Security -framework FinderSync -framework WebKit

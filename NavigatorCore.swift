@@ -710,6 +710,29 @@ enum RestyleRules {
         colour temperature, lighting character and direction, contrast and value range, \
         surface finish, edge treatment, level of detail, grain/texture, and overall mood.
 
+        EDGE TREATMENT IS REQUIRED, and must be stated explicitly, because everything \
+        drawn from this description depends on it. Say which of these the artwork does:
+        - a drawn contour: an inked outline or keyline following the silhouette, or \
+        visible line art — say so plainly, using the word "outline" or "line art";
+        - or no drawn contour: forms separated by painted colour and value meeting, with \
+        the edge being where one surface ends and the next begins.
+        Then say whether edges are crisp, soft, or crisp at the focal features and soft \
+        where forms turn away, and whether there is any halo, glow or light band \
+        following the silhouette.
+
+        END your answer with these two lines, exactly, on their own lines:
+        EDGE-TREATMENT: outline
+        RIM-GLOW: yes
+        Answer "outline" when a contour has deliberately been DRAWN — an ink line or \
+        keyline following the silhouette, of roughly even weight, sitting on top of the \
+        painting as a separate mark, or visible line art anywhere in the piece. Dark \
+        recesses, embossed or engraved relief, occlusion shadow where forms meet, and a \
+        dark material simply ending against a lighter one are NOT drawn contours — answer \
+        "none" for those.
+
+        Use RIM-GLOW "yes" only when a glow, halo or light band follows the silhouette, \
+        and "no" when it does not.
+
         HARD RULES — breaking these ruins the result:
         - Never name or imply the subject: no species, creature, person, character, \
         clothing, props, setting, or body parts.
@@ -718,7 +741,7 @@ enum RestyleRules {
         rendered instead — "fine high-frequency detail on organic surfaces", \
         "soft specular sheen".
         - No composition, framing, pose, or background layout.
-        - Output style directives only, as one dense paragraph under 110 words, no preamble.
+        - Output style directives only, as one dense paragraph under 140 words, no preamble.
         """
 
     // MARK: - Prompts
@@ -5628,6 +5651,88 @@ enum ChromaKeyOutputRules {
         return bias
     }
 
+    /// Recover the true foreground colour by arithmetic instead of trusting despill.
+    ///
+    /// The source image is a composite over a known flat backing:  S = F·a + B·(1−a).
+    /// Keylight estimates `a` well; what it does badly is the second half of its job,
+    /// DESPILL — subtracting the screen colour from what it kept. On a magenta field
+    /// that means taking red and blue out of everything, so a gold-and-crimson symbol
+    /// came back uniformly green. The colour is not lost, though: given `a` and `B`,
+    /// the equation above rearranges to F = (S − B·(1−a)) / a, which is exact.
+    ///
+    /// So the alpha is Keylight's — that is what it is good at — and the colour is
+    /// computed. Nothing is clipped, so soft FX keep every transitional value, and
+    /// nothing is classified, so this needs no guess about what kind of image it is.
+    ///
+    /// The division blows up as `a` approaches zero, where a pixel is almost entirely
+    /// backing and carries almost no foreground to recover. Below `alphaFloor` the
+    /// recovered value is noise and Keylight's despilled colour is kept instead, with a
+    /// smooth crossfade up to `alphaFull` so the edge does not band.
+    enum SpillRules {
+        /// Below this, the pixel is too nearly pure backing to invert: 1/a amplifies
+        /// any error in Keylight's alpha, and at a thin matte that error is all there is.
+        static let alphaFloor: Double = 0.28
+        /// At and above this, the computed foreground is used outright. Chosen from the
+        /// real matte: on a keyed symbol the subject's body is spread across alpha
+        /// 0.4-1.0 rather than sitting at 1.0, so recovery has to reach well below full
+        /// opacity or most of the symbol keeps the despilled colour.
+        static let alphaFull: Double = 0.50
+
+        /// How much to trust the computed colour, 0…1.
+        static func weight(alpha: UInt8) -> Double {
+            let a = Double(alpha) / 255
+            if a <= alphaFloor { return 0 }
+            if a >= alphaFull { return 1 }
+            let t = (a - alphaFloor) / (alphaFull - alphaFloor)
+            return t * t * (3 - 2 * t)          // smoothstep, so the edge does not band
+        }
+
+        /// F = (S − B·(1−a)) / a, clamped to the representable range.
+        static func foreground(source: RGB8, backing: RGB8, alpha: UInt8) -> RGB8 {
+            let a = max(Double(alpha) / 255, 1.0 / 255)
+            func ch(_ s: UInt8, _ b: UInt8) -> UInt8 {
+                let v = (Double(s) - Double(b) * (1 - a)) / a
+                return UInt8(max(0, min(255, v.rounded())))
+            }
+            return RGB8(ch(source.r, backing.r), ch(source.g, backing.g), ch(source.b, backing.b))
+        }
+
+        /// The colour to write: Keylight's where the matte is too thin to invert, the
+        /// computed foreground where it is not, blended in between.
+        static func recovered(keyed: RGB8, source: RGB8, backing: RGB8, alpha: UInt8) -> RGB8 {
+            let w = weight(alpha: alpha)
+            if w <= 0 { return keyed }
+            let f = foreground(source: source, backing: backing, alpha: alpha)
+            if w >= 1 { return f }
+            func mix(_ k: UInt8, _ v: UInt8) -> UInt8 {
+                UInt8(max(0, min(255, (Double(k) * (1 - w) + Double(v) * w).rounded())))
+            }
+            return RGB8(mix(keyed.r, f.r), mix(keyed.g, f.g), mix(keyed.b, f.b))
+        }
+    }
+
+    /// The flat backing colour, taken as the median of the four corners.
+    ///
+    /// Median rather than mean: one corner clipped by the subject would drag a mean
+    /// toward the art, and the whole recovery is anchored on this value being right.
+    static func backingColour(_ image: CGImage) throws -> RGB8 {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let decoded = bytes.withUnsafeMutableBytes { raw -> Bool in
+            let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
+            guard let context = CGContext(data: raw.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            context.setBlendMode(.copy)
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            return true
+        }
+        guard decoded else { throw failure("Could not sample the backing colour") }
+        let corners = [0, (image.width - 1) * 4,
+                       (image.height - 1) * image.width * 4, bytes.count - 4]
+        let m = (0..<3).map { c in corners.map { bytes[$0 + c] }.sorted()[1] }
+        return RGB8(m[0], m[1], m[2])
+    }
+
     /// Copy source RGB into the pixels the matte calls (near-)opaque. Returns nil when there is
     /// nothing to change or the images cannot be read in a compatible form, in which case the
     /// caller keeps the keyed image exactly as it is.
@@ -5636,7 +5741,8 @@ enum ChromaKeyOutputRules {
     /// both images through a premultiplied CGContext, which re-quantised the SOFT pixels by a
     /// fraction of a level (48.188 became 47.937) — and the soft pixels are precisely the ones
     /// Keylight's despill is working on, so they must come through untouched.
-    static func restoreOpaqueInterior(keyed: CGImage, source: CGImage) throws -> CGImage? {
+    static func restoreOpaqueInterior(keyed: CGImage, source: CGImage,
+                                      backing: RGB8? = nil) throws -> CGImage? {
         let w = keyed.width, h = keyed.height
         guard source.width == w, source.height == h,
               keyed.bitsPerComponent == 8, keyed.bitsPerPixel == 32,
@@ -5661,11 +5767,26 @@ enum ChromaKeyOutputRules {
         for y in 0..<h {
             for x in 0..<w {
                 let k = y*kRow + x*4, sp = y*sRow + x*4
-                guard bytes[k+3] >= opaqueEnough else { continue }
-                // Alpha is at or near full on both sides, so the channels carry the same
-                // meaning and copy across directly.
-                if bytes[k] != sData[sp] || bytes[k+1] != sData[sp+1] || bytes[k+2] != sData[sp+2] { restored += 1 }
-                bytes[k] = sData[sp]; bytes[k+1] = sData[sp+1]; bytes[k+2] = sData[sp+2]
+                let a = bytes[k+3]
+                guard a > 0 else { continue }
+                if let backing {
+                    // Recover the colour from the compositing equation at EVERY pixel the
+                    // matte kept, not just the fully opaque ones — see SpillRules. The old
+                    // behaviour only repaired pixels at alpha >= 250, so an image whose
+                    // matte never reached that (a solid symbol on a backing sharing its
+                    // colours) kept Keylight's despilled result everywhere and came back
+                    // the wrong colour entirely.
+                    let out = SpillRules.recovered(
+                        keyed: RGB8(bytes[k], bytes[k+1], bytes[k+2]),
+                        source: RGB8(sData[sp], sData[sp+1], sData[sp+2]),
+                        backing: backing, alpha: a)
+                    if out != RGB8(bytes[k], bytes[k+1], bytes[k+2]) { restored += 1 }
+                    bytes[k] = out.r; bytes[k+1] = out.g; bytes[k+2] = out.b
+                } else {
+                    guard a >= opaqueEnough else { continue }
+                    if bytes[k] != sData[sp] || bytes[k+1] != sData[sp+1] || bytes[k+2] != sData[sp+2] { restored += 1 }
+                    bytes[k] = sData[sp]; bytes[k+1] = sData[sp+1]; bytes[k+2] = sData[sp+2]
+                }
             }
         }
         guard restored > 0 else { return nil }
@@ -5696,7 +5817,8 @@ enum ChromaKeyOutputRules {
         // (rgb(255,255,142) -> rgb(174,174,174)), so the bias is doing necessary work on the
         // SOFT pixels, which is where Keylight earns its place. This only touches the
         // interior, and only where the answer is arithmetically certain.
-        let final = try restoreOpaqueInterior(keyed: image, source: input) ?? image
+        let final = try restoreOpaqueInterior(keyed: image, source: input,
+                                              backing: try? backingColour(input)) ?? image
         let data = NSMutableData()
         guard let encoder = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
             throw failure("Could not encode PNG")
@@ -5709,7 +5831,30 @@ enum ChromaKeyOutputRules {
         return out
     }
 
+    /// How hard to clip the matte.
+    ///
+    /// These are not a preference, they are two different jobs, and one setting cannot
+    /// do both. Measured on a generated symbol, same image, same key:
+    ///
+    ///   softFX       24.3% clear, 19.1% opaque, 56.6% PARTIAL
+    ///   solidSymbol  70.8% clear, 27.4% opaque,  1.8% partial
+    ///
+    /// For a sparkle or a ray, that 56.6% is the asset — clipping it away is what the
+    /// "hard cut" complaint was about, so FX keeps Clip Black 0 / Clip White 100 and
+    /// preserves every transitional value. For a solid symbol it is a defect: the whole
+    /// piece comes out semi-transparent and the reel shows through the giant's face.
+    enum KeylightProfile {
+        /// Preserve transitional alpha. Sparkles, rays, soft FX.
+        case softFX
+        /// Solid subject on a flat field: opaque interior, thin anti-aliased edge.
+        case solidSymbol
+
+        var clipBlack: Double { self == .softFX ? 0 : 10 }
+        var clipWhite: Double { self == .softFX ? 100 : 80 }
+    }
+
     static func exportPNG(source: URL, scriptURL: URL, bundleID: String,
+                          profile: KeylightProfile = .softFX,
                           onLaunch: ((@escaping () -> Bool) -> Void)? = nil) throws -> URL {
         renderLock.lock()
         defer { renderLock.unlock() }
@@ -5724,7 +5869,9 @@ enum ChromaKeyOutputRules {
         let logFile = scratch.appendingPathComponent("keylight.log")
         let config: [String: Any] = ["sourceFile": source.path, "outputFolder": scratch.path,
             "outputName": "keyed", "automationMode": true, "showUi": false, "keyMode": "auto",
-            "useSampleAverage": true, "keylight": ["despillBias": bias],
+            "useSampleAverage": true,
+            "keylight": ["despillBias": bias,
+                         "clipBlack": profile.clipBlack, "clipWhite": profile.clipWhite],
             "resultFile": statusFile.path, "logFile": logFile.path]
         let json = String(decoding: try JSONSerialization.data(withJSONObject: config), as: UTF8.self)
         // DoScriptFile is refused by AE's scripting security; DoScript SOURCE works.
@@ -6187,5 +6334,2981 @@ enum RefreshRules {
         // Dropped keeps the ORDER it had, so a caller reporting "3 items removed" lists them
         // the way the user last saw them rather than in hash order.
         return Plan(reuse: reuse, fetch: fetch, dropped: existing.filter { !now.contains($0) })
+    }
+}
+
+// ===== Google Drive stubs =====
+
+/// What a Drive "stub" file on disk points at, and how to get the REAL document.
+///
+/// Google Drive for desktop does not store a Google-native file's content on disk. A
+/// .gdoc/.gsheet/.gslides is ~190 bytes of JSON holding an id. Reading one means asking
+/// Google to export it.
+///
+/// WHICH export matters more than it looks. Docs' plain-text export flattens every
+/// table to one cell per line:
+///
+///     txt export          .docx export
+///     \t0                 0\tWD1\t0\t1\t1
+///     \tWD1
+///     \t0
+///
+/// A GDD that declares its symbols in a table — the most common shape — is therefore
+/// UNREADABLE through the text export, and readable through the .docx export, because
+/// that one keeps the row. So Docs are fetched as .docx and read with the same reader a
+/// local .docx goes through; Sheets as TSV, which is already the shape the row parser
+/// wants; Slides as text, which is all a deck has.
+public struct DriveStub: Equatable, Hashable, Sendable {
+    public enum Kind: String, Sendable, Hashable, CaseIterable {
+        case document, spreadsheet, presentation, drawing, form, site
+
+        public init?(fileExtension ext: String) {
+            switch ext.lowercased() {
+            case "gdoc":    self = .document
+            case "gsheet":  self = .spreadsheet
+            case "gslides": self = .presentation
+            case "gdraw":   self = .drawing
+            case "gform":   self = .form
+            case "gsite":   self = .site
+            default:        return nil
+            }
+        }
+
+        /// The path segment Google uses for this kind of file.
+        var segment: String {
+            switch self {
+            case .document: return "document"
+            case .spreadsheet: return "spreadsheets"
+            case .presentation: return "presentation"
+            case .drawing: return "drawings"
+            case .form, .site: return ""
+            }
+        }
+
+        /// The export format asked for, and the extension the answer is saved under.
+        /// nil when there is no text to get.
+        public var export: (format: String, fileExtension: String)? {
+            switch self {
+            // .docx, NOT txt — txt loses the tables, and the tables are the symbol set.
+            case .document:     return ("docx", "docx")
+            // Already tab-separated, which is exactly what the row reader parses.
+            case .spreadsheet:  return ("tsv", "tsv")
+            case .presentation: return ("txt", "txt")
+            // A drawing is a picture and a form/site is not a document.
+            case .drawing, .form, .site: return nil
+            }
+        }
+
+        public var label: String {
+            switch self {
+            case .document: return "Google Doc"
+            case .spreadsheet: return "Google Sheet"
+            case .presentation: return "Google Slides"
+            case .drawing: return "Google Drawing"
+            case .form: return "Google Form"
+            case .site: return "Google Site"
+            }
+        }
+
+        /// Why this kind cannot be read, for the user rather than the log.
+        public var cannotReadReason: String? {
+            switch self {
+            case .drawing: return "a Google Drawing is a picture, with no text to read"
+            case .form:    return "a Google Form has no document text"
+            case .site:    return "a Google Site is a website, not a document"
+            default:       return nil
+            }
+        }
+    }
+
+    public let id: String
+    public let resourceKey: String
+    public let kind: Kind
+
+    public init(id: String, resourceKey: String = "", kind: Kind) {
+        self.id = id; self.resourceKey = resourceKey; self.kind = kind
+    }
+
+    /// Read a stub file's JSON. Drive writes the same shape for every type.
+    ///
+    /// Older stubs carry `resource_id` ("document:<id>") instead of `doc_id`, and files
+    /// shared by link since 2021 carry a `resource_key` that the export refuses to work
+    /// without.
+    public static func parse(json: String, fileExtension ext: String) -> DriveStub? {
+        guard let kind = Kind(fileExtension: ext),
+              let d = json.data(using: .utf8),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
+        else { return nil }
+        var id = (o["doc_id"] as? String) ?? ""
+        if id.isEmpty, let r = o["resource_id"] as? String {
+            id = r.contains(":") ? String(r.split(separator: ":").last!) : r
+        }
+        guard !id.isEmpty else { return nil }
+        return DriveStub(id: id, resourceKey: (o["resource_key"] as? String) ?? "", kind: kind)
+    }
+
+    /// The URL that returns the real content, or nil when there is none to get.
+    public var exportURL: URL? {
+        guard let e = kind.export, !kind.segment.isEmpty else { return nil }
+        var s = "https://docs.google.com/\(kind.segment)/d/\(id)/export?format=\(e.format)"
+        // A resource key is required for files shared by link; without it the export
+        // answers 404 even though the document opens fine in a browser.
+        if !resourceKey.isEmpty { s += "&resourcekey=\(resourceKey)" }
+        return URL(string: s)
+    }
+
+    /// The extension the downloaded file must be saved under for its reader to work.
+    public var fileExtension: String { kind.export?.fileExtension ?? "bin" }
+
+    /// A second format to try when the first export fails.
+    ///
+    /// Docs' plain-text export is lossy — it flattens tables — so it is the fallback and
+    /// never the first choice. But a document that refuses to export as .docx and does
+    /// export as text is a document read rather than a document lost, and the rule is
+    /// that the tool reads the GDD.
+    public var fallbackExportURL: URL? {
+        guard kind == .document else { return nil }
+        var s = "https://docs.google.com/document/d/\(id)/export?format=txt"
+        if !resourceKey.isEmpty { s += "&resourcekey=\(resourceKey)" }
+        return URL(string: s)
+    }
+}
+
+/// What a scan of the GDD folder found, per document.
+///
+/// Two thirds of the documents in a real GDD folder declare no symbol set at all —
+/// they are Power Bet variants, R&D notes and framework documents that describe a
+/// mechanic layered onto an existing game. Listing them beside the ones that CAN be
+/// turned into art just makes the picker a guessing game.
+///
+/// So this records what each document actually contained, and the picker hides the
+/// empty ones. Deliberately NOT a hardcoded list of names: a GDD in progress gains its
+/// symbol set later, documents get renamed, new ones arrive. A result is a measurement
+/// with a date on it, it can be re-taken, and nothing is ever hidden that the user
+/// cannot show again.
+public struct GDDScanResult: Codable, Equatable, Sendable {
+    /// doc id for a Drive file, path for a local one — survives a rename either way.
+    public let key: String
+    public let name: String
+    public let symbolCount: Int
+    public let checkedAt: Date
+    /// Set when the document could not be read at all, as opposed to read and empty.
+    /// An unreadable document is NOT hidden: "we failed" and "there is nothing there"
+    /// are different answers and only one of them is the document's fault.
+    public let failure: String?
+
+    public init(key: String, name: String, symbolCount: Int, checkedAt: Date,
+                failure: String? = nil) {
+        self.key = key; self.name = name; self.symbolCount = symbolCount
+        self.checkedAt = checkedAt; self.failure = failure
+    }
+
+    public var declaresNothing: Bool { failure == nil && symbolCount == 0 }
+}
+
+public enum GDDScanRules {
+    /// Keys to hide: read successfully, and declared no symbols.
+    public static func hiddenKeys(_ results: [GDDScanResult]) -> Set<String> {
+        Set(results.filter(\.declaresNothing).map(\.key))
+    }
+
+    public static func encode(_ results: [GDDScanResult]) -> Data? {
+        try? JSONEncoder().encode(results)
+    }
+
+    public static func decode(_ data: Data?) -> [GDDScanResult] {
+        guard let data else { return [] }
+        return (try? JSONDecoder().decode([GDDScanResult].self, from: data)) ?? []
+    }
+
+    /// A one-line summary for the window.
+    public static func summary(_ results: [GDDScanResult]) -> String? {
+        guard !results.isEmpty else { return nil }
+        let empty = results.filter(\.declaresNothing).count
+        let failed = results.filter { $0.failure != nil }.count
+        var s = "\(results.count - empty - failed) of \(results.count) documents declare a symbol set"
+        if empty > 0 { s += " · \(empty) declare none and are hidden" }
+        if failed > 0 { s += " · \(failed) couldn’t be read" }
+        return s
+    }
+}
+
+/// Laying a theme out as one line of a macOS menu.
+///
+/// A menu item sizes itself to its content and ignores flexible space, so columns in a
+/// Picker cannot be laid out — they have to be padded, in a monospaced row. Pure so the
+/// alignment can be checked without opening a window.
+public enum ThemeRowRules {
+    public static let minNameWidth = 14
+    public static let maxNameWidth = 36
+
+    /// The name column width for a list: as wide as its widest name, within bounds, so
+    /// the columns shrink with a filtered list instead of leaving a canyon of spaces.
+    public static func nameWidth(forNames names: [String]) -> Int {
+        min(max(names.map(\.count).max() ?? minNameWidth, minNameWidth), maxNameWidth)
+    }
+
+    /// "Piggy Banks              T1    👍 2"
+    public static func label(name: String, tier: String, votes: Int, nameWidth: Int) -> String {
+        var n = name
+        if n.count > nameWidth { n = String(n.prefix(max(1, nameWidth - 1))) + "…" }
+        let namePad = String(repeating: " ", count: max(0, nameWidth - n.count))
+        // Two columns for the tier whether or not there is one, so a theme with no tier
+        // does not shunt its vote count left and break the column.
+        let t = String(tier.prefix(2))
+        let tierPad = String(repeating: " ", count: max(0, 2 - t.count))
+        let v = votes > 0 ? "👍 \(votes)" : ""
+        return "\(n)\(namePad)   \(t)\(tierPad)   \(v)"
+    }
+}
+
+// ===== Art styles =====
+
+/// One rendering style a game's art can be drawn in.
+///
+/// Ported from the art-style list the previous HTML tool carried: written for slot
+/// symbols on a phone, so every one of them is about HOW something is drawn — colour,
+/// light, edge, surface — and none of them about WHAT is in the picture. That split is
+/// the point. The theme says what the world is; this says how it is rendered, and the
+/// two must never argue.
+///
+/// Styles built on a drawn contour — cel shading, anime line art, pixel outlines, neon
+/// stroke work, vector keylines, card illustration — were removed at the studio's
+/// request. A hard black outline is the single most complained-about artefact in this
+/// pipeline; offering eight styles that mandate one was working against that. Separation
+/// here comes from rim light and painted colour meeting, never a traced stroke.
+///
+/// The old list also held about forty entries named after specific games and studios —
+/// "Nintendo Style", "Pokemon Style", "World of Warcraft Style". Those looks ARE here,
+/// under the Video Game Styles category, rewritten as descriptions of the rendering.
+///
+/// Two reasons, and the second matters more. A studio's name in a prompt asks a model to
+/// reproduce that studio's protected art in a commercial product. And it is a bad
+/// instruction: "Nintendo Style" is as likely to draw Mario as it is to produce the
+/// bright rounded finish that was actually wanted. "Rounded friendly forms, bright
+/// primary dominance, glossy plastic-like highlight" cannot draw anyone's character and
+/// says precisely what to do.
+///
+/// The originals also broke this list's own rule. Most described CONTENT, not rendering
+/// — "hellish demon environments", "vampire hunter visual themes", "stadium
+/// environments" — which in a slot symbol prompt drags a different game's subject matter
+/// into the picture. Forty-three entries carried perhaps eighteen distinct RENDERINGS
+/// between them; the duplicates were different subjects wearing the same technique.
+public struct SlotArtStyle: Equatable, Hashable, Codable, Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let category: String
+    /// The rendering direction itself, as keywords. Goes straight into the prompt.
+    public let keywords: String
+
+    public init(id: String, name: String, category: String, keywords: String) {
+        self.id = id; self.name = name; self.category = category; self.keywords = keywords
+    }
+
+    /// True when line work is part of THIS style rather than a defect in it.
+    ///
+    /// Cel shading, pixel art, vector casino art and card illustration all use a drawn
+    /// contour on purpose. Suppressing it for them would be the same mistake as telling a
+    /// framed symbol "no frame": two instructions in one prompt, pulling opposite ways.
+    ///
+    /// Read from the style's own words rather than a hand-kept list, so a style added
+    /// later is classified by what it says it is.
+    public var usesLineWork: Bool {
+        let k = keywords.lowercased()
+        for t in ["outline", "line art", "lineart", "keyline", "line work", "linework",
+                  "contour line", "inked", "ink line"] where k.contains(t) { return true }
+        return false
+    }
+}
+
+public enum SlotArtStyles {
+    public static let all: [SlotArtStyle] = [
+        // Cartoon & Whimsical Styles
+        SlotArtStyle(id: "whimsical-soft-palette", name: "Whimsical Soft Palette",
+                     category: "Cartoon & Whimsical Styles",
+                     keywords: "desaturated pastel palette, wet-blended watercolour transitions with visible bleed at the edges, diffuse light with no hard shadow, low overall contrast, organic curved forms, soft granulated paper texture, glow falling off gently"),
+        SlotArtStyle(id: "playful-inviting", name: "Playful Inviting",
+                     category: "Cartoon & Whimsical Styles",
+                     keywords: "bright candy-toned fills, smooth airbrushed shading with soft round highlights, rounded thick-cornered forms, warm high-key light, gentle drop shadow under each mass, low texture noise, glossy sheen on curved surfaces"),
+        SlotArtStyle(id: "quirky-humorous", name: "Quirky Humorous",
+                     category: "Cartoon & Whimsical Styles",
+                     keywords: "exaggerated proportion with oversized features and tiny extremities, bouncy asymmetric shapes, bright clashing hue pairs, chunky shading in two or three flat steps with a hard terminator, springy tapering forms, soft rounded highlights, low texture"),
+        SlotArtStyle(id: "modern-fun", name: "Modern Fun",
+                     category: "Cartoon & Whimsical Styles",
+                     keywords: "clean flat-plus-gradient rendering, fresh saturated palette with one accent hue, smooth digital shading, crisp geometric edges, minimal texture, even frontal light, generous negative space, contemporary poster-like clarity"),
+
+        // Realistic & Stylized Approaches
+        SlotArtStyle(id: "realistic-stylized", name: "Realistic Stylized",
+                     category: "Realistic & Stylized Approaches",
+                     keywords: "photoreal material behaviour simplified into broad planes, accurate reflectance and falloff, natural palette with controlled saturation, subtle subsurface warmth in organic surfaces, fine detail concentrated at the focal feature"),
+        SlotArtStyle(id: "calming-realistic", name: "Calming Realistic",
+                     category: "Realistic & Stylized Approaches",
+                     keywords: "soft diffuse light from a broad source, narrow value range in the mid-tones, gentle tonal transitions with no hard terminator, muted cool-leaning palette, matte surfaces with restrained specular, low contrast overall"),
+        SlotArtStyle(id: "sharp-detailed", name: "Sharp Detailed",
+                     category: "Realistic & Stylized Approaches",
+                     keywords: "crisp high-definition edges, clean precise edge definition, tight focus across the whole form, strong local contrast, fine legible surface detail, hard-edged specular highlights, precise colour boundaries with no bleed"),
+        SlotArtStyle(id: "luxurious-opulent", name: "Luxurious Opulent",
+                     category: "Realistic & Stylized Approaches",
+                     keywords: "deep gold and jewel-tone palette, high specular range with sharp reflections and warm bounce, polished metal and faceted gem surfaces, rich dark mid-tones, ornament rendered with real depth and cast shadow"),
+        SlotArtStyle(id: "ornate-decorative", name: "Ornate Decorative",
+                     category: "Realistic & Stylized Approaches",
+                     keywords: "repeating ornamental pattern carried in low relief, controlled palette of two metals and one accent hue, crisp incised edges with shadow in every groove, narrow specular catching each raised contour, symmetrical construction, restrained saturation, patterned areas kept broad"),
+        SlotArtStyle(id: "gritty-intense", name: "Gritty Intense",
+                     category: "Realistic & Stylized Approaches",
+                     keywords: "rough weathered surfaces with chipping, pitting and abrasion, desaturated earth palette, harsh directional light with hard shadow edges, heavy grain and dust, crushed blacks, worn matte finish with dull broken highlights"),
+
+        // Atmospheric & Lighting Styles
+        SlotArtStyle(id: "dramatic-mythical", name: "Dramatic Mythical",
+                     category: "Atmospheric & Lighting Styles",
+                     keywords: "strong single key light from low or behind, long cast shadows, wide value range from near-black to blown highlight, warm key against cool shadow, atmospheric haze separating depth, monumental scale cues"),
+        SlotArtStyle(id: "soft-ethereal", name: "Soft Ethereal",
+                     category: "Atmospheric & Lighting Styles",
+                     keywords: "luminous diffuse glow with light appearing to come from within, pale cool palette, very soft edges and low contrast, bloom spreading around bright areas, translucent layered veils, no hard shadow anywhere"),
+        SlotArtStyle(id: "cold-mysterious", name: "Cold Mysterious",
+                     category: "Atmospheric & Lighting Styles",
+                     keywords: "icy blue-cyan dominance, crystalline hard-edged highlights, cool shadow with almost no warm bounce, high clarity in the lights and deep density in the darks, frosted matte surfaces, breath-like haze in the depth"),
+        SlotArtStyle(id: "warm-golden-lighting", name: "Warm Golden Lighting",
+                     category: "Atmospheric & Lighting Styles",
+                     keywords: "low warm key light raking across the form, amber and honey palette, long soft shadows, strong warm-to-cool shift from lit to shadow side, glowing bounce in the half-tones, gentle bloom on the brightest edges"),
+        SlotArtStyle(id: "dynamic-lighting", name: "Dynamic Lighting",
+                     category: "Atmospheric & Lighting Styles",
+                     keywords: "multiple coloured light sources from opposing directions, strong light-to-shadow contrast, hard-edged coloured rim on opposite sides, energetic falloff, saturated shadows carrying the secondary hue, cinematic separation of planes"),
+
+        // Bold & Vivid Styles
+        SlotArtStyle(id: "vivid-bold", name: "Vivid Bold",
+                     category: "Bold & Vivid Styles",
+                     keywords: "maximum chroma with pure unmixed hues, flat broad colour masses, high hue contrast between adjacent shapes, minimal tonal shading, thick confident shape language, poster-like clarity at small size"),
+        SlotArtStyle(id: "high-contrast-vintage", name: "High-Contrast Vintage",
+                     category: "Bold & Vivid Styles",
+                     keywords: "limited retro palette of three or four inks, heavy value separation with little mid-tone, slight registration offset and halftone dot texture, faded paper warmth, flat fills with simple hard shading"),
+        SlotArtStyle(id: "bright-tropical", name: "Bright Tropical",
+                     category: "Bold & Vivid Styles",
+                     keywords: "hot saturated greens, corals and turquoise, strong overhead sun with short dense shadows, high chroma throughout, glossy wet-looking surfaces, sharp dappled highlights, vivid complementary pairings"),
+        SlotArtStyle(id: "electric-neon", name: "Electric Neon",
+                     category: "Bold & Vivid Styles",
+                     keywords: "glowing additive light on a dark ground, fluorescent cyan magenta and lime, bright cores with wide soft bloom, deep near-black shadow, luminous saturated edges, colour bleeding into the surrounding darkness"),
+        SlotArtStyle(id: "high-energy-dynamic", name: "High-Energy Dynamic",
+                     category: "Bold & Vivid Styles",
+                     keywords: "diagonal thrust in every shape, strong directional blur on secondary forms, high chroma with hot accent against cool field, hard contrast between lit and shadow, sharp leading edges and trailing softness"),
+        SlotArtStyle(id: "bold-sultry", name: "Bold Sultry",
+                     category: "Bold & Vivid Styles",
+                     keywords: "deep jewel reds and blacks, low-key lighting with a single warm key, rich dark mid-tones, soft falloff on curved surfaces, satin sheen with broad gentle highlights, restrained detail and generous shadow"),
+        SlotArtStyle(id: "thrilling-adventure", name: "Thrilling Adventure",
+                     category: "Bold & Vivid Styles",
+                     keywords: "warm golden key with deep shadow, dusty sunlit haze, saturated earth and brass palette, strong contrast between lit planes and shade, weathered surfaces with catching highlights, energetic diagonal light"),
+
+        // Elegant & Sophisticated Styles
+        SlotArtStyle(id: "sleek-elegant", name: "Sleek Elegant",
+                     category: "Elegant & Sophisticated Styles",
+                     keywords: "restrained palette of two or three close hues, smooth even gradients, polished surfaces with long clean specular sweeps, precise uncluttered forms, controlled mid-range contrast, generous empty space, no texture noise"),
+        SlotArtStyle(id: "sleek-mysterious", name: "Sleek Mysterious",
+                     category: "Elegant & Sophisticated Styles",
+                     keywords: "low-key palette with one cool accent, most of the form falling into soft shadow, a single narrow highlight describing the silhouette, smooth glossy surfaces, gradual falloff, deep unbroken darks"),
+
+        // Fantasy & Magical Styles
+        SlotArtStyle(id: "kaleidoscope-magical", name: "Kaleidoscope Magical",
+                     category: "Fantasy & Magical Styles",
+                     keywords: "prismatic colour-shifting across surfaces, symmetrical repeating facet patterns, refracted rainbow dispersion at the edges, high chroma with iridescent transitions, glassy hard highlights, radial symmetry"),
+        SlotArtStyle(id: "epic-heroic", name: "Epic Heroic",
+                     category: "Fantasy & Magical Styles",
+                     keywords: "strong low key light with a warm rim separating the form, wide value range, monumental proportion, saturated but controlled palette, broad confident shading masses, detail concentrated at the focal feature"),
+        SlotArtStyle(id: "mystical-expansive", name: "Mystical Expansive",
+                     category: "Fantasy & Magical Styles",
+                     keywords: "deep space-like darks with luminous coloured mist, layered atmospheric depth with each plane lighter and cooler, glowing point highlights, soft-edged forms, low contrast in the distance and crisp in the front"),
+        SlotArtStyle(id: "electric-divine", name: "Electric Divine",
+                     category: "Fantasy & Magical Styles",
+                     keywords: "radiant white-hot core with saturated coloured falloff, light emitted rather than reflected, sharp lens-like flare spikes, strong bloom, cool shadow against hot key, high contrast at the light source"),
+        SlotArtStyle(id: "captivating-mythology-scifi", name: "Captivating Mythology Sci-Fi",
+                     category: "Fantasy & Magical Styles",
+                     keywords: "polished metal and stone side by side, cool cyan emissive accents on warm classical forms, hard specular on machined surfaces beside soft matte on carved ones, controlled palette, crisp panel and relief detail"),
+
+        // Nature & Elemental Styles
+        SlotArtStyle(id: "deep-nature-connected", name: "Deep Nature Connected",
+                     category: "Nature & Elemental Styles",
+                     keywords: "soft dappled light filtered through layers, muted green and earth palette, organic irregular shapes, matte surfaces with fine natural grain, humid atmospheric depth, gentle contrast and low specular"),
+        SlotArtStyle(id: "dynamic-natural-forces", name: "Dynamic Natural Forces",
+                     category: "Nature & Elemental Styles",
+                     keywords: "turbulent directional motion in the forms, spray and particulate catching the light, high contrast between mass and highlight, cool desaturated palette with white foam or flare, hard-edged energy against soft haze"),
+
+        // Cultural & Regional Styles
+        SlotArtStyle(id: "exotic-colorful", name: "Exotic Colorful",
+                     category: "Cultural & Regional Styles",
+                     keywords: "dense saturated pattern in layered warm hues, flat decorative colour with fine linear ornament, strong hue contrast between adjacent bands, matte surfaces, even light, rich detail kept in broad readable zones"),
+        SlotArtStyle(id: "oriental-fusion", name: "Oriental Fusion",
+                     category: "Cultural & Regional Styles",
+                     keywords: "ink-wash tonal gradation against flat colour fields, restrained palette of red black and gold, deliberate negative space, soft brush transitions beside hard graphic edges, gentle even light, matte paper grain, minimal specular"),
+        SlotArtStyle(id: "simplified-celtic", name: "Simplified Celtic",
+                     category: "Cultural & Regional Styles",
+                     keywords: "interlaced knot ornament carved in low relief, restrained palette of stone grey with gold and moss, raking light picking out every incised groove, matte weathered surfaces, symmetrical construction, broad simple masses"),
+
+        // Modern & Futuristic Styles
+        SlotArtStyle(id: "high-energy-scifi", name: "High-Energy Sci-Fi",
+                     category: "Modern & Futuristic Styles",
+                     keywords: "cool blue-grey base with hot emissive accent strips, hard specular on brushed and anodised metal, machined bevels and panel seams, controlled reflections, high contrast between lit surfaces and deep shadow"),
+
+        // Material & Texture Styles
+        SlotArtStyle(id: "shiny-metallic", name: "Shiny Metallic",
+                     category: "Material & Texture Styles",
+                     keywords: "polished reflective metal with sharp mirrored highlights and dark reflected occlusion, gold silver and bronze tonal families, high specular contrast, crisp bevelled edges catching a hard light"),
+        SlotArtStyle(id: "vintage-brass-wood", name: "Vintage Brass Wood",
+                     category: "Material & Texture Styles",
+                     keywords: "aged brass with patina in the recesses beside oiled grained wood, warm amber palette, soft directional light, satin rather than mirror specular, visible turned and riveted construction, fine honest wear"),
+        SlotArtStyle(id: "crystalline-gem", name: "Crystalline Gem",
+                     category: "Material & Texture Styles",
+                     keywords: "faceted transparent surfaces with internal refraction and caustic sparkle, sharp facet boundaries, bright specular points, colour deepening through thickness, cool highlights against saturated core"),
+        SlotArtStyle(id: "rugged-medieval", name: "Rugged Medieval",
+                     category: "Material & Texture Styles",
+                     keywords: "hammered iron and rough-hewn timber, desaturated earth palette, hard directional light raking the texture, heavy cast shadow in every recess, matte pitted surfaces, honest joinery and visible tool marks"),
+
+        // Special Atmosphere Styles
+        SlotArtStyle(id: "gothic-carnival", name: "Gothic Carnival",
+                     category: "Special Atmosphere Styles",
+                     keywords: "saturated crimson and violet against deep shadow, theatrical footlight from below, striped and scalloped ornament, high contrast with hot accent lights, glossy painted surfaces, uneasy tilted forms"),
+        SlotArtStyle(id: "suspenseful-noir", name: "Suspenseful Noir",
+                     category: "Special Atmosphere Styles",
+                     keywords: "hard single-source light with sharp-edged shadow, near-monochrome palette with one warm accent, crushed blacks and blown highlights, venetian slat shadow patterns, high contrast and heavy vignette"),
+        SlotArtStyle(id: "chilling-immersive", name: "Chilling Immersive",
+                     category: "Special Atmosphere Styles",
+                     keywords: "desaturated cold palette with sickly green undertone, weak diffuse light with heavy shadow, low contrast in the mid-tones and deep density in the darks, damp matte surfaces, fog thickening with depth"),
+        SlotArtStyle(id: "eerie-thrilling", name: "Eerie Thrilling",
+                     category: "Special Atmosphere Styles",
+                     keywords: "cold underlit key throwing shadows upward, unnatural green-cyan accents against warm decay, sharp contrast at the light source with soft murk elsewhere, wet glistening surfaces, grain in the shadows"),
+        SlotArtStyle(id: "gothic-romantic", name: "Gothic Romantic",
+                     category: "Special Atmosphere Styles",
+                     keywords: "deep crimson and black with candle-warm key, soft falloff on skin and velvet, heavy shadow enveloping the periphery, ornate relief detail catching narrow highlights, low-key with rich saturated darks"),
+
+        // Energy & Light Effects
+        SlotArtStyle(id: "glowing-luminous", name: "Glowing Luminous",
+                     category: "Energy & Light Effects",
+                     keywords: "self-illuminating surfaces with a bright core and wide soft bloom, light spilling onto neighbouring forms, saturated colour in the glow and desaturated white at the centre, dark surroundings for contrast"),
+        SlotArtStyle(id: "high-energy-jewel", name: "High-Energy Jewel",
+                     category: "Energy & Light Effects",
+                     keywords: "intense saturated gem hues with hard sparkle points, sharp facet highlights, strong internal light, high chroma against dark settings, crisp edge definition, brilliant specular flashes"),
+        SlotArtStyle(id: "radiant-prismatic", name: "Radiant Prismatic",
+                     category: "Energy & Light Effects",
+                     keywords: "white light split into spectral bands across the surface, smooth rainbow gradients with hard-edged transitions where facets break, bright bloom at the source, iridescent sheen shifting with curvature")
+,
+
+        // Video Game Styles
+        SlotArtStyle(id: "hand-painted-heroic", name: "Hand-Painted Heroic",
+                     category: "Video Game Styles",
+                     keywords: "hand-painted texture with visible brush direction baked into the surface, exaggerated chunky silhouette, oversized forms and thick tapering shapes, warm rim light separating the subject from behind, rich saturated midtones, soft occlusion in the crevices, painterly detail that stays legible when small, heavy confident shapes over fine detail"),
+        SlotArtStyle(id: "clean-stylized-3d", name: "Clean Stylized 3D",
+                     category: "Video Game Styles",
+                     keywords: "smooth matte surfaces with gentle falloff, soft ambient occlusion, rounded bevelled edges catching a soft highlight, bright saturated primaries, minimal texture noise, clean broad shapes, even studio-like key light, glossy accents on metal and glass only, polished toy-like finish"),
+        SlotArtStyle(id: "dark-painterly-gothic", name: "Dark Painterly Gothic",
+                     category: "Video Game Styles",
+                     keywords: "low-key value range with the subject lit against deep shadow, desaturated palette broken by one hot accent, painterly texture with heavy impasto in the highlights, strong chiaroscuro, cold shadow and warm key, aged and pitted surfaces, atmospheric haze in the depth, dramatic downward lighting"),
+        SlotArtStyle(id: "airbrushed-fantasy", name: "Airbrushed Fantasy",
+                     category: "Video Game Styles",
+                     keywords: "soft airbrushed blending with no visible brush marks, luminous atmospheric depth, delicate gradient transitions, cool ambient light with warm magical accent glow, fine jewel and fabric detail, glassy reflective highlights, cinematic rim lighting, refined polished finish"),
+        SlotArtStyle(id: "gritty-photoreal", name: "Gritty Photoreal",
+                     category: "Video Game Styles",
+                     keywords: "physically based realistic materials, desaturated cool palette with crushed blacks, fine surface detail — scratches, grain, wear, dust, harsh directional light with hard shadow edges, shallow depth of field, subtle lens grain and vignette, muted colour grading, unstylised proportions"),
+        SlotArtStyle(id: "period-muted-realism", name: "Period Muted Realism",
+                     category: "Video Game Styles",
+                     keywords: "muted earthy palette of ochre, stone grey and oxidised metal, realistic material rendering with age and patina, heavy architectural and ornamental detail, soft overcast light with gentle shadow falloff, restrained saturation, textural richness in cloth, leather and masonry, historical craftsmanship in every surface"),
+        SlotArtStyle(id: "voxel-blocks", name: "Voxel Blocks",
+                     category: "Video Game Styles",
+                     keywords: "cubic voxel construction with visible blocky facets, flat per-face shading with no smoothing, low-resolution square textures, hard-edged geometric forms, simple directional light giving three distinct face values, chunky modular shapes"),
+        SlotArtStyle(id: "bright-toy-3d", name: "Bright Toy 3D",
+                     category: "Video Game Styles",
+                     keywords: "rounded friendly forms with thick soft edges, bright primary colour dominance, smooth even shading with soft shadow, glossy plastic-like highlight, minimal surface texture, cheerful high-key lighting, generous simple shapes, clean and uncluttered"),
+        SlotArtStyle(id: "clean-minimal", name: "Clean Minimal",
+                     category: "Video Game Styles",
+                     keywords: "flat colour with almost no shading, sparse restrained palette, simple geometric construction, generous empty space, crisp hard edges, no texture or noise, even flat lighting, iconographic simplified forms, immediate readability"),
+        SlotArtStyle(id: "cold-industrial-scifi", name: "Cold Industrial Sci-Fi",
+                     category: "Video Game Styles",
+                     keywords: "cold blue-grey palette with emissive accent strips, brushed and anodised metal surfaces, panel seams and machined bevels, hard specular highlights on edges, functional geometric forms, controlled reflections, technical precision in every surface"),
+        SlotArtStyle(id: "motion-streak", name: "Motion Streak",
+                     category: "Video Game Styles",
+                     keywords: "strong directional motion blur and speed streaks, stretched trailing highlights, high-contrast saturated colour, dynamic diagonal composition, sharp leading edge against a blurred tail, energetic light trails, exaggerated sense of velocity"),
+    ]
+
+    public static func byID(_ id: String?) -> SlotArtStyle? {
+        guard let id, !id.isEmpty else { return nil }
+        return all.first { $0.id == id }
+    }
+
+    /// Categories in their listed order, each with its styles — the order a picker shows.
+    public static var byCategory: [(category: String, styles: [SlotArtStyle])] {
+        var order: [String] = []
+        for s in all where !order.contains(s.category) { order.append(s.category) }
+        return order.map { c in (c, all.filter { $0.category == c }) }
+    }
+
+    /// Styles whose name or keywords contain `query`, for the search field.
+    public static func search(_ query: String) -> [SlotArtStyle] {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return all }
+        return all.filter {
+            $0.name.lowercased().contains(q) || $0.category.lowercased().contains(q)
+                || $0.keywords.lowercased().contains(q)
+        }
+    }
+}
+
+public enum SlotSymbolRole: String, Sendable, CaseIterable {
+    case wild, highPay, mediumPay, lowPay, scatter, bonus, jackpot
+    case wysiwyg, collector, multiplier, replacement, blank, unknown
+    /// SF codes cover four different jobs, and the prefix alone cannot tell them apart —
+    /// the design document's own words can. See SlotSymbolRole.refined(byNote:).
+    case activator, adder
+
+    /// How the role reads to a person, for the plan table.
+    public var label: String {
+        switch self {
+        case .wild: return "Wild"
+        case .highPay: return "High pay"
+        case .mediumPay: return "Medium pay"
+        case .lowPay: return "Low pay"
+        case .scatter: return "Scatter"
+        case .bonus: return "Bonus"
+        case .jackpot: return "Jackpot"
+        case .wysiwyg: return "WYSIWYG value"
+        case .collector: return "Collector"
+        case .activator: return "Activator"
+        case .adder: return "Adder"
+        case .multiplier: return "Multiplier"
+        case .replacement: return "Replacement"
+        case .blank: return "Blank"
+        case .unknown: return "Unclassified"
+        }
+    }
+
+    /// The job a special-feature symbol actually does, read from what the design document
+    /// says about it rather than from its code.
+    ///
+    /// SF is one prefix covering four jobs. Defaulting every SF to "collector" is how an
+    /// adder ends up drawn as a vessel with a running total it never has. When the
+    /// document does not say, collector stays the default — but it is a default, not a
+    /// deduction.
+    public func refined(byNote note: String) -> SlotSymbolRole {
+        guard self == .collector else { return self }
+        let n = note.lowercased()
+        // A note that denies its verb must not be read as asserting it: "Does not
+        // activate a feature" was coming back .activator.
+        for d in ["does not", "doesn't", "do not", "don't", "cannot", "can't", "never ",
+                  "no longer", "rather than", "instead of"] where n.contains(d) {
+            return .collector
+        }
+        // A symbol the document calls its most valuable is a PAYING symbol, whatever its
+        // code says. 4490 writes "SFs - highest value, full body, full color, full
+        // frames" — those are the game's premium characters, and drawing them as
+        // collector pickups throws away the document's own ranking.
+        for v in ["highest value", "highest paying", "high value", "premium", "top pay",
+                  "most valuable"] where n.contains(v) {
+            return .highPay
+        }
+        // What the symbol DOES comes before what it acts on. "Collects all multiplier
+        // values" is a collector; matching "multipl" first made it a multiplier, and the
+        // two get drawn differently.
+        if n.contains("collect") || n.contains("gather") { return .collector }
+        if n.contains("multipl") { return .multiplier }
+        if n.contains("adds ") || n.contains("adder") || n.contains("addition") { return .adder }
+        if n.contains("activat") || n.contains("trigger") || n.contains("unlock") { return .activator }
+        return .collector
+    }
+
+    /// Roles whose members are DELIBERATELY one family, so sharing a word between them is
+    /// the design working rather than a collision.
+    ///
+    /// Low pays are one family by rule — all royals, or all gems, or all pebbles. Jackpots
+    /// are one shared construction separated by tier colour and name, which is what
+    /// shipping games do and what the art direction now demands. Reporting "chest (JP1,
+    /// JP2, JP3, JP4)" as a fault told the user their correct set was broken.
+    public var isFamily: Bool { self == .lowPay || self == .jackpot || self == .wysiwyg }
+
+    /// A blank is an empty reel position. Everything else is a picture someone has to draw.
+    public var needsArt: Bool { self != .blank }
+
+    /// Rough drawing order: the symbols that set the game's look come first, so a
+    /// part-finished run still shows the art that decides whether the set is working.
+    public var priority: Int {
+        switch self {
+        case .highPay: return 0
+        case .wild: return 1
+        case .collector: return 2
+        case .activator, .adder: return 2
+        case .scatter, .bonus: return 3
+        case .mediumPay: return 4
+        case .jackpot: return 5
+        case .wysiwyg, .multiplier: return 6
+        case .lowPay: return 7
+        case .replacement: return 8
+        case .blank, .unknown: return 9
+        }
+    }
+}
+
+/// One symbol slot, as the GDD defines it.
+public struct SlotSymbol: Equatable, Sendable {
+    public let code: String        // "HP1", "WD1", "JP3" — the GDD's own spelling
+    public let index: Int          // its symbol-set index in the GDD
+    public let role: SlotSymbolRole
+    public let tier: Int?          // 1 for HP1, 3 for JP3; nil when the code carries no number
+    public let note: String        // the GDD's own trailing comment, verbatim
+
+    public init(code: String, index: Int, role: SlotSymbolRole, tier: Int?, note: String) {
+        self.code = code; self.index = index; self.role = role; self.tier = tier; self.note = note
+    }
+}
+
+/// Reading the "Symbol Set" block out of a GDD's exported plain text.
+///
+/// Both real formats in the wild are handled, because both exist in the same Drive
+/// folder and differ in where the code sits relative to the comment marker:
+///
+///     * 1-4 HP1-4        // HPs                 (4260 Dodge — code before the //)
+///     - 2-5 // MPs  (Standard MP symbols)       (4400 Chevy-Hot — code after it)
+///
+/// The second form also names a group rather than each member, so "2-5 // MPs" has
+/// to become MP1…MP4 by counting the index range. Getting that wrong silently drops
+/// four symbols from the game, which is exactly the kind of quiet miscount this
+/// parser exists to prevent.
+
+public enum GDDSymbolSetRules {
+    /// Code prefix -> role. Order matters: longer prefixes first where one is a prefix
+    /// of another.
+    static let prefixes: [(String, SlotSymbolRole)] = [
+        // Longest first: BWY1 is a bonus WYSIWYG, not a blank that happens to start
+        // with B, and DHP a doubled high pay rather than an unknown.
+        ("BWY", .wysiwyg), ("DHP", .highPay),
+        ("WD", .wild), ("HP", .highPay), ("MP", .mediumPay), ("LP", .lowPay),
+        ("SC", .scatter), ("BO", .bonus), ("BN", .bonus), ("JP", .jackpot),
+        ("WY", .wysiwyg), ("SF", .collector), ("MU", .multiplier), ("BL", .blank),
+        ("R", .replacement),
+    ]
+
+    /// The role a symbol code implies, plus its tier number when it carries one.
+    /// Unknown codes are reported as `.unknown` rather than guessed into a role —
+    /// a mis-roled symbol gets the wrong art direction, which is worse than being
+    /// shown as unclassified and fixed by hand.
+    public static func classify(_ code: String) -> (role: SlotSymbolRole, tier: Int?) {
+        let up = code.uppercased()
+        for (p, role) in prefixes where up.hasPrefix(p) {
+            let rest = String(up.dropFirst(p.count))
+            // "HP" + "1" is a tier; "HP" + "s" is the plural group name, not a tier.
+            if rest.isEmpty { return (role, nil) }
+            if let n = Int(rest) { return (role, n) }
+            if rest == "S" { return (role, nil) }   // "MPs", "LPs"
+            continue                                 // not really this prefix, keep looking
+        }
+        return (.unknown, nil)
+    }
+
+    /// Expand a code spec into individual codes.
+    ///
+    /// "HP1-4" -> HP1…HP4, "R1-2" -> R1, R2, "WD1" -> WD1, and a bare plural like
+    /// "MPs" -> MP1…MPn where n is how many indices the line covers.
+    static func expand(codeSpec: String, indexCount: Int) -> [String] {
+        let s = codeSpec.trimmingCharacters(in: .whitespaces)
+        guard !s.isEmpty else { return [] }
+        // "HP1-4" / "R1-2"
+        if let dash = s.range(of: #"^([A-Za-z]+)(\d+)-(\d+)$"#, options: .regularExpression),
+           dash.lowerBound == s.startIndex {
+            let letters = s.prefix { $0.isLetter }
+            let nums = s.dropFirst(letters.count).split(separator: "-").compactMap { Int($0) }
+            // The span is bounded and must match how many indices the line covers.
+            // Unbounded, a typo like "HP1-1000000000" tries to build a billion strings
+            // on whatever thread is parsing; mismatched, "1-2 HP1-4" quietly produced
+            // four symbols crammed onto two indices — two of them invented, and each
+            // one an image someone would be charged for.
+            if nums.count == 2, nums[0] <= nums[1], nums[1] - nums[0] < 64,
+               nums[1] - nums[0] + 1 == indexCount {
+                return (nums[0]...nums[1]).map { "\(letters)\($0)" }
+            }
+            return []   // reported by parseWithProblems — never dropped in silence
+        }
+        // "MPs" / "LPs" — a plural group, numbered by how many slots the line covers.
+        if s.count >= 3, s.hasSuffix("s") || s.hasSuffix("S") {
+            let stem = String(s.dropLast())
+            if stem.allSatisfy({ $0.isLetter }), indexCount > 1 {
+                return (1...indexCount).map { "\(stem.uppercased())\($0)" }
+            }
+        }
+        // A single code. Over one index that is one symbol; over a range it is the same
+        // group form as the plural above — "1-4 HP" means four high pays, and returning
+        // a lone "HP" for it quietly turned four paid symbols into one.
+        if s.allSatisfy({ $0.isLetter || $0.isNumber }) {
+            if indexCount == 1 { return [s.uppercased()] }
+            if s.allSatisfy({ $0.isLetter }) {
+                return (1...indexCount).map { "\(s.uppercased())\($0)" }
+            }
+            return []   // "1-4 HP1" — a numbered code cannot cover four indices
+        }
+        return []
+    }
+
+    /// A symbol set typed by hand, for a game whose GDD does not exist yet.
+    ///
+    /// Not every game has a document to read. A producer who knows the set wants to say
+    /// so directly — "WD, HP1-4, MP1-4, LP1-5, SC, BO, JP1-4" — and get on with it,
+    /// rather than inventing a document for the tool's benefit.
+    ///
+    /// Accepts codes separated by commas, spaces or newlines, with ranges written the way
+    /// the GDDs write them. Anything it cannot read is reported rather than dropped.
+    public static func parseManual(_ text: String) -> (symbols: [SlotSymbol], problems: [String]) {
+        let tokens = text
+            .components(separatedBy: CharacterSet(charactersIn: ",\n\r\t "))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var out: [SlotSymbol] = [], problems: [String] = [], seen = Set<String>()
+        for token in tokens {
+            // "HP1-4" -> HP1…HP4. indexCount is the span itself here, since a hand-typed
+            // list has no reel indices to count against.
+            let span: Int
+            if let r = token.range(of: #"^[A-Za-z]+(\d+)-(\d+)$"#, options: .regularExpression),
+               r.lowerBound == token.startIndex {
+                let nums = token.drop { $0.isLetter }.split(separator: "-").compactMap { Int($0) }
+                span = nums.count == 2 && nums[1] >= nums[0] ? nums[1] - nums[0] + 1 : 1
+            } else { span = 1 }
+            let codes = expand(codeSpec: token, indexCount: span)
+            guard !codes.isEmpty else { problems.append(token); continue }
+            for code in codes where !seen.contains(code) {
+                seen.insert(code)
+                let (role, tier) = classify(code)
+                guard role != .unknown else { problems.append(code); continue }
+                out.append(SlotSymbol(code: code, index: out.count, role: role, tier: tier, note: ""))
+            }
+        }
+        return (out, problems)
+    }
+
+    /// A set to start from when there is no document — the shape most games take.
+    public static let typicalSet = "WD, HP1-4, MP1-4, LP1-5, SC, BO, JP1-4"
+
+    /// A symbol set laid out as a TABLE rather than a list.
+    ///
+    /// Exporting a Word table flattens it to one cell per line, so a "Name | Symbol ID"
+    /// table arrives as a column of bare codes with their indices on the following
+    /// lines — SF1 / 7 / 1 / (blank) / SF2 / 8 / 2. There is no "0 WD1 // wild" line
+    /// anywhere, so the list parser finds nothing at all and the document reads as
+    /// having no symbols.
+    ///
+    /// Requires several codes before believing it, because a single stray "R1" in prose
+    /// is a reel, not a replacement symbol.
+    static func parseTable(_ gddText: String, minimumCodes: Int = 4) -> [SlotSymbol] {
+        var found: [(code: String, index: Int?)] = []
+        let lines = gddText.components(separatedBy: .newlines)
+        // Only inside a symbol table. Scanning the whole document meant any four bare
+        // codes anywhere became a symbol set: "Reel definitions / R1 / R2 / R3 / R4"
+        // returned four symbols, and a non-empty set is what stops the model fallback
+        // from ever running — so the invented set was the one that got drawn and paid for.
+        guard let head = lines.firstIndex(where: {
+            $0.lowercased().contains("symbol")
+        }) else { return [] }
+        for (i, raw) in lines.enumerated() where i > head {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard isBareCode(line) else { continue }
+            // The next non-empty line is the index when it is a plain number.
+            var idx: Int? = nil
+            var j = i + 1
+            while j < lines.count, j <= i + 2 {
+                let n = lines[j].trimmingCharacters(in: .whitespaces)
+                if !n.isEmpty { idx = Int(n); break }
+                j += 1
+            }
+            found.append((line.uppercased(), idx))
+        }
+        var seen = Set<String>(), out: [SlotSymbol] = []
+        for (n, f) in found.enumerated() where !seen.contains(f.code) {
+            seen.insert(f.code)
+            let (role, tier) = classify(f.code)
+            guard role != .unknown else { continue }
+            out.append(SlotSymbol(code: f.code, index: f.index ?? n, role: role,
+                                  tier: tier, note: ""))
+        }
+        return out.count >= minimumCodes ? out.sorted { $0.index < $1.index } : []
+    }
+
+    /// True when a whole line is nothing but a symbol code.
+    static func isBareCode(_ line: String) -> Bool {
+        guard line.count >= 2, line.count <= 6 else { return false }
+        let up = line.uppercased()
+        // Casing is not a signal here — Word tables carry "HP1", "hp1" and "Hp1" alike.
+        guard up.allSatisfy({ $0.isLetter || $0.isNumber }) else { return false }
+        guard up.first?.isLetter == true, up.last?.isNumber == true else { return false }
+        return classify(up).role != .unknown
+    }
+
+    /// Symbol codes the document TALKS about but never declares.
+    ///
+    /// Only codes from a family the set already has, and only numbered ones: a bare "LP"
+    /// in a sentence is English, but a set holding WY1–WY3 next to prose saying "the
+    /// wedges share the same IDs as WY1 - WY4" is a document that contradicts itself,
+    /// and the missing symbol is one nobody will notice is absent until the art is due.
+    ///
+    /// This reports. It does not add them — a symbol mentioned in a sound cue may be a
+    /// leftover from the game this one was cloned from, and inventing art for it costs
+    /// real money. The judgement is the user's; the tool's job is to not hide it.
+    public static func mentionedButNotDeclared(in gddText: String,
+                                               symbols: [SlotSymbol]) -> [String] {
+        guard !symbols.isEmpty else { return [] }
+        let declared = Set(symbols.map(\.code))
+        let families = Set(declared.map { String($0.prefix { $0.isLetter }) })
+        var out = Set<String>()
+        for tk in gddText.split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
+            let c = String(tk).uppercased()
+            guard c.count >= 3, c.count <= 6, !declared.contains(c) else { continue }
+            let letters = String(c.prefix { $0.isLetter })
+            let digits = c.dropFirst(letters.count)
+            guard !digits.isEmpty, digits.allSatisfy(\.isNumber),
+                  families.contains(letters) else { continue }
+            out.insert(c)
+        }
+        return out.sorted()
+    }
+
+    /// Parse, and say what could not be read.
+    ///
+    /// A line the parser rejects is a symbol the game needs and will not get. Dropping it
+    /// silently means the miscount only shows up when someone opens the folder and finds
+    /// four symbols missing — so every rejected line inside the symbol-set block is
+    /// reported, with its own text, for the user to judge.
+    public static func parseWithProblems(_ gddText: String) -> (symbols: [SlotSymbol],
+                                                                problems: [String]) {
+        let symbols = parse(gddText)
+        guard !symbols.isEmpty else { return (symbols, []) }
+        let lines = gddText.components(separatedBy: .newlines)
+        guard let start = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("symbol set")
+        }) else { return (symbols, []) }
+
+        var problems: [String] = [], misses = 0, seenAny = false
+        for raw in lines.dropFirst(start + 1) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            if parseLine(line) != nil { seenAny = true; misses = 0; continue }
+            misses += 1
+            // Report BEFORE deciding the block is over. This used to break first, so the
+            // second consecutive rejection — the one that actually truncates the set —
+            // was the one line guaranteed never to be shown. "1-4 HP1–4" then "5-9 LP1–5"
+            // lost the low pays in silence.
+            //
+            // "Looks like an entry" has to be the same test parseLine applies, not just a
+            // leading digit: the line that ENDS a symbol block is usually prose, and
+            // "4x5 ways game, with 4 HP symbols" is not a dropped symbol.
+            if seenAny, looksLikeEntry(line) { problems.append(String(line.prefix(120))) }
+            if misses >= 2 && seenAny { break }          // the block has ended
+        }
+        return (symbols, problems)
+    }
+
+    // ===== The three shapes real GDDs actually use =====
+    //
+    // Measured, not guessed: every .docx in the team's GDD folder was run through the
+    // app's own text extraction and read by hand. Of seven documents, ONE parsed. The
+    // rest declare their symbols in shapes this parser had never been taught:
+    //
+    //   2750, 3520, 3690   a tab-separated table   "0\tWD1\t0\t1\t1"
+    //   4490               a described list        "HP1 - main cowboy character, gold frame"
+    //   3310               codes sharing one note  "LP1, LP2, LP3, and LP4 - bag"
+    //   3140               a table keyed by code   "SF1\t7\t1"
+    //
+    // The described shapes matter twice over. They carry the symbol set AND the art
+    // direction for each symbol — "gold frame", "silver frame", "Iron Jack, red" — which
+    // is the whole point of reading the document rather than inventing a set.
+
+    /// True when a field is a symbol code — "WD", "HP1", "WY12".
+    ///
+    /// Deliberately stricter than "starts with a known prefix": the prefix has to be
+    /// followed by nothing or by digits, so "HPs" is a group name and "HOPJE" is a word.
+    static func isSymbolCode(_ field: String) -> Bool {
+        let up = field.uppercased()
+        guard up.count >= 2, up.count <= 6, up.allSatisfy({ $0.isLetter || $0.isNumber }),
+              up.first?.isLetter == true else { return false }
+        let letters = up.prefix { $0.isLetter }
+        let digits = up.dropFirst(letters.count)
+        guard digits.allSatisfy(\.isNumber) else { return false }
+        return classify(up).role != .unknown
+    }
+
+    /// Symbols declared as rows of a table: tab-separated columns, one of them a code.
+    ///
+    /// This is the most common shape in the real folder and the parser could not read a
+    /// single one of them.
+    static func parseRows(_ gddText: String) -> [SlotSymbol] {
+        var out: [SlotSymbol] = [], seen = Set<String>()
+        for raw in gddText.components(separatedBy: .newlines) {
+            let fields = raw.components(separatedBy: "\t")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            guard fields.count >= 2, let ci = fields.firstIndex(where: isSymbolCode) else {
+                continue
+            }
+            let code = fields[ci].uppercased()
+            guard !seen.contains(code) else { continue }
+            // The reel index is a plain number in a neighbouring column — before the code
+            // in "0 WD1 0 1 1", after it in a table keyed by code.
+            let idx = fields.prefix(ci).compactMap { Int($0) }.last
+                ?? fields.dropFirst(ci + 1).compactMap { Int($0) }.first
+            // Any non-numeric column after the code is a description worth keeping.
+            let note = fields.dropFirst(ci + 1).first { Int($0) == nil && $0.count > 3 } ?? ""
+            let (role, tier) = classify(code)
+            seen.insert(code)
+            out.append(SlotSymbol(code: code, index: idx ?? out.count,
+                                  role: role.refined(byNote: note), tier: tier, note: note))
+        }
+        // Four is the floor for "this is a table, not a sentence that mentions WD".
+        return out.count >= 4 ? out.sorted { $0.index == $1.index ? $0.code < $1.code
+                                                                 : $0.index < $1.index } : []
+    }
+
+    /// Symbols declared as a described list — the shape that carries art direction.
+    ///
+    ///     HPs - high value colorized western characters, frame based tiering
+    ///     HP1 - "hero" 1, main cowboy character, gold frame
+    ///     LP1, LP2, LP3, and LP4 - bag
+    ///
+    /// A plural head ("HPs", "SFs") names the FAMILY. It declares no symbol of its own,
+    /// but its description applies to every member, so it is kept and handed down — that
+    /// line is where a document says how a whole tier is drawn.
+    static func parseDescribedList(_ gddText: String) -> [SlotSymbol] {
+        var out: [SlotSymbol] = [], seen = Set<String>()
+        var family: [String: String] = [:]      // "HP" -> the family's own description
+
+        for raw in gddText.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.count < 400 else { continue }   // a paragraph, not a list entry
+            guard let (head, note) = splitDescription(line) else { continue }
+
+            // The head must be codes and joining words, nothing else. This is what keeps
+            // ordinary prose that happens to contain a dash out of the symbol set.
+            // Original case, deliberately. A document writes the family as "HPs" and a
+            // real code as "WYS" — the lowercase s is the only thing telling them apart,
+            // and uppercasing first turned every family header into a symbol.
+            let tokens = head
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+            guard !tokens.isEmpty, tokens.count <= 8 else { continue }
+            let joiners: Set<String> = ["AND", "THE", "OR", "AMP"]
+            var codes: [String] = []
+            var plural: [String] = []
+            var clean = true
+            for t in tokens {
+                if joiners.contains(t.uppercased()) { continue }
+                // "HPs" / "SFs" — the family, not a symbol. Checked BEFORE the code test,
+                // because "HPs" also passes as a code once it is uppercased.
+                if t.hasSuffix("s"), t.count > 2, isSymbolCode(String(t.dropLast())) {
+                    plural.append(String(t.dropLast()).uppercased()); continue
+                }
+                if isSymbolCode(t) { codes.append(t.uppercased()); continue }
+                clean = false; break
+            }
+            guard clean else { continue }
+
+            for p in plural where !note.isEmpty {
+                family[String(p.prefix { $0.isLetter })] = note
+            }
+            for c in codes where !seen.contains(c) {
+                seen.insert(c)
+                let (role, tier) = classify(c)
+                out.append(SlotSymbol(code: c, index: out.count, role: role,
+                                      tier: tier, note: note))
+            }
+        }
+        guard out.count >= 4 else { return [] }
+        // Hand each family's description down to its members, behind their own.
+        return out.map { s in
+            let stem = String(s.code.prefix { $0.isLetter })
+            let note = family[stem].map { s.note.isEmpty ? $0 : s.note + " — " + $0 } ?? s.note
+            return SlotSymbol(code: s.code, index: s.index,
+                              role: s.role.refined(byNote: note), tier: s.tier, note: note)
+        }
+    }
+
+    /// Split "CODE(s) <separator> description" on the first real separator.
+    ///
+    /// Only a dash with space around it, or a colon. "HP1-4" must stay one token, and a
+    /// hyphenated word inside a description is not a separator either.
+    static func splitDescription(_ line: String) -> (head: String, note: String)? {
+        for sep in [" - ", " \u{2013} ", " \u{2014} ", ": ", " -", ":"] {
+            guard let r = line.range(of: sep) else { continue }
+            let head = String(line[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let note = String(line[r.upperBound...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-\u{2013}\u{2014} \t"))
+            guard !head.isEmpty, head.count <= 60 else { return nil }
+            return (head, note)
+        }
+        return nil
+    }
+
+    /// Parse a whole GDD's plain text. Returns the symbols in symbol-set index order.
+    ///
+    /// Scans from a "Symbol Set" heading until the block stops looking like a list,
+    /// so prose further down the document can't inject phantom symbols.
+    /// Read a GDD's symbol set, whatever shape it is written in.
+    ///
+    /// Four readers, and the document decides which one applies: the one that finds the
+    /// most symbols wins, ties going to the shape that carries the most information.
+    /// Nothing here invents a symbol — every reader requires real evidence in the text,
+    /// and a document none of them can read returns EMPTY so the caller has to say so.
+    public static func parse(_ gddText: String) -> [SlotSymbol] {
+        var best: [SlotSymbol] = []
+        for c in [parseIndexedList(gddText),      // "0 WD1 // wild"
+                  parseDescribedList(gddText),    // "HP1 - main cowboy, gold frame"
+                  parseRows(gddText),             // "0\tWD1\t0\t1\t1"
+                  parseTable(gddText)]            // bare codes in a column
+        where c.count > best.count { best = c }
+        return best
+    }
+
+    /// The indexed "Symbol Set" block: "0 WD1 // wild", "1-4 HP1-4 // HPs".
+    static func parseIndexedList(_ gddText: String) -> [SlotSymbol] {
+        let lines = gddText.components(separatedBy: .newlines)
+        guard let start = lines.firstIndex(where: {
+            $0.trimmingCharacters(in: .whitespaces)
+              .lowercased().hasPrefix("symbol set")
+        }) else { return [] }
+
+        var out: [SlotSymbol] = []
+        var seen = Set<String>()
+        var misses = 0
+        for raw in lines.dropFirst(start + 1) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            guard let parsed = parseLine(line) else {
+                misses += 1
+                // Two consecutive non-list lines means the block is over. One is
+                // tolerated because these documents carry stray blank-ish rows.
+                if misses >= 2 && !out.isEmpty { break }
+                continue
+            }
+            misses = 0
+            for s in parsed where !seen.contains(s.code) {
+                seen.insert(s.code); out.append(s)
+            }
+        }
+        return out.sorted { $0.index == $1.index ? $0.code < $1.code : $0.index < $1.index }
+    }
+
+    /// True when a line has the SHAPE of a symbol-set entry — an index or range, then a
+    /// break, then something. It says nothing about whether the rest parsed.
+    ///
+    /// This is the line between "a symbol we failed to read" and "the prose that follows
+    /// the block". Both start with a digit; only the entry separates the index from what
+    /// comes after it.
+    static func looksLikeEntry(_ line: String) -> Bool {
+        var s = line.replacingOccurrences(of: "\u{2013}", with: "-")
+                    .replacingOccurrences(of: "\u{2014}", with: "-")
+        while let f = s.first, f == "*" || f == "-" || f == "•" {
+            s = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+        guard let first = s.first, first.isNumber else { return false }
+        let idxStr = s.prefix { $0.isNumber || $0 == "-" }
+        let after = s.dropFirst(idxStr.count)
+        guard let sep = after.first, sep.isWhitespace || sep == "/" else { return false }
+        return !after.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// One symbol-set line -> the symbols it declares. nil when it isn't one.
+    static func parseLine(_ line: String) -> [SlotSymbol]? {
+        // Word turns "1-4" into "1\u{2013}4" on its own. Every range check below looks for
+        // an ASCII hyphen, so an en dash made "1\u{2013}4 HP1\u{2013}4" unreadable — and a
+        // .docx exported from Word is the normal input, not the exception.
+        var s = line.replacingOccurrences(of: "\u{2013}", with: "-")
+                    .replacingOccurrences(of: "\u{2014}", with: "-")
+                    .replacingOccurrences(of: "\u{2212}", with: "-")
+        // Drop a leading bullet: "* ", "- ", "• ".
+        while let f = s.first, f == "*" || f == "-" || f == "•" {
+            s = String(s.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+        guard let first = s.first, first.isNumber else { return nil }
+
+        // Index or index range at the head of the line.
+        let idxStr = s.prefix { $0.isNumber || $0 == "-" }
+        let idxParts = idxStr.split(separator: "-").compactMap { Int($0) }
+        guard let lo = idxParts.first else { return nil }
+        let hi = idxParts.count > 1 ? idxParts[1] : lo
+        guard hi >= lo, hi - lo < 64 else { return nil }
+        let count = hi - lo + 1
+
+        // A real entry always separates the index from the code — "0 WD1", "2-5 // MPs".
+        // Prose that merely opens with a digit does not: "4x5 ways game, with 4 HP
+        // symbols…" parsed as index 4 plus a code "x5" and invented a symbol out of a
+        // sentence. Requiring the break is what tells one from the other.
+        let afterIndex = s.dropFirst(idxStr.count)
+        guard let sep = afterIndex.first, sep.isWhitespace || sep == "/" else { return nil }
+
+        var rest = String(afterIndex).trimmingCharacters(in: .whitespaces)
+        // "* 0 — WD1 (Wild Symbol)" — some documents separate the index from the code
+        // with a dash instead of just space. The em dash is already normalised to "-"
+        // above, so this is one strip. It cannot eat a range: "1-4 HP1-4" keeps its dash
+        // inside the index, and this only runs on what follows the index.
+        while let f = rest.first, f == "-" {
+            rest = String(rest.dropFirst()).trimmingCharacters(in: .whitespaces)
+        }
+
+        // The code may sit before the comment marker or after it.
+        var codeSpec = "", note = ""
+        if let cm = rest.range(of: "//") {
+            let head = String(rest[..<cm.lowerBound]).trimmingCharacters(in: .whitespaces)
+            let tail = String(rest[cm.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if head.isEmpty {
+                // "- 2-5 // MPs  (Standard MP symbols)" — code is the first token after //.
+                let tok = tail.prefix { !$0.isWhitespace && $0 != "(" }
+                codeSpec = String(tok)
+                note = String(tail.dropFirst(tok.count)).trimmingCharacters(in: .whitespaces)
+            } else {
+                codeSpec = head; note = tail
+            }
+        } else {
+            let tok = rest.prefix { !$0.isWhitespace }
+            codeSpec = String(tok)
+            note = String(rest.dropFirst(tok.count)).trimmingCharacters(in: .whitespaces)
+        }
+        rest = ""
+        // "0 WD1, // wild" — the comma belongs to the sentence, not the code. Left on, it
+        // failed every branch of `expand` and the game silently lost its wild.
+        codeSpec = codeSpec.trimmingCharacters(in: CharacterSet(charactersIn: ",;.:"))
+        note = note.trimmingCharacters(in: CharacterSet(charactersIn: "()").union(.whitespaces))
+
+        let codes = expand(codeSpec: codeSpec, indexCount: count)
+        guard !codes.isEmpty else { return nil }
+        // A line covering N indices should declare N codes; when it declares one
+        // (a single symbol on a single index) that is fine too.
+        return codes.enumerated().map { off, code in
+            let (role, tier) = classify(code)
+            // The document's own words decide what an SF actually does — see refined(byNote:).
+            return SlotSymbol(code: code, index: lo + min(off, count - 1),
+                              role: role.refined(byNote: note), tier: tier, note: note)
+        }
+    }
+}
+
+/// A theme as the H5G theme hub holds it. Everything here is text the hub already
+/// shows on a card — Navigator does not invent any of it.
+public struct GameTheme: Equatable, Hashable, Sendable {
+    public let name: String          // "Jack and the Beanstalk"
+    public let category: String      // "Fairytale"
+    public let comparables: String   // "Megaways Jack"
+    public let why: String           // the hub's market rationale
+    public let look: String          // the hub's "Theme & look" paragraph — the art direction
+    public let tier: String          // "T1"
+    /// The card's reference artwork as a data: URL, when the hub has one. The written
+    /// look says what the world is; this says how it is RENDERED.
+    /// Filled in on demand, for the one theme the user picks — not during the list
+    /// load. See ThemeHubClient for why that matters. The first of `artDataURLs`.
+    public var artDataURL: String
+    /// EVERY reference image on the card. A hub card can carry several — it shows a
+    /// "+2" badge when it does — and the extras are as much the approved art as the
+    /// first. The style is read from the first; the window cycles through all of them.
+    public var artDataURLs: [String] = []
+    /// Rendering style read off `artDataURL`, filled in before planning.
+    public var styleFromArt: String = ""
+    /// A style picked by hand, which OVERRIDES the one read from the reference art.
+    ///
+    /// It lives on the theme rather than being passed to each prompt builder because
+    /// three different prompts need it — the planner, the symbol pass and the background
+    /// pass — and threading it through three signatures is how one of them gets missed.
+    /// That already happened once here: an anti-pattern list reached the symbol prompt
+    /// and not the background prompt, and the backgrounds came back covered in invented
+    /// lettering.
+    public var chosenStyle: SlotArtStyle? = nil
+    /// The hub card HAS artwork, whether or not it has been fetched yet. Lets the window
+    /// tell "this theme has no reference art" apart from "it has some and we haven't
+    /// fetched it", which are different things and were being shown identically.
+    public var hasArt: Bool = false
+    /// The team notes from the card — status, who is on it, links. The freshest thing on
+    /// a hub card and the one most likely to say "art already started".
+    public var notes: String = ""
+    /// 👍 count on the card.
+    public var votes: Int = 0
+    /// The card's own badge, e.g. "T1 · Greenlight".
+    public var status: String = ""
+
+    public init(name: String, category: String = "", comparables: String = "",
+                why: String = "", look: String = "", tier: String = "",
+                artDataURL: String = "") {
+        self.name = name; self.category = category; self.comparables = comparables
+        self.why = why; self.look = look; self.tier = tier; self.artDataURL = artDataURL
+    }
+
+    /// Base64 payload of `artDataURL`, if it is one.
+    public var artBase64: String? {
+        guard let r = artDataURL.range(of: ";base64,") else { return nil }
+        let b = String(artDataURL[r.upperBound...])
+        return b.isEmpty ? nil : b
+    }
+}
+
+/// What each symbol role has to look like.
+///
+/// Distilled from High 5 Games' own slot design guide (the "Symbol Types and
+/// Hierarchy" and "Critical Symbol Category Differentiation Guide" sections). These
+/// are the rules that make a set read as a set: a player has to tell an HP1 from an
+/// MP1 apart at a glance, on a phone, without reading anything.
+public enum SlotArtDirection {
+
+    /// Rules every symbol obeys, whatever its role. Mostly about surviving downscale —
+    /// the failure mode that kills slot art is detail that dissolves at reel size.
+    /// Rules about LEGIBILITY, not about rendering.
+    ///
+    /// An earlier version of this dictated the medium — "vector-clean, NOT painterly" —
+    /// taken from the design guide's advice on art that survives downscaling. Handed to
+    /// the image model alongside a theme whose own reference art is a richly painted
+    /// illustration, it won, and the set came back looking like clip art. The guide's
+    /// point is that detail must survive at reel size, which is a constraint on
+    /// COMPOSITION and CONTRAST; it is not an instruction to draw flat vector icons.
+    /// How the art is rendered comes from the theme's reference artwork instead.
+    public static let houseStyle = """
+    CRAFT (these are about staying readable on a reel, not about the medium):
+    - Richly rendered and finished to a high standard — this is premium commercial game art.
+      Painted form, real material response, specular on metal and gem. Painterly and
+      semi-3D are both correct. Unstructured detail is the failure, not rendering.
+    - One clear focal point, and a strong closed silhouette that still reads as a solid
+      black shape.
+    - Strong value contrast and clean edge separation, so the symbol holds against a
+      busy, dark, high-contrast reel field behind it.
+    - Detail concentrated where it matters — the face, the ornament, the light — rather
+      than spread evenly across every surface.
+    - Nothing so fine it dissolves when the symbol is shown small: no hairline filigree,
+      no micro-texture, no tiny writing, no thin scattered particles.
+    - FILL THE FRAME. The symbol occupies the canvas it is generated in. A subject floating
+      small in the middle of a big empty square is the single most common way generated
+      slot art looks wrong beside hand-made art.
+    - Leave a small, even breathing space so no part of the resting artwork touches or is
+      clipped by the edge. That is a COMPOSITION margin and nothing else: it is not atlas
+      padding, and it is not room for the symbol to move in later.
+    - FRAMES: most slot symbols other than card royals sit in or on a frame, plaque or
+      backing shape, and it is drawn as part of the symbol. Card royals usually carry no
+      frame — the letterform is the symbol. When a frame is used it must be the SAME frame
+      treatment across the tier, so the set reads as a set.
+    - Compose so the symbol can be taken apart for the motion it will actually have —
+      a head that turns, a lid that opens, a jewel that pulses, a wing that moves. There is
+      no required number of parts: a symbol that only scales as a whole needs none. What
+      matters is that wherever one piece overlaps another, the art beneath continues
+      rather than stopping at the seam, so nothing tears open when it animates.
+    - Sleek, rich and fun. Never childish, never cheap, never cluttered. A dimensional
+      object with real material and real light on it, painted rather than drawn.
+    - The subject is centred, upright and complete.
+    - Give it a POSE, not a catalogue photograph. A character is caught mid-expression or
+      mid-action — leaning in, turning, laughing, roaring — rather than standing square and
+      lifeless. An object usually reads best turned slightly, with weight and gravity and
+      light that describes its form. Face-on is right when the symbol is a plaque, badge,
+      seal or value panel; everywhere else it tends to look like stock clip art.
+    """
+
+    /// How an EDGE is made, when the art is not meant to have drawn line work.
+    ///
+    /// The commonest complaint about generated slot art is a cartoon contour: a dark ink
+    /// stroke hugging the silhouette, or a pale "die-cut sticker" band around the whole
+    /// symbol. The prompt used to ask for "the same edge treatment" across the set
+    /// without ever saying how an edge should be FORMED — and an outline is a perfectly
+    /// sensible way to make a symbol read at 120px, so the model kept choosing it.
+    ///
+    /// Written as a positive specification because that is what Google's own prompting
+    /// guide asks for: "Describe what you want, not what you don't want (e.g. 'empty
+    /// street' instead of 'no cars')." The single exclusion at the end is deliberate and
+    /// short — naming the artefact once is worth more than a blacklist, and there is no
+    /// negativePrompt parameter on this model family to put it in.
+    ///
+    /// Two temptations are deliberately not used. "Soft edges" trades the artefact for an
+    /// unreadable symbol. An unqualified "rim light" produces the same continuous bright
+    /// perimeter under a different name — so the highlight is specified as broken and
+    /// only on surfaces facing the key.
+    public static func edgeTreatment(allowRimGlow: Bool = false) -> String {
+        let highlights = allowRimGlow
+            // The game's own approved art has a luminous rim. Forbidding it here would
+            // contradict the style description sitting directly above it in the prompt —
+            // and the reference art is the stronger authority on how this game looks.
+            ? """
+              - The rim light this style calls for is part of the artwork: let it follow the
+                form, varying in width and intensity with the material and the curvature
+                rather than tracing the outline at one even thickness.
+              """
+            : """
+              - Edge highlights are SHORT AND BROKEN, only on the surfaces facing the key
+                light, varying in width with the material and the curvature. Never a
+                continuous bright band tracing the whole outline.
+              """
+        let exclusions = allowRimGlow
+            ? "- No inked contour stroke around the subject, and no pale or white die-cut border."
+            : """
+              - No inked contour stroke around the subject, no pale or white die-cut border,
+                and no glow following the silhouette.
+              """
+        return """
+        EDGES — how the symbol separates from what is behind it:
+        - The silhouette is where the painted surface ENDS. Carry each material's own
+          colour, value and lighting all the way out to that boundary, so the edge is the
+          meeting of two surfaces rather than a line drawn on top of the art.
+        - Keep edges CRISP at the identifying features — the ones that say what this symbol
+          is at a glance — and let them soften only where a form genuinely turns away.
+        - SEPARATE THE SYMBOL WITH LIGHT, NOT WITH A LINE. A warm rim light catching the
+          top and one side of the form, falling off where the form turns away, is how this
+          symbol lifts off the reel — together with broad VALUE contrast against the field
+          behind it, a distinctive silhouette with generous gaps between its major parts,
+          and shading grouped into large coherent masses. That rim is lighting on the
+          form; it is not a stroke drawn around it, and it varies in width and brightness
+          with the material and the curvature instead of running at one even thickness.
+        \(highlights.trimmingCharacters(in: .whitespacesAndNewlines))
+        \(exclusions.trimmingCharacters(in: .whitespacesAndNewlines))
+        """
+    }
+
+    /// What the drawing model must be told about the OTHER symbols it cannot see.
+    ///
+    /// Each image is generated on its own, in its own request, with no sight of its
+    /// siblings — so unless it is told, every symbol is drawn as if it were the only one.
+    /// That is how a set ends up with twelve individually decent symbols that plainly
+    /// belong to twelve different games. These rules used to be sent to the PLANNER only,
+    /// which decided the subjects and then had no say in how they were drawn.
+    public static let setConsistency = """
+    THIS SYMBOL IS ONE OF A SET — it will sit on the same reel as the others, and they
+    must look like one game made by one artist:
+    - ONE light direction across the whole set: key light from the upper left, consistent
+      falloff, consistent shadow side.
+    - ONE rendering treatment. Same paint quality, same edge treatment, same finish on
+      metal and gem. Higher-paying symbols may carry MORE detail than lower ones — that is
+      how the tiers read — but the way that detail is painted must not change.
+    - ONE palette. Use the theme's colours; do not introduce a hue the theme has not
+      established.
+    - Matched OPTICAL weight: this symbol should look the same size beside the others,
+      which is not the same as filling the same box.
+    - It must hold against a busy, dark, high-contrast reel field behind it.
+    - It must not look MORE expensive than a symbol that pays more than it does. A lower
+      pay rendered in heavier gold than the high pays reverses the ladder and no single
+      image can notice it happening.
+    """
+
+    /// The ways generated slot art goes wrong, stated as instructions rather than as
+    /// warnings.
+    ///
+    /// These are production failure patterns, not a test for whether a machine made the
+    /// picture. Several were hit in this project before they were written down: every
+    /// special feature arriving as a swirling vortex, and a cutout destroying art that
+    /// was meant to stay.
+    public static let antiPatterns = """
+    AVOID THESE SPECIFICALLY:
+    - Draw the NAMED SUBJECT, and let it stay the subject. Reaching for generic ornament
+      instead collapses every symbol in the set into the same one.
+    - Take the shape from the SUBJECT, never from what the mechanic is called. A role name
+      describes how the game counts a symbol; it says nothing about what the thing is.
+    - No invented lettering, inscriptions, runes or pseudo-script. If a motif is cultural,
+      use a real one from the theme rather than decorative squiggles that imitate writing.
+    - Gloss is not form. Keep material-specific highlights — metal, gem, cloth, skin each
+      behave differently — and keep anatomy, joins and ornament continuous and correct.
+    - Concentrate detail at the focal feature and keep secondary surfaces broad. Fine
+      detail spread everywhere reads as rich in a big preview and as noise on a reel.
+    - Do not reproduce an existing game's symbol. Shipping games are a guide to treatment
+      and function, never something to copy.
+    """
+
+    /// The set-level rules. Two symbols that share a silhouette are the single most
+    /// common way a symbol set fails, so this is stated to the model every time.
+    public static let setRules = """
+    SET RULES:
+    - Every symbol must be told apart INSTANTLY from every other one — by subject first,
+      then by internal shape, colour and contrast. No two symbols may read as the same
+      thing at a glance.
+    - RESOLVE THAT SIDEWAYS, NOT UPWARD. When the obvious subject for a symbol is already
+      taken by another one, reach for a DIFFERENT thing from the same world — another
+      character in the story, a creature that belongs beside the first, the object this
+      world is known for. Do not retreat into a token, emblem or abstraction of the
+      subject that was taken: a set where one symbol is a real thing and the next is a
+      badge bearing a picture of that thing has stopped being one world.
+    - EVERY subject comes from THIS game's theme, and every one is rendered in the SAME
+      art style. A symbol that would fit equally well in a different game is the wrong
+      symbol, however well drawn.
+    - A shared frame, bezel or backing plate across a tier is allowed and is common in
+      shipping games; when one is used, the distinctness has to come from what sits
+      inside it.
+    - ONE light direction, ONE rendering treatment and ONE level of detail across every
+      symbol in the game. Twelve individually good symbols that do not look like one game
+      is the most common way a set fails.
+    - Symbols must look optically the SAME SIZE beside each other — matched visual weight,
+      not matched bounding boxes.
+    - Value tiers must be obvious at a glance, top to bottom, without reading anything.
+    - Higher-paying symbols run WARMER, HOTTER and RICHER than lower-paying ones: gold,
+      amber, crimson and deep jewel tones at the top; cooler, plainer, more muted colour at
+      the bottom. This is the house preference, not a law of the genre — shipping games do
+      break it (Gems Bonanza pays cyan above orange) — so where the theme genuinely forbids
+      it, an ice or deep-space game may keep a cool high pay and carry value through
+      material richness, contrast and ornament instead.
+    - The gap between HP1 and LP1 should be obvious side by side: HP1 is the single most
+      desirable object in the game, LP1 is plain by comparison.
+    - HP are the rulers; MP are allies (creatures/objects, never human); LP are the plain
+      foundation.
+    - All LP symbols are the SAME family — all card ranks, or all gems, or all icons.
+      Never mixed.
+    - Wild reads as transformation/energy. Scatter reads as a gateway you travel THROUGH.
+      Bonus reads as a container you OPEN. Never swap these.
+    - Do not separate two symbols by colour alone.
+    """
+
+    /// Role-specific direction, including the tier's own framing and ornament budget.
+    public static func direction(for role: SlotSymbolRole, tier: Int?) -> String {
+        switch role {
+        case .wild:
+            return """
+            WILD — the symbol that substitutes for others.
+
+            Draw a SPECIFIC SUBJECT from this theme, at the same level of reality as every \
+            other symbol in the set: something a person could point at in this world. In \
+            shipping games the wild is a character, creature or signature object — Big Bass \
+            Bonanza's fisherman, Wild West Gold's sheriff, Book of Dead's book.
+
+            IF THE OBVIOUS SUBJECT IS ALREADY TAKEN by a paying symbol, move SIDEWAYS in this \
+            world, not upward into a token of it: another character from the same story, the \
+            hero who belongs with those creatures, the one object this world is known for. A \
+            paw print stands FOR a wolf; it is not a wolf, and it is a weaker symbol than the \
+            huntsman, the moon-priest or the antler crown would be. Reaching for a badge, seal \
+            or coin bearing the motif is the move to resist — it is what makes every game's \
+            wild look like every other game's wild.
+
+            So: pick the one figure or object that best stands for this world's power, and make \
+            it unmistakably itself. The game prints a label over this symbol at runtime, so keep one area of the ARTWORK calm and uncluttered for it — no busy detail, no strong edge crossing it. Do NOT draw a band, bar, plate, box or panel for the text, and do not letter it yourself: a blank white strip across the picture is not a text zone, it is a mistake in the art. The strongest value contrast and \
+            cleanest edge separation in the set.
+            """
+        case .highPay:
+            let t = tier ?? 1
+            let frame: String
+            switch t {
+            case 1: frame = "The tightest crop and the most ornate thing in the entire game. A character: head and upper shoulders only, eyes large and frontal, direct eye contact, an expression of authority. Or, if an object instead: the single most precious object in the game. Ornament concentrated in one or two places — a crown, a jewelled band — not spread over everything."
+            case 2: frame = "A little wider than HP1 — head, neck and upper chest — and visibly less ornate. As an object: premium, but clearly second to HP1's. Where it looks is a character choice, not a rank: HP2 does not have to look away from the player."
+            case 3: frame = "Wider still: a bust, with distinctive accessories that establish who or what this is. Noticeably simpler than HP2."
+            default: frame = "The widest and plainest of the high pays — full costume or full object visible, clean lines, the least ornament of the four."
+            }
+            return """
+            HIGH PAY \(t) of 4 — "the rulers". \(frame)
+            Rich materials and precious-metal response. Angular, authoritative shape language.
+
+            The four high pays are a LADDER and a player must be able to rank them at a glance,
+            side by side, without knowing the paytable. Each step down loses something specific
+            and visible: less precious material (gold, then bronze, then wood or stone), fewer
+            gems, less ornament, cooler colour, less light on it. Do not make a lower tier
+            smaller to say it is worth less — make it plainer.
+            \(t == 1 ? "HP1 is the single most desirable object in the entire game. If it does not look like the thing the player most wants to land, it is wrong." : "")
+            """
+        case .mediumPay:
+            let t = tier ?? 1
+            return """
+            MEDIUM PAY \(t) — the middle band of the paytable. Objects, creatures, characters \
+            and artefacts are all fair game — there is no rule against a person here; what \
+            matters is that it sits clearly between the high pays and the low pays. \
+            Clearly richer than the low pays and clearly subordinate to the high pays: fewer \
+            decorative elements than a high pay, more than a low pay, and less of them with each \
+            step down the medium-pay tiers. Curved, organic shape language. Moderate saturation.
+            """
+        case .lowPay:
+            let t = tier ?? 1
+            return """
+            LOW PAY \(t) — filler. The simplest, plainest symbols in the set, and the ones a
+            player sees most often.
+
+            Every low pay in this game belongs to ONE family. Pick a single family for all of
+            them and do not mix:
+              - ROYALS: card ranks A K Q J 10 7 5, styled to the theme
+              - GEMSTONES: simple cut stones, one per rank
+              - PEBBLES or tokens: plain but refined objects that read as holding some value
+              - THEMED ITEMS: simple everyday objects from this world
+            One pebble, one royal, one gem and one item in the same game is wrong. All of them
+            must be the same kind of thing, differing only in which one it is.
+
+            FRAMES: royals usually carry NO frame — the letterform IS the symbol. Every other
+            low-pay family almost always sits in or on a frame, plaque or backing shape.
+
+            The symbol must FILL the frame it is generated in. A low pay floating small in the
+            middle of the canvas reads as a mistake beside the high pays. Two or three visual
+            elements at most, and enough contrast to be counted instantly.
+            """
+
+        case .scatter:
+            return """
+            SCATTER — the symbol that is COUNTED wherever it lands, rather than paying along a \
+            line. That is a rule about how the game EVALUATES it, not a shape, and it carries no \
+            required form: take the subject from this game's own world and let the shape follow \
+            from it.
+
+            What it must be is INSTANTLY COUNTABLE — a player has to see three or four of them \
+            scattered across the reels at a glance. So: one bold, unmistakable subject from this \
+            theme, the highest colour contrast in the whole set against every other symbol, and \
+            a shape that reads even partly obscured. The game prints a label over this symbol at runtime, so keep one area of the ARTWORK calm and uncluttered for it — no busy detail, no strong edge crossing it. Do NOT draw a band, bar, plate, box or panel for the text, and do not letter it yourself: a blank white strip across the picture is not a text zone, it is a mistake in the art.
+            """
+        case .bonus:
+            return """
+            BONUS — the symbol that triggers this game's bonus feature. A chest or a case is one \
+            good answer, but it is not a requirement: shipping games use coins, emblems, badges \
+            and characters just as often. Pick whatever this game's own bonus actually is about.
+
+            The one hard rule: if this game ALSO has a separate scatter, the two must be \
+            impossible to confuse at a glance — different subject, different colour, different \
+            shape. The game prints a label over this symbol at runtime, so keep one area of the ARTWORK calm and uncluttered for it — no busy detail, no strong edge crossing it. Do NOT draw a band, bar, plate, box or panel for the text, and do not letter it yourself: a blank white strip across the picture is not a text zone, it is a mistake in the art.
+            """
+        case .jackpot:
+            let names = [1: "GRAND", 2: "MAJOR", 3: "MINOR", 4: "MINI"]
+            let t = tier ?? 1
+            return """
+            JACKPOT \(names[t] ?? "tier \(t)") — one of four prize tiers that must read as a FAMILY.
+
+            Shipping games build all four from the SAME construction and separate them by colour \
+            and by a printed tier name — Book of Dead GO Collect uses one gold-and-gem coin in \
+            red, turquoise, purple and lime. Four unrelated treasures make the player guess which \
+            outranks which, so keep the form shared and let colour carry the tier: \
+            \(t == 1 ? "GRAND is the hottest and richest of the four." : t == 2 ? "MAJOR sits just below GRAND." : t == 3 ? "MINOR is cooler and calmer than MAJOR." : "MINI is the coolest and plainest of the four.")
+
+            Perfect symmetry, one centre of attention, flawless material. The game prints a label over this symbol at runtime, so keep one area of the ARTWORK calm and uncluttered for it — no busy detail, no strong edge crossing it. Do NOT draw a band, bar, plate, box or panel for the text, and do not letter it yourself: a blank white strip across the picture is not a text zone, it is a mistake in the art.
+
+            Not every game has four: some run Grand, Major and Minor only. Draw the tiers this \
+            game actually defines, and nothing for a jackpot that exists only as a meter.
+            """
+        case .wysiwyg:
+            return """
+            WYSIWYG VALUE SYMBOL — it carries a cash value the game prints on it at runtime.
+
+            Design the SUBJECT first — whatever THIS game's money looks like, taken from its \
+            own world — then make sure part of its own surface is calm enough to read a value \
+            over: the face of it, a flat facet, a panel that belongs to the object. The game prints the number \
+            there at runtime. Do not draw a blank plate, band or rectangle for it, do not \
+            surrender half the symbol to one, and put NO lettering or numerals in the art. A \
+            value carrier does not have to look like a plaque.
+            """
+        case .collector, .activator, .adder:
+            return """
+            SPECIAL FEATURE SYMBOL — these are FOUR different jobs and the design document says
+            which one this is. Draw the job it names, and do not blend them:
+
+              - COLLECTOR: gathers values in from other symbols. Give it somewhere the gathered
+                total visibly lands, left clean for the game to print a running number over.
+                A character can do the collecting just as well as an object can.
+              - ACTIVATOR: starts a feature. Its subject should be tied to the feature it
+                triggers, with a readable difference between its resting and fired states, and a
+                clear point the effect comes FROM. No running total unless it also collects.
+              - ADDER: adds an amount to something else. Leave a clear zone for the increment
+                and its unit, and make the direction of the effect readable. Must not be
+                confusable with the collector or the multiplier.
+              - MULTIPLIER: applies a factor. Controlled and precise rather than chaotic — that
+                is the wild's job. Clear upright zone for the factor.
+
+            In every case the number is printed by the game at runtime over the ARTWORK itself:
+            keep that part of the subject calm enough to read a number against, draw no band,
+            plate or box for it, and put no lettering or numerals in the art. This is the symbol
+            players hunt for, so give it the highest contrast and the most distinctive silhouette
+            you can.
+            """
+
+        case .multiplier:
+            return """
+            MULTIPLIER — "the amplifier". CONTROLLED, precise energy — mathematical, not chaotic \
+            (that is the wild's job). The game prints the multiplier value over this symbol at \
+            runtime, so part of the artwork itself must be calm enough to read a number over. \
+            Do NOT draw a blank plate, band or rectangle for it — that is the same mistake as \
+            leaving a bare panel, and it comes back as a white box in the middle of the symbol. \
+            Reads as amplification and precision.
+            """
+        case .replacement:
+            return """
+            REPLACEMENT SYMBOL — a plain stand-in that sits quietly among the others. Same art \
+            style and same visual weight as the low pays, deliberately unremarkable, and visibly \
+            distinct from every named symbol in the set.
+            """
+        case .blank:
+            return "BLANK — an empty reel position. No art is generated for this."
+        case .unknown:
+            return """
+            UNCLASSIFIED SYMBOL — the design document did not say what this is. Draw a \
+            handsome, thematically appropriate object in the game's style with a distinct \
+            silhouette, and treat it as a medium pay.
+            """
+        }
+    }
+}
+
+/// Choosing the flat colour a symbol is generated ON.
+///
+/// Nano Banana has no alpha — it flattens transparency to black — so symbols are
+/// generated on a flat field and the background is taken off afterwards. Which field
+/// colour is safe depends on the game's palette: keying green out of a beanstalk game
+/// eats the beanstalk. One colour is chosen for the WHOLE set rather than per symbol,
+/// so a single setting clears every asset.
+enum SlotBackingRules {
+
+    /// The three classic keys. Anything else risks a colour the model renders
+    /// inconsistently across a batch, which defeats a single setting.
+    static let candidates: [(name: String, rgb: RGB8)] = [
+        ("chroma green", RGB8(0, 177, 64)),
+        ("chroma blue", RGB8(0, 71, 187)),
+        ("chroma magenta", RGB8(255, 0, 255)),
+    ]
+
+    /// The candidate furthest from everything in the palette.
+    ///
+    /// Scored by the palette colour it is CLOSEST to (max-min), not by an average:
+    /// a backing that is far from most of a palette but near one prominent colour
+    /// still destroys that colour when it is taken out.
+    static func choose(palette: [RGB8]) -> (name: String, rgb: RGB8) {
+        guard !palette.isEmpty else { return candidates[2] }   // magenta: rarest in game art
+        return candidates.max { a, b in
+            let da = palette.map { KeyColorRules.deltaE($0, a.rgb) }.min() ?? 0
+            let db = palette.map { KeyColorRules.deltaE($0, b.rgb) }.min() ?? 0
+            return da < db
+        } ?? candidates[2]
+    }
+
+    /// "#1e8f3c" / "1e8f3c" -> RGB8. nil for anything else, so a model that answers
+    /// with prose instead of a hex code is ignored rather than silently read as black.
+    static func hex(_ s: String) -> RGB8? {
+        var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasPrefix("#") { t = String(t.dropFirst()) }
+        guard t.count == 6, let v = UInt32(t, radix: 16) else { return nil }
+        return RGB8(UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF))
+    }
+}
+
+/// Whether a generated image actually came back at the resolution that was asked for.
+///
+/// Google documents an exact size-by-aspect table — 1:1 is 1024 / 2048 / 4096 for
+/// 1K / 2K / 4K — and a short answer lands exactly on the 1K row, at the price of the
+/// size that was asked for. So the size cannot be assumed; it is measured.
+enum GeneratedSizeRules {
+
+    /// The long edge each size name is asking for.
+    static func targetLongEdge(_ size: String) -> Int {
+        switch size {
+        case "4K": return 4096
+        case "2K": return 2048
+        default: return 1024
+        }
+    }
+
+    /// True when `longEdge` is meaningfully short of the request. The 0.9 slack is
+    /// because a non-square ratio lands on numbers like 1536x2752 that are correct
+    /// for the request without matching it exactly.
+    static func isUndersized(longEdge: Int, requested: String) -> Bool {
+        Double(longEdge) < Double(targetLongEdge(requested)) * 0.9
+    }
+
+    /// "2048x2048" for the plan table.
+    static func describe(width: Int, height: Int) -> String { "\(width)x\(height)" }
+}
+
+/// One image to generate.
+public struct AssetJob: Equatable, Sendable {
+    public enum Kind: String, Sendable { case symbol, background }
+    public let id: String            // "HP1", "bg_base"
+    public let kind: Kind
+    public let role: SlotSymbolRole  // .unknown for backgrounds
+    public let tier: Int?
+    public let title: String         // what it is, for the plan table
+    public var subject: String       // the art subject — filled in by the planning pass
+    public var silhouette: String    // one or two words, used to enforce distinctness
+    /// Whether this symbol is drawn inside a frame, plaque or backing shape.
+    ///
+    /// Decided by the planner, because it depends on the low-pay family it chose: card
+    /// royals carry no frame — the letterform is the symbol — while nearly everything
+    /// else does. Generating the frame WITH the symbol is what stops the two drifting
+    /// apart, which is the old pipeline's failure; separating them afterwards is what
+    /// makes the frame reusable.
+    public var hasFrame: Bool = false
+    public let aspect: String        // "1:1" symbols; backgrounds follow BackgroundFormatRules
+    public let size: String
+    public var filename: String { "\(id).png" }
+
+    public init(id: String, kind: Kind, role: SlotSymbolRole, tier: Int?, title: String,
+                subject: String = "", silhouette: String = "", aspect: String, size: String,
+                hasFrame: Bool = false) {
+        self.id = id; self.kind = kind; self.role = role; self.tier = tier; self.title = title
+        self.subject = subject; self.silhouette = silhouette; self.aspect = aspect; self.size = size
+        self.hasFrame = hasFrame
+    }
+}
+
+/// Turning a parsed GDD into the list of images to make.
+public enum AssetPlanRules {
+
+    /// Square 2K symbols by default. Backgrounds are not a fixed default — they are
+    /// whatever covers the 1920x2532 portrait target, which works out as 3:4 at 4K.
+    public static let symbolAspect = "1:1"
+    public static let defaultSize = "2K"
+    public static let sizes = ["1K", "2K", "4K"]
+    public static let symbolAspects = ["1:1", "4:5", "5:4", "4:3", "3:4"]
+    public static var backgroundAspects: [String] { BackgroundFormatRules.ratios.map(\.name) }
+    public static var backgroundAspect: String { BackgroundFormatRules.best().aspect }
+    public static var backgroundSize: String { BackgroundFormatRules.best().size }
+
+    /// Symbol jobs, in the order they should be drawn — the symbols that decide
+    /// whether the set is working come first.
+    public static func symbolJobs(_ symbols: [SlotSymbol], size: String = defaultSize,
+                                  aspect: String = symbolAspect) -> [AssetJob] {
+        symbols.filter { $0.role.needsArt }
+            .sorted {
+                $0.role.priority == $1.role.priority
+                    ? ($0.tier ?? 0, $0.code) < ($1.tier ?? 0, $1.code)
+                    : $0.role.priority < $1.role.priority
+            }
+            .map {
+                AssetJob(id: $0.code, kind: .symbol, role: $0.role, tier: $0.tier,
+                         title: $0.note.isEmpty ? $0.role.label : $0.note,
+                         aspect: aspect, size: size)
+            }
+    }
+
+    /// Background jobs for the game's scenes.
+    ///
+    /// A MODE has to be named, not merely a word mentioned. "jackpot" alone matched
+    /// every game that has a jackpot SYMBOL — which is most of them — and invented a
+    /// jackpot scene nobody asked for, at 4K, on the bill.
+    public static func backgroundJobs(gddText: String, size: String? = nil,
+                                      aspect: String? = nil) -> [AssetJob] {
+        let fmt = BackgroundFormatRules.best()
+        let size = size ?? fmt.size, aspect = aspect ?? fmt.aspect
+        let scenes = GDDScenes.scenes(in: gddText)
+        return scenes.map {
+            AssetJob(id: $0.id, kind: .background, role: .unknown, tier: nil, title: $0.title,
+                     aspect: aspect, size: size)
+        }
+    }
+}
+
+/// Picking the aspect and resolution a BACKGROUND is generated at.
+///
+/// A slot background has a real target: 1920x2532, the portrait background size the
+/// games are built to. The rule is to take the SMALLEST supported format whose
+/// pixels still cover it, and among equals the one shaped most like it.
+///
+/// For 1920x2532 that works out as 3:4 at 4K (3547x4730). Nothing at 2K reaches it —
+/// the tallest 2K option is 1774x2365, short on both edges — so a portrait
+/// background is a 4K request whether or not the symbols are. That is also the
+/// request Nano Banana honours most reliably: 4K came back full size every time it
+/// was asked, while 2K came back halved about half the time.
+///
+/// The pixel maths is measured, not assumed: Nano Banana fits roughly S-by-S pixels
+/// worth of image into the requested ratio, so a "2K" 9:16 comes back 1536x2752
+/// (2048 x 0.75 by 2048 / 0.75). A 2K 1:1 comes back 2048x2048. Both confirmed on
+/// live calls.
+enum BackgroundFormatRules {
+
+    /// The phone this is sized for.
+    public static let defaultTarget = (w: 1920, h: 2532)
+
+    /// Ratios worth offering for a background.
+    ///
+    /// 9:21 is deliberately absent. It is listed as a Nano Banana ratio and is the
+    /// closest of all of them to a modern phone, but asking for it came back
+    /// 768x1376 — which is 9:16, at half size. Offering a ratio the service quietly
+    /// substitutes would be offering a setting that does nothing.
+    static let ratios: [(name: String, value: Double)] = [
+        ("9:16", 9.0 / 16), ("2:3", 2.0 / 3), ("3:4", 3.0 / 4), ("1:1", 1.0),
+        ("4:3", 4.0 / 3), ("16:9", 16.0 / 9),
+    ]
+
+    static let sizes = ["1K", "2K", "4K"]
+
+    /// The pixels a (ratio, size) request is expected to produce.
+    static func pixels(ratio: Double, size: String) -> (w: Int, h: Int) {
+        let s = Double(GeneratedSizeRules.targetLongEdge(size))
+        let r = ratio.squareRoot()
+        return (Int((s * r).rounded()), Int((s / r).rounded()))
+    }
+
+    /// The smallest size class that can cover `target`, and within it the ratio
+    /// shaped most like `target`.
+    ///
+    /// Size first, then shape — NOT total pixels. Every 4K request yields the same
+    /// pixel count whatever its ratio, but rounding leaves the areas differing by a
+    /// thousand pixels or so, and ranking on area let that noise decide: 9:16 came out
+    /// "smaller" than 3:4 and won, handing back a background a third too tall for a
+    /// 3:4 target, to be thrown away in the crop.
+    static func best(target: (w: Int, h: Int) = defaultTarget) -> (aspect: String, size: String) {
+        let want = log(Double(target.w) / Double(target.h))
+        for size in sizes {
+            let fits = ratios.filter { r in
+                let p = pixels(ratio: r.value, size: size)
+                return p.w >= target.w && p.h >= target.h
+            }
+            if let pick = fits.min(by: { abs(log($0.value) - want) < abs(log($1.value) - want) }) {
+                return (pick.name, size)
+            }
+        }
+        return ("9:16", "4K")
+    }
+
+    /// True when what actually arrived is too small for the target.
+    static func covers(width: Int, height: Int, target: (w: Int, h: Int) = defaultTarget) -> Bool {
+        width >= target.w && height >= target.h
+    }
+}
+
+/// Where a run's art is written.
+///
+/// The user picks a PARENT folder once and Navigator makes a folder per run inside
+/// it, named for the game and the theme. Picking the exact output folder every time
+/// is the kind of small friction that ends with three games' symbols in one folder,
+/// all called HP1.png.
+enum GDDOutputRules {
+
+    /// Characters that are legal in a file name but miserable in one.
+    static func safe(_ s: String) -> String {
+        let cleaned = s.components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
+            .joined(separator: " ")
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "  ", with: " ")
+    }
+
+    /// "4400 Chevy-Hot — Jack and the Beanstalk".
+    static func folderName(game: String, theme: String) -> String {
+        let g = safe(game), t = safe(theme)
+        if g.isEmpty && t.isEmpty { return "Game assets" }
+        if t.isEmpty { return g }
+        if g.isEmpty { return t }
+        return "\(g) — \(t)"
+    }
+
+    /// A name that does not collide with something already there. Two runs of the
+    /// same game and theme are a normal thing to do — a second pass after changing a
+    /// few subjects — and silently writing over the first one is not.
+    static func uniqueName(_ base: String, existing: Set<String>) -> String {
+        guard existing.contains(base) else { return base }
+        for n in 2...99 where !existing.contains("\(base) \(n)") { return "\(base) \(n)" }
+        return "\(base) \(Int(Date().timeIntervalSince1970))"
+    }
+}
+
+/// Putting a cut-out symbol back on the canvas it was drawn on.
+///
+/// Photoshop's background removal TRIMS to the subject: a 2048x2048 symbol comes back
+/// 1653x1804. For one image that is fine, but a symbol SET has to register — every
+/// symbol sitting in the same square, in the same place, so the reel does not jitter
+/// when one lands next to another.
+///
+/// The position is not guessed. The symbol was generated on a flat field of a known
+/// colour, so the pixels that are NOT that colour are the subject, and their bounding
+/// box in the source is exactly where the trimmed cut-out came from.
+enum SymbolCanvasRules {
+
+    /// Squared distance between two colours, for the flat-field test. Plain RGB is
+    /// the right measure here: the question is "is this pixel the backing we just
+    /// asked for", not "do these look alike to a person".
+    static func distanceSquared(_ a: RGB8, _ b: RGB8) -> Int {
+        let dr = Int(a.r) - Int(b.r), dg = Int(a.g) - Int(b.g), db = Int(a.b) - Int(b.b)
+        return dr*dr + dg*dg + db*db
+    }
+
+    /// Anything this far from the backing counts as subject. Generous, because the
+    /// soft edge of the subject blends toward the backing and must not be clipped off
+    /// the bounding box.
+    static let subjectThreshold = 60 * 60
+
+    /// The subject's bounding box in a flat-backed image, as (x, y, w, h).
+    ///
+    /// `sample` answers the pixel at (x, y). Returns nil when nothing differs from the
+    /// backing — an empty image has no box, and inventing one would place the cut-out
+    /// somewhere arbitrary.
+    static func subjectBounds(width: Int, height: Int, backing: RGB8,
+                              sample: (Int, Int) -> RGB8) -> (x: Int, y: Int, w: Int, h: Int)? {
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width where distanceSquared(sample(x, y), backing) > subjectThreshold {
+                if x < minX { minX = x }
+                if x > maxX { maxX = x }
+                if y < minY { minY = y }
+                if y > maxY { maxY = y }
+            }
+        }
+        guard maxX >= minX, maxY >= minY else { return nil }
+        return (minX, minY, maxX - minX + 1, maxY - minY + 1)
+    }
+
+    /// Where to place a trimmed cut-out on the original canvas.
+    ///
+    /// Photoshop's trim and this bounding box are computed from the same picture but
+    /// not by the same code, so they land within a pixel or two of each other rather
+    /// than exactly. The cut-out is centred on the box when they disagree slightly,
+    /// and the placement is REFUSED when they disagree a lot — a wrong offset is worse
+    /// than an untrimmed file, because it is invisible until the reel spins.
+    /// How far the two measurements may disagree: 5% of the canvas, or 24px, whichever
+    /// is larger.
+    ///
+    /// A flat 24px was too strict. A soft-edged symbol — a glowing vortex — fades into
+    /// the backing, so this scan's threshold keeps more of the glow than Photoshop's cut
+    /// does, and the two disagreed by 56px on a 2048 canvas. Refusing that left exactly
+    /// the symbols with soft edges untrimmed while the hard-edged ones were placed,
+    /// which is the opposite of a consistent set. Centring within the box bounds the
+    /// error at half the tolerance — about 1.4% of the canvas — which is invisible on a
+    /// reel, and still refuses a cut-out that is nothing like the box.
+    static func tolerance(canvas: (w: Int, h: Int)) -> Int {
+        max(24, max(canvas.w, canvas.h) / 20)
+    }
+
+    static func placement(cutout: (w: Int, h: Int), bounds: (x: Int, y: Int, w: Int, h: Int),
+                          canvas: (w: Int, h: Int), tolerance: Int? = nil)
+        -> (x: Int, y: Int)? {
+        let tolerance = tolerance ?? Self.tolerance(canvas: canvas)
+        guard abs(cutout.w - bounds.w) <= tolerance, abs(cutout.h - bounds.h) <= tolerance
+        else { return nil }
+        let x = bounds.x + (bounds.w - cutout.w) / 2
+        let y = bounds.y + (bounds.h - cutout.h) / 2
+        guard x >= 0, y >= 0, x + cutout.w <= canvas.w, y + cutout.h <= canvas.h else { return nil }
+        return (x, y)
+    }
+}
+
+/// How hard to push the image service, and what to do when it pushes back.
+///
+/// Every number here is Google's, or explicitly marked as ours. Their API-errors page
+/// recommends retrying "no more than two times" with a minimum one-second delay
+/// increasing exponentially; their retry-strategy guide documents initial delay 1s,
+/// base 2, maximum 60s, with jitter, and names 429, 408 and transient 5xx as the
+/// retryable statuses while other 4xx are terminal.
+///
+/// Concurrency is NOT documented by Google for online image generation, and we sit
+/// behind a metering proxy whose own limits we cannot see. So this takes the smallest
+/// parallel step above the sequential baseline that was already working — two — and
+/// gives up that second worker at the first sign of pushback, rather than discovering
+/// a hidden ceiling by failing twenty images at once.
+enum ImageRequestPolicy {
+
+    /// How many images are in flight at once.
+    ///
+    /// Ours, not Google's — Google documents no concurrency limit for online image
+    /// generation, and the metering proxy in front of it publishes none either. Measured
+    /// rather than assumed: see the note on `widenAfterSuccesses`.
+    /// Measured on a 19-image set, 1K, this machine alone on the service:
+    ///
+    ///     sequential   13.8s per image
+    ///     4-wide        3.2s      61s total
+    ///     8-wide        1.7s      32s total   no pushback, three runs
+    ///    16-wide        1.4s      26s total   no pushback
+    ///
+    /// 16 works, and 8 is the setting. Past 8 the wall time is bounded by how long ONE
+    /// image takes, so the last doubling bought six seconds — while putting twice the
+    /// load on a service the whole studio shares, measured with nobody else on it.
+    /// If pushback ever does arrive the pool narrows and recovers on its own, so this is
+    /// a starting point rather than a ceiling.
+    static let concurrency = 8
+    /// Consecutive successes before the pool takes a worker back after being narrowed.
+    /// Narrow fast, widen slowly — the usual shape for a limit nobody will tell you.
+    static let widenAfterSuccesses = 4
+    /// Ours: stagger the workers so they do not start in lockstep.
+    static let staggerSeconds: Double = 1
+
+    /// Google: "retrying no more than two times" — so three attempts in total.
+    static let maxAttempts = 3
+    static let initialBackoff: Double = 1
+    static let backoffMultiplier: Double = 2
+    static let maxBackoff: Double = 60
+
+    /// Google: 429, 408 and transient 5xx are retryable; other 4xx are terminal.
+    static func isRetryable(status: Int) -> Bool {
+        status == 408 || status == 429 || (status >= 500 && status < 600)
+    }
+
+    /// Our own error strings carry the status inline — "AI service HTTP 429: …".
+    static func status(inMessage m: String) -> Int? {
+        guard let r = m.range(of: #"HTTP (\d{3})"#, options: .regularExpression) else { return nil }
+        return Int(m[r].dropFirst(5))
+    }
+
+    /// True when an error message describes something worth trying again.
+    ///
+    /// An error with NO status is a transport failure — a dropped connection or a
+    /// timeout. Those are deliberately NOT retried: the request may already have been
+    /// generated and metered, and a blind replay would pay for it twice.
+    static func shouldRetry(errorMessage m: String) -> Bool {
+        guard let s = status(inMessage: m) else { return false }
+        return isRetryable(status: s)
+    }
+
+    /// Delay before attempt `n` (1-based), with jitter. The jitter distribution is not
+    /// documented; 0-1s added preserves the documented one-second minimum.
+    static func backoff(forAttempt n: Int, jitter: Double) -> Double {
+        let base = initialBackoff * pow(backoffMultiplier, Double(max(0, n - 1)))
+        return min(maxBackoff, base) + max(0, min(1, jitter))
+    }
+}
+
+/// The part of a GDD that says what the special symbols DO.
+///
+/// The symbol-set list gives codes and one-line comments; the prose further down is
+/// where a game actually lives — that 4400's collector shoots fireballs at a glass
+/// panel over a "Hot Reel", that its upgraded scatter is ringed, that its bonus reels
+/// carry red scatters. Handing the planner only the codes throws all of that away and
+/// gets back symbols that would suit any game at all. This finds those passages and
+/// keeps a bounded amount of them.
+enum GDDFeatureContext {
+
+    /// Headings that introduce the prose worth keeping.
+    static let headings = ["special symbols", "special feature", "features", "bonus features",
+                           "free spins", "base features", "spinning & winning", "presentation",
+                           "feature -", "upgraded symbols"]
+
+    /// Lines that are machine detail rather than game description.
+    static func isNoise(_ line: String) -> Bool {
+        let l = line.trimmingCharacters(in: .whitespaces)
+        if l.isEmpty { return true }
+        // Code, JSON and tables carry no art meaning and eat the budget fast.
+        if l.hasPrefix("*") && l.contains("//") { return true }
+        if l.contains("{") || l.contains("}") || l.contains(";") { return true }
+        if l.hasPrefix("int ") || l.hasPrefix("struct ") || l.hasPrefix("enum ") { return true }
+        return false
+    }
+
+    /// The document, with machine noise stripped, bounded generously.
+    ///
+    /// This used to capture 2,500 characters and only from lines following a short list
+    /// of headings — a list that did not include "Symbols". 4490 survived only because it
+    /// happens to write "Presentation" above its symbol block; a document that puts its
+    /// symbol descriptions under a plain "Symbols" heading lost them entirely, and the
+    /// planner then invented subjects for symbols the document had already described.
+    ///
+    /// The ceiling was set when the model had a small window and long context was
+    /// expensive. gemini-3.8-flash takes 1,048,576 tokens, and Google's own long-context
+    /// guidance is to keep the relevant document whole and put the task after it rather
+    /// than pre-chunking. A 25,000-character GDD is a rounding error against that window.
+    ///
+    /// Noise filtering stays: code blocks, JSON and reel tables carry no art meaning.
+    public static func excerpt(_ gddText: String, limit: Int = 40000) -> String {
+        let lines = gddText.components(separatedBy: .newlines)
+        var out: [String] = [], total = 0, capturing = false
+        for raw in lines {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let lower = line.lowercased()
+            // Every heading now opens the capture, and capture starts immediately: the
+            // planner should see the whole document, not the part after a keyword.
+            if headings.contains(where: { lower.hasPrefix($0) }) { capturing = true; continue }
+            _ = capturing
+            guard !isNoise(line) else { continue }
+            // A heading-looking line that is not one of ours ends the passage.
+            if line.count < 40 && line.hasSuffix(":") { continue }
+            let piece = String(line.prefix(300))
+            if total + piece.count > limit { break }
+            out.append(piece); total += piece.count
+        }
+        return out.joined(separator: "\n")
+    }
+}
+
+/// Whether a design document actually states what its symbols pay.
+///
+/// Everything downstream assumes HP1 outranks HP4 because of the number in the code.
+/// That is a NAMING convention, not a fact about the game: a document can number its
+/// symbols by reel-strip index, and nothing in the code list proves the order. Where
+/// the document says nothing about pay, the ranking is still used — there is no better
+/// signal — but the user is told it was assumed rather than read.
+enum GDDPayOrder {
+
+    /// Phrases that mean a paytable is present.
+    static let markers = ["paytable", "pay table", "pays ", "payout", "x bet", "multiplier of bet",
+                          "5 of a kind", "4 of a kind", "3 of a kind", "5oak", "4oak", "3oak"]
+
+    /// True when the document appears to state pay values or a pay order.
+    static func isStated(in gddText: String) -> Bool {
+        let t = gddText.lowercased()
+        return markers.contains { t.contains($0) }
+    }
+
+    /// What to tell the user about where the ranking came from.
+    static func note(for gddText: String, symbols: [SlotSymbol]) -> String? {
+        let ranked = symbols.filter { $0.tier != nil && ($0.role == .highPay || $0.role == .mediumPay
+                                                         || $0.role == .lowPay || $0.role == .jackpot) }
+        guard ranked.count > 1, !isStated(in: gddText) else { return nil }
+        return "This document doesn’t state pay values, so the value order was taken from the "
+             + "code numbering (HP1 above HP4, JP1 above JP4). Check it against the paytable."
+    }
+}
+
+/// The distinct SCENES a game has, read from its design document.
+///
+/// Every slot has a base game, so that one is assumed. The rest are not: a game may
+/// have free games, a separate bonus round, a pick screen, a hold-and-spin, or several
+/// of those, and each is its own background. The first version of this matched six
+/// fixed phrases and could never return more than three scenes — it read 4400's
+/// "Jackpot Pick" as nothing at all, because the phrase it knew was "jackpot picker".
+///
+/// Each scene still has to be NAMED by the document. Nothing here invents a screen the
+/// game does not describe, because every extra background is a paid 4K image.
+enum GDDScenes {
+
+    /// Phrases that name a mode, and the scene each belongs to. Longest first, so
+    /// "free spins bonus" is one scene rather than matching "bonus" separately.
+    static let modes: [(phrase: String, id: String, title: String)] = [
+        ("free spins bonus", "bg_freegames", "Free spins background"),
+        ("free spins game", "bg_freegames", "Free spins background"),
+        ("free games", "bg_freegames", "Free games background"),
+        ("free spins", "bg_freegames", "Free spins background"),
+        ("hold and spin", "bg_holdspin", "Hold and spin background"),
+        ("hold & spin", "bg_holdspin", "Hold and spin background"),
+        ("loot link", "bg_lootlink", "Loot Link background"),
+        ("jackpot pick", "bg_jackpot", "Jackpot pick background"),
+        ("jackpot wheel", "bg_jackpot", "Jackpot wheel background"),
+        ("jackpot round", "bg_jackpot", "Jackpot round background"),
+        ("jackpot game", "bg_jackpot", "Jackpot game background"),
+        ("jackpot screen", "bg_jackpot", "Jackpot screen background"),
+        ("pick screen", "bg_pick", "Pick screen background"),
+        ("picker screen", "bg_pick", "Pick screen background"),
+        ("bonus round", "bg_bonus", "Bonus round background"),
+        ("bonus game", "bg_bonus", "Bonus game background"),
+        ("bonus mode", "bg_bonus", "Bonus mode background"),
+    ]
+
+    /// Scenes the document names, base game first. Deduplicated by scene id, so a
+    /// document saying "free games" six times still gets one background.
+    /// True when the words immediately before a mode name deny it.
+    ///
+    /// A GDD says what a game does NOT have as readily as what it does, and "No free
+    /// spins or bonus game." was building two paid 4K backgrounds for screens that do
+    /// not exist. Only the short run of text ahead of the phrase is considered — a "no"
+    /// in the previous sentence is about something else.
+    static func isNegated(_ t: String, at r: Range<String.Index>) -> Bool {
+        // Scope is the SENTENCE, not a fixed window. A denial governs a whole list —
+        // "no free spins or bonus game" denies both — so walking back word by word and
+        // stopping at the first ordinary word missed the second item every time.
+        // What a PREVIOUS sentence denied is a different matter, hence the boundary.
+        var lead = String(t[t.startIndex..<r.lowerBound])
+        if let cut = lead.lastIndex(where: { $0 == "." || $0 == ";" || $0 == "\n" }) {
+            lead = String(lead[lead.index(after: cut)...])
+        }
+        let words = lead.split(whereSeparator: { !$0.isLetter && $0 != "'" }).map(String.init)
+        let deny: Set<String> = ["no", "not", "none", "without", "never", "excludes",
+                                 "omits", "lacks", "neither", "nor"]
+        guard let last = words.lastIndex(where: { deny.contains($0) }) else { return false }
+        // "There is no wild, but free spins are awarded" — the turn reverses the denial.
+        let after = Set(words[words.index(after: last)...])
+        return after.isDisjoint(with: ["but", "however", "although", "though", "instead",
+                                       "whereas", "aside", "except"])
+    }
+
+    public static func scenes(in gddText: String) -> [(id: String, title: String)] {
+        var out: [(String, String)] = [("bg_base", "Base game background")]
+        var seen: Set<String> = ["bg_base"]
+        let t = gddText.lowercased()
+        // Once a phrase has matched a span of text, nothing else may match inside it.
+        // "free spins bonus game" is ONE mode; without this it matched "free spins
+        // bonus" and then "bonus game" again, and the game got two backgrounds for one
+        // screen — at 4K each.
+        var claimed: [Range<String.Index>] = []
+        for m in modes {
+            var from = t.startIndex
+            while let r = t.range(of: m.phrase, range: from..<t.endIndex) {
+                if !claimed.contains(where: { $0.overlaps(r) }), !isNegated(t, at: r) {
+                    claimed.append(r)
+                    if !seen.contains(m.id) { seen.insert(m.id); out.append((m.id, m.title)) }
+                }
+                from = r.upperBound
+            }
+        }
+        return out
+    }
+}
+
+/// The symbol set a game ACTUALLY shipped, read from its production asset manifest.
+///
+/// Some GDDs never list their symbols — 2690 Supercoco's only symbol codes appear in
+/// feature prose and inside a sound cue — so reading the document is the wrong place to
+/// look for the truth about that game. The truth is in the art it shipped, and that is
+/// recorded per game in a plain-text manifest of every PNG:
+///
+///     .../art/base/highPaySymbol/
+///      +-- base_HP1_static.png [240x240px]
+///     .../art/base/lowPaySymbol/
+///      +-- base_LP_1-static.png [240x240px]
+///     .../art/base/specialSymbol/
+///      +-- base_SF_1-front-static.png [240x240px]
+///
+/// Which is eleven symbols for that game, against the two its document yields.
+enum GameAssetManifest {
+
+    /// Folder names that say what a symbol IS, which is more reliable than the filename.
+    static let folderRoles: [(String, SlotSymbolRole)] = [
+        ("highpaysymbol", .highPay), ("mediumpaysymbol", .mediumPay), ("midpaysymbol", .mediumPay),
+        ("lowpaysymbol", .lowPay), ("specialsymbol", .collector), ("wildsymbol", .wild),
+        ("scattersymbol", .scatter), ("bonussymbol", .bonus), ("jackpotsymbol", .jackpot),
+        ("wysiwygsymbol", .wysiwyg),
+    ]
+
+    /// "base_HP1_static.png" -> HP1.  "base_LP_1-static.png" -> LP1.
+    /// "base_SF_1-front-static.png" -> SF1.
+    static func code(inFilename name: String) -> String? {
+        let up = name.uppercased()
+        // The code is a known prefix followed by an optional underscore and a number.
+        for (prefix, _) in GDDSymbolSetRules.prefixes {
+            guard let r = up.range(of: "(^|[_-])" + prefix + "_?([0-9]+)",
+                                   options: .regularExpression) else { continue }
+            let hit = up[r]
+            let digits = hit.drop { !$0.isNumber }
+            guard !digits.isEmpty else { continue }
+            return prefix + digits
+        }
+        return nil
+    }
+
+    /// Symbols the manifest shows the game shipped.
+    ///
+    /// Only the symbol folders are read: a manifest lists fonts, meters, bezels and
+    /// buttons too, and none of those is a reel symbol.
+    public static func symbols(fromManifest text: String) -> [SlotSymbol] {
+        var out: [SlotSymbol] = [], seen = Set<String>()
+        var folderRole: SlotSymbolRole? = nil
+        for raw in text.components(separatedBy: .newlines) {
+            let line = raw.replacingOccurrences(of: "\\", with: "")
+            let lower = line.lowercased()
+            // A folder line resets the context for the files beneath it.
+            if lower.contains("/art/") || lower.hasSuffix("/") {
+                folderRole = folderRoles.first { lower.contains($0.0) }?.1
+                if !lower.contains(".png") { continue }
+            }
+            guard lower.contains(".png"), let role = folderRole else { continue }
+            guard let file = line.components(separatedBy: " ").first(where: {
+                $0.lowercased().hasSuffix(".png")
+            }) ?? line.components(separatedBy: CharacterSet(charactersIn: " │├└─")).first(where: {
+                $0.lowercased().hasSuffix(".png")
+            }) else { continue }
+            guard let code = code(inFilename: file), !seen.contains(code) else { continue }
+            seen.insert(code)
+            let tier = GDDSymbolSetRules.classify(code).tier
+            out.append(SlotSymbol(code: code, index: out.count, role: role, tier: tier,
+                                  note: "from the game's shipped art"))
+        }
+        return out
+    }
+
+    /// The manifest file for a game number, among a folder's worth of them.
+    ///
+    /// They are named "<number>_<name>_production.txt", so the number is the key.
+    public static func fileName(forGame number: String, among files: [String]) -> String? {
+        let n = number.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return nil }
+        return files.first { $0.hasPrefix(n + "_") && $0.lowercased().hasSuffix(".txt") }
+    }
+
+    /// The leading game number in a document's name — "4400 Chevy-Hot GDD" -> "4400".
+    public static func gameNumber(inName name: String) -> String? {
+        let digits = name.prefix { $0.isNumber }
+        return digits.count >= 3 ? String(digits) : nil
+    }
+}
+
+/// Whether a symbol set is believable as a slot game's.
+///
+/// 2690 Supercoco has no symbol-set section at all. Its only symbol codes appear in
+/// prose ("scatters HP1 symbols") and inside a SOUND CUE parenthetical ("when WD1 has
+/// been consumed"), so reading it produced a two-symbol game — one wild, one high pay —
+/// and the window reported that as fact. The shipped art for that game is eleven
+/// symbols. No real slot machine has two.
+///
+/// This cannot know the right answer; it can know when the answer is not credible and
+/// say so, which is the difference between a wrong number and a wrong number nobody
+/// questioned.
+enum GDDSymbolPlausibility {
+
+    /// Below this, a symbol set is almost certainly incomplete rather than small.
+    static let leastCredible = 5
+
+    /// What is missing that essentially every slot game has.
+    static func concerns(_ symbols: [SlotSymbol]) -> [String] {
+        guard !symbols.isEmpty else { return [] }
+        var out: [String] = []
+        let drawable = symbols.filter { $0.role.needsArt }
+        if drawable.count < leastCredible {
+            out.append("only \(drawable.count) symbol\(drawable.count == 1 ? "" : "s") — a slot "
+                     + "game normally has eight or more")
+        }
+        let roles = Set(symbols.map(\.role))
+        if !roles.contains(.lowPay) { out.append("no low pays") }
+        if !roles.contains(.highPay) { out.append("no high pays") }
+        return out
+    }
+
+    /// One sentence for the user, or nil when the set looks normal.
+    static func warning(_ symbols: [SlotSymbol], inferred: Bool) -> String? {
+        let c = concerns(symbols)
+        guard !c.isEmpty else { return nil }
+        let head = inferred
+            ? "This document has no symbol list, and what could be read from it looks incomplete: "
+            : "This symbol set looks incomplete: "
+        return head + c.joined(separator: ", ")
+             + ". Check it against the game's own art list before generating anything."
+    }
+}
+
+/// The two prompts this feature is built on: one that DESIGNS the symbol set, and
+/// one that DRAWS a single symbol.
+///
+/// They are split because they are different jobs. Deciding that HP1 should be the
+/// giant's golden harp — and that nothing else in the set may be harp-shaped — is a
+/// language problem best done once, with every symbol visible at the same time. That
+/// is the only way silhouette collisions can be avoided at all; a per-image prompt
+/// cannot know what the other twenty images look like.
+public enum GDDAssetPrompts {
+
+    /// The designer pass. Sees the whole set at once, and answers with JSON.
+    public static let planningSystem = """
+    You are a senior art director for social casino slot machine games at High 5 Games. \
+    You design symbol sets that are sleek, rich and fun to look at — never childish, never \
+    cluttered, never generic. A player takes in a whole reel at a glance, so what matters \
+    most is that every symbol is instantly told apart from every other one, and that the \
+    value order is obvious without reading anything.
+
+    You will be given a game's symbol slots and a theme. Assign a specific art subject to \
+    every slot. Answer with JSON only — no commentary, no markdown fences.
+    """
+
+    /// The planning request. `jobs` carries the slots; the model fills in the subjects.
+    /// The shape the planner must answer in.
+    ///
+    /// Only the ENVELOPE is constrained — the fields must exist and be strings. `subject`
+    /// and `silhouette` are deliberately unbounded: the published work on forced
+    /// structured output finds the cost falls on creative content when the content itself
+    /// is constrained, and enumerating acceptable subjects would defeat the entire task.
+    public static func planSchema(ids: [String]) -> [String: Any] {
+        // Mirrors the shape apply(planJSON:to:) reads — "assets", with a palette
+        // alongside it. A schema that describes a DIFFERENT shape to the one the parser
+        // expects produces perfectly valid JSON that fills nothing, which is exactly what
+        // happened the first time: 0 of 20 slots, no error anywhere.
+        [
+            "type": "OBJECT",
+            "properties": [
+                "palette": [
+                    "type": "ARRAY",
+                    "description": "Five hex colours, #rrggbb, for the whole set.",
+                    "items": ["type": "STRING"],
+                ],
+                "assets": [
+                    "type": "ARRAY",
+                    "description": "One entry per slot, using these exact ids: "
+                                 + ids.joined(separator: ", "),
+                    "items": [
+                        "type": "OBJECT",
+                        "properties": [
+                            "id": ["type": "STRING"],
+                            "subject": ["type": "STRING",
+                                        "description": "One vivid sentence naming the "
+                                                     + "subject and its framing."],
+                            "silhouette": ["type": "STRING",
+                                           "description": "Its shape in one or two words."],
+                            "frame": ["type": "BOOLEAN"],
+                        ],
+                        "required": ["id", "subject", "silhouette", "frame"],
+                    ],
+                ],
+            ],
+            "required": ["assets"],
+        ]
+    }
+
+    public static func planning(theme: GameTheme, gameName: String, jobs: [AssetJob],
+                                gddText: String = "") -> String {
+        let features = GDDFeatureContext.excerpt(gddText)
+        let slotLines = jobs.map { j -> String in
+            let t = j.tier.map { " (tier \($0))" } ?? ""
+            return "- \(j.id): \(j.kind == .background ? "BACKGROUND" : j.role.label)\(t) — \(j.title)"
+        }.joined(separator: "\n")
+
+        return """
+        GAME: \(gameName)
+        \(features.isEmpty ? "" : """
+
+        WHAT THIS GAME DOES — from its own design document. Use it. A symbol that plays a
+        part in one of these features should LOOK like it does that job:
+        \(features)
+        """)
+
+        THEME: \(theme.name)\(theme.category.isEmpty ? "" : "  [\(theme.category)]")
+        ART DIRECTION (follow it closely):
+        \(styleBlock(theme))
+        \(theme.comparables.isEmpty ? "" : "Comparable games: \(theme.comparables)\n")\
+        \(theme.why.isEmpty ? "" : "Why this theme works: \(theme.why)\n")
+
+        \(SlotArtDirection.setRules)
+
+        WHAT EACH ROLE HAS TO BE — these decide the SUBJECT, so they belong to you, not
+        just to whoever draws it:
+        \(roleBrief(for: jobs))
+
+        SLOTS TO FILL (\(jobs.count)):
+        \(slotLines)
+
+        For EVERY slot above, choose the single art subject that fills it. Rules:
+        - Subjects must come from this theme's own world, and they must be the INTERESTING
+          choices from it. No generic casino filler, and no obvious first answer taken because
+          it was the first answer — a wild is not automatically a vortex, a scatter is not
+          automatically a glowing portal, a bonus is not automatically a treasure chest.
+        - Every subject must have a DIFFERENT silhouette from every other subject in this set.
+          Name each silhouette in one or two words and make sure no two match.
+        - Respect the value hierarchy and make it VISIBLE. The four high pays must be rankable
+          at a glance by what they are made of and how ornate they are; HP1 is the single most
+          desirable object in this world. Higher pays run warmer, hotter and richer than lower
+          pays unless the theme genuinely forbids it. All low pays must be ONE family, and they
+          are the plainest things in the set.
+        - Backgrounds are scenes, not objects, with an empty middle where the reels will sit.
+
+        Answer with this JSON and nothing else:
+        {
+          "palette": ["#rrggbb", "#rrggbb", "#rrggbb", "#rrggbb", "#rrggbb"],
+          "assets": [
+            {"id": "<slot id>", "subject": "<one vivid sentence naming the subject and its framing>",
+             "silhouette": "<one or two words>", "frame": true}
+          ]
+        }
+        "palette" is the 5 dominant colours this game's art will actually use.
+        "frame" says whether that symbol is drawn inside a frame, plaque or backing shape.
+        Card royals carry NO frame — the letterform is the symbol — and backgrounds never do.
+        Almost everything else does, and the frame must be the same treatment across a tier.
+        Include every slot id exactly once.
+        """
+    }
+
+    /// A one-line brief per role present in this set.
+    ///
+    /// The planner picks the SUBJECTS, so any rule that constrains what a symbol may BE
+    /// has to reach the planner — not only the prompt that draws it. Left out, the
+    /// planner chose four unrelated jackpot objects (crown, chalice, chest, medallion)
+    /// while the drawing prompt was separately insisting the four be one family: an
+    /// instruction that arrived far too late to be followed.
+    static func roleBrief(for jobs: [AssetJob]) -> String {
+        var lines: [String] = []
+        let roles = Set(jobs.filter { $0.kind == .symbol }.map(\.role))
+        if roles.contains(.jackpot) {
+            lines.append("- JACKPOTS: GRAND, MAJOR, MINOR and MINI must be ONE FAMILY — the same "
+                       + "object or construction, separated by colour and by the tier name the "
+                       + "game prints on them. Do NOT pick four unrelated treasures; a player "
+                       + "cannot rank a crown against a chalice against a chest.")
+        }
+        if roles.contains(.wild) {
+            lines.append("- WILD: a specific character, emblem, animal or signature object from "
+                       + "this theme. NOT a vortex, swirl, spiral or abstract energy — that is "
+                       + "the weakest answer and every game already has one.")
+        }
+        if roles.contains(.lowPay) {
+            lines.append("- LOW PAYS: choose ONE family for all of them and say which — royals "
+                       + "(A K Q J 10 7 5), gemstones, pebbles/tokens, or simple themed items. "
+                       + "Never a mixture: one pebble plus one royal plus one gem plus one item "
+                       + "is wrong. They are filler symbols and should be the plainest things "
+                       + "in the set.")
+        }
+        if roles.contains(.highPay) {
+            lines.append("- HIGH PAYS: rankable at a glance, HP1 the most desirable object in "
+                       + "the game and each one below it visibly less so.")
+        }
+        if roles.contains(.scatter) && roles.contains(.bonus) {
+            lines.append("- SCATTER and BONUS must be impossible to confuse: different subject, "
+                       + "different colour, different shape.")
+        }
+        if roles.contains(.wysiwyg) || roles.contains(.collector) || roles.contains(.multiplier)
+            || roles.contains(.activator) || roles.contains(.adder) {
+            lines.append("- WYSIWYG, COLLECTOR, ACTIVATOR, ADDER and MULTIPLIER symbols carry a "
+                       + "number the game prints at runtime, so their subject needs a calm area "
+                       + "for it — not a blank plate drawn into the art.")
+        }
+        if jobs.filter({ $0.role == .wysiwyg }).count > 1 {
+            lines.append("- The WYSIWYG symbols are ONE FAMILY at different value tiers, like the "
+                       + "jackpots: same object, separated by material and colour, not two "
+                       + "unrelated things. But they must still be tellable apart instantly — "
+                       + "two coins that differ only in a flame will read as the same symbol.")
+        }
+        return lines.isEmpty ? "- (nothing role-specific for this set)" : lines.joined(separator: "\n")
+    }
+
+    /// The drawing pass, for one symbol or background.
+    ///
+    /// The backing colour is stated in the strongest terms the prompt can manage,
+    /// because the entire alpha pipeline downstream depends on it: the symbol is keyed
+    /// off this colour in After Effects afterwards, and any of that colour inside the
+    /// art itself is punched out along with the background.
+    static func image(job: AssetJob, theme: GameTheme,
+                      backing: (name: String, rgb: RGB8)) -> String {
+        let hex = String(format: "#%02X%02X%02X", backing.rgb.r, backing.rgb.g, backing.rgb.b)
+        if job.kind == .background {
+            return """
+            A slot machine game BACKGROUND for "\(theme.name)".
+
+            SCENE: \(job.subject)
+
+            \(styleBlock(theme))
+
+            This background must look like it belongs to the SAME GAME as that game's symbols: \
+            same light direction (key from the upper left), same rendering treatment, same \
+            palette, same world. It is the stage those symbols stand on.
+
+            Composition: vertical mobile game background. Keep the CENTRE of the image calm, \
+            simple and uncluttered — the spinning reels sit there and must stay readable, and \
+            the symbols on top of it must stay legible against it, so keep the centre lower in \
+            contrast than the edges. Put the interest at the top, bottom and edges. Deep, rich, \
+            atmospheric. No characters in the centre.
+
+            ABSOLUTELY NO LETTERING. No game title, no logo, no wordmark, no signage, no
+            inscriptions, no runes, no invented script, no numerals — not on a banner, not
+            carved into stone, not on a pillar, not anywhere. A background with the game's
+            name painted across it cannot be shipped: the title is a separate asset the game
+            draws on top. This is the single most common way a generated background is
+            wasted.
+
+            No UI, no buttons, no meters, no reel frames, no symbols.
+
+            \(SlotArtDirection.antiPatterns)
+            """
+        }
+        return """
+        A single slot machine game SYMBOL for "\(theme.name)".
+
+        SUBJECT: \(job.subject)
+        SILHOUETTE: \(job.silhouette)
+        \(job.title.isEmpty ? "" : "WHAT THE DESIGN DOCUMENT CALLS IT: \(job.title)")
+
+        \(styleBlock(theme))
+
+        \(SlotArtDirection.direction(for: job.role, tier: job.tier))
+
+        \(job.hasFrame
+          ? "FRAME: draw this symbol inside a frame, plaque or backing shape, as part of the same picture — the frame and the subject must be lit and painted together so they belong to each other. Use the same frame treatment every symbol of this tier uses."
+          : "NO FRAME: this symbol stands on its own, with no border, plaque or backing shape around it.")
+
+        \(SlotArtDirection.setConsistency)
+
+        \(SlotArtDirection.houseStyle)
+
+        \(SlotArtDirection.antiPatterns)
+
+        BACKDROP: the symbol sits alone on a completely flat, uniform \(backing.name) field, \
+        exactly \(hex), edge to edge, with no gradient, no vignette, no shadow cast onto it and \
+        no pattern. Do NOT use \(backing.name) anywhere in the symbol itself.
+
+        That field is a BACKDROP and it will be cut away. It is not part of the design. If this \
+        symbol needs a backing plate, frame or plaque behind its subject, DRAW one — as artwork, \
+        in the theme's own materials — rather than letting the flat field stand in for it. A \
+        symbol that relies on the backdrop as its background is destroyed the moment it is cut \
+        out.
+        \(exclusions(job))
+        """
+    }
+
+    /// The closing DON'T list, which has to agree with everything above it.
+    ///
+    /// It used to be one fixed line, and it contradicted the prompt it closed. A framed
+    /// symbol was told "draw this symbol inside a frame, plaque or backing shape" and
+    /// then, last thing before the model starts drawing, "NO frame or border around the
+    /// symbol". A card royal — which the low-pay direction explicitly allows, and whose
+    /// letterform IS the symbol — was told "NO text, NO numbers, NO lettering".
+    ///
+    /// The last instruction in a prompt is the one that carries, so these were not
+    /// harmless: they were the instruction the model actually followed, on images
+    /// someone paid for.
+    static func exclusions(_ job: AssetJob) -> String {
+        var no = ["NO watermark", "NO drop shadow", "NO reel", "NO user interface"]
+        if !job.hasFrame { no.insert("NO frame or border around the symbol", at: 0) }
+        if isRoyal(job) {
+            // The rank is the subject. Everything else that reads as text still isn't.
+            return "The rank character is the subject and must be drawn. Apart from it: "
+                 + no.joined(separator: ", ")
+                 + ", NO extra lettering, NO numbers other than the rank. "
+                 + "One symbol only, centred, complete."
+        }
+        no.insert("NO text, NO numbers, NO lettering", at: 0)
+        return no.joined(separator: ", ") + ". One symbol only, centred, complete."
+    }
+
+    /// A card royal — A, K, Q, J, 10, 9 — whose letterform is the artwork.
+    static func isRoyal(_ job: AssetJob) -> Bool {
+        // Keywords only. Matching bare rank letters against the subject looked obvious
+        // and was wrong immediately: "a giant" contains "a", so the most common word in
+        // English turned a high pay into a royal and dropped "NO text" from its prompt.
+        // A royal always says so in words — the planner is told to name it.
+        let t = (job.subject + " " + job.silhouette).lowercased()
+        for k in ["royal", "card rank", "playing card", "card suit", "rank symbol"]
+        where t.contains(k) { return true }
+        // "letter A", "rank K", "the 10" — the rank named, not merely present.
+        let words = t.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        for (i, w) in words.enumerated() where w == "letter" || w == "rank" {
+            if i + 1 < words.count,
+               ["a", "k", "q", "j", "10", "9"].contains(words[i + 1]) { return true }
+        }
+        return false
+    }
+
+    /// A SHORT drawing prompt — the whole brief in roughly 200 words.
+    ///
+    /// The full prompt is ~1,460 words and 29 bullet rules. Measured: a rule added to it
+    /// to stop the model drawing a cartoon contour changed nothing across 59 images
+    /// (43.9% -> 43.5% of the silhouette carrying a dark rim). Google's guidance is to
+    /// write a specific brief rather than a rule list, and the plausible reading is that
+    /// a 29-rule contract dilutes every clause in it.
+    ///
+    /// Structure follows that guidance: subject and rendering together at the top, then
+    /// geometry, then the backdrop, then one short exclusion line. Nothing here is new
+    /// direction — it is the same requirements, stated once each instead of argued.
+    static func imageShort(job: AssetJob, theme: GameTheme,
+                           backing: (name: String, rgb: RGB8)) -> String {
+        let hex = String(format: "#%02X%02X%02X", backing.rgb.r, backing.rgb.g, backing.rgb.b)
+        let lit = wantsLineWork(theme)
+            ? ""
+            : "Lit, not inked: it is separated from the background by light and by painted "
+            + "colour meeting, with a rim light along the lit edges and no drawn contour. "
+        let style = theme.chosenStyle.map { "\($0.name). \($0.keywords)" }
+            ?? (theme.styleFromArt.split(separator: "\n").first.map(String.init) ?? theme.look)
+        if job.kind == .background {
+            return """
+            Draw a slot-machine game BACKGROUND: \(job.subject).
+
+            RENDERING: \(style) \(lit)\(theme.look)
+
+            A deep scene with its focus and detail around the edges and the CENTRE kept \
+            calm and uncluttered — the reels sit over the middle and must stay readable. \
+            One consistent light direction. No characters in the centre, no text, no \
+            lettering of any kind, no user interface, no reel frames.
+            """
+        }
+        let frame = job.hasFrame
+            ? "It sits in a frame or plaque drawn as part of the same picture, lit and painted with it."
+            : "It stands on its own, with no border or backing shape."
+        // The role's direction, trimmed to whole sentences. A hard character cut left
+        // the brief ending "less precious material (gold, then bronze, then wood or".
+        let full = SlotArtDirection.direction(for: job.role, tier: job.tier)
+            .split(separator: "\n").dropFirst().joined(separator: " ")
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespaces)
+        var role = ""
+        for sentence in full.split(separator: ".", omittingEmptySubsequences: true) {
+            let next = role + sentence.trimmingCharacters(in: .whitespaces) + ". "
+            if next.count > 340 { break }
+            role = next
+        }
+        if role.isEmpty { role = String(full.prefix(200)) }
+        return """
+        Draw ONE slot-machine game symbol: \(job.subject).
+
+        RENDERING: \(style) \(lit)\(theme.look)
+
+        \(role.trimmingCharacters(in: .whitespaces))
+        \(frame)
+        Centred, upright and complete, filling the frame with a clear distinctive \
+        silhouette. Give it a pose with life in it rather than a catalogue photograph. \
+        Concentrate detail at the focal feature and keep the other surfaces broad, so it \
+        still reads at 120 pixels on a phone.
+
+        BACKDROP: a completely flat, uniform \(backing.name) field, exactly \(hex), edge \
+        to edge, no gradient and no shadow. Do NOT use \(backing.name) anywhere in the \
+        symbol. That field will be cut away, so draw any plate or frame the symbol needs.
+
+        \(exclusions(job))
+        """
+    }
+
+    /// The art direction, strongest evidence first.
+    ///
+    /// `styleFromArt` is read off the theme's OWN reference artwork on the hub and is
+    /// the only part that describes how the art is rendered, so it leads. Without it
+    /// the model has nothing but adjectives about colour and invents the medium.
+    static func styleBlock(_ theme: GameTheme) -> String {
+        var out = ""
+        // A chosen style REPLACES the one read from the reference art — it never joins
+        // it. Two rendering directions in one prompt is the single most reliable way to
+        // get art that matches neither, and this pair would contradict directly: one
+        // says "painterly, warm, soft-edged", the other "crisp flat cel shading".
+        //
+        // THEME & LOOK stays either way. That describes the WORLD, not the rendering,
+        // and picking a style is not a decision to draw a different game.
+        if let style = theme.chosenStyle {
+            out += """
+            ART STYLE — match this closely. It governs the rendering of every asset in \
+            this set, and it replaces any other reading of how this game looks:
+            \(style.name). \(style.keywords)
+
+            """
+        } else if !theme.styleFromArt.isEmpty {
+            out += """
+            ART STYLE — match this closely. It is taken from this game's own approved \
+            reference artwork, and it governs the rendering:
+            \(theme.styleFromArt)
+
+            """
+        }
+        out += "THEME & LOOK: \(theme.look)"
+        if !theme.comparables.isEmpty { out += "\nComparable games: \(theme.comparables)" }
+        // The edge spec goes through styleBlock because all three prompts already call
+        // it — the planner, the symbol pass and the background pass. Adding it to each
+        // of them separately is how the anti-pattern list reached the symbols and not
+        // the backgrounds, and the backgrounds came back covered in invented lettering.
+        if wantsLineWork(theme) == false {
+            // The single sentence that matters goes INTO the style definition, at the top,
+            // rather than only appearing as a rule among twenty-nine others further down.
+            // Measured: the rule on its own, two paragraphs later, changed nothing —
+            // 43.9% of the silhouette carrying a dark rim before, 43.5% after.
+            out = "RENDERING: this art is lit, not inked — forms are separated from the "
+                + "background by light and by painted colour meeting, with a rim light "
+                + "along the lit edges and no drawn contour anywhere.\n\n" + out
+            out += "\n\n" + SlotArtDirection.edgeTreatment(allowRimGlow: wantsRimGlow(theme))
+        }
+        return out
+    }
+
+    /// True when line work belongs to this game's art rather than being a defect in it.
+    ///
+    /// A chosen style says so in its own keywords. With no chosen style the rendering
+    /// comes from the theme's reference artwork, so that description is checked the same
+    /// way — if the approved art for this game is inked, suppressing ink would fight the
+    /// very thing the style was read from.
+    /// True when a luminous rim along the silhouette belongs to this game's art.
+    ///
+    /// Found by running it: Wild Wolves' approved artwork was described as having "a
+    /// bright golden luminous rim-glow following the outer silhouettes", and the prompt
+    /// then told the model, two paragraphs later, to draw no glow following the
+    /// silhouette. A rim glow is a legitimate treatment; the die-cut sticker band and the
+    /// inked contour are not, and those stay forbidden either way.
+    static func wantsRimGlow(_ theme: GameTheme) -> Bool {
+        let terms = ["rim-glow", "rim glow", "rim light", "rim-light", "rim lighting",
+                     "luminous rim", "glowing rim", "halo", "bloom"]
+        if let s = theme.chosenStyle {
+            return mentionsUnnegated(terms, in: s.keywords)
+        }
+        if let v = verdict("RIM-GLOW", in: theme.styleFromArt) { return v.hasPrefix("yes") }
+        return mentionsUnnegated(terms, in: theme.styleFromArt)
+    }
+
+    static func wantsLineWork(_ theme: GameTheme) -> Bool {
+        if let s = theme.chosenStyle { return s.usesLineWork }
+        // The style read ends with a machine-readable verdict. Prefer it: the prose
+        // around it is written fresh every time and says the same thing five ways.
+        // EITHER signal counts, rather than the verdict silencing the prose.
+        //
+        // Measured on real cards: Dragon Fantasy's "intricate embossed relief" made the
+        // verdict flip none/outline/outline across three reads of the SAME artwork, so
+        // whether suppression applied was a coin toss. Tightening the criterion fixed
+        // that but then answered "none" for Snow Queen, whose own description says
+        // "delicate, crisp dark line art" — which would have put the prompt back in the
+        // business of contradicting itself, telling the model "lit, not inked" directly
+        // under a style paragraph describing ink.
+        //
+        // So the verdict decides the ambiguous cases and the prose vetoes it when the
+        // description plainly says otherwise.
+        // "contour" alone is NOT one of these. In art writing a contour is the edge of a
+        // form — "soft contours", "smooth contour shading" — not a drawn line, and it
+        // misread Wild Bears as inked when its own verdict said none. Only phrases that
+        // can only mean a DRAWN mark qualify. Same over-broad matching that once read
+        // "velocity" as containing a city and the article "a" as a card rank.
+        let terms = ["outline", "line art", "lineart", "keyline", "line work",
+                     "linework", "contour line", "inked contour", "ink contour",
+                     "ink line", "cel shad", "cel-shad"]
+        if let v = verdict("EDGE-TREATMENT", in: theme.styleFromArt), v.contains("outline") {
+            return true
+        }
+        return mentionsUnnegated(terms, in: theme.styleFromArt)
+    }
+
+    /// Read a trailing "KEY: value" verdict out of a style description.
+    static func verdict(_ key: String, in text: String) -> String? {
+        for raw in text.split(separator: "\n").reversed() {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard line.lowercased().hasPrefix(key.lowercased() + ":") else { continue }
+            return String(line.dropFirst(key.count + 1))
+                .trimmingCharacters(in: .whitespaces).lowercased()
+        }
+        return nil
+    }
+
+    /// True when a term appears and is NOT negated by the words just before it.
+    ///
+    /// The fallback path used a bare substring test, and a description reading "No drawn
+    /// contour; forms are separated by painted colour" therefore matched "contour" and
+    /// concluded the art was inked — turning the suppression OFF on exactly the artwork
+    /// that needed it. The same mistake as reading "no free spins" as a free-spins mode.
+    static func mentionsUnnegated(_ terms: [String], in text: String) -> Bool {
+        let k = text.lowercased()
+        for t in terms {
+            var from = k.startIndex
+            while let r = k.range(of: t, range: from..<k.endIndex) {
+                let back = k.index(r.lowerBound, offsetBy: -24, limitedBy: k.startIndex)
+                    ?? k.startIndex
+                let lead = String(k[back..<r.lowerBound])
+                let negated = ["no ", "not ", "without ", "none", "never ", "free of ",
+                               "absent", "lacks"].contains { lead.contains($0) }
+                if !negated { return true }
+                from = r.upperBound
+            }
+        }
+        return false
+    }
+
+    /// Ask the model to read a symbol set out of a document that has no machine-readable
+    /// one.
+    ///
+    /// The GDDs are not written to one template. Some list "0 WD1 // wild symbol", some
+    /// carry a Word table that exports as a column of bare codes, and some simply say
+    /// "Symbols (16 total) / 4 high-value symbols / 4 low-value symbols / Wild — …" in
+    /// prose. No parser is going to cover the third kind, and refusing those games is
+    /// worse than spending a fraction of a cent reading them properly.
+    static let symbolExtractionSystem = """
+    You are a slot machine producer who reads Game Design Documents and works out the \
+    full list of art assets the game needs. You are good at this because you know these \
+    documents are inconsistent: some list their symbols, many do not, and the ones that \
+    do not still contain the answer — in the feature prose, in the sound-asset names, in \
+    the paytable, in what the mechanics require to exist. You reconstruct the set from \
+    whatever the document gives you, and you say plainly what you inferred rather than \
+    what you read. You answer with JSON only — no commentary, no markdown fences.
+    """
+
+    static func symbolExtraction(gddText: String, limit: Int = 14000) -> String {
+        """
+        Work out every SYMBOL this game needs art for, and what each one is FOR.
+
+        Many of these documents have no symbol list at all. That is normal and it is not a
+        reason to give up: reconstruct the set from everything the document does contain.
+
+        WHERE THE ANSWER HIDES WHEN THERE IS NO LIST:
+        - Feature prose: "there are 2 special trigger symbols", "a front, a mid and an end
+          wild piece", "four high-value symbols", "the collector gathers the coins".
+        - Sound and asset naming: "base_HP (1-3)" means three high pays, HP1 to HP3.
+          "base_SF_1 / SF_2 / SF_3" means three special-feature pieces.
+        - Mechanics that REQUIRE a symbol to exist: a jackpot ladder implies a symbol per
+          tier; a collect feature implies something collected and something collecting.
+        - The paytable, if there is one.
+
+        Do NOT treat a code mentioned in passing as a symbol definition on its own. A code
+        inside a sound cue — "(when WD1 has been consumed)" — tells you a wild exists; it
+        does not tell you the game has exactly one symbol.
+
+        CODES: use the document's own where it gives them. Otherwise use the convention:
+        WD wild, HP1..HPn high pays (HP1 highest), MP1..MPn medium pays, LP1..LPn low pays,
+        SC scatter, BO bonus, JP1..JP4 jackpots (Grand, Major, Minor, Mini), WY WYSIWYG
+        cash-value symbols, SF collector/activator/adder, MU multiplier, R replacement,
+        BL blank.
+
+        For EACH symbol also say what it DOES and what it INTERACTS with, in the game's own
+        terms — that is what makes the art purposeful rather than decorative. A collector
+        that gathers coins should look like it gathers; a wild that extends a chain should
+        look like a piece of that chain.
+
+        Answer with this JSON and nothing else:
+        {"symbols":[
+          {"code":"HP1","role":"highPay","does":"<what it does, or empty>",
+           "interacts":"<what it works with, or empty>","confident":true}
+        ]}
+        role is one of: wild, highPay, mediumPay, lowPay, scatter, bonus, jackpot,
+        wysiwyg, collector, activator, adder, multiplier, replacement, blank.
+        "confident" is false when you inferred the symbol rather than found it stated.
+        Do not invent symbols the game has no use for, and do not list blanks as art.
+
+        DOCUMENT:
+        \(String(gddText.prefix(limit)))
+        """
+    }
+
+    /// Turn that answer into symbols. Unknown roles fall back to the code's own prefix
+    /// rather than being dropped, so a model that answers with a good code and a bad role
+    /// still produces a usable slot.
+    static func symbols(fromExtraction json: [String: Any]) -> [SlotSymbol] {
+        var out: [SlotSymbol] = [], seen = Set<String>()
+        for case let e as [String: Any] in (json["symbols"] as? [Any] ?? []) {
+            guard let code = (e["code"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+                  !code.isEmpty, !seen.contains(code) else { continue }
+            seen.insert(code)
+            let byCode = GDDSymbolSetRules.classify(code)
+            let role = (e["role"] as? String).flatMap { SlotSymbolRole(rawValue: $0) }
+            // What it does and what it works with, joined into the note the planner and
+            // the artist both read. A collector that gathers coins should look like it
+            // gathers; that only happens if the behaviour survives extraction.
+            let does = (e["does"] as? String) ?? (e["note"] as? String) ?? ""
+            let with = (e["interacts"] as? String) ?? ""
+            var note = does
+            if !with.isEmpty { note += note.isEmpty ? "works with \(with)" : " — works with \(with)" }
+            if (e["confident"] as? Bool) == false { note += note.isEmpty ? "inferred" : " (inferred)" }
+            out.append(SlotSymbol(code: code, index: out.count,
+                                  role: (role ?? byCode.role).refined(byNote: does),
+                                  tier: byCode.tier, note: note))
+        }
+        return out
+    }
+
+    /// Pull the planner's JSON out of whatever it actually answered with.
+    ///
+    /// Models wrap JSON in ``` fences, or open with a sentence, often enough that
+    /// treating the reply as raw JSON fails intermittently — and an intermittent
+    /// failure halfway through a 20-symbol run is worse than no feature at all.
+    public static func json(fromModelReply reply: String) -> [String: Any]? {
+        var s = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let f = s.range(of: "```") {
+            let after = s[f.upperBound...]
+            // ```json\n{...}\n```
+            let body = after.drop { $0 != "\n" }
+            if let close = body.range(of: "```") {
+                s = String(body[..<close.lowerBound])
+            } else { s = String(body) }
+        }
+        guard let open = s.firstIndex(of: "{"), let close = s.lastIndex(of: "}"), open < close
+        else { return nil }
+        let slice = String(s[open...close])
+        return (try? JSONSerialization.jsonObject(with: Data(slice.utf8))) as? [String: Any]
+    }
+
+    /// Merge the planner's answer back onto the jobs. Returns the filled jobs plus the
+    /// ids it failed to answer for, so the caller can say exactly what is missing
+    /// instead of generating a symbol with an empty subject.
+    static func apply(planJSON: [String: Any], to jobs: [AssetJob])
+        -> (jobs: [AssetJob], missing: [String], palette: [RGB8]) {
+        var bySubject: [String: (String, String)] = [:]
+        var frames: [String: Bool] = [:]
+        for case let a as [String: Any] in (planJSON["assets"] as? [Any] ?? []) {
+            guard let id = a["id"] as? String else { continue }
+            bySubject[id] = ((a["subject"] as? String ?? ""), (a["silhouette"] as? String ?? ""))
+            frames[id] = (a["frame"] as? Bool) ?? ((a["frame"] as? NSNumber)?.boolValue ?? false)
+        }
+        var out: [AssetJob] = [], missing: [String] = []
+        for var j in jobs {
+            let subj = (bySubject[j.id]?.0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !subj.isEmpty else {
+                // CLEAR it rather than leaving the previous run's subject in place.
+                // Designing the set a second time and getting a shorter answer used to
+                // leave the old subject sitting there — reported as missing, but still
+                // carrying text, so generation drew it anyway and charged for it.
+                missing.append(j.id)
+                j.subject = ""; j.silhouette = ""
+                out.append(j); continue
+            }
+            j.subject = subj
+            j.silhouette = (bySubject[j.id]?.1 ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            j.hasFrame = frames[j.id] ?? false
+            out.append(j)
+        }
+        let palette = (planJSON["palette"] as? [Any] ?? [])
+            .compactMap { ($0 as? String).flatMap(SlotBackingRules.hex) }
+        return (out, missing, palette)
+    }
+
+    /// Silhouettes the planner reused. Empty is the goal; anything here is a real
+    /// defect in the set the user should see before spending credits on it.
+    /// Words too generic to make two symbols alike on their own.
+    static let weakWords: Set<String> = ["golden", "gold", "magic", "magical", "glowing",
+                                         "enchanted", "ornate", "giant", "great", "the",
+                                         "shining", "sparkling", "bright", "large", "small"]
+
+    /// The words in a silhouette that actually distinguish it.
+    static func significantWords(_ s: String) -> Set<String> {
+        Set(s.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count > 2 && !weakWords.contains($0) })
+    }
+
+    public static func silhouetteClashes(_ jobs: [AssetJob]) -> [String: [String]] {
+        var byShape: [String: [String]] = [:]
+        for j in jobs where j.kind == .symbol {
+            let k = j.silhouette.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !k.isEmpty else { continue }
+            byShape[k, default: []].append(j.id)
+        }
+        var out = byShape.filter { $0.value.count > 1 }
+
+        // Exact matches are the easy half. "Fireball Coin" and "Flaming Coin" are two
+        // different strings and two symbols that will look the same on a reel, and a
+        // plain equality check waves them straight through — which is what happened in a
+        // real plan. Two silhouettes sharing a meaningful noun are reported too.
+        let named = jobs.filter { $0.kind == .symbol && !$0.silhouette.isEmpty }
+        for i in named.indices {
+            for k in named.indices where k > i {
+                guard named[i].silhouette.lowercased() != named[k].silhouette.lowercased()
+                else { continue }
+                // Sharing a word inside a family role is the POINT, not a fault — low pays
+                // are one family by rule, jackpots are one shared construction. Flagging
+                // "wooden (LP1…LP4)" or "chest (JP1…JP4)" told the user their correct set
+                // was broken. Two members of a family clash only when literally identical.
+                if named[i].role == named[k].role && named[i].role.isFamily { continue }
+                let shared = significantWords(named[i].silhouette)
+                    .intersection(significantWords(named[k].silhouette))
+                guard let word = shared.sorted().first else { continue }
+                out[word, default: []].append(contentsOf: [named[i].id, named[k].id])
+            }
+        }
+        return out.mapValues { Array(Set($0)).sorted() }.filter { $0.value.count > 1 }
     }
 }
