@@ -7589,6 +7589,18 @@ public enum GDDSymbolSetRules {
     ///
     /// Deliberately stricter than "starts with a known prefix": the prefix has to be
     /// followed by nothing or by digits, so "HPs" is a group name and "HOPJE" is a word.
+    /// Whether the text names any numbered symbol code at all — HP1, LP5, WD1, BO3.
+    ///
+    /// Decides whether a document is worth re-reading as .docx. That second read exists
+    /// for a set declared in a table, which plain text flattens; but flattening moves the
+    /// words, it does not remove them. A document whose text names no code cannot have a
+    /// table of codes in its .docx either, and re-reading it downloaded every embedded
+    /// image — up to 69 MB, ~30 s — to confirm there was nothing there.
+    public static func mentionsNumberedSymbolCode(_ text: String) -> Bool {
+        text.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .contains { $0.contains(where: \.isNumber) && isSymbolCode(String($0)) }
+    }
+
     static func isSymbolCode(_ field: String) -> Bool {
         let up = field.uppercased()
         guard up.count >= 2, up.count <= 6, up.allSatisfy({ $0.isLetter || $0.isNumber }),

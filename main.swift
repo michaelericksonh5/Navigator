@@ -21067,8 +21067,21 @@ if CommandLine.arguments.contains("--gdd-window-test") {
     app.setActivationPolicy(.accessory)
     guard let folder = GDDLibrary.folder else { print("No GDD folder set"); exit(2) }
     let hidden = GDDScanRules.hiddenKeys(GDDLibrary.scanResults)
-    let shown = GDDLibrary.entries(in: folder).filter { !hidden.contains($0.key) }
-    print("picker shows \(shown.count) document(s)")
+    // --all: every document in the folder, not just the ones the picker shows. A GDD added
+    // tomorrow goes through the same read as any of today's hidden ones.
+    let all = CommandLine.arguments.contains("--all")
+    let shown = GDDLibrary.entries(in: folder).filter { all || !hidden.contains($0.key) }
+    print(all ? "reading all \(shown.count) document(s) in the folder" : "picker shows \(shown.count) document(s)")
+    // --cold: start from an empty HTTP cache, so no read is served from an earlier one.
+    // Cookies are kept — clearing them would sign Google out.
+    if CommandLine.arguments.contains("--cold") {
+        let sem = DispatchSemaphore(value: 0)
+        WKWebsiteDataStore.default().removeData(
+            ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeFetchCache],
+            modifiedSince: .distantPast) { sem.signal() }
+        while sem.wait(timeout: .now() + 0.05) == .timedOut { RunLoop.main.run(until: Date() + 0.05) }
+        print("HTTP cache cleared (sign-in kept)")
+    }
     var failures = 0, hubDone = false, docsDone = false
     func maybeExit() { if hubDone && docsDone { print(failures == 0 ? "\nALL OK" : "\n\(failures) FAILED"); exit(failures == 0 ? 0 : 1) } }
     DispatchQueue.main.async { MainActor.assumeIsolated {
@@ -22165,6 +22178,11 @@ enum GDDLibrary {
                           Date().timeIntervalSince(asked), symbols.count))
             if let t, !symbols.isEmpty,
                GDDSymbolPlausibility.warning(symbols, inferred: false, gddText: t) == nil {
+                completion(t, nil); return
+            }
+            // No set, and not a single symbol code anywhere in the text: the .docx has the
+            // same words, so it cannot have a table of codes. Done, without the download.
+            if let t, symbols.isEmpty, !GDDSymbolSetRules.mentionsNumberedSymbolCode(t) {
                 completion(t, nil); return
             }
             docx(t)
