@@ -21058,6 +21058,88 @@ if let flag = CommandLine.arguments.firstIndex(of: "--style-test") {
     app.run()
 }
 
+// Every document the GDD to Assets picker shows, read the way the window reads it:
+// the same list (folder minus the documents the saved scan hides), the same
+// GDDLibrary.text, the same GDDToAssetsRun.load — with the theme hub starting at the
+// same instant as the first document, as it does when the window opens. No AI calls.
+//   Navigator --gdd-window-test
+if CommandLine.arguments.contains("--gdd-window-test") {
+    app.setActivationPolicy(.accessory)
+    guard let folder = GDDLibrary.folder else { print("No GDD folder set"); exit(2) }
+    let hidden = GDDScanRules.hiddenKeys(GDDLibrary.scanResults)
+    let shown = GDDLibrary.entries(in: folder).filter { !hidden.contains($0.key) }
+    print("picker shows \(shown.count) document(s)")
+    var failures = 0, hubDone = false, docsDone = false
+    func maybeExit() { if hubDone && docsDone { print(failures == 0 ? "\nALL OK" : "\n\(failures) FAILED"); exit(failures == 0 ? 0 : 1) } }
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        ThemeHubClient.themes { list, err in
+            print(list.map { "hub: \($0.count) themes" } ?? "hub: FAILED — \(err ?? "?")")
+            if list == nil { failures += 1 }
+            // The hub's own count, from the same page, to check Navigator against.
+            let audit = """
+            \(ThemeHubClient.settleJS)
+            const cards = [...document.querySelectorAll('.card[data-name]')].filter(c => !c.classList.contains('hidden'));
+            const all = [...document.querySelectorAll('button, [role=tab], a, span, div')]
+              .filter(e => e.children.length <= 2)
+              .map(e => e.textContent.trim().replace(/\\s+/g, ' '))
+              .filter(t => /^All\\b/i.test(t) && /\\d/.test(t) && t.length < 24);
+            return JSON.stringify({ total: cards.length,
+                                    hidden: cards.filter(c => c.classList.contains('hidden')).length,
+                                    allCounter: [...new Set(all)].slice(0, 3),
+                                    names: cards.map(c => c.getAttribute('data-name') || '') });
+            """
+            if let base = GoogleWebSession.themeHubURL, let url = URL(string: base) {
+                GoogleWebSession.shared.evaluate(url: url, js: audit) { v, e in
+                    if let str = v as? String, let d = str.data(using: .utf8),
+                       let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+                        let names = o["names"] as? [String] ?? []
+                        let got = Set((list ?? []).map(\.name))
+                        let missing = names.filter { !got.contains($0) }
+                        print("hub page: \(o["total"] ?? "?") cards, \(o["hidden"] ?? "?") hidden, counter \(o["allCounter"] ?? "?")")
+                        print("hub page: missing from Navigator (\(missing.count)): \(missing)")
+                        print("hub page: their positions among \(names.count) cards: \(missing.compactMap { names.firstIndex(of: $0) })")
+                        // Read again, warm, in the same session: does a second extraction catch them?
+                        ThemeHubClient.themes { again, _ in
+                            let got2 = Set((again ?? []).map(\.name))
+                            print("hub: second read \(again?.count ?? 0) themes; still missing: \(names.filter { !got2.contains($0) })")
+                            hubDone = true; maybeExit()
+                        }
+                        if !missing.isEmpty { failures += 1 }
+                        return
+                    } else { print("hub page: audit failed — \(e ?? "?")") }
+                    hubDone = true; maybeExit()
+                }
+            } else { hubDone = true; maybeExit() }
+        }
+        @MainActor func next(_ i: Int) {
+            guard i < shown.count else { docsDone = true; maybeExit(); return }
+            let e = shown[i], t0 = Date()
+            GDDLibrary.text(of: e) { text, err in
+                let secs = Date().timeIntervalSince(t0)
+                guard let text else {
+                    failures += 1
+                    print(String(format: "FAIL  %-52@ could not read: %@", e.uniqueName as NSString, (err ?? "?") as NSString))
+                    return next(i + 1)
+                }
+                let run = GDDToAssetsRun()
+                run.load(gddText: text, gameName: e.name, size: AssetPlanRules.defaultSize,
+                         symbolAspect: AssetPlanRules.symbolAspect,
+                         backgroundAspect: AssetPlanRules.backgroundAspect,
+                         backgroundSize: AssetPlanRules.backgroundSize)
+                let n = run.symbols.count
+                if n == 0 { failures += 1 }
+                print(String(format: "%@  %-52@ %3d symbols  %3d images  %4.1fs%@%@", n == 0 ? "FAIL" : "ok  ",
+                             e.uniqueName as NSString, n, run.jobs.count, secs,
+                             (run.fromShippedArt ? "  (from shipped art)" : "") as NSString,
+                             (run.plausibilityWarning.map { "  ⚠︎ " + $0.prefix(70) } ?? "") as NSString))
+                next(i + 1)
+            }
+        }
+        next(0)
+    } }
+    app.run()
+}
+
 // The collision that broke GDD to Assets: the theme hub and a GDD export in flight at the
 // same moment through the one Google web session. No AI calls — list and export only.
 //   Navigator --google-queue-test <out-dir> <gdd-folder>
@@ -21556,30 +21638,87 @@ enum ThemeHubClient {
     ///
     /// The text is ~80 KB. Art is fetched one image at a time, for the one theme the
     /// user actually picked — see artJS.
-    static let extractionJS = """
-    // Wait for the grid to finish building before reading it.
-    //
-    // The hub renders its cards from JS, and extracting the moment the page reported
-    // "finished loading" caught it mid-build: the app listed 111 themes where the hub's
-    // own counter said 112. One missing theme is invisible unless you count them, and
-    // nobody counts 112 of anything.
-    const ready = async () => {
-      let last = -1;
-      for (let i = 0; i < 60; i++) {
-        const grid = document.querySelector('.grid.ready');
-        const n = document.querySelectorAll('.card[data-name]').length;
-        if (grid && n > 0 && n === last) return n;
-        last = n;
+    /// Wait until the hub page has applied its own live data, then until it stops changing.
+    ///
+    /// The page ships a fixed set of cards in its HTML, fetches the live state from
+    /// /api/state (themes people added, deletions, tiers, votes, art), and only then
+    /// removes the deleted cards, appends the added ones and applies the art. It also sets
+    /// `.grid.ready` from a 3-second FALLBACK timer, so over a slow link the grid reports
+    /// ready before any of that has happened. Trusting that flag, Navigator read 107
+    /// themes where the page, a moment later, showed 111 — the four missing were exactly
+    /// the user-added ones, appended at the end — and a second read could catch deleted
+    /// themes still present. The art fetch had no wait at all.
+    ///
+    /// So ask the page's own source of truth what should be there, and wait until the
+    /// page shows exactly that: every added theme present, every deleted one gone, and
+    /// cards and images unchanged for 0.8 s. A page that never gets there is an error to
+    /// report, not a partial list to hand back.
+    static let settleJS = """
+    const settle = async () => {
+      const t0 = Date.now();
+      let want = [], gone = [], fetched = 'not tried', tries = [];
+      // The page's own source of truth. Retried, because a list read without it can only
+      // be checked against the page's weak "ready" flag — the failure this exists to stop.
+      for (let attempt = 1; attempt <= 4 && fetched.indexOf('ok') !== 0; attempt++) {
+        try {
+          const r = await fetch('/api/state', { cache: 'no-store', credentials: 'same-origin' });
+          const type = r.headers.get('content-type') || '';
+          if (r.ok && type.indexOf('json') >= 0) {
+            const j = await r.json();
+            gone = (j.deleted || []).filter(Boolean);
+            want = (j.custom || []).map(c => c && c.n).filter(n => n && !gone.includes(n));
+            fetched = 'ok (attempt ' + attempt + ')';
+          } else {
+            fetched = 'HTTP ' + r.status + ' ' + type + (r.redirected ? ' redirected to ' + new URL(r.url).host : '') + ' (attempt ' + attempt + ')';
+            tries.push(fetched);
+          }
+        } catch (e) { fetched = 'threw ' + e + ' (attempt ' + attempt + ')'; tries.push(fetched); }
+        if (fetched.indexOf('ok') !== 0) await new Promise(r => setTimeout(r, 1000));
+      }
+      const info = () => ({ fetched: tries.length ? tries.join('; ') + '; then ' + fetched : fetched, want: want.length, gone: gone.length, ms: Date.now() - t0,
+                            cards: document.querySelectorAll('.card[data-name]').length });
+      if (fetched.indexOf('ok') !== 0) return { ok: false, why: 'could not read the hub state', ...info() };
+      const deadline = Date.now() + 45000;
+      let last = '', since = Date.now();
+      while (Date.now() < deadline) {
+        const cards = [...document.querySelectorAll('.card[data-name]')];
+        const names = new Set(cards.map(c => c.getAttribute('data-name')));
+        const done = !!document.querySelector('.grid.ready') && cards.length > 0 &&
+                     want.every(n => names.has(n)) && gone.every(n => !names.has(n));
+        const sig = cards.length + ':' + document.querySelectorAll('.card[data-name] img').length;
+        if (!done || sig !== last) { last = sig; since = Date.now(); }
+        else if (Date.now() - since >= 800) return { ok: true, ...info() };
         await new Promise(r => setTimeout(r, 100));
       }
-      return document.querySelectorAll('.card[data-name]').length;
+      return { ok: false, why: 'the page never showed the hub state', ...info() };
     };
-    await ready();
+    const SETTLE = await settle();
+    if (!SETTLE.ok) {
+      return JSON.stringify({ error: 'The theme hub did not finish loading (' + SETTLE.why + ').', settle: SETTLE });
+    }
+    """
+
+    /// What the settle step saw, for the log: whether the hub state was read, how many
+    /// added and deleted themes it expected, how long the page took.
+    static func settleSummary(_ raw: String) -> String {
+        guard let o = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any],
+              let st = o["settle"] as? [String: Any] else { return "" }
+        return "(state: \(st["fetched"] ?? "?"), expected +\(st["want"] ?? "?") added / -\(st["gone"] ?? "?") deleted, "
+             + "\(st["cards"] ?? "?") cards, settled in \(st["ms"] ?? "?") ms)"
+    }
+
+    /// The JSON object a hub script returns in place of its result when it gave up.
+    static func hubError(_ raw: String) -> String? {
+        ((try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any])?["error"] as? String
+    }
+
+    static let extractionJS = """
+    \(settleJS)
 
     const out = [];
     for (const c of document.querySelectorAll('.card[data-name]')) {
-      // The hub marks superseded cards `hidden` and leaves them in the page; its own
-      // "All" counter excludes them, so an edited theme was being offered twice.
+      // `hidden` is how the page's filter keeps "Used" themes out of All (and applies any
+      // tier or search filter); its own All counter excludes them, so Navigator does too.
       if (c.classList.contains('hidden')) continue;
       const q = (sel) => { const e = c.querySelector(sel); return e ? e.textContent.trim() : ''; };
       let look = '';
@@ -21621,7 +21760,7 @@ enum ThemeHubClient {
         hasArt: src.length > 0
       });
     }
-    return JSON.stringify(out);
+    return JSON.stringify({ settle: SETTLE, rows: out });
     """
 
     /// The reference artwork for ONE theme, as a data URL.
@@ -21636,6 +21775,7 @@ enum ThemeHubClient {
         let quoted = (try? JSONSerialization.data(withJSONObject: [name]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
         return """
+        \(settleJS)
         const want = \(quoted)[0];
         const cards = document.querySelectorAll('.card[data-name]');
         let card = null;
@@ -21678,8 +21818,12 @@ enum ThemeHubClient {
         }
         GoogleWebSession.shared.evaluate(url: url, js: extractionJS) { v, err in
             if let err { completion(nil, err); return }
+            if let s = v as? String, let e = hubError(s) {
+                navLog("hub: \(e) \(settleSummary(s))"); completion(nil, e); return
+            }
             guard let s = v as? String, let d = s.data(using: .utf8),
-                  let rows = (try? JSONSerialization.jsonObject(with: d)) as? [[String: Any]] else {
+                  let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+                  let rows = o["rows"] as? [[String: Any]] else {
                 completion(nil, "The theme hub page didn’t look the way Navigator expects."); return
             }
             let themes = rows.compactMap { r -> GameTheme? in
@@ -21697,6 +21841,7 @@ enum ThemeHubClient {
                 t.status = r["status"] as? String ?? ""
                 return t
             }
+            navLog("hub: \(themes.count) themes \(settleSummary(s))")
             completion(themes.isEmpty ? nil : themes,
                        themes.isEmpty ? "The theme hub returned no themes." : nil)
         }
@@ -21714,16 +21859,7 @@ enum ThemeHubClient {
             completion([], "No theme hub address is set on this Mac."); return
         }
         let js = """
-        const ready = async () => {
-          let last = -1;
-          for (let i = 0; i < 60; i++) {
-            const g = document.querySelector('.grid.ready');
-            const n = document.querySelectorAll('.card[data-name]').length;
-            if (g && n > 0 && n === last) return n;
-            last = n; await new Promise(r => setTimeout(r, 100));
-          }
-        };
-        await ready();
+        \(settleJS)
         const out = [];
         for (const c of document.querySelectorAll('.card[data-name]')) {
           if (c.classList.contains('hidden')) continue;
@@ -21743,6 +21879,7 @@ enum ThemeHubClient {
         GoogleWebSession.shared.evaluate(url: url, js: js, timeout: 600) { v, err in
             if let err { completion([], err); return }
             let raw = (v as? String) ?? "[]"
+            if let e = hubError(raw) { completion([], e); return }
             let rows = ((try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [[Any]]) ?? []
             completion(rows.compactMap {
                 guard let n = $0.first as? String, $0.count >= 3,
@@ -21762,6 +21899,7 @@ enum ThemeHubClient {
         GoogleWebSession.shared.evaluate(url: url, js: artJS(themeNamed: name)) { v, err in
             if let err { completion([], err); return }
             let raw = (v as? String) ?? "[]"
+            if let e = hubError(raw) { completion([], e); return }
             let urls = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String] ?? []
             completion(urls, urls.isEmpty ? "no artwork on this theme’s card" : nil)
         }
