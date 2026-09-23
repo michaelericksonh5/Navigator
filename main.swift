@@ -21058,6 +21058,30 @@ if let flag = CommandLine.arguments.firstIndex(of: "--style-test") {
     app.run()
 }
 
+// The collision that broke GDD to Assets: the theme hub and a GDD export in flight at the
+// same moment through the one Google web session. No AI calls — list and export only.
+//   Navigator --google-queue-test <out-dir> <gdd-folder>
+if let flag = CommandLine.arguments.firstIndex(of: "--google-queue-test"), flag + 2 < CommandLine.arguments.count {
+    let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 2])
+    try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    app.setActivationPolicy(.accessory)
+    var remaining = 2, failed = false
+    func finish() { remaining -= 1; if remaining == 0 { exit(failed ? 1 : 0) } }
+    DispatchQueue.main.async {
+        ThemeHubClient.themes { list, err in
+            if let list { print("hub:  \(list.count) themes") } else { print("hub:  FAILED — \(err ?? "?")"); failed = true }
+            finish()
+        }
+        GDDLibrary.exportAll(from: folder, into: out) { _, _, _ in } done: { written, failures in
+            print("gdd:  wrote \(written)" + (failures.isEmpty ? "" : "  FAILED — \(failures.joined(separator: "; "))"))
+            if !failures.isEmpty || written == 0 { failed = true }
+            finish()
+        }
+    }
+    app.run()
+}
+
 if let flag = CommandLine.arguments.firstIndex(of: "--export-gdds") {
     let args = CommandLine.arguments
     guard flag + 1 < args.count else {
@@ -21188,6 +21212,19 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     nonisolated(unsafe) static var pendingDestination: URL?
     nonisolated(unsafe) static var pendingWantsFile = false
     private var pending: Pending?
+    /// Requests waiting their turn. The worker is one web view, so requests have to run
+    /// one at a time — but REJECTING the second one is what broke GDD to Assets: opening
+    /// the window starts the theme hub, picking a GDD starts an export, and the export
+    /// was turned away with "Another Google request is already running". Worse, it had
+    /// already set its own download flag before being turned away, so the hub page still
+    /// loading was downloaded as a FILE and came back as "The page didn't load". Both
+    /// failed from one collision. Now the second waits, and each request's settings are
+    /// applied only when it actually starts.
+    private struct Waiting {
+        let url: URL, timeout: TimeInterval, wantsFile: Bool, fileExtension: String
+        let done: (WKWebView?, String?, URL?, String?) -> Void
+    }
+    private var waiting: [Waiting] = []
     private var nextID = 1
     private var watchdog: DispatchWorkItem?
     private var downloadDestination: URL?
@@ -21225,18 +21262,27 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
         if downloadRequestID == id { downloadRequestID = nil; downloadDestination = nil }
         wantsFile = false; downloadExtension = "txt"
         p.done(web, text, file, error)
+        // `done` may itself have started a follow-up request; only start the next waiting
+        // one if the worker is still free.
+        if pending == nil, !waiting.isEmpty { start(waiting.removeFirst()) }
     }
 
-    /// Start a request. Returns its id, or nil when one is already in flight.
-    @discardableResult
-    private func begin(_ url: URL, timeout: TimeInterval,
-                       done: @escaping (WKWebView?, String?, URL?, String?) -> Void) -> Int? {
-        guard pending == nil else {
-            done(nil, nil, nil, "Another Google request is already running.")
-            return nil
-        }
+    /// Run a request now, or after the one in flight. The timeout starts when the request
+    /// does, so time spent waiting its turn is never counted against it.
+    private func begin(_ url: URL, timeout: TimeInterval, wantsFile: Bool = false,
+                       fileExtension: String = "txt",
+                       done: @escaping (WKWebView?, String?, URL?, String?) -> Void) {
+        let request = Waiting(url: url, timeout: timeout, wantsFile: wantsFile,
+                              fileExtension: fileExtension, done: done)
+        if pending == nil { start(request) } else { waiting.append(request) }
+    }
+
+    private func start(_ request: Waiting) {
+        let url = request.url, timeout = request.timeout
         let id = nextID; nextID += 1
-        pending = Pending(id: id, done: done)
+        pending = Pending(id: id, done: request.done)
+        wantsFile = request.wantsFile
+        downloadExtension = request.fileExtension
         let w = makeWorker()
         let wd = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -21249,7 +21295,6 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
         watchdog = wd
         DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: wd)
         w.load(URLRequest(url: url))
-        return id
     }
 
     private var liveID: Int? { pending?.id }
@@ -21399,9 +21444,7 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     /// it with the same reader a local .docx goes through.
     func fetchFile(url: URL, fileExtension: String, timeout: TimeInterval = 180,
                    completion: @escaping (URL?, String?) -> Void) {
-        wantsFile = true
-        downloadExtension = fileExtension
-        begin(url, timeout: timeout) { web, _, file, err in
+        begin(url, timeout: timeout, wantsFile: true, fileExtension: fileExtension) { web, _, file, err in
             if let file { completion(file, nil); return }
             if let w = web, Self.isSignInPage(w.url) {
                 completion(nil, GoogleWebSession.signInNeeded); return
@@ -23601,6 +23644,7 @@ struct GDDToAssetsSheet: View {
                 // Clear the old document plan. Leaving it meant the window showed one
                 // document name above another document symbols, ready to generate.
                 run.jobs = []; run.symbols = []; run.missing = []; run.gddText = ""
+                navLog("gdd: could not read “\(e.name)”: \(err ?? "unknown error")")
                 run.status = err == GoogleWebSession.signInNeeded
                     ? "Sign in to Google to read this document."
                     : "Couldn’t read that document: \(err ?? "unknown error")"
@@ -23633,6 +23677,7 @@ struct GDDToAssetsSheet: View {
                 run.status = "Sign in to Google to load the themes."
                 offerSignIn { loadThemes() }
             } else {
+                navLog("hub: could not load themes: \(err ?? "unknown error")")
                 run.status = "Couldn’t load themes: \(err ?? "unknown error")"
             }
         }
