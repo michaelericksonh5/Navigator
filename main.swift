@@ -22022,7 +22022,11 @@ enum ThemeHubClient {
     /// Every theme on the hub. Errors are strings the caller shows verbatim.
     @MainActor
     static func themes(completion: @escaping ([GameTheme]?, String?) -> Void) {
-        if ArtPanelProbe.forceHubError { completion(nil, "The request timed out."); return }
+        // Worded as what it is. It first borrowed a real error message, "The request timed
+        // out.", so the snapshot runs logged failures indistinguishable from a real outage.
+        if ArtPanelProbe.forceHubError {
+            completion(nil, "Test error forced by NAVIGATOR_TEST_HUB_ERROR — not a real failure"); return
+        }
         guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
             completion(nil, "No theme hub address is set on this Mac."); return
         }
