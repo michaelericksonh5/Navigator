@@ -89,7 +89,8 @@ enum ExternalProcess {
                     timeout: TimeInterval? = 3600,
                     onLaunch: ((@escaping () -> Bool) -> Void)? = nil,
                     cancellation: Cancellation? = nil,
-                    receiveStdout: ((Data) -> Void)? = nil) -> Result {
+                    receiveStdout: ((Data) -> Void)? = nil,
+                    receiveStderr: ((Data) -> Void)? = nil) -> Result {
         if let timeout, !timeout.isFinite || timeout <= 0 {
             return .failedToLaunch(NSError(domain: NSPOSIXErrorDomain, code: Int(EINVAL)))
         }
@@ -115,7 +116,8 @@ enum ExternalProcess {
             drains.enter()
             DispatchQueue.global(qos: .utility).async {
                 capture.drain(pipe.fileHandleForReading, until: drainDeadline,
-                              cancellation: cancellation, receive: pipe === stdout ? receiveStdout : nil)
+                              cancellation: cancellation,
+                              receive: pipe === stdout ? receiveStdout : receiveStderr)
                 drains.leave()
             }
         }
@@ -237,6 +239,65 @@ enum WalkStream {
     }
 }
 
+/// Reading an archive's shape without expanding it, and reading a running expansion's
+/// progress off the tool's own chatter.
+///
+/// Copying has had a progress window with a Cancel button for a long time; extracting
+/// had nothing at all. On a local disk that is invisible — a 1.16 GB zip expands in
+/// about 3 seconds. On an SMB share the same archive was measured at roughly 11 seconds
+/// PER FILE, almost all of it round trips rather than data, and 1,223 files of silence
+/// with no way to stop it is indistinguishable from a hang.
+public enum ArchiveProgressRules {
+
+    /// How many entries a zip holds, read from its End of Central Directory record.
+    ///
+    /// The EOCD sits at the very end of the file, so this needs the tail and not the
+    /// 793 MB in front of it — which matters when the archive is on the share. `tail`
+    /// is the last bytes of the file, and must be at least the 22-byte record; pass
+    /// more to survive a zip comment, which can push the record up to 64 KB from the end.
+    ///
+    /// nil means "do not claim to know": an empty tail, no signature (not a zip, or the
+    /// comment is longer than what was read), or the 0xFFFF that says the real count is
+    /// in a Zip64 record this does not parse. The progress window shows a count without
+    /// a bar in that case, which is honest, rather than a bar that lies.
+    public static func zipEntryCount(tail: Data) -> Int? {
+        let sig: [UInt8] = [0x50, 0x4B, 0x05, 0x06]
+        let b = [UInt8](tail)
+        guard b.count >= 22 else { return nil }
+        // Scan backwards: the LAST signature is the real record. A zip that stores a
+        // file whose own bytes happen to contain this signature would otherwise win.
+        var i = b.count - 22
+        while i >= 0 {
+            if b[i] == sig[0], b[i+1] == sig[1], b[i+2] == sig[2], b[i+3] == sig[3] {
+                let count = Int(b[i+10]) | (Int(b[i+11]) << 8)   // little-endian uint16
+                return count == 0xFFFF ? nil : count
+            }
+            i -= 1
+        }
+        return nil
+    }
+
+    /// The file an extraction is working on, from one line of the tool's verbose output,
+    /// or nil for a line that is not about a file.
+    ///
+    /// ditto -V writes "copying file NAME ... " and a following "N bytes for NAME"; only
+    /// the first is counted, or every entry would count twice. tar -xv writes "x NAME".
+    /// Both go to stderr, which is why run() had to learn to stream it.
+    public static func extractedName(fromLine line: String) -> String? {
+        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let r = t.range(of: "copying file ") {
+            var name = String(t[r.upperBound...])
+            if let dots = name.range(of: " ...", options: .backwards) { name = String(name[..<dots.lowerBound]) }
+            return name.isEmpty ? nil : name
+        }
+        if t.hasPrefix("x ") {
+            let name = String(t.dropFirst(2))
+            return name.isEmpty ? nil : name
+        }
+        return nil
+    }
+}
+
 enum PathRules {
 
     static func canGoUp(_ url: URL) -> Bool {
@@ -288,6 +349,7 @@ enum PathRules {
     static func archiveTimeout(bytes: Int64) -> TimeInterval {
         max(3600, Double(bytes) / 20_000)
     }
+
 
     // Search selections can span parents; bare names would archive unrelated siblings.
     static func archiveInputs(_ urls: [URL]) -> (directory: URL, entries: [String])? {

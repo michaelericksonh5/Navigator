@@ -5072,6 +5072,25 @@ let thumbnailExtensions: Set<String> = imageExtensions.union(videoExtensions).un
 func isThumbnailable(_ url: URL) -> Bool { thumbnailExtensions.contains(url.pathExtension.lowercased()) }
 
 let archiveExtensions: Set<String> = ["zip","tar","tgz","gz","bz2","xz","tbz","txz"]
+extension Browser {
+    /// How many entries a zip holds, or nil when it will not say.
+    ///
+    /// Reads at most the last 64 KB plus the 22-byte record — the End of Central
+    /// Directory lives at the tail — so asking a 793 MB archive on an SMB share costs
+    /// one short read at the end rather than a pass over the whole thing.
+    static func zipEntryCount(_ url: URL) -> Int? {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize), size > 22,
+              let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        let want = min(size, 65_557)
+        do {
+            try h.seek(toOffset: UInt64(size - want))
+            guard let tail = try h.readToEnd() else { return nil }
+            return ArchiveProgressRules.zipEntryCount(tail: tail)
+        } catch { return nil }
+    }
+}
+
 func isArchive(_ url: URL) -> Bool {
     // An AppleDouble sidecar wears the original's extension, so "._thing.zip" passes an
     // extension test and is not an archive. Answering here covers both callers at once:
@@ -8976,11 +8995,27 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         guard !sel.isEmpty else { return }
         let dir = currentURL
         busy = true; busyText = "Extracting…"
+        // Extracting had no progress window at all, while copying has had one for ages.
+        // On local disk nobody noticed — a 1.16 GB zip expands in about 3 seconds. On an
+        // SMB share the same archive ran at roughly 11 seconds per file, and 1,223 files
+        // of silence with no way to stop it cannot be told apart from a hang.
+        let progress = TransferProgress()
+        let cancellation = ExternalProcess.Cancellation()
+        TransferProgressController.shared.show(progress, title: "Extracting…")
+        // The window's Cancel sets progress.cancelled; the process watches a
+        // Cancellation. Mirror one onto the other for as long as the job runs, rather
+        // than checking only when output arrives — a stalled share produces no output,
+        // which is exactly when someone reaches for Cancel.
+        let cancelWatch = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        cancelWatch.schedule(deadline: .now() + 0.25, repeating: 0.25)
+        cancelWatch.setEventHandler { if progress.cancelled { cancellation.cancel() } }
+        cancelWatch.resume()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var created: [URL] = []
             var failures: [(name: String, reason: String, explained: Bool)] = []
             for it in sel {
+                if cancellation.isCancelled { break }
                 var base = it.url.deletingPathExtension().lastPathComponent
                 if (base as NSString).pathExtension.lowercased() == "tar" { base = (base as NSString).deletingPathExtension }
                 // Extract only into a folder we created. Ignoring a creation failure could
@@ -8993,10 +9028,40 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                 }
                 let isZip = it.url.pathExtension.lowercased() == "zip"
                 let size = (try? it.url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { Int64($0) } ?? 0
+                // The entry count comes from the zip's tail, so asking costs a short read
+                // at the end of the file rather than a pass over all 793 MB of it. A tar
+                // cannot answer without being read through, so it stays indeterminate.
+                let total = isZip ? Browser.zipEntryCount(it.url) : nil
+                DispatchQueue.main.async {
+                    progress.total = total ?? 0
+                    progress.done = 0
+                    progress.fraction = 0
+                    progress.current = it.url.lastPathComponent
+                }
+                var seen = 0
+                var pending = ""
                 do {
                     let output = try ExternalProcess.run(isZip ? "/usr/bin/ditto" : "/usr/bin/tar",
-                        arguments: isZip ? ["-x", "-k", it.url.path, dest.path] : ["-xf", it.url.path, "-C", dest.path],
-                        timeout: PathRules.archiveTimeout(bytes: size)).completed()
+                        arguments: isZip ? ["-V", "-x", "-k", it.url.path, dest.path] : ["-xvf", it.url.path, "-C", dest.path],
+                        timeout: PathRules.archiveTimeout(bytes: size),
+                        cancellation: cancellation,
+                        receiveStderr: { chunk in
+                            // Both tools report per entry on stderr, and a chunk can split
+                            // a line, so the remainder is carried to the next one.
+                            pending += String(decoding: chunk, as: UTF8.self)
+                            var lines = pending.components(separatedBy: "\n")
+                            pending = lines.removeLast()
+                            for line in lines {
+                                guard let name = ArchiveProgressRules.extractedName(fromLine: line) else { continue }
+                                seen += 1
+                                let n = seen
+                                DispatchQueue.main.async {
+                                    progress.done = n
+                                    progress.current = (name as NSString).lastPathComponent
+                                    if let total, total > 0 { progress.fraction = min(1, Double(n) / Double(total)) }
+                                }
+                            }
+                        }).completed()
                     if output.status == 0 { created.append(dest) }
                     else {
                         try? FileManager.default.removeItem(at: dest)
@@ -9014,13 +9079,17 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
                     failures.append((it.url.lastPathComponent, error.localizedDescription, false))
                 }
             }
+            cancelWatch.cancel()
             DispatchQueue.main.async {
+                TransferProgressController.shared.hide()
                 self.busy = false; self.busyText = ""
                 if !created.isEmpty {
                     RecentFolders.shared.record(dir)
                     self.pushCreation("Extract", created)
                 }
                 self.load()
+                // Cancel is the user's own decision, not a failure to report back at them.
+                if cancellation.isCancelled { return }
                 if !failures.isEmpty {
                     let detail = failures.prefix(5).map { "• \($0.name): \($0.reason)" }.joined(separator: "\n")
                     // The permissions paragraph is for failures we cannot explain. When

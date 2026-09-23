@@ -9160,6 +9160,62 @@ final class AntiPatternTests: XCTestCase {
     }
 }
 
+final class ArchiveProgressTests: XCTestCase {
+
+    /// Build a real zip and read its count back, so this is pinned to the format and
+    /// not to my reading of the spec.
+    func testEntryCountFromARealZip() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("navzip-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for i in 1...7 { try "x\(i)".write(to: dir.appendingPathComponent("f\(i).txt"),
+                                           atomically: true, encoding: .utf8) }
+        let zip = dir.appendingPathComponent("t.zip")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        p.arguments = ["-q", "-j", zip.path] + (1...7).map { dir.appendingPathComponent("f\($0).txt").path }
+        try p.run(); p.waitUntilExit()
+        try XCTSkipUnless(p.terminationStatus == 0, "zip unavailable")
+
+        let tail = try Data(contentsOf: zip)
+        XCTAssertEqual(ArchiveProgressRules.zipEntryCount(tail: tail), 7)
+    }
+
+    /// Anything that is not a zip must say "I don't know" rather than invent a number,
+    /// because the bar is drawn from it.
+    func testNonZipTailsRefuseToGuess() {
+        XCTAssertNil(ArchiveProgressRules.zipEntryCount(tail: Data()))
+        XCTAssertNil(ArchiveProgressRules.zipEntryCount(tail: Data(repeating: 0, count: 8)))
+        XCTAssertNil(ArchiveProgressRules.zipEntryCount(tail: Data(repeating: 0x41, count: 4096)))
+    }
+
+    /// 0xFFFF is the format saying "the real count is in a Zip64 record". Reporting
+    /// 65535 would draw a bar that never fills.
+    func testZip64SentinelIsRefused() {
+        var b = [UInt8](repeating: 0, count: 22)
+        b[0] = 0x50; b[1] = 0x4B; b[2] = 0x05; b[3] = 0x06
+        b[10] = 0xFF; b[11] = 0xFF
+        XCTAssertNil(ArchiveProgressRules.zipEntryCount(tail: Data(b)))
+    }
+
+    func testProgressLinesFromDittoAndTar() {
+        XCTAssertEqual(ArchiveProgressRules.extractedName(fromLine: "copying file f1.txt ... "), "f1.txt")
+        XCTAssertEqual(ArchiveProgressRules.extractedName(
+            fromLine: "copying file Project/parts/BO1 wheel.png ... "), "Project/parts/BO1 wheel.png")
+        XCTAssertEqual(ArchiveProgressRules.extractedName(fromLine: "x Project/parts/a.png"), "Project/parts/a.png")
+    }
+
+    /// ditto prints a SECOND line per file ("N bytes for NAME"). Counting it would
+    /// double every entry and send the bar to 100% halfway through.
+    func testTheByteLineIsNotCounted() {
+        XCTAssertNil(ArchiveProgressRules.extractedName(fromLine: "5 bytes for f1.txt"))
+        XCTAssertNil(ArchiveProgressRules.extractedName(fromLine: ">>> Copying t.zip "))
+        XCTAssertNil(ArchiveProgressRules.extractedName(fromLine: ""))
+        XCTAssertNil(ArchiveProgressRules.extractedName(fromLine: "   "))
+    }
+}
+
 final class ArchiveTimeoutTests: XCTestCase {
 
     /// The measured case. A 793 MB zip onto an SMB share took about 84 minutes, so an
