@@ -21303,10 +21303,22 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     /// failed from one collision. Now the second waits, and each request's settings are
     /// applied only when it actually starts.
     private struct Waiting {
-        let url: URL, timeout: TimeInterval, wantsFile: Bool, fileExtension: String
+        let url: URL, timeout: TimeInterval, wantsFile: Bool, fileExtension: String, label: String
         let done: (WKWebView?, String?, URL?, String?) -> Void
     }
     private var waiting: [Waiting] = []
+    /// What the session is doing right now, for a window to say while it waits: "the theme
+    /// hub" or "the document". nil when idle.
+    private(set) var liveLabel: String?
+    /// True while a page script from `evaluate` is still running. The request itself ends
+    /// when the page loads, but the worker is not free until the script returns: handing
+    /// it to the next request navigates the page away underneath the script. That only
+    /// went unnoticed because every other request was a .docx DOWNLOAD, which leaves the
+    /// page in place; a plain-text read replaces it.
+    private var holdingForScript = false
+    private func startNextIfIdle() {
+        if pending == nil, !holdingForScript, !waiting.isEmpty { start(waiting.removeFirst()) }
+    }
     private var nextID = 1
     private var watchdog: DispatchWorkItem?
     private var downloadDestination: URL?
@@ -21340,29 +21352,31 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
                         error: String?) {
         guard let p = pending, p.id == id else { return }
         pending = nil
+        liveLabel = nil
         watchdog?.cancel(); watchdog = nil
         if downloadRequestID == id { downloadRequestID = nil; downloadDestination = nil }
         wantsFile = false; downloadExtension = "txt"
         p.done(web, text, file, error)
-        // `done` may itself have started a follow-up request; only start the next waiting
-        // one if the worker is still free.
-        if pending == nil, !waiting.isEmpty { start(waiting.removeFirst()) }
+        // `done` may itself have started a follow-up request, or be holding the worker for a
+        // page script; only start the next waiting one if the worker is really free.
+        startNextIfIdle()
     }
 
     /// Run a request now, or after the one in flight. The timeout starts when the request
     /// does, so time spent waiting its turn is never counted against it.
     private func begin(_ url: URL, timeout: TimeInterval, wantsFile: Bool = false,
-                       fileExtension: String = "txt",
+                       fileExtension: String = "txt", label: String = "the document",
                        done: @escaping (WKWebView?, String?, URL?, String?) -> Void) {
         let request = Waiting(url: url, timeout: timeout, wantsFile: wantsFile,
-                              fileExtension: fileExtension, done: done)
-        if pending == nil { start(request) } else { waiting.append(request) }
+                              fileExtension: fileExtension, label: label, done: done)
+        if pending == nil, !holdingForScript { start(request) } else { waiting.append(request) }
     }
 
     private func start(_ request: Waiting) {
         let url = request.url, timeout = request.timeout
         let id = nextID; nextID += 1
         pending = Pending(id: id, done: request.done)
+        liveLabel = request.label
         wantsFile = request.wantsFile
         downloadExtension = request.fileExtension
         let w = makeWorker()
@@ -21507,14 +21521,19 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     /// takes and what lets the script use `await`.
     func evaluate(url: URL, js: String, timeout: TimeInterval = 90,
                   completion: @escaping (Any?, String?) -> Void) {
-        begin(url, timeout: timeout) { web, _, _, err in
+        begin(url, timeout: timeout, label: "the theme hub") { web, _, _, err in
             guard let w = web else { completion(nil, err ?? "The page didn’t load."); return }
             if Self.isSignInPage(w.url) { completion(nil, GoogleWebSession.signInNeeded); return }
+            self.holdingForScript = true
+            self.liveLabel = "the theme hub"
             w.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { res in
+                self.holdingForScript = false
+                self.liveLabel = nil
                 switch res {
                 case .success(let v): completion(v, nil)
                 case .failure(let e): completion(nil, e.localizedDescription)
                 }
+                self.startNextIfIdle()
             }
         }
     }
@@ -22108,26 +22127,47 @@ enum GDDLibrary {
             completion(nil, "\(entry.name) has an id Navigator couldn’t use.")
             return
         }
-        // Download the REAL file and read it with the same reader a local one goes
-        // through. Asking Docs for plain text instead loses every table, and a table is
-        // how most of these documents declare their symbols — see DriveStub.
-        GoogleWebSession.shared.fetchFile(url: url, fileExtension: stub.fileExtension) { file, err in
-            if let file {
-                defer { try? FileManager.default.removeItem(at: file) }
-                if let t = localText(of: file), !t.isEmpty { completion(t, nil); return }
-            }
-            // Sign-in is not something a different export format fixes.
-            if err == GoogleWebSession.signInNeeded { completion(nil, err); return }
-            guard let alt = stub.fallbackExportURL else {
+        // Plain text first; the .docx only when plain text does not settle it.
+        //
+        // The .docx carries every embedded image, and a GDD full of mockups is enormous:
+        // measured, 4370 Chevy exported as 65 MB and took 28 s over the VPN to deliver a
+        // few KB of symbol table; three documents took ~30 s each. Plain text took 1.2 s.
+        // Across every Google Doc in the folder, plain text parsed to the SAME symbols —
+        // codes, roles, descriptions, warnings — as the .docx.
+        //
+        // The .docx stays as the second read because plain text flattens tables, and a
+        // future document could declare its set in a table that only survives as .docx.
+        // So it is fetched when plain text finds no set, or a set with a warning, and
+        // whichever reads more symbols wins.
+        let asked = Date()
+        let docx: (String?) -> Void = { plain in
+            GoogleWebSession.shared.fetchFile(url: url, fileExtension: stub.fileExtension) { file, err in
+                var rich: String?
+                if let file {
+                    defer { try? FileManager.default.removeItem(at: file) }
+                    let bytes = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    rich = localText(of: file)
+                    navLog(String(format: "gdd: read “%@” as .%@ — %.1fs, %.1f MB", entry.name,
+                                  stub.fileExtension, Date().timeIntervalSince(asked), Double(bytes) / 1_048_576))
+                }
+                let richCount = rich.map { GDDSymbolSetRules.parse($0).count } ?? 0
+                let plainCount = plain.map { GDDSymbolSetRules.parse($0).count } ?? 0
+                if let rich, !rich.isEmpty, richCount >= plainCount { completion(rich, nil); return }
+                if let plain, !plain.isEmpty { completion(plain, nil); return }
                 completion(nil, err ?? "\(entry.name) exported, but came back empty.")
-                return
             }
-            // Second chance, in the lossy format. A document read imperfectly beats a
-            // document not read — the loss is table structure, and the failure is total.
-            GoogleWebSession.shared.fetchPlainText(url: alt) { t, e2 in
-                guard let t, !t.isEmpty else { completion(nil, err ?? e2); return }
-                completion(t, nil)
+        }
+        guard let plainURL = stub.fallbackExportURL else { docx(nil); return }
+        GoogleWebSession.shared.fetchPlainText(url: plainURL) { t, err in
+            if err == GoogleWebSession.signInNeeded { completion(nil, err); return }
+            let symbols = t.map(GDDSymbolSetRules.parse) ?? []
+            navLog(String(format: "gdd: read “%@” as text — %.1fs, %d symbols", entry.name,
+                          Date().timeIntervalSince(asked), symbols.count))
+            if let t, !symbols.isEmpty,
+               GDDSymbolPlausibility.warning(symbols, inferred: false, gddText: t) == nil {
+                completion(t, nil); return
             }
+            docx(t)
         }
     }
 }
@@ -22910,6 +22950,8 @@ struct GDDToAssetsSheet: View {
         return dupes
     }
     @State private var pickedGDD: GDDLibrary.Entry?
+    /// Set while a document is being read, so the window can show that it is working.
+    @State private var readingSince: Date?
     @State private var themes: [GameTheme] = []
     @State private var themeQuery = ""
     @State private var pickedTheme: GameTheme?
@@ -23124,6 +23166,19 @@ struct GDDToAssetsSheet: View {
                         .help(e.stub == nil
                               ? "Open this document in its usual app"
                               : "Open this document in Google Docs")
+                }
+            }
+            // A read can take a while — a GDD full of images used to take 30 s — and with
+            // nothing on screen it looked frozen. Say what is happening, and for how long.
+            if let since = readingSince, let e = pickedGDD {
+                TimelineView(.periodic(from: since, by: 1)) { ctx in
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(GDDReadingRules.line(document: e.name,
+                                                  waitingForHub: GoogleWebSession.shared.liveLabel == "the theme hub",
+                                                  seconds: Int(ctx.date.timeIntervalSince(since))))
+                            .font(.caption).foregroundColor(.secondary)
+                    }
                 }
             }
             if !run.symbols.isEmpty {
@@ -23776,7 +23831,14 @@ struct GDDToAssetsSheet: View {
     private func loadGDD() {
         guard let e = pickedGDD else { return }
         run.busy = true; run.status = "Reading \(e.name)…"
+        // The previous document's symbols must not sit under the new document's name while
+        // it loads — "20 symbols" reads as this document's answer.
+        run.jobs = []; run.symbols = []; run.plausibilityWarning = nil; run.undeclared = []
+        readingSince = Date()
         GDDLibrary.text(of: e) { text, err in
+            // A reply for a document that is no longer the chosen one is stale.
+            guard pickedGDD == e else { return }
+            readingSince = nil
             run.busy = false
             guard let text else {
                 // Clear the old document plan. Leaving it meant the window showed one

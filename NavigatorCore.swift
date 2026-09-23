@@ -247,6 +247,18 @@ enum WalkStream {
 /// about 3 seconds. On an SMB share the same archive was measured at roughly 11 seconds
 /// PER FILE, almost all of it round trips rather than data, and 1,223 files of silence
 /// with no way to stop it is indistinguishable from a hang.
+/// The line the GDD to Assets window shows while a document is being read.
+enum GDDReadingRules {
+    static func line(document: String, waitingForHub: Bool, seconds: Int) -> String {
+        let t = seconds < 2 ? "" : " \(seconds)s"
+        // The document read queues behind the theme hub, whose first load of a session
+        // takes ~13 s. Saying "Reading…" for all of that would blame the wrong thing.
+        return waitingForHub
+            ? "Waiting for the theme hub to finish loading, then reading “\(document)”…\(t)"
+            : "Reading “\(document)” from Google Drive…\(t)"
+    }
+}
+
 public enum ArchiveProgressRules {
 
     /// How many entries a zip holds, read from its End of Central Directory record.
