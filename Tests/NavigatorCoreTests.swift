@@ -8500,6 +8500,25 @@ final class SymbolCanvasTests: XCTestCase {
     }
 }
 
+final class StyleTextRulesTests: XCTestCase {
+    func testTagsAreSplitFromTheProse() {
+        let r = StyleTextRules.split("Painterly fantasy with soft light.\n\nEDGE-TREATMENT: outline\nRIM-GLOW: yes")
+        XCTAssertEqual(r.prose, "Painterly fantasy with soft light.")
+        XCTAssertEqual(r.tags, ["Edges: outline", "Rim glow: yes"])
+    }
+
+    // A colon in ordinary prose is not a tag.
+    func testProseWithAColonIsLeftAlone() {
+        let text = "Palette: deep greens and gold, with rim light."
+        XCTAssertEqual(StyleTextRules.split(text).prose, text)
+        XCTAssertEqual(StyleTextRules.split(text).tags, [])
+    }
+
+    func testNoTagsAtAll() {
+        XCTAssertEqual(StyleTextRules.split("Clean vector art.").tags, [])
+    }
+}
+
 final class ThemeStyleKeyTests: XCTestCase {
     private let art = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ"
 

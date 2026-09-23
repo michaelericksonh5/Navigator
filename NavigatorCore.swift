@@ -258,6 +258,32 @@ enum ThemeStyleRules {
     }
 }
 
+/// Splits a style read into what a person reads and the machine tags at its end.
+///
+/// The vision pass ends its description with `EDGE-TREATMENT: outline` / `RIM-GLOW: yes`
+/// lines, which the prompts need verbatim and which were shown to artists verbatim.
+/// Display only — the stored text is never changed.
+enum StyleTextRules {
+    static let names = ["EDGE-TREATMENT": "Edges", "RIM-GLOW": "Rim glow"]
+
+    static func split(_ text: String) -> (prose: String, tags: [String]) {
+        var lines = text.components(separatedBy: .newlines)
+        var tags: [String] = []
+        while let last = lines.last {
+            let t = last.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { lines.removeLast(); continue }
+            guard let colon = t.firstIndex(of: ":") else { break }
+            let key = String(t[..<colon]), value = t[t.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty, !value.isEmpty,
+                  key.allSatisfy({ $0.isUppercase || $0 == "-" }) else { break }
+            let name = names[key] ?? key.replacingOccurrences(of: "-", with: " ").lowercased().capitalized
+            tags.insert("\(name): \(value)", at: 0)
+            lines.removeLast()
+        }
+        return (lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines), tags)
+    }
+}
+
 /// The line the GDD to Assets window shows while a document is being read.
 enum GDDReadingRules {
     static func line(document: String, waitingForHub: Bool, seconds: Int) -> String {

@@ -21075,6 +21075,77 @@ if let flag = CommandLine.arguments.firstIndex(of: "--style-test") {
     app.run()
 }
 
+// Snapshots of the GDD to Assets window in its main states, for before/after design review.
+// Paid calls must be off. Sample style text is placed on the theme for the picture only —
+// never saved, never sent anywhere.
+//   NAVIGATOR_NO_PAID_CALLS=1 Navigator --ux-snapshots <out-dir> [NAVIGATOR_TEST_HUB_ERROR=1]
+if let flag = CommandLine.arguments.firstIndex(of: "--ux-snapshots"), flag + 1 < CommandLine.arguments.count {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    guard PaidCalls.disabled else { print("Refusing: set NAVIGATOR_NO_PAID_CALLS=1"); exit(2) }
+    let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    app.setActivationPolicy(.accessory)
+    @MainActor func capture(_ name: String) {
+        guard let v = ArtPanelProbe.window?.contentView,
+              let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { print("no window"); return }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: out.appendingPathComponent(name))
+        print("wrote \(name)")
+    }
+    @MainActor func scrollView(_ v: NSView?) -> NSScrollView? {
+        guard let v else { return nil }
+        if let s = v as? NSScrollView { return s }
+        for c in v.subviews { if let s = scrollView(c) { return s } }
+        return nil
+    }
+    // Top and bottom of the scroll area: the window is clamped to the screen height.
+    @MainActor func snap(_ name: String) {
+        let sv = scrollView(ArtPanelProbe.window?.contentView)
+        sv?.contentView.scroll(to: .zero); sv?.reflectScrolledClipView(sv!.contentView)
+        capture(name.replacingOccurrences(of: ".png", with: "-top.png"))
+        if let sv, let doc = sv.documentView {
+            let maxY = max(0, doc.frame.height - sv.contentView.bounds.height)
+            sv.contentView.scroll(to: NSPoint(x: 0, y: doc.isFlipped ? maxY : 0))
+            sv.reflectScrolledClipView(sv.contentView)
+        }
+        capture(name.replacingOccurrences(of: ".png", with: "-bottom.png"))
+    }
+    @MainActor func wait(_ cond: @escaping () -> Bool, _ limit: Double, then: @escaping () -> Void) {
+        let t0 = Date()
+        func poll() {
+            if cond() || Date().timeIntervalSince(t0) > limit { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { then() } }
+            else { DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { poll() } }
+        }
+        poll()
+    }
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        GDDToAssetsWindow.open()
+        if let w = ArtPanelProbe.window { w.setFrame(NSRect(x: 0, y: 0, width: 1000, height: 1700), display: true) }
+        if ArtPanelProbe.forceHubError {
+            wait({ false }, 2.5) { snap("3-hub-error.png"); exit(0) }
+            return
+        }
+        wait({ ArtPanelProbe.windowThemes > 0 }, 60) {
+            NotificationCenter.default.post(name: ArtPanelProbe.pickGDD, object: "4370 Chevy GDD")
+            wait({ !(ArtPanelProbe.run?.symbols.isEmpty ?? true) }, 30) {
+                snap("1-gdd.png")
+                NotificationCenter.default.post(name: ArtPanelProbe.pick, object: "Loki")
+                wait({ (ArtPanelProbe.shown["Loki"] ?? 0) > 0 }, 10) {
+                    ArtPanelProbe.run?.theme?.styleFromArt = """
+                    Polished digital fantasy illustration style combining smooth digital airbrushing with fine, crisp line art and delicate ink contours defining all silhouettes and internal forms. The palette is dominated by cool forest greens, deep teals, and murky charcoal darks, richly contrasted by warm brassy golds and radiant, electric cyan and lime-green emissive accents. Lighting features a diffused, misty atmospheric back-scatter pierced by intense, high-contrast localized bioluminescent glows.
+
+                    EDGE-TREATMENT: outline
+                    RIM-GLOW: yes
+                    """
+                    ArtPanelProbe.run?.styleRead = .ok
+                    wait({ false }, 0.8) { snap("2-theme.png"); exit(0) }
+                }
+            }
+        }
+    } }
+    app.run()
+}
+
 // Picks every theme in the REAL GDD to Assets window and checks what its artwork panel has
 // to draw. Refuses to run unless paid calls are off: picking a theme starts a style read.
 //   NAVIGATOR_NO_PAID_CALLS=1 Navigator --art-panel-test
@@ -21951,6 +22022,7 @@ enum ThemeHubClient {
     /// Every theme on the hub. Errors are strings the caller shows verbatim.
     @MainActor
     static func themes(completion: @escaping ([GameTheme]?, String?) -> Void) {
+        if ArtPanelProbe.forceHubError { completion(nil, "The request timed out."); return }
         guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
             completion(nil, "No theme hub address is set on this Mac."); return
         }
@@ -23191,6 +23263,10 @@ struct GDDToAssetsSheet: View {
     @State private var pickedGDD: GDDLibrary.Entry?
     /// Set while a document is being read, so the window can show that it is working.
     @State private var readingSince: Date?
+    /// Why the theme list failed to load, shown in step 2 rather than only in the footer.
+    @State private var themeError: String?
+    /// Whether the art-style description is shown in full or trimmed to a few lines.
+    @State private var styleExpanded = false
     @State private var themes: [GameTheme] = []
     @State private var themeQuery = ""
     @State private var pickedTheme: GameTheme?
@@ -23350,20 +23426,29 @@ struct GDDToAssetsSheet: View {
                                          : "\(entries.count) documents")
                         .foregroundColor(.secondary)
                 }
-                Spacer()
-                Button(GDDLibrary.manifestFolder == nil ? "Asset lists…" : "Asset lists ✓") {
-                    picking = .manifests
+                if scanning || exporting {
+                    ProgressView().controlSize(.small)
+                    Text(scanning ? "Checking documents…" : "Exporting…")
+                        .font(.caption).foregroundColor(.secondary)
                 }
-                .help("Optional: a folder of <game>_production.txt asset lists. Used when a document doesn’t describe its symbols.")
-                Button(scanning ? "Checking…" : "Check documents…") { scanGDDs() }
-                    .disabled(entries.isEmpty || scanning || exporting)
-                    .help("Read every document and note which ones declare a symbol set. "
-                        + "The ones that declare none are hidden from the list. "
-                        + "Free; no image or model calls.")
-                Button("Export all as text…") { exportAllGDDs() }
-                    .disabled(entries.isEmpty || exporting || scanning)
-                    .help("Save every document in this folder as plain text — what "
-                        + "Navigator itself reads. Free; no image or model calls.")
+                Spacer()
+                // Folder maintenance, not a step in making art — kept one click away
+                // instead of competing with the document choice for attention.
+                Menu {
+                    Button(GDDLibrary.manifestFolder == nil ? "Asset lists…" : "Asset lists ✓ (change…)") {
+                        picking = .manifests
+                    }
+                    Button("Check documents…") { scanGDDs() }
+                        .disabled(entries.isEmpty || scanning || exporting)
+                    Button("Export all as text…") { exportAllGDDs() }
+                        .disabled(entries.isEmpty || exporting || scanning)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton).fixedSize()
+                .help("Document tools, all free: asset lists (used when a document doesn’t "
+                    + "describe its symbols), check which documents declare a symbol set, "
+                    + "and export every document as text.")
             }
             if let summary = GDDScanRules.summary(scan) {
                 HStack(spacing: 8) {
@@ -23381,6 +23466,7 @@ struct GDDToAssetsSheet: View {
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             if !entries.isEmpty {
+              HStack(spacing: 8) {
                 Picker("Document", selection: $pickedGDD) {
                     Text("Choose…").tag(GDDLibrary.Entry?.none)
                     // Label with the file kind ONLY when two entries share a name —
@@ -23393,6 +23479,11 @@ struct GDDToAssetsSheet: View {
                     }
                 }
                 .frame(maxWidth: 520)
+                .onReceive(NotificationCenter.default.publisher(for: ArtPanelProbe.pickGDD)) { n in
+                    guard PaidCalls.disabled, let name = n.object as? String,
+                          let e = visibleEntries.first(where: { $0.name == name }) else { return }
+                    pickedGDD = e
+                }
                 .onChange(of: pickedGDD) { loadGDD() }
                 .disabled(run.busy || run.running)
 
@@ -23406,6 +23497,7 @@ struct GDDToAssetsSheet: View {
                               ? "Open this document in its usual app"
                               : "Open this document in Google Docs")
                 }
+              }
             }
             // A read can take a while — a GDD full of images used to take 30 s — and with
             // nothing on screen it looked frozen. Say what is happening, and for how long.
@@ -23510,20 +23602,37 @@ struct GDDToAssetsSheet: View {
 
     @ViewBuilder private var themeStep: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                TextField("Search \(themes.count) themes…", text: $themeQuery).frame(maxWidth: 300)
-                Button("Reload") { loadThemes() }.disabled(loadingThemes)
-                if loadingThemes { ProgressView().controlSize(.small) }
-                Button("View hub") { viewHub() }
-                    .help("Open the team theme hub to browse the themes and their artwork")
-            }
-            if themes.isEmpty && !loadingThemes {
-                HStack(spacing: 6) {
-                    Text(GoogleWebSession.themeHubURL == nil
-                         ? "Navigator doesn’t know the team hub’s address yet."
-                         : "No themes loaded — use Reload, and sign in to Google if it asks.")
-                        .font(.caption).foregroundColor(.secondary)
-                    Button("Set address…") { askForHubURL() }.font(.caption)
+            if themes.isEmpty && loadingThemes {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading themes from the hub…").font(.caption).foregroundColor(.secondary)
+                }
+            } else if themes.isEmpty {
+                // One place for the problem and its fixes. It used to be spread across a
+                // search box reading "Search 0 themes…", a note, three buttons and the footer.
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(GoogleWebSession.themeHubURL == nil
+                          ? "Navigator doesn’t know the team hub’s address yet."
+                          : "Couldn’t load themes" + (themeError.map { ": \($0)" } ?? "."),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        if GoogleWebSession.themeHubURL != nil { Button("Retry") { loadThemes() } }
+                        Button("Hub address…") { askForHubURL() }
+                        Button("View hub") { viewHub() }
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: 520, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.08)))
+            } else {
+                HStack {
+                    TextField("Search \(themes.count) themes…", text: $themeQuery).frame(maxWidth: 300)
+                    Button("Reload") { loadThemes() }.disabled(loadingThemes)
+                    if loadingThemes { ProgressView().controlSize(.small) }
+                    Button("View hub") { viewHub() }
+                        .help("Open the team theme hub to browse the themes and their artwork")
                 }
             }
             if !themes.isEmpty {
@@ -23593,9 +23702,6 @@ struct GDDToAssetsSheet: View {
                                 if !t.comparables.isEmpty {
                                     Text("Like: \(t.comparables)").font(.caption2)
                                         .foregroundColor(.secondary)
-                                }
-                                if t.votes > 0 {
-                                    Text("👍 \(t.votes)").font(.caption2).foregroundColor(.secondary)
                                 }
                             }
                         }
@@ -23786,14 +23892,33 @@ struct GDDToAssetsSheet: View {
     }
 
     @ViewBuilder private func styleText(_ body: String, caption: String) -> some View {
+        // Display only: the tags the prompts rely on stay in the stored text verbatim;
+        // here they read as labels instead of raw EDGE-TREATMENT / RIM-GLOW lines, and a
+        // long description is trimmed so it does not push the plan off the screen.
+        let parts = StyleTextRules.split(body)
+        let long = parts.prose.count > 320
         VStack(alignment: .leading, spacing: 4) {
             Text(caption).font(.caption2).foregroundColor(.secondary)
-            Text(body).font(.caption).foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+            VStack(alignment: .leading, spacing: 6) {
+                Text(parts.prose).font(.caption).foregroundColor(.secondary)
+                    .lineLimit(long && !styleExpanded ? 4 : nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                HStack(spacing: 6) {
+                    ForEach(parts.tags, id: \.self) { tag in
+                        Text(tag).font(.caption2)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.secondary.opacity(0.15)))
+                    }
+                    if long {
+                        Button(styleExpanded ? "Less" : "More") { styleExpanded.toggle() }
+                            .font(.caption).buttonStyle(.link)
+                    }
+                }
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
         }
     }
 
@@ -23811,45 +23936,57 @@ struct GDDToAssetsSheet: View {
                 Text("Navigator makes a folder in there for this run: “\(runFolderName)”.")
                     .font(.caption).foregroundColor(.secondary)
             }
-            HStack(spacing: 16) {
+            HStack(spacing: 22) {
                 Picker("Model", selection: $run.modelFlag) {
                     ForEach(NanoBananaModel.all.filter { $0.flag == "nb2" || $0.flag == "nb-pro" },
                             id: \.flag) { Text($0.name).tag($0.flag) }
                 }.frame(width: 220)
-                Picker("Size", selection: $size) {
-                    ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
-                }.frame(width: 140)
-                Picker("Symbols", selection: $symbolAspect) {
-                    ForEach(AssetPlanRules.symbolAspects, id: \.self) { Text($0) }
-                }.frame(width: 150)
-                Picker("Backgrounds", selection: $backgroundAspect) {
-                    ForEach(AssetPlanRules.backgroundAspects, id: \.self) { Text($0) }
-                }.frame(width: 170)
-                Picker("", selection: $backgroundSize) {
-                    ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
-                }.frame(width: 80)
+                // Each group reads as one thing: what it is, then its resolution and shape.
+                // The row used to be "Model / Size / Symbols / Backgrounds / 4K" — "Size"
+                // was the SYMBOL resolution, and the last 4K had no label at all.
+                HStack(spacing: 6) {
+                    Text("Symbols")
+                    Picker("Symbol resolution", selection: $size) {
+                        ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
+                    }.labelsHidden().frame(width: 72).help("Symbol resolution")
+                    Picker("Symbol aspect ratio", selection: $symbolAspect) {
+                        ForEach(AssetPlanRules.symbolAspects, id: \.self) { Text($0) }
+                    }.labelsHidden().frame(width: 72).help("Symbol aspect ratio")
+                }
+                HStack(spacing: 6) {
+                    Text("Backgrounds")
+                    Picker("Background resolution", selection: $backgroundSize) {
+                        ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
+                    }.labelsHidden().frame(width: 72).help("Background resolution")
+                    Picker("Background aspect ratio", selection: $backgroundAspect) {
+                        ForEach(AssetPlanRules.backgroundAspects, id: \.self) { Text($0) }
+                    }.labelsHidden().frame(width: 72).help("Background aspect ratio")
+                }
             }
             .disabled(run.busy || run.running)
             .onChange(of: size) { reflow() }
             .onChange(of: symbolAspect) { reflow() }
             .onChange(of: backgroundAspect) { reflow() }
             .onChange(of: backgroundSize) { reflow() }
+            if run.modelFlag == "nb2" && size == "2K" {
+                // Beside the setting it is about, not below the post-processing options.
+                Label("2K often comes back at half size. Navigator retries at 4K and scales "
+                    + "down, which can cost more than the estimate — pick 4K or Pro to avoid it.",
+                      systemImage: "info.circle")
+                    .font(.caption).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             Text(backgroundNote)
                 .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
                 .fixedSize(horizontal: false, vertical: true)
-            Toggle("Remove symbol backgrounds with Photoshop when the images are done", isOn: $removeBG)
-            Toggle("Then split frames off the framed symbols with Layerize", isOn: $separateFrames)
-                .disabled(!removeBG)
-                .help("Billed by fal.ai, separately from Vertex. Card royals have no frame "
-                    + "and are skipped.")
-            if run.modelFlag == "nb2" && size == "2K" {
-                // The one note that changes what the user should DO. Everything else that
-                // used to be printed here was explaining the implementation to someone who
-                // only wants to make art; it is in the code, where it belongs.
-                Text("2K often comes back at half size. Navigator retries at 4K and scales "
-                   + "down, which can cost more than the estimate — pick 4K or Pro to avoid it.")
-                    .font(.caption).foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("After generating").font(.subheadline).bold().padding(.top, 4)
+                Toggle("Remove symbol backgrounds with Photoshop", isOn: $removeBG)
+                Toggle("Then split frames off the framed symbols with Layerize", isOn: $separateFrames)
+                    .disabled(!removeBG)
+                    .padding(.leading, 20)
+                    .help("Billed by fal.ai, separately from Vertex. Card royals have no frame "
+                        + "and are skipped.")
             }
         }
     }
@@ -23883,10 +24020,21 @@ struct GDDToAssetsSheet: View {
                       systemImage: "exclamationmark.circle")
                     .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
             }
+            // Column headings: the placeholders vanished as soon as a field had text, and
+            // the status and remove icons at the end of each row were never explained.
+            HStack(spacing: 8) {
+                Text("ID").frame(width: 100, alignment: .leading)
+                Text("Role").frame(width: 130, alignment: .leading)
+                Text("Subject").frame(maxWidth: .infinity, alignment: .leading)
+                Text("Silhouette").frame(width: 150, alignment: .leading)
+                Text("Delivered").frame(width: 78, alignment: .trailing)
+                Text("").frame(width: 44)
+            }
+            .font(.caption2.bold()).foregroundColor(.secondary)
             ForEach(run.jobs, id: \.id) { job in
                 HStack(alignment: .top, spacing: 8) {
                     Text(job.id).font(.system(.caption, design: .monospaced)).bold()
-                        .frame(width: 54, alignment: .leading)
+                        .lineLimit(1).frame(width: 100, alignment: .leading)
                     Text(job.kind == .background ? "Background" : job.role.label)
                         .font(.caption).foregroundColor(.secondary)
                         .frame(width: 130, alignment: .leading)
@@ -23945,9 +24093,9 @@ struct GDDToAssetsSheet: View {
         if let e = run.failures[id] {
             Image(systemName: "xmark.circle.fill").foregroundColor(.red).help(e)
         } else if run.produced.contains(where: { $0.lastPathComponent == "\(id).png" }) {
-            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+            Image(systemName: "checkmark.circle.fill").foregroundColor(.green).help("Generated")
         } else {
-            Image(systemName: "circle").foregroundColor(.secondary.opacity(0.35))
+            Image(systemName: "circle").foregroundColor(.secondary.opacity(0.35)).help("Not generated yet")
         }
     }
 
@@ -24125,7 +24273,7 @@ struct GDDToAssetsSheet: View {
         ThemeHubClient.themes { list, err in
             loadingThemes = false
             if let list {
-                themes = list; run.status = "\(list.count) themes loaded."
+                themes = list; themeError = nil; run.status = "\(list.count) themes loaded."
                 if PaidCalls.disabled { ArtPanelProbe.windowThemes = list.count }
                 return
             }
@@ -24134,7 +24282,8 @@ struct GDDToAssetsSheet: View {
                 offerSignIn { loadThemes() }
             } else {
                 navLog("hub: could not load themes: \(err ?? "unknown error")")
-                run.status = "Couldn’t load themes: \(err ?? "unknown error")"
+                themeError = err ?? "unknown error"
+                run.status = "Couldn’t load themes — see step 2."
             }
         }
     }
@@ -24351,6 +24500,12 @@ final class CloseGuard: NSObject, NSWindowDelegate {
 /// are switched off, which is the only time the window can be driven from outside.
 enum ArtPanelProbe {
     static let pick = Notification.Name("NavigatorTestPickTheme")
+    static let pickGDD = Notification.Name("NavigatorTestPickGDD")
+    /// The window and run the last GDD to Assets open made, for test snapshots.
+    nonisolated(unsafe) static weak var window: NSWindow?
+    nonisolated(unsafe) static weak var run: GDDToAssetsRun?
+    /// Test runs only: make the theme list fail, to see the error state without breaking the hub.
+    static var forceHubError: Bool { PaidCalls.disabled && ProcessInfo.processInfo.environment["NAVIGATOR_TEST_HUB_ERROR"] != nil }
     nonisolated(unsafe) static var shown: [String: Int] = [:]
     nonisolated(unsafe) static var windowThemes = 0
 }
@@ -24375,6 +24530,7 @@ enum GDDToAssetsWindow {
                 w?.close()
             }))
         w.center(); windows.append(w)
+        ArtPanelProbe.window = w; ArtPanelProbe.run = run
         // The token has to be kept and removed. A block observer that captures the
         // window strongly keeps it — and its hosting view, and the whole run with its
         // plan and images — alive for the life of the process, so opening the feature
