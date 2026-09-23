@@ -3889,13 +3889,14 @@ func batchRemoveBackgroundFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
 }
 
 // Batch Chroma Key on a FOLDER (After Effects + Keylight) — same per-file routing.
-func batchChromaKeyFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
+func batchChromaKeyFolder(_ folder: URL, profile: ChromaKeyOutputRules.KeylightProfile = .softFX,
+                          onDone: (() -> Void)? = nil) {
     let pngs = batchImageURLs(in: folder).filter { $0.pathExtension.lowercased() == "png" }
     guard !pngs.isEmpty else {
         DispatchQueue.main.async { reportFileError("No PNGs to process", "Chroma Key processes PNG images; none found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_rmbg” files).") }
         onDone?(); return
     }
-    chromaKeyForImages(pngs) { _ in onDone?() }
+    chromaKeyForImages(pngs, profile: profile) { _ in onDone?() }
 }
 
 // ===== FX Alpha Upscale =====
@@ -7881,9 +7882,9 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     // Batch Chroma Key BG writes each <name>_rmbg.png next to its source.
-    func batchChromaKeyBackground(_ ids: Set<String>) {
+    func batchChromaKeyBackground(_ ids: Set<String>, profile: ChromaKeyOutputRules.KeylightProfile = .softFX) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
-        batchChromaKeyFolder(it.url) { [weak self] in self?.refresh() }
+        batchChromaKeyFolder(it.url, profile: profile) { [weak self] in self?.refresh() }
     }
 
     // Batch Remove BG (folder): Photoshop opens each ORIGINAL image (recursively,
@@ -11586,7 +11587,16 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                         Label(pngCount == 1 ? "Chroma Key BG" : "Chroma Key BG (\(pngCount) images)", systemImage: "eyedropper.halffull")
                     }
                 } else if dirs.count == 1, sel.count == 1 {
-                    Button { browser.batchChromaKeyBackground(ids) } label: { Label("Batch Chroma Key BG", systemImage: "eyedropper.halffull") }
+                    // The same two jobs as a single image. A folder of symbols keyed as soft FX
+                    // came back see-through, which is the failure the Solid choice exists for.
+                    Menu {
+                        Button { browser.batchChromaKeyBackground(ids, profile: .softFX) } label: {
+                            Label("Soft FX — keep transparency", systemImage: "sparkles")
+                        }
+                        Button { browser.batchChromaKeyBackground(ids, profile: .solidSymbol) } label: {
+                            Label("Solid subject — opaque interior", systemImage: "square.fill")
+                        }
+                    } label: { Label("Batch Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
             }
             // FX Alpha Upscale — regenerate + key, one action. A submenu only because
@@ -17934,6 +17944,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "chromakey":
             folders.forEach { batchChromaKeyFolder($0) }
             if !images.isEmpty { chromaKeyForImages(images) }
+        case "chromakey-solid":
+            folders.forEach { batchChromaKeyFolder($0, profile: .solidSymbol) }
+            if !images.isEmpty { chromaKeyForImages(images, profile: .solidSymbol) }
         // Upscalers are addressed by INDEX into `upscaleOptions` rather than by a name
         // string, so Finder's menu and Navigator's own can never drift apart: both are
         // built from the same list. "upscale-lowq" is kept as an alias because older

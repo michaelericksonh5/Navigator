@@ -8500,6 +8500,102 @@ final class SymbolCanvasTests: XCTestCase {
     }
 }
 
+final class SolidSubjectMatteTests: XCTestCase {
+    typealias M = ChromaKeyOutputRules.SolidSubjectMatte
+    private let magenta = RGB8(253, 2, 251)
+    private let W = 40, H = 40
+
+    /// A 40×40 magenta field with a 24×24 subject in the middle. Keylight's alpha is
+    /// supplied the way Keylight gets it wrong: the subject's SKIN is keyed half
+    /// transparent, because skin carries red.
+    private func scene(_ paint: (Int, Int) -> (RGB8, UInt8)?) -> (src: [UInt8], key: [UInt8]) {
+        var src = [UInt8](repeating: 0, count: W * H * 4), key = src
+        for y in 0..<H { for x in 0..<W {
+            let i = (y * W + x) * 4
+            let (c, a) = paint(x, y) ?? (magenta, 0)
+            src[i] = c.r; src[i+1] = c.g; src[i+2] = c.b; src[i+3] = 255
+            key[i] = 0; key[i+1] = 200; key[i+2] = 0; key[i+3] = a      // Keylight's green cast
+        } }
+        return (src, key)
+    }
+    private func px(_ out: [UInt8], _ x: Int, _ y: Int) -> (RGB8, UInt8) {
+        let i = (y * W + x) * 4
+        return (RGB8(out[i], out[i+1], out[i+2]), out[i+3])
+    }
+    private let gold = RGB8(212, 175, 55), skin = RGB8(228, 150, 120)
+
+    // The reported bug: the whole symbol came back green and see-through.
+    func testTheSubjectComesBackOpaqueInItsOwnColour() {
+        let (src, key) = scene { x, y in
+            guard (8..<32).contains(x), (8..<32).contains(y) else { return nil }
+            let border = x == 8 || y == 8 || x == 31 || y == 31
+            return border ? (self.gold, 255) : (self.skin, 120)         // skin keyed half-clear
+        }
+        let out = M.apply(source: src, keyed: key, width: W, height: H, backing: magenta)
+        XCTAssertEqual(px(out, 20, 20).0, skin, "interior keeps its source colour, not Keylight's green")
+        XCTAssertEqual(px(out, 20, 20).1, 255, "interior is opaque even where Keylight said 120")
+        XCTAssertEqual(px(out, 2, 2).1, 0, "the field is gone")
+    }
+
+    // The rule: remove the field, not the colour. Magenta artwork INSIDE the symbol —
+    // a neon glow — is not connected to the border and is not the flat backing.
+    func testMagentaArtworkInsideTheSymbolSurvives() {
+        let pink = RGB8(245, 60, 220)                                     // 60+ from the backing
+        let (src, key) = scene { x, y in
+            guard (8..<32).contains(x), (8..<32).contains(y) else { return nil }
+            if (15..<25).contains(x), (15..<25).contains(y) { return (pink, 0) }   // Keylight: clear
+            return (self.gold, 255)
+        }
+        let out = M.apply(source: src, keyed: key, width: W, height: H, backing: magenta)
+        XCTAssertEqual(px(out, 20, 20).1, 255)
+        XCTAssertEqual(px(out, 20, 20).0, pink)
+    }
+
+    // …but a gap between a frame and a figure, showing the flat backing itself, IS
+    // background even though it is enclosed.
+    func testAnEnclosedPocketOfTheBackingIsRemoved() {
+        let (src, key) = scene { x, y in
+            guard (8..<32).contains(x), (8..<32).contains(y) else { return nil }
+            if (15..<25).contains(x), (15..<25).contains(y) { return (RGB8(250, 6, 246), 0) }  // backing, 5 off
+            return (self.gold, 255)
+        }
+        let out = M.apply(source: src, keyed: key, width: W, height: H, backing: magenta)
+        XCTAssertEqual(px(out, 20, 20).1, 0)
+    }
+
+    // At the rim both colours are known, so alpha comes from where the pixel sits on the
+    // line from backing to foreground — not from Keylight, which under-reads there.
+    func testARimPixelGetsItsMixAlphaAndItsOwnColour() {
+        let half = RGB8(UInt8((212 + 253) / 2), UInt8((175 + 2) / 2), UInt8((55 + 251) / 2))
+        let (src, key) = scene { x, y in
+            guard (8..<32).contains(x), (8..<32).contains(y) else { return x == 7 && (8..<32).contains(y) ? (half, 40) : nil }
+            return (self.gold, 255)
+        }
+        let out = M.apply(source: src, keyed: key, width: W, height: H, backing: magenta)
+        let (c, a) = px(out, 7, 20)
+        XCTAssertEqual(Double(a), 127.5, accuracy: 6, "half-covered pixel reads half alpha, not Keylight's 40")
+        XCTAssertEqual(Double(c.r), 212, accuracy: 8); XCTAssertEqual(Double(c.g), 175, accuracy: 8)
+        XCTAssertEqual(Double(c.b), 55, accuracy: 8, "its colour is gold, with the magenta taken out")
+    }
+
+    // Regression for the silent skip: a symbol generated on a backing decodes as RGB with
+    // a padding byte, and the repair used to demand straight RGBA, return nil, and ship
+    // Keylight's output untouched. Decoding must now hand back usable straight RGBA.
+    func testAnRGBSourceWithNoAlphaDecodesToOpaqueStraightRGBA() throws {
+        // Built from exact bytes: CGColor(red:green:blue:) is Generic RGB, and filling an
+        // sRGB context with it converts 212 to 221 before the code under test ever runs.
+        let bytes0 = [UInt8]((0..<16).flatMap { _ in [212, 175, 55, 0] })   // 4th byte is padding
+        let img = try XCTUnwrap(CGImage(width: 4, height: 4, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: 16, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+            provider: CGDataProvider(data: Data(bytes0) as CFData)!, decode: nil,
+            shouldInterpolate: false, intent: .defaultIntent))
+        XCTAssertEqual(img.alphaInfo, .noneSkipLast, "the shape a generated symbol really has")
+        let bytes = try XCTUnwrap(ChromaKeyOutputRules.straightRGBA8(img))
+        XCTAssertEqual(Array(bytes[0..<4]), [212, 175, 55, 255])
+    }
+}
+
 final class SpillRecoveryTests: XCTestCase {
     private let magenta = RGB8(255, 0, 255)
 

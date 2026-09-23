@@ -81,7 +81,15 @@ final class NavigatorFinderSync: FIFinderSync {
                 add(sub, "Remove BG", "removebg", Self.psIcon)
             }
             if Self.installed("com.adobe.AfterEffects"), hasPNG || hasFolder {
-                add(sub, "Chroma Key BG", "chromakey", Self.aeIcon)
+                // The same two jobs Navigator's own menu offers; one item that silently
+                // picked soft FX left every symbol keyed from Finder see-through.
+                let ck = NSMenuItem(title: "Chroma Key BG", action: nil, keyEquivalent: "")
+                ck.image = Self.aeIcon
+                let ckSub = NSMenu()
+                add(ckSub, "Soft FX — keep transparency", "chromakey", Self.icon(systemSymbol: "sparkles"))
+                add(ckSub, "Solid subject — opaque interior", "chromakey-solid", Self.icon(systemSymbol: "square.fill"))
+                ck.submenu = ckSub
+                sub.addItem(ck)
             }
             // Prep for AI is a ratio submenu crossed with a colour submenu in Navigator,
             // which is far too deep to reproduce here. Only the one combination worth a

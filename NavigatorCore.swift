@@ -5810,6 +5810,225 @@ enum ChromaKeyOutputRules {
         }
     }
 
+    /// The matte for a SOLID symbol: remove the field, not the colour.
+    ///
+    /// Keylight is a colour-difference keyer and knows nothing about WHERE anything is.
+    /// Skin carries red and a sky carries blue — both halves of magenta — so it keyed a
+    /// face and the sky behind it as partly transparent, as if the backing showed through,
+    /// and the arithmetic then subtracted magenta that was never there. Measured on six
+    /// generated symbols through this app's own path: 27–77% of each subject came back
+    /// partly transparent, with colour errors of 33–83 levels, and a strong green cast.
+    ///
+    /// The rule a person applies is spatial, so this is:
+    ///   - FIELD: what Keylight calls clear AND is connected to the image border, plus any
+    ///     enclosed pocket whose core is the flat backing itself (the gap between a frame
+    ///     and a figure). Magenta ARTWORK is never reachable from the border through clear
+    ///     pixels, and its core is never the flat generated backing — measured, the best
+    ///     tenth of a real hole sits 2–8 levels from the backing and artwork 19 or more —
+    ///     so a neon symbol's pink glow survives.
+    ///   - INTERIOR: everything the silhouette encloses. Fully opaque, source colour
+    ///     exactly, because a pixel inside the symbol contains no backing at all.
+    ///   - RIM: the few pixels in between. Both colours in that mix are known — the local
+    ///     interior colour F and the backing B — so alpha is where the pixel sits on the
+    ///     line from B to F, and its colour is recovered with THAT alpha. Keylight's alpha
+    ///     under-reads at the rim, and recovering colour from it is what left a green
+    ///     fringe. Where F and B are too alike to project (pink artwork against magenta),
+    ///     Keylight's alpha is the only estimate there is, and it is kept.
+    enum SolidSubjectMatte {
+        static let clearBelow: UInt8 = 25     // Keylight alpha under this counts as clear
+        static let opaqueFrom: UInt8 = 250
+        static let holeMatch = 12.0           // a pocket is backing if its best tenth is this close
+        static let distinct = 80.0            // |F − B| needed before projecting onto the line
+        static let reach = 12                 // how far a soft edge may extend from the field
+        static let rim = 6                    // how far out from the interior alpha is re-estimated
+
+        /// `source` and `keyed` are straight (unpremultiplied) RGBA8 of `width*height*4`
+        /// bytes. Returns straight RGBA8 of the same size.
+        static func apply(source: [UInt8], keyed: [UInt8], width w: Int, height h: Int,
+                          backing: RGB8) -> [UInt8] {
+            let n = w * h
+            precondition(source.count == n * 4 && keyed.count == n * 4)
+            // `backing` is only the fallback; the field's own median replaces it below.
+            var B = [Double(backing.r), Double(backing.g), Double(backing.b)]
+            func toBacking(_ p: Int) -> Double {
+                let i = p * 4
+                let r = Double(source[i]) - B[0], g = Double(source[i+1]) - B[1], b = Double(source[i+2]) - B[2]
+                return (r*r + g*g + b*b).squareRoot()
+            }
+            func neighbours4(_ p: Int, _ body: (Int) -> Void) {
+                let x = p % w
+                if x > 0 { body(p - 1) }
+                if x < w - 1 { body(p + 1) }
+                if p >= w { body(p - w) }
+                if p < n - w { body(p + w) }
+            }
+
+            // Field: clear components touching the border, or whose core is the backing.
+            var field = [Bool](repeating: false, count: n)
+            var seen = [Bool](repeating: false, count: n)
+            var stack: [Int] = []
+            var enclosed: [[Int]] = []
+            for start in 0..<n where !seen[start] && keyed[start*4+3] < clearBelow {
+                var members: [Int] = []
+                var touchesBorder = false
+                seen[start] = true; stack.append(start)
+                while let p = stack.popLast() {
+                    members.append(p)
+                    let x = p % w, y = p / w
+                    if x == 0 || y == 0 || x == w - 1 || y == h - 1 { touchesBorder = true }
+                    neighbours4(p) { q in
+                        if !seen[q] && keyed[q*4+3] < clearBelow { seen[q] = true; stack.append(q) }
+                    }
+                }
+                if touchesBorder { for p in members { field[p] = true } } else { enclosed.append(members) }
+            }
+            // The backing, measured from the field itself rather than four corner pixels.
+            // A generated backing drifts a few levels across the image, and the corner
+            // estimate moved one real hole from 10.8 to 16.2 levels away — across the
+            // line that decides whether it is removed.
+            var samples: [[Int]] = [[], [], []]
+            var k = 0
+            for p in 0..<n where field[p] {
+                k += 1
+                if k % 7 != 0 { continue }
+                for c in 0..<3 { samples[c].append(Int(source[p*4+c])) }
+            }
+            if !samples[0].isEmpty {
+                for c in 0..<3 { samples[c].sort(); B[c] = Double(samples[c][samples[c].count / 2]) }
+            }
+            for members in enclosed {
+                let d = members.map(toBacking).sorted()
+                if d[d.count / 10] <= holeMatch { for p in members { field[p] = true } }
+            }
+            let backing = RGB8(UInt8(B[0]), UInt8(B[1]), UInt8(B[2]))
+
+            // Soft edge: partial pixels reachable from the field through partial pixels.
+            var edge = [Bool](repeating: false, count: n)
+            var depth = [Int](repeating: -1, count: n)
+            var queue: [Int] = []
+            queue.reserveCapacity(n / 2)
+            for p in 0..<n where field[p] { depth[p] = 0; queue.append(p) }
+            var head = 0
+            while head < queue.count {
+                let p = queue[head]; head += 1
+                if depth[p] >= reach { continue }
+                neighbours4(p) { q in
+                    if depth[q] < 0 && keyed[q*4+3] < opaqueFrom {
+                        depth[q] = depth[p] + 1; edge[q] = true; queue.append(q)
+                    }
+                }
+            }
+            let interior = (0..<n).map { !field[$0] && !edge[$0] }
+
+            // Rim: pixels within `rim` of the interior, each with its nearest interior pixel.
+            var nearest = [Int](repeating: -1, count: n)
+            var rimDepth = [Int](repeating: -1, count: n)
+            queue.removeAll(keepingCapacity: true); head = 0
+            for p in 0..<n where interior[p] { nearest[p] = p; rimDepth[p] = 0; queue.append(p) }
+            while head < queue.count {
+                let p = queue[head]; head += 1
+                if rimDepth[p] >= rim { continue }
+                let x = p % w, y = p / w
+                for dy in -1...1 { for dx in -1...1 where dx != 0 || dy != 0 {
+                    let nx = x + dx, ny = y + dy
+                    guard nx >= 0, ny >= 0, nx < w, ny < h else { continue }
+                    let q = ny * w + nx
+                    if rimDepth[q] < 0 { rimDepth[q] = rimDepth[p] + 1; nearest[q] = nearest[p]; queue.append(q) }
+                } }
+            }
+
+            var out = [UInt8](repeating: 0, count: n * 4)
+            func put(_ p: Int, _ r: Double, _ g: Double, _ b: Double, _ a: Double) {
+                let i = p * 4
+                out[i] = UInt8(max(0, min(255, r.rounded()))); out[i+1] = UInt8(max(0, min(255, g.rounded())))
+                out[i+2] = UInt8(max(0, min(255, b.rounded()))); out[i+3] = UInt8(max(0, min(255, a.rounded())))
+            }
+            for p in 0..<n {
+                let i = p * 4
+                if interior[p] {
+                    out[i] = source[i]; out[i+1] = source[i+1]; out[i+2] = source[i+2]; out[i+3] = 255
+                    continue
+                }
+                if rimDepth[p] > 0 {
+                    // Local interior colour: the mean over a 7×7 window, so one specular
+                    // highlight does not paint a whole stretch of rim cream.
+                    let x = p % w, y = p / w
+                    var sum = [0.0, 0.0, 0.0], count = 0.0
+                    for yy in max(0, y - 3)...min(h - 1, y + 3) { for xx in max(0, x - 3)...min(w - 1, x + 3) {
+                        let q = yy * w + xx
+                        guard interior[q] else { continue }
+                        sum[0] += Double(source[q*4]); sum[1] += Double(source[q*4+1]); sum[2] += Double(source[q*4+2]); count += 1
+                    } }
+                    let q = nearest[p] * 4
+                    let F = count > 0 ? sum.map { $0 / count }
+                                      : [Double(source[q]), Double(source[q+1]), Double(source[q+2])]
+                    let v = (0..<3).map { F[$0] - B[$0] }
+                    let vv = v[0]*v[0] + v[1]*v[1] + v[2]*v[2]
+                    if vv >= distinct * distinct {
+                        let S = [Double(source[i]), Double(source[i+1]), Double(source[i+2])]
+                        var a = max(0, min(1, ((S[0]-B[0])*v[0] + (S[1]-B[1])*v[1] + (S[2]-B[2])*v[2]) / vv))
+                        // A pixel already judged to be field cannot be FAINTLY subject: a few
+                        // percent here is the backing drifting a few levels, not coverage.
+                        if field[p] && a < 0.08 { a = 0 }
+                        // Own colour from the projected alpha; faint pixels fade to F, where
+                        // the division would amplify noise more than it recovers colour.
+                        var t = max(0, min(1, (a - 0.15) / 0.20)); t = t * t * (3 - 2 * t)
+                        let c = (0..<3).map { k -> Double in
+                            let own = max(0, min(255, B[k] + (S[k] - B[k]) / max(a, 0.001)))
+                            return own * t + F[k] * (1 - t)
+                        }
+                        put(p, c[0], c[1], c[2], a * 255)
+                        continue
+                    }
+                }
+                // The field itself is gone rather than faintly tinted: Keylight leaves it
+                // at alpha < 25 in its despilled colour, a haze on a dark reel.
+                if field[p] && rimDepth[p] < 0 { continue }
+                let a = keyed[i+3]
+                let c = SpillRules.recovered(keyed: RGB8(keyed[i], keyed[i+1], keyed[i+2]),
+                                             source: RGB8(source[i], source[i+1], source[i+2]),
+                                             backing: backing, alpha: a)
+                out[i] = c.r; out[i+1] = c.g; out[i+2] = c.b; out[i+3] = a
+            }
+            return out
+        }
+    }
+
+    /// Any decoded image as straight RGBA8, row-packed, in the image's own RGB space.
+    ///
+    /// The interior repair used to demand the SOURCE already be 8-bit straight RGBA, and a
+    /// symbol generated on a flat backing never is: it decodes as RGB with a padding byte
+    /// (alphaInfo .noneSkipLast). So the repair returned nil without a word, and Keylight's
+    /// green-cast output was published untouched — on every generated symbol.
+    static func straightRGBA8(_ image: CGImage) -> [UInt8]? {
+        let w = image.width, h = image.height
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
+        let drawn = bytes.withUnsafeMutableBytes { raw -> Bool in
+            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.setBlendMode(.copy)
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard drawn else { return nil }
+        for i in stride(from: 0, to: bytes.count, by: 4) {
+            let a = Int(bytes[i+3])
+            guard a > 0 && a < 255 else { continue }
+            for c in 0..<3 { bytes[i+c] = UInt8(min(255, (Int(bytes[i+c]) * 255 + a / 2) / a)) }
+        }
+        return bytes
+    }
+
+    static func image(straightRGBA8 bytes: [UInt8], width: Int, height: Int, space: CGColorSpace?) -> CGImage? {
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: space ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
     /// The flat backing colour, taken as the median of the four corners.
     ///
     /// Median rather than mean: one corner clipped by the subject would drag a mean
@@ -5896,8 +6115,9 @@ enum ChromaKeyOutputRules {
                        decode: nil, shouldInterpolate: false, intent: keyed.renderingIntent)
     }
 
-    static func publish(rendered: URL, source: URL) throws -> URL {
-        let input = try load(source), image = try load(rendered)
+    static func publish(rendered: URL, source: URL, profile: KeylightProfile = .softFX) throws -> URL {
+        var input = try load(source)
+        let image = try load(rendered)
         guard image.width == input.width, image.height == input.height else {
             throw failure("After Effects changed the image dimensions")
         }
@@ -5916,8 +6136,23 @@ enum ChromaKeyOutputRules {
         // (rgb(255,255,142) -> rgb(174,174,174)), so the bias is doing necessary work on the
         // SOFT pixels, which is where Keylight earns its place. This only touches the
         // interior, and only where the answer is arithmetically certain.
-        let final = try restoreOpaqueInterior(keyed: image, source: input,
+        let space = image.colorSpace
+        let final: CGImage
+        if profile == .solidSymbol {
+            guard let src = straightRGBA8(input), let keyed = straightRGBA8(image),
+                  let made = self.image(straightRGBA8: SolidSubjectMatte.apply(
+                    source: src, keyed: keyed, width: input.width, height: input.height,
+                    backing: try backingColour(input)), width: input.width, height: input.height, space: space)
+            else { throw failure("Could not build the symbol matte") }
+            final = made
+        } else {
+            // The soft-FX repair needs the source as straight RGBA; a generated PNG is RGB.
+            if let bytes = straightRGBA8(input),
+               let normal = self.image(straightRGBA8: bytes, width: input.width, height: input.height,
+                                       space: input.colorSpace) { input = normal }
+            final = try restoreOpaqueInterior(keyed: image, source: input,
                                               backing: try? backingColour(input)) ?? image
+        }
         let data = NSMutableData()
         guard let encoder = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else {
             throw failure("Could not encode PNG")
@@ -5998,7 +6233,7 @@ enum ChromaKeyOutputRules {
               ["tif", "png"].contains(rendered.pathExtension.lowercased()) else {
             throw failure("After Effects reported an unexpected output path")
         }
-        return try publish(rendered: rendered, source: source)
+        return try publish(rendered: rendered, source: source, profile: profile)
     }
 }
 
