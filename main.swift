@@ -4551,12 +4551,29 @@ let adobeRevealAfter: TimeInterval = 90
 
 func keepHidden(while isRunning: @escaping () -> Bool, bundleID: String,
                 revealAfter: TimeInterval? = nil) {
+    // Re-hide on macOS's own un-hide notification, not on the next poll. Measured during a
+    // 50-image Chroma Key batch: After Effects un-hid itself once per image, every ~6 s, and
+    // the 0.5 s poll left it on screen 0.4-0.6 s each time — a flash in front of the user
+    // fifty times. The poll below stays as the backstop for anything the notification misses.
+    final class Revealed: @unchecked Sendable {
+        private let lock = NSLock(); private var value = false
+        var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        func set() { lock.lock(); value = true; lock.unlock() }
+    }
+    let revealed = Revealed()
+    let observer = NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: nil) { note in
+        guard !revealed.isSet,
+              let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == bundleID else { return }
+        app.hide()
+    }
     DispatchQueue.global(qos: .utility).async {
+        defer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         let start = Date()
-        var revealed = false
         while isRunning() {
-            if let revealAfter, !revealed, Date().timeIntervalSince(start) > revealAfter {
-                revealed = true
+            if let revealAfter, !revealed.isSet, Date().timeIntervalSince(start) > revealAfter {
+                revealed.set()
                 navLog("\(bundleID): still running after \(Int(revealAfter))s — showing it, in case it is "
                        + "waiting on a dialog that cannot be answered while hidden")
                 for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) {
@@ -4564,7 +4581,7 @@ func keepHidden(while isRunning: @escaping () -> Bool, bundleID: String,
                     app.activate()
                 }
             }
-            if !revealed {
+            if !revealed.isSet {
                 for app in NSRunningApplication.runningApplications(withBundleIdentifier: bundleID) where !app.isHidden { app.hide() }
             }
             Thread.sleep(forTimeInterval: 0.5)

@@ -6187,13 +6187,30 @@ enum ChromaKeyOutputRules {
         var clipWhite: Double { self == .softFX ? 100 : 80 }
     }
 
+    /// Tell the keying script which colour to key, so it never samples one itself.
+    ///
+    /// As HEX, deliberately. In custom mode the script re-derives the colour from
+    /// customKeyColorHex, whose default is "#00FF00" — so passing only customKeyColor keyed
+    /// a magenta image for GREEN and removed nothing: every pixel came back opaque.
+    static func keyColorConfig(_ backing: RGB8) -> [String: Any] {
+        ["keyMode": "custom", "customKeyColorHex": String(format: "#%02X%02X%02X", backing.r, backing.g, backing.b)]
+    }
+
     static func exportPNG(source: URL, scriptURL: URL, bundleID: String,
                           profile: KeylightProfile = .softFX,
                           onLaunch: ((@escaping () -> Bool) -> Void)? = nil) throws -> URL {
         renderLock.lock()
         defer { renderLock.unlock() }
         guard source.pathExtension.lowercased() == "png" else { throw failure("Chroma Key needs a PNG") }
-        let bias = try foregroundBias(load(source))
+        let sourceImage = try load(source)
+        let bias = try foregroundBias(sourceImage)
+        // Hand After Effects the backing colour instead of letting it sample one. Its sampler
+        // reads the image through an expression bridge, and doing that on a real image un-hid
+        // After Effects — measured 1 of 1 runs, every run, against 0 for every step before
+        // it. That is the flash in front of the user once per image of a batch. The colour is
+        // the same four-corner measurement the script would make, and skipping the sampler also
+        // skips its four quarter-second waits.
+        let backing = try backingColour(sourceImage)
         let script = try String(contentsOf: scriptURL, encoding: .utf8)
         let fm = FileManager.default
         let scratch = fm.temporaryDirectory.appendingPathComponent("NavigatorKeylight-" + UUID().uuidString)
@@ -6201,12 +6218,12 @@ enum ChromaKeyOutputRules {
         defer { try? fm.removeItem(at: scratch) }
         let statusFile = scratch.appendingPathComponent("result.txt")
         let logFile = scratch.appendingPathComponent("keylight.log")
-        let config: [String: Any] = ["sourceFile": source.path, "outputFolder": scratch.path,
-            "outputName": "keyed", "automationMode": true, "showUi": false, "keyMode": "auto",
-            "useSampleAverage": true,
+        var config: [String: Any] = ["sourceFile": source.path, "outputFolder": scratch.path,
+            "outputName": "keyed", "automationMode": true, "showUi": false,
             "keylight": ["despillBias": bias,
                          "clipBlack": profile.clipBlack, "clipWhite": profile.clipWhite],
             "resultFile": statusFile.path, "logFile": logFile.path]
+        config.merge(keyColorConfig(backing)) { _, new in new }
         let json = String(decoding: try JSONSerialization.data(withJSONObject: config), as: UTF8.self)
         // DoScriptFile is refused by AE's scripting security; DoScript SOURCE works.
         // No system.callSystem: TIFF-to-PNG conversion is entirely in ImageIO above.

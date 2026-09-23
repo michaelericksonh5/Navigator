@@ -8500,6 +8500,18 @@ final class SymbolCanvasTests: XCTestCase {
     }
 }
 
+final class KeyColorConfigTests: XCTestCase {
+    // The script's own default is customKeyColorHex "#00FF00", and in custom mode the hex
+    // wins. Handing over the colour any other way keyed magenta art for green and removed
+    // nothing — so the hex must be present and must be the backing.
+    func testTheBackingIsHandedOverAsTheHexTheScriptActuallyReads() {
+        let c = ChromaKeyOutputRules.keyColorConfig(RGB8(253, 2, 251))
+        XCTAssertEqual(c["keyMode"] as? String, "custom")
+        XCTAssertEqual(c["customKeyColorHex"] as? String, "#FD02FB")
+        XCTAssertNil(c["customKeyColor"], "an array alone is overridden by the script's green default")
+    }
+}
+
 final class SolidSubjectMatteTests: XCTestCase {
     typealias M = ChromaKeyOutputRules.SolidSubjectMatte
     private let magenta = RGB8(253, 2, 251)
