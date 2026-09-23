@@ -8500,6 +8500,28 @@ final class SymbolCanvasTests: XCTestCase {
     }
 }
 
+final class ThemeStyleKeyTests: XCTestCase {
+    private let art = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ"
+
+    // The whole point: artwork changed on the hub must not inherit the old read.
+    func testChangedArtworkGetsADifferentKey() {
+        XCTAssertNotEqual(ThemeStyleRules.key(theme: "Loki", artDataURL: art),
+                          ThemeStyleRules.key(theme: "Loki", artDataURL: art + "X"))
+    }
+
+    // Unchanged artwork reuses its read — the vision pass is not repeatable.
+    func testIdenticalArtworkGetsTheSameKeyEveryTime() {
+        XCTAssertEqual(ThemeStyleRules.key(theme: "Loki", artDataURL: art),
+                       ThemeStyleRules.key(theme: "Loki", artDataURL: art))
+    }
+
+    // Two themes sharing a picture are still two entries.
+    func testTheThemeIsPartOfTheKey() {
+        XCTAssertNotEqual(ThemeStyleRules.key(theme: "Loki", artDataURL: art),
+                          ThemeStyleRules.key(theme: "Thor", artDataURL: art))
+    }
+}
+
 final class KeyColorConfigTests: XCTestCase {
     // The script's own default is customKeyColorHex "#00FF00", and in custom mode the hex
     // wins. Handing over the colour any other way keyed magenta art for green and removed

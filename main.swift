@@ -2379,6 +2379,7 @@ private func firstURL(in any: Any) -> String? {
 
 // One synchronous fal upscale call → (result PNG bytes, error message).
 private func falUpscale(pngData input: Data, option: UpscaleOption, key: String) -> (data: Data?, error: String?) {
+    if PaidCalls.disabled { return (nil, PaidCalls.refusal) }
     let dataURI = "data:image/png;base64," + input.base64EncodedString()
     guard let url = URL(string: "https://fal.run/\(option.endpoint)") else { return (nil, "bad URL") }
     var req = URLRequest(url: url)
@@ -2713,6 +2714,7 @@ func askLayerizeElements(imageCount: Int, firstImage: Data?) -> String? {
 private func falLayerize(imageRef: String, tier: String, key: String,
                          prompt: String = LayerizeRules.basePrompt)
     -> (layers: [LayerizeLayer], error: String?, seconds: Double) {
+    if PaidCalls.disabled { return ([], PaidCalls.refusal, 0) }
     let started = Date()
     guard let url = URL(string: "https://fal.run/bytedance/seedream/v5/pro/layerize") else { return ([], "bad URL", 0) }
     var req = URLRequest(url: url)
@@ -3235,6 +3237,17 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
 
 struct H5GResult { let out: String; let err: String; let code: Int32 }
 
+/// A hard stop on every call that costs money, for test runs.
+///
+/// Set NAVIGATOR_NO_PAID_CALLS in the environment and nothing can reach the metering
+/// service, the Vertex client or fal — whatever a test clicks or triggers. It exists
+/// because a check of the GDD window, driven from outside, picked a theme by accident and
+/// the window did what it is built to do: paid for a style read.
+enum PaidCalls {
+    static let disabled = ProcessInfo.processInfo.environment["NAVIGATOR_NO_PAID_CALLS"] != nil
+    static let refusal = "Paid calls are disabled for this run (NAVIGATOR_NO_PAID_CALLS)."
+}
+
 /// True when the window's first responder is editing text, so app-wide shortcuts must
 /// keep their hands off.
 ///
@@ -3443,6 +3456,7 @@ func vertexSignedIn() -> Bool {
 // (avoids a full-buffer deadlock). Node's own dir is put on PATH so the client's
 // child `open`/etc. resolve.
 func runH5GClient(_ args: [String]) -> H5GResult {
+    if PaidCalls.disabled { return H5GResult(out: "", err: PaidCalls.refusal, code: 1) }
     guard let node = resolveNode() else { return H5GResult(out: "", err: "Node.js not found", code: 127) }
     guard let client = resolveH5GClient() else { return H5GResult(out: "", err: "h5g-ai-connect client not found", code: 127) }
     var env = ProcessInfo.processInfo.environment
@@ -19368,6 +19382,7 @@ enum H5GService {
     /// kept as its subject.
     static func image(prompt: String, modelID: String, inputPNGs: [Data],
                       aspect: String?, size: String?) -> (png: Data?, cost: Double?, error: String?) {
+        if PaidCalls.disabled { return (nil, nil, PaidCalls.refusal) }
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
         guard let token else {
             return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
@@ -19499,6 +19514,7 @@ enum H5GService {
 
     /// Raw POST, for probing which model ids an endpoint will accept.
     static func rawPOST(_ path: String, _ body: [String: Any]) -> String {
+        if PaidCalls.disabled { return PaidCalls.refusal }
         guard let base = baseURL, let url = URL(string: base + path) else { return "no URL" }
         guard let token else { return "not signed in" }
         var req = URLRequest(url: url)
@@ -19529,6 +19545,7 @@ enum H5GService {
 
     static func describe(prompt: String, systemPrompt: String?, imagePNG: Data?)
         -> (text: String?, cost: Double?, error: String?) {
+        if PaidCalls.disabled { return (nil, nil, PaidCalls.refusal) }
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
         guard let token else {
             return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
@@ -21058,12 +21075,72 @@ if let flag = CommandLine.arguments.firstIndex(of: "--style-test") {
     app.run()
 }
 
+// Picks every theme in the REAL GDD to Assets window and checks what its artwork panel has
+// to draw. Refuses to run unless paid calls are off: picking a theme starts a style read.
+//   NAVIGATOR_NO_PAID_CALLS=1 Navigator --art-panel-test
+if CommandLine.arguments.contains("--art-panel-test") {
+    setvbuf(stdout, nil, _IOLBF, 0)   // progress as it happens, not all at exit
+    guard PaidCalls.disabled else {
+        print("Refusing: set NAVIGATOR_NO_PAID_CALLS=1 — picking a theme starts a paid style read.")
+        exit(2)
+    }
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        ThemeHubClient.themes { list, err in
+            guard let full = list else { print("hub FAILED — \(err ?? "?")"); exit(1) }
+            let args = CommandLine.arguments
+            let limit = args.firstIndex(of: "--limit").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil }
+            let list = limit.map { Array(full.prefix($0)) } ?? full
+            GDDToAssetsWindow.open()
+            var i = 0, ok = 0, noArt = 0
+            var failed: [String] = []
+            func finish() {
+                print("\npanel showed artwork for \(ok) of \(list.count) themes"
+                      + (noArt > 0 ? ", \(noArt) have no art on their card" : "")
+                      + (failed.isEmpty ? " — ALL OK" : " — FAILED: \(failed)"))
+                exit(failed.isEmpty ? 0 : 1)
+            }
+            func next() {
+                guard i < list.count else { finish(); return }
+                let t = list[i]; i += 1
+                let started = Date()
+                ArtPanelProbe.shown[t.name] = nil
+                NotificationCenter.default.post(name: ArtPanelProbe.pick, object: t.name)
+                func poll() {
+                    let n = ArtPanelProbe.shown[t.name] ?? 0
+                    let secs = Date().timeIntervalSince(started)
+                    if n > 0 {
+                        ok += 1
+                        print(String(format: "ok    %-40@ %d image(s) in the panel  %4.1fs", t.name as NSString, n, secs))
+                        next()
+                    } else if !t.hasArt && secs > 3 {
+                        noArt += 1; print("—     \(t.name): no art on its hub card"); next()
+                    } else if secs > 10 {
+                        // Ten seconds is the bar a person holds it to; anything slower has failed.
+                        failed.append(t.name); print("FAIL  \(t.name): panel had nothing to draw after 10 s"); next()
+                    } else {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { poll() }
+                    }
+                }
+                poll()
+            }
+            func waitForWindow() {
+                if ArtPanelProbe.windowThemes > 0 { print("window loaded \(ArtPanelProbe.windowThemes) themes"); next() }
+                else { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { waitForWindow() } }
+            }
+            waitForWindow()
+        }
+    } }
+    app.run()
+}
+
 // Every document the GDD to Assets picker shows, read the way the window reads it:
 // the same list (folder minus the documents the saved scan hides), the same
 // GDDLibrary.text, the same GDDToAssetsRun.load — with the theme hub starting at the
 // same instant as the first document, as it does when the window opens. No AI calls.
 //   Navigator --gdd-window-test
 if CommandLine.arguments.contains("--gdd-window-test") {
+    setvbuf(stdout, nil, _IOLBF, 0)   // progress as it happens, not all at exit
     app.setActivationPolicy(.accessory)
     guard let folder = GDDLibrary.folder else { print("No GDD folder set"); exit(2) }
     let hidden = GDDScanRules.hiddenKeys(GDDLibrary.scanResults)
@@ -21532,23 +21609,52 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     ///
     /// `js` is a function BODY (it must `return`), which is what callAsyncJavaScript
     /// takes and what lets the script use `await`.
-    func evaluate(url: URL, js: String, timeout: TimeInterval = 90,
-                  completion: @escaping (Any?, String?) -> Void) {
-        begin(url, timeout: timeout, label: "the theme hub") { web, _, _, err in
-            guard let w = web else { completion(nil, err ?? "The page didn’t load."); return }
-            if Self.isSignInPage(w.url) { completion(nil, GoogleWebSession.signInNeeded); return }
+    /// Load a page ONCE and run as many scripts on it as the caller needs, holding the
+    /// worker until `release` — so no queued request can navigate the page away mid-way.
+    ///
+    /// The theme hub is a ~15 MB page (105 of its cards carry their artwork inline).
+    /// Reloading it for every script is what made artwork slow and able to time out;
+    /// this lets one load serve the theme list AND all of the artwork.
+    ///
+    /// A watchdog releases the worker if the caller never does, so a bug here stalls one
+    /// request rather than every Google request for the rest of the session.
+    func withPage(url: URL, timeout: TimeInterval = 90, label: String, holdLimit: TimeInterval = 180,
+                  _ body: @escaping (_ run: @escaping (String, @escaping (Any?, String?) -> Void) -> Void,
+                                     _ release: @escaping () -> Void) -> Void,
+                  failed: @escaping (String) -> Void) {
+        begin(url, timeout: timeout, label: label) { web, _, _, err in
+            guard let w = web else { failed(err ?? "The page didn’t load."); return }
+            if Self.isSignInPage(w.url) { failed(GoogleWebSession.signInNeeded); return }
             self.holdingForScript = true
-            self.liveLabel = "the theme hub"
-            w.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { res in
+            self.liveLabel = label
+            var released = false
+            let release = {
+                guard !released else { return }
+                released = true
                 self.holdingForScript = false
                 self.liveLabel = nil
-                switch res {
-                case .success(let v): completion(v, nil)
-                case .failure(let e): completion(nil, e.localizedDescription)
-                }
                 self.startNextIfIdle()
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + holdLimit) {
+                if !released { navLog("google: \(label) held the worker for \(Int(holdLimit))s — releasing it"); release() }
+            }
+            let run: (String, @escaping (Any?, String?) -> Void) -> Void = { js, done in
+                w.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { res in
+                    switch res {
+                    case .success(let v): done(v, nil)
+                    case .failure(let e): done(nil, e.localizedDescription)
+                    }
+                }
+            }
+            body(run, release)
         }
+    }
+
+    func evaluate(url: URL, js: String, timeout: TimeInterval = 90,
+                  completion: @escaping (Any?, String?) -> Void) {
+        withPage(url: url, timeout: timeout, label: "the theme hub", { run, release in
+            run(js) { v, e in completion(v, e); release() }
+        }, failed: { completion(nil, $0) })
     }
 
     /// Download a URL to a real file and hand back where it landed.
@@ -21848,8 +21954,9 @@ enum ThemeHubClient {
         guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
             completion(nil, "No theme hub address is set on this Mac."); return
         }
-        GoogleWebSession.shared.evaluate(url: url, js: extractionJS) { v, err in
-            if let err { completion(nil, err); return }
+        GoogleWebSession.shared.withPage(url: url, label: "the theme hub", { run, release in
+          run(extractionJS) { v, err in
+            if let err { release(); completion(nil, err); return }
             if let s = v as? String, let e = hubError(s) {
                 navLog("hub: \(e) \(settleSummary(s))"); completion(nil, e); return
             }
@@ -21876,7 +21983,87 @@ enum ThemeHubClient {
             navLog("hub: \(themes.count) themes \(settleSummary(s))")
             completion(themes.isEmpty ? nil : themes,
                        themes.isEmpty ? "The theme hub returned no themes." : nil)
+            // The page is loaded and settled, and every card's artwork is already in it.
+            // Copy it all now, while it is here, instead of reloading the page per theme.
+            prefetchArt(names: themes.filter(\.hasArt).map(\.name), run: run, done: release)
+          }
+        }, failed: { completion(nil, $0) })
+    }
+
+    // MARK: Artwork, copied once per hub load
+
+    /// Every theme's reference artwork as data URLs, copied off the loaded hub page.
+    nonisolated(unsafe) static var artStore: [String: [String]] = [:]
+    nonisolated(unsafe) private static var prefetching = false
+    nonisolated(unsafe) private static var artWaiters: [String: [([String], String?) -> Void]] = [:]
+
+    /// Pull the artwork for `names` off the already-loaded page, ten cards per script.
+    ///
+    /// Ten cards is ~1.5 MB per crossing. All of it in one return was the 16.5 MB payload
+    /// that silently lost eight themes, so it is batched; and nothing is reloaded, so no
+    /// batch depends on the network except the 14 cards whose art the server hosts, which
+    /// the page itself has already fetched and cached.
+    @MainActor
+    static func prefetchArt(names: [String], run: @escaping (String, @escaping (Any?, String?) -> Void) -> Void,
+                            done: @escaping () -> Void) {
+        prefetching = true
+        artStore = [:]          // this load's copy replaces the last one entirely
+        let started = Date()
+        let batches = stride(from: 0, to: names.count, by: 10).map { Array(names[$0..<min($0 + 10, names.count)]) }
+        var copied = 0, images = 0, failures: [String] = []
+        func finish() {
+            prefetching = false
+            navLog(String(format: "hub: artwork copied for %d of %d themes (%d images) in %.1fs%@", copied, names.count,
+                          images, Date().timeIntervalSince(started),
+                          failures.isEmpty ? "" : " — missing: \(failures.joined(separator: ", "))"))
+            let waiting = artWaiters; artWaiters = [:]
+            for (name, callbacks) in waiting { for cb in callbacks { art(forThemeNamed: name, completion: cb) } }
+            done()
         }
+        func next(_ i: Int) {
+            guard i < batches.count else { finish(); return }
+            run(artBatchJS(batches[i])) { v, err in
+                let got = (v as? String).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: [String]] ?? [:]
+                for name in batches[i] {
+                    if let urls = got[name], !urls.isEmpty { artStore[name] = urls; copied += 1; images += urls.count }
+                    else { failures.append(name) }
+                }
+                if let err { navLog("hub: artwork batch \(i + 1) failed: \(err)") }
+                next(i + 1)
+            }
+        }
+        next(0)
+    }
+
+    /// One batch: every image on each named card, as data URLs.
+    static func artBatchJS(_ names: [String]) -> String {
+        let quoted = (try? JSONSerialization.data(withJSONObject: names)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        return """
+        const want = \(quoted);
+        const toDataURL = async (src) => {
+          if (src.indexOf('data:') === 0) return src;
+          const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20000);
+          try {
+            const r = await fetch(src, { signal: ctl.signal }); if (!r.ok) return null;
+            const b = await r.blob();
+            return await new Promise(res => { const f = new FileReader(); f.onloadend = () => res(f.result); f.onerror = () => res(null); f.readAsDataURL(b); });
+          } catch (e) { return null; } finally { clearTimeout(t); }
+        };
+        const out = {};
+        for (const c of document.querySelectorAll('.card[data-name]')) {
+          const name = c.getAttribute('data-name');
+          if (!want.includes(name) || out[name]) continue;
+          const urls = [];
+          for (const im of c.querySelectorAll('img')) {
+            const src = im.getAttribute('src') || '';
+            if (!src) continue;
+            const d = await toDataURL(src);
+            if (d) urls.push(d);
+          }
+          out[name] = urls;
+        }
+        return JSON.stringify(out);
+        """
     }
 
     /// How many reference images every card actually yields, in one page load.
@@ -21928,11 +22115,16 @@ enum ThemeHubClient {
         guard let base = GoogleWebSession.themeHubURL, let url = URL(string: base) else {
             completion([], "No theme hub address is set on this Mac."); return
         }
+        if let urls = artStore[name], !urls.isEmpty { completion(urls, nil); return }
+        if prefetching { artWaiters[name, default: []].append(completion); return }
+        // Not copied (the batch failed, or the list was never loaded): load the page for it.
+        navLog("hub: artwork for “\(name)” not in the copied set — loading the page for it")
         GoogleWebSession.shared.evaluate(url: url, js: artJS(themeNamed: name)) { v, err in
             if let err { completion([], err); return }
             let raw = (v as? String) ?? "[]"
             if let e = hubError(raw) { completion([], e); return }
             let urls = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String] ?? []
+            if !urls.isEmpty { artStore[name] = urls }
             completion(urls, urls.isEmpty ? "no artwork on this theme’s card" : nil)
         }
     }
@@ -22307,7 +22499,6 @@ final class GDDToAssetsRun: ObservableObject {
     /// that never resolved and "Not read yet", while the status bar still reported the
     /// read that had succeeded. Caching by name makes reapplying it free and idempotent,
     /// and re-picking a theme instant instead of a second paid round trip.
-    nonisolated(unsafe) static var artCache: [String: [String]] = [:]
 
     /// The art style read off each theme's artwork, REMEMBERED between launches.
     ///
@@ -22319,6 +22510,15 @@ final class GDDToAssetsRun: ObservableObject {
     /// A theme's approved artwork changes rarely, so the style is read ONCE and kept. The
     /// window offers "Re-read" for when the art on the hub actually changes. This also
     /// stops paying for the same vision call repeatedly.
+    /// Where a style read is filed: the theme AND a fingerprint of the picture it was read
+    /// from. Filed by name alone, a theme whose art was changed on the hub kept describing
+    /// the old picture forever. Unchanged art still reuses its read — the vision pass is
+    /// not repeatable (line art read true/false/true across three reads of the same
+    /// picture), so re-reading identical art would flip the result at random.
+    static func styleKey(_ t: GameTheme) -> String {
+        ThemeStyleRules.key(theme: t.name, artDataURL: t.artDataURLs.first ?? t.artDataURL)
+    }
+
     static var styleCache: [String: String] {
         get {
             guard let d = Prefs.d.data(forKey: "themeStyleCache"),
@@ -22333,11 +22533,12 @@ final class GDDToAssetsRun: ObservableObject {
     func rehydrate() {
         guard var t = theme else { return }
         var changed = false
-        if t.artDataURLs.isEmpty, let art = Self.artCache[t.name], !art.isEmpty {
+        // Artwork only from the copy taken at the LATEST hub load, never from an earlier
+        // one: a picture changed on the hub has to show up here. The style is not
+        // restored at all until that artwork is in hand — it is matched to the picture's
+        // fingerprint in readThemeStyle, so a changed picture cannot inherit an old read.
+        if t.artDataURLs.isEmpty, let art = ThemeHubClient.artStore[t.name], !art.isEmpty {
             t.artDataURLs = art; t.artDataURL = art[0]; changed = true
-        }
-        if t.styleFromArt.isEmpty, let st = Self.styleCache[t.name], !st.isEmpty {
-            t.styleFromArt = st; styleRead = .ok; changed = true
         }
         if changed { theme = t }
     }
@@ -22446,8 +22647,14 @@ final class GDDToAssetsRun: ObservableObject {
     /// informing a new symbol. Turning it into words sidesteps that entirely.
     func readThemeStyle(completion: (() -> Void)? = nil) {
         guard let t0 = theme else { completion?(); return }
-        guard t0.styleFromArt.isEmpty else { styleRead = .ok; completion?(); return }
-        // A remembered STYLE must not skip fetching the ARTWORK. It did, and the window
+        // A remembered STYLE must not skip fetching the ARTWORK.
+        //
+        // It still did: `rehydrate()` fills in a remembered style the moment a theme is
+        // picked, and a `styleFromArt.isEmpty` guard HERE returned before the artwork was
+        // ever requested. Every theme whose style had been read before sat on a spinner —
+        // the log showed all 112 themes' art copied into memory in 0.3 s while the panel
+        // for Loki, Phoenix, Piggy Banks and Wild Wolves stayed empty. So: artwork first,
+        // always; the remembered style is reused only after it, further down. It did, and the window
         // sat on a spinner that never resolved — the artwork is what the thumbnail shows,
         // and it is fetched every session because it is never persisted. Only the paid
         // vision call is skipped, further down, once the bytes are in hand.
@@ -22483,17 +22690,18 @@ final class GDDToAssetsRun: ObservableObject {
                 // else that changed while the fetch was running.
                 self.theme?.artDataURLs = urls
                 self.theme?.artDataURL = urls[0]
-                Self.artCache[t0.name] = urls
                 // Now the vision pass, with the bytes in hand.
                 self.readThemeStyle(completion: completion)
             }
             return
         }
+        // Artwork in hand. A style already on the theme (remembered or just read) is done.
+        guard t0.styleFromArt.isEmpty else { styleRead = .ok; completion?(); return }
         guard var t = theme, let b64 = t.artBase64,
               let jpeg = Data(base64Encoded: b64) else { completion?(); return }
         // Artwork is in hand. If the style was read before, reuse it: same answer as last
         // time instead of a fresh roll, and no charge.
-        if let remembered = Self.styleCache[t.name], !remembered.isEmpty {
+        if let remembered = Self.styleCache[Self.styleKey(t)], !remembered.isEmpty {
             theme?.styleFromArt = remembered
             styleRead = .ok
             status = "Art style for \(t.name) — remembered from the last read."
@@ -22519,7 +22727,7 @@ final class GDDToAssetsRun: ObservableObject {
                 self.spent += r.cost ?? 0
                 if let text = r.text, !text.isEmpty {
                     self.theme?.styleFromArt = text
-                    var c = Self.styleCache; c[t.name] = text; Self.styleCache = c
+                    var c = Self.styleCache; c[Self.styleKey(t)] = text; Self.styleCache = c
                     self.styleRead = .ok
                     self.status = "Art style read from \(t.name)’s reference art."
                 } else {
@@ -22932,6 +23140,19 @@ struct GDDToAssetsSheet: View {
     @State private var artIndex = 0
     private let artTimer = Timer.publish(every: 3.5, on: .main, in: .common).autoconnect()
 
+    /// The theme as the panel must show it: the RUN's copy, whenever it is the same theme.
+    ///
+    /// Picking a theme copies it into `run.theme`, and that copy is where the fetched
+    /// artwork and the style read land. The panel was drawn from `pickedTheme`, the view's
+    /// own copy, which never received either — so the artwork spinner never resolved and
+    /// the style row said "Reloading…" forever, while the status bar reported the art had
+    /// been read. It only ever worked while the theme list carried every image itself.
+    private var shownTheme: GameTheme? {
+        guard let p = pickedTheme else { return nil }
+        if let r = run.theme, r.name == p.name { return r }
+        return p
+    }
+
     /// The image currently on show, decoded from its data URL.
     private func artImage(_ t: GameTheme) -> NSImage? {
         let urls = t.artDataURLs.isEmpty ? (t.artDataURL.isEmpty ? [] : [t.artDataURL])
@@ -23333,6 +23554,13 @@ struct GDDToAssetsSheet: View {
                 .popover(isPresented: $themeListOpen, arrowEdge: .bottom) {
                     themeList
                 }
+                .onReceive(NotificationCenter.default.publisher(for: ArtPanelProbe.pick)) { n in
+                    // Test runs only: picking a theme starts a paid style read, so this hook
+                    // does nothing unless paid calls are switched off for the whole process.
+                    guard PaidCalls.disabled, let name = n.object as? String,
+                          let t = themes.first(where: { $0.name == name }) else { return }
+                    pickedTheme = t
+                }
                 .onChange(of: pickedTheme) {
                     run.theme = pickedTheme
                     // A style picked for the previous game is not a choice about this
@@ -23352,7 +23580,7 @@ struct GDDToAssetsSheet: View {
                 }
                 .disabled(run.busy || run.running)
             }
-            if let t = pickedTheme, !t.look.isEmpty {
+            if let t = shownTheme, !t.look.isEmpty {
                 HStack(alignment: .top, spacing: 10) {
                     VStack(alignment: .leading, spacing: 6) {
                         if !t.status.isEmpty || !t.comparables.isEmpty {
@@ -23406,6 +23634,9 @@ struct GDDToAssetsSheet: View {
 
     /// The card's reference artwork, cycling when there is more than one.
     @ViewBuilder private func themeArt(_ t: GameTheme) -> some View {
+        let drawable = (t.artDataURLs.isEmpty ? (t.artDataURL.isEmpty ? [] : [t.artDataURL]) : t.artDataURLs)
+            .filter { u in u.range(of: ";base64,").flatMap { Data(base64Encoded: String(u[$0.upperBound...])) }
+                .flatMap(NSImage.init(data:)) != nil }.count
         Group {
             if let img = artImage(t) {
                 VStack(spacing: 4) {
@@ -23446,6 +23677,9 @@ struct GDDToAssetsSheet: View {
                         .font(.caption2).multilineTextAlignment(.center)
                         .foregroundColor(.secondary))
             }
+        }
+        .task(id: "\(t.name)#\(drawable)") {
+            if PaidCalls.disabled { ArtPanelProbe.shown[t.name] = drawable }
         }
     }
 
@@ -23890,7 +24124,11 @@ struct GDDToAssetsSheet: View {
         loadingThemes = true
         ThemeHubClient.themes { list, err in
             loadingThemes = false
-            if let list { themes = list; run.status = "\(list.count) themes loaded."; return }
+            if let list {
+                themes = list; run.status = "\(list.count) themes loaded."
+                if PaidCalls.disabled { ArtPanelProbe.windowThemes = list.count }
+                return
+            }
             if err == GoogleWebSession.signInNeeded {
                 run.status = "Sign in to Google to load the themes."
                 offerSignIn { loadThemes() }
@@ -23939,9 +24177,8 @@ struct GDDToAssetsSheet: View {
     /// Forget the remembered style for this theme and read the artwork again.
     private func rereadStyle() {
         guard let t = run.theme else { return }
-        var c = GDDToAssetsRun.styleCache; c.removeValue(forKey: t.name)
+        var c = GDDToAssetsRun.styleCache; c.removeValue(forKey: GDDToAssetsRun.styleKey(t))
         GDDToAssetsRun.styleCache = c
-        GDDToAssetsRun.artCache.removeValue(forKey: t.name)
         run.theme?.styleFromArt = ""
         run.theme?.artDataURLs = []
         run.theme?.artDataURL = ""
@@ -24106,6 +24343,16 @@ final class CloseGuard: NSObject, NSWindowDelegate {
         }
         return false
     }
+}
+
+/// What the GDD to Assets panel itself had on hand to draw, per theme — for checking the
+/// PANEL, not the model. Every earlier check of the artwork read `run.theme`, which always
+/// had it; the panel drew from a different copy and never did. Written only when paid calls
+/// are switched off, which is the only time the window can be driven from outside.
+enum ArtPanelProbe {
+    static let pick = Notification.Name("NavigatorTestPickTheme")
+    nonisolated(unsafe) static var shown: [String: Int] = [:]
+    nonisolated(unsafe) static var windowThemes = 0
 }
 
 enum GDDToAssetsWindow {

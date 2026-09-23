@@ -7,6 +7,7 @@
 // real use, so they're the ones worth pinning down with tests.
 
 import Foundation
+import CryptoKit
 // CoreGraphics only — no AppKit. The pixel sampling behind the adaptive backing colour
 // lives here so `swift test` exercises the SHIPPED code rather than a copy of it.
 import CoreGraphics
@@ -247,6 +248,16 @@ enum WalkStream {
 /// about 3 seconds. On an SMB share the same archive was measured at roughly 11 seconds
 /// PER FILE, almost all of it round trips rather than data, and 1,223 files of silence
 /// with no way to stop it is indistinguishable from a hang.
+/// Where a theme's art-style read is filed: the theme plus a fingerprint of the exact
+/// picture the style was read from, so artwork changed on the hub gets a fresh read.
+enum ThemeStyleRules {
+    static func key(theme: String, artDataURL: String) -> String {
+        let digest = SHA256.hash(data: Data(artDataURL.utf8)).prefix(12)
+            .map { String(format: "%02x", $0) }.joined()
+        return "\(theme)#\(digest)"
+    }
+}
+
 /// The line the GDD to Assets window shows while a document is being read.
 enum GDDReadingRules {
     static func line(document: String, waitingForHub: Bool, seconds: Int) -> String {

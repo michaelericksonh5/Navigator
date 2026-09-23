@@ -12,6 +12,9 @@ import PackageDescription
 
 let package = Package(
     name: "NavigatorCore",
+    // The app targets macOS 14.4 (compile.sh); without this, SwiftPM assumed 10.13 and
+    // refused anything newer that NavigatorCore uses, such as CryptoKit.
+    platforms: [.macOS(.v14)],
     targets: [
         .target(
             name: "NavigatorCore",
