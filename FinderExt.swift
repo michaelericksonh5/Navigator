@@ -13,6 +13,7 @@
 
 import Cocoa
 import FinderSync
+import os
 
 // @objc(...) pins the Objective-C runtime name. Without it Swift exposes the class
 // as "<module>.NavigatorFinderSync", the NSExtensionPrincipalClass lookup fails, and
@@ -43,16 +44,29 @@ final class NavigatorFinderSync: FIFinderSync {
             item.target = self
             item.image = Self.appIcon
             m.addItem(item)
+            let gdd = NSMenuItem(title: "GDD to Assets…", action: #selector(openGDDTool(_:)), keyEquivalent: "")
+            gdd.target = self
+            gdd.image = Self.vertexIcon
+            m.addItem(gdd)
             return m
         }
         guard menuKind == .contextualMenuForItems else { return nil }
         let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
         guard !urls.isEmpty else { return nil }
 
-        let hasImage = urls.contains { Self.isImage($0) }
+        let imageCount = urls.filter { Self.isImage($0) }.count
+        let hasImage = imageCount > 0
         let hasPNG = urls.contains { $0.pathExtension.lowercased() == "png" }
-        let hasFolder = urls.contains { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let folders = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        let hasFolder = !folders.isEmpty
         let hasPSD = urls.contains { ["psd", "psb"].contains($0.pathExtension.lowercased()) }
+        // Detected by the manifest Layerize writes, as Navigator does, not by the name.
+        let hasLayerFolder = folders.contains {
+            FileManager.default.fileExists(atPath: $0.appendingPathComponent("_layers.json").path)
+        }
+        let isGDD = urls.count == 1 && Self.gddExts.contains(urls[0].pathExtension.lowercased())
+        let hasPS = Self.installed("com.adobe.Photoshop")
+        let hasAE = Self.aeBundleID != nil
 
         let root = NSMenu()
 
@@ -70,63 +84,87 @@ final class NavigatorFinderSync: FIFinderSync {
         loc.image = Self.appIcon
         sub.addItem(loc)
 
-        // Photoshop / After Effects entries only when that app is actually present,
-        // matching what Navigator itself shows. Each carries the icon of the app or
-        // service that does the work, so you can tell at a glance what a row will
-        // launch. One separator divides "open" from "do something", which is the only
-        // grouping worth a gap — two of them left the short menu looking sparse.
-        if hasImage || hasFolder {
+        // The same image tools as Navigator's own right-click menu, gated the same way:
+        // Photoshop / After Effects rows only when that app is present, image-only rows
+        // only when the selection has an image. Each carries the icon of the app or
+        // service that does the work. One separator divides "open" from "do something";
+        // Finder draws separators as a full blank row, so more than one looks broken.
+        if hasImage || hasFolder || hasPSD || isGDD {
             sub.addItem(.separator())
-            if Self.installed("com.adobe.Photoshop") {
+        }
+        if hasImage || hasFolder {
+            if hasPS {
                 add(sub, "Remove BG", "removebg", Self.psIcon)
             }
-            if Self.installed("com.adobe.AfterEffects"), hasPNG || hasFolder {
+            if hasAE, hasPNG || hasFolder {
                 // The same two jobs Navigator's own menu offers; one item that silently
                 // picked soft FX left every symbol keyed from Finder see-through.
-                let ck = NSMenuItem(title: "Chroma Key BG", action: nil, keyEquivalent: "")
-                ck.image = Self.aeIcon
-                let ckSub = NSMenu()
-                add(ckSub, "Soft FX — keep transparency", "chromakey", Self.icon(systemSymbol: "sparkles"))
-                add(ckSub, "Solid subject — opaque interior", "chromakey-solid", Self.icon(systemSymbol: "square.fill"))
-                ck.submenu = ckSub
-                sub.addItem(ck)
+                sub.addItem(submenu("Chroma Key BG", Self.aeIcon) { m in
+                    add(m, "Soft FX — keep transparency", "chromakey", Self.icon(systemSymbol: "sparkles"))
+                    add(m, "Solid subject — opaque interior", "chromakey-solid", Self.icon(systemSymbol: "square.fill"))
+                })
             }
-            // Prep for AI is a ratio submenu crossed with a colour submenu in Navigator,
-            // which is far too deep to reproduce here. Only the one combination worth a
-            // single click is offered: the adaptive fill at the nearest supported ratio.
-            // Anything more specific belongs in Navigator, where the depth is affordable.
-            add(sub, "Prep for AI (Adaptive)", "prep-adaptive",
-                Self.icon(systemSymbol: "wand.and.stars"))
+            if hasAE, hasImage {
+                // Paid per image; Navigator shows the price and asks before spending.
+                sub.addItem(submenu("FX Alpha Upscale", Self.aeIcon) { m in
+                    add(m, "2K", "fxalpha-2k")
+                    add(m, "4K", "fxalpha-4k")
+                })
+            }
+            if hasImage {
+                // Ratio × colour, exactly as Navigator's menu. Addressed by INDEX into
+                // Navigator's `aiPrepColors` and `nb2Ratios`, like the upscalers below.
+                sub.addItem(submenu("Prep for AI", Self.icon(systemSymbol: "wand.and.stars")) { m in
+                    m.addItem(submenu("Auto (nearest ratio)", Self.icon(systemSymbol: "wand.and.stars")) {
+                        colourItems($0, ratio: "auto")
+                    })
+                    m.addItem(.separator())
+                    for (i, r) in Self.prepRatios.enumerated() {
+                        m.addItem(submenu(r, nil) { colourItems($0, ratio: String(i)) })
+                    }
+                })
+            }
 
-            let up = NSMenuItem(title: "Upscale (AI)", action: nil, keyEquivalent: "")
-            up.image = Self.icon(systemSymbol: "arrow.up.left.and.arrow.down.right")
-            let upSub = NSMenu()
-            // Addressed by INDEX into Navigator's own `upscaleOptions`, so the two menus
-            // cannot drift: reorder that list and Finder follows. Titles are duplicated
-            // here because the extension is a separate target and can't import them.
-            add(upSub, "Crystal (best fidelity) ×4", "upscale-0", Self.falIcon)
-            add(upSub, "AuraSR (non-generative) ×4", "upscale-1", Self.falIcon)
-            add(upSub, "Topaz ×4", "upscale-2", Self.falIcon)
-            add(upSub, "Local resample ×4 (free)", "upscale-3",
-                Self.icon(systemSymbol: "desktopcomputer"))
-            upSub.addItem(.separator())
-            up.submenu = upSub
-            sub.addItem(up)
+            sub.addItem(submenu(hasImage ? "Upscale (AI)" : "Batch Upscale (AI)",
+                                Self.icon(systemSymbol: "arrow.up.left.and.arrow.down.right")) { m in
+                // Addressed by INDEX into Navigator's own `upscaleOptions`, so the two menus
+                // cannot drift: reorder that list and Finder follows. Titles are duplicated
+                // here because the extension is a separate target and can't import them.
+                add(m, "Crystal (best fidelity) ×4", "upscale-0", Self.falIcon)
+                add(m, "AuraSR (non-generative) ×4", "upscale-1", Self.falIcon)
+                add(m, "Topaz ×4", "upscale-2", Self.falIcon)
+                add(m, "Local resample ×4 (free)", "upscale-3", Self.icon(systemSymbol: "desktopcomputer"))
+                // Firefly runs inside Photoshop and takes images only, as in Navigator.
+                if hasPS, hasImage {
+                    m.addItem(.separator())
+                    add(m, "Firefly ×2", "firefly-2", Self.psIcon)
+                    add(m, "Firefly ×4", "firefly-4", Self.psIcon)
+                }
+            })
 
-            // Both open or drive Navigator itself rather than running silently, so they
-            // read as "…" commands exactly as they do in Navigator's own menu.
+            // These open a Navigator window rather than running silently, so they read
+            // as "…" commands exactly as they do in Navigator's own menu.
             if hasImage {
                 add(sub, "Restyle (AI)…", "restyle", Self.icon(systemSymbol: "paintbrush.pointed"))
                 add(sub, "Layerize (AI)…", "layerize", Self.falIcon)
+            }
+            if imageCount >= 2 {
+                add(sub, "Swipe Compare", "compare", Self.icon(systemSymbol: "rectangle.split.2x1"))
+            }
+            if hasLayerFolder, hasPS {
+                add(sub, "Assemble Layers into PSD", "assemblelayers", Self.psIcon)
             }
         }
 
         // Photoshop documents are not "images" by extension, so this sits outside the
         // block above — a PSD-only selection reaches nothing else here.
-        if hasPSD, Self.installed("com.adobe.Photoshop") {
-            if !hasImage && !hasFolder { sub.addItem(.separator()) }
+        if hasPSD, hasPS {
             add(sub, "Quick Export as PNG", "exportpng", Self.psIcon)
         }
+        // Always offered: on a GDD it opens with that document picked and read; on
+        // anything else it just opens the tool.
+        if !(hasImage || hasFolder || hasPSD || isGDD) { sub.addItem(.separator()) }
+        add(sub, "GDD to Assets…", "gddtoassets", Self.vertexIcon)
 
         parent.submenu = sub
         root.addItem(parent)
@@ -136,9 +174,40 @@ final class NavigatorFinderSync: FIFinderSync {
     private func add(_ menu: NSMenu, _ title: String, _ action: String, _ image: NSImage? = nil) {
         let item = NSMenuItem(title: title, action: #selector(runAction(_:)), keyEquivalent: "")
         item.target = self
-        item.representedObject = action
+        item.tag = Self.tag(for: action)
         item.image = image
         menu.addItem(item)
+    }
+
+    // Finder hands the action a COPY of the clicked item, and the copy has no
+    // representedObject — it arrived as nil, so every tool here silently did nothing.
+    // The tag survives the copy, so the action rides in it as an index into this list.
+    // Tags start at 1 so an unset tag (0) can't be mistaken for the first action.
+    private static var actions: [String] = []
+    private static func tag(for action: String) -> Int {
+        if let i = actions.firstIndex(of: action) { return i + 1 }
+        actions.append(action)
+        return actions.count
+    }
+
+    private func submenu(_ title: String, _ image: NSImage?, _ fill: (NSMenu) -> Void) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.image = image
+        let m = NSMenu()
+        fill(m)
+        item.submenu = m
+        return item
+    }
+
+    private func colourItems(_ menu: NSMenu, ratio: String) {
+        for (i, c) in Self.prepColours.enumerated() {
+            let img = c.rgb.map { rgb -> NSImage? in
+                let cfg = NSImage.SymbolConfiguration(paletteColors: [NSColor(srgbRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1)])
+                return Self.sized(NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+                    .withSymbolConfiguration(cfg))
+            } ?? Self.icon(systemSymbol: "eyedropper.halffull")
+            add(menu, c.name, "prep-\(i)-\(ratio)", img)
+        }
     }
 
     // MARK: - Dispatch to Navigator
@@ -147,6 +216,13 @@ final class NavigatorFinderSync: FIFinderSync {
     @objc private func openContainer(_ sender: NSMenuItem) {
         guard let here = FIFinderSyncController.default().targetedURL() else { return }
         openInNavigator([here])
+    }
+
+    /// Right-click empty space → GDD to Assets. The folder rides along only because the
+    /// action URL always carries paths; Navigator pre-picks nothing for a folder.
+    @objc private func openGDDTool(_ sender: NSMenuItem) {
+        guard let here = FIFinderSyncController.default().targetedURL() else { return }
+        send("gddtoassets", [here])
     }
 
     /// Open the folder the selection lives in. For a selected FOLDER that's the
@@ -173,13 +249,25 @@ final class NavigatorFinderSync: FIFinderSync {
     }
 
     @objc private func runAction(_ sender: NSMenuItem) {
-        guard let action = sender.representedObject as? String else { return }
+        guard Self.actions.indices.contains(sender.tag - 1) else {
+            Self.log.error("no action for tag \(sender.tag) (\(sender.title, privacy: .public))")
+            return
+        }
+        let action = Self.actions[sender.tag - 1]
         let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
+        Self.log.notice("clicked \(action, privacy: .public), \(urls.count) selected")
         guard !urls.isEmpty else { return }
 
         if action == "open" { openInNavigator(urls); return }
         // navigatoraction://<action>?hex=<hex of the newline-joined paths>. Hex keeps
         // spaces, quotes and non-ASCII names intact with no escaping questions.
+        send(action, urls)
+    }
+
+    private static let log = Logger(subsystem: "com.merickson.navigator.findersync", category: "menu")
+
+    private func send(_ action: String, _ urls: [URL]) {
+        Self.log.notice("send \(action, privacy: .public) with \(urls.count) path(s)")
         let joined = urls.map { $0.path }.joined(separator: "\n")
         let hex = Data(joined.utf8).map { String(format: "%02x", $0) }.joined()
         guard let u = URL(string: "navigatoraction://\(action)?hex=\(hex)") else { return }
@@ -192,6 +280,22 @@ final class NavigatorFinderSync: FIFinderSync {
         "png","jpg","jpeg","gif","bmp","tif","tiff","webp","heic","psd","avif","jp2"
     ]
     private static func isImage(_ u: URL) -> Bool { imageExts.contains(u.pathExtension.lowercased()) }
+    // Copies of Navigator's `aiPrepColors` (name, sRGB; nil = adaptive) and `nb2Ratios`,
+    // in the same order — the menu sends indices, so only the titles can go stale.
+    private static let prepColours: [(name: String, rgb: (CGFloat, CGFloat, CGFloat)?)] = [
+        ("Adaptive (from image)", nil), ("White", (1, 1, 1)), ("Black", (0, 0, 0)),
+        ("Greenscreen", (0, 1, 0)), ("MagentaScreen", (1, 0, 1)), ("Bluescreen", (0, 0, 1)),
+        ("Yellow", (1, 1, 0)), ("Orange", (1, 0.5, 0)),
+    ]
+    private static let prepRatios = ["16:9", "9:16", "4:3", "3:4", "1:1", "3:2", "2:3",
+                                     "21:9", "9:21", "5:4", "4:5"]
+    // What GDD to Assets can read (GDDLibrary.entries): Google Docs/Sheets/Slides
+    // pointers and Word files.
+    private static let gddExts: Set<String> = ["gdoc", "gsheet", "gslides", "docx"]
+    // After Effects 2026 is "com.adobe.AfterEffects.application"; older builds dropped the
+    // suffix. Checking only the old one hid every After Effects row on a Mac that has it.
+    private static let aeBundleID: String? = ["com.adobe.AfterEffects.application", "com.adobe.AfterEffects"]
+        .first { installed($0) }
     private static func installed(_ bundleID: String) -> Bool {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
     }
@@ -231,7 +335,7 @@ final class NavigatorFinderSync: FIFinderSync {
 
     private static let appIcon: NSImage? = sized(NSWorkspace.shared.icon(forFile: appURL.path))
     private static let psIcon: NSImage? = appIcon("com.adobe.Photoshop")
-    private static let aeIcon: NSImage? = appIcon("com.adobe.AfterEffects")
+    private static let aeIcon: NSImage? = aeBundleID.flatMap { appIcon($0) }
     private static let vertexIcon: NSImage? = bundled("vertex", fallback: "sparkles")
     private static let falIcon: NSImage? = bundled("fal", fallback: "bolt.fill")
 }

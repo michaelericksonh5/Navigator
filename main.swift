@@ -17802,9 +17802,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         NSUpdateDynamicServices()
         // Install the Finder Quick Actions once per version (cheap; skips the pbs
         // flush on subsequent launches). Bump the marker when the workflows change.
-        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 4 {
+        if Prefs.d.integer(forKey: "finderQuickActionsVersion") < 5 {
             installFinderQuickActions(nil)
-            Prefs.d.set(4, forKey: "finderQuickActionsVersion")
+            Prefs.d.set(5, forKey: "finderQuickActionsVersion")
         }
         // The Finder menu ships inside the app but macOS won't switch a Finder
         // extension on by itself — the user has to tick it once. Offer to take them
@@ -17961,6 +17961,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             .split(separator: "\n").map(String.init)
         // Same routing as Navigator's own menu: folders → batch; image(s) → single/multi.
         let all = paths.map { URL(fileURLWithPath: $0) }
+        // Offered on every right-click. Only a GDD is pre-picked; from an image, a folder or
+        // empty space it just opens the tool. Handled before the image/folder guard below.
+        if url.host == "gddtoassets" {
+            let doc = all.first.flatMap { u -> URL? in
+                let ext = u.pathExtension.lowercased()
+                return DriveStub.Kind(fileExtension: ext) != nil || ["docx", "rtf", "txt", "md"].contains(ext) ? u : nil
+            }
+            Task { @MainActor in GDDToAssetsWindow.open(document: doc) }
+            return
+        }
         let folders = all.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
         let images = all.filter { !folders.contains($0) && isImageFile($0) }
         // PSD/PSB are not in `imageExtensions`, so a Quick Export selection is neither a
@@ -17990,12 +18000,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "layerize":
             if !images.isEmpty { layerizeImages(images) }
         case "prep-adaptive":
-            // The adaptive fill at the nearest supported ratio — the one combination worth
-            // a single click. Every other colour/ratio pairing stays in Navigator's own
-            // menu, where a submenu of submenus is affordable.
+            // Older extension builds sent this for the adaptive fill at the nearest ratio.
             if !images.isEmpty {
                 fillBackgroundForImages(images, color: nil, suffix: "auto", ratio: nil)
             }
+        case let h? where h.hasPrefix("prep-"):
+            // prep-<colour index>-<ratio index | auto>, indices into `aiPrepColors` and
+            // `nb2Ratios` — the same pairings as Navigator's Prep for AI submenu.
+            let parts = h.split(separator: "-")
+            guard parts.count == 3, let ci = Int(parts[1]), aiPrepColors.indices.contains(ci),
+                  !images.isEmpty else { NSSound.beep(); return }
+            let ratio = Int(parts[2]).flatMap { nb2Ratios.indices.contains($0) ? nb2Ratios[$0].ratio : nil }
+            let c = aiPrepColors[ci]
+            fillBackgroundForImages(images, color: c.color, suffix: c.suffix, ratio: ratio)
+        case "fxalpha-2k", "fxalpha-4k":
+            // fxAlphaUpscale shows the price and asks before spending.
+            if !images.isEmpty { fxAlphaUpscale(images, size: url.host == "fxalpha-4k" ? "4K" : "2K") }
+        case "firefly-2", "firefly-4":
+            // Confirm once for the whole selection, as Navigator's own menu does.
+            guard !images.isEmpty, AdobeCredits.confirmSpend(count: images.count) else { return }
+            let scale = url.host == "firefly-4" ? 4 : 2
+            for u in images { fireflyUpscaleForImage(u, scale: scale) }
+        case "compare":
+            CompareController.show(images: images)
+        case "assemblelayers":
+            let dirs = folders.filter {
+                FileManager.default.fileExists(atPath: $0.appendingPathComponent("_layers.json").path)
+            }
+            if !dirs.isEmpty { assembleLayerFolders(dirs) }
         case "restyle":
             // Opens Navigator's Restyle window on the selection — it needs prompt/model UI,
             // so there is nothing to fire and forget.
@@ -18024,6 +18056,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         "Navigator — Remove Background", "Navigator — Chroma Key (Green Screen)",
         "Navigator — Upscale (Art)", "Navigator — Upscale (Photoreal)", "Navigator — Upscale (Low Quality ×4)",
         "Upscale Art", "Upscale Photoreal",
+        // Imagen 4 upscale was retired by Google; these sent an action nothing handles.
+        "Upscale (Imagen 4) ×2", "Upscale (Imagen 4) ×4",
     ]
 
     // Install/refresh the Quick Actions in ~/Library/Services. Photoshop/After
@@ -23201,6 +23235,7 @@ struct GDDToAssetsSheet: View {
     // same question the Close button asks. A paid batch must not be able to slip
     // behind a closed window where nobody can see it, stop it, or learn what it spent.
     @ObservedObject var run: GDDToAssetsRun
+    var initialDocument: URL? = nil
     let onClose: () -> Void
 
     @State private var gddFolder: URL? = GDDLibrary.folder
@@ -23375,7 +23410,18 @@ struct GDDToAssetsSheet: View {
         }
         .frame(minWidth: 940, minHeight: 700)
         .onAppear {
-            if let f = gddFolder { entries = GDDLibrary.entries(in: f) }
+            // Resolved both sides: "~/Google Drive" is a symlink to ~/Library/CloudStorage,
+            // and Finder sends one spelling while the listing may carry the other.
+            let want = initialDocument?.resolvingSymlinksInPath().path
+            let theirs = initialDocument.map { GDDLibrary.entries(in: $0.deletingLastPathComponent()) } ?? []
+            if let e = theirs.first(where: { $0.url.resolvingSymlinksInPath().path == want }) {
+                gddFolder = e.url.deletingLastPathComponent()
+                entries = theirs
+                pickedGDD = e
+                // onChange(of: pickedGDD) is not watching yet during onAppear, so nothing
+                // else starts the read.
+                loadGDD()
+            } else if let f = gddFolder { entries = GDDLibrary.entries(in: f) }
             loadThemes()
         }
         .sheet(item: $picking) { which in
@@ -24517,7 +24563,9 @@ enum ArtPanelProbe {
 enum GDDToAssetsWindow {
     private static var windows: [NSWindow] = []
     private static var guards: [CloseGuard] = []
-    @MainActor static func open() {
+    /// `document`: a GDD right-clicked in Finder — the window opens on its folder with it
+    /// picked. The saved GDD folder is left alone; that stays the user's choice.
+    @MainActor static func open(document: URL? = nil) {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 740),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
@@ -24529,7 +24577,7 @@ enum GDDToAssetsWindow {
         w.delegate = guardian
         guards.append(guardian)
         w.contentView = NSHostingView(
-            rootView: GDDToAssetsSheet(run: run, onClose: { [weak w] in
+            rootView: GDDToAssetsSheet(run: run, initialDocument: document, onClose: { [weak w] in
                 guardian.force = true
                 w?.close()
             }))
