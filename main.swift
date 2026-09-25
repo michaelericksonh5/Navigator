@@ -628,6 +628,54 @@ struct TagsCell: View {
 
 // MARK: - API keys (macOS Keychain — never plaintext)
 
+/// Does fal actually accept the stored key? A key that is merely SAVED proves nothing — a
+/// typo, a revoked key or one from the wrong fal account all sit in the keychain looking fine
+/// until the first Layerize fails.
+///
+/// Asked of fal's pricing lookup (GET /v1/models/pricing): documented to require a valid key
+/// and to answer 401 without one, and read-only — it runs no model, so it costs nothing.
+/// Verified: a made-up key and no key both get 401.
+enum FalKeyCheck {
+    private static let url = URL(string: "https://api.fal.ai/v1/models/pricing?endpoint_id=fal-ai/aura-sr")!
+    private static let prefKey = "falKeyCheck"
+
+    /// true = accepted, false = rejected, nil = couldn't tell (network) — never a guess.
+    /// Blocks; call off the main thread.
+    static func verify(_ key: String) -> (accepted: Bool?, message: String) {
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.setValue("Key \(key)", forHTTPHeaderField: "Authorization")
+        let done = DispatchSemaphore(value: 0)
+        var status = 0, failure: String?
+        URLSession.shared.dataTask(with: req) { _, resp, err in
+            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            failure = err?.localizedDescription
+            done.signal()
+        }.resume()
+        done.wait()
+        let r: (Bool?, String)
+        switch status {
+        case 200: r = (true, "fal accepted the key.")
+        case 401, 403: r = (false, "fal rejected this key (\(status)). Paste a fresh one from fal.ai/dashboard/keys.")
+        default: r = (nil, failure.map { "Couldn’t reach fal (\($0)) — the key isn’t proven wrong." }
+                            ?? "Unexpected answer from fal (\(status)) — the key isn’t proven wrong.")
+        }
+        if let ok = r.0 { last = (ok, Date()) }
+        navLog("fal key check: \(status) → \(r.1)")
+        return r
+    }
+
+    /// The last definite answer, kept so Setup can show it without reading the key — reading
+    /// it is what raises the keychain password prompt after an update.
+    static var last: (accepted: Bool, at: Date)? {
+        get {
+            let p = (Prefs.d.string(forKey: prefKey) ?? "").split(separator: "|")
+            guard p.count == 2, let t = Double(p[1]) else { return nil }
+            return (p[0] == "1", Date(timeIntervalSince1970: t))
+        }
+        set { Prefs.d.set(newValue.map { "\($0.accepted ? 1 : 0)|\($0.at.timeIntervalSince1970)" } ?? "", forKey: prefKey) }
+    }
+}
+
 enum APIKeys {
     private static let service = "com.merickson.navigator.apikeys"
     static func get(_ account: String) -> String? { lookup(account).key }
@@ -1897,15 +1945,6 @@ extension AfterEffectsApp {
             let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
             let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
             return da < db
-        }
-    }
-
-    static func scriptingFileAccess() -> PermissionState {
-        guard let f = prefsFile, let text = try? String(contentsOf: f, encoding: .utf8) else { return .unknown }
-        switch AfterEffectsPrefsRules.scriptingFileAccessEnabled(prefsText: text) {
-        case .some(true):  return .granted
-        case .some(false): return .denied
-        case nil:          return .unknown
         }
     }
 }
@@ -3230,13 +3269,6 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
     }
 }
 
-// ===== AI Upscale (Vertex / Imagen 4) via the H5G ai-connect client =====
-// We don't re-implement Vertex OAuth in Swift — we drive the existing,
-// cost-tracked `client.mjs` (browser Google sign-in, company-metered). Navigator
-// just locates node + the client, then shells `imagen-upscale`.
-
-struct H5GResult { let out: String; let err: String; let code: Int32 }
-
 /// A hard stop on every call that costs money, for test runs.
 ///
 /// Set NAVIGATOR_NO_PAID_CALLS in the environment and nothing can reach the metering
@@ -3414,21 +3446,6 @@ enum ExceptionLog {
     }
 }
 
-// GUI apps launched from Finder/Dock have a minimal PATH (no nvm/homebrew), so
-// resolve node by absolute path: nvm versions, then homebrew, then system.
-func resolveNode() -> String? {
-    let fm = FileManager.default
-    var candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
-    let nvm = (NSHomeDirectory() as NSString).appendingPathComponent(".nvm/versions/node")
-    // Newest first, compared NUMERICALLY. A plain string sort ranks "v9.0.0" above "v26.5.0" and
-    // would hand back a years-old node on any machine with both installed.
-    if let vers = try? fm.contentsOfDirectory(atPath: nvm)
-        .sorted(by: { NodeVersion.isDescending($0, $1) }) {
-        candidates.insert(contentsOf: vers.map { "\(nvm)/\($0)/bin/node" }, at: 0)
-    }
-    return candidates.first { fm.isExecutableFile(atPath: $0) }
-}
-
 // The h5g-ai-connect client, wherever the plugin/skill is installed.
 func resolveH5GClient() -> String? {
     let home = NSHomeDirectory()
@@ -3450,49 +3467,6 @@ func resolveH5GClient() -> String? {
 
 func vertexSignedIn() -> Bool {
     FileManager.default.fileExists(atPath: (NSHomeDirectory() as NSString).appendingPathComponent(".h5g-ai-gen/token.json"))
-}
-
-// Synchronous run of `node client.mjs <args>`. Reads pipes fully before waiting
-// (avoids a full-buffer deadlock). Node's own dir is put on PATH so the client's
-// child `open`/etc. resolve.
-func runH5GClient(_ args: [String]) -> H5GResult {
-    if PaidCalls.disabled { return H5GResult(out: "", err: PaidCalls.refusal, code: 1) }
-    guard let node = resolveNode() else { return H5GResult(out: "", err: "Node.js not found", code: 127) }
-    guard let client = resolveH5GClient() else { return H5GResult(out: "", err: "h5g-ai-connect client not found", code: 127) }
-    var env = ProcessInfo.processInfo.environment
-    let nodeDir = (node as NSString).deletingLastPathComponent
-    env["PATH"] = "\(nodeDir):/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
-    navLog("run: node \(client) \(args.joined(separator: " "))")
-    let result = ExternalProcess.run(node, arguments: [client] + args, environment: env)
-    do {
-        let output = try result.completed()
-        navLog("exit \(output.status)  out: \(navLogFlat(output.out, limit: 900))  err: \(navLogFlat(output.err, limit: 900))")
-        return H5GResult(out: output.out, err: output.err, code: output.status)
-    } catch {
-        if case .failedToLaunch = result { navLog("run FAILED to launch: \(error.localizedDescription)") }
-        else { navLog("run timed out: \(error.localizedDescription)") }
-        return H5GResult(out: "", err: error.localizedDescription, code: 127)
-    }
-}
-
-// client.mjs prints "✅ Saved <path>" on success.
-private func parseSavedPath(_ out: String) -> String? {
-    for line in out.split(separator: "\n") {
-        if let r = line.range(of: "Saved ") { return String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces) }
-    }
-    return nil
-}
-// Surface the whole "❌ …" block (the client prints the real reason there, often
-// multi-line JSON), not just the last line — that was only the request_id.
-private func cleanH5GError(_ r: H5GResult) -> String {
-    let combined = (r.out + "\n" + r.err)
-    let lines = combined.split(separator: "\n", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
-    if let start = lines.firstIndex(where: { $0.contains("❌") }) {
-        let block = lines[start...].joined(separator: " ")
-            .replacingOccurrences(of: "❌", with: "").trimmingCharacters(in: .whitespaces)
-        if !block.isEmpty { return String(block.prefix(300)) }
-    }
-    return lines.last { !$0.isEmpty } ?? "upscale failed"
 }
 
 /// Signing in to Vertex WITHOUT Claude, Node, or the h5g-ai-connect plugin.
@@ -3775,7 +3749,7 @@ enum VertexStatus {
     /// (state, one-line detail). Never blocks.
     static func current() -> (state: PermissionState, detail: String) {
         guard H5GService.baseURL != nil else {
-            return (.denied, "No service address on this Mac yet — ask Michael for it, or open a setup link he sends you.")
+            return (.denied, "No service address on this Mac yet. Click a teammate’s setup link (AI ▸ Copy Team Setup Link… on their Mac), or press Sign In and paste it.")
         }
         guard vertexSignedIn() else {
             VertexStatus.invalidate()
@@ -17195,11 +17169,86 @@ enum PermissionProbe {
 /// Finder Menu… alert and the once-per-version nudge — so they cannot drift apart again.
 let finderExtensionSectionName = "Login Items & Extensions ▸ File Providers"
 
-/// One row of the assistant: what the permission is FOR in the user's words, how to find
-/// out whether we have it, and where they go to change it.
+/// Navigator's Finder menu, as macOS actually sees it.
+///
+/// "Enabled" is not the whole story. Replacing /Applications/Navigator.app — an update, a
+/// rebuild — can drop the extension from macOS's plug-in registry until something registers
+/// it again, and then Finder shows no Navigator menu while the switch in Settings still
+/// looks on. `pluginkit` is how macOS itself registers and elects Finder Sync plug-ins, and
+/// it needs no admin rights for the user's own apps.
+enum FinderExtension {
+    static let bundleID = "com.merickson.navigator.findersync"
+    static var appexURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/PlugIns/NavigatorFinder.appex")
+    }
+    private static let pluginkit = "/usr/bin/pluginkit"
+
+    /// Registered with macOS at all — the question `isExtensionEnabled` doesn't answer.
+    static func isRegistered() -> Bool {
+        guard case .success(let o) = ExternalProcess.run(pluginkit, arguments: ["-m", "-i", bundleID], timeout: 10)
+        else { return false }
+        return o.out.contains(bundleID)
+    }
+
+    static func state() -> PermissionState {
+        isRegistered() && FIFinderSyncController.isExtensionEnabled ? .granted : .off
+    }
+
+    /// Register this copy (launch-time repair; says nothing about the user's switch).
+    static func register() {
+        _ = ExternalProcess.run(pluginkit, arguments: ["-a", appexURL.path], timeout: 20)
+    }
+
+    /// The Setup row's button: register, switch on, and report whether it took. Only ever
+    /// run because the user pressed a button asking for exactly this.
+    static func repair() -> Bool {
+        register()
+        _ = ExternalProcess.run(pluginkit, arguments: ["-e", "use", "-i", bundleID], timeout: 20)
+        return state() == .granted
+    }
+
+    /// Launch-time: put the extension back in the registry if an update dropped it.
+    static func ensureRegistered() {
+        DispatchQueue.global(qos: .utility).async {
+            guard !isRegistered() else { return }
+            register()
+            navLog("finder menu: extension was not registered — registered \(isRegistered() ? "OK" : "FAILED")")
+        }
+    }
+
+    /// The one "turn it on" flow every entry point uses: repair first, and only if macOS
+    /// still says no, open the pane where the user ticks it.
+    static func turnOn(_ done: ((Bool) -> Void)? = nil) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ok = repair()
+            navLog("finder menu: repair \(ok ? "succeeded" : "did not take — opening Settings")")
+            DispatchQueue.main.async {
+                if !ok { FIFinderSyncController.showExtensionManagementInterface() }
+                done?(ok)
+            }
+        }
+    }
+}
+
+/// Where a row sits in the Setup window. Ordered by what you need to USE Navigator's
+/// tools — the connections first, the Finder menu next — not by macOS's own taxonomy.
+enum SetupSection: String, CaseIterable {
+    case connect = "Connect the AI tools"
+    case finder = "Finder menu"
+    case apps = "Apps Navigator uses"
+    case files = "Files & folders"
+    case optional = "Optional"
+}
+
+/// One row of the assistant: what it is FOR in one line, how to find out whether it works,
+/// and the one button that fixes it. The long explanation stays, behind "More".
 struct SetupItem: Identifiable {
     let id: String
+    let section: SetupSection
     let title: String
+    /// One line: what this is for, in the user's words.
+    let short: String
+    /// Everything else worth knowing — shown behind "More".
     let why: String
     /// `prompt` is true only from the row's own "Ask macOS" button.
     let probe: (_ prompt: Bool) -> PermissionState
@@ -17221,6 +17270,11 @@ struct SetupItem: Identifiable {
     /// top with nothing highlighted, so "we opened it" leaves the user hunting an app
     /// name in a list of forty. Shown only alongside the button it describes.
     var afterOpening: String?
+    /// A button that does the job itself and reports back in a line under the row —
+    /// used where Navigator can fix or test the thing instead of sending you somewhere.
+    var run: ((@escaping (String) -> Void) -> Void)?
+    /// Row-specific status words where the generic ones mislead — "Not installed", not "Off".
+    var labels: [PermissionState: String] = [:]
     let openSettings: () -> Void
 
     static func all() -> [SetupItem] {
@@ -17229,20 +17283,190 @@ struct SetupItem: Identifiable {
         // Every Files & Folders row lands on the same pane and needs the same last step,
         // so the sentence is written once — five copies would drift.
         let inFilesPane = "Then: find Navigator in that list, expand it, and switch this on. The pane opens at the top and doesn’t highlight us."
-        func homeFolder(_ name: String, _ why: String) -> SetupItem {
-            SetupItem(id: name, title: name, why: why,
+        func homeFolder(_ name: String, _ short: String) -> SetupItem {
+            SetupItem(id: name, section: .files, title: name, short: short, why: "",
                       probe: { _ in PermissionProbe.folder(home.appendingPathComponent(name)) },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
                       afterOpening: inFilesPane,
                       openSettings: files)
         }
-        return [
-            // Listed FIRST, and in this section rather than under Extras, because it is the
-            // row that explains the five below it: when it reads Granted they all read
-            // "Covered by Full Disk Access", and a user who scrolled past a green tick at
-            // the bottom would have no idea why.
-            SetupItem(id: "fda", title: "Full Disk Access",
-                      why: "Optional, and it changes what the rows below mean: with it on, macOS grants Navigator every file permission listed here and REPLACES their individual switches in Files & Folders with a single greyed “Full Disk Access” line — so there is nothing left to turn on there. It reaches what those switches don’t, too: other apps’ Library folders, another user’s home, some system folders. It does NOT override a file’s own owner or read-only flag, everyday browsing works without it, and macOS never asks — you turn it on yourself.",
+        let hasPhotoshop = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.Photoshop") != nil
+        let openKeys = { _ = NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) }
+        let openGDD = { _ = NSApp.sendAction(#selector(AppDelegate.gddToAssetsAction(_:)), to: nil, from: nil) }
+        let hub = GoogleWebSession.themeHubURL
+        let falStored = PermissionProbe.keyStored(account: "fal.ai") == .granted
+        var rows: [SetupItem] = [
+            // ── Connect ─────────────────────────────────────────────────────────────
+            SetupItem(id: "vertex", section: .connect, title: "Vertex sign-in",
+                      short: "Your @high5games.com Google sign-in for Restyle, FX Alpha Upscale, GDD to Assets and Layerize’s Analyze. No key to paste.",
+                      why: "A browser sign-in — no gcloud, no Node.js, and no Claude or plugin needed. Lasts about 30 days. If Navigator asks for a service address, a teammate’s setup link (AI ▸ Copy Team Setup Link…) fills it in.\n\n"
+                         + VertexStatus.current().detail
+                         + "\n\nGreen means the service confirmed the account, not merely that a session file exists.",
+                      // The real question, asked of the service and cached — see VertexStatus.
+                      probe: { _ in VertexStatus.current().state },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: "Sign In…",
+                      // Starts the sign-in outright. It used to open a dialog telling you to go and
+                      // find the menu item that does this, which is a button that describes a button.
+                      openSettings: { NSApp.sendAction(#selector(AppDelegate.vertexSignInAction(_:)), to: nil, from: nil) }),
+            SetupItem(id: "falkey", section: .connect, title: "fal.ai API key",
+                      short: !falStored ? "For Layerize and the Crystal, AuraSR and Topaz upscalers. Add Key opens a box to paste it, with a link to get one."
+                        : FalKeyCheck.last?.accepted == false ? "fal rejected the saved key. Replace it with a fresh one."
+                        : FalKeyCheck.last == nil ? "Saved, but not checked yet. Check asks fal whether it accepts the key."
+                        : "For Layerize and the Crystal, AuraSR and Topaz upscalers. fal accepts the key.",
+                      why: "Green means fal itself accepted the key, not just that one is saved — checked with fal’s pricing lookup, which runs no model and costs nothing.\n\nCreate the key while switched to the High5games team in fal’s dashboard (account switcher, top left), so usage bills the team, not your personal account.\n\nExpect one keychain prompt after each Navigator update: updating re-signs the app, which invalidates the keychain’s saved permission. Choose Always Allow — the key itself is fine."
+                         + (FalKeyCheck.last.map { "\n\nLast checked " + $0.at.formatted(date: .abbreviated, time: .shortened) + "." } ?? ""),
+                      probe: { _ in
+                          guard PermissionProbe.keyStored(account: "fal.ai") == .granted else { return .off }
+                          guard let v = FalKeyCheck.last else { return .notAsked }
+                          return v.accepted ? .granted : .denied
+                      },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: !falStored ? "Add Key…" : FalKeyCheck.last?.accepted == false ? "Replace Key…" : "Check",
+                      // Checking needs the key itself, which can raise the keychain prompt —
+                      // so it happens on this button, never on a redraw.
+                      run: !falStored || FalKeyCheck.last?.accepted == false ? nil : { report in
+                          report("Asking fal…")
+                          DispatchQueue.global(qos: .userInitiated).async {
+                              let found = APIKeys.lookup("fal.ai")
+                              let msg = found.key.map { k -> String in
+                                  let r = FalKeyCheck.verify(k)
+                                  return r.accepted == true ? "Checked just now." : r.message
+                              }
+                                  ?? (found.accessDenied ? "The keychain didn’t hand the key over — choose Always Allow when it asks."
+                                                         : "No key is saved.")
+                              DispatchQueue.main.async { report(msg) }
+                          }
+                      },
+                      labels: falStored ? [.notAsked: "Not checked", .denied: "Rejected"] : [:],
+                      openSettings: openKeys),
+            SetupItem(id: "themehub", section: .connect, title: "Team theme hub",
+                      short: hub == nil
+                        ? "Where GDD to Assets gets its themes. Needs the hub’s address — a teammate’s setup link fills it in."
+                        : "Where GDD to Assets gets its themes. Check loads the hub for real, and signs you in to Google if it asks.",
+                      why: "The hub sits behind Google’s Identity-Aware Proxy, so Navigator signs in the first time and reuses that session afterwards — the same account you already use in the browser. Navigator never sees your password.\n\nGreen means the hub actually answered with themes from this address, not just that an address is saved."
+                         + (ThemeHubClient.lastLoad.map { "\n\nLast loaded \($0.count) themes, " + $0.at.formatted(date: .abbreviated, time: .shortened) + "." } ?? ""),
+                      probe: { _ in
+                          guard let u = GoogleWebSession.themeHubURL else { return .notAsked }
+                          return ThemeHubClient.lastLoad?.url == u ? .granted : .notAsked
+                      },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: hub == nil ? "Set Address…" : "Check",
+                      // Buttons call this, so it is always on the main thread.
+                      run: { report in MainActor.assumeIsolated {
+                          if GoogleWebSession.themeHubURL == nil {
+                              guard promptThemeHubAddress() else { report(""); return }
+                          }
+                          report("Loading the theme hub…")
+                          ThemeHubClient.check(report)
+                      } },
+                      openSettings: {}),
+            SetupItem(id: "gddfolder", section: .connect, title: "Game design documents folder",
+                      short: GDDLibrary.folder.map { "GDD to Assets reads GDDs from “\($0.lastPathComponent)”." }
+                        ?? "The Google Drive folder your GDDs live in. Pick it once inside GDD to Assets.",
+                      why: "Google Drive for Desktop already keeps it on this Mac, so Navigator lists the documents straight off disk and only goes to the network for a document’s text."
+                         + (GDDLibrary.folder.map { "\n\nSet to “\($0.path)”." } ?? ""),
+                      probe: { _ in
+                          guard let f = GDDLibrary.folder else { return .notAsked }
+                          return FileManager.default.fileExists(atPath: f.path) ? .granted : .denied
+                      },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: "GDD to Assets…",
+                      openSettings: openGDD),
+            // ── Finder menu ─────────────────────────────────────────────────────────
+            SetupItem(id: "finderext", section: .finder, title: "Navigator in Finder’s right-click menu",
+                      short: "Remove BG, Chroma Key, Prep for AI, the upscalers, Restyle, Layerize and GDD to Assets, right in Finder.",
+                      why: "Green means macOS has the extension registered AND switched on — both, because an update can drop the registration while the switch still looks on, and then Finder quietly shows no Navigator menu. Navigator re-registers it at launch.\n\nTurn On does both itself. If macOS wants you to tick it by hand, it opens \(finderExtensionSectionName): tick Navigator in the “File Providers” sheet and click Done.\n\nRight after Navigator restarts, the first right-click can come up without the Navigator item while Finder reloads it — right-click again.",
+                      probe: { _ in FinderExtension.state() },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: "Turn On",
+                      run: { report in
+                          report("Turning it on…")
+                          FinderExtension.turnOn { ok in
+                              report(ok ? "On. Right-click a file in Finder and look for Navigator."
+                                        : "macOS wants you to tick it: tick Navigator in the “File Providers” sheet, then click Done.")
+                          }
+                      },
+                      openSettings: {}),
+        ]
+        // ── Apps Navigator uses ─────────────────────────────────────────────────────
+        // Installed → the permission to drive it. Missing → what needs it, and where to get
+        // it. Adobe installs go through Creative Cloud when it is there (that is where a
+        // studio licence lives), else Adobe's download page.
+        func getAdobe(_ slug: String) -> () -> Void {
+            {
+                if let cc = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.adobe.acc.AdobeCreativeCloud") {
+                    NSWorkspace.shared.openApplication(at: cc, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+                } else {
+                    NSWorkspace.shared.open(URL(string: "https://www.adobe.com/download/\(slug)")!)
+                }
+            }
+        }
+        let notInstalled: [PermissionState: String] = [.off: "Not installed"]
+        if !hasPhotoshop {
+            rows.append(SetupItem(id: "app-ps", section: .apps, title: "Adobe Photoshop",
+                      short: "Needed for Remove BG, Quick Export as PNG, Firefly upscale, Assemble Layers, and GDD to Assets’ background removal.",
+                      why: "Install it from Creative Cloud with your studio Adobe account. Once it’s installed, reopen this window — this row becomes the permission Navigator needs to drive it. Firefly upscale also spends Adobe generative credits.",
+                      probe: { _ in .off }, probeMayPrompt: false, canAsk: false,
+                      settingsLabel: "Get Photoshop…", labels: notInstalled,
+                      openSettings: getAdobe("photoshop")))
+        }
+        if AfterEffectsApp.bundleID == nil {
+            rows.append(SetupItem(id: "app-ae", section: .apps, title: "Adobe After Effects",
+                      short: "Needed for Chroma Key BG and FX Alpha Upscale, which key out the backing colour with Keylight.",
+                      why: "Keylight ships with After Effects — nothing extra to install. Get it from Creative Cloud with your studio Adobe account, then reopen this window.",
+                      probe: { _ in .off }, probeMayPrompt: false, canAsk: false,
+                      settingsLabel: "Get After Effects…", labels: notInstalled,
+                      openSettings: getAdobe("after-effects")))
+        }
+        let driveApp = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.drivefs")
+        rows.append(SetupItem(id: "app-drive", section: .apps, title: "Google Drive for Desktop",
+                      short: "Needed for GDD to Assets — it keeps the team’s GDDs on this Mac — and for Navigator’s Drive link and offline commands.",
+                      why: "Sign in with your @high5games.com account. The shared drives then appear under Google Drive in Navigator’s sidebar, and the GDDs folder can be picked from there.\n\nGreen means the app is installed AND signed in: a Drive folder exists in ~/Library/CloudStorage.",
+                      probe: { _ in
+                          guard NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.drivefs") != nil else { return .off }
+                          let cs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")
+                          let signedIn = ((try? FileManager.default.contentsOfDirectory(atPath: cs.path)) ?? [])
+                              .contains { $0.hasPrefix("GoogleDrive-") }
+                          return signedIn ? .granted : .notAsked
+                      },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: driveApp == nil ? "Get Google Drive…" : "Open Google Drive",
+                      labels: [.off: "Not installed", .notAsked: "Not signed in", .granted: "Ready"],
+                      openSettings: {
+                          if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.google.drivefs") {
+                              NSWorkspace.shared.openApplication(at: u, configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
+                          } else {
+                              NSWorkspace.shared.open(URL(string: "https://workspace.google.com/products/drive/#download")!)
+                          }
+                      }))
+        // Photoshop and After Effects are SEPARATE Automation grants from Finder; allowing
+        // one says nothing about the other.
+        if hasPhotoshop {
+            rows.append(SetupItem(id: "automation-ps", section: .apps, title: "Control Photoshop",
+                      short: "For Remove BG, Quick Export as PNG, Firefly upscale and Assemble Layers.",
+                      why: "macOS only lists Navigator under Automation once it has asked, so use the button.",
+                      probe: { _ in PermissionProbe.appAutomation(bundleID: "com.adobe.Photoshop") },
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      afterOpening: "Then: find Navigator in that list and switch Adobe Photoshop on underneath it.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }))
+        }
+        if let ae = AfterEffectsApp.bundleID {
+            rows.append(SetupItem(id: "automation-ae", section: .apps, title: "Control After Effects",
+                      short: "For Chroma Key BG and FX Alpha Upscale, which key out the backing in After Effects.",
+                      why: "Navigator keeps After Effects hidden while it works. macOS only lists Navigator under Automation once it has asked, so use the button.",
+                      probe: { _ in PermissionProbe.appAutomation(bundleID: ae) },
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      afterOpening: "Then: find Navigator in that list and switch Adobe After Effects on underneath it.",
+                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }))
+        }
+        rows += [
+            // ── Files & folders ─────────────────────────────────────────────────────
+            // Full Disk Access leads the section because it explains the rows below it:
+            // when it reads Granted they all read "Covered by Full Disk Access".
+            SetupItem(id: "fda", section: .files, title: "Full Disk Access",
+                      short: "Optional. One switch that covers every row below it.",
+                      why: "With it on, macOS grants Navigator every file permission listed here and REPLACES their individual switches in Files & Folders with a single greyed “Full Disk Access” line — so there is nothing left to turn on there. It reaches what those switches don’t, too: other apps’ Library folders, another user’s home, some system folders. It does NOT override a file’s own owner or read-only flag, everyday browsing works without it, and macOS never asks — you turn it on yourself.",
                       probe: { _ in PermissionProbe.fullDisk() },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch it on. If it isn’t listed, click +, press ⇧⌘G, type /Applications/Navigator.app. Quit and reopen Navigator afterwards.",
@@ -17252,163 +17476,98 @@ struct SetupItem: Identifiable {
             homeFolder("Downloads", "Browse Downloads and move things out of it."),
             // Volumes are probed live rather than gated behind a button: with none of the
             // kind mounted the probe is free and answers "Unknown", and with one mounted
-            // reading it is both the honest test and the prompt you'd want anyway.
-            //
-            // canAsk stays false for both, and that is not an oversight: with no volume of
-            // the kind mounted there is nothing to attempt, so an "Ask macOS…" button would
-            // be a button that provably does nothing. The wording carries that instead.
-            SetupItem(id: "network", title: "Network volumes",
-                      why: "Reading and writing FILES on a shared drive once it's mounted — you connect with ⌘K, this is what lets Navigator browse what's inside. Not the same as Local Network below, which is only about DISCOVERING servers so they appear in the sidebar by themselves; the two are separate switches in different panes. With none mounted there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
+            // reading it is both the honest test and the prompt you'd want anyway. canAsk
+            // stays false: with nothing mounted an "Ask macOS…" button provably does nothing.
+            SetupItem(id: "network", section: .files, title: "Network volumes",
+                      short: "Read and write files on shared drives once they’re mounted.",
+                      why: "You connect with ⌘K; this is what lets Navigator browse what’s inside. Not the same as Local Network under Optional, which is only about DISCOVERING servers. With none mounted there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: true) },
                       probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
                       afterOpening: inFilesPane,
                       openSettings: files),
-            SetupItem(id: "removable", title: "USB & external drives",
-                      why: "Browse sticks and external disks, and use them as a Send To target. With none plugged in there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
+            SetupItem(id: "removable", section: .files, title: "USB & external drives",
+                      short: "Browse sticks and external disks, and use them as a Send To target.",
+                      why: "With none plugged in there is nothing to test — macOS settles this the first time Navigator opens one, and does not list it in System Settings before then.",
                       probe: { _ in PermissionProbe.volumes(network: false) },
                       probeMayPrompt: false, canAsk: false, listedOnlyAfterRequest: true,
                       afterOpening: inFilesPane,
                       openSettings: files),
-            SetupItem(id: "automation", title: "Control Finder",
-                      why: "Used for one thing: saving the Comment field in Get Info. Finder owns Finder comments, so Finder has to be the one to write them. Automation only lists Navigator once it has asked, so use the button — the pane is empty of us until then.",
+            // ── Optional ────────────────────────────────────────────────────────────
+            SetupItem(id: "automation", section: .optional, title: "Control Finder",
+                      short: "Only for saving the Comment field in Get Info.",
+                      why: "Finder owns Finder comments, so Finder has to be the one to write them. Automation only lists Navigator once it has asked, so use the button — the pane is empty of us until then.",
                       probe: { _ in PermissionProbe.finderAutomation() },
-                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
+                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch Finder on underneath it.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
-            SetupItem(id: "finderext", title: "Navigator’s Finder menu",
-                      why: "Adds Navigator’s submenu — Remove BG, Chroma Key, the AI upscalers — to Finder’s own right-click menu. macOS makes you tick this one yourself, in \(finderExtensionSectionName).",
-                      probe: { _ in FIFinderSyncController.isExtensionEnabled ? .granted : .off },
-                      probeMayPrompt: false, canAsk: false,
-                      settingsLabel: "Open Extensions",
-                      afterOpening: "Then: tick Navigator in the “File Providers” sheet that opens on top, and click Done.",
-                      // The SAME call the AI ▸ Finder Menu… item and the once-per-version
-                      // nudge already use — one path to that pane, not two.
-                      openSettings: { FIFinderSyncController.showExtensionManagementInterface() }),
-            // The row this whole window was missing. It is LAST and optional because it
-            // buys exactly one keystroke, but its `why` is the longest here on purpose:
-            // the owner of this app went looking for this switch, clicked the pane named
-            // "Accessibility" in the sidebar, found VoiceOver and Zoom, and concluded the
-            // permission wasn't there. Naming the trap is the row's main job; the button
-            // is what makes the naming unnecessary.
-            SetupItem(id: "accessibility", title: "Accessibility (one-key dialog jump)",
-                      why: "Needed for one thing only: ⌃⌥⇧⌘G, which types ⇧⌘G, pastes and presses Return in another app’s Open or Save dialog. Driving another app’s keyboard is what macOS gates here. Without it ⌃⌥⌘G still copies the path and you paste it yourself, so nothing is broken — that is why this row never counts as needing attention.\n\nThe button goes to Privacy & Security ▸ Accessibility. That is NOT the Accessibility item in the System Settings sidebar, which is VoiceOver, Zoom and Hover Text and has no list of apps in it at all — two different panes, same name.\n\nExpect to redo this: macOS keys the grant to Navigator’s code signature, and Navigator is signed locally, so rebuilding or updating the app drops it.",
+            // The owner went looking for this switch, clicked the pane named "Accessibility"
+            // in the sidebar, found VoiceOver and Zoom, and concluded it wasn't there. Naming
+            // that trap is why the details are long.
+            SetupItem(id: "accessibility", section: .optional, title: "Accessibility",
+                      short: "Only for ⌃⌥⇧⌘G, which types a path into another app’s Open or Save dialog for you.",
+                      why: "Without it ⌃⌥⌘G still copies the path and you paste it yourself, so nothing is broken.\n\nThe button goes to Privacy & Security ▸ Accessibility. That is NOT the Accessibility item in the System Settings sidebar, which is VoiceOver, Zoom and Hover Text and has no list of apps in it at all — two different panes, same name.\n\nExpect to redo this: macOS keys the grant to Navigator’s code signature, and Navigator is signed locally, so rebuilding or updating the app drops it.",
                       probe: { _ in AXIsProcessTrusted() ? .granted : .off },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch it on. If it isn’t listed, click +, press ⇧⌘G, type /Applications/Navigator.app.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.accessibilityPane) }),
-            // Photoshop and After Effects are SEPARATE Automation grants from Finder, and
-            // this window listed only Finder — while Remove BG, Quick Export as PNG,
-            // Generative Upscale and Chroma Key all depend on these. Each row appears only
-            // when that app is installed, matching what Navigator's own menus show.
-            SetupItem(id: "automation-ps", title: "Control Photoshop",
-                      why: "Powers Remove BG, Quick Export as PNG, Generative Upscale, and the re-cut step after an AI upscale. Photoshop is a separate Automation grant from Finder — allowing one says nothing about the other. macOS only lists Navigator here once it has asked, so use the button.",
-                      probe: { _ in PermissionProbe.appAutomation(bundleID: "com.adobe.Photoshop") },
-                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
-                      afterOpening: "Then: find Navigator in that list and switch Adobe Photoshop on underneath it.",
-                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
-            SetupItem(id: "automation-ae", title: "Control After Effects",
-                      why: "Chroma Key BG uses After Effects + Keylight and needs permission to control After Effects.",
-                      probe: { _ in PermissionProbe.appAutomation(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects") },
-                      probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true, optional: true,
-                      afterOpening: "Then: find Navigator in that list and switch Adobe After Effects on underneath it.",
-                      openSettings: { PermissionProbe.openPane(PermissionProbe.automationPane) }),
-            // Not a macOS permission — After Effects' own. It gets a row because of how it
-            // fails: OFF, a script's system.callSystem is refused and After Effects raises the
-            // refusal as a MODAL dialog. Navigator runs it hidden, so nobody could see or
-            // answer that dialog and Chroma Key simply stopped with no output and no error.
-            SetupItem(id: "ae-scripting", title: "After Effects: allow scripts to write files",
-                      why: "After Effects' setting for scripts that run external helpers. Chroma Key BG renders in After Effects and converts the still to PNG in Navigator, so it does not require shell access.\n\nRead from the preferences file After Effects writes when it quits.",
-                      probe: { _ in AfterEffectsApp.scriptingFileAccess() },
-                      probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "Open After Effects",
-                      afterOpening: "Then, in After Effects: Settings ▸ Scripting & Expressions ▸ tick “Allow Scripts to Write Files and Access Network”. Quit After Effects afterwards so the setting is written and this row can read it.",
-                      openSettings: { if let u = AfterEffectsApp.url { NSWorkspace.shared.openApplication(at: u, configuration: NSWorkspace.OpenConfiguration()) { _, _ in } } }),
-            // No API exists to query either of the two below, so both report Unknown and
-            // lead with what BREAKS when they're off. A row that can only say "Unknown" still
-            // earns its place if it tells you the symptom you'd otherwise misdiagnose.
-            SetupItem(id: "localnetwork", title: "Local Network",
-                      why: "Only about DISCOVERY: finding SMB servers on your network so they appear in the sidebar on their own. It is NOT what lets Navigator read files on them — that's Network volumes above. Without this the sidebar just won't find servers by itself; ⌘K still reaches any of them by name, so nothing is actually lost.\n\nmacOS provides no way to READ this setting — it is stored in none of the databases the other rows here use — so this row reports what Navigator can actually DO instead.\n\nGranted means it has genuinely discovered a server, which only a working permission allows. Denied means macOS refused the search outright. Unknown is the NORMAL result on most networks and does not mean anything is wrong: it means nothing has been found yet, and that is equally consistent with the permission being off and with there simply being no servers advertising themselves. Rather than guess between the two, this row says so.\n\nIf your shared drives are ones you mount by name or by address, they are not advertised on the network and will never appear here — that is the usual reason this stays Unknown even with the switch on.",
+            // No API exists to read Local Network, so the row reports what Navigator can DO.
+            SetupItem(id: "localnetwork", section: .optional, title: "Local Network",
+                      short: "Only for finding servers so they appear in the sidebar by themselves. ⌘K reaches any of them anyway.",
+                      why: "It is NOT what lets Navigator read files on them — that’s Network volumes. macOS provides no way to READ this setting, so this row reports what Navigator can actually do instead.\n\nGranted means it has genuinely discovered a server. Denied means macOS refused the search. Unknown is the NORMAL result on most networks: nothing has been found yet, which fits both the permission being off and no servers advertising themselves. Shared drives you mount by name or address are not advertised and will never appear here.",
                       probe: { _ in
                           if NetworkBrowser.shared.everFound { return .granted }
                           return NetworkBrowser.shared.searchRefused ? .denied : .unknown
                       },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Open Privacy & Security",
-                      // There is NO URL anchor for this pane. Privacy_LocalNetwork,
-                      // Privacy_LocalNetworking, Privacy_Network, Privacy_LocalNetworkAccess,
-                      // Privacy_Bonjour, Privacy_Multicast, Privacy_LocalArea and Privacy_LAN
-                      // were all tried against macOS 26.6 and every one silently lands on the
-                      // Privacy & Security ROOT. So the button is honest about only getting
-                      // you to the list, and the text does the last step — pretending
-                      // otherwise is what made this row useless.
-                      afterOpening: "Then: scroll down that list to Local Network, open it, and switch Navigator on. macOS has no direct link to this particular pane, so the button can only get you as far as the list.",
+                      // There is NO URL anchor for this pane — eight candidates were tried
+                      // against macOS 26.6 and all land on the Privacy & Security root.
+                      afterOpening: "Then: scroll down that list to Local Network, open it, and switch Navigator on. macOS has no direct link to this particular pane.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.privacyRootPane) }),
-            SetupItem(id: "appmanagement", title: "App Management (for updates)",
-                      why: "How Navigator updates ITSELF. Installing an update replaces /Applications/Navigator.app, and macOS treats replacing an app bundle as App Management. If this is off the download succeeds and the swap silently doesn't — you stay on the old version and the only clue is that the same update keeps reappearing.\n\nThere is no API for this one, so the status is read from macOS's own permission database. That needs Full Disk Access; without it this row honestly says Unknown rather than guessing.",
+            SetupItem(id: "appmanagement", section: .optional, title: "App Management",
+                      short: "Lets Navigator install its own updates.",
+                      why: "Installing an update replaces /Applications/Navigator.app, and macOS treats replacing an app bundle as App Management. If this is off the download succeeds and the swap silently doesn’t — you stay on the old version and the same update keeps reappearing.\n\nThe status is read from macOS’s own permission database, which needs Full Disk Access; without it this row says Unknown rather than guessing.",
                       probe: { _ in PermissionProbe.tccDecision(service: "kTCCServiceSystemPolicyAppBundles") },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       afterOpening: "Then: find Navigator in that list and switch it on.",
                       openSettings: { PermissionProbe.openPane(PermissionProbe.appManagementPane) }),
-            // Not macOS permissions, but they fail the same way — a feature that just doesn't
-            // work — and this window is where people come to find out why.
-            // Not permissions, but the same kind of setup step, and they were previously only
-            // reachable as their own menu items with no way to see whether they had taken.
-            SetupItem(id: "defaultimages", title: "Default image viewer",
-                      why: "Makes opening an image anywhere — Finder, Mail, Messages — open it in Navigator's viewer. Set per file type, so this reads Granted once PNG points at Navigator.\n\nTo undo: in Finder select an image ▸ Get Info ▸ “Open with” ▸ pick another app ▸ “Change All…”.",
+            SetupItem(id: "defaultimages", section: .optional, title: "Default image viewer",
+                      short: "Open images from Finder, Mail or Messages in Navigator’s viewer.",
+                      why: "Set per file type, so this reads Granted once PNG points at Navigator.\n\nTo undo: in Finder select an image ▸ Get Info ▸ “Open with” ▸ pick another app ▸ “Change All…”.",
                       probe: { _ in PermissionProbe.isDefaultApp(for: .png) },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Make Default",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultImageViewerAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "defaultfolders", title: "Default folder handler",
-                      why: "macOS does NOT let any third-party app take folders from Finder — Apple locks that one, so this row will read Off however many times you press the button, and that is not a fault to fix.\n\nWhat does work, and what the button sets up: Navigator is registered as a folder app, so you can right-click a folder ▸ Open With ▸ Navigator, or Open With ▸ Other… and tick “Always Open With” to make one folder always open here. From Terminal, open -b com.merickson.navigator <folder>. Keeping Navigator in the Dock covers the rest.",
+            SetupItem(id: "defaultfolders", section: .optional, title: "Open folders with Navigator",
+                      short: "Adds Navigator to Open With for folders. macOS never lets any app replace Finder for folders, so this stays Off.",
+                      why: "What the button sets up: Navigator is registered as a folder app, so you can right-click a folder ▸ Open With ▸ Navigator, or Open With ▸ Other… and tick “Always Open With” to make one folder always open here. From Terminal, open -b com.merickson.navigator <folder>. Keeping Navigator in the Dock covers the rest.",
                       probe: { _ in PermissionProbe.isDefaultApp(for: .folder) },
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Register & Explain",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultBrowserAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "vertex", title: "Vertex sign-in (Google, company-metered)",
-                      why: "Powers Restyle, Imagen upscaling and Layerize's Analyze. A browser sign-in with your @high5games.com account — no key to paste, no gcloud, no Node.js, and no Claude or plugin needed. Lasts about 30 days.\n\n"
-                         + VertexStatus.current().detail
-                         + "\n\nGreen means the service confirmed the account, not merely that a session file exists.",
-                      // The real question, asked of the service and cached — see VertexStatus.
-                      probe: { _ in VertexStatus.current().state },
-                      probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "Sign in…",
-                      // Starts the sign-in outright. It used to open a dialog telling you to go and
-                      // find the menu item that does this, which is a button that describes a button.
-                      openSettings: { NSApp.sendAction(#selector(AppDelegate.vertexSignInAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "falkey", title: "fal.ai API key",
-                      why: "Powers Layerize and the fal upscalers (Crystal, AuraSR, Topaz). Stored in your login keychain.\n\nExpect one prompt after each Navigator update: updating re-signs the app, which invalidates the keychain's saved permission. Choose Always Allow when it asks — the key itself is fine and never needs re-entering.",
-                      probe: { _ in PermissionProbe.keyStored(account: "fal.ai") },
-                      probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "API Keys…",
-                      openSettings: { NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "themehub", title: "Team theme hub (GDD to Assets)",
-                      why: "Where GDD to Assets gets its themes and art direction. Two parts: the hub's address, stored once on this Mac, and a Google sign-in.\n\nThe hub sits behind Google's Identity-Aware Proxy, so Navigator opens it in a sign-in window the first time and reuses that session afterwards — the same account you already use in the browser. Navigator never sees your password.\n\n"
-                         + (GoogleWebSession.themeHubURL == nil
-                            ? "No address set yet. Ask Michael for it, then use the button."
-                            : "Address is set. Open GDD to Assets and press Reload to check the sign-in."),
-                      probe: { _ in GoogleWebSession.themeHubURL == nil ? .notAsked : .granted },
-                      probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "GDD to Assets…",
-                      openSettings: { NSApp.sendAction(#selector(AppDelegate.gddToAssetsAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "gddfolder", title: "Game design documents folder",
-                      why: "The Drive folder your GDDs live in. Google Drive for Desktop already keeps it on this Mac, so Navigator lists the documents straight off disk and only goes to the network for a document's text.\n\n"
-                         + (GDDLibrary.folder.map { "Set to “\($0.path)”." }
-                            ?? "Not chosen yet — pick it once inside GDD to Assets."),
+            // macOS decodes WebP but cannot write it, so Export as WebP borrows Google's
+            // encoder. Everything else Navigator exports uses macOS's own ImageIO.
+            SetupItem(id: "app-webp", section: .optional, title: "WebP encoder",
+                      short: "Only for Export as WebP. Every other format is built into macOS.",
+                      why: "Google’s cwebp, installed with Homebrew. In Terminal:\n\n    brew install webp\n\nNo Homebrew? Install it first from brew.sh (one command, it explains itself). The button copies the command.",
                       probe: { _ in
-                          guard let f = GDDLibrary.folder else { return .notAsked }
-                          return FileManager.default.fileExists(atPath: f.path) ? .granted : .denied
+                          ["/opt/homebrew/bin/cwebp", "/usr/local/bin/cwebp"]
+                              .contains { FileManager.default.isExecutableFile(atPath: $0) } ? .granted : .off
                       },
                       probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "GDD to Assets…",
-                      openSettings: { NSApp.sendAction(#selector(AppDelegate.gddToAssetsAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "openaikey", title: "OpenAI API key",
-                      why: "Not used by anything yet — reserved for future gpt-image surfaces. Nothing in Navigator needs it today, so an empty row here is expected.",
-                      probe: { _ in PermissionProbe.keyStored(account: "openai") },
-                      probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "API Keys…",
-                      openSettings: { NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) })
+                      settingsLabel: "Copy Install Command",
+                      run: { report in
+                          NSPasteboard.general.clearContents()
+                          NSPasteboard.general.setString("brew install webp", forType: .string)
+                          let hasBrew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+                              .contains { FileManager.default.isExecutableFile(atPath: $0) }
+                          report(hasBrew ? "Copied “brew install webp” — paste it into Terminal."
+                                         : "Copied “brew install webp”. Homebrew isn’t installed yet — get it from brew.sh first.")
+                      },
+                      labels: [.off: "Not installed", .granted: "Installed"],
+                      openSettings: {}),
         ]
+        return rows
     }
 }
 
@@ -17427,25 +17586,35 @@ struct SetupAssistantView: View {
     @AppStorage("iconSize") private var iconSize = 76.0
     @AppStorage("inferFolderView") private var inferFolderView = true
 
-    private let items = SetupItem.all()
-    /// Rows that aren't about reading files. Full Disk Access can't cover any of them.
-    private static let extras: Set<String> = ["automation", "automation-ps", "automation-ae",
-                                              "finderext", "accessibility", "localnetwork",
-                                              "appmanagement", "defaultimages", "defaultfolders",
-                                              "vertex", "falkey", "openaikey"]
+    @State private var items = SetupItem.all()
+    /// What a row's own "does it itself" button last reported, shown under the row.
+    @State private var notes: [String: String] = [:]
 
     var body: some View {
         Form {
             Section {
-                Text("macOS keeps Navigator out of your files until you say otherwise. This checks what it can actually reach right now.\n\n“Ask macOS” makes macOS put up its own permission dialog. A row with no button needs nothing from you — either it is already covered, or macOS has nowhere for you to change it yet and will decide the first time Navigator tries.")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(headline).font(.headline)
+                    Text("Everything Navigator needs, in one place. Each row checks the real thing — a green tick means it works right now. Setting up a new Mac? A teammate’s setup link (AI ▸ Copy Team Setup Link…) fills in the team addresses; then sign in and add your fal key.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button("Copy Team Setup Link…") {
+                            NSApp.sendAction(#selector(AppDelegate.copyVertexSetupLinkAction(_:)), to: nil, from: nil)
+                        }
+                        .help("For a teammate: a link that fills in the Vertex and theme hub addresses on their Mac.")
+                        Spacer()
+                    }.controlSize(.small)
+                }
             }
-            // Split by id rather than by count: the sections used to be prefix(5)/dropFirst(5)
-            // and reordering the list silently moved a row into the wrong one. One membership
-            // set, negated for the other section, so no row can land in both or in neither.
-            Section("Files & folders") { ForEach(items.filter { !Self.extras.contains($0.id) }) { row($0) } }
-            Section("Extras") { ForEach(items.filter { Self.extras.contains($0.id) }) { row($0) } }
+            // Split by the row's own section, so reordering the list can never move a row
+            // into the wrong one — the sections used to be counted off by position.
+            ForEach(SetupSection.allCases, id: \.self) { sec in
+                let rows = items.filter { $0.section == sec }
+                if !rows.isEmpty {
+                    Section(sec.rawValue) { ForEach(rows) { row($0) } }
+                }
+            }
             // Onboarding a coworker used to mean opening Add Network Drive once per share. One
             // paste covers the lot. Nothing is mounted here on purpose: the addresses are saved as
             // sidebar drives, and the first click mounts through NetFS with THEIR login, which is
@@ -17548,13 +17717,35 @@ struct SetupAssistantView: View {
         SetupAudit.effectiveState(id: item.id, probed: states[item.id] ?? .unknown, fullDisk: fullDisk)
     }
 
+    private var attention: Int {
+        SetupAudit.attentionCount(items.map { ($0.id, states[$0.id] ?? .unknown, $0.optional) },
+                                  fullDisk: fullDisk)
+    }
+    private var headline: String {
+        if checking && states.isEmpty { return "Checking…" }
+        let bad = attention
+        return bad == 0 ? "Navigator is ready to use"
+                        : "\(bad) thing\(bad == 1 ? "" : "s") left to set up"
+    }
     private var summary: String {
         let stamp = checkedAt.map { " · checked " + $0.formatted(date: .omitted, time: .standard) } ?? ""
         if checking { return "Checking…" }
-        let bad = SetupAudit.attentionCount(items.map { ($0.id, states[$0.id] ?? .unknown, $0.optional) },
-                                            fullDisk: fullDisk)
+        let bad = attention
         if bad == 0 { return "Nothing needs your attention" + stamp }
         return "\(bad) item\(bad == 1 ? "" : "s") still need\(bad == 1 ? "s" : "") attention" + stamp
+    }
+
+    /// macOS's words for its own permissions; plain words for the rest. "Granted" on a
+    /// sign-in or a key, or "Not yet asked" on the Finder menu, describes nothing anyone did.
+    private func label(_ s: PermissionState, _ item: SetupItem) -> String {
+        if let l = item.labels[s] { return l }
+        guard item.section == .connect || item.section == .finder else { return s.label }
+        switch s {
+        case .granted, .covered: return "Ready"
+        case .notAsked, .off:    return "Not set up"
+        case .denied:            return "Needs fixing"
+        case .unknown:           return "Unknown"
+        }
     }
 
     private func tint(_ s: PermissionState) -> Color {
@@ -17602,22 +17793,36 @@ struct SetupAssistantView: View {
         let state = state(of: item)
         let buttons = SetupAudit.buttons(state: state, canAsk: item.canAsk,
                                          listedOnlyAfterRequest: item.listedOnlyAfterRequest)
+        // A row that fixes or tests the thing itself: offered unless there is nothing left
+        // to do. The theme hub keeps its Check — a sign-in can lapse after the tick went green.
+        let showRun = item.run != nil && (state != .granted || ["themehub", "falkey"].contains(item.id))
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: state.symbol)
                 .foregroundStyle(tint(state)).frame(width: 16).padding(.top, 2)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(item.title).fontWeight(.medium)
-                    Text(state.label).font(.caption).foregroundStyle(tint(state))
+                    Text(label(state, item)).font(.caption).foregroundStyle(tint(state))
                 }
-                Text(item.why).font(.caption).foregroundStyle(.secondary)
+                Text(item.short).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                // Only next to the button it is about: with no button there is no "then",
-                // and a "find Navigator in the list" on a row we just told the user needs
-                // nothing would send them to a pane for no reason.
-                if buttons.settings, let next = item.afterOpening {
+                // The last step, only while there IS a step: on a green row "find Navigator in
+                // the list and switch it on" is an instruction to do nothing.
+                if buttons.settings, item.run == nil, state.needsAttention, let next = item.afterOpening {
                     Text(next).font(.caption).foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                if let note = notes[item.id], !note.isEmpty {
+                    Text(note).font(.caption).foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !item.why.isEmpty {
+                    DisclosureGroup("More") {
+                        Text(item.why).font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .font(.caption)
                 }
             }
             Spacer(minLength: 8)
@@ -17625,7 +17830,27 @@ struct SetupAssistantView: View {
                 if buttons.ask {
                     Button("Ask macOS…") { ask(item) }.buttonStyle(.borderedProminent)
                 }
-                if buttons.settings { Button(item.settingsLabel) { item.openSettings() } }
+                if let run = item.run {
+                    if showRun {
+                        let go = {
+                            run { note in
+                                notes[item.id] = note
+                                refresh()   // rebuilds the rows too: labels depend on the answer
+                            }
+                        }
+                        if state.needsAttention {
+                            Button(item.settingsLabel, action: go).buttonStyle(.borderedProminent)
+                        } else {
+                            Button(item.settingsLabel, action: go)
+                        }
+                    }
+                } else if buttons.settings {
+                    if state.needsAttention {
+                        Button(item.settingsLabel) { item.openSettings() }.buttonStyle(.borderedProminent)
+                    } else {
+                        Button(item.settingsLabel) { item.openSettings() }
+                    }
+                }
             }
             .controlSize(.small)
         }
@@ -17653,6 +17878,7 @@ struct SetupAssistantView: View {
     /// completing, which is precisely the "confident wrong status" this is meant to avoid.
     private func refresh() {
         checking = true
+        items = SetupItem.all()   // wording that depends on what's set (hub address, GDD folder)
         let items = self.items
         DispatchQueue.global(qos: .userInitiated).async {
             // Ask the AI service before the rows are probed, so the Vertex row paints its real
@@ -17810,6 +18036,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // extension on by itself — the user has to tick it once. Offer to take them
         // straight there rather than leaving the feature silently absent. Asked at
         // most once per version, and always reachable from AI → Finder Menu….
+        // An update replaces the app bundle, which can drop the extension from macOS's
+        // registry; put it back before anything asks whether it is on.
+        FinderExtension.ensureRegistered()
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
             self?.offerFinderExtensionIfDisabled()
         }
@@ -17928,25 +18157,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // the previous dialog said "ask Michael for it".
         if url.host?.lowercased() == "vertex-setup" {
             NSApp.activate(ignoringOtherApps: true)
-            var value = comps.queryItems?.first(where: { $0.name == "url" })?.value ?? ""
-            while value.hasSuffix("/") { value = String(value.dropLast()) }
+            func address(_ name: String) -> String? {
+                guard var v = comps.queryItems?.first(where: { $0.name == name })?.value else { return nil }
+                while v.hasSuffix("/") { v = String(v.dropLast()) }
+                return v
+            }
+            let value = address("url"), hub = address("hub")
             let a = NSAlert()
-            guard value.lowercased().hasPrefix("https://"), URL(string: value) != nil else {
+            let valid = { (v: String?) in v.map { $0.lowercased().hasPrefix("https://") && URL(string: $0) != nil } ?? true }
+            guard value != nil || hub != nil, valid(value), valid(hub) else {
                 a.alertStyle = .warning
                 a.messageText = "That setup link isn’t valid"
-                a.informativeText = "It must carry an https:// service address. Ask for a fresh link."
+                a.informativeText = "It must carry https:// addresses. Ask for a fresh link."
                 a.addButton(withTitle: "OK"); a.runModal(); return
             }
-            a.messageText = "Set up Vertex on this Mac?"
-            a.informativeText = "This link points Navigator at:\n\n\(value)\n\n"
-                              + "Only accept it from someone you trust — it decides where your "
+            a.messageText = "Set up Navigator from this link?"
+            a.informativeText = "This link points Navigator at:\n\n"
+                              + (value.map { "Vertex service: \($0)\n" } ?? "")
+                              + (hub.map { "Theme hub: \($0)\n" } ?? "")
+                              + "\nOnly accept it from someone you trust — it decides where your "
                               + "Google sign-in goes. Nothing is sent anywhere yet."
-            a.addButton(withTitle: "Use This Address")
+            a.addButton(withTitle: "Use These Addresses")
             a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
-            VertexSetup.storedServiceURL = value
-            VertexStatus.invalidate()
-            vertexSignInAction(nil)
+            if let hub { GoogleWebSession.themeHubURL = hub }
+            if let value {
+                VertexSetup.storedServiceURL = value
+                VertexStatus.invalidate()
+                vertexSignInAction(nil)
+            }
             return
         }
 
@@ -18628,7 +18867,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         qaItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
         let vSignIn = aiMenu.addItem(withTitle: "Sign in to Vertex…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
-        aiMenu.addItem(withTitle: "Copy Vertex Setup Link…", action: #selector(copyVertexSetupLinkAction(_:)), keyEquivalent: "")
+        aiMenu.addItem(withTitle: "Copy Team Setup Link…", action: #selector(copyVertexSetupLinkAction(_:)), keyEquivalent: "")
         vSignIn.target = self
         let vStatus = aiMenu.addItem(withTitle: "Vertex Status…", action: #selector(vertexStatusAction(_:)), keyEquivalent: "")
         vStatus.target = self
@@ -18654,41 +18893,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     // AI → API Keys… — paste/store the fal.ai key (Keychain-backed).
     @objc func apiKeysAction(_ sender: Any?) {
         let a = NSAlert()
-        a.messageText = "AI API Keys"
-        a.informativeText = "Paste your fal.ai API key (used for AI upscaling). It’s stored securely in your macOS Keychain, not in a file."
+        a.messageText = "fal.ai API key"
+        a.informativeText = "Used by Layerize and the Crystal, AuraSR and Topaz upscalers. Stored in your macOS keychain, not in a file.\n\nNo key yet? Get Key opens fal’s dashboard. Switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         field.placeholderString = "fal.ai key (e.g. 1234abcd-…:…)"
         field.stringValue = APIKeys.fal ?? ""
         a.accessoryView = field
-        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
+        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel"); a.addButton(withTitle: "Get Key…")
         a.window.initialFirstResponder = field
-        if a.runModal() == .alertFirstButtonReturn {
-            APIKeys.fal = field.stringValue
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            APIKeys.fal = key
+            FalKeyCheck.last = nil   // a new key has no verdict yet
+            guard !key.isEmpty else { return }
+            // Checked now, while the key is in hand — no keychain read, so no prompt.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let r = FalKeyCheck.verify(key)
+                DispatchQueue.main.async {
+                    let done = NSAlert()
+                    done.alertStyle = r.accepted == false ? .warning : .informational
+                    done.messageText = r.accepted == true ? "Key saved and working" : "Key saved"
+                    done.informativeText = r.message
+                    done.addButton(withTitle: "OK"); done.runModal()
+                }
+            }
+        case .alertThirdButtonReturn:
+            NSWorkspace.shared.open(URL(string: "https://fal.ai/dashboard/keys")!)
+        default: break
         }
     }
 
     // AI → Copy Vertex Setup Link — hand a coworker one clickable link instead of an address to
     // retype. The address is not a password, but it is not ours to publish either, so it travels by
     // whatever channel you already use for internal things and never through this app's repository.
+    // One link carries both team addresses — Vertex's service and the theme hub — so a new
+    // teammate clicks once instead of being told to "ask Michael" twice. Only the addresses
+    // travel: no key, no session, nothing that signs anyone in as anyone else.
     @objc func copyVertexSetupLinkAction(_ sender: Any?) {
-        guard let base = H5GService.baseURL else {
+        let base = H5GService.baseURL, hub = GoogleWebSession.themeHubURL
+        guard base != nil || hub != nil else {
             let a = NSAlert(); a.alertStyle = .warning
-            a.messageText = "No service address on this Mac"
-            a.informativeText = "Set Vertex up here first, then you can pass the link on."
+            a.messageText = "Nothing to share yet"
+            a.informativeText = "Set up Vertex or the theme hub on this Mac first, then you can pass the link on."
             a.addButton(withTitle: "OK"); a.runModal(); return
         }
         var comps = URLComponents()
         comps.scheme = "navigatoraction"
         comps.host = "vertex-setup"
-        comps.queryItems = [URLQueryItem(name: "url", value: base)]
+        comps.queryItems = [base.map { URLQueryItem(name: "url", value: $0) },
+                            hub.map { URLQueryItem(name: "hub", value: $0) }].compactMap { $0 }
         guard let link = comps.url?.absoluteString else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(link, forType: .string)
         let a = NSAlert()
-        a.messageText = "Setup link copied"
-        a.informativeText = "Send it to anyone who needs Vertex in Navigator. They click it, confirm "
-                          + "the address, and Navigator takes them straight to the Google sign-in — "
-                          + "no Node.js, no plugin, nothing to type."
+        a.messageText = "Team setup link copied"
+        a.informativeText = "Send it to a teammate. They click it, confirm, and Navigator fills in "
+                          + [base.map { _ in "the Vertex service" }, hub.map { _ in "the theme hub" }]
+                              .compactMap { $0 }.joined(separator: " and ")
+                          + ", then takes them to the Google sign-in. Nothing to type, no plugin."
         a.addButton(withTitle: "OK"); a.runModal()
     }
 
@@ -18733,7 +18996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     // Nudge, once per version, if Navigator's Finder menu is switched off.
     private func offerFinderExtensionIfDisabled() {
-        guard !FIFinderSyncController.isExtensionEnabled else { return }
+        guard FinderExtension.state() != .granted else { return }
         // The Setup Assistant has a row for this and opened moments ago — two prompts
         // about the same switch on someone's very first launch is one too many.
         guard !isFirstRun else { return }
@@ -18748,25 +19011,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
         macOS needs you to switch it on once: tick Navigator in \(finderExtensionSectionName).
         """
-        a.addButton(withTitle: "Open Settings")
+        a.addButton(withTitle: "Turn On")
         a.addButton(withTitle: "Not Now")
-        if a.runModal() == .alertFirstButtonReturn {
-            FIFinderSyncController.showExtensionManagementInterface()
-        }
+        if a.runModal() == .alertFirstButtonReturn { FinderExtension.turnOn() }
     }
 
     // AI → Finder Menu… — say whether it's on, and offer the switch either way.
     @objc func finderExtensionAction(_ sender: Any?) {
-        let on = FIFinderSyncController.isExtensionEnabled
+        let on = FinderExtension.state() == .granted
         let a = NSAlert()
         a.messageText = on ? "Navigator’s Finder menu is on" : "Navigator’s Finder menu is off"
         a.informativeText = on
             ? "Right-click any file or folder in Finder and look for the Navigator submenu."
-            : "Tick Navigator in \(finderExtensionSectionName) to add its menu to Finder’s right-click menu."
-        a.addButton(withTitle: on ? "Open Settings" : "Open Settings")
+            : "Turn On registers it with macOS and switches it on. If macOS wants you to do that last step yourself, it opens \(finderExtensionSectionName)."
+        a.addButton(withTitle: on ? "Open Settings" : "Turn On")
         a.addButton(withTitle: "Done")
         if a.runModal() == .alertFirstButtonReturn {
-            FIFinderSyncController.showExtensionManagementInterface()
+            if on { FIFinderSyncController.showExtensionManagementInterface() } else { FinderExtension.turnOn() }
         }
     }
 
@@ -19397,6 +19658,11 @@ enum H5GService {
         if let e = ProcessInfo.processInfo.environment["H5G_AIGEN_URL"], !e.isEmpty {
             return e.hasSuffix("/") ? String(e.dropLast()) : e
         }
+        // The address saved on this Mac — typed once, or filled in by a team setup link. This
+        // was missing: the address was saved and then never read, so on a Mac WITHOUT the
+        // Claude plugin Vertex could not be set up at all, and sign-in asked for it forever.
+        if let v = VertexSetup.storedServiceURL { return v }
+        // Last resort: the address baked into an installed h5g-ai-connect plugin.
         guard let client = resolveH5GClient(),
               let src = try? String(contentsOfFile: client, encoding: .utf8) else { return nil }
         // SERVICE_URL = "https://…"  — first quoted https URL after the name.
@@ -20802,6 +21068,36 @@ if CommandLine.arguments.contains("--timing") {
 }
 
 // Reference-art audit:  Navigator --art-audit
+// Setup check:  open -n -a Navigator --args --setup-report <out.txt>
+//
+// Every Setup row's state, exactly as the window would paint it, written to a file. Launch
+// it with `open` rather than from a shell: macOS credits permission checks to whoever
+// launched the process, so a shell-started run reports the shell's grants, not Navigator's.
+// Probes that would raise a macOS dialog are skipped unless the window already asked.
+if let flag = CommandLine.arguments.firstIndex(of: "--setup-report"), flag + 1 < CommandLine.arguments.count {
+    let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.global(qos: .userInitiated).async {
+        VertexStatus.warm()
+        let asked = PermissionProbe.asked
+        let items = SetupItem.all()
+        var states: [String: PermissionState] = [:]
+        for i in items {
+            states[i.id] = (i.probeMayPrompt && !asked.contains(i.id)) ? .notAsked : i.probe(false)
+        }
+        let fda = states["fda"] ?? .unknown
+        var lines = items.map { i -> String in
+            let st = SetupAudit.effectiveState(id: i.id, probed: states[i.id] ?? .unknown, fullDisk: fda)
+            return "\(i.id)\t\(st.rawValue)\t\(i.optional ? "optional" : "required")\t\(i.title)"
+        }
+        let bad = SetupAudit.attentionCount(items.map { ($0.id, states[$0.id] ?? .unknown, $0.optional) }, fullDisk: fda)
+        lines.append("attention\t\(bad)")
+        try? (lines.joined(separator: "\n") + "\n").write(to: out, atomically: true, encoding: .utf8)
+        exit(0)
+    }
+    app.run()
+}
+
 if CommandLine.arguments.contains("--art-audit") {
     app.setActivationPolicy(.accessory)
     DispatchQueue.main.async {
@@ -21868,6 +22164,32 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
 // The selectors below were read off the live DOM, not guessed. `textContent` is used
 // rather than `innerText` on purpose: the "Theme & look" paragraph lives inside a
 // collapsed <details>, and innerText returns nothing for anything not rendered.
+
+/// Ask for the team theme hub's address. True when a valid one was saved. Shared by GDD to
+/// Assets and the Setup window so the two cannot word or validate it differently.
+@MainActor @discardableResult func promptThemeHubAddress() -> Bool {
+    let a = NSAlert()
+    a.messageText = "Team theme hub address"
+    a.informativeText = """
+        Navigator reads the game themes from High 5 Games' own team hub. Paste its \
+        address once. The quickest way is a teammate's setup link (Navigator ▸ AI ▸ Copy Team \
+        Setup Link…), which fills this in for you. It is not a password, but it is not \
+        published either, so it is stored here rather than shipped in the app.
+        """
+    let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
+    f.placeholderString = "https://…"
+    f.stringValue = GoogleWebSession.themeHubURL ?? ""
+    a.accessoryView = f
+    a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
+    a.window.initialFirstResponder = f
+    guard a.runModal() == .alertFirstButtonReturn else { return false }
+    var v = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    while v.hasSuffix("/") { v = String(v.dropLast()) }
+    guard v.lowercased().hasPrefix("https://"), URL(string: v) != nil else { return false }
+    GoogleWebSession.themeHubURL = v
+    return true
+}
+
 enum ThemeHubClient {
 
     /// Reads the CARDS only — every text field, and whether the card has artwork.
@@ -22053,6 +22375,35 @@ enum ThemeHubClient {
         """
     }
 
+    /// The last time the hub actually answered with themes, and from which address. What
+    /// the Setup row goes green on: a saved address proves nothing about the sign-in.
+    static var lastLoad: (url: String, count: Int, at: Date)? {
+        get {
+            let p = (Prefs.d.string(forKey: "themeHubLastLoad") ?? "").components(separatedBy: "\t")
+            guard p.count == 3, let n = Int(p[1]), let t = Double(p[2]) else { return nil }
+            return (p[0], n, Date(timeIntervalSince1970: t))
+        }
+        set {
+            Prefs.d.set(newValue.map { "\($0.url)\t\($0.count)\t\($0.at.timeIntervalSince1970)" } ?? "",
+                        forKey: "themeHubLastLoad")
+        }
+    }
+
+    /// Setup's "Check" button: load the hub for real, signing in first if Google asks.
+    @MainActor static func check(_ done: @escaping (String) -> Void) {
+        themes { list, err in
+            if let list { done("Connected — \(list.count) themes."); return }
+            if err == GoogleWebSession.signInNeeded, let base = GoogleWebSession.themeHubURL,
+               let u = URL(string: base) {
+                GoogleWebSession.shared.presentSignIn(startAt: u) {
+                    themes { l, e in done(l.map { "Connected — \($0.count) themes." } ?? "Couldn’t load themes: \(e ?? "unknown error")") }
+                }
+                return
+            }
+            done("Couldn’t load themes: \(err ?? "unknown error")")
+        }
+    }
+
     /// Every theme on the hub. Errors are strings the caller shows verbatim.
     @MainActor
     static func themes(completion: @escaping ([GameTheme]?, String?) -> Void) {
@@ -22091,6 +22442,7 @@ enum ThemeHubClient {
                 return t
             }
             navLog("hub: \(themes.count) themes \(settleSummary(s))")
+            if !themes.isEmpty { lastLoad = (base, themes.count, Date()) }
             completion(themes.isEmpty ? nil : themes,
                        themes.isEmpty ? "The theme hub returned no themes." : nil)
             // The page is loaded and settled, and every card's artwork is already in it.
@@ -24352,25 +24704,7 @@ struct GDDToAssetsSheet: View {
     }
 
     private func askForHubURL() {
-        let a = NSAlert()
-        a.messageText = "Team theme hub address"
-        a.informativeText = """
-            Navigator reads the game themes from High 5 Games' own team hub. Paste its \
-            address once — ask Michael if you don't have it. It is not a password, but it \
-            is not published either, so it is stored here rather than shipped in the app.
-            """
-        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 24))
-        f.placeholderString = "https://…"
-        f.stringValue = GoogleWebSession.themeHubURL ?? ""
-        a.accessoryView = f
-        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel")
-        a.window.initialFirstResponder = f
-        guard a.runModal() == .alertFirstButtonReturn else { return }
-        var v = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        while v.hasSuffix("/") { v = String(v.dropLast()) }
-        guard v.lowercased().hasPrefix("https://"), URL(string: v) != nil else { return }
-        GoogleWebSession.themeHubURL = v
-        loadThemes()
+        if promptThemeHubAddress() { loadThemes() }
     }
 
     /// Forget the remembered style for this theme and read the artwork again.
