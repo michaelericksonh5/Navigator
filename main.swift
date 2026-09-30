@@ -25206,7 +25206,9 @@ struct GDDToAssetsSheet: View {
                             .pickerStyle(.segmented).frame(width: 340)
                             .disabled(run.busy || run.running)
                             if fromDocument { gddStep } else { manualStep }
-                            if run.jobs.contains(where: { $0.role == .lowPay }) { lowPayRow }
+                            // Shown before a document is picked too: it is the artist's choice,
+                            // not the document's, and loading a document keeps it.
+                            lowPayRow
                         }
                     }
                     step(2, "Theme and art direction") { themeStep }
@@ -25868,7 +25870,8 @@ struct GDDToAssetsSheet: View {
     // MARK: Step 4 — the plan
 
     /// What the low pays are is the artist's call: design documents only say "LPs". Shown in step
-    /// 1, under the symbol count it is about — at the top of the plan it was below the fold.
+    /// 1 from the start — at the top of the plan it was below the fold, and hidden until a
+    /// document was picked.
     @ViewBuilder private var lowPayRow: some View {
         HStack(spacing: 8) {
             Text("Low pays")
