@@ -8124,8 +8124,8 @@ public enum SlotArtDirection {
     /// common way a symbol set fails, so this is stated to the model every time.
     public static let setRules = """
     SET RULES:
-    - Every symbol must be told apart INSTANTLY from every other one — by subject first,
-      then by internal shape, colour and contrast. No two symbols may read as the same
+    - Every symbol must be told apart INSTANTLY from every other one — by subject and
+      outline first, then by colour and contrast. No two symbols may read as the same
       thing at a glance.
     - RESOLVE THAT SIDEWAYS, NOT UPWARD. When the obvious subject for a symbol is already
       taken by another one, reach for a DIFFERENT thing from the same world — another
@@ -8136,29 +8136,33 @@ public enum SlotArtDirection {
     - EVERY subject comes from THIS game's theme, and every one is rendered in the SAME
       art style. A symbol that would fit equally well in a different game is the wrong
       symbol, however well drawn.
-    - A shared frame, bezel or backing plate across a tier is allowed and is common in
-      shipping games; when one is used, the distinctness has to come from what sits
-      inside it.
+    - A frame, bezel or backing plate IS part of a symbol's outline — on a reel the outline
+      is what the eye reads first. A tier may share one frame treatment, but different
+      tiers and every special symbol need DIFFERENT outlines, and some symbols can stand
+      frameless on their own silhouette. A set where everything sits in the same square
+      plaque has one outline, however different the paintings inside it are.
     - ONE light direction, ONE rendering treatment and ONE level of detail across every
       symbol in the game. Twelve individually good symbols that do not look like one game
       is the most common way a set fails.
     - Symbols must look optically the SAME SIZE beside each other — matched visual weight,
       not matched bounding boxes.
     - Value tiers must be obvious at a glance, top to bottom, without reading anything.
-    - Higher-paying symbols run WARMER, HOTTER and RICHER than lower-paying ones: gold,
-      amber, crimson and deep jewel tones at the top; cooler, plainer, more muted colour at
-      the bottom. This is the house preference, not a law of the genre — shipping games do
-      break it (Gems Bonanza pays cyan above orange) — so where the theme genuinely forbids
-      it, an ice or deep-space game may keep a cool high pay and carry value through
-      material richness, contrast and ornament instead.
+    - Higher-paying symbols run RICHER than lower-paying ones — more precious material,
+      more ornament, more light — and the house preference is warmer, hotter colour at the
+      top. But every high pay keeps its OWN dominant hue: the ladder is read from richness
+      and ornament, never from four shades of gold. Shipping games break the warm-at-the-top
+      preference (Gems Bonanza pays cyan above orange), and a cool theme may keep a cool
+      high pay.
     - The gap between HP1 and LP1 should be obvious side by side: HP1 is the single most
       desirable object in the game, LP1 is plain by comparison.
-    - HP are the rulers; MP are allies (creatures/objects, never human); LP are the plain
-      foundation.
+    - HP are the most prized subjects of this world — characters or objects, whichever the
+      theme is made of; MP are its supporting cast (creatures or objects, never human); LP
+      are the plain foundation.
     - All LP symbols are the SAME family — all card ranks, or all gems, or all icons.
       Never mixed.
-    - Wild reads as transformation/energy. Scatter reads as a gateway you travel THROUGH.
-      Bonus reads as a container you OPEN. Never swap these.
+    - The wild, the scatter and the bonus each read as SPECIAL at a glance — their own
+      outline, their own colour, the strongest contrast in the set — and they look unlike
+      each other. Never swap their jobs.
     - Do not separate two symbols by colour alone.
     """
 
@@ -8357,6 +8361,28 @@ enum SlotBackingRules {
         ("chroma magenta", RGB8(255, 0, 255)),
     ]
 
+    /// The colour families a backing claims. A symbol painted in one of them is cut out along
+    /// with the backing, so the design is not allowed to use them as a dominant colour.
+    static func reserved(_ backingName: String) -> Set<String> {
+        switch backingName {
+        case "chroma green": return ["green", "teal"]
+        case "chroma blue": return ["blue", "teal"]
+        default: return ["pink", "purple"]
+        }
+    }
+
+    /// The backing whose reserved colours the theme's own art uses least — chosen BEFORE
+    /// the design, so the design can keep those colours off the symbols. Chosen after it, a
+    /// set spread across the whole colour wheel leaves no free colour for the key: a real
+    /// run put a purple money sack on magenta. Ties go to magenta, the rarest in game art.
+    static func choose(themeArtShares shares: [String: Double]) -> (name: String, rgb: RGB8) {
+        guard !shares.isEmpty else { return candidates[2] }
+        let order = [candidates[2], candidates[0], candidates[1]]
+        return order.min { a, b in
+            reserved(a.name).reduce(0) { $0 + (shares[$1] ?? 0) } < reserved(b.name).reduce(0) { $0 + (shares[$1] ?? 0) }
+        } ?? candidates[2]
+    }
+
     /// The candidate furthest from everything in the palette.
     ///
     /// Scored by the palette colour it is CLOSEST to (max-min), not by an average:
@@ -8406,6 +8432,15 @@ enum GeneratedSizeRules {
 
     /// "2048x2048" for the plan table.
     static func describe(width: Int, height: Int) -> String { "\(width)x\(height)" }
+
+    /// The pixel canvas for an aspect ratio ("3:4") at a size name ("2K").
+    static func canvas(aspect: String, size: String) -> (w: Int, h: Int) {
+        let long = targetLongEdge(size)
+        let p = aspect.split(separator: ":").compactMap { Double($0) }
+        guard p.count == 2, p[0] > 0, p[1] > 0 else { return (long, long) }
+        return p[0] >= p[1] ? (long, Int((Double(long) * p[1] / p[0]).rounded()))
+                            : (Int((Double(long) * p[0] / p[1]).rounded()), long)
+    }
 }
 
 /// One image to generate.
@@ -8426,6 +8461,15 @@ public struct AssetJob: Equatable, Sendable {
     /// apart, which is the old pipeline's failure; separating them afterwards is what
     /// makes the frame reusable.
     public var hasFrame: Bool = false
+    /// Its dominant colour family, one of SetDesignRules.hues. Chosen by the designer so the
+    /// set spreads across the palette instead of landing in one gold-brown band.
+    public var hue: String = ""
+    /// Its OUTER shape class, frame included, one of SetDesignRules.shapes. The frame IS the
+    /// silhouette on a reel: a set of square plaques has one outline however different the
+    /// paintings inside them are.
+    public var shape: String = ""
+    /// For a family member: the one thing that changes from its family's first member.
+    public var variation: String = ""
     public let aspect: String        // "1:1" symbols; backgrounds follow BackgroundFormatRules
     public let size: String
     public var filename: String { "\(id).png" }
@@ -8847,11 +8891,14 @@ enum GDDScenes {
 
     /// Phrases that name a mode, and the scene each belongs to. Longest first, so
     /// "free spins bonus" is one scene rather than matching "bonus" separately.
+    /// The studio calls that mode BONUS GAMES — never "free games", which it does not say
+    /// for legal reasons — so a document's "free spins" is read, and written as Bonus Games.
     static let modes: [(phrase: String, id: String, title: String)] = [
-        ("free spins bonus", "bg_freegames", "Free spins background"),
-        ("free spins game", "bg_freegames", "Free spins background"),
-        ("free games", "bg_freegames", "Free games background"),
-        ("free spins", "bg_freegames", "Free spins background"),
+        ("free spins bonus", "bg_bonusgames", "Bonus Games background"),
+        ("free spins game", "bg_bonusgames", "Bonus Games background"),
+        ("free games", "bg_bonusgames", "Bonus Games background"),
+        ("free spins", "bg_bonusgames", "Bonus Games background"),
+        ("bonus games", "bg_bonusgames", "Bonus Games background"),
         ("hold and spin", "bg_holdspin", "Hold and spin background"),
         ("hold & spin", "bg_holdspin", "Hold and spin background"),
         ("loot link", "bg_lootlink", "Loot Link background"),
@@ -9092,8 +9139,13 @@ public enum GDDAssetPrompts {
     You are a senior art director for social casino slot machine games at High 5 Games. \
     You design symbol sets that are sleek, rich and fun to look at — never childish, never \
     cluttered, never generic. A player takes in a whole reel at a glance, so what matters \
-    most is that every symbol is instantly told apart from every other one, and that the \
-    value order is obvious without reading anything.
+    most is that every symbol is instantly told apart from every other one — by its outline \
+    and its colour as well as its subject — and that the value order is obvious without \
+    reading anything.
+
+    Your plan is handed to an image model one symbol at a time, so every subject you write \
+    must be concrete and drawable: a specific thing, its material and colour, its pose or \
+    angle — never a mood or an idea.
 
     You will be given a game's symbol slots and a theme. Assign a specific art subject to \
     every slot. Answer with JSON only — no commentary, no markdown fences.
@@ -9106,18 +9158,38 @@ public enum GDDAssetPrompts {
     /// and `silhouette` are deliberately unbounded: the published work on forced
     /// structured output finds the cost falls on creative content when the content itself
     /// is constrained, and enumerating acceptable subjects would defeat the entire task.
-    public static func planSchema(ids: [String]) -> [String: Any] {
+    /// `lean`: no per-item length limits. Vertex rejects a schema whose constraints multiply
+    /// past what it can serve — a length limit on every field of every item did, at 26 and 45
+    /// slots, with a bare "Request contains an invalid argument" — so a rejected design is
+    /// retried with this.
+    public static func planSchema(ids: [String], reserved: Set<String> = [], lean: Bool = false) -> [String: Any] {
+        let hues = SetDesignRules.hues.filter { !reserved.contains($0) }
         // Mirrors the shape apply(planJSON:to:) reads — "assets", with a palette
         // alongside it. A schema that describes a DIFFERENT shape to the one the parser
         // expects produces perfectly valid JSON that fills nothing, which is exactly what
         // happened the first time: 0 of 20 slots, no error anywhere.
-        [
+        // Every string is bounded. Two real designs looped — "…clearly displayed at all times
+        // universally without fail smoothly cleanly…" — one to 499 KB ($0.49, unreadable) and one
+        // to a 44,000-character family description that parsed and would have been pasted
+        // into every value-symbol prompt. Both started describing the calm area for runtime text.
+        func text(_ max: Int, _ description: String? = nil, perItem: Bool = false) -> [String: Any] {
+            var f: [String: Any] = ["type": "STRING"]
+            if !(perItem && lean) { f["maxLength"] = max }
+            if let description { f["description"] = description }
+            return f
+        }
+        func plain(_ description: String? = nil) -> [String: Any] {
+            var f: [String: Any] = ["type": "STRING"]
+            if let description { f["description"] = description }
+            return f
+        }
+        return [
             "type": "OBJECT",
             "properties": [
                 "palette": [
                     "type": "ARRAY",
                     "description": "Five hex colours, #rrggbb, for the whole set.",
-                    "items": ["type": "STRING"],
+                    "items": plain(),
                 ],
                 "assets": [
                     "type": "ARRAY",
@@ -9126,24 +9198,46 @@ public enum GDDAssetPrompts {
                     "items": [
                         "type": "OBJECT",
                         "properties": [
-                            "id": ["type": "STRING"],
-                            "subject": ["type": "STRING",
-                                        "description": "One vivid sentence naming the "
-                                                     + "subject and its framing."],
-                            "silhouette": ["type": "STRING",
-                                           "description": "Its shape in one or two words."],
+                            "id": plain(),
+                            "subject": text(SetDesignRules.maxSubject,
+                                            "One vivid sentence naming the subject and its framing, under 40 words.", perItem: true),
+                            "silhouette": plain("Its shape in one or two words."),
+                            "shape": ["type": "STRING", "enum": SetDesignRules.shapes,
+                                      "description": "The OUTER outline class, frame included."],
+                            "hue": ["type": "STRING", "enum": hues,
+                                    "description": "The dominant colour family."],
                             "frame": ["type": "BOOLEAN"],
+                            "variation": text(SetDesignRules.maxVariation,
+                                              "For a family member: what differs from the family's first member, under 20 words. Else empty.", perItem: true),
                         ],
-                        "required": ["id", "subject", "silhouette", "frame"],
+                        "required": ["id", "subject", "silhouette", "shape", "hue", "frame"],
+                    ],
+                ],
+                "hero": plain("The game's hero, or empty for a pure-symbol game."),
+                "anchor": plain("The slot id drawn first."),
+                "look": text(SetDesignRules.maxLook, "One paragraph of shared visual language for every image, under 90 words."),
+                "families": [
+                    "type": "OBJECT",
+                    "properties": [
+                        "jackpot": text(SetDesignRules.maxFamily, "The shared construction, under 25 words."),
+                        "wysiwyg": text(SetDesignRules.maxFamily, "The shared construction, under 25 words."),
+                        "lowPay": text(SetDesignRules.maxFamily, "The shared construction, under 25 words."),
                     ],
                 ],
             ],
-            "required": ["assets"],
+            "required": ["assets", "anchor", "look"],
         ]
     }
 
     public static func planning(theme: GameTheme, gameName: String, jobs: [AssetJob],
-                                gddText: String = "") -> String {
+                                gddText: String = "", backing: String = "",
+                                reserved: Set<String> = [],
+                                lowPays: LowPayKind = .royals, customLowPays: String = "") -> String {
+        let hueList = SetDesignRules.hues.filter { !reserved.contains($0) }.joined(separator: ", ")
+        let backingRule = reserved.isEmpty ? "" :
+            "\n    Every symbol is drawn on a flat \(backing) backing that is cut away afterwards, so "
+            + reserved.sorted().joined(separator: " and ")
+            + " are not available: a symbol in them is cut out with the backing. Keep them out of every symbol's main areas as well."
         let features = GDDFeatureContext.excerpt(gddText)
         let slotLines = jobs.map { j -> String in
             let t = j.tier.map { " (tier \($0))" } ?? ""
@@ -9160,8 +9254,15 @@ public enum GDDAssetPrompts {
         """)
 
         THEME: \(theme.name)\(theme.category.isEmpty ? "" : "  [\(theme.category)]")
-        ART DIRECTION (follow it closely):
+        THE THEME DECIDES WHAT THINGS ARE. If the document above was written for this same
+        theme, its descriptions of the symbols are your brief. If it was written for a
+        different theme — this game is being reskinned — take only what each symbol DOES from
+        it, and none of its names, characters, places or imagery: those belong to another skin.
+
+        ART DIRECTION (follow it closely for HOW things are rendered):
         \(styleBlock(theme))
+        Where that direction describes a palette, it is the game's overall colour mood, not a
+        limit every symbol shares: the colour rules below still give each symbol its own hue.
         \(theme.comparables.isEmpty ? "" : "Comparable games: \(theme.comparables)\n")\
         \(theme.why.isEmpty ? "" : "Why this theme works: \(theme.why)\n")
 
@@ -9169,7 +9270,7 @@ public enum GDDAssetPrompts {
 
         WHAT EACH ROLE HAS TO BE — these decide the SUBJECT, so they belong to you, not
         just to whoever draws it:
-        \(roleBrief(for: jobs))
+        \(roleBrief(for: jobs, lowPays: lowPays, custom: customLowPays))
 
         SLOTS TO FILL (\(jobs.count)):
         \(slotLines)
@@ -9179,29 +9280,122 @@ public enum GDDAssetPrompts {
           choices from it. No generic casino filler, and no obvious first answer taken because
           it was the first answer — a wild is not automatically a vortex, a scatter is not
           automatically a glowing portal, a bonus is not automatically a treasure chest.
-        - Every subject must have a DIFFERENT silhouette from every other subject in this set.
-          Name each silhouette in one or two words and make sure no two match.
-        - Respect the value hierarchy and make it VISIBLE. The four high pays must be rankable
-          at a glance by what they are made of and how ornate they are; HP1 is the single most
-          desirable object in this world. Higher pays run warmer, hotter and richer than lower
-          pays unless the theme genuinely forbids it. All low pays must be ONE family, and they
-          are the plainest things in the set.
+        - HERO: decide whether this game has a hero — a named character, mascot or signature
+          creature the game is built around. If it does, name it in "hero"; the wild or HP1 is
+          usually that hero's symbol. Many games have none — a pure-symbol game of objects,
+          gems or fruit — and then "hero" is "". Never invent a mascot the theme does not have.
+        - ANCHOR: name in "anchor" the ONE slot to draw first, because it best sets the look for
+          everything else: the hero's symbol if there is one, otherwise the most representative
+          high pay (usually HP1). Its finished image is shown to every later symbol.
+        - LOOK: write "look" — ONE short paragraph, under 90 words, that every image in this set
+          is given word for word: the rendering technique, the light (direction and colour), the surface
+          finish and the edge treatment. Specific and visual: nouns and materials, not
+          adjectives on their own. Because EVERY symbol receives it, it must not name any
+          symbol's subject, give any symbol a colour, describe a frame, or mention a
+          background or backdrop colour — those belong to each symbol's own fields. Rim light
+          sits on the form's own lit edges: never describe a glow, halo, outline or band
+          AROUND the silhouette, because every symbol is cut out along that edge.
+        - SUBJECT: one sentence, under 40 words, that an image model can draw — the specific
+          thing, its material and its dominant colour, and its pose or angle. It describes the symbol alone: no scene or
+          setting behind it, no backdrop colour, and no words, numbers or labels painted on it
+          (the game prints those at runtime; a card royal is its letter). It must agree with the
+          symbol's "hue" and "shape": a symbol labelled red whose subject reads "a gold coin"
+          will be drawn gold — the label changes nothing in the picture.
+        - Every symbol must be told apart INSTANTLY by its OUTLINE and its COLOUR, not only by
+          what is painted inside it — and never by colour alone:
+          * "shape" is the OUTER outline class, frame included: \(SetDesignRules.shapes.joined(separator: ", ")).
+            A card royal's outline is "letter". Do not put every symbol in the same square
+            plaque. A tier may share a frame, but different tiers need different outlines, and
+            some symbols can stand frameless on their own silhouette. Coin-type specials — value,
+            collector, bonus, multiplier and jackpot coins — are round coins, orbs or medallions
+            in this studio's shipped games, and may share that outline. Apart from them, no
+            outline for more than half the set.
+          * "hue" is the dominant colour family: \(hueList).\(backingRule)
+            Each high pay gets its OWN hue; each low pay gets its own hue; no single hue for more than about a third of the set, and gold, yellow,
+            orange and brown together for no more than about half of it. Gold is one colour,
+            not the default for everything.
+        - High pays are different KINDS of thing — never variations of one creature or object
+          (three pigs, four crowns). If the theme is built on one kind of object, vary WHICH
+          objects of that world appear, and give the one the theme is named for to the top slot.
+        - FAMILIES, by convention: jackpot tiers and value (WYSIWYG) symbols.
+          A family's members share ONE construction and outline, and differ in colour and
+          material and in the tier word or value the game prints on them. Jackpot tiers each take
+          their own colour; value symbols may repeat colours, since the value the game prints on
+          each one is what tells them apart. Describe each
+          family's shared construction in "families", in under 25 words — the object, not the
+          text the game prints on it. The FIRST member of each family is drawn
+          in full from its subject; every later member is drawn as an EDIT of that first image,
+          so its "variation" must say exactly what changes — the material and colour ("ruby
+          enamel instead of gold").
+        - The LOW PAYS are one matching row but NOT one design edited: each is its own thing (see
+          LOW PAYS above). Put what they share in "families" as "lowPay".
+          Nothing outside a family may share its outline AND colour: a coin-type
+          special (collector, activator, adder, multiplier, bonus) may use the value symbols'
+          round coin only in a colour none of them use, and the wild, scatter and bonus never
+          share both an outline and a colour with anything. Some likeness is fine; confusion is not.
+        - Respect the value hierarchy and make it VISIBLE: HP1 is the single most desirable
+          object in this world; each rank below is plainer — less ornament, less precious
+          material, less light — while keeping its own hue. The low pays are one matching row and
+          the plainest things in the set.
         - Backgrounds are scenes, not objects, with an empty middle where the reels will sit.
+        - The studio calls the free-spins mode BONUS GAMES. Never write "free games" or "free
+          spins", even where the document does.
 
         Answer with this JSON and nothing else:
         {
           "palette": ["#rrggbb", "#rrggbb", "#rrggbb", "#rrggbb", "#rrggbb"],
+          "hero": "<the hero, or empty>",
+          "anchor": "<slot id drawn first>",
+          "look": "<one paragraph every image is given>",
+          "families": {"jackpot": "<shared construction>", "wysiwyg": "<…>", "lowPay": "<…>"},
           "assets": [
             {"id": "<slot id>", "subject": "<one vivid sentence naming the subject and its framing>",
-             "silhouette": "<one or two words>", "frame": true}
+             "silhouette": "<one or two words>", "shape": "<outline class>", "hue": "<colour family>",
+             "frame": true, "variation": "<for a family member: what differs from the first member>"}
           ]
         }
         "palette" is the 5 dominant colours this game's art will actually use.
         "frame" says whether that symbol is drawn inside a frame, plaque or backing shape.
         Card royals carry NO frame — the letterform is the symbol — and backgrounds never do.
-        Almost everything else does, and the frame must be the same treatment across a tier.
+        Name a royal's rank in its silhouette, e.g. "letter K" or "rank 10".
         Include every slot id exactly once.
         """
+    }
+
+    /// What the low pays are to be, for the planner. They are drawn TOGETHER, on one sheet, so
+    /// they read as one row; each is still its own thing — a gem recoloured three times is one
+    /// symbol four times.
+    static func lowPayBrief(_ lps: [AssetJob], kind: LowPayKind, custom: String) -> String {
+        let ids = lps.map(\.id)
+        let what: String
+        switch kind {
+        case .royals:
+            let ranks = zip(ids, royalOrder).map { "\($0) “\($1)”" }.joined(separator: ", ")
+            what = "card ranks, in this order: \(ranks). Each subject is “The letter X …” (“The numeral 10 …”) "
+                 + "and names its rank in the silhouette (“letter K”, “rank 10”). All of them are set in ONE "
+                 + "proper, well-drawn typeface — real letterforms with correct proportions, such as a bold "
+                 + "classic serif like a playing-card face or a heavy slab serif — built from this set's "
+                 + "material; name that typeface, its weight and its material in the lowPay family. No frame: "
+                 + "the letterform is the symbol"
+        case .gemstones:
+            what = "gemstones — every one a DIFFERENT gem with its own cut and its own colour (for example a "
+                 + "round ruby, a square emerald, a pear sapphire, a marquise amethyst). The cut is the "
+                 + "outline, so no two share one; never the same stone recoloured"
+        case .themed:
+            what = "simple items from this theme's world — every one a DIFFERENT object with its own outline "
+                 + "and colour, plainer and less precious than the medium pays"
+        case .pebbles:
+            what = "smooth, polished pebbles — every one unique: its own outline (a round stone, a tall egg, a "
+                 + "wide flat disc, a rounded triangle, a squarish slab), its own colour and its own subtle marking or inlay"
+        case .custom:
+            let c = custom.trimmingCharacters(in: .whitespacesAndNewlines)
+            what = "\(c.isEmpty ? "simple items from this theme's world" : "“\(c)”") — every one its own "
+                 + "thing, with its own outline and colour, never another one recoloured"
+        }
+        return "- LOW PAYS (\(ids.count), chosen by the artist) are \(what). They are drawn together, side by "
+             + "side on one sheet, so they must read as one matching row: say what they share — material, "
+             + "finish, size and light — in the lowPay family, and leave their “variation” empty. They are the "
+             + "plainest symbols in the set."
     }
 
     /// A one-line brief per role present in this set.
@@ -9211,7 +9405,7 @@ public enum GDDAssetPrompts {
     /// planner chose four unrelated jackpot objects (crown, chalice, chest, medallion)
     /// while the drawing prompt was separately insisting the four be one family: an
     /// instruction that arrived far too late to be followed.
-    static func roleBrief(for jobs: [AssetJob]) -> String {
+    static func roleBrief(for jobs: [AssetJob], lowPays: LowPayKind = .royals, custom: String = "") -> String {
         var lines: [String] = []
         let roles = Set(jobs.filter { $0.kind == .symbol }.map(\.role))
         if roles.contains(.jackpot) {
@@ -9226,25 +9420,35 @@ public enum GDDAssetPrompts {
                        + "the weakest answer and every game already has one.")
         }
         if roles.contains(.lowPay) {
-            lines.append("- LOW PAYS: choose ONE family for all of them and say which — royals "
-                       + "(A K Q J 10 7 5), gemstones, pebbles/tokens, or simple themed items. "
-                       + "Never a mixture: one pebble plus one royal plus one gem plus one item "
-                       + "is wrong. They are filler symbols and should be the plainest things "
-                       + "in the set.")
+            lines.append(lowPayBrief(jobs.filter { $0.role == .lowPay }, kind: lowPays, custom: custom))
         }
         if roles.contains(.highPay) {
             lines.append("- HIGH PAYS: rankable at a glance, HP1 the most desirable object in "
                        + "the game and each one below it visibly less so.")
         }
         if roles.contains(.scatter) && roles.contains(.bonus) {
-            lines.append("- SCATTER and BONUS must be impossible to confuse: different subject, "
-                       + "different colour, different shape.")
+            lines.append("- SCATTER and BONUS must be impossible to confuse: different subject and "
+                       + "different colour.")
+        }
+        if roles.contains(.bonus) {
+            lines.append("- BONUS (BO): in this studio's games usually CIRCULAR — a coin, badge or "
+                       + "medallion with a bold emblem of the theme at its centre — told apart from "
+                       + "the other coins by its colour, its emblem and the word the game prints on it.")
+        }
+        if roles.contains(.collector) {
+            lines.append("- COLLECTOR (SF): the most VALUABLE-looking special in the set — rich gold, a "
+                       + "heavy ornate ring or setting, a prized object of the theme (a gold bar, a "
+                       + "treasure, the game's emblem) at its centre. It should look like a prize.")
         }
         if roles.contains(.wysiwyg) || roles.contains(.collector) || roles.contains(.multiplier)
             || roles.contains(.activator) || roles.contains(.adder) {
+            // Short on purpose, and the planner is told NOT to describe the area: both loops
+            // seen in real designs began with the model describing "the calm area for the
+            // runtime value" and never stopping. The drawing brief asks for the area itself.
             lines.append("- WYSIWYG, COLLECTOR, ACTIVATOR, ADDER and MULTIPLIER symbols carry a "
-                       + "number the game prints at runtime, so their subject needs a calm area "
-                       + "for it — not a blank plate drawn into the art.")
+                       + "number the game prints at runtime. The drawing step leaves a calm area "
+                       + "for it — do NOT describe that area, the number or the text in the "
+                       + "subject; describe only the object.")
         }
         if jobs.filter({ $0.role == .wysiwyg }).count > 1 {
             lines.append("- The WYSIWYG symbols are ONE FAMILY at different value tiers, like the "
@@ -9690,13 +9894,33 @@ public enum GDDAssetPrompts {
     /// ids it failed to answer for, so the caller can say exactly what is missing
     /// instead of generating a symbol with an empty subject.
     static func apply(planJSON: [String: Any], to jobs: [AssetJob])
-        -> (jobs: [AssetJob], missing: [String], palette: [RGB8]) {
+        -> (jobs: [AssetJob], missing: [String], palette: [RGB8], design: SetDesign) {
         var bySubject: [String: (String, String)] = [:]
         var frames: [String: Bool] = [:]
+        var extras: [String: (hue: String, shape: String, variation: String)] = [:]
+        func clean(_ v: Any?, allowed: [String]? = nil) -> String {
+            let t = (v as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let allowed else { return t }
+            let l = t.lowercased()
+            return allowed.contains(l) ? l : ""
+        }
+        let cap = SetDesignRules.clamp
         for case let a as [String: Any] in (planJSON["assets"] as? [Any] ?? []) {
-            guard let id = a["id"] as? String else { continue }
-            bySubject[id] = ((a["subject"] as? String ?? ""), (a["silhouette"] as? String ?? ""))
+            guard var id = a["id"] as? String else { continue }
+            // Plans saved before the mode was renamed Bonus Games still name its background.
+            if id == "bg_freegames" { id = "bg_bonusgames" }
+            bySubject[id] = (cap(a["subject"] as? String ?? "", SetDesignRules.maxSubject),
+                             cap(a["silhouette"] as? String ?? "", 40))
             frames[id] = (a["frame"] as? Bool) ?? ((a["frame"] as? NSNumber)?.boolValue ?? false)
+            extras[id] = (clean(a["hue"], allowed: SetDesignRules.hues),
+                          clean(a["shape"], allowed: SetDesignRules.shapes),
+                          cap(clean(a["variation"]), SetDesignRules.maxVariation))
+        }
+        var design = SetDesign(hero: cap(clean(planJSON["hero"]), 80), anchorID: clean(planJSON["anchor"]),
+                               look: cap(clean(planJSON["look"]), SetDesignRules.maxLook))
+        for (k, v) in (planJSON["families"] as? [String: Any] ?? [:]) {
+            let t = cap(clean(v), SetDesignRules.maxFamily)
+            if !t.isEmpty { design.families[k] = t }
         }
         var out: [AssetJob] = [], missing: [String] = []
         for var j in jobs {
@@ -9707,17 +9931,56 @@ public enum GDDAssetPrompts {
                 // leave the old subject sitting there — reported as missing, but still
                 // carrying text, so generation drew it anyway and charged for it.
                 missing.append(j.id)
-                j.subject = ""; j.silhouette = ""
+                j.subject = ""; j.silhouette = ""; j.hue = ""; j.shape = ""; j.variation = ""
                 out.append(j); continue
             }
             j.subject = subj
             j.silhouette = (bySubject[j.id]?.1 ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             j.hasFrame = frames[j.id] ?? false
+            j.hue = extras[j.id]?.hue ?? ""
+            j.shape = extras[j.id]?.shape ?? ""
+            j.variation = extras[j.id]?.variation ?? ""
             out.append(j)
         }
         let palette = (planJSON["palette"] as? [Any] ?? [])
             .compactMap { ($0 as? String).flatMap(SlotBackingRules.hex) }
-        return (out, missing, palette)
+        return (out, missing, palette, design)
+    }
+
+    /// The second design pass: the same designer, sent back with what the checks found.
+    ///
+    /// Only runs when SetDesignRules.problems found something. The fixes are specific —
+    /// "HP1 and HP3 are both gold" — so they are handed over as a list rather than as a
+    /// general instruction to try harder.
+    ///
+    /// `brief` is the original design request, sent again in full: the revision is a fresh
+    /// call, and without the rules a fix for one problem made another — told to stop the wild
+    /// being a pig, it made the wild a jewelled shield, the jackpots' own outline.
+    public static func revision(brief: String, planReply: String, problems: [String]) -> String {
+        """
+        \(brief)
+
+        ---
+
+        You already answered that request with the plan below, and checking it found these
+        problems. Fix every one of them, and change as little else as possible — keep every
+        subject that is not part of a problem, and keep the hero, the anchor and the look
+        unless a problem is about them. Before you answer, check the WHOLE revised plan
+        against every rule above again — outlines, colours, families, kinds of thing — so that
+        fixing one problem does not create another.
+
+        Fix the PICTURE, not the label: when you change a symbol's colour or outline, rewrite
+        its subject sentence so it describes the new colour or outline. Changing "hue" or
+        "shape" alone changes nothing in the image that gets drawn.
+
+        PROBLEMS:
+        \(problems.map { "- " + $0 }.joined(separator: "\n"))
+
+        YOUR PLAN:
+        \(planReply)
+
+        Answer with the complete corrected plan in exactly the same JSON shape, and nothing else.
+        """
     }
 
     /// Silhouettes the planner reused. Empty is the goal; anything here is a real
@@ -9764,5 +10027,1238 @@ public enum GDDAssetPrompts {
             }
         }
         return out.mapValues { Array(Set($0)).sorted() }.filter { $0.value.count > 1 }
+    }
+}
+
+// MARK: - Set design: what is decided once for the whole set
+
+/// The decisions the designer makes ONCE for the whole set, which every image then follows.
+/// What the low pays are — the artist's pick in the window, Royals unless they choose.
+/// GDDs never say (“6-9 // LPs”), so the planner used to guess.
+public enum LowPayKind: String, CaseIterable, Sendable {
+    case royals, gemstones, themed, pebbles, custom
+    public var label: String {
+        switch self {
+        case .royals: return "Royals"
+        case .gemstones: return "Gemstones"
+        case .themed: return "Themed items"
+        case .pebbles: return "Smooth pebbles"
+        case .custom: return "Custom…"
+        }
+    }
+    var plural: String {
+        switch self {
+        case .royals: return "card ranks"
+        case .gemstones: return "gemstones"
+        case .themed: return "themed items"
+        case .pebbles: return "pebbles"
+        case .custom: return "what was asked for"
+        }
+    }
+}
+
+public struct SetDesign: Equatable, Sendable {
+    /// The game's hero — a named character, mascot or signature creature the game is built
+    /// around — or "" for a pure-symbol game. Not every game has one, and inventing a mascot
+    /// a theme does not have is its own failure.
+    public var hero: String
+    /// The slot drawn FIRST. Its finished image is attached to every later request, so it
+    /// sets the rendering, light and finish for the rest of the set.
+    public var anchorID: String
+    /// The shared visual language, one paragraph, given word for word to every image —
+    /// the "style block" slot studios lock before rendering a set.
+    public var look: String
+    /// A family's shared construction, keyed by role rawValue: "jackpot", "wysiwyg", "lowPay".
+    public var families: [String: String]
+
+    public init(hero: String = "", anchorID: String = "", look: String = "",
+                families: [String: String] = [:]) {
+        self.hero = hero; self.anchorID = anchorID; self.look = look; self.families = families
+    }
+}
+
+/// The rules a designed set is checked against before anything is paid for.
+///
+/// Sources: slot-art studio guidance agrees that symbols "similar in shape or color" are
+/// hard to tell apart and that wild and scatter must stand out; GLI-11 §4.4.1 requires that
+/// a symbol cannot be "misinterpreted to be some other symbol"; and cash-value and jackpot
+/// symbols conventionally SHARE one shape (Dragon Link, Wolf Gold, Coin Strike), told apart
+/// by the value or tier word printed on them. So sharing is a defect only across a family's
+/// edge, never inside it.
+public enum SetDesignRules {
+    public static let hues = ["red", "orange", "gold", "yellow", "green", "teal", "blue",
+                              "purple", "pink", "white", "black", "brown"]
+    public static let shapes = ["round", "square", "shield", "tall", "wide", "pointed",
+                                "figure", "freeform", "letter"]
+    // Field limits, in characters. The prompt asks for fewer words; these are the backstop.
+    static let maxSubject = 320, maxVariation = 180, maxLook = 700, maxFamily = 220
+
+    /// A field cut back to its limit at the last whole sentence (or word) — a runaway reply
+    /// must never reach an image prompt at full length.
+    public static func clamp(_ s: String, _ limit: Int) -> String {
+        guard s.count > limit else { return s }
+        let head = String(s.prefix(limit))
+        if let r = head.range(of: ". ", options: .backwards), head.distance(from: head.startIndex, to: r.lowerBound) > limit / 3 {
+            return String(head[..<r.lowerBound]) + "."
+        }
+        return head.split(separator: " ").dropLast().joined(separator: " ")
+    }
+
+    // ponytail: thresholds are judgement calls, not published numbers — tune against real runs.
+    static let maxShareOfOneHue = 0.35
+    static let maxShareOfOneShape = 0.5
+    static let maxShareOfWarm = 0.6
+    static let warm: Set<String> = ["gold", "yellow", "orange", "brown"]
+
+    /// Colours too close to tell apart side by side on a reel, folded together for the
+    /// within-tier check. Gold and yellow are one colour at 64 pixels.
+    static func sideBySide(_ hue: String) -> String { hue == "yellow" ? "gold" : hue }
+
+    /// Colours close enough to confuse two symbols that share an outline — an orange token
+    /// beside a gold one reads as the same thing on a reel.
+    static let nearPairs: Set<Set<String>> = [["gold", "yellow"], ["gold", "orange"], ["orange", "brown"],
+                                              ["red", "pink"], ["pink", "purple"], ["green", "teal"],
+                                              ["blue", "teal"], ["gold", "brown"]]
+    public static func near(_ a: String, _ b: String) -> Bool {
+        a == b || nearPairs.contains([a, b])
+    }
+
+    /// Words a subject uses for each colour family. The subject sentence is what is actually
+    /// drawn — "hue" is only a label on the plan — so a symbol whose subject never names
+    /// its colour is a plan whose label and picture can disagree.
+    static let colourWords: [String: [String]] = [
+        "red": ["red", "ruby", "crimson", "scarlet", "cherry", "garnet", "vermilion", "cardinal"],
+        "orange": ["orange", "amber", "tangerine", "copper", "coral", "apricot", "flame"],
+        "gold": ["gold", "golden", "gilded", "gilt", "brass"],
+        "yellow": ["yellow", "lemon", "canary", "saffron", "sunflower", "citrine"],
+        "green": ["green", "emerald", "jade", "lime", "olive", "mint", "malachite", "verdant"],
+        "teal": ["teal", "turquoise", "cyan", "aqua", "aquamarine", "seafoam"],
+        "blue": ["blue", "sapphire", "azure", "cobalt", "navy", "cerulean", "ultramarine", "lapis"],
+        "purple": ["purple", "violet", "amethyst", "lavender", "plum", "indigo", "mauve", "lilac"],
+        "pink": ["pink", "rose", "fuchsia", "magenta", "blush", "bubblegum"],
+        "white": ["white", "ivory", "pearl", "silver", "platinum", "porcelain", "snow", "alabaster", "chrome"],
+        "black": ["black", "obsidian", "onyx", "ebony", "jet", "charcoal"],
+        "brown": ["brown", "bronze", "wood", "wooden", "oak", "mahogany", "walnut", "chocolate",
+                  "leather", "rust", "tan", "copper"],
+    ]
+
+    static func subjectNames(_ hue: String, in subject: String) -> Bool {
+        let words = Set(subject.lowercased().components(separatedBy: CharacterSet.letters.inverted))
+        return (colourWords[hue] ?? []).contains { words.contains($0) }
+    }
+
+    /// The symbols that must stand out from everything: own shape, always.
+    static let standouts: Set<SlotSymbolRole> = [.wild, .scatter, .bonus]
+    /// Symbols that are round coins, orbs or medallions in the studio's shipped games — value,
+    /// collector, bonus, multiplier, jackpot coins (Bankrush, Honda, Nissan, Chevy, Tiki Titans,
+    /// Blazing Stampede, Billionaire's, 88 Drums). They share that outline by convention and are
+    /// told apart by colour, ring and the word or amount printed on them.
+    static let coinRoles: Set<SlotSymbolRole> = [.wysiwyg, .jackpot, .collector, .activator, .adder,
+                                                 .multiplier, .bonus]
+    /// Feature symbols of hold-and-win mechanics. These may share the value coins' shape —
+    /// feature coins are colour-coded in shipping games — but then never their colour.
+    static let featureCoins: Set<SlotSymbolRole> = [.collector, .activator, .adder,
+                                                     .multiplier, .replacement]
+    static let familyRoles: [SlotSymbolRole] = [.jackpot, .wysiwyg, .lowPay]
+
+    /// The slot to draw first: the designer's choice when it names a real symbol, else the
+    /// top high pay, else the wild, else the first symbol. A pure-symbol game still has one —
+    /// something has to set the look.
+    public static func anchor(_ jobs: [AssetJob], _ design: SetDesign) -> AssetJob? {
+        let syms = jobs.filter { $0.kind == .symbol && !$0.subject.isEmpty }
+        if let a = syms.first(where: { $0.id == design.anchorID }) { return a }
+        return syms.first { $0.role == .highPay } ?? syms.first { $0.role == .wild } ?? syms.first
+    }
+
+    /// Each family's first member — the one the others are drawn as edits of — for families
+    /// with two or more members. The anchor leads its family when it is in one.
+    public static func founders(_ jobs: [AssetJob], anchorID: String?) -> [SlotSymbolRole: String] {
+        var out: [SlotSymbolRole: String] = [:]
+        for r in familyRoles {
+            let members = jobs.filter { $0.kind == .symbol && $0.role == r && !$0.subject.isEmpty }
+            guard members.count >= 2 else { continue }
+            out[r] = members.first { $0.id == anchorID }?.id ?? members[0].id
+        }
+        return out
+    }
+
+    /// A representative colour for each hue name. Used to keep the backing colour away from
+    /// what the symbols will actually be painted in — the palette alone is five colours and
+    /// a spread set uses more.
+    static func swatch(_ hue: String) -> RGB8? {
+        switch hue {
+        case "red": return RGB8(215, 35, 35)
+        case "orange": return RGB8(240, 130, 25)
+        case "gold": return RGB8(225, 175, 45)
+        case "yellow": return RGB8(248, 222, 50)
+        case "green": return RGB8(45, 165, 65)
+        case "teal": return RGB8(25, 165, 165)
+        case "blue": return RGB8(35, 90, 215)
+        case "purple": return RGB8(130, 55, 195)
+        case "pink": return RGB8(238, 95, 170)
+        case "white": return RGB8(238, 238, 238)
+        case "black": return RGB8(22, 22, 26)
+        case "brown": return RGB8(120, 72, 32)
+        default: return nil
+        }
+    }
+
+    /// The first framed member of each paying tier that shares a frame. The others are
+    /// shown it, so the tier's frame is one construction — only the anchor's tier had a
+    /// picture to agree with before, and a tier drawn without one came back with a
+    /// different frame on every symbol.
+    public static func tierFounders(_ jobs: [AssetJob], anchorID: String?) -> [SlotSymbolRole: String] {
+        var out: [SlotSymbolRole: String] = [:]
+        for r in [SlotSymbolRole.highPay, .mediumPay] {
+            let framed = jobs.filter { $0.kind == .symbol && $0.role == r && $0.hasFrame && !$0.subject.isEmpty }
+            guard framed.count >= 2 else { continue }
+            out[r] = framed.first { $0.id == anchorID }?.id ?? framed[0].id
+        }
+        return out
+    }
+
+    static func familyNoun(_ r: SlotSymbolRole) -> String {
+        switch r {
+        case .jackpot: return "the jackpots"
+        case .wysiwyg: return "the value symbols"
+        case .lowPay:  return "the low pays"
+        default:       return "the \(r.label.lowercased())s"
+        }
+    }
+
+    static func list(_ items: [String]) -> String {
+        items.count <= 2 ? items.joined(separator: " and ")
+            : items.dropLast().joined(separator: ", ") + " and " + items.last!
+    }
+
+    static func mostCommon(_ xs: [String]) -> (String, Int)? {
+        Dictionary(grouping: xs, by: { $0 }).map { ($0.key, $0.value.count) }
+            .max { $0.1 == $1.1 ? $0.0 > $1.0 : $0.1 < $1.1 }
+    }
+
+    /// What is wrong with the set, as sentences the designer can be sent back with and a
+    /// person can act on. Empty is the goal.
+    /// `lowPays`: what the artist asked the low pays to be, when known.
+    /// A coin among coins is told from them by colour — in shipped games a gold collector sits
+    /// among yellow coins, a blue logo orb among blue value orbs, set apart by ring and label —
+    /// so only the SAME colour makes it a twin. Anything else needs a clearly different colour.
+    static func coinTwin(_ s: AssetJob, _ other: AssetJob) -> Bool {
+        guard !s.hue.isEmpty, !other.hue.isEmpty else { return false }
+        return coinRoles.contains(s.role) ? s.hue == other.hue : near(s.hue, other.hue)
+    }
+
+    public static func problems(_ jobs: [AssetJob], _ design: SetDesign,
+                                reserved: Set<String> = [], lowPays: LowPayKind? = nil) -> [String] {
+        let syms = jobs.filter { $0.kind == .symbol && !$0.subject.isEmpty }
+        guard syms.count >= 2 else { return [] }
+        var out: [String] = []
+
+        // 0. The backing's own colours stay off the symbols.
+        for s in syms where reserved.contains(s.hue) {
+            out.append("\(s.id) is \(s.hue), the backing's colour — it would be cut out with it; give it another colour.")
+        }
+
+        // 1. Colour inside the groups a player compares side by side.
+        // Not value symbols: they are told apart by the value the game prints on them, and
+        // share a colour in shipping games (Dragon Link's fireballs). A game with ten value
+        // tiers cannot give each its own colour, and a real design stayed flagged trying.
+        let groups: [(SlotSymbolRole, String)] = [(.highPay, "high pay"), (.mediumPay, "medium pay"),
+                                                  (.lowPay, "low pay"), (.jackpot, "jackpot tier")]
+        for (role, noun) in groups {
+            let tier = syms.filter { $0.role == role && !$0.hue.isEmpty }
+            for (_, same) in Dictionary(grouping: tier, by: { sideBySide($0.hue) }).sorted(by: { $0.key < $1.key })
+            where same.count > 1 {
+                let named = Set(same.map(\.hue)).sorted().joined(separator: " and ")
+                out.append("\(list(same.map(\.id))) are all \(named) — each \(noun) needs its own colour.")
+            }
+        }
+
+        // 1a. Text the game prints itself must not be painted in. A subject asking for
+        // "glowing numeric pop-up flags" contradicts the brief's "no numbers" and invites
+        // painted digits — the first real design did exactly that.
+        let textWords = ["numeric", "numeral", "numerals", "number", "numbers", "digit", "digits",
+                         "lettering", "inscription", "inscribed", "inscriptions", "text", "word",
+                         "words", "label", "labels", "logo", "signage", "writing", "written",
+                         "sign", "glyph"]
+        for s in syms where GDDAssetPrompts.royalRank(s) == nil {
+            let words = s.subject.lowercased().components(separatedBy: CharacterSet.letters.inverted)
+                .filter { !$0.isEmpty }
+            // "…a calm disc designed for value text" is the designer leaving room for what the
+            // game prints — exactly what it was asked to do. Only a word NOT led by "for" is a
+            // request to paint it.
+            let hit = words.indices.first { i in
+                textWords.contains(words[i]) && !words[max(0, i - 3)..<i].contains("for")
+            }
+            if let i = hit {
+                out.append("\(s.id)'s subject asks for painted text or numbers (“\(words[i])”) — the game prints those itself; describe the thing without them.")
+            }
+        }
+
+        // 1a'. A word in capitals is a label the image model will paint — "a gleaming golden
+        // WILD ribbon" on a real wild, whose label the game prints itself.
+        for s in syms where GDDAssetPrompts.royalRank(s) == nil {
+            let caps = s.subject.components(separatedBy: CharacterSet.letters.inverted)
+                .filter { $0.count >= 3 && $0 == $0.uppercased() && $0.rangeOfCharacter(from: .letters) != nil }
+            if let w = caps.first {
+                out.append("\(s.id)'s subject writes “\(w)” into the art — the game prints its labels itself; describe the symbol without the word.")
+            }
+        }
+
+        // 1b. The label has to be in the picture.
+        for s in syms where !s.hue.isEmpty && !subjectNames(s.hue, in: s.subject) {
+            out.append("\(s.id) is labelled \(s.hue), but its subject never says so — write its colour into the subject sentence, since that is what gets drawn.")
+        }
+
+        // 2. One colour, or one outline, carrying the whole set.
+        let hued = syms.filter { !$0.hue.isEmpty }
+        if hued.count >= 6, let (hue, n) = mostCommon(hued.map(\.hue)),
+           Double(n) / Double(hued.count) > maxShareOfOneHue {
+            out.append("\(n) of \(hued.count) symbols are \(hue) — spread the set across more colours.")
+        }
+        let warmCount = hued.filter { warm.contains($0.hue) }.count
+        if hued.count >= 6, Double(warmCount) / Double(hued.count) > maxShareOfWarm {
+            out.append("\(warmCount) of \(hued.count) symbols are gold, yellow, orange or brown — the set will read as one warm colour; move some to cool or contrasting hues.")
+        }
+        // Coins are round by convention, so they are left out of this count: in a hold-and-win
+        // game they alone can be half the set.
+        let shaped = syms.filter { !$0.shape.isEmpty && !coinRoles.contains($0.role) }
+        if shaped.count >= 6, let (shape, n) = mostCommon(shaped.map(\.shape)),
+           Double(n) / Double(shaped.count) > maxShareOfOneShape {
+            out.append("\(n) of \(shaped.count) symbols have a \(shape) outline — vary the frames, "
+                     + "or let some symbols stand frameless on their own outline.")
+        }
+
+        // 3. A family's outline belongs to the family.
+        var familyShape: [SlotSymbolRole: String] = [:]
+        for r in familyRoles {
+            let m = syms.filter { $0.role == r && !$0.shape.isEmpty }
+            // Only when most of the family shares it: gems of different cuts have no one outline,
+            // and treating one cut as "the low pays' outline" flagged pay symbols for nothing.
+            if m.count >= 2, let (shape, n) = mostCommon(m.map(\.shape)), n * 2 > m.count { familyShape[r] = shape }
+        }
+        let highPayShape = mostCommon(syms.filter { $0.role == .highPay && !$0.shape.isEmpty }.map(\.shape))
+            .flatMap { $0.1 >= 2 ? $0.0 : nil }
+        for s in syms where !s.shape.isEmpty {
+            let who = "\(s.id) (\(s.role.label))"
+            if standouts.contains(s.role) {
+                // Sharing an outline is how shipped games work — a bonus coin among value coins, a
+                // wild in the high pays' frame. What must not happen is outline AND colour.
+                for r in familyRoles where familyShape[r] == s.shape {
+                    let twins = syms.filter { $0.role == r && coinTwin(s, $0) }
+                    if !twins.isEmpty {
+                        out.append("\(who) would pass for \(familyNoun(r)): the same \(s.shape) outline and "
+                                 + "\(s.hue), close to \(list(twins.map { "\($0.id) (\($0.hue))" })) — change its colour or its shape.")
+                    }
+                }
+                if highPayShape == s.shape {
+                    let twins = syms.filter { $0.role == .highPay && $0.shape == s.shape && !s.hue.isEmpty && near($0.hue, s.hue) }
+                    if !twins.isEmpty {
+                        out.append("\(who) has the high pays' \(s.shape) outline and a colour close to \(list(twins.map { "\($0.id) (\($0.hue))" })) — it has to stand out from them.")
+                    }
+                }
+            } else if [.highPay, .mediumPay].contains(s.role) {
+                // A pay symbol sharing a family's outline reads as one of the family.
+                for r in familyRoles where familyShape[r] == s.shape {
+                    out.append("\(who) has the same \(s.shape) outline as \(familyNoun(r)) — give it an outline of its own.")
+                }
+            } else if featureCoins.contains(s.role) {
+                for r in familyRoles where familyShape[r] == s.shape {
+                    let twins = syms.filter { $0.role == r && coinTwin(s, $0) }
+                    if !twins.isEmpty {
+                        out.append("\(who) would pass for \(familyNoun(r)): the same \(s.shape) outline and "
+                                 + "\(s.hue), close to \(list(twins.map { "\($0.id) (\($0.hue))" })) — change its colour or its shape.")
+                    }
+                }
+            }
+        }
+        // A standout beside ANY symbol of the same outline and a near colour — Fruit Blitz's star
+        // wild beside its golden star collector.
+        for s in syms where standouts.contains(s.role) && !s.shape.isEmpty && !s.hue.isEmpty {
+            let twins = syms.filter { $0.id != s.id && !standouts.contains($0.role) && !$0.role.isFamily
+                && $0.role != .highPay && $0.shape == s.shape && near($0.hue, s.hue) }
+            if !twins.isEmpty {
+                out.append("\(s.id) (\(s.role.label)) is a \(s.shape) \(s.hue) shape like \(list(twins.map { "\($0.id) (\($0.hue))" })) — it has to stand out; change its outline or colour.")
+            }
+        }
+        let stand = syms.filter { standouts.contains($0.role) && !$0.shape.isEmpty }
+        for (shape, same) in Dictionary(grouping: stand, by: \.shape).sorted(by: { $0.key < $1.key })
+        where same.count > 1 {
+            // Two specials may both be coins; told apart by colour, they read fine.
+            for (i, a) in same.enumerated() { for b in same[(i + 1)...] where !a.hue.isEmpty && near(a.hue, b.hue) {
+                out.append("\(a.id) (\(a.role.label)) and \(b.id) (\(b.role.label)) are both \(shape) and close in colour "
+                         + "(\(a.hue), \(b.hue)) — give one of them its own colour or shape.")
+            } }
+        }
+
+        // 3a. The low pays are what the artist chose, and each one is its own thing.
+        let lps = syms.filter { $0.role == .lowPay }.sorted { ($0.tier ?? 0, $0.id) < ($1.tier ?? 0, $1.id) }
+        if lowPays == .royals {
+            let order = GDDAssetPrompts.royalOrder
+            for (i, s) in lps.enumerated() where i < order.count && GDDAssetPrompts.royalRank(s) != order[i] {
+                out.append("\(s.id) should be the card rank “\(order[i])” — the royal low pays run "
+                         + order.prefix(lps.count).joined(separator: ", ")
+                         + " from LP1 down; say “letter \(order[i])” in its silhouette.")
+            }
+        } else if let kind = lowPays {
+            for s in lps where GDDAssetPrompts.royalRank(s) != nil {
+                out.append("\(s.id) is a card rank, but the low pays are to be \(kind.plural) — make it one of those.")
+            }
+        }
+        // Gems, pebbles and items are told apart by outline first. Not royals — the letter does
+        // that — and not a custom pick, whose words decide (snow globes are all round).
+        // Some likeness is fine — a round stone and an egg — but most of the row on one outline is
+        // one symbol repeated.
+        if let kind = lowPays, [.gemstones, .pebbles, .themed].contains(kind) {
+            let shaped = lps.filter { !$0.shape.isEmpty }
+            for (shape, same) in Dictionary(grouping: shaped, by: \.shape).sorted(by: { $0.key < $1.key })
+            where same.count > 1 && same.count * 2 > shaped.count {
+                out.append("\(list(same.map(\.id))) share a \(shape) outline — vary the low pays' outlines, so most of the row is not one shape.")
+            }
+        }
+        let lpKey: (AssetJob) -> String = {
+            GDDAssetPrompts.royalRank($0).map { "“\($0)”" } ?? $0.silhouette.lowercased().trimmingCharacters(in: .whitespaces)
+        }
+        for (key, same) in Dictionary(grouping: lps, by: lpKey).sorted(by: { $0.key < $1.key })
+        where same.count > 1 && !key.isEmpty {
+            out.append("\(list(same.map(\.id))) are the same low pay (\(key.hasPrefix("“") ? key : "“\(key)”")) — each low pay must be its own thing.")
+        }
+
+        // 4. Pay symbols that are the same KIND of thing — three pigs among the high pays.
+        // Only between pay symbols: the wild is often the theme's own mascot, and it is held
+        // apart from the pays by outline and colour above. Applied to it, this rule turned a
+        // Piggy Banks wild from its pig into a generic dollar sign.
+        let pays = syms.filter { [.highPay, .mediumPay].contains($0.role) }
+        for (word, ids) in GDDAssetPrompts.silhouetteClashes(pays).sorted(by: { $0.key < $1.key }) {
+            out.append("\(list(ids)) are all “\(word)” — make them different kinds of thing, not "
+                     + "variations of one.")
+        }
+        return out
+    }
+}
+
+/// One image in the order it is drawn, with the pictures attached to it.
+public struct RenderStep: Equatable, Sendable {
+    public enum Mode: String, Equatable, Sendable {
+        /// Drawn first; sets the look.
+        case anchor
+        /// A new subject drawn to match the anchor.
+        case match
+        /// A family member drawn as an EDIT of its family's first member.
+        case familyEdit
+        case background
+        /// Every low pay drawn at once, side by side on one wide image, then cut apart.
+        case sheet
+    }
+    public let id: String
+    public let mode: Mode
+    /// What is attached, in order: RenderPlan.themeArt or a slot id. An edit target goes
+    /// LAST — the service treats the last image as the one being edited.
+    public let refs: [String]
+    /// Slots whose image must exist before this one starts.
+    public let after: [String]
+    /// A sheet's symbols, left to right. `id` is the first of them.
+    public var members: [String] = []
+}
+
+/// The order a set is drawn in, and what each image is shown.
+///
+/// Every symbol used to be generated cold, from text alone, with nothing to match — so
+/// frames changed within a tier and a jackpot "family" came back as four different emblems.
+/// Google's guidance is to include previously generated images in later prompts to keep a
+/// set consistent; this is that, arranged so each image sees what it has to agree with.
+public enum RenderPlan {
+    public static let themeArt = "theme-art"
+
+    /// `hasThemeArt`: whether the theme's approved artwork is available AND governs the look.
+    public static func steps(_ jobs: [AssetJob], _ design: SetDesign, hasThemeArt: Bool) -> [RenderStep] {
+        let planned = jobs.filter { !$0.subject.isEmpty }
+        let art = hasThemeArt ? [Self.themeArt] : []
+        guard let anchor = SetDesignRules.anchor(planned, design) else {
+            return planned.map { RenderStep(id: $0.id, mode: $0.kind == .background ? .background : .match,
+                                             refs: art, after: []) }
+        }
+        let founders = SetDesignRules.founders(planned, anchorID: anchor.id)
+        let tierMates = SetDesignRules.tierFounders(planned, anchorID: anchor.id)
+        var first: [RenderStep] = [RenderStep(id: anchor.id, mode: .anchor, refs: art, after: [])]
+        var later: [RenderStep] = []
+        // The low pays are drawn TOGETHER, in one row on one image, so each is made in the light
+        // of the others — the artist's own way, and it keeps a set of gems or ranks cohesive.
+        let lowPays = planned.filter { $0.kind == .symbol && $0.role == .lowPay && $0.id != anchor.id }
+        let sheet = lowPays.count >= 2 && anchor.role != .lowPay
+        for j in planned where j.id != anchor.id {
+            if sheet && j.role == .lowPay {
+                if j.id == lowPays[0].id {
+                    first.append(RenderStep(id: j.id, mode: .sheet, refs: [anchor.id], after: [anchor.id],
+                                            members: lowPays.map(\.id)))
+                }
+            } else if j.kind == .background {
+                // A scene takes its style from the theme art. Given a SYMBOL as its only
+                // reference it tends to paint that symbol into the scene, so the anchor is
+                // attached only when there is no theme art to use instead.
+                first.append(RenderStep(id: j.id, mode: .background,
+                                        refs: hasThemeArt ? art : [anchor.id],
+                                        after: hasThemeArt ? [] : [anchor.id]))
+            } else if let f = founders[j.role], f != j.id {
+                // A low pay is its own thing — a different letter, gem or item — so without a
+                // sheet it is drawn fresh with the first low pay as its style reference, never as
+                // an edit: edited, a K kept the A's outline and came back as an A with a K fused
+                // into it, in four of five real themes.
+                later.append(RenderStep(id: j.id, mode: j.role == .lowPay ? .match : .familyEdit,
+                                        refs: [f], after: [f]))
+            } else {
+                // The concept art is NOT attached here. The anchor already carries the look, and
+                // the concept art carries its scene: in real runs it painted Snow Queen's castle
+                // and Neon City's streets behind three of five symbols, despite being told not to.
+                // Only when the plan gives both the SAME outline: told to copy a round frame, a
+                // symbol the plan had framed square came back round.
+                let mateJob = tierMates[j.role].flatMap { id in planned.first { $0.id == id } }
+                let mate = (j.hasFrame && mateJob.map { $0.shape == j.shape && !j.shape.isEmpty } == true)
+                    ? mateJob.flatMap { $0.id != anchor.id && $0.id != j.id ? $0.id : nil } : nil
+                first.append(RenderStep(id: j.id, mode: .match, refs: [anchor.id] + (mate.map { [$0] } ?? []),
+                                        after: [anchor.id] + (mate.map { [$0] } ?? [])))
+            }
+        }
+        return first + later
+    }
+
+    /// The steps of a batch that makes only `ids`. A sheet is drawn whole only when all its low
+    /// pays are being made; redoing some of them draws each alone, matched to a low pay that
+    /// stays and to what the sheet itself was shown.
+    public static func scoped(_ steps: [RenderStep], to ids: Set<String>) -> [RenderStep] {
+        steps.flatMap { st -> [RenderStep] in
+            guard st.mode == .sheet else { return ids.contains(st.id) ? [st] : [] }
+            if st.members.allSatisfy(ids.contains) { return [st] }
+            let kept = st.members.first { !ids.contains($0) }
+            return st.members.filter(ids.contains).map {
+                RenderStep(id: $0, mode: .match, refs: (kept.map { [$0] } ?? []) + st.refs, after: st.after)
+            }
+        }
+    }
+
+    /// One step per image, for tables and logs: each of a sheet's low pays listed as drawn on it.
+    public static func flat(_ steps: [RenderStep]) -> [RenderStep] {
+        steps.flatMap { st in
+            st.mode != .sheet ? [st]
+                : st.members.map { RenderStep(id: $0, mode: .sheet, refs: st.refs, after: st.after, members: st.members) }
+        }
+    }
+}
+
+/// A second look at each finished image by a cheap Gemini vision model. The checks made on
+/// this Mac guess from pixels: the letter reader called a good Q an "A" and could not read
+/// every K; the scene test missed a skyline painted in the backing's own green. A model that
+/// can see answers the questions directly, for about a tenth of a cent an image.
+public struct ImageReview: Equatable, Sendable {
+    /// Every letter, number or word drawn in it, as drawn; "" for none.
+    public var text: String = ""
+    /// Something painted behind the symbol — sky, landscape, buildings, ground — instead of
+    /// the flat backing.
+    public var scene = false
+    /// A card, tile or panel behind the symbol that is not part of it — Loki's themed low pays
+    /// each came back on a dark tile the backing cannot key out, and "scene" did not catch it.
+    public var panel = false
+    /// A person, face or humanoid figure anywhere in it.
+    public var character = false
+    /// Whether it shows the planned subject.
+    public var matches = true
+    /// Whether the planned description itself is of a person — so a character in a symbol
+    /// planned as an object (the Snow Queen's bust in her frost-crown wild) is told from a
+    /// portrait that is meant to have one.
+    public var plannedPerson = false
+    public var note = ""
+
+    /// A person drawn into a symbol that was planned as an object.
+    public var characterLeak: Bool { character && !plannedPerson }
+    /// Something behind the symbol that the backing key will leave in: a scene or a panel.
+    public var unkeyable: Bool { scene || panel }
+
+    /// The model that looks. Measured on 17 images with known faults (25 September 2026):
+    /// gemini-3.8-flash judged 16–17 right at $0.0027 an image; gemini-3.5-flash-lite 13 at
+    /// $0.0006 — it missed a tile and the queen in the wild, and called a square pebble a tile.
+    /// A false alarm costs a $0.10 redraw, so the better eye is the cheaper one.
+    /// NAVIGATOR_REVIEW_MODEL overrides it, for comparing models on the same images.
+    public static let model = ProcessInfo.processInfo.environment["NAVIGATOR_REVIEW_MODEL"] ?? "gemini-3.8-flash"
+
+    public static func prompt(for job: AssetJob, backing: String) -> String {
+        """
+        This is one slot-machine reel symbol, drawn on a flat \(backing) background. Say what is \
+        actually drawn — not what was intended.
+        - text: every letter, number or word in the image, exactly as drawn, left to right, \
+        separated by spaces. "" if there is none.
+        - scene: true if anything is painted behind the symbol — sky, landscape, buildings, a \
+        room, ground, other objects — instead of the plain flat background.
+        - panel: true if the symbol sits on a card, tile, panel or box of another colour that is \
+        not part of the symbol itself\(job.hasFrame ? " (it was planned inside its own frame or plaque: that frame is part of it and does not count)" : " (it was planned with no frame, plaque or tile of any kind)").
+        - character: true if a person, a face or a humanoid figure appears anywhere.
+        - matches: true if the image shows this: “\(job.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))”.
+        - planned_person: true if that description itself is of a person, a face or a humanoid character.
+        - note: anything wrong with it as a reel symbol, in under 15 words, or "".
+        """
+    }
+
+    public static let schema: [String: Any] = [
+        "type": "OBJECT",
+        "properties": [
+            "text": ["type": "STRING", "maxLength": 60],
+            "scene": ["type": "BOOLEAN"],
+            "panel": ["type": "BOOLEAN"],
+            "character": ["type": "BOOLEAN"],
+            "matches": ["type": "BOOLEAN"],
+            "planned_person": ["type": "BOOLEAN"],
+            "note": ["type": "STRING", "maxLength": 120],
+        ],
+        "required": ["text", "scene", "panel", "character", "matches", "planned_person"],
+    ]
+
+    public static func parse(_ reply: String) -> ImageReview? {
+        guard let j = GDDAssetPrompts.json(fromModelReply: reply) else { return nil }
+        var r = ImageReview()
+        r.text = (j["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        r.scene = j["scene"] as? Bool ?? false
+        r.panel = j["panel"] as? Bool ?? false
+        r.character = j["character"] as? Bool ?? false
+        r.matches = j["matches"] as? Bool ?? true
+        r.plannedPerson = j["planned_person"] as? Bool ?? true
+        r.note = (j["note"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return r
+    }
+
+    /// What a card symbol reads as: its letters and digits run together, or nil when nothing
+    /// is drawn. A fused A-K reads "AK" — not "K" — which is exactly the failure to catch.
+    public var cardText: String? {
+        let t = text.uppercased().filter { $0.isLetter || $0.isNumber }
+        return t.isEmpty ? nil : t
+    }
+}
+
+/// The low pays drawn together on one wide 4K image and cut apart afterwards. Drawn one at a
+/// time they drifted apart — the artist's experience, and ours with the fused A-K — while
+/// drawn together each is made in the light of the others.
+public enum LowPaySheet {
+    /// Four fit 16:9; five or six need 21:9, which is also the wider 4K canvas.
+    public static func aspect(count: Int) -> String { count <= 4 ? "16:9" : "21:9" }
+
+    /// The boxes, left to right in pixels from the top-left, of exactly `count` separate
+    /// symbols in a row on the backing — with the backdrop's own colour, which the model paints
+    /// a shade off the one asked for. Nil when the sheet does not hold that many apart.
+    static func boxes(_ image: CGImage, backing: RGB8, count: Int) -> (boxes: [CGRect], backdrop: RGB8)? {
+        let w = min(1200, image.width), h = max(1, image.height * w / image.width)
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let raw = ctx.data else { return nil }
+        let px = raw.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        func rgb(_ x: Int, _ y: Int) -> (Int, Int, Int) { let i = (y * w + x) * 4; return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2])) }
+        func dist(_ p: (Int, Int, Int), _ c: RGB8) -> Int { abs(p.0 - Int(c.r)) + abs(p.1 - Int(c.g)) + abs(p.2 - Int(c.b)) }
+        // The backdrop: the border's pixels near the backing, averaged.
+        var sum = (0, 0, 0), n = 0
+        let e = max(1, min(w, h) / 50)
+        for y in 0..<h { for x in 0..<w where x < e || y < e || x >= w - e || y >= h - e {
+            let p = rgb(x, y); if dist(p, backing) <= 90 { sum.0 += p.0; sum.1 += p.1; sum.2 += p.2; n += 1 }
+        } }
+        let back = n == 0 ? backing : RGB8(UInt8(sum.0 / n), UInt8(sum.1 / n), UInt8(sum.2 / n))
+        // Columns with ink, then runs of them: a symbol each. Specks — a stray sparkle — are dropped.
+        var colInk = [Int](repeating: 0, count: w)
+        for y in 0..<h { for x in 0..<w where dist(rgb(x, y), back) > 90 { colInk[x] += 1 } }
+        var runs: [(Int, Int)] = []
+        var start: Int? = nil
+        for x in 0...w {
+            let ink = x < w && colInk[x] > max(2, h / 100)
+            if ink, start == nil { start = x }
+            if !ink, let s0 = start { runs.append((s0, x - 1)); start = nil }
+        }
+        let mass = runs.map { r in (r.0...r.1).reduce(0) { $0 + colInk[$1] } }
+        let biggest = mass.max() ?? 0
+        var kept = runs.indices.filter { runs[$0].1 - runs[$0].0 + 1 >= w / 60 && mass[$0] * 20 >= biggest }.map { runs[$0] }
+        // One symbol can be two runs — the 1 and the 0 of a "10" drawn apart. A gap far narrower
+        // than the gaps between symbols is inside a symbol, so the two are joined.
+        while kept.count > count {
+            let gaps = zip(kept, kept.dropFirst()).map { $1.0 - $0.1 }
+            let i = gaps.indices.min { gaps[$0] < gaps[$1] }!
+            let others = gaps.enumerated().filter { $0.offset != i }.map(\.element).sorted()
+            guard let median = others.isEmpty ? nil : others[others.count / 2], gaps[i] * 3 < median else { break }
+            kept[i] = (kept[i].0, kept[i + 1].1)
+            kept.remove(at: i + 1)
+        }
+        guard kept.count == count else { return nil }
+        let sx = Double(image.width) / Double(w), sy = Double(image.height) / Double(h)
+        var out: [CGRect] = []
+        for (x0, x1) in kept {
+            var y0 = h, y1 = -1
+            for y in 0..<h {
+                var k = 0
+                for x in x0...x1 where dist(rgb(x, y), back) > 90 { k += 1 }
+                if k > max(1, (x1 - x0) / 100) { y0 = min(y0, y); y1 = max(y1, y) }
+            }
+            guard y1 >= y0 else { return nil }
+            out.append(CGRect(x: Double(x0) * sx, y: Double(y0) * sy,
+                              width: Double(x1 - x0 + 1) * sx, height: Double(y1 - y0 + 1) * sy).integral)
+        }
+        return (out, back)
+    }
+
+    /// One symbol cut from the sheet onto its own canvas of the backdrop colour, centred, its
+    /// larger side `fill` of the canvas's — the margin every other symbol is drawn with.
+    static func cut(_ image: CGImage, box: CGRect, backdrop: RGB8, width: Int, height: Int,
+                           fill: Double = 0.86) -> CGImage? {
+        let pad = max(box.width, box.height) * 0.03
+        let r = box.insetBy(dx: -pad, dy: -pad).intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
+        guard let crop = image.cropping(to: r),
+              let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(red: Double(backdrop.r) / 255, green: Double(backdrop.g) / 255, blue: Double(backdrop.b) / 255, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        // Scaled on the box, not the padded crop, so every symbol lands at the same size.
+        let scale = min(fill * Double(width) / box.width, fill * Double(height) / box.height)
+        let dw = Double(r.width) * scale, dh = Double(r.height) * scale
+        ctx.interpolationQuality = .high
+        ctx.draw(crop, in: CGRect(x: (Double(width) - dw) / 2, y: (Double(height) - dh) / 2, width: dw, height: dh))
+        return ctx.makeImage()
+    }
+}
+
+/// What a finished symbol image actually looks like, measured — free, local, no model.
+///
+/// The questions a person asks of a set on screen, turned into numbers the run log can
+/// print: is the backdrop really flat, did the backing colour leak into the art (the key
+/// will punch it out), does the symbol fill its square, what colour is it, and does its
+/// outline look like another symbol's.
+public struct SymbolImageMetrics: Equatable, Sendable {
+    /// Share of the outer ring that is the backing colour. Below ~0.9 the key will struggle.
+    public let backdropPurity: Double
+    /// Share of the subject's pixels close to the backing hue — cut out along with it.
+    public let spill: Double
+    /// The subject's bounding box as a share of the canvas.
+    public let fill: Double
+    /// True when the subject runs into the canvas edge.
+    public let touchesEdge: Bool
+    /// The subject's dominant colour family.
+    public let hue: String
+    /// A 64×64 subject mask, for comparing outlines.
+    public let mask: [Bool]
+    /// Corners (of four) that are mostly backing. A symbol drawn on the backing leaves at
+    /// least two flat; one drawn on a copied scene fills them all.
+    public var flatCorners: Int = 4
+    /// Share of the outer edge strip that is backing, overall and on its least-backed side.
+    public var edgeBacked: Double = 1
+    public var sideBacked: Double = 1
+    /// The subject's dominant colour family in its middle — for a framed symbol, the field
+    /// or gem the plan's colour describes, rather than the frame around it.
+    public var centreHue: String = ""
+    /// The subject's bounding box, width over height. The outline mask is stretched to a
+    /// square, so without this a square ruby and a tall baguette emerald measured 99% alike.
+    public var aspect: Double = 1
+    /// True when the flat backing is missing: a scene or a full-bleed picture instead.
+    /// ponytail: calibrated on 35 real symbols. Scenes measured 16–68% backed at the edge, or a
+    /// whole side of ground (0%); clean symbols, however big, 85% or more with every side over
+    /// 75%. A faint skyline painted in the backing's own colour (Neon City, 86–93%) still gets
+    /// through — not attaching concept art to symbols is the actual fix for those.
+    public var backingMissing: Bool { flatCorners <= 1 || edgeBacked < 0.7 || sideBacked < 0.1 }
+
+    static let side = 256, maskSide = 64
+
+    static func measure(_ image: CGImage, backing: RGB8) -> SymbolImageMetrics? {
+        let n = side
+        guard let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8, bytesPerRow: n * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: n, height: n))
+        guard let raw = ctx.data else { return nil }
+        let px = raw.bindMemory(to: UInt8.self, capacity: n * n * 4)
+        func rgb(_ x: Int, _ y: Int) -> (Int, Int, Int) {
+            let i = (y * n + x) * 4
+            return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2]))
+        }
+        func dist(_ p: (Int, Int, Int)) -> Int {
+            abs(p.0 - Int(backing.r)) + abs(p.1 - Int(backing.g)) + abs(p.2 - Int(backing.b))
+        }
+        let bh = hsv(Int(backing.r), Int(backing.g), Int(backing.b)).h
+        let ring = max(1, n * 6 / 100)
+        var ringPure = 0, ringAll = 0, ringSum = (0, 0, 0)
+        var subject = 0, spill = 0, minX = n, minY = n, maxX = -1, maxY = -1
+        var counts: [String: Int] = [:], neutral: [String: Int] = [:]
+        for y in 0..<n {
+            for x in 0..<n {
+                let p = rgb(x, y)
+                let d = dist(p)
+                // Purity is a property of the BACKDROP: a symbol that reaches into the outer
+                // ring is not an impure backdrop. Only backdrop-coloured pixels are judged —
+                // a gradient or vignette shows as pixels near the backing but not on it.
+                if (x < ring || y < ring || x >= n - ring || y >= n - ring) && d <= 90 {
+                    ringAll += 1; ringSum.0 += p.0; ringSum.1 += p.1; ringSum.2 += p.2
+                }
+                guard d > 90 else { continue }
+                subject += 1
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+                let c = hsv(p.0, p.1, p.2)
+                let nearKey = c.s > 0.45 && c.v > 0.35 && hueGap(c.h, bh) < 22
+                if nearKey { spill += 1; continue }
+                let fam = family(h: c.h, s: c.s, v: c.v)
+                if c.s > 0.3 && c.v > 0.25 { counts[fam, default: 0] += 1 } else { neutral[fam, default: 0] += 1 }
+            }
+        }
+        guard subject > 0 else { return nil }
+        // Flat is judged against the backdrop's OWN colour: a backdrop painted one flat shade
+        // off the asked-for colour still keys cleanly. Real K's on a flat #0EA149, asked for
+        // #00B140, measured 31% "pure" against the hex.
+        if ringAll > 0 {
+            let mean = (ringSum.0 / ringAll, ringSum.1 / ringAll, ringSum.2 / ringAll)
+            for y in 0..<n {
+                for x in 0..<n where x < ring || y < ring || x >= n - ring || y >= n - ring {
+                    let p = rgb(x, y)
+                    if dist(p) <= 90 && abs(p.0 - mean.0) + abs(p.1 - mean.1) + abs(p.2 - mean.2) <= 40 { ringPure += 1 }
+                }
+            }
+        }
+        // The outline, cropped to its own bounds and scaled to 64 px before it is compared:
+        // otherwise any two symbols that both fill their square look alike, whatever their shape.
+        var mask = [Bool](repeating: false, count: maskSide * maskSide)
+        let bw = Double(maxX - minX + 1), bh2 = Double(maxY - minY + 1)
+        for my in 0..<maskSide {
+            for mx in 0..<maskSide {
+                let x = minX + Int((Double(mx) + 0.5) * bw / Double(maskSide))
+                let y = minY + Int((Double(my) + 0.5) * bh2 / Double(maskSide))
+                mask[my * maskSide + mx] = dist(rgb(min(x, n - 1), min(y, n - 1))) > 90
+            }
+        }
+        let saturated = counts.values.reduce(0, +)
+        let pool = saturated * 100 >= subject * 15 ? counts : neutral.merging(counts, uniquingKeysWith: +)
+        let hue = pool.max { $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value }?.key ?? ""
+        // The middle half of the subject's box, for a framed symbol's field or gem.
+        var centre: [String: Int] = [:]
+        let cx0 = minX + (maxX - minX) / 4, cx1 = maxX - (maxX - minX) / 4
+        let cy0 = minY + (maxY - minY) / 4, cy1 = maxY - (maxY - minY) / 4
+        if cx1 > cx0 && cy1 > cy0 {
+            for y in stride(from: cy0, through: cy1, by: 2) {
+                for x in stride(from: cx0, through: cx1, by: 2) {
+                    let p = rgb(x, y); guard dist(p) > 90 else { continue }
+                    let c = hsv(p.0, p.1, p.2)
+                    if c.s > 0.3 && c.v > 0.25 { centre[family(h: c.h, s: c.s, v: c.v), default: 0] += 1 }
+                }
+            }
+        }
+        let centreHue = centre.max { $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value }?.key ?? ""
+        // Four corner patches, each an eighth of the side.
+        let k = n / 8
+        var flat = 0
+        for (ox, oy) in [(0, 0), (n - k, 0), (0, n - k), (n - k, n - k)] {
+            var back = 0
+            for y in oy..<(oy + k) { for x in ox..<(ox + k) where dist(rgb(x, y)) <= 90 { back += 1 } }
+            if back * 2 >= k * k { flat += 1 }
+        }
+        // The edge strip, a sixteenth of the side, one side at a time.
+        let e = n / 16
+        var sideBack = [0, 0, 0, 0]
+        for i in 0..<n {
+            for d in 0..<e {
+                if dist(rgb(i, d)) <= 90 { sideBack[0] += 1 }
+                if dist(rgb(i, n - 1 - d)) <= 90 { sideBack[1] += 1 }
+                if dist(rgb(d, i)) <= 90 { sideBack[2] += 1 }
+                if dist(rgb(n - 1 - d, i)) <= 90 { sideBack[3] += 1 }
+            }
+        }
+        var m = SymbolImageMetrics(
+            backdropPurity: ringAll == 0 ? 1 : Double(ringPure) / Double(ringAll),
+            spill: Double(spill) / Double(subject),
+            fill: Double((maxX - minX + 1) * (maxY - minY + 1)) / Double(n * n),
+            touchesEdge: minX == 0 || minY == 0 || maxX == n - 1 || maxY == n - 1,
+            hue: hue, mask: mask)
+        m.flatCorners = flat
+        m.aspect = Double(maxX - minX + 1) / Double(maxY - minY + 1)
+        m.edgeBacked = Double(sideBack.reduce(0, +)) / Double(4 * n * e)
+        m.sideBacked = Double(sideBack.min() ?? 0) / Double(n * e)
+        m.centreHue = centreHue
+        return m
+    }
+
+    /// Share of a picture's colourful pixels in each colour family — the theme art's own
+    /// colours, for choosing a backing the art does not use.
+    static func hueShares(_ image: CGImage) -> [String: Double] {
+        let n = 128
+        guard let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8, bytesPerRow: n * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue), let raw = ctx.data else { return [:] }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: n, height: n))
+        let px = raw.bindMemory(to: UInt8.self, capacity: n * n * 4)
+        var counts: [String: Int] = [:], total = 0
+        for i in 0..<(n * n) {
+            let c = hsv(Int(px[i * 4]), Int(px[i * 4 + 1]), Int(px[i * 4 + 2]))
+            guard c.s > 0.3 && c.v > 0.25 else { continue }
+            counts[family(h: c.h, s: c.s, v: c.v), default: 0] += 1; total += 1
+        }
+        return total == 0 ? [:] : counts.mapValues { Double($0) / Double(total) }
+    }
+
+    /// How alike two outlines are: intersection over union of the masks.
+    /// How alike two outlines are, 0–1, when their proportions are close too — nil when one
+    /// is plainly wider or taller than the other, whatever their stretched masks say.
+    public static func alike(_ a: SymbolImageMetrics, _ b: SymbolImageMetrics) -> Double? {
+        max(a.aspect, b.aspect) / max(0.01, min(a.aspect, b.aspect)) < 1.25 ? overlap(a.mask, b.mask) : nil
+    }
+
+    public static func overlap(_ a: [Bool], _ b: [Bool]) -> Double {
+        var i = 0, u = 0
+        for k in 0..<min(a.count, b.count) {
+            if a[k] && b[k] { i += 1 }
+            if a[k] || b[k] { u += 1 }
+        }
+        return u == 0 ? 0 : Double(i) / Double(u)
+    }
+
+    static func hsv(_ r: Int, _ g: Int, _ b: Int) -> (h: Double, s: Double, v: Double) {
+        let rf = Double(r) / 255, gf = Double(g) / 255, bf = Double(b) / 255
+        let mx = max(rf, gf, bf), mn = min(rf, gf, bf), d = mx - mn
+        var h = 0.0
+        if d > 0 {
+            if mx == rf { h = 60 * ((gf - bf) / d).truncatingRemainder(dividingBy: 6) }
+            else if mx == gf { h = 60 * ((bf - rf) / d + 2) }
+            else { h = 60 * ((rf - gf) / d + 4) }
+        }
+        if h < 0 { h += 360 }
+        return (h, mx == 0 ? 0 : d / mx, mx)
+    }
+
+    static func hueGap(_ a: Double, _ b: Double) -> Double {
+        let d = abs(a - b).truncatingRemainder(dividingBy: 360)
+        return min(d, 360 - d)
+    }
+
+    /// The colour family a pixel reads as — the same names the designer is asked to use.
+    static func family(h: Double, s: Double, v: Double) -> String {
+        if v < 0.2 { return "black" }
+        if s < 0.18 { return v > 0.7 ? "white" : "black" }
+        let warm = h < 50 || h >= 345
+        if warm && v < 0.5 { return "brown" }
+        switch h {
+        case 345..., ..<12: return "red"
+        case 12..<35: return "orange"
+        case 35..<50: return "gold"
+        case 50..<70: return "yellow"
+        case 70..<160: return "green"
+        case 160..<195: return "teal"
+        case 195..<255: return "blue"
+        case 255..<290: return "purple"
+        default: return "pink"
+        }
+    }
+}
+
+// MARK: - The drawing brief: what Nano Banana 2 is actually sent
+
+/// A short narrative brief per image, in the order Google's image-prompting guidance
+/// gives: the intent, the role of every attached image, one fixed style block, the
+/// subject, then the backdrop, then a short list of bans.
+///
+/// It replaces a 1,599-word, 29-rule prompt that asked each image to match a set it never
+/// saw. Consistency now comes from the attached pictures; the words only have to say what
+/// this one symbol is. Two things are kept OUT on purpose: the design document's game name,
+/// which carries the document's own theme into a reskin, and slot codes like "HP1", which
+/// mean nothing to an image model and invite it to paint them.
+extension GDDAssetPrompts {
+
+    /// The rank a card royal shows, when the plan names it ("letter K", "rank 10").
+    static func royalRank(_ job: AssetJob) -> String? {
+        let t = job.silhouette + " " + job.subject
+        // "numeral 10", "number 9", "rank ten" are ranks too. Missing them flagged a real
+        // design's 10 as painted text, and the revision "fixed" it into a letter T.
+        guard let r = t.range(of: #"(?i)\b(letter|rank|numeral|number|digit)\s+(10|[AKQJ5-9]|ten|nine|eight|seven|six|five)\b"#,
+                              options: .regularExpression)
+        else { return nil }
+        let rank = t[r].split(separator: " ").last.map { String($0).uppercased() } ?? ""
+        return ["TEN": "10", "NINE": "9", "EIGHT": "8", "SEVEN": "7", "SIX": "6", "FIVE": "5"][rank] ?? rank
+    }
+
+    /// The studio's royal low pays, LP1 down: A K Q J 10 7 5.
+    static let royalOrder = ["A", "K", "Q", "J", "10", "7", "5"]
+    /// Every rank a royal could show, for reading one back.
+    static let ranks = ["A", "K", "Q", "J", "10", "9", "8", "7", "6", "5"]
+
+    /// The card rank some recognised text names, or nil when it names none.
+    static func rank(read: String) -> String? {
+        let s = read.uppercased().filter { $0.isLetter || $0.isNumber }
+        return ranks.contains(s) ? s : nil
+    }
+
+    /// What reading the card symbols back found wrong: one that reads as another rank than
+    /// planned, and two that read as the same rank — which catches a scored set with no plan.
+    static func rankProblems(read: [String: String], wanted: [String: String]) -> [String] {
+        var out: [String] = []
+        for (id, r) in read.sorted(by: { $0.key < $1.key }) {
+            if let w = wanted[id], w != r { out.append("⚠ \(id) should read “\(w)” but reads “\(r)” — redo it.") }
+        }
+        for (r, ids) in Dictionary(grouping: read.keys, by: { read[$0]! }).sorted(by: { $0.key < $1.key }) where ids.count > 1 {
+            out.append("⚠ \(ids.sorted().joined(separator: " and ")) \(ids.count == 2 ? "both" : "all") read “\(r)” — each card symbol must be its own letter.")
+        }
+        return out
+    }
+
+    static func jackpotTierName(_ job: AssetJob) -> String {
+        let t = (job.title + " " + job.subject).lowercased()
+        for n in ["grand", "mega", "major", "minor", "mini"] where t.contains(n) { return n.uppercased() }
+        return "tier \(job.tier ?? 1)"
+    }
+
+    static let ordinals = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
+    static func ordinal(_ n: Int) -> String { n >= 1 && n <= ordinals.count ? ordinals[n - 1] : "\(n)th" }
+    static let counts = ["one", "two", "three", "four", "five", "six", "seven", "eight"]
+    static func countWord(_ n: Int) -> String { n >= 1 && n <= counts.count ? counts[n - 1] : "\(n)" }
+
+    /// What a symbol is called in a prompt — its job in words, never its slot code.
+    static func displayName(_ job: AssetJob) -> String {
+        let t = job.tier ?? 1
+        switch job.role {
+        case .highPay: return t == 1 ? "the top high-pay symbol" : "the \(ordinal(t)) high-pay symbol"
+        case .mediumPay: return "the \(ordinal(t)) medium-pay symbol"
+        case .lowPay: return royalRank(job).map { "the “\($0)” card symbol" } ?? "a low-pay symbol"
+        case .wild: return "the WILD symbol"
+        case .scatter: return "the SCATTER symbol"
+        case .bonus: return "the BONUS symbol"
+        case .jackpot: return "the \(jackpotTierName(job)) jackpot symbol"
+        case .wysiwyg: return job.tier.map { "the \(ordinal($0)) value symbol" } ?? "a value symbol"
+        case .replacement: return "the mystery symbol"
+        default: return "the \(job.role.label.lowercased()) symbol"
+        }
+    }
+
+    /// The outline class, in words.
+    static func outlinePhrase(_ shape: String) -> String {
+        switch shape {
+        case "round": return "a round outline"
+        case "square": return "a square outline"
+        case "shield": return "a shield-shaped outline"
+        case "tall": return "a tall, narrow outline"
+        case "wide": return "a wide, low outline"
+        case "pointed": return "a pointed, spiked or star-like outline"
+        case "figure": return "the outline of a figure or creature"
+        case "freeform": return "an irregular, freeform outline"
+        case "letter": return "the outline of the letterform itself"
+        default: return "a distinctive outline"
+        }
+    }
+
+    /// What this symbol is FOR on the reel, in a sentence or two.
+    static func roleLine(_ job: AssetJob, jobs: [AssetJob], design: SetDesign) -> String {
+        let count = jobs.filter { $0.kind == .symbol && $0.role == job.role }.count
+        let t = job.tier ?? 1
+        let built = design.families[job.role.rawValue].map { ", all built as \($0)" } ?? ""
+        switch job.role {
+        case .highPay:
+            return t == 1
+                ? "It is the top-paying symbol of \(countWord(count)) high pays: the single most desirable thing in this game — the richest material, the most ornament and the most light in the set."
+                : "It is the \(ordinal(t)) of \(countWord(count)) high pays: valuable, but visibly plainer and less precious than the one above it, while keeping its own colour."
+        case .mediumPay:
+            return "It is the \(ordinal(t)) of \(countWord(count)) medium pays: simpler and less precious than the high pays, richer than the low pays."
+        case .lowPay:
+            if let r = royalRank(job) {
+                return "It is a low-pay card-rank symbol: the letter “\(r)” itself is the artwork — a bold, instantly legible \(r) with the correct proportions of a proper typeface, built from this set's material, one of a matching set of ranks\(built). It is one of the plainest symbols in the set."
+            }
+            return "It is a low-pay symbol, one of a matching row of low pays\(built) — but its own thing, not another one recoloured — and among the plainest things in the set."
+        case .wild:
+            return "It is the WILD, which stands in for other symbols: the most eye-catching symbol on the reel, with the strongest contrast in the set. The game prints the word WILD over it, so keep one calm, uncluttered area of the artwork for that label — do not draw a band, bar or panel for it."
+        case .scatter:
+            return "It is the SCATTER, which triggers the bonus feature: special at a glance, and unlike every other symbol in colour and subject."
+        case .bonus:
+            return "It is the BONUS symbol, which triggers the bonus game: a bold, rich coin, badge or medallion — special at a glance, and unmistakably different from the scatter."
+        case .jackpot:
+            return "It is the \(jackpotTierName(job)) jackpot symbol, one of a matching family of jackpot tiers\(built). The game prints the tier name on it, so keep a calm, clear area for that label."
+        case .wysiwyg:
+            return "It is a value symbol, one of a matching family\(built). The game prints a credit amount on it during play, so keep a calm, clear area in its middle for the number."
+        case .collector:
+            return "It is the collector symbol of this game's feature, and the most valuable-looking special in the set: the richest gold, a heavy ornate ring or setting around its prize, like a jackpot won. The game prints a number on it, so keep a calm, clear area for it."
+        case .activator, .adder, .multiplier:
+            return "It is the \(job.role.label.lowercased()) symbol of this game's feature. The game prints a number on it, so keep a calm, clear area for it."
+        case .replacement:
+            return "It is a mystery symbol: it lands, then transforms into another symbol, so it reads as sealed and full of anticipation."
+        default:
+            return ""
+        }
+    }
+
+    /// The set's shared style block — the same words in every image of the set. With no
+    /// concept art attached, nothing else carries the rendering, so the style read of that
+    /// art — or the chosen style — is spelled out here.
+    static func lookBlock(_ theme: GameTheme, _ design: SetDesign, artAttached: Bool) -> String {
+        var parts: [String] = []
+        if !design.look.isEmpty { parts.append(design.look) }
+        if let st = theme.chosenStyle {
+            parts.append("Rendering: \(st.name). \(st.keywords)")
+        } else if !artAttached || design.look.isEmpty {
+            let read = theme.styleFromArt.components(separatedBy: "EDGE-TREATMENT:").first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            parts.append(read.isEmpty ? theme.look : read)
+        }
+        if !wantsLineWork(theme) {
+            parts.append("Forms are separated by light and painted colour, with a rim light on the lit edges — no drawn outline.")
+        }
+        return parts.filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// One sentence per attached image, naming its role. Numbered in attachment order.
+    /// The anchor is matched for rendering; a tier-mate (the same tier's first symbol) is
+    /// matched for its FRAME as well.
+    static func referenceLines(_ step: RenderStep, job: AssetJob, jobs: [AssetJob],
+                               anchorID: String?) -> [String] {
+        let byID = Dictionary(jobs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var lines: [String] = []
+        for (i, r) in step.refs.enumerated() {
+            let n = "Image \(i + 1)"
+            guard r != RenderPlan.themeArt else {
+                lines.append(step.mode == .background
+                    ? "\(n) is the approved concept art for this theme: match its rendering style and colour mood — the technique, lighting, materials and finish. Do not copy its composition, characters or text."
+                    : "\(n) is the approved concept art for this theme. Take ONLY how it is painted — the technique, lighting, materials and finish. Nothing in it appears in the new image: not its characters, objects or text, and not its scene — no sky, buildings, landscape, ground or light behind the symbol. The symbol stands alone on the flat backing colour.")
+                continue
+            }
+            let other = byID[r]
+            let name = other.map(displayName) ?? "a symbol from this set"
+            if step.mode == .background {
+                lines.append("\(n) is \(name) of this set: match its rendering and light, but do not put it, or any symbol, in the scene.")
+            } else if let o = other, let theirs = royalRank(o), let mine = royalRank(job) {
+                lines.append("\(n) is the “\(theirs)” card symbol already made for this set. Draw the “\(mine)” in exactly its typeface style, material, bevel, colouring approach and finish — but as a NEW letter drawn from scratch. It is a different character: no stroke, shape or outline of the “\(theirs)” may remain in the “\(mine)”.")
+            } else if r != anchorID, let o = other, o.role == job.role, o.hasFrame, job.hasFrame {
+                lines.append("\(n) is \(name), from the same tier: give this symbol exactly its frame — the same construction, material and outline — around a different subject. Do not copy its subject or its colours.")
+            } else {
+                let sameFrame = other.map { $0.role == job.role && $0.hasFrame && job.hasFrame } ?? false
+                // A character in the reference leaks in: a Snow Queen wild asked for as "a frost
+                // crown cradling a flame" came back as the queen's own bust with a flame for a face.
+                let character = other?.shape == "figure" && job.shape != "figure"
+                    ? " It shows a character: nothing of that character — no figure, face, hair, clothing or pose — appears in this symbol."
+                    : ""
+                lines.append("\(n) is \(name), already made for this same set. Draw this new symbol so the two sit side by side as one game — the same rendering, light direction, edge treatment and finish\(sameFrame ? ", and the same frame construction" : ""). Do not copy its subject, its colours or its outline; this is a different symbol.\(character)")
+            }
+        }
+        if step.mode == .match && !step.refs.isEmpty {
+            lines.append("None of the attached images is to be edited or reproduced: they are references, and this is a new picture.")
+        }
+        return lines
+    }
+
+    static func backdropLine(_ backing: (name: String, rgb: RGB8), several: Bool = false) -> String {
+        let hex = String(format: "#%02X%02X%02X", backing.rgb.r, backing.rgb.g, backing.rgb.b)
+        let (it, its, cut, itself) = several
+            ? ("them", "Each symbol's own painted edge", "each symbol is cut out along its edge", "the symbols themselves")
+            : ("it", "The symbol's own painted edge", "the symbol is cut out along that edge", "the symbol itself")
+        return "Put \(it) on a perfectly flat, uniform \(backing.name) background (\(hex)) from edge to edge: one solid colour, with no gradient, glow, light rays, sparkles, particles, vignette, shadow or texture on it. \(its) meets that background directly — no outline, halo, glow band or darker ring around the silhouette, because \(cut). Keep \(backing.name), and colours close to it, out of \(itself)."
+    }
+
+    static func bans(_ job: AssetJob) -> String {
+        if let r = royalRank(job) {
+            return "Exactly one character, the “\(r)”, whole and unmistakable — no second letter, no other lettering, no numbers, no watermark, no user interface."
+        }
+        return "No text, lettering or numbers, no watermark, no user interface."
+    }
+
+    /// The brief for one image of the set.
+    /// The brief for the low-pay sheet: every low pay at once, in one row, left to right.
+    static func sheetBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
+                           backing: (name: String, rgb: RGB8), jobs: [AssetJob]) -> String {
+        let byID = Dictionary(jobs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let lps = step.members.compactMap { byID[$0] }
+        let n = lps.count
+        let ranks = lps.compactMap(royalRank)
+        let royal = !ranks.isEmpty && ranks.count == n
+        let intro = "Create the \(countWord(n)) low-pay symbols of a video slot game themed “\(theme.name)”, drawn together on one sheet so they match: \(countWord(n)) separate symbols side by side in a single row, left to right in the order below. They will be cut apart and shown small on spinning reels, where a player has to recognise each one at a glance."
+        var refs: [String] = []
+        for (i, r) in step.refs.enumerated() {
+            guard let o = byID[r] else { continue }
+            let character = o.shape == "figure"
+                ? " It shows a character: nothing of that character — no figure, face, hair, clothing or pose — appears on this sheet." : ""
+            refs.append("Image \(i + 1) is \(displayName(o)), already made for this same set. Draw the low pays so they sit beside it as one game — the same rendering, light direction, edge treatment and finish — but plainer. Nothing of its subject, its colours or its outline appears on this sheet.\(character)")
+        }
+        if !refs.isEmpty {
+            refs.append("The attached image is a reference, not something to edit or reproduce: this sheet is a new picture.")
+        }
+        let items = lps.enumerated().map { i, j -> String in
+            let subject = j.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+            return "\(i + 1). \(subject).\(j.hue.isEmpty ? "" : " Its dominant colour is \(j.hue).")"
+        }.joined(separator: "\n")
+        let shared = design.families[SlotSymbolRole.lowPay.rawValue]
+            .map { " They share this: \($0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))." } ?? ""
+        let kind = royal
+            ? "Each is one card rank — the letter itself is the artwork, with no frame. All \(countWord(n)) are set in ONE proper typeface with correct letterforms: the same height, weight, construction and finish, differing only in the letter and its colour. Every letter complete and correct — \(ranks.map { "“\($0)”" }.joined(separator: ", ")) — one character per symbol."
+            : "Each one is its own thing — its own outline and its own colour, never another one of the row recoloured — made of the same material, with the same finish, size and light."
+        return ([intro] + refs + [
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            "THE LOW PAYS, left to right:\n\(items)",
+            "They are the plainest symbols in the set: simpler and less precious than everything else in it.\(shared) \(kind)",
+            "LAYOUT: the \(countWord(n)) symbols in one straight row across the image, evenly spaced, centred vertically, all the same size — each as large as the spacing allows. Leave a clear gap of plain background between neighbours and around every edge: no symbol touches another or the edge of the image, and nothing joins them — no shared base, frame, shadow or glow. \(lps.contains(where: \.hasFrame) ? "Apart from a symbol's own frame, nothing is behind any of them" : "Each stands directly on the background, with nothing behind it") — no card, tile, panel or box.",
+            "Each symbol has one clear focal point, big simple shapes and strong light-and-dark contrast, so it still reads at 64 pixels — no hairline detail, tiny text or scattered particles.",
+            backdropLine(backing, several: true),
+            royal
+                ? "The only lettering is the ranks themselves, one per symbol. No other letters, numbers or labels, no watermark, no user interface."
+                : "No text, lettering, numbers or labels, no watermark, no user interface.",
+        ]).joined(separator: "\n\n")
+    }
+
+    static func brief(job: AssetJob, step: RenderStep, theme: GameTheme, design: SetDesign,
+                      backing: (name: String, rgb: RGB8), gameName: String,
+                      jobs: [AssetJob]) -> String {
+        _ = gameName   // deliberately unused: the document's game name carries its OWN theme
+        if step.mode == .sheet {
+            return sheetBrief(step: step, theme: theme, design: design, backing: backing, jobs: jobs)
+        }
+        let artAttached = step.refs.contains(RenderPlan.themeArt)
+        let look = lookBlock(theme, design, artAttached: artAttached)
+        let refs = referenceLines(step, job: job, jobs: jobs,
+                                  anchorID: SetDesignRules.anchor(jobs, design)?.id)
+        let game = "a video slot game themed “\(theme.name)”"
+
+        if job.kind == .background {
+            // "Bonus Games background" names the scene; the sentence says "background" itself.
+            let scene = job.title.isEmpty ? "main"
+                : job.title.replacingOccurrences(of: " background", with: "", options: [.caseInsensitive, .anchored, .backwards])
+            return ([
+                "Create the \(scene) background for \(game): \(job.subject).",
+            ] + refs + [
+                "THE LOOK OF THIS SET: \(look)",
+                "A vertical mobile game background. The reels sit over the middle, so keep the centre calm, simple and lower in contrast, and put the interest and detail at the top, bottom and edges. One consistent light direction; deep and atmospheric.",
+                "The scene contains no text or lettering of any kind — no title, logo, signage or inscriptions — and no user interface, reel frames or symbols, and no characters in the centre.",
+            ]).joined(separator: "\n\n")
+        }
+
+        let hue = job.hue.isEmpty ? "" : " Its dominant colour is \(job.hue)."
+        if step.mode == .familyEdit, let founderID = step.refs.last,
+           let founder = jobs.first(where: { $0.id == founderID }) {
+            let change = job.variation.isEmpty ? "its colour" : job.variation
+            // Recoloured explicitly: told only "the ear accents become crimson", a value coin
+            // planned red kept the blue disc it was edited from.
+            let recolour = (!founder.hue.isEmpty && !job.hue.isEmpty && founder.hue != job.hue)
+                ? " Recolour it from \(founder.hue) to \(job.hue): every area that is \(founder.hue) in the original becomes \(job.hue)." : ""
+            let rank = royalRank(job).map { " The letter becomes “\($0)”, in exactly the same typeface, material and construction as the original letter." } ?? ""
+            let calm = [.jackpot, .wysiwyg].contains(job.role)
+                ? " Keep the same calm, clear area for the \(job.role == .jackpot ? "tier name" : "value") the game prints on it." : ""
+            return [
+                "Edit the attached image: it is \(displayName(founder)) of \(game). Turn it into \(displayName(job)) — the same symbol with the same construction, outline, frame, pose, camera angle, lighting, size and finish, changed only in this way: \(change).\(recolour)\(hue)\(rank)\(calm)",
+                backdropLine(backing),
+                bans(job),
+            ].joined(separator: "\n\n")
+        }
+
+        let first = step.mode == .anchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : ""
+        let intro = "Create one reel symbol for \(game).\(first) It will be cut out of a flat backing colour and shown small on spinning reels, where a player has to recognise it at a glance."
+        let outline = job.shape.isEmpty ? "a distinctive outline" : outlinePhrase(job.shape)
+        let form = job.silhouette.isEmpty ? "" : " — \(job.silhouette)"
+        let frame = job.hasFrame
+            ? " It sits in a frame drawn as part of the same painting and lit with it, and the frame gives it \(outline)."
+            : " No frame: it stands on its own silhouette, \(outline)\(form)."
+        return ([intro] + refs + [
+            "THE LOOK OF THIS SET: \(look)",
+            "THE SYMBOL: \(job.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". "))). \(roleLine(job, jobs: jobs, design: design))\(hue)\(frame)",
+            "Centre it and let it fill most of the square, with a small even margin so no part touches the edge. One clear focal point, big simple shapes and strong light-and-dark contrast, so it still reads at 64 pixels — no hairline detail, tiny text or scattered particles.",
+            backdropLine(backing),
+            bans(job),
+        ]).joined(separator: "\n\n")
+    }
+}
+
+
+/// Which favorite a sidebar reorder drag is over. Only the height counts: a drag that
+/// wanders sideways past the row's text is still aimed at that row.
+public enum SidebarReorder {
+    public static func target(rows: [(path: String, minY: Double, maxY: Double)], y: Double) -> String? {
+        rows.first { y >= $0.minY && y < $0.maxY }?.path
     }
 }

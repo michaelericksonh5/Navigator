@@ -14,6 +14,7 @@ import Network   // loopback listener for the Vertex sign-in callback
 import SQLite3   // read-only peek at Google Drive's own index — see googleDriveLocalPath
 import WebKit   // the signed-in Google session behind GDD to Assets
 import os
+import Vision   // on-device text recognition — finds lettering painted into generated art
 
 /// The dead-mount gate for ONE listing or walk, resolved once and carried.
 ///
@@ -927,7 +928,7 @@ final class FolderViewOptionsStore: ObservableObject {
 final class RecentFolders: ObservableObject {
     static let shared = RecentFolders()
     @Published var urls: [URL]
-    private let cap = 30
+    private let cap = 20
     // A remembered share may be offline; probing it here can prevent the first window.
     init() { urls = Prefs.recentFolders.map { URL(fileURLWithPath: $0, isDirectory: true) } }
     func record(_ url: URL) {
@@ -10364,6 +10365,13 @@ struct SidebarView: View {
     @ObservedObject private var volumesStore = VolumeLocations.shared
     @State private var favNodes: [SidebarNode] = []
     @State private var recentsTargeted = false
+    @AppStorage("recentsExpanded") private var recentsExpanded = false
+    /// Reordering favorites is a plain in-sidebar drag, not a drag-and-drop session: the
+    /// system drop never reliably reached the row under the mouse (the log shows it landing
+    /// on the dragged row itself, or nowhere). Each row carries a FavRowAnchor, and the drag
+    /// picks the row whose on-screen rect is under the mouse.
+    @State private var reorderDragging: String?
+    @State private var reorderOver: String?
     @State private var cloudNodes: [SidebarNode] = []
 
     @ViewBuilder private func row(_ loc: SidebarLocation) -> some View {
@@ -10504,44 +10512,6 @@ struct SidebarView: View {
         }
     }
 
-    /// The drag SOURCE half of favorite reordering; the drop half lives in
-    /// FolderDropRow, which is the row's one and only drop handler (read the trap
-    /// documented there before touching either).
-    ///
-    /// onDrag rather than draggable: the row's content is a full-width Button, and
-    /// the newer API loses the mouse-down to it, so the drag never starts. List's
-    /// .onMove isn't available either — these rows are OutlineGroups and a List only
-    /// reorders plain ForEach rows (tested).
-    private struct ReorderDrag: ViewModifier {
-        let path: String
-        let enabled: Bool
-        @ViewBuilder func body(content: Content) -> some View {
-            // The itemProvider closure is SwiftUI's only drag-start hook — `.onDrag` gives no
-            // end callback at all, so this source could previously leak a session with no
-            // trace in the log whatsoever. DragSessionTracker's polled watch supplies the end.
-            //
-            // It stays `.onDrag` rather than becoming a real NSDraggingSource, and that is a
-            // decision rather than an omission: the row's content is a full-width Button, an
-            // AppKit mouse-handling overlay on top of it would take the mouseDown the Button
-            // needs, and a SwiftUI gesture plus an AppKit mouseDown on one click double-fires.
-            // What the source needs instead is for its leaked state to be IMPOSSIBLE rather
-            // than watched, and it now is: this source holds no per-drag state of its own, its
-            // one entry in the ledger is ticketed so a stale poll cannot touch a later drag,
-            // and NavWindow.sendEvent gives it the exact mouseDown boundary it never had.
-            if enabled {
-                content.onDrag {
-                    // The start line this source never had. Its END was already logged (the
-                    // tracker's polled watch supplies it), which made the log strictly
-                    // misleading: an end with no start reads like a session that leaked from
-                    // nowhere. One line per drag, matching the icon grid's wording.
-                    navLog("sidebar reorder drag start: “\((path as NSString).lastPathComponent)” — carries a navreorder token, not a file")
-                    DragSessionTracker.shared.began("sidebar reorder")
-                    return ReorderToken.provider(path)
-                }
-            } else { content }
-        }
-    }
-
     // An expandable folder entry (Windows-11-style): disclosure triangle drills
     // into subfolders inline; clicking any node navigates the main view there.
     @ViewBuilder private func tree(_ node: SidebarNode, removable: Bool) -> some View {
@@ -10574,6 +10544,18 @@ struct SidebarView: View {
                 if n.mountURL != nil {   // network drive favorite → offer to disconnect
                     Button("Disconnect") { disconnectVolume(n.url, isNetwork: true) }
                 }
+                // Any other folder in the tree — a Cloud row like Google Drive, or a folder
+                // expanded under a favorite — can be pinned from here. It used to have no pin
+                // at all and no drag either, so a Shared drives folder reached through the
+                // Cloud tree could not become a favorite from the sidebar.
+                if !pinned && !isHome {
+                    Divider()
+                    if favStore.contains(n.url) {
+                        Button("Unpin from Sidebar") { favStore.remove(url: n.url) }
+                    } else {
+                        Button("Pin to Sidebar") { favStore.add(n.url) }
+                    }
+                }
                 if pinned {
                     Divider()
                     // Always-works alternative to aiming a drag.
@@ -10596,7 +10578,16 @@ struct SidebarView: View {
             // always ended in nothing happening.
             .modifier(FolderDropRow(folder: n.url, browser: browser,
                                     reorderOnto: removable && isTop ? n.url.path : nil))
-            .modifier(ReorderDrag(path: n.url.path, enabled: removable && isTop))
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.accentColor.opacity(pinned && reorderOver == n.url.path && reorderDragging != n.url.path ? 0.35 : 0))
+            )
+            .opacity(reorderDragging == n.url.path ? 0.5 : 1)
+            // AppKit, not a SwiftUI preference: a sidebar List hosts each row in its own
+            // table cell, so row frames reported by preference never reached the List and
+            // every release found "no other favorite".
+            .background(FavRowAnchor(path: removable && isTop ? n.url.path : nil))
+            .simultaneousGesture(removable && isTop ? reorderGesture(n.url.path) : nil)
         }
     }
 
@@ -10660,7 +10651,7 @@ struct SidebarView: View {
             }
             if !recents.urls.isEmpty {
                 Section {
-                    ForEach(recents.urls, id: \.self) { u in
+                    ForEach(recents.urls.prefix(recentsExpanded ? 20 : 5), id: \.self) { u in
                         Button { browser.navigate(to: u) } label: {
                             Label(u.lastPathComponent.isEmpty ? u.path : u.lastPathComponent, systemImage: "clock.arrow.circlepath")
                                 .frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
@@ -10677,6 +10668,10 @@ struct SidebarView: View {
                     HStack {
                         Text("Recent Folders")
                         Spacer()
+                        if recents.urls.count > 5 {
+                            Button(recentsExpanded ? "Show Less" : "Show More") { recentsExpanded.toggle() }
+                                .buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary)
+                        }
                         Button("Clear") { recents.clear() }.buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary)
                     }
                 }
@@ -10731,12 +10726,58 @@ struct SidebarView: View {
         .onChange(of: favStore.items) { rebuildFav() }
     }
 
+    /// Drag a favorite onto another to take its place. Home stays first (FavoritesStore).
+    private func reorderGesture(_ path: String) -> some Gesture {
+        DragGesture(minimumDistance: 6)
+            .onChanged { _ in
+                if reorderDragging == nil { navLog("sidebar reorder drag start: “\((path as NSString).lastPathComponent)”") }
+                reorderDragging = path
+                reorderOver = FavRowAnchor.row(under: NSEvent.mouseLocation, sameWindowAs: path)
+            }
+            .onEnded { _ in
+                defer { reorderDragging = nil; reorderOver = nil }
+                guard let onto = reorderOver, onto != path else {
+                    navLog("sidebar reorder: “\((path as NSString).lastPathComponent)” released on no other favorite")
+                    return
+                }
+                navLog("sidebar reorder: “\((path as NSString).lastPathComponent)” → onto “\((onto as NSString).lastPathComponent)”")
+                favStore.reorder(from: path, onto: onto)
+            }
+    }
+
     private func rebuildFav() {
         favNodes = favStore.items.map { SidebarNode(url: $0.url, name: $0.label, symbol: favoriteSymbol($0.url), mountURL: $0.mountURL) }
     }
     private func rebuildNodes() {
         rebuildFav()
         cloudNodes = cloudLocations().map { SidebarNode(url: $0.url, name: $0.name, symbol: $0.symbol) }
+    }
+}
+
+/// An invisible AppKit view behind each top-level favorite row, so the reorder drag can
+/// find the row under the mouse in screen coordinates. The path lives on the view (not in
+/// a path→view map) because the sidebar's table reuses cells for other rows.
+private struct FavRowAnchor: NSViewRepresentable {
+    let path: String?
+    final class Anchor: NSView {
+        var path: String?
+        static let all = NSHashTable<Anchor>.weakObjects()
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        var screenRect: CGRect? {
+            guard let w = window, !isHiddenOrHasHiddenAncestor else { return nil }
+            return w.convertToScreen(convert(bounds, to: nil))
+        }
+    }
+    func makeNSView(context: Context) -> Anchor { let v = Anchor(); Anchor.all.add(v); return v }
+    func updateNSView(_ v: Anchor, context: Context) { v.path = path }
+
+    static func row(under screenPoint: NSPoint, sameWindowAs path: String) -> String? {
+        let live = Anchor.all.allObjects.filter { $0.path != nil && $0.window != nil }
+        guard let win = live.first(where: { $0.path == path })?.window else { return nil }
+        let rows = live.filter { $0.window === win }.compactMap { a in
+            a.screenRect.flatMap { r in r.minX <= screenPoint.x && screenPoint.x < r.maxX ? (a.path!, Double(r.minY), Double(r.maxY)) : nil }
+        }
+        return SidebarReorder.target(rows: rows, y: Double(screenPoint.y))
     }
 }
 
@@ -19786,10 +19827,19 @@ enum H5GService {
     /// So this cannot be fixed in the app: the service must be redeployed to honour it
     /// (DEVOP-8733). Navigator asks anyway, so the day it lands nothing needs changing,
     /// and reports the mismatch rather than quietly using a lesser model.
+    ///
+    /// By 25 September 2026 it had landed: the image review asked for gemini-3.5-flash-lite
+    /// and for gemini-3.8-flash, and each call came back naming the model asked for.
     nonisolated(unsafe) static var wantedVisionModel = "gemini-3.8-flash"
+    /// How long a text/vision call may take. Three minutes suits a style read; a whole-set
+    /// design is a 5,000-word prompt answered with a 24-slot plan, which took 33 s on one run
+    /// and ran past 180 s on the next two, so the planner raises it for its own calls.
+    nonisolated(unsafe) static var describeTimeout: TimeInterval = 180
 
     /// The model id the service reported for the last /v1/vision call.
     nonisolated(unsafe) static var lastVisionModel: String?
+    /// …and for the last call that asked for its own model (the image review).
+    nonisolated(unsafe) static var lastReviewModel: String?
     /// True when the service answered with a model other than the one asked for.
     nonisolated(unsafe) static var visionModelOverridden = false
 
@@ -19843,7 +19893,10 @@ enum H5GService {
     /// malformed, which a planner cannot recover from.
     nonisolated(unsafe) static var responseSchema: [String: Any]?
 
-    static func describe(prompt: String, systemPrompt: String?, imagePNG: Data?)
+    /// `model` asks for a model for this call alone — the image review asks for the cheapest —
+    /// and then only this call's `schema` and `thinking` apply, not the planner's settings.
+    static func describe(prompt: String, systemPrompt: String?, imagePNG: Data?,
+                         model: String? = nil, schema: [String: Any]? = nil, thinking: String? = nil)
         -> (text: String?, cost: Double?, error: String?) {
         if PaidCalls.disabled { return (nil, nil, PaidCalls.refusal) }
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
@@ -19855,21 +19908,21 @@ enum H5GService {
         // Ask under every field name the service might read. Extra keys are ignored by
         // an API that does not know them, and the one that IS read wins.
         for k in ["model", "model_id", "text_model", "vision_model"] {
-            body[k] = Self.wantedVisionModel
+            body[k] = model ?? Self.wantedVisionModel
         }
         if let imagePNG, !imagePNG.isEmpty {
             body["input_images"] = [["mime": "image/png", "base64": imagePNG.base64EncodedString()]]
         }
         if let systemPrompt, !systemPrompt.isEmpty { body["system_prompt"] = systemPrompt }
-        if let t = Self.thinkingLevel { body["thinking_level"] = t }
-        if let sc = Self.responseSchema { body["response_schema"] = sc }
+        if let t = model == nil ? Self.thinkingLevel : thinking { body["thinking_level"] = t }
+        if let sc = model == nil ? Self.responseSchema : schema { body["response_schema"] = sc }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // The symbol-set designer sends the whole plan in one request and gets a long
         // JSON answer back; 60s was sized for a one-line image description.
-        req.timeoutInterval = 180
+        req.timeoutInterval = Self.describeTimeout
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         var out: (String?, Double?, String?) = (nil, nil, "no response")
         let sem = DispatchSemaphore(value: 0)
@@ -19889,8 +19942,12 @@ enum H5GService {
             // attributable. It pins this server-side; the app cannot choose.
             for k in ["model", "model_id", "text_model", "vision_model"] {
                 if let m = j[k] as? String, !m.isEmpty {
-                    Self.lastVisionModel = m
-                    Self.visionModelOverridden = (m != Self.wantedVisionModel)
+                    if model == nil {
+                        Self.lastVisionModel = m
+                        Self.visionModelOverridden = (m != Self.wantedVisionModel)
+                    } else {
+                        Self.lastReviewModel = m
+                    }
                     break
                 }
             }
@@ -21074,6 +21131,161 @@ if CommandLine.arguments.contains("--timing") {
 // it with `open` rather than from a shell: macOS credits permission checks to whoever
 // launched the process, so a shell-started run reports the shell's grants, not Navigator's.
 // Probes that would raise a macOS dialog are skipped unless the window already asked.
+// PAID test of the design pipeline, headless — the same steps as the window, logged in full:
+//   Navigator --design-test "<GDD document name>" "<theme name>" [--anchor <out-dir>]
+// Reads the document, loads the theme and its art, reads the art style (free when it was read
+// before), designs the set (plus one revision when the checks find something), and with
+// --anchor draws ONLY the anchor. Every call is metered, so this never runs on its own.
+if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let gddName = args[flag + 1], themeName = args[flag + 2]
+    func value(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    // --anchor <dir>: draw only the anchor. --generate <ids|all> --out <dir>: draw those.
+    // --reuse-plan <design or revision reply .json>: skip the paid design call.
+    let anchorOut = value("--anchor").map { URL(fileURLWithPath: $0) }
+    let generateList = value("--generate")
+    let genOut = value("--out").map { URL(fileURLWithPath: $0) }
+    let reusePlan = value("--reuse-plan")
+    // --low-pays royals|gemstones|themed|pebbles|"custom:<what>" — the window's Low pays menu.
+    let lowPayArg = value("--low-pays") ?? "royals"
+    setvbuf(stdout, nil, _IOLBF, 0)
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        func fail(_ m: String) -> Never { print("FAILED: \(m)"); exit(1) }
+        guard let folder = GDDLibrary.folder else { fail("no GDD folder is set") }
+        guard let entry = GDDLibrary.entries(in: folder).first(where: { $0.name == gddName })
+        else { fail("no document named “\(gddName)”") }
+        let run = GDDToAssetsRun()
+        if lowPayArg.hasPrefix("custom:") {
+            run.lowPays = .custom; run.lowPayCustom = String(lowPayArg.dropFirst("custom:".count))
+        } else if let k = LowPayKind(rawValue: lowPayArg) {
+            run.lowPays = k
+        } else { fail("--low-pays is one of \(LowPayKind.allCases.map(\.rawValue).joined(separator: ", ")), or custom:<what>") }
+        GDDLibrary.text(of: entry) { text, err in MainActor.assumeIsolated {
+            guard let text else { fail(err ?? "the document could not be read") }
+            run.load(gddText: text, gameName: entry.name, size: "2K", symbolAspect: "1:1",
+                     backgroundAspect: "3:4", backgroundSize: "4K")
+            print("GDD: \(run.symbols.count) symbols, \(run.jobs.count) images to plan")
+            ThemeHubClient.themes { list, err in MainActor.assumeIsolated {
+                guard let t = list?.first(where: { $0.name == themeName }) else { fail(err ?? "no theme named “\(themeName)”") }
+                run.theme = t
+                run.rehydrate()
+                run.readThemeStyle { MainActor.assumeIsolated {
+                    print("STYLE: \(run.styleRead) — \(run.status)")
+                    @MainActor func draw() {
+                        print("DESIGN: \(run.status)")
+                        print("LOG: \(run.logFolder?.path ?? "")")
+                        print("PROBLEMS: \(run.designProblems)")
+                        print(String(format: "SPENT: $%.4f", run.spent))
+                        guard run.planned, let a = run.anchorJob else { exit(0) }
+                        var ids: Set<String>
+                        let out: URL
+                        if let list = generateList, let o = genOut {
+                            ids = list == "all" ? Set(run.jobs.filter { !$0.subject.isEmpty }.map(\.id))
+                                                : Set(list.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces) })
+                            out = o
+                        } else if let o = anchorOut {
+                            ids = [a.id]; out = o
+                        } else { exit(0) }
+                        ids = ids.intersection(Set(run.jobs.map(\.id)))
+                        // Everything is drawn to match the anchor, as in the window: without its
+                        // image in the folder it is drawn first.
+                        if !FileManager.default.fileExists(atPath: out.appendingPathComponent(a.filename).path) { ids.insert(a.id) }
+                        try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+                        print("DRAWING: \(ids.sorted().joined(separator: ", ")) into \(out.path) — estimate $\(String(format: "%.2f", run.estimate(for: ids)))")
+                        run.generate(into: out, removeBackground: false, only: ids) { urls in
+                            MainActor.assumeIsolated {
+                                print("MADE: \(urls.map(\.lastPathComponent).sorted()) · failures \(run.failures)")
+                                print(String(format: "SPENT: $%.4f", run.spent))
+                            }
+                            // The run log's summary is written on a background queue.
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { exit(0) }
+                        }
+                    }
+                    if let path = reusePlan {
+                        guard let text = try? String(contentsOfFile: path, encoding: .utf8), run.adopt(planReply: text)
+                        else { fail("could not reuse the plan in \(path)") }
+                        draw()
+                    } else {
+                        run.designSet { MainActor.assumeIsolated { draw() } }
+                    }
+                } }
+            } }
+        } }
+    } }
+    app.run()
+}
+
+// Paid, about a tenth of a cent:  Navigator --review-image <png> <backing name> <subject> [role]
+// The Gemini image review of one picture, as the generator would see it — for checking the
+// reviewer against images whose faults are known.
+if let flag = CommandLine.arguments.firstIndex(of: "--review-image"), flag + 3 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    guard let png = try? Data(contentsOf: URL(fileURLWithPath: args[flag + 1])) else { print("FAILED: no image"); exit(1) }
+    let role = flag + 4 < args.count ? GDDSymbolSetRules.classify(args[flag + 4]).role : .unknown
+    let job = AssetJob(id: "X", kind: .symbol, role: role, tier: nil, title: "", subject: args[flag + 3], aspect: "1:1", size: "2K")
+    let r = H5GService.describe(prompt: ImageReview.prompt(for: job, backing: args[flag + 2]), systemPrompt: nil,
+                                imagePNG: downsamplePNG(png, longEdge: 768) ?? png,
+                                model: ImageReview.model, schema: ImageReview.schema)
+    print("MODEL: \(H5GService.lastReviewModel ?? "?")  COST: \(r.cost.map { String(format: "$%.5f", $0) } ?? "?")")
+    print(r.text ?? "FAILED: \(r.error ?? "")")
+    exit(r.text == nil ? 1 : 0)
+}
+
+// Free:  Navigator --list-themes   — every theme on the hub: name, category, tier, art.
+if CommandLine.arguments.contains("--list-themes") {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        ThemeHubClient.themes { list, err in
+            guard let list else { print("FAILED: \(err ?? "")"); exit(1) }
+            for t in list {
+                print([t.name, t.category, t.tier, t.hasArt ? "art" : "no art", t.status, "\(t.votes)"].joined(separator: "\t"))
+            }
+            exit(0)
+        }
+    } }
+    app.run()
+}
+
+// Score a finished set:  Navigator --score-set <folder> [backing hex, default FF00FF]
+//
+// The measurements a new run's log makes — colour spread, outline overlap, a flat backdrop,
+// backing-colour spill, edge contact — run on any folder of generated symbols. Free and local:
+// no model is called. Writes a session into the run logs with its summary, contact sheet and
+// a LATEST.md entry, so an old set can be compared with a new one on the same terms.
+if let flag = CommandLine.arguments.firstIndex(of: "--score-set"), flag + 1 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let dir = URL(fileURLWithPath: args[flag + 1])
+    let backing = (flag + 2 < args.count ? SlotBackingRules.hex(args[flag + 2]) : nil) ?? RGB8(255, 0, 255)
+    let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+        .filter { $0.pathExtension.lowercased() == "png" }
+        .map { $0.deletingPathExtension().lastPathComponent }
+        .filter { $0.hasPrefix("bg_") || $0.range(of: #"^[A-Za-z]+[0-9]*$"#, options: .regularExpression) != nil }
+    let jobs: [AssetJob] = files.map { id in
+        let c = GDDSymbolSetRules.classify(id)
+        return AssetJob(id: id, kind: id.hasPrefix("bg_") ? .background : .symbol, role: c.role, tier: c.tier,
+                        title: "", subject: "(scored)", aspect: "1:1", size: "2K")
+    }.sorted { ($0.role.priority, $0.tier ?? 0, $0.id) < ($1.role.priority, $1.tier ?? 0, $1.id) }
+    let log = GDDRunLog(game: "Scored — \(dir.lastPathComponent)", theme: "existing set")
+    for j in jobs {
+        if let d = try? Data(contentsOf: dir.appendingPathComponent(j.filename)) {
+            // Scored folders carry no plan, so a low pay is assumed to be a royal: its letter is its art.
+            log.record(image: d, id: j.id, backing: backing, isSymbol: j.kind == .symbol,
+                       expectsText: j.role == .lowPay)
+            log.event(["step": "image", "id": j.id, "delivered": pngPixelSize(d).map { "\($0.w)x\($0.h)" } ?? ""])
+        }
+    }
+    log.finishBatch(GDDRunLog.Snapshot(game: "Scored — \(dir.lastPathComponent)", theme: "existing set",
+                                       model: "(already generated)", backing: String(format: "#%02X%02X%02X", backing.r, backing.g, backing.b),
+                                       backingRGB: backing,
+                                       design: SetDesign(), jobs: jobs,
+                                       steps: jobs.map { RenderStep(id: $0.id, mode: .match, refs: [], after: []) },
+                                       problems: [], fixed: [], spent: 0))
+    print(log.folder.appendingPathComponent("summary.md").path)
+    exit(0)
+}
+
 if let flag = CommandLine.arguments.firstIndex(of: "--setup-report"), flag + 1 < CommandLine.arguments.count {
     let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
     app.setActivationPolicy(.accessory)
@@ -22932,6 +23144,433 @@ func nbEstimatedCost(size: String, modelFlag: String) -> Double {
     }
 }
 
+/// A reviewable record of one GDD to Assets session — what each model was asked, what it
+/// answered, and what every step cost — written as it happens, so a run can be reviewed, or
+/// two runs compared, after the window is closed. Kept on this Mac; nothing here is sent.
+///
+/// Until this existed the only trace of a run was the images: the design prompt, the
+/// model's plan, each image's prompt and the per-image cost were gone the moment the
+/// window closed, so "why did it design three pigs?" had no evidence to answer from.
+final class GDDRunLog {
+    static let root = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Navigator/GDD to Assets")
+    let folder: URL
+    private let lock = NSLock()
+
+    init(game: String, theme: String) {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HHmmss"
+        let name = "\(f.string(from: Date())) \(game.isEmpty ? "Game" : game) — \(theme.isEmpty ? "no theme" : theme)"
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        folder = Self.root.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder.appendingPathComponent("prompts"),
+                                                 withIntermediateDirectories: true)
+        navLog("gdd run: logging to \(folder.path)")
+    }
+
+    /// A whole file in the session folder — a prompt, a reply, the plan.
+    func write(_ name: String, _ text: String) {
+        try? text.write(to: folder.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    /// A picture kept with the run, as JPEG — the low-pay sheet before it was cut.
+    func writeJPEG(_ name: String, _ cg: CGImage) {
+        guard let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent(name) as CFURL,
+                                                         "public.jpeg" as CFString, 1, nil) else { return }
+        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary)
+        CGImageDestinationFinalize(dest)
+    }
+
+    /// One JSON line in events.jsonl, stamped.
+    func event(_ fields: [String: Any]) {
+        var f = fields
+        f["at"] = ISO8601DateFormatter().string(from: Date())
+        guard let d = try? JSONSerialization.data(withJSONObject: f, options: [.sortedKeys]),
+              var line = String(data: d, encoding: .utf8) else { return }
+        line += "\n"
+        lock.lock(); defer { lock.unlock() }
+        let url = folder.appendingPathComponent("events.jsonl")
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? Data(line.utf8).write(to: url)
+        }
+    }
+
+    // MARK: Images as they arrive
+
+    /// Scores and thumbnails, per image id, collected as each one arrives.
+    private var scores: [String: SymbolImageMetrics] = [:]
+    private var thumbs: [String: CGImage] = [:]
+    /// Lettering read off an image that should carry none.
+    private var lettering: [String: String] = [:]
+    /// What each card symbol reads as, and what it should read as when the plan says.
+    private var ranksRead: [String: String] = [:]
+    private var ranksWanted: [String: String] = [:]
+    /// The Gemini review of each image, when one was made.
+    private var reviews: [String: ImageReview] = [:]
+
+    /// Words painted into the art, read on this Mac. The model is told again and again not to
+    /// letter a background, and one of the four in a real run still came back with the game's
+    /// title across it — so it is checked, not trusted.
+    static func readText(_ cg: CGImage) -> String {
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate
+        req.usesLanguageCorrection = false
+        try? VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
+        return (req.results ?? []).compactMap { $0.topCandidates(1).first }
+            .filter { $0.confidence >= 0.5 && $0.string.filter(\.isLetter).count >= 3 }
+            .map(\.string).joined(separator: " ")
+    }
+
+    /// The card rank a royal reads as. The backing is keyed to white and everything else to
+    /// black, then Vision's fast recogniser is told the six ranks. On ten real royals the
+    /// accurate recogniser read nothing, and the fast one read each fused “A-K” as “A” and a
+    /// clean K as “K”. Nil when what it reads is not a rank — unknown, not wrong.
+    static func readRank(_ png: Data, backing: RGB8) -> String? {
+        guard let src = CGImageSourceCreateWithData(png as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        let n = 512
+        guard let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8, bytesPerRow: n * 4,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: n, height: n))
+        guard let px = ctx.data?.bindMemory(to: UInt8.self, capacity: n * n * 4) else { return nil }
+        let (br, bg, bb) = (Int(backing.r), Int(backing.g), Int(backing.b))
+        for o in stride(from: 0, to: n * n * 4, by: 4) {
+            let d = abs(Int(px[o]) - br) + abs(Int(px[o + 1]) - bg) + abs(Int(px[o + 2]) - bb)
+            let ink: UInt8 = d < 120 ? 255 : 0
+            px[o] = ink; px[o + 1] = ink; px[o + 2] = ink; px[o + 3] = 255
+        }
+        guard let bw = ctx.makeImage() else { return nil }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .fast
+        req.usesLanguageCorrection = false
+        req.customWords = GDDAssetPrompts.ranks
+        try? VNImageRequestHandler(cgImage: bw, options: [:]).perform([req])
+        // Only a confident capital counts. A real fused "A-K" read as "A" at 1.0; a perfectly good
+        // Q read as a lowercase "a" at 0.5, and redrawing it on that cost a sheet-made symbol.
+        let reads: [VNRecognizedText] = (req.results ?? []).compactMap { $0.topCandidates(1).first }
+        let sure = reads.filter { (t: VNRecognizedText) -> Bool in t.confidence >= 0.9 && t.string == t.string.uppercased() }
+        guard let best = sure.max(by: { $0.confidence < $1.confidence }) else { return nil }
+        return GDDAssetPrompts.rank(read: best.string)
+    }
+
+    /// A 256-px thumbnail for the summary, and — for a symbol — its measured scores.
+    /// A card symbol (`expectsText`) is read for its rank instead of for stray lettering.
+    func record(image png: Data, id: String, backing: RGB8, isSymbol: Bool, expectsText: Bool = false,
+                rank: String? = nil, review: ImageReview? = nil) {
+        guard let src = CGImageSourceCreateWithData(png as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
+        let side = 256
+        guard let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        let scale = Double(side) / Double(max(cg.width, cg.height))
+        let w = Double(cg.width) * scale, h = Double(cg.height) * scale
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: (Double(side) - w) / 2, y: (Double(side) - h) / 2, width: w, height: h))
+        guard let thumb = ctx.makeImage() else { return }
+        let url = folder.appendingPathComponent("thumbs/\(id).jpg")
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, thumb, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+        let m = isSymbol ? SymbolImageMetrics.measure(cg, backing: backing) : nil
+        // The review's reading when there is one; the reader on this Mac otherwise.
+        let text = expectsText ? "" : (review?.text ?? Self.readText(cg))
+        let read = expectsText ? (review != nil ? review?.cardText : Self.readRank(png, backing: backing)) : nil
+        lock.lock()
+        thumbs[id] = thumb; if let m { scores[id] = m }
+        if !text.isEmpty { lettering[id] = text }
+        ranksRead[id] = read; ranksWanted[id] = rank
+        reviews[id] = review
+        lock.unlock()
+    }
+
+    /// Every finished image on one sheet, in plan order. Drawn into its own bitmap, so it is
+    /// safe on the background queue a batch finishes on.
+    private func writeContactSheet(order: [String]) {
+        lock.lock(); let t = thumbs; lock.unlock()
+        let ids = order.filter { t[$0] != nil }
+        guard !ids.isEmpty else { return }
+        let cell = 200, label = 22, cols = min(6, ids.count), rows = (ids.count + cols - 1) / cols
+        let W = cols * cell, H = rows * (cell + label)
+        guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        ctx.setFillColor(CGColor(gray: 0.11, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        let g = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = g
+        for (i, id) in ids.enumerated() {
+            let x = (i % cols) * cell, y = H - (i / cols + 1) * (cell + label)
+            if let cg = t[id] { ctx.draw(cg, in: CGRect(x: x, y: y + label, width: cell, height: cell)) }
+            (id as NSString).draw(at: NSPoint(x: x + 6, y: y + 4), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.white])
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let img = ctx.makeImage() else { return }
+        let url = folder.appendingPathComponent("contact-sheet.jpg")
+        if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+    }
+
+    /// Every symbol keyed off its backing and laid out on a dark reel at about phone size —
+    /// readability is judged at reel size, not at 2048 pixels.
+    private func writeReelPreview(order: [String], backing: RGB8, symbols: Set<String>) {
+        lock.lock(); let t = thumbs; lock.unlock()
+        let ids = order.filter { t[$0] != nil && symbols.contains($0) }
+        guard !ids.isEmpty else { return }
+        let cell = 96, gap = 8, label = 18, cols = min(10, ids.count), rows = (ids.count + cols - 1) / cols
+        let W = cols * (cell + gap) + gap, H = rows * (cell + gap + label) + gap
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        ctx.setFillColor(CGColor(red: 0.11, green: 0.08, blue: 0.17, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        let g = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = g
+        for (i, id) in ids.enumerated() {
+            guard let thumb = t[id], let keyed = Self.keyed(thumb, backing: backing, space: space) else { continue }
+            let x = gap + (i % cols) * (cell + gap)
+            let y = H - (i / cols + 1) * (cell + gap + label)
+            ctx.interpolationQuality = .high
+            ctx.draw(keyed, in: CGRect(x: x, y: y + label, width: cell, height: cell))
+            (id as NSString).draw(at: NSPoint(x: x + 2, y: y + 2), withAttributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor(white: 0.9, alpha: 1)])
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let img = ctx.makeImage() else { return }
+        let url = folder.appendingPathComponent("reel-preview.jpg")
+        if let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+    }
+
+    /// A quick chroma key for the preview only: transparent near the backing, opaque away from it.
+    static func keyed(_ image: CGImage, backing: RGB8, space: CGColorSpace) -> CGImage? {
+        let w = image.width, h = image.height
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue), let raw = ctx.data else { return nil }
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let px = raw.bindMemory(to: UInt8.self, capacity: w * h * 4)
+        for i in 0..<(w * h) {
+            let o = i * 4
+            let d = abs(Int(px[o]) - Int(backing.r)) + abs(Int(px[o + 1]) - Int(backing.g)) + abs(Int(px[o + 2]) - Int(backing.b))
+            let a = d < 60 ? 0 : (d > 140 ? 255 : (d - 60) * 255 / 80)
+            px[o] = UInt8(Int(px[o]) * a / 255); px[o + 1] = UInt8(Int(px[o + 1]) * a / 255)
+            px[o + 2] = UInt8(Int(px[o + 2]) * a / 255); px[o + 3] = UInt8(a)
+        }
+        return ctx.makeImage()
+    }
+
+    // MARK: The summary
+
+    /// What the run log needs from the window, captured on the main thread.
+    struct Snapshot {
+        let game: String, theme: String, model: String, backing: String
+        var backingRGB = RGB8(255, 0, 255)
+        let design: SetDesign, jobs: [AssetJob], steps: [RenderStep]
+        let problems: [String], fixed: [String], spent: Double
+    }
+
+    private func events() -> [[String: Any]] {
+        guard let text = try? String(contentsOf: folder.appendingPathComponent("events.jsonl"), encoding: .utf8)
+        else { return [] }
+        return text.split(separator: "\n").compactMap {
+            (try? JSONSerialization.jsonObject(with: Data($0.utf8))) as? [String: Any]
+        }
+    }
+
+    /// The automatic verdict on the finished images — what a person would notice looking at
+    /// the set side by side, as numbers.
+    private func verdict(_ snap: Snapshot) -> [String] {
+        lock.lock(); let m = scores; let words = lettering; let read = ranksRead; let wanted = ranksWanted
+        let seen = reviews; lock.unlock()
+        guard !m.isEmpty || !words.isEmpty else { return [] }
+        var out: [String] = []
+        for (id, t) in words.sorted(by: { $0.key < $1.key }) {
+            out.append("⚠ \(id) has lettering painted into it: “\(t.prefix(60))”.")
+        }
+        out += GDDAssetPrompts.rankProblems(read: read, wanted: wanted)
+        // What the Gemini review saw that the numbers below cannot.
+        for (id, r) in seen.sorted(by: { $0.key < $1.key }) {
+            let card = wanted[id] != nil
+            if r.scene && !(m[id]?.backingMissing ?? false) {
+                out.append("⚠ \(id) has a scene painted behind it (the review saw it) — it can't be keyed; redo it.")
+            }
+            if r.panel { out.append("⚠ \(id) sits on a card or tile that was not planned — the key will leave it in; redo it.") }
+            if r.characterLeak { out.append("⚠ \(id) shows a person or figure, but it was planned as an object.") }
+            if card && r.cardText == nil { out.append("⚠ \(id)'s letter could not be read by the review — check it is legible.") }
+            if !card && !r.matches { out.append("⚠ \(id) doesn't look like its plan\(r.note.isEmpty ? "." : ": \(r.note)")") }
+        }
+        let byID = Dictionary(snap.jobs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let hues = m.values.map(\.hue).filter { !$0.isEmpty }
+        if let (hue, n) = Dictionary(grouping: hues, by: { $0 }).map({ ($0.key, $0.value.count) }).max(by: { $0.1 < $1.1 }),
+           hues.count >= 6, Double(n) / Double(hues.count) > 0.35 {
+            out.append("⚠ \(n) of \(hues.count) symbols came out \(hue) — the set reads as one colour.")
+        }
+        for j in snap.jobs where j.kind == .symbol {
+            if let x = m[j.id], x.backingMissing {
+                out.append("⚠ \(j.id) has a scene painted behind it instead of the flat backing — it can't be keyed; redo it.")
+            }
+        }
+        for j in snap.jobs where j.kind == .symbol && !j.hue.isEmpty {
+            // Whole symbol OR its middle: a framed jackpot's purple gem inside a gold frame is
+            // purple, whatever the frame makes the whole picture average out to.
+            if let x = m[j.id], !x.hue.isEmpty, !SetDesignRules.near(j.hue, x.hue),
+               !(x.centreHue.isEmpty == false && SetDesignRules.near(j.hue, x.centreHue)) {
+                out.append("⚠ \(j.id) was planned \(j.hue) but came out \(x.hue).")
+            }
+        }
+        let hp = snap.jobs.filter { $0.role == .highPay }.compactMap { j in m[j.id].map { (j.id, $0.hue) } }
+        for (hue, same) in Dictionary(grouping: hp, by: { $0.1 }) where same.count > 1 {
+            out.append("⚠ \(same.map(\.0).sorted().joined(separator: ", ")) came out the same colour (\(hue)).")
+        }
+        // Outlines: every pair outside a family, cropped to their own bounds first.
+        // ponytail: 0.9 is calibrated on two real sets, not published — identical outlines
+        // (plaque against plaque, circle against circle) scored 0.93–0.95, while different
+        // but compact ones (a pig against a round dial) scored 0.82–0.84. Re-check it on
+        // more sets; the research's suggested 0.8 flagged the second group.
+        let ids = m.keys.sorted()
+        var alike: [(Double, String, String)] = []
+        for (i, a) in ids.enumerated() {
+            for b in ids[(i + 1)...] {
+                let ra = byID[a]?.role, rb = byID[b]?.role
+                // Jackpot tiers and value symbols share an outline by design; low pays do not —
+                // each is its own thing, so two pebbles of one shape are flagged like any pair.
+                if let ra, ra == rb, ra.isFamily, ra != .lowPay { continue }
+                // Feature coins beside the value or jackpot coins: sharing the coin's shape is
+                // the hold-and-win convention; colour tells them apart and is checked above.
+                let coin: Set<SlotSymbolRole> = [.collector, .activator, .adder, .multiplier]
+                if let ra, let rb, (coin.contains(ra) && rb.isFamily) || (coin.contains(rb) && ra.isFamily) { continue }
+                // Coins among coins — bonus, collector, value, jackpot — are round in every shipped
+                // game; and low pays in their own colours may resemble each other (snow globes).
+                if let ra, let rb, SetDesignRules.coinRoles.contains(ra) && SetDesignRules.coinRoles.contains(rb) { continue }
+                if ra == .lowPay && rb == .lowPay, !SetDesignRules.near(m[a]!.hue, m[b]!.hue) { continue }
+                if let o = SymbolImageMetrics.alike(m[a]!, m[b]!), o >= 0.9 { alike.append((o, a, b)) }
+            }
+        }
+        alike.sort { $0.0 > $1.0 }
+        if !alike.isEmpty {
+            out.append("⚠ \(alike.count) pair\(alike.count == 1 ? "" : "s") of unrelated symbols share an outline (≥90% overlap): "
+                     + alike.prefix(5).map { "\($0.1)–\($0.2) \(Int($0.0 * 100))%" }.joined(separator: ", ") + ".")
+        }
+        for id in ids {
+            guard let x = m[id] else { continue }
+            if x.backdropPurity < 0.9 { out.append("⚠ \(id): the backdrop isn’t flat (\(Int(x.backdropPurity * 100))% pure) — keying will struggle.") }
+            // ponytail: 2% is a judgement call; the research's 0.5% flagged every real image.
+            if x.spill > 0.02 { out.append("⚠ \(id): \(String(format: "%.1f", x.spill * 100))% of the art is close to the backing colour — a chroma key would eat it (glow or tint around the symbol, or a colour too near the backing).") }
+            if x.touchesEdge { out.append("⚠ \(id) runs into the edge of the canvas.") }
+        }
+        if out.isEmpty { out.append("✓ No problems found: colours spread, outlines distinct, backdrops flat, no stray lettering, card letters read right\(seen.isEmpty ? "" : ", and the review saw nothing wrong").") }
+        return out
+    }
+
+    /// Rewrites summary.md from everything known so far, then LATEST.md.
+    func writeSummary(_ snap: Snapshot) {
+        let ev = events()
+        lock.lock(); let m = scores; lock.unlock()
+        let verdictLines = verdict(snap)
+        var md = "# \(snap.game.isEmpty ? "Game" : snap.game) — \(snap.theme)\n\n"
+        md += "\(folder.lastPathComponent.prefix(17)) · \(snap.model) · backing \(snap.backing) · "
+        md += String(format: "spent in this window $%.3f\n\n", snap.spent)
+        if !verdictLines.isEmpty { md += "## Verdict on the images\n\n" + verdictLines.map { "- \($0)" }.joined(separator: "\n") + "\n\n" }
+        if FileManager.default.fileExists(atPath: folder.appendingPathComponent("reel-preview.jpg").path) {
+            md += "At reel size, keyed:\n\n![reel preview](reel-preview.jpg)\n\n"
+        }
+        if FileManager.default.fileExists(atPath: folder.appendingPathComponent("contact-sheet.jpg").path) {
+            md += "![contact sheet](contact-sheet.jpg)\n\n"
+        }
+        md += "## The design\n\n"
+        md += snap.design.hero.isEmpty ? "- Hero: none — a pure-symbol game\n" : "- Hero: \(snap.design.hero)\n"
+        md += "- Drawn first, sets the look: \(snap.steps.first { $0.mode == .anchor }?.id ?? "—")\n"
+        if !snap.design.look.isEmpty { md += "- Look: \(snap.design.look)\n" }
+        for (k, v) in snap.design.families.sorted(by: { $0.key < $1.key }) { md += "- \(k) family: \(v)\n" }
+        if !snap.fixed.isEmpty { md += "\nFixed by the second design pass:\n" + snap.fixed.map { "- \($0)" }.joined(separator: "\n") + "\n" }
+        md += snap.problems.isEmpty ? "\nChecks: nothing flagged.\n"
+            : "\nStill flagged by the checks:\n" + snap.problems.map { "- \($0)" }.joined(separator: "\n") + "\n"
+
+        let images = Dictionary(ev.filter { $0["step"] as? String == "image" }.compactMap { e in
+            (e["id"] as? String).map { ($0, e) } }, uniquingKeysWith: { _, b in b })
+        md += "\n## Symbols, in drawing order\n\n| # | ID | Role | Planned | Measured | Outline | Attached | Delivered | Cost | Time | Image |\n|---|---|---|---|---|---|---|---|---|---|---|\n"
+        let byID = Dictionary(snap.jobs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        for (i, st) in snap.steps.enumerated() {
+            guard let j = byID[st.id] else { continue }
+            let e = images[j.id]
+            let refs = (e?["refs"] as? [String] ?? st.refs).map { $0 == RenderPlan.themeArt ? "concept art" : $0 }
+            let err = (e?["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            md += "| \(i + 1) | \(j.id) | \(j.kind == .background ? "Background" : j.role.label) | \(j.hue) | \(m[j.id]?.hue ?? "") | \(j.shape) | \(refs.isEmpty ? "—" : refs.joined(separator: ", ")) | "
+            md += "\(err.map { "FAILED: \($0.prefix(60))" } ?? (e?["delivered"] as? String ?? "not made")) | "
+            md += (e?["cost"] as? Double).map { String(format: "$%.3f", $0) } ?? ""
+            md += " | " + ((e?["seconds"] as? Double).map { String(format: "%.0fs", $0) } ?? "")
+            md += " | " + (FileManager.default.fileExists(atPath: folder.appendingPathComponent("thumbs/\(j.id).jpg").path)
+                           ? "![](thumbs/\(j.id).jpg)" : "") + " |\n"
+        }
+        let calls = ev.filter { ["design", "revision", "style-read", "symbol-extraction"].contains($0["step"] as? String ?? "") }
+        if !calls.isEmpty {
+            md += "\n## Gemini calls\n\n| Step | Cost | Time | Prompt words | Error |\n|---|---|---|---|---|\n"
+            for c in calls {
+                md += "| \(c["step"] as? String ?? "") | " + String(format: "$%.4f", c["cost"] as? Double ?? 0)
+                md += " | " + String(format: "%.1fs", c["seconds"] as? Double ?? 0)
+                md += " | \(c["promptWords"] as? Int ?? 0) | \(c["error"] as? String ?? "") |\n"
+            }
+        }
+        md += "\n## Files\n\n- `ideas-and-prompts.md` — every symbol idea and its exact Nano Banana 2 prompt\n"
+        md += "- `design-prompt.txt`, `design-reply.json` (and `revision-*`) — the design calls, verbatim\n"
+        md += "- `prompts/` — the prompt each image was actually sent, with what was attached\n"
+        md += "- `events.jsonl` — one line per step: cost, time, size, errors\n"
+        write("summary.md", md)
+        try? verdictLines.joined(separator: "\n").write(to: folder.appendingPathComponent("verdict.txt"),
+                                                         atomically: true, encoding: .utf8)
+        Self.updateLatest()
+    }
+
+    /// Called when a batch ends: the contact sheet, then the summary.
+    @discardableResult
+    func finishBatch(_ snap: Snapshot) -> [String] {
+        writeContactSheet(order: snap.steps.map(\.id))
+        writeReelPreview(order: snap.steps.map(\.id), backing: snap.backingRGB,
+                         symbols: Set(snap.jobs.filter { $0.kind == .symbol }.map(\.id)))
+        writeSummary(snap)
+        return verdict(snap)
+    }
+
+    /// LATEST.md at the top of the log folder: the three newest sessions, verdict first.
+    /// Older sessions are pruned past the newest twenty runs and the newest five scorings —
+    /// counted apart, because fifteen scorings in a row once pushed out every paid design
+    /// they were being compared with.
+    static func updateLatest() {
+        let fm = FileManager.default
+        let dirs = ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+        let scored = dirs.filter { $0.lastPathComponent.contains(" Scored — ") }
+        for old in scored.dropFirst(5) + dirs.filter({ !scored.contains($0) }).dropFirst(20) {
+            try? fm.removeItem(at: old)
+        }
+        var md = "# The latest GDD to Assets runs\n\nNewest first. Each links to its full summary: the design, every Gemini call, every image prompt and what came back.\n"
+        for d in dirs.prefix(3) {
+            let name = d.lastPathComponent
+            let verdict = (try? String(contentsOf: d.appendingPathComponent("verdict.txt"), encoding: .utf8)) ?? ""
+            let enc = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+            md += "\n## \(name)\n\n[summary](\(enc)/summary.md) · [ideas & prompts](\(enc)/ideas-and-prompts.md)\n\n"
+            md += verdict.isEmpty ? "No images yet.\n" : verdict.split(separator: "\n").map { "- \($0)" }.joined(separator: "\n") + "\n"
+        }
+        try? md.write(to: root.appendingPathComponent("LATEST.md"), atomically: true, encoding: .utf8)
+    }
+
+    /// The plan as a table a person can read, in slot order.
+    static func planTable(_ jobs: [AssetJob]) -> String {
+        (["id\trole\thue\tshape\tframe\tsilhouette\tvariation\tsubject"] + jobs.map {
+            "\($0.id)\t\($0.kind == .background ? "background" : $0.role.label)\t\($0.hue)\t\($0.shape)\t\($0.hasFrame ? "frame" : "-")\t\($0.silhouette)\t\($0.variation)\t\($0.subject)"
+        }).joined(separator: "\n") + "\n"
+    }
+}
+
 @MainActor
 final class GDDToAssetsRun: ObservableObject {
     @Published var jobs: [AssetJob] = []
@@ -23013,6 +23652,42 @@ final class GDDToAssetsRun: ObservableObject {
         case idle, fetchingArt, reading, ok, noArt, failed(String)
     }
     @Published var styleRead: StyleRead = .idle
+    /// The set-level decisions from the last design: hero, the slot drawn first, the shared look.
+    @Published var design = SetDesign()
+    /// What the low pays are to be — the artist's pick, Royals unless they choose — and what
+    /// the plan on screen was designed with, so a changed pick is noticed before paying for it.
+    @Published var lowPays: LowPayKind = .royals
+    @Published var lowPayCustom = ""
+    @Published var designedLowPays: (kind: LowPayKind, custom: String)?
+    /// What the checks fixed on the automatic second pass, and what they still flag.
+    @Published var fixedProblems: [String] = []
+    func resetDesign() { design = SetDesign(); fixedProblems = [] }
+    /// The checks, live — so an edit to a row is reflected before anything is paid for.
+    var designProblems: [String] {
+        SetDesignRules.problems(jobs, design, reserved: reservedHues, lowPays: designedLowPays?.kind)
+    }
+    /// The colour families the backing claims — kept off the symbols.
+    var reservedHues: Set<String> { SlotBackingRules.reserved(backing.name) }
+    /// The last batch's verdict on its images, for the window. Shown beside the anchor so a
+    /// defect in it is seen before every other symbol copies it.
+    @Published var lastVerdict: [String] = []
+
+    /// Choose the backing from the theme art's own colours, BEFORE the design, so the design
+    /// can keep the backing's colours off the symbols.
+    func chooseBacking() {
+        guard let t = theme, let b64 = t.artBase64, let bytes = Data(base64Encoded: b64),
+              let src = CGImageSourceCreateWithData(bytes as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
+        backing = SlotBackingRules.choose(themeArtShares: SymbolImageMetrics.hueShares(cg))
+    }
+    /// The slot drawn first. Every other symbol is shown its finished image.
+    var anchorJob: AssetJob? { SetDesignRules.anchor(jobs, design) }
+    /// The anchor's finished image in this run's folder, once it exists.
+    var anchorImageURL: URL? {
+        guard let a = anchorJob, let f = lastFolder else { return nil }
+        let u = f.appendingPathComponent(a.filename)
+        return FileManager.default.fileExists(atPath: u.path) ? u : nil
+    }
     @Published var palette: [RGB8] = []
     @Published var backing = SlotBackingRules.candidates[2]
     @Published var missing: [String] = []
@@ -23047,6 +23722,18 @@ final class GDDToAssetsRun: ObservableObject {
     /// direction — which then gets generated and paid for.
     private var revision = 0
     func invalidate() { revision += 1 }
+
+    /// This session's log. A new one starts when the inputs change — a different document
+    /// or theme is a different run, and mixing them would make the record lie.
+    private var runLog: GDDRunLog?
+    private var runLogRevision = -1
+    var logFolder: URL? { runLog?.folder }
+    func session() -> GDDRunLog {
+        if let l = runLog, runLogRevision == revision { return l }
+        let l = GDDRunLog(game: gameName, theme: theme?.name ?? "")
+        runLog = l; runLogRevision = revision
+        return l
+    }
 
     var clashes: [String: [String]] { GDDAssetPrompts.silhouetteClashes(jobs) }
     var planned: Bool { !jobs.isEmpty && jobs.allSatisfy { !$0.subject.isEmpty } }
@@ -23087,6 +23774,7 @@ final class GDDToAssetsRun: ObservableObject {
               + AssetPlanRules.backgroundJobs(gddText: text, size: backgroundSize,
                                               aspect: backgroundAspect)
         missing = []; palette = []
+        resetDesign(); lastFolder = nil
         // Codes the document talks about but never declares. Reported, never added.
         undeclared = GDDSymbolSetRules.mentionedButNotDeclared(in: text, symbols: symbols)
 
@@ -23187,6 +23875,11 @@ final class GDDToAssetsRun: ObservableObject {
                 // Reading the reference art is a paid vision call. Dropping its cost made
                 // "Spent so far" quietly wrong, which is the one number that must not be.
                 self.spent += r.cost ?? 0
+                let log = self.session()
+                log.write("style-read.txt", r.text ?? "(no reply) \(r.error ?? "")")
+                log.event(["step": "style-read", "theme": t.name, "cost": r.cost ?? 0, "error": r.error ?? ""])
+                navLog(String(format: "gdd style: read %@’s reference art — $%.4f%@", t.name, r.cost ?? 0,
+                              r.error.map { " — FAILED: \($0)" } ?? ""))
                 if let text = r.text, !text.isEmpty {
                     self.theme?.styleFromArt = text
                     var c = Self.styleCache; c[Self.styleKey(t)] = text; Self.styleCache = c
@@ -23214,9 +23907,10 @@ final class GDDToAssetsRun: ObservableObject {
         symbolsInferred = false; fromShippedArt = false
         plausibilityWarning = GDDSymbolPlausibility.warning(r.symbols, inferred: false)
         jobs = AssetPlanRules.symbolJobs(r.symbols, size: size, aspect: symbolAspect)
-            + AssetPlanRules.backgroundJobs(gddText: "base game and free spins bonus game",
+            + AssetPlanRules.backgroundJobs(gddText: "base game and bonus games",
                                             size: backgroundSize, aspect: backgroundAspect)
         missing = []; palette = []
+        resetDesign(); lastFolder = nil
         status = r.symbols.isEmpty
             ? "Type the symbols this game needs, e.g. \(GDDSymbolSetRules.typicalSet)"
             : "\(r.symbols.count) symbols · \(jobs.count) images to make."
@@ -23242,6 +23936,11 @@ final class GDDToAssetsRun: ObservableObject {
             DispatchQueue.main.async {
                 self.busy = false
                 self.spent += r.cost ?? 0
+                let log = self.session()
+                log.write("symbol-extraction-reply.json", r.text ?? "(no reply) \(r.error ?? "")")
+                log.event(["step": "symbol-extraction", "cost": r.cost ?? 0, "error": r.error ?? ""])
+                navLog(String(format: "gdd: symbols inferred with Gemini for %@ — $%.4f%@", self.gameName,
+                              r.cost ?? 0, r.error.map { " — FAILED: \($0)" } ?? ""))
                 guard rev == self.revision else { completion?(); return }
                 guard let t = r.text, let j = GDDAssetPrompts.json(fromModelReply: t) else {
                     self.status = "Couldn’t find a symbol set in that document."
@@ -23254,6 +23953,7 @@ final class GDDToAssetsRun: ObservableObject {
                 }
                 self.symbols = found
                 self.symbolsInferred = true
+                self.resetDesign(); self.lastFolder = nil
                 self.plausibilityWarning = GDDSymbolPlausibility.warning(found, inferred: true,
                                                                          gddText: text)
                 self.jobs = AssetPlanRules.symbolJobs(found, size: size, aspect: symbolAspect)
@@ -23266,14 +23966,9 @@ final class GDDToAssetsRun: ObservableObject {
         }
     }
 
-    /// The designer pass: one model call that assigns a subject to every slot.
-    func designSet(completion: (() -> Void)? = nil) {
-        guard let theme else { status = "Pick a theme first."; return }
-        guard !jobs.isEmpty else { status = "Load a GDD first."; return }
-        busy = true; status = "Designing the symbol set…"
-        let prompt = GDDAssetPrompts.planning(theme: theme, gameName: gameName, jobs: jobs,
-                                              gddText: gddText)
-        let sys = GDDAssetPrompts.planningSystem
+    /// One planning call — the design, or its revision — logged in full.
+    private func planCall(_ prompt: String, system sys: String, ids: [String], log: GDDRunLog,
+                          name: String, done: @escaping (_ text: String?, _ error: String?) -> Void) {
         // Thinking stays at the documented default (MEDIUM). HIGH was measured over three
         // runs against the same GDD and did not improve adherence — frames rose 3.7->4.0
         // but the low-pay subjects fell 3.0->2.0 and the named characters 5.0->4.7, at 8%
@@ -23282,49 +23977,272 @@ final class GDDToAssetsRun: ObservableObject {
         // The ENVELOPE is constrained; subject and silhouette stay free text. Constraining
         // the creative fields is the one thing the published work on forced structured
         // output suggests costs quality, and it would buy nothing here.
-        H5GService.responseSchema = GDDAssetPrompts.planSchema(ids: jobs.map(\.id))
-        let snapshot = jobs
-        let rev = revision
+        H5GService.responseSchema = GDDAssetPrompts.planSchema(ids: ids, reserved: reservedHues)
+        let leanSchema = GDDAssetPrompts.planSchema(ids: ids, reserved: reservedHues, lean: true)
+        H5GService.describeTimeout = 420
+        log.write("\(name)-prompt.txt", "SYSTEM:\n\(sys)\n\nUSER:\n\(prompt)\n")
+        let started = Date()
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = H5GService.describe(prompt: prompt, systemPrompt: sys, imagePNG: nil)
+            var r = H5GService.describe(prompt: prompt, systemPrompt: sys, imagePNG: nil)
+            // Vertex refusing the schema itself — too many constraints to serve — gets the lean
+            // schema straight away; it is the one request that is certain to fail again as is.
+            if let e = r.error, e.contains("INVALID_ARGUMENT") {
+                navLog("gdd \(name): Vertex rejected the answer schema — retrying with the lean one")
+                H5GService.responseSchema = leanSchema
+                let again = H5GService.describe(prompt: prompt, systemPrompt: sys, imagePNG: nil)
+                r = (again.text, (r.cost ?? 0) + (again.cost ?? 0), again.error)
+            }
+            // Once more on a status Google calls transient (429, 408, 5xx) — a 502 "fetch
+            // failed" from the service means the work never happened. A bare timeout is NOT
+            // retried: the design may have finished and been billed.
+            if let e = r.error, ImageRequestPolicy.shouldRetry(errorMessage: e) {
+                navLog("gdd \(name): \(e.prefix(120)) — retrying once")
+                Thread.sleep(forTimeInterval: ImageRequestPolicy.backoff(forAttempt: 1, jitter: Double.random(in: 0...1)))
+                let again = H5GService.describe(prompt: prompt, systemPrompt: sys, imagePNG: nil)
+                r = (again.text, (r.cost ?? 0) + (again.cost ?? 0), again.error)
+            }
             DispatchQueue.main.async {
                 // Per-call settings, cleared so a later style read does not inherit them.
                 H5GService.thinkingLevel = nil
                 H5GService.responseSchema = nil
-                self.busy = false
+                H5GService.describeTimeout = 180
                 // Count what the service charged BEFORE deciding whether the answer was
-                // usable. A billed reply that turns out not to be JSON still cost money,
-                // and dropping it made the running total quietly understate the spend.
+                // usable. A billed reply that turns out not to be JSON still cost money.
                 self.spent += r.cost ?? 0
-                guard rev == self.revision else {
-                    self.status = "That plan was for a different game — design the set again."
-                    completion?(); return
-                }
-                if let e = r.error { self.status = "Couldn’t design the set: \(e)"; completion?(); return }
-                guard let text = r.text, let j = GDDAssetPrompts.json(fromModelReply: text) else {
-                    self.status = "The model didn’t answer with a plan. Try again."
-                    completion?(); return
-                }
-                let applied = GDDAssetPrompts.apply(planJSON: j, to: snapshot)
-                self.jobs = applied.jobs
-                self.missing = applied.missing
-                self.palette = applied.palette
-                self.backing = SlotBackingRules.choose(palette: applied.palette)
-                var s = "Set designed — \(applied.jobs.count - applied.missing.count) of \(applied.jobs.count) filled."
-                s += " Backing: \(self.backing.name)."
-                if !applied.missing.isEmpty { s += " Missing: \(applied.missing.joined(separator: ", "))." }
-                self.status = s
-                completion?()
+                let secs = Date().timeIntervalSince(started)
+                log.write("\(name)-reply.json", r.text ?? "(no reply) \(r.error ?? "")")
+                log.event(["step": name, "cost": r.cost ?? 0, "seconds": secs,
+                           "promptWords": prompt.split(whereSeparator: \.isWhitespace).count,
+                           "error": r.error ?? ""])
+                navLog(String(format: "gdd %@: %@ × %@ — %d slots, $%.4f, %.1fs%@", name,
+                              self.gameName, self.theme?.name ?? "", ids.count, r.cost ?? 0, secs,
+                              r.error.map { " — FAILED: \($0)" } ?? ""))
+                done(r.text, r.error)
             }
         }
+    }
+
+    /// The designer pass: one model call that assigns a subject, a colour and an outline to
+    /// every slot and makes the set-level decisions — then the free checks, and ONE revision
+    /// pass when they find something. Revising costs about what designing did; drawing a
+    /// flawed set costs a hundred times more.
+    func designSet(completion: (() -> Void)? = nil) {
+        guard let theme else { status = "Pick a theme first."; return }
+        guard !jobs.isEmpty else { status = "Load a GDD first."; return }
+        busy = true; status = "Designing the symbol set…"
+        chooseBacking()
+        let reserved = reservedHues
+        let picked = (kind: lowPays, custom: lowPayCustom)
+        let prompt = GDDAssetPrompts.planning(theme: theme, gameName: gameName, jobs: jobs,
+                                              gddText: gddText, backing: backing.name, reserved: reserved,
+                                              lowPays: picked.kind, customLowPays: picked.custom)
+        let sys = GDDAssetPrompts.planningSystem
+        let snapshot = jobs, ids = jobs.map(\.id)
+        let rev = revision
+        let log = session()
+        func stale() -> Bool {
+            guard rev == self.revision else {
+                self.busy = false
+                self.status = "That plan was for a different game — design the set again."
+                completion?()
+                return true
+            }
+            return false
+        }
+        @MainActor func handle(_ text: String?, _ err: String?, retried: Bool) {
+            if stale() { return }
+            if let err { self.busy = false; self.status = "Couldn’t design the set: \(err)"; completion?(); return }
+            guard let text, let j = GDDAssetPrompts.json(fromModelReply: text) else {
+                // Once more: an unreadable plan is usually a model that looped in one field,
+                // and the next answer is usually fine. The field limits keep the retry cheap.
+                if !retried {
+                    navLog("gdd design: the reply was not a readable plan (\(text?.count ?? 0) chars) — asking once more")
+                    self.status = "The first answer wasn’t a readable plan — asking once more…"
+                    self.planCall(prompt, system: sys, ids: ids, log: log, name: "design-retry") { t, e in
+                        handle(t, e, retried: true)
+                    }
+                    return
+                }
+                self.busy = false; self.status = "The model didn’t answer with a plan. Try again."
+                completion?(); return
+            }
+            let first = GDDAssetPrompts.apply(planJSON: j, to: snapshot)
+            let problems = SetDesignRules.problems(first.jobs, first.design, reserved: reserved, lowPays: picked.kind)
+            log.event(["step": "checks", "problems": problems])
+            guard !problems.isEmpty else {
+                self.install(first, fixed: [], log: log, lowPays: picked); completion?(); return
+            }
+            // Up to two revision passes, each re-checked, keeping the plan with the fewest
+            // problems: one pass fixed four problems and made two new ones.
+            let firstProblems = problems
+            @MainActor func revise(_ plan: (jobs: [AssetJob], missing: [String], palette: [RGB8], design: SetDesign),
+                        reply: String, problems: [String], pass: Int) {
+                self.status = "Designed — sending it back to fix \(problems.count) thing\(problems.count == 1 ? "" : "s") the checks found (pass \(pass))…"
+                let fix = GDDAssetPrompts.revision(brief: prompt, planReply: reply, problems: problems)
+                self.planCall(fix, system: sys, ids: ids, log: log, name: "revision-\(pass)") { t2, e2 in
+                    if stale() { return }
+                    var best = plan, bestProblems = problems, bestReply = reply
+                    if e2 == nil, let t2, let j2 = GDDAssetPrompts.json(fromModelReply: t2) {
+                        let next = GDDAssetPrompts.apply(planJSON: j2, to: snapshot)
+                        let nextProblems = SetDesignRules.problems(next.jobs, next.design, reserved: reserved,
+                                                                   lowPays: picked.kind)
+                        log.event(["step": "checks-after-revision-\(pass)", "problems": nextProblems])
+                        if next.missing.count <= plan.missing.count && nextProblems.count <= problems.count {
+                            best = next; bestProblems = nextProblems; bestReply = t2
+                        }
+                    }
+                    if !bestProblems.isEmpty && pass < 2 && bestReply != reply {
+                        revise(best, reply: bestReply, problems: bestProblems, pass: pass + 1)
+                        return
+                    }
+                    let fixed = firstProblems.filter { !bestProblems.contains($0) }
+                    self.install(best, fixed: fixed, log: log, lowPays: picked)
+                    completion?()
+                }
+            }
+            revise(first, reply: text, problems: problems, pass: 1)
+        }
+        planCall(prompt, system: sys, ids: ids, log: log, name: "design") { text, err in
+            handle(text, err, retried: false)
+        }
+    }
+
+    /// The run log's view of this window, taken on the main thread.
+    func logSnapshot() -> GDDRunLog.Snapshot {
+        GDDRunLog.Snapshot(game: gameName, theme: theme?.name ?? "",
+                           model: NanoBananaModel.byFlag(modelFlag).name, backing: backing.name,
+                           backingRGB: backing.rgb,
+                           design: design, jobs: jobs, steps: RenderPlan.flat(renderSteps()),
+                           problems: designProblems, fixed: fixedProblems, spent: spent)
+    }
+    func writeLogSummary() { session().writeSummary(logSnapshot()) }
+
+    /// Install a plan answer saved earlier — the design reply from a run log — without asking
+    /// the model again. Used by --design-test to compare drawing changes on ONE plan.
+    func adopt(planReply text: String) -> Bool {
+        guard let j = GDDAssetPrompts.json(fromModelReply: text) else { return false }
+        chooseBacking()
+        let log = session()
+        // The reply travels with the run, so the run can be repeated after the one that
+        // designed it has been pruned.
+        log.write("design-reply.json", text)
+        install(GDDAssetPrompts.apply(planJSON: j, to: jobs), fixed: [], log: log, lowPays: (lowPays, lowPayCustom))
+        return true
+    }
+
+    /// Put a designed plan on screen and in the log.
+    private func install(_ applied: (jobs: [AssetJob], missing: [String], palette: [RGB8], design: SetDesign),
+                         fixed: [String], log: GDDRunLog, lowPays picked: (kind: LowPayKind, custom: String)) {
+        busy = false
+        designedLowPays = picked
+        jobs = applied.jobs
+        missing = applied.missing
+        palette = applied.palette
+        design = applied.design
+        fixedProblems = fixed
+        // The backing was chosen BEFORE the design, and the design kept its colours off the
+        // symbols — so it stays; re-choosing it now could land on a colour the set uses.
+        // A new design is a new run: its anchor has to be drawn again before the rest.
+        lastFolder = nil
+        let remaining = designProblems
+        log.write("plan.tsv", GDDRunLog.planTable(applied.jobs))
+        log.write("ideas-and-prompts.md", ideasAndPrompts())
+        log.event(["step": "plan", "filled": applied.jobs.count - applied.missing.count,
+                   "missing": applied.missing, "backing": backing.name, "hero": design.hero,
+                   "anchor": anchorJob?.id ?? "", "look": design.look,
+                   "palette": applied.palette.map { String(format: "#%02X%02X%02X", $0.r, $0.g, $0.b) },
+                   "problems": remaining, "fixed": fixed])
+        writeLogSummary()
+        var s = "Set designed — \(applied.jobs.count - applied.missing.count) of \(applied.jobs.count) filled."
+        if !fixed.isEmpty { s += " The checks sent it back once; \(fixed.count) fixed." }
+        if !remaining.isEmpty { s += " \(remaining.count) still flagged below." }
+        s += " Backing: \(backing.name)."
+        if !applied.missing.isEmpty { s += " Missing: \(applied.missing.joined(separator: ", "))." }
+        status = s
+    }
+
+    // MARK: Drawing order, references and prompts
+
+    /// The theme's approved artwork as PNG — only while it governs the look. A chosen art
+    /// style REPLACES the reference art's look, so its picture is not attached then: it
+    /// would pull every symbol back toward the style the user chose to move away from.
+    private var themeArtCache: (key: Int, png: Data)?
+    func themeArtPNG() -> Data? {
+        guard let t = theme, t.chosenStyle == nil, let b64 = t.artBase64,
+              let bytes = Data(base64Encoded: b64) else { return nil }
+        let key = b64.hashValue
+        if let c = themeArtCache, c.key == key { return c.png }
+        guard let src = CGImageSourceCreateWithData(bytes as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil), let png = encodePNG(cg) else { return nil }
+        // Every input image is billed at the same flat token count, so resolution past this
+        // buys nothing but a bigger upload.
+        let small = downsamplePNG(png, longEdge: 1536) ?? png
+        themeArtCache = (key, small)
+        return small
+    }
+
+    /// The order the planned set is drawn in, and what each image is shown.
+    func renderSteps() -> [RenderStep] {
+        RenderPlan.steps(jobs, design, hasThemeArt: themeArtPNG() != nil)
+    }
+
+    /// The exact Nano Banana 2 prompt for one planned image.
+    func prompt(for job: AssetJob, step: RenderStep) -> String {
+        guard let theme else { return "" }
+        return GDDAssetPrompts.brief(job: job, step: step, theme: theme, design: design,
+                                     backing: backing, gameName: gameName, jobs: jobs)
+    }
+
+    /// The whole set as one document: every symbol idea, and the exact prompt and pictures
+    /// each image will be given. The run log keeps a copy; the window shows it per row.
+    func ideasAndPrompts() -> String {
+        guard let theme else { return "" }
+        let steps = RenderPlan.flat(renderSteps())
+        let byID = Dictionary(jobs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        func refsText(_ st: RenderStep) -> String {
+            st.refs.isEmpty ? "none"
+                : st.refs.enumerated().map { "Image \($0.offset + 1): \($0.element == RenderPlan.themeArt ? "the theme’s concept art" : $0.element)" }
+                    .joined(separator: ", ")
+        }
+        var md = "# \(gameName.isEmpty ? "Game" : gameName) — \(theme.name)\n\n"
+        md += design.hero.isEmpty ? "**Hero:** none — a pure-symbol game.  \n" : "**Hero:** \(design.hero)  \n"
+        md += "**Drawn first, sets the look:** \(anchorJob?.id ?? "—")  \n"
+        md += "**Backing:** \(backing.name)\n\n"
+        if !design.look.isEmpty { md += "**The look of this set:** \(design.look)\n\n" }
+        for (k, v) in design.families.sorted(by: { $0.key < $1.key }) { md += "- **\(k) family:** \(v)\n" }
+        let flagged = designProblems
+        if !flagged.isEmpty { md += "\n**Still flagged:**\n" + flagged.map { "- \($0)" }.joined(separator: "\n") + "\n" }
+        if !fixedProblems.isEmpty { md += "\n**Fixed by the second pass:**\n" + fixedProblems.map { "- \($0)" }.joined(separator: "\n") + "\n" }
+        md += "\n## Symbol ideas\n\n| Order | ID | Role | Colour | Outline | Frame | Subject |\n|---|---|---|---|---|---|---|\n"
+        for (i, st) in steps.enumerated() {
+            guard let j = byID[st.id] else { continue }
+            md += "| \(i + 1) | \(j.id) | \(j.kind == .background ? "Background" : j.role.label) | \(j.hue) | \(j.shape) | \(j.hasFrame ? "yes" : "no") | \(j.subject.replacingOccurrences(of: "|", with: "/")) |\n"
+        }
+        md += "\n## Nano Banana 2 prompts, in drawing order\n"
+        for st in steps {
+            guard let j = byID[st.id] else { continue }
+            if st.mode == .sheet {
+                // One prompt draws the whole row; it is listed once.
+                guard st.id == st.members.first else { continue }
+                md += "\n### \(st.members.joined(separator: ", ")) — one \(LowPaySheet.aspect(count: st.members.count)) 4K sheet, cut apart · attached: \(refsText(st))\n\n```\n\(prompt(for: j, step: st))\n```\n"
+                continue
+            }
+            md += "\n### \(j.id) — \(st.mode.rawValue) · attached: \(refsText(st))\n\n```\n\(prompt(for: j, step: st))\n```\n"
+        }
+        return md
     }
 
     var estimate: Double { estimate(for: nil) }
 
     /// What a batch will cost. `ids` scopes it to a retry.
     func estimate(for ids: Set<String>?) -> Double {
-        jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
-            .reduce(0) { $0 + nbEstimatedCost(size: $1.size, modelFlag: modelFlag) }
+        let planned = jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
+        let byID = Dictionary(planned.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        // The low pays' sheet is ONE 4K image, whatever the number of low pays on it.
+        return RenderPlan.scoped(renderSteps(), to: Set(byID.keys)).reduce(0) { sum, st in
+            sum + (st.mode == .sheet ? nbEstimatedCost(size: "4K", modelFlag: modelFlag)
+                                     : byID[st.id].map { nbEstimatedCost(size: $0.size, modelFlag: modelFlag) } ?? 0)
+        }
     }
 
     /// Generate every planned image into `folder`.
@@ -23350,12 +24268,11 @@ final class GDDToAssetsRun: ObservableObject {
     /// transient 5xx as the retryable statuses. An error carrying NO status is a
     /// transport failure, and those are deliberately not retried: the image may already
     /// have been generated and metered, so a blind replay would pay for it twice.
-    private func request(_ job: AssetJob, theme: GameTheme, backing: (name: String, rgb: RGB8),
+    private func request(_ job: AssetJob, prompt: String, inputs: [Data],
                          model: String, size: String) -> (png: Data?, cost: Double, error: String?) {
         var cost = 0.0
-        let prompt = GDDAssetPrompts.image(job: job, theme: theme, backing: backing)
         for attempt in 1...ImageRequestPolicy.maxAttempts {
-            let r = H5GService.image(prompt: prompt, modelID: model, inputPNGs: [],
+            let r = H5GService.image(prompt: prompt, modelID: model, inputPNGs: inputs,
                                      aspect: job.aspect, size: size)
             cost += r.cost ?? 0
             if r.png != nil {
@@ -23373,6 +24290,7 @@ final class GDDToAssetsRun: ObservableObject {
             }
             guard let e = r.error, ImageRequestPolicy.shouldRetry(errorMessage: e),
                   attempt < ImageRequestPolicy.maxAttempts else { return (nil, cost, r.error) }
+            navLog("gdd image: \(job.id) attempt \(attempt) failed, retrying — \(e)")
             // Narrow by one rather than collapsing to serial. A single transient 429 used
             // to pin the width at 1 for the remainder of the run, so one blip cost the
             // whole batch its parallelism.
@@ -23386,12 +24304,194 @@ final class GDDToAssetsRun: ObservableObject {
         return (nil, cost, "gave up after \(ImageRequestPolicy.maxAttempts) attempts")
     }
 
+    /// The cheap Gemini review of one finished image (ImageReview). Nil when the call fails,
+    /// and the checks made on this Mac stand in.
+    fileprivate func review(_ png: Data, job: AssetJob, log: GDDRunLog) -> ImageReview? {
+        let backingName = DispatchQueue.main.sync { self.backing.name }
+        let started = Date()
+        let r = H5GService.describe(prompt: ImageReview.prompt(for: job, backing: backingName), systemPrompt: nil,
+                                    imagePNG: downsamplePNG(png, longEdge: 768) ?? png,
+                                    model: ImageReview.model, schema: ImageReview.schema)
+        let v = r.text.flatMap(ImageReview.parse)
+        let cost = r.cost ?? 0
+        DispatchQueue.main.async { self.spent += cost }
+        log.event(["step": "review", "id": job.id, "model": H5GService.lastReviewModel ?? "", "cost": cost,
+                   "seconds": Date().timeIntervalSince(started), "text": v?.text ?? "", "scene": v?.scene ?? false,
+                   "panel": v?.panel ?? false,
+                   "character": v?.character ?? false, "plannedPerson": v?.plannedPerson ?? false,
+                   "matches": v?.matches ?? true, "note": v?.note ?? "",
+                   "error": v == nil ? (r.error ?? "unreadable review") : ""])
+        return v
+    }
+
+    /// One image at the size its job asks for: a short answer is asked for again at 4K and
+    /// scaled back (see generateOne).
+    private func sizedRequest(_ job: AssetJob, prompt: String, inputs: [Data], model: String)
+        -> (png: Data?, cost: Double, error: String?, escalations: Int) {
+        var r = request(job, prompt: prompt, inputs: inputs, model: model, size: job.size)
+        var tries = 0
+        while tries < 2, let png = r.png, let d = pngPixelSize(png),
+              GeneratedSizeRules.isUndersized(longEdge: max(d.w, d.h), requested: job.size) {
+            tries += 1
+            navLog("gdd image: \(job.id) came back \(d.w)x\(d.h) for \(job.size) — asking again at 4K")
+            let again = request(job, prompt: prompt, inputs: inputs, model: model, size: "4K")
+            r.cost += again.cost
+            guard let p2 = again.png, let d2 = pngPixelSize(p2),
+                  max(d2.w, d2.h) > max(d.w, d.h) else { continue }
+            r.png = downsamplePNG(p2, longEdge: GeneratedSizeRules.targetLongEdge(job.size)) ?? p2
+        }
+        return (r.png, r.cost, r.error, tries)
+    }
+
+    /// The low pays, drawn together on one wide 4K image and cut apart into a file each.
+    ///
+    /// A sheet that does not come back as exactly that many separate symbols is asked for once
+    /// more; after that each low pay is drawn alone. A card rank that reads as another once cut
+    /// is drawn again alone, matched to one that read right. Progress and cost go to the main
+    /// thread, as in generateOne.
+    fileprivate func generateSheet(step: RenderStep, themeArt: Data?, model: String, folder: URL) {
+        let members = DispatchQueue.main.sync { step.members.compactMap { id in self.jobs.first { $0.id == id } } }
+        guard let lead = members.first else { return }
+        DispatchQueue.main.async { self.status = "Generating the \(members.count) low pays together…" }
+        var refs: [String] = [], inputs: [Data] = []
+        for r in step.refs where r != RenderPlan.themeArt {
+            if let d = try? Data(contentsOf: folder.appendingPathComponent("\(r).png")) {
+                refs.append(r); inputs.append(downsamplePNG(d, longEdge: 1536) ?? d)
+            }
+        }
+        let st = RenderStep(id: step.id, mode: .sheet, refs: refs, after: step.after, members: step.members)
+        let prompt = DispatchQueue.main.sync { self.prompt(for: lead, step: st) }
+        let log = DispatchQueue.main.sync { self.session() }
+        let backingRGB = DispatchQueue.main.sync { self.backing.rgb }
+        log.write("prompts/low-pay-sheet.txt", "MODE: sheet — \(step.members.joined(separator: ", "))\nATTACHED: \(refs.isEmpty ? "nothing" : refs.joined(separator: ", "))\n\n\(prompt)")
+        let aspect = LowPaySheet.aspect(count: members.count)
+        let sheetJob = AssetJob(id: "low-pay sheet", kind: .symbol, role: .lowPay, tier: nil, title: "",
+                                subject: "", aspect: aspect, size: "4K")
+        let started = Date()
+        var cost = 0.0, attempts = 0, lastError: String?
+        // Each symbol cut from an accepted sheet, reviewed, and why it has to be drawn again.
+        typealias Piece = (job: AssetJob, png: Data, box: CGRect, size: (w: Int, h: Int), review: ImageReview?, redo: String?)
+        var cut: [Piece]?
+        while cut == nil && attempts < 2 {
+            attempts += 1
+            let r = sizedRequest(sheetJob, prompt: prompt, inputs: inputs, model: model)
+            cost += r.cost
+            lastError = r.error
+            guard let png = r.png, let src = CGImageSourceCreateWithData(png as CFData, nil),
+                  let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            log.writeJPEG(attempts == 1 ? "low-pay-sheet.jpg" : "low-pay-sheet-\(attempts).jpg", cg)
+            guard let f = LowPaySheet.boxes(cg, backing: backingRGB, count: members.count + (TestFaults.take("sheet") ? 1 : 0)) else {
+                lastError = "the sheet did not hold \(members.count) separate symbols"
+                navLog("gdd sheet: attempt \(attempts) — \(lastError!)")
+                continue
+            }
+            var pieces: [Piece] = []
+            for (m, box) in zip(members, f.boxes) {
+                let size = GeneratedSizeRules.canvas(aspect: m.aspect, size: m.size)
+                guard let one = LowPaySheet.cut(cg, box: box, backdrop: f.backdrop, width: size.w, height: size.h),
+                      let png = encodePNG(one) else { continue }
+                let rev = review(png, job: m, log: log)
+                var redo: String?
+                if let rank = GDDAssetPrompts.royalRank(m),
+                   let read = (TestFaults.take("misread", m.id) ? (rank == "A" ? "K" : "A") : nil)
+                       ?? (rev != nil ? rev?.cardText : GDDRunLog.readRank(png, backing: backingRGB)), read != rank {
+                    redo = "should read “\(rank)” but reads “\(read)”"
+                    log.event(["step": "sheet-misread", "id": m.id, "wanted": rank, "read": read])
+                } else if rev?.unkeyable == true {
+                    redo = rev?.panel == true ? "sits on a card or tile" : "has a scene behind it"
+                }
+                pieces.append((m, png, box, size, rev, redo))
+            }
+            // Most of the row wrong is the sheet's fault — Loki's items each on a dark tile — so a
+            // new sheet is cheaper than drawing them one by one.
+            let wrong = pieces.filter { $0.redo != nil }.count
+            if pieces.count == members.count && (wrong * 2 <= members.count || attempts == 2) {
+                cut = pieces
+            } else {
+                lastError = pieces.count < members.count ? "a symbol could not be cut from the sheet"
+                                                         : "\(wrong) of \(members.count) came out wrong on the sheet"
+                navLog("gdd sheet: attempt \(attempts) — \(lastError!)")
+            }
+        }
+        let secs = Date().timeIntervalSince(started)
+        log.event(["step": "sheet", "members": step.members, "aspect": aspect, "refs": refs, "attempts": attempts,
+                   "cost": cost, "seconds": secs, "cut": cut != nil, "error": cut == nil ? (lastError ?? "") : ""])
+        navLog(String(format: "gdd sheet: %@ on one %@ 4K sheet → %@ $%.3f %.1fs", step.members.joined(separator: ","),
+                      aspect, cut == nil ? "not cut" : "cut", cost, secs))
+        DispatchQueue.main.async { self.spent += cost }
+        guard let pieces = cut else {
+            // Twice not a clean row: each low pay alone, the first matched to the anchor and the
+            // rest to it as well.
+            for (i, m) in members.enumerated() {
+                let one = RenderStep(id: m.id, mode: .match, refs: (i == 0 ? [] : [members[0].id]) + step.refs, after: [])
+                generateOne(job: m, step: one, themeArt: themeArt, model: model, folder: folder)
+            }
+            return
+        }
+        for p in pieces {
+            let dst = folder.appendingPathComponent(p.job.filename)
+            do {
+                try p.png.write(to: dst)
+                DispatchQueue.main.async {
+                    self.produced.append(dst)
+                    self.delivered[p.job.id] = "\(p.size.w)x\(p.size.h) · cut from the sheet"
+                }
+            } catch {
+                DispatchQueue.main.async { self.failures[p.job.id] = error.localizedDescription }
+            }
+            log.event(["step": "image", "id": p.job.id, "mode": "sheet", "refs": refs, "model": model, "size": "4K sheet",
+                       "delivered": "\(p.size.w)x\(p.size.h)", "box": "\(Int(p.box.width))x\(Int(p.box.height))",
+                       "cost": cost / Double(members.count), "seconds": secs, "error": ""])
+            let rank = GDDAssetPrompts.royalRank(p.job)
+            log.record(image: p.png, id: p.job.id, backing: backingRGB, isSymbol: true, expectsText: rank != nil,
+                       rank: rank, review: p.review)
+        }
+        // What came out wrong on an otherwise good sheet is drawn again alone, matched to a low
+        // pay that came out right.
+        let redo = pieces.filter { $0.redo != nil }
+        DispatchQueue.main.async { self.doneCount += members.count - redo.count }
+        let good = pieces.first { $0.redo == nil }?.job
+        for p in redo {
+            navLog("gdd sheet: \(p.job.id) \(p.redo!) — drawing it again alone")
+            let one = RenderStep(id: p.job.id, mode: .match, refs: (good.map { [$0.id] } ?? []) + step.refs, after: [])
+            generateOne(job: p.job, step: one, themeArt: themeArt, model: model, folder: folder)
+        }
+    }
+
     /// Generate one asset and write it. Reports progress and cost on the main thread.
-    fileprivate func generateOne(job: AssetJob, theme: GameTheme,
-                                 backing: (name: String, rgb: RGB8),
+    ///
+    /// The step says what the image is shown. A reference that is not on disk — its own
+    /// image failed, or was never made — is dropped rather than waited on forever, and the
+    /// prompt is written for the pictures actually attached, so it never describes an
+    /// image that is not there.
+    fileprivate func generateOne(job: AssetJob, step planned: RenderStep, themeArt: Data?,
                                  model: String, folder: URL) {
         DispatchQueue.main.async { self.status = "Generating \(job.id)…" }
-        var r = request(job, theme: theme, backing: backing, model: model, size: job.size)
+        var refs: [String] = [], inputs: [Data] = []
+        for r in planned.refs {
+            if r == RenderPlan.themeArt {
+                if let a = themeArt { refs.append(r); inputs.append(a) }
+            } else if let d = try? Data(contentsOf: folder.appendingPathComponent("\(r).png")) {
+                refs.append(r); inputs.append(downsamplePNG(d, longEdge: 1536) ?? d)
+            }
+        }
+        var step = RenderStep(id: planned.id, mode: planned.mode, refs: refs, after: planned.after)
+        // A family member whose first member never arrived is drawn fresh, to match the anchor.
+        if step.mode == .familyEdit && refs.isEmpty {
+            let anchorID = DispatchQueue.main.sync { self.anchorJob?.id }
+            var alt: [String] = [], altIn: [Data] = []
+            if let a = themeArt { alt.append(RenderPlan.themeArt); altIn.append(a) }
+            if let a = anchorID, let d = try? Data(contentsOf: folder.appendingPathComponent("\(a).png")) {
+                alt.append(a); altIn.append(downsamplePNG(d, longEdge: 1536) ?? d)
+            }
+            step = RenderStep(id: planned.id, mode: .match, refs: alt, after: [])
+            inputs = altIn
+            navLog("gdd image: \(job.id)'s family image is missing — drawing it fresh to match the anchor")
+        }
+        let prompt = DispatchQueue.main.sync { self.prompt(for: job, step: step) }
+        let log = DispatchQueue.main.sync { self.session() }
+        log.write("prompts/\(job.id).txt", "MODE: \(step.mode.rawValue)\nATTACHED: \(step.refs.isEmpty ? "nothing" : step.refs.joined(separator: ", "))\n\n\(prompt)")
+        let started = Date()
 
         // The requested size is not honoured reliably, so it is CHECKED, and a short
         // answer is escalated rather than accepted. Google documents an exact
@@ -23399,15 +24499,88 @@ final class GDDToAssetsRun: ObservableObject {
         // asking again at the same size is a coin flip; 4K is not. The result is scaled
         // back to the size that was asked for. This applies to 4K jobs too — a 4K
         // background came back 896x1200 once, and the first version of this skipped it.
+        // A redraw below goes through here as well.
         var escalations = 0
-        while escalations < 2, let png = r.png, let d = pngPixelSize(png),
-              GeneratedSizeRules.isUndersized(longEdge: max(d.w, d.h), requested: job.size) {
-            escalations += 1
-            let again = request(job, theme: theme, backing: backing, model: model, size: "4K")
+        func draw(_ prompt: String, _ inputs: [Data]) -> (png: Data?, cost: Double, error: String?) {
+            let r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
+            escalations += r.escalations
+            return (r.png, r.cost, r.error)
+        }
+        var r = draw(prompt, inputs)
+
+        // A symbol that came back on a painted scene instead of the flat backing cannot be
+        // keyed. Measured here, for free, and redrawn ONCE without the concept art; the result
+        // with more flat backing is kept. Seen on Snow Queen and Neon City in real runs.
+        let backingRGB = DispatchQueue.main.sync { self.backing.rgb }
+        func measure(_ png: Data) -> SymbolImageMetrics? {
+            guard let src = CGImageSourceCreateWithData(png as CFData, nil),
+                  let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+            return SymbolImageMetrics.measure(cg, backing: backingRGB)
+        }
+        // The Gemini review of what came back — what the pixel checks can only guess at.
+        var rev = job.kind == .symbol ? r.png.flatMap { review($0, job: job, log: log) } : nil
+        var redrawn = false
+        if job.kind == .symbol, let png = r.png, let m = measure(png),
+           m.backingMissing || rev?.unkeyable == true || TestFaults.take("scene", job.id) {
+            navLog("gdd image: \(job.id) came back with a scene behind it (\(Int(m.edgeBacked * 100))% of its edge is backing) — redrawing once without the concept art")
+            let pairs = zip(step.refs, inputs).filter { $0.0 != RenderPlan.themeArt }
+            let lean = RenderStep(id: step.id, mode: step.mode, refs: pairs.map(\.0), after: step.after)
+            let p2 = DispatchQueue.main.sync { self.prompt(for: job, step: lean) }
+                + "\n\nThe previous attempt painted \(rev?.panel == true ? "a card or tile" : "a scene") behind the symbol. This time there is nothing around it at all but the flat backing colour."
+            log.write("prompts/\(job.id)-redraw.txt", "MODE: \(lean.mode.rawValue)\nATTACHED: \(lean.refs.isEmpty ? "nothing" : lean.refs.joined(separator: ", "))\n\n\(p2)")
+            let again = draw(p2, pairs.map(\.1))
             r.cost += again.cost
-            guard let p2 = again.png, let d2 = pngPixelSize(p2),
-                  max(d2.w, d2.h) > max(d.w, d.h) else { continue }
-            r.png = downsamplePNG(p2, longEdge: GeneratedSizeRules.targetLongEdge(job.size)) ?? p2
+            if let png2 = again.png, let m2 = measure(png2) {
+                let rev2 = review(png2, job: job, log: log)
+                if (rev?.unkeyable == true && rev2?.unkeyable == false) || m2.edgeBacked > m.edgeBacked {
+                    r.png = png2; rev = rev2; redrawn = true
+                }
+            }
+            navLog("gdd image: \(job.id) redraw \(redrawn ? "kept" : "no better — first kept")")
+        }
+
+        // A person in a symbol planned as an object: the anchor's character leaking in, as the
+        // Snow Queen's bust did into her frost-crown wild. Redrawn once, told so.
+        if job.kind == .symbol, rev?.characterLeak == true || TestFaults.take("person", job.id) {
+            navLog("gdd image: \(job.id) has a person in it but was planned as an object — redrawing once")
+            let p2 = prompt + "\n\nThe previous attempt drew a person or figure. This symbol has no person, face or figure in it at all — only this: \(job.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))."
+            log.write("prompts/\(job.id)-object.txt", "MODE: \(step.mode.rawValue)\nATTACHED: \(step.refs.isEmpty ? "nothing" : step.refs.joined(separator: ", "))\n\n\(p2)")
+            let again = draw(p2, inputs)
+            r.cost += again.cost
+            if let png2 = again.png {
+                let rev2 = review(png2, job: job, log: log)
+                if rev2?.characterLeak != true { r.png = png2; rev = rev2; redrawn = true }
+            }
+        }
+
+        // A card rank is read back, here, for free. Drawn as an edit of the A, four of five
+        // real sets got a K with the A still in it. A confident read of ANOTHER rank is
+        // redrawn once with no letter attached to copy — the anchor alone carries the look —
+        // and the redraw is kept unless it reads wrong too. Nothing readable is not wrong.
+        if let rank = GDDAssetPrompts.royalRank(job), let png = r.png,
+           let read = (TestFaults.take("misread", job.id) ? (rank == "A" ? "K" : "A") : nil)
+               ?? (rev != nil ? rev?.cardText : GDDRunLog.readRank(png, backing: backingRGB)), read != rank {
+            navLog("gdd image: \(job.id) should read “\(rank)” but reads “\(read)” — redrawing once")
+            let anchor = DispatchQueue.main.sync { self.anchorJob }
+            var lean = RenderStep(id: step.id, mode: .match, refs: [], after: step.after), leanIn: [Data] = []
+            if let a = anchor, a.id != job.id, GDDAssetPrompts.royalRank(a) == nil,
+               let d = try? Data(contentsOf: folder.appendingPathComponent("\(a.id).png")) {
+                lean = RenderStep(id: step.id, mode: .match, refs: [a.id], after: step.after)
+                leanIn = [downsamplePNG(d, longEdge: 1536) ?? d]
+            }
+            let p2 = DispatchQueue.main.sync { self.prompt(for: job, step: lean) }
+                + "\n\nThe previous attempt came out reading as “\(read)”. This symbol is the single letter “\(rank)” — nothing of any other letter in it."
+            log.write("prompts/\(job.id)-letter.txt", "MODE: \(lean.mode.rawValue)\nATTACHED: \(lean.refs.isEmpty ? "nothing" : lean.refs.joined(separator: ", "))\n\n\(p2)")
+            let again = draw(p2, leanIn)
+            r.cost += again.cost
+            var kept = false
+            if let png2 = again.png {
+                let rev2 = review(png2, job: job, log: log)
+                if ((rev2 != nil ? rev2?.cardText : GDDRunLog.readRank(png2, backing: backingRGB)) ?? rank) == rank {
+                    r.png = png2; rev = rev2; redrawn = true; kept = true
+                }
+            }
+            navLog("gdd image: \(job.id) letter redraw \(kept ? "kept" : "reads wrong too — first kept")")
         }
 
         if let png = r.png {
@@ -23418,7 +24591,8 @@ final class GDDToAssetsRun: ObservableObject {
             let dst = folder.appendingPathComponent(job.filename)
             do {
                 try png.write(to: dst)
-                DispatchQueue.main.async { self.produced.append(dst) }
+                // A low pay redrawn after the sheet is already listed from its first cut.
+                DispatchQueue.main.async { if !self.produced.contains(dst) { self.produced.append(dst) } }
             } catch {
                 DispatchQueue.main.async { self.failures[job.id] = error.localizedDescription }
             }
@@ -23426,6 +24600,19 @@ final class GDDToAssetsRun: ObservableObject {
             DispatchQueue.main.async { self.failures[job.id] = r.error ?? "no image returned" }
         }
         let c = r.cost
+        let dims = r.png.flatMap { pngPixelSize($0) }.map { "\($0.w)x\($0.h)" } ?? ""
+        let secs = Date().timeIntervalSince(started)
+        log.event(["step": "image", "id": job.id, "mode": step.mode.rawValue, "refs": step.refs, "redrawn": redrawn,
+                   "model": model, "size": job.size,
+                   "delivered": dims, "escalations": escalations, "cost": c, "seconds": secs,
+                   "error": r.png == nil ? (r.error ?? "no image returned") : ""])
+        if let png = r.png {
+            log.record(image: png, id: job.id, backing: backingRGB, isSymbol: job.kind == .symbol,
+                       expectsText: GDDAssetPrompts.royalRank(job) != nil, rank: GDDAssetPrompts.royalRank(job), review: rev)
+        }
+        navLog(String(format: "gdd image: %@ %@ %@ → %@ $%.3f %.1fs%@", job.id, model, job.size,
+                      dims.isEmpty ? "nothing" : dims, c, secs,
+                      r.png == nil ? " — FAILED: \(r.error ?? "no image returned")" : ""))
         DispatchQueue.main.async { self.doneCount += 1; self.spent += c }
     }
 
@@ -23439,7 +24626,8 @@ final class GDDToAssetsRun: ObservableObject {
             !$0.subject.isEmpty && (only == nil || only!.contains($0.id))
         }
         guard !todo.isEmpty, let theme else { return }
-        running = true; doneCount = 0; produced = []; delivered = [:]
+        running = true; doneCount = 0; produced = []
+        if only == nil { delivered = [:] }
         stopRequested = false
         parallelWidth = ImageRequestPolicy.concurrency   // a fresh run starts wide again
         lastFolder = folder
@@ -23451,6 +24639,18 @@ final class GDDToAssetsRun: ObservableObject {
         status = "Generating 1 of \(todo.count)…"
         let backing = self.backing
         let model = NanoBananaModel.byFlag(self.modelFlag).id
+        let batchLog = session()
+        let themeArt = themeArtPNG()
+        // In drawing order: the anchor, then what matches it, then each family's edits.
+        let todoIDs = Set(todo.map(\.id))
+        let steps = RenderPlan.scoped(RenderPlan.steps(jobs, design, hasThemeArt: themeArt != nil), to: todoIDs)
+        let jobByID = Dictionary(todo.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        batchLog.write("plan.tsv", GDDRunLog.planTable(jobs))
+        batchLog.write("ideas-and-prompts.md", ideasAndPrompts())
+        batchLog.event(["step": "batch-start", "images": todo.count, "model": model,
+                        "backing": backing.name, "folder": folder.path,
+                        "estimate": estimate(for: only)])
+        navLog("gdd batch: \(todo.count) images with \(model) into \(folder.lastPathComponent) — log \(batchLog.folder.path)")
         // Two at a time, not one — and not more. Google documents no concurrency limit
         // for online image generation, and this runs through a metering proxy whose own
         // limits are invisible from here, so ImageRequestPolicy takes the smallest step
@@ -23466,33 +24666,52 @@ final class GDDToAssetsRun: ObservableObject {
             // the other worker sat idle until it finished. A worker here takes the next
             // job the moment it finishes its own, so the only idle time is at the very end.
             let next = NSLock()
-            var cursor = 0
+            var pending = steps
+            var finished = Set<String>()
             var stopped = false
-            func take() -> AssetJob? {
-                next.lock(); defer { next.unlock() }
-                guard cursor < todo.count else { return nil }
-                if DispatchQueue.main.sync(execute: { self.stopRequested }) {
-                    stopped = true
-                    return nil
+            // The next step whose references are finished. A reference outside this batch
+            // counts as finished — it is on disk from an earlier run, or it is not coming,
+            // and generateOne uses whatever is there.
+            func take() -> RenderStep? {
+                while true {
+                    next.lock()
+                    if pending.isEmpty { next.unlock(); return nil }
+                    if DispatchQueue.main.sync(execute: { self.stopRequested }) {
+                        stopped = true; next.unlock(); return nil
+                    }
+                    if let i = pending.firstIndex(where: { st in
+                        st.after.allSatisfy { finished.contains($0) || !todoIDs.contains($0) } }) {
+                        let st = pending.remove(at: i)
+                        next.unlock()
+                        return st
+                    }
+                    next.unlock()
+                    Thread.sleep(forTimeInterval: 0.3)   // waiting on the anchor or a family's first image
                 }
-                defer { cursor += 1 }
-                return todo[cursor]
             }
+            func done(_ id: String) { next.lock(); finished.insert(id); next.unlock() }
             let group = DispatchGroup()
             for w in 0..<max(1, ImageRequestPolicy.concurrency) {
                 group.enter()
                 DispatchQueue.global(qos: .userInitiated).asyncAfter(
                     deadline: .now() + Double(w) * ImageRequestPolicy.staggerSeconds) {
                     defer { group.leave() }
-                    while let job = take() {
+                    while let st = take() {
                         // A worker beyond the current width parks instead of exiting, so
                         // the pool can widen again after the service stops pushing back.
                         while w >= self.parallelWidth && !stopped {
                             Thread.sleep(forTimeInterval: 0.5)
                         }
                         if stopped { return }
-                        self.generateOne(job: job, theme: theme, backing: backing,
+                        if st.mode == .sheet {
+                            self.generateSheet(step: st, themeArt: themeArt, model: model, folder: folder)
+                            st.members.forEach(done)
+                            continue
+                        }
+                        guard let job = jobByID[st.id] else { done(st.id); continue }
+                        self.generateOne(job: job, step: st, themeArt: themeArt,
                                          model: model, folder: folder)
+                        done(st.id)
                     }
                 }
             }
@@ -23504,6 +24723,15 @@ final class GDDToAssetsRun: ObservableObject {
                 // files were still being read and rewritten, into the same filenames.
                 let ok = out.count, bad = self.failures.count
                 let skipped = todo.count - ok - bad
+                batchLog.event(["step": "batch-end", "made": ok, "failed": bad, "notStarted": skipped,
+                                "spentThisWindow": self.spent, "failures": self.failures])
+                let snap = self.logSnapshot()
+                DispatchQueue.global(qos: .utility).async {
+                    let v = batchLog.finishBatch(snap)
+                    DispatchQueue.main.async { self.lastVerdict = v }
+                }
+                navLog(String(format: "gdd batch: made %d of %d, %d failed · $%.2f spent in this window",
+                              ok, todo.count, bad, self.spent))
                 self.status = String(format: "Made %d of %d image%@%@%@ · $%.2f so far.",
                                      ok, todo.count, todo.count == 1 ? "" : "s",
                                      bad > 0 ? ", \(bad) failed" : "",
@@ -23658,6 +24886,9 @@ struct GDDToAssetsSheet: View {
     @State private var themeError: String?
     /// Whether the art-style description is shown in full or trimmed to a few lines.
     @State private var styleExpanded = false
+    @State private var lookExpanded = false
+    /// The row whose prompt is showing.
+    @State private var promptFor: String?
     @State private var themes: [GameTheme] = []
     @State private var themeQuery = ""
     @State private var pickedTheme: GameTheme?
@@ -23844,6 +25075,20 @@ struct GDDToAssetsSheet: View {
                         .disabled(entries.isEmpty || scanning || exporting)
                     Button("Export all as text…") { exportAllGDDs() }
                         .disabled(entries.isEmpty || exporting || scanning)
+                    Divider()
+                    // Every symbol idea and the exact prompt each image will be given.
+                    Button("Show Ideas & Prompts") {
+                        let log = run.session()
+                        log.write("ideas-and-prompts.md", run.ideasAndPrompts())
+                        NSWorkspace.shared.open(log.folder.appendingPathComponent("ideas-and-prompts.md"))
+                    }
+                    .disabled(!run.planned)
+                    // Every design and image request, with its prompt, reply and cost.
+                    Button("Show Run Logs") {
+                        let f = run.logFolder ?? GDDRunLog.root
+                        try? FileManager.default.createDirectory(at: f, withIntermediateDirectories: true)
+                        NSWorkspace.shared.activateFileViewerSelecting([f])
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -24397,6 +25642,27 @@ struct GDDToAssetsSheet: View {
 
     @ViewBuilder private var planStep: some View {
         VStack(alignment: .leading, spacing: 8) {
+            // What the low pays are is the artist's call: design documents only say "LPs".
+            HStack(spacing: 8) {
+                Text("Low pays")
+                Picker("Low pays", selection: $run.lowPays) {
+                    ForEach(LowPayKind.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .labelsHidden().frame(width: 150)
+                .help("What every low pay is. They are drawn together on one 4K sheet, each its own thing, then cut apart.")
+                if run.lowPays == .custom {
+                    TextField("e.g. carved tiki masks", text: $run.lowPayCustom)
+                        .textFieldStyle(.roundedBorder).frame(maxWidth: 260)
+                }
+            }
+            .disabled(run.busy || run.running)
+            if run.planned, let d = run.designedLowPays,
+               d.kind != run.lowPays || (d.kind == .custom && d.custom != run.lowPayCustom) {
+                Label("The plan below was designed with \(d.kind == .custom ? "“\(d.custom)”" : d.kind.label.lowercased()) as the low pays — design the set again to use the new choice.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 Button(run.planned ? "Design the set again" : "Design the set") { run.designSet() }
                     .disabled(run.busy || pickedTheme == nil || run.running)
@@ -24411,11 +25677,55 @@ struct GDDToAssetsSheet: View {
                     }
                 }
             }
-            if !run.clashes.isEmpty {
-                Label("\(run.clashes.count) silhouette\(run.clashes.count == 1 ? "" : "s") used twice: "
-                      + run.clashes.map { "\($0.key) (\($0.value.joined(separator: ", ")))" }.joined(separator: "; "),
+            if run.planned {
+                // The decisions the whole set follows, stated once.
+                VStack(alignment: .leading, spacing: 3) {
+                    Text((run.design.hero.isEmpty ? "No hero — a pure-symbol game." : "Hero: \(run.design.hero).")
+                         + (run.anchorJob.map { " \($0.id) is drawn first and sets the look; every other symbol is shown it." } ?? ""))
+                        .font(.caption)
+                    if !run.design.look.isEmpty {
+                        Text("The look: \(run.design.look)").font(.caption).foregroundColor(.secondary)
+                            .lineLimit(lookExpanded ? nil : 2).fixedSize(horizontal: false, vertical: true)
+                        Button(lookExpanded ? "Less" : "More") { lookExpanded.toggle() }
+                            .buttonStyle(.link).font(.caption)
+                    }
+                    if !run.fixedProblems.isEmpty {
+                        Text("The checks sent the design back once and fixed \(run.fixedProblems.count): "
+                             + run.fixedProblems.joined(separator: " "))
+                            .font(.caption).foregroundColor(.secondary).lineLimit(2)
+                            .help(run.fixedProblems.joined(separator: "\n"))
+                    }
+                }
+            }
+            let flagged = run.designProblems
+            if !flagged.isEmpty {
+                Label("Worth fixing before you generate: " + flagged.joined(separator: " "),
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if let a = run.anchorJob, let url = run.anchorImageURL {
+                // The picture every other symbol will be shown. Worth a look before paying for them.
+                HStack(alignment: .top, spacing: 10) {
+                    if let img = NSImage(contentsOf: url) {
+                        Image(nsImage: img).resizable().interpolation(.high)
+                            .frame(width: 96, height: 96).cornerRadius(6)
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("\(a.id) sets the look").font(.caption.bold())
+                        Text("Every other symbol is drawn with this image attached. If it isn’t right, redo it before generating the rest.")
+                            .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                        let mine = run.lastVerdict.filter { $0.contains(a.id) }
+                        if !mine.isEmpty {
+                            Text("Measured: " + mine.joined(separator: " ")).font(.caption).foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        HStack {
+                            Button("Redo \(a.id)") { makeAnchor(redo: true) }
+                                .disabled(run.running || run.busy)
+                            Button("Open") { NSWorkspace.shared.open(url) }
+                        }.controlSize(.small)
+                    }
+                }
             }
             if !run.missing.isEmpty {
                 Label("No subject for: \(run.missing.joined(separator: ", ")). Those are skipped — design again, or type one in.",
@@ -24429,8 +25739,9 @@ struct GDDToAssetsSheet: View {
                 Text("Role").frame(width: 130, alignment: .leading)
                 Text("Subject").frame(maxWidth: .infinity, alignment: .leading)
                 Text("Silhouette").frame(width: 150, alignment: .leading)
+                Text("Colour · outline").frame(width: 110, alignment: .leading)
                 Text("Delivered").frame(width: 78, alignment: .trailing)
-                Text("").frame(width: 44)
+                Text("").frame(width: 66)
             }
             .font(.caption2.bold()).foregroundColor(.secondary)
             ForEach(run.jobs, id: \.id) { job in
@@ -24446,6 +25757,17 @@ struct GDDToAssetsSheet: View {
                     TextField("silhouette", text: field(job.id, \.silhouette))
                         .font(.caption).textFieldStyle(.roundedBorder).frame(width: 150)
                         .disabled(run.running || run.busy)
+                    HStack(spacing: 4) {
+                        if let c = SetDesignRules.swatch(job.hue) {
+                            Circle().fill(Color(red: Double(c.r) / 255, green: Double(c.g) / 255, blue: Double(c.b) / 255))
+                                .frame(width: 9, height: 9)
+                        }
+                        Text([job.hue, job.shape].filter { !$0.isEmpty }.joined(separator: " · "))
+                            .font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    }
+                    .frame(width: 110, alignment: .leading)
+                    .help(job.variation.isEmpty ? "The colour and outer outline the design gave it"
+                                                : "Family member — differs by: \(job.variation)")
                     if let d = run.delivered[job.id] {
                         Text(d).font(.caption2).foregroundColor(
                             GeneratedSizeRules.isUndersized(
@@ -24455,6 +25777,15 @@ struct GDDToAssetsSheet: View {
                     } else {
                         Spacer().frame(width: 78)
                     }
+                    // The exact prompt and pictures this image will be sent — free to look at.
+                    Button { promptFor = job.id } label: { Image(systemName: "info.circle") }
+                        .buttonStyle(.borderless)
+                        .disabled(job.subject.isEmpty)
+                        .help("The Nano Banana 2 prompt for this image, and what is attached to it")
+                        .popover(isPresented: Binding(get: { promptFor == job.id },
+                                                      set: { if !$0 { promptFor = nil } })) {
+                            promptPopover(job)
+                        }
                     statusDot(job.id)
                     // Every row is a paid image. A scene the document named but this game
                     // does not actually need should be removable without redesigning.
@@ -24476,6 +25807,35 @@ struct GDDToAssetsSheet: View {
         }
     }
 
+    @ViewBuilder private func promptPopover(_ job: AssetJob) -> some View {
+        let step = RenderPlan.flat(run.renderSteps()).first { $0.id == job.id }
+            ?? RenderStep(id: job.id, mode: .match, refs: [], after: [])
+        let text = run.prompt(for: job, step: step)
+        let attached = step.refs.isEmpty ? "Nothing attached — drawn from the words alone."
+            : "Attached: " + step.refs.enumerated().map {
+                "Image \($0.offset + 1) — \($0.element == RenderPlan.themeArt ? "the theme’s concept art" : "\($0.element)’s finished image")"
+            }.joined(separator: "; ")
+        VStack(alignment: .leading, spacing: 8) {
+            Text("\(job.id) · \(step.mode == .anchor ? "drawn first — sets the look" : step.mode == .familyEdit ? "an edit of its family’s first member" : step.mode == .background ? "background" : step.mode == .sheet ? "drawn with \(step.members.joined(separator: ", ")) on one 4K sheet, then cut apart" : "drawn to match \(run.anchorJob?.id ?? "the anchor")")")
+                .font(.headline)
+            Text(attached).font(.caption).foregroundColor(.secondary)
+            ScrollView {
+                Text(text).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 300)
+            HStack {
+                Text("\(text.split(whereSeparator: \.isWhitespace).count) words").font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                Button("Copy Prompt") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+            }
+        }
+        .padding(12).frame(width: 520)
+    }
+
     /// A binding to one field of one job, found by IDENTITY rather than by position.
     ///
     /// Binding by array index crashed the app: SwiftUI keeps a binding alive across a
@@ -24494,7 +25854,8 @@ struct GDDToAssetsSheet: View {
     @ViewBuilder private func statusDot(_ id: String) -> some View {
         if let e = run.failures[id] {
             Image(systemName: "xmark.circle.fill").foregroundColor(.red).help(e)
-        } else if run.produced.contains(where: { $0.lastPathComponent == "\(id).png" }) {
+        } else if run.produced.contains(where: { $0.lastPathComponent == "\(id).png" })
+                    || (run.lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(id).png").path) } ?? false) {
             Image(systemName: "checkmark.circle.fill").foregroundColor(.green).help("Generated")
         } else {
             Image(systemName: "circle").foregroundColor(.secondary.opacity(0.35)).help("Not generated yet")
@@ -24554,9 +25915,19 @@ struct GDDToAssetsSheet: View {
     }
 
     private var readyJobs: Int { run.jobs.filter { !$0.subject.isEmpty }.count }
+    /// Designed, and its first image not drawn yet.
+    private var anchorPending: Bool { run.planned && run.anchorJob != nil && run.anchorImageURL == nil }
+    /// What is left to draw once the anchor exists: planned, not the anchor, not on disk yet.
+    private var restIDs: Set<String> {
+        let a = run.anchorJob?.id
+        return Set(run.jobs.filter { j in
+            !j.subject.isEmpty && j.id != a
+                && !(run.lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent(j.filename).path) } ?? false)
+        }.map(\.id))
+    }
     private var canGenerate: Bool {
         !run.running && !run.busy && outParent != nil && pickedTheme != nil && readyJobs > 0
-            && !styleNotChosen
+            && !styleNotChosen && !(run.anchorImageURL != nil && restIDs.isEmpty)
     }
     /// "Choose a style" is selected but no style has been picked. Generating here would
     /// quietly use the reference-art style instead — the control would say one thing and
@@ -24567,6 +25938,15 @@ struct GDDToAssetsSheet: View {
         // "more", not a total: designing the set already cost something and it is
         // already counted in "Spent so far" below, so calling this the total would
         // double-count it or hide it depending on which number you believed.
+        if anchorPending, let a = run.anchorJob {
+            return String(format: "Make %@ first — about $%.2f", a.id, run.estimate(for: [a.id]))
+        }
+        if run.anchorImageURL != nil {
+            let rest = restIDs
+            guard !rest.isEmpty else { return "All generated" }
+            return String(format: "Generate the other %d to match — about $%.2f more",
+                          rest.count, run.estimate(for: rest))
+        }
         return String(format: "Generate %d image%@ — about $%.2f more",
                       readyJobs, readyJobs == 1 ? "" : "s", run.estimate)
     }
@@ -24575,22 +25955,28 @@ struct GDDToAssetsSheet: View {
 
     /// Drop subjects designed for a theme that is no longer selected.
     private func clearPlanSubjects() {
-        run.jobs = run.jobs.map { var j = $0; j.subject = ""; j.silhouette = ""; return j }
+        run.jobs = run.jobs.map { var j = $0; j.subject = ""; j.silhouette = ""; j.hue = ""; j.shape = ""; j.variation = ""; return j }
+        run.resetDesign()
         run.missing = []
         run.status = "Theme changed — design the set again."
     }
 
     private func reflow() {
         guard !run.gddText.isEmpty else { return }
-        let keep = Dictionary(uniqueKeysWithValues: run.jobs.map { ($0.id, ($0.subject, $0.silhouette)) })
+        let keep = Dictionary(uniqueKeysWithValues: run.jobs.map { ($0.id, $0) })
+        let design = run.design, fixed = run.fixedProblems
         run.load(gddText: run.gddText, gameName: run.gameName, size: size,
                  symbolAspect: symbolAspect, backgroundAspect: backgroundAspect,
                  backgroundSize: backgroundSize)
         run.jobs = run.jobs.map { j in
             var j = j
-            if let (s, sil) = keep[j.id] { j.subject = s; j.silhouette = sil }
+            if let k = keep[j.id] {
+                j.subject = k.subject; j.silhouette = k.silhouette; j.hasFrame = k.hasFrame
+                j.hue = k.hue; j.shape = k.shape; j.variation = k.variation
+            }
             return j
         }
+        run.design = design; run.fixedProblems = fixed
     }
 
     // Navigator's own picker, not NSOpenPanel. See NavigatorFolderPicker.
@@ -24833,20 +26219,81 @@ struct GDDToAssetsSheet: View {
 
     private func startGenerate() {
         guard outParent != nil else { return }
+        // The anchor first: one image, looked at, before paying for the set that copies it.
+        if anchorPending, let a = run.anchorJob {
+            let now = run.estimate(for: [a.id])
+            let alert = NSAlert()
+            alert.messageText = "Make \(a.id) first?"
+            alert.informativeText = String(
+                format: "%@ is drawn first%@. Every other symbol is then drawn with it attached, so the set matches it. Look at it, redo it if it isn’t right, then generate the rest.\n\nNow: ~$%.2f (%@). The rest: ~$%.2f.",
+                a.id, run.themeArtPNG() != nil ? ", with the theme’s concept art attached" : "",
+                now, NanoBananaModel.byFlag(run.modelFlag).name, max(0, run.estimate - now))
+            alert.addButton(withTitle: "Make \(a.id) First")
+            alert.addButton(withTitle: "Make All Now")
+            alert.addButton(withTitle: "Cancel")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: makeAnchor(redo: false)
+            case .alertSecondButtonReturn: generateAll(confirmed: true)
+            default: break
+            }
+            return
+        }
+        // The anchor exists: draw what is left, into the same folder, matched to it.
+        if run.anchorImageURL != nil, let folder = run.lastFolder {
+            let rest = restIDs
+            guard !rest.isEmpty else { return }
+            let a = NSAlert()
+            a.messageText = "Generate the other \(rest.count)?"
+            a.informativeText = String(
+                format: "Each is drawn with %@ attached%@; jackpot tiers, value symbols and low pays are drawn as edits of their family’s first image.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent. They are saved into “%@” as they arrive.",
+                run.anchorJob?.id ?? "the first symbol",
+                run.themeArtPNG() != nil ? " and the theme’s concept art" : "",
+                run.estimate(for: rest), folder.lastPathComponent)
+            a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+            run.generate(into: folder, removeBackground: removeBG, separateFrames: separateFrames,
+                         only: rest) { urls in
+                if let first = urls.first { NSWorkspace.shared.activateFileViewerSelecting([first]) }
+            }
+            return
+        }
+        generateAll(confirmed: false)
+    }
+
+    /// Everything in one go — the anchor still drawn first, the rest matched to it.
+    private func generateAll(confirmed: Bool) {
         let n = readyJobs
-        let a = NSAlert()
-        a.messageText = "Generate \(n) image\(n == 1 ? "" : "s")?"
-        a.informativeText = String(
-            format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into a new folder “%@” as they arrive.",
-            NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName)
-        a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
-        guard a.runModal() == .alertFirstButtonReturn else { return }
+        if !confirmed {
+            let a = NSAlert()
+            a.messageText = "Generate \(n) image\(n == 1 ? "" : "s")?"
+            a.informativeText = String(
+                format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into a new folder “%@” as they arrive.",
+                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName)
+            a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
         guard let out = makeRunFolder() else { return }
         run.generate(into: out, removeBackground: removeBG, separateFrames: separateFrames) { urls in
             if let first = urls.first {
                 NSWorkspace.shared.activateFileViewerSelecting([first])
             }
         }
+    }
+
+    /// Draw only the anchor — into a new run folder, or over itself when redoing it.
+    private func makeAnchor(redo: Bool) {
+        guard let a = run.anchorJob else { return }
+        if redo, let folder = run.lastFolder {
+            let alert = NSAlert()
+            alert.messageText = "Redo \(a.id)?"
+            alert.informativeText = String(format: "It is drawn again and replaces the current one. Symbols already drawn to match the old one are kept.\n\nEstimated cost: ~$%.2f.", run.estimate(for: [a.id]))
+            alert.addButton(withTitle: "Redo"); alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            run.generate(into: folder, removeBackground: removeBG, only: [a.id]) { _ in }
+            return
+        }
+        guard let out = makeRunFolder() else { return }
+        run.generate(into: out, removeBackground: removeBG, only: [a.id]) { _ in }
     }
 }
 
@@ -24882,6 +26329,34 @@ final class CloseGuard: NSObject, NSWindowDelegate {
 /// PANEL, not the model. Every earlier check of the artwork read `run.theme`, which always
 /// had it; the panel drew from a different copy and never did. Written only when paid calls
 /// are switched off, which is the only time the window can be driven from outside.
+/// Test runs only: take the recovery paths that real runs rarely need, so they can be seen
+/// working. Set by environment, never in use:
+///   NAVIGATOR_TEST_SHEET_MISCOUNT=2      the next two low-pay sheets are "not cut"
+///   NAVIGATOR_TEST_MISREAD=LP2,LP2       each listing: that card symbol "reads wrong" once
+///   NAVIGATOR_TEST_SCENE=WD1             each listing: that symbol "came back on a scene" once
+///   NAVIGATOR_TEST_PERSON=WD1            each listing: that symbol "has a person in it" once
+enum TestFaults {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var left: [String: Int] = {
+        let env = ProcessInfo.processInfo.environment
+        var out: [String: Int] = ["sheet": Int(env["NAVIGATOR_TEST_SHEET_MISCOUNT"] ?? "") ?? 0]
+        for (kind, key) in [("misread", "NAVIGATOR_TEST_MISREAD"), ("scene", "NAVIGATOR_TEST_SCENE"),
+                            ("person", "NAVIGATOR_TEST_PERSON")] {
+            for id in (env[key] ?? "").split(separator: ",") { out["\(kind):\(id)", default: 0] += 1 }
+        }
+        return out
+    }()
+    /// True — once per listing — when this fault is to be forced now.
+    static func take(_ kind: String, _ id: String = "") -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let key = id.isEmpty ? kind : "\(kind):\(id)"
+        guard let n = left[key], n > 0 else { return false }
+        left[key] = n - 1
+        navLog("gdd test fault: \(key)")
+        return true
+    }
+}
+
 enum ArtPanelProbe {
     static let pick = Notification.Name("NavigatorTestPickTheme")
     static let pickGDD = Notification.Name("NavigatorTestPickGDD")
