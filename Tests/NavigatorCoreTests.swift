@@ -11339,7 +11339,7 @@ final class SetDesignTests: XCTestCase {
         let brief = GDDAssetPrompts.roleBrief(for: coins)
         XCTAssertTrue(brief.contains("BONUS (BO): in this studio's games usually CIRCULAR"), brief)
         XCTAssertTrue(brief.contains("COLLECTOR (SF): the most VALUABLE-looking special"), brief)
-        XCTAssertTrue(GDDAssetPrompts.roleLine(coins[3], jobs: coins, design: SetDesign()).contains("most valuable-looking special"))
+        XCTAssertTrue(GDDAssetPrompts.roleLine(coins[3], jobs: coins, design: SetDesign()).contains("made to look like a prize won"))
     }
 
     func testMonochromeAndSameColourHighPaysAreCaught() {
@@ -11377,23 +11377,144 @@ final class SetDesignTests: XCTestCase {
         jobs.append(AssetJob(id: "bg_base", kind: .background, role: .unknown, tier: nil, title: "",
                              subject: "a bank vault hall", aspect: "3:4", size: "4K"))
         let steps = RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true)
-        XCTAssertEqual(steps.first, RenderStep(id: "HP1", mode: .anchor, refs: ["theme-art"], after: []))
+        // The anchor is a high pay, so all four high pays are drawn first, together: the ranking
+        // is seen on one image instead of described to images that cannot see each other.
+        XCTAssertEqual(steps.first, RenderStep(id: "HP1", mode: .sheet, refs: ["theme-art"], after: [],
+                                               members: ["HP1", "HP2", "HP3", "HP4"]))
+        XCTAssertEqual(RenderPlan.anchorGroup(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true), ["HP1", "HP2", "HP3", "HP4"])
         let byID = Dictionary(uniqueKeysWithValues: steps.map { ($0.id, $0) })
-        // A new subject matches the anchor only. The concept art stays out of a symbol's
-        // inputs: given it, the model painted the art's scene (a castle, a skyline) behind it.
-        XCTAssertEqual(byID["HP2"], RenderStep(id: "HP2", mode: .match, refs: ["HP1"], after: ["HP1"]))
-        // A family's first member matches; the rest are edits of it, and come after it.
-        XCTAssertEqual(byID["JP1"]?.mode, .match)
-        XCTAssertEqual(byID["JP3"], RenderStep(id: "JP3", mode: .familyEdit, refs: ["JP1"], after: ["JP1"]))
-        XCTAssertEqual(byID["WY2"]?.refs, ["WY1"])
-        XCTAssertLessThan(steps.firstIndex { $0.id == "JP1" }!, steps.firstIndex { $0.id == "JP2" }!)
+        XCTAssertNil(byID["HP2"])
+        // The jackpot tiers are one sheet too, matched to the anchor.
+        XCTAssertEqual(byID["JP1"], RenderStep(id: "JP1", mode: .sheet, refs: ["HP1"], after: ["HP1"],
+                                               members: ["JP1", "JP2", "JP3", "JP4"]))
+        XCTAssertNil(byID["JP3"])
+        // Value symbols are still edits of their first member, and come after it.
+        XCTAssertEqual(byID["WY2"], RenderStep(id: "WY2", mode: .familyEdit, refs: ["WY1"], after: ["WY1"]))
+        // A special is drawn after the sheets and shown the set so far, to stand apart from it.
+        XCTAssertEqual(byID["WD1"], RenderStep(id: "WD1", mode: .match, refs: ["HP1", RenderPlan.setSoFar], after: ["HP1", "JP1"]))
         // A scene takes its style from the concept art only, and waits for nothing.
         XCTAssertEqual(byID["bg_base"], RenderStep(id: "bg_base", mode: .background, refs: ["theme-art"], after: []))
         // Without concept art the anchor carries the look, background included.
         let bare = RenderPlan.steps(jobs, SetDesign(), hasThemeArt: false)
         XCTAssertEqual(bare.first?.refs, [])
         XCTAssertEqual(bare.first { $0.id == "bg_base" }?.refs, ["HP1"])
-        XCTAssertEqual(bare.first { $0.id == "HP2" }?.refs, ["HP1"])
+        // A partial redo of the sheet draws its members alone, matched to one that stays.
+        let redo = RenderPlan.scoped(steps, to: ["HP3"])
+        XCTAssertEqual(redo, [RenderStep(id: "HP3", mode: .match, refs: ["HP1", "theme-art"], after: [])])
+    }
+
+    // A character on two symbols is drawn once, first, and attached to both; one on a single
+    // symbol, or none at all, draws nothing extra.
+    func testARecurringCharacterIsDrawnOnceAndShownToEachSymbol() {
+        var jobs = piggy
+        jobs[0].cast = "Porky"; jobs[4].cast = "Porky"; jobs[5].cast = "Vault Wolf"
+        let design = SetDesign(anchorID: "HP1", cast: [CastMember(name: "Porky", kind: "hero", look: "a crowned pink pig"),
+                                                       CastMember(name: "Vault Wolf", kind: "villain", look: "a grey wolf in a bank robber's mask")])
+        let steps = RenderPlan.steps(jobs, design, hasThemeArt: true)
+        XCTAssertEqual(steps.first, RenderStep(id: "cast-porky", mode: .character, refs: ["theme-art"], after: []))
+        XCTAssertFalse(steps.contains { $0.id == "cast-vault-wolf" })
+        let byID = Dictionary(uniqueKeysWithValues: steps.map { ($0.id, $0) })
+        XCTAssertEqual(byID["HP1"]?.refs, ["theme-art", "cast-porky"])
+        XCTAssertEqual(byID["HP1"]?.after, ["cast-porky"])
+        XCTAssertEqual(byID["WD1"]?.refs, ["HP1", "cast-porky", RenderPlan.setSoFar])
+        // A retry of the wild keeps the reference it is shown; one of HP4 alone does not need it.
+        XCTAssertEqual(RenderPlan.scoped(steps, to: ["WD1"]).map(\.id), ["cast-porky", "WD1"])
+        XCTAssertEqual(RenderPlan.scoped(steps, to: ["WY1"]).map(\.id), ["WY1"])
+        let brief = GDDAssetPrompts.brief(job: jobs[4], step: byID["WD1"]!, theme: GameTheme(name: "Piggy Bank"), design: design,
+                                          backing: (name: "chroma green", rgb: RGB8(0, 177, 64)), gameName: "", jobs: jobs)
+        XCTAssertTrue(brief.contains("Image 2 is Porky, the hero of this game, drawn once for reference"), brief)
+        XCTAssertTrue(brief.contains("Image 3 shows the symbols already made for this set"), brief)
+        XCTAssertFalse(brief.contains("nothing of that character"), brief)
+        let ref = GDDAssetPrompts.brief(job: jobs[0], step: steps[0], theme: GameTheme(name: "Piggy Bank"), design: design,
+                                        backing: (name: "chroma green", rgb: RGB8(0, 177, 64)), gameName: "", jobs: jobs)
+        XCTAssertTrue(ref.hasPrefix("Create a character reference of Porky, the hero"), ref)
+        XCTAssertTrue(ref.contains("PORKY: a crowned pink pig."), ref)
+    }
+
+    // An object symbol is matched to an object from the anchor's sheet, not to the character
+    // anchor: shown the goddess, a winged-star wild came back with her in it, twice.
+    func testAnObjectSymbolIsNotShownTheCharacterAnchor() {
+        var jobs = piggy
+        jobs[0].shape = "figure"; jobs[0].cast = "Astraea"
+        let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
+        XCTAssertEqual(steps["SF1"]?.refs.first, "HP2")
+        XCTAssertEqual(steps["SF1"]?.after.first, "HP1")      // still waits for the sheet
+        XCTAssertEqual(steps["WD1"]?.refs.first, "HP1")       // the winged pig is a figure itself
+        jobs[5].cast = "Astraea"                               // a collector that shows her keeps the anchor
+        let again = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
+        XCTAssertEqual(again["SF1"]?.refs.first, "HP1")
+    }
+
+    // No sentence compares a symbol with one the image model cannot see; the finish carries it.
+    func testTheRoleLineStatesAFinishInsteadOfComparing() {
+        var jobs = piggy
+        jobs[2].finish = "polished rose copper, a simple bevel, no gems"
+        for j in jobs {
+            let line = GDDAssetPrompts.roleLine(j, jobs: jobs, design: SetDesign())
+            for phrase in ["plainer", "than the one above", "less precious than", "most ornament", "in the set:"] {
+                XCTAssertFalse(line.contains(phrase), "\(j.id): \(line)")
+            }
+        }
+        XCTAssertTrue(GDDAssetPrompts.roleLine(jobs[2], jobs: jobs, design: SetDesign())
+            .hasSuffix("Its finish: polished rose copper, a simple bevel, no gems."))
+    }
+
+    // The high pays' 2×2 sheet is cut row by row; a symbol with a gap inside it stays whole.
+    func testAGridSheetIsCutRowByRow() throws {
+        let size = 800
+        let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(red: 0, green: 177 / 255, blue: 64 / 255, alpha: 1); ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+        ctx.setFillColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 1)
+        // Quartz y runs up: the top row is at y 470…750, the bottom row at 60…330.
+        ctx.fill(CGRect(x: 60, y: 470, width: 280, height: 280)); ctx.fill(CGRect(x: 460, y: 470, width: 280, height: 280))
+        ctx.fill(CGRect(x: 60, y: 60, width: 280, height: 120)); ctx.fill(CGRect(x: 60, y: 200, width: 280, height: 130))  // a split one
+        ctx.fill(CGRect(x: 460, y: 60, width: 200, height: 270))
+        let img = ctx.makeImage()!
+        let found = try XCTUnwrap(SymbolSheet.boxes(img, backing: RGB8(0, 177, 64), rows: [2, 2]))
+        XCTAssertEqual(found.boxes.count, 4)
+        // Top-left origin, reading order: top row first.
+        XCTAssertEqual(found.boxes[0].minY, 50, accuracy: 6)
+        XCTAssertEqual(found.boxes[1].minX, 460, accuracy: 6)
+        XCTAssertEqual(found.boxes[2].height, 270, accuracy: 8)
+        XCTAssertEqual(found.boxes[3].width, 200, accuracy: 6)
+        XCTAssertNil(SymbolSheet.boxes(img, backing: RGB8(0, 177, 64), rows: [3, 2]))
+        XCTAssertEqual(SymbolSheet.layout(count: 4, role: .highPay).aspect, "1:1")
+        XCTAssertEqual(SymbolSheet.layout(count: 4, role: .lowPay).rows, [4])
+    }
+
+    // The planner's cast and finishes reach the jobs; a symbol naming no listed character shows none.
+    func testThePlanCarriesTheCastAndFinishes() throws {
+        let reply = """
+        {"cast": [{"name": "Selene", "kind": "heroine", "look": "silver hair, a crescent crown", "inArt": true},
+                  {"name": "Nyx", "kind": "villain", "look": "a shadow queen in black"}],
+         "anchor": "HP1", "look": "painted",
+         "assets": [{"id": "HP1", "subject": "Selene holding the moon", "silhouette": "figure", "shape": "figure",
+                     "hue": "white", "frame": true, "finish": "silver and moonstone", "cast": "selene"},
+                    {"id": "HP2", "subject": "a comet lantern", "silhouette": "lantern", "shape": "tall",
+                     "hue": "blue", "frame": false, "finish": "brass", "cast": "Somebody Else"}]}
+        """
+        let jobs = [AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "", aspect: "1:1", size: "2K"),
+                    AssetJob(id: "HP2", kind: .symbol, role: .highPay, tier: 2, title: "", aspect: "1:1", size: "2K")]
+        let r = GDDAssetPrompts.apply(planJSON: try XCTUnwrap(GDDAssetPrompts.json(fromModelReply: reply)), to: jobs)
+        XCTAssertEqual(r.design.cast.map(\.name), ["Selene", "Nyx"])
+        XCTAssertEqual(r.design.hero, "Selene")
+        XCTAssertTrue(r.design.cast[0].inArt)
+        XCTAssertEqual(r.jobs[0].cast, "Selene")
+        XCTAssertEqual(r.jobs[1].cast, "")
+        XCTAssertEqual(r.jobs[0].finish, "silver and moonstone")
+        // The brief written for a subject is used only while that subject is on the row.
+        var j = r.jobs[0]; j.brief = "Selene, arms raised…"; j.briefSubject = j.subject
+        XCTAssertEqual(j.currentBrief, "Selene, arms raised…")
+        j.subject = "Selene asleep"
+        XCTAssertNil(j.currentBrief)
+        // The second step's request sees the whole set and the character's look.
+        let ask = GDDAssetPrompts.symbolBrief(job: r.jobs[0], jobs: r.jobs, design: r.design, theme: GameTheme(name: "Moon Queens"))
+        XCTAssertTrue(ask.contains("It shows Selene: silver hair, a crescent crown"), ask)
+        XCTAssertTrue(ask.contains("a comet lantern"), ask)
+        XCTAssertTrue(ask.contains("← THIS ONE"), ask)
+        XCTAssertEqual(GDDAssetPrompts.brief(fromReply: #"{"brief": "  A lantern.  "}"#), "A lantern.")
     }
 
     func testThePlanCarriesColourShapeAndTheSetDecisions() throws {
@@ -11420,7 +11541,8 @@ final class SetDesignTests: XCTestCase {
     func testTheBriefIsShortNamesItsReferencesAndEditsFamilies() {
         let design = SetDesign(anchorID: "HP1", look: "Glossy lacquered ceramic, warm key light from the upper left.",
                                families: ["lowPay": "chunky lacquered letters"])
-        var hp2 = j("HP2", .highPay, "golden harp", hue: "red", shape: "tall", tier: 2)
+        // A medium pay: two high pays would be drawn together on one sheet.
+        var hp2 = j("MP1", .mediumPay, "golden harp", hue: "red", shape: "tall", tier: 1)
         hp2.subject = "A crimson lacquered harp with gold strings."
         var lp1 = j("LP1", .lowPay, "letter A", hue: "pink", shape: "square", frame: false)
         lp1.subject = "The letter A in lacquer"
@@ -11429,7 +11551,7 @@ final class SetDesignTests: XCTestCase {
         let backing = (name: "chroma green", rgb: RGB8(0, 255, 0))
         let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, design, hasThemeArt: true).map { ($0.id, $0) })
 
-        let b = GDDAssetPrompts.brief(job: hp2, step: steps["HP2"]!, theme: GameTheme(name: "Piggy Banks"),
+        let b = GDDAssetPrompts.brief(job: hp2, step: steps["MP1"]!, theme: GameTheme(name: "Piggy Banks"),
                                       design: design, backing: backing, gameName: "Test Game", jobs: jobs)
         XCTAssertTrue(b.contains("Image 1 is the top high-pay symbol, already made for this same set"), b)
         XCTAssertFalse(b.contains("concept art"), b)
@@ -11444,7 +11566,8 @@ final class SetDesignTests: XCTestCase {
         XCTAssertFalse(b.contains("THIS SYMBOL IS ONE OF A SET"))   // the unenforceable rule list is gone
         // No slot codes and no document game name: an image model paints codes, and the
         // document's name carries its own theme into a reskin.
-        XCTAssertFalse(b.contains("HP1") || b.contains("HP2"), b)
+        XCTAssertFalse(b.contains("HP1") || b.contains("MP1"), b)
+        XCTAssertTrue(b.contains("Image 2 shows the symbols already made for this set"), b)
         XCTAssertFalse(b.contains("Test Game"), b)
         XCTAssertLessThan(b.split(whereSeparator: \.isWhitespace).count, 400, b)
 
@@ -11454,11 +11577,11 @@ final class SetDesignTests: XCTestCase {
         let sheet = GDDAssetPrompts.brief(job: lp1, step: steps["LP1"]!, theme: GameTheme(name: "Piggy Banks"),
                                           design: design, backing: backing, gameName: "Test Game", jobs: jobs)
         XCTAssertTrue(sheet.hasPrefix("Create the two low-pay symbols"), sheet)
-        XCTAssertTrue(sheet.contains("1. The letter A in lacquer. Its dominant colour is pink.\n2. a teal letter K. Its dominant colour is teal."), sheet)
+        XCTAssertTrue(sheet.contains("1. The letter A in lacquer. Dominant colour: pink.\n2. a teal letter K. Dominant colour: teal."), sheet)
         XCTAssertTrue(sheet.contains("ONE proper typeface"), sheet)
         XCTAssertTrue(sheet.contains("“A”, “K”"), sheet)
         XCTAssertTrue(sheet.contains("They share this: chunky lacquered letters. Each"), sheet)
-        XCTAssertTrue(sheet.contains("Put them on a perfectly flat"), sheet)
+        XCTAssertTrue(sheet.contains("They stand on a perfectly flat"), sheet)
         XCTAssertTrue(sheet.contains("in one straight row"), sheet)
         XCTAssertTrue(sheet.contains("Each stands directly on the background, with nothing behind it — no card, tile, panel or box."), sheet)
         XCTAssertTrue(sheet.contains("Image 1 is the top high-pay symbol"), sheet)
@@ -11587,10 +11710,10 @@ final class SetDesignTests: XCTestCase {
     }
 
     // The sheet's size follows the count, and it is cut back into one symbol per low pay.
-    func testTheLowPaySheetIsCutIntoItsSymbols() throws {
-        XCTAssertEqual(LowPaySheet.aspect(count: 4), "16:9")
-        XCTAssertEqual(LowPaySheet.aspect(count: 5), "21:9")
-        XCTAssertEqual(LowPaySheet.aspect(count: 6), "21:9")
+    func testTheSymbolSheetIsCutIntoItsSymbols() throws {
+        XCTAssertEqual(SymbolSheet.aspect(count: 4), "16:9")
+        XCTAssertEqual(SymbolSheet.aspect(count: 5), "21:9")
+        XCTAssertEqual(SymbolSheet.aspect(count: 6), "21:9")
         XCTAssertTrue(GeneratedSizeRules.canvas(aspect: "1:1", size: "2K") == (2048, 2048))
         XCTAssertTrue(GeneratedSizeRules.canvas(aspect: "3:4", size: "2K") == (1536, 2048))
         func sheet(_ body: (CGContext) -> Void) throws -> CGImage {
@@ -11610,18 +11733,18 @@ final class SetDesignTests: XCTestCase {
             ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
             ctx.fill(CGRect(x: 1530, y: 60, width: 6, height: 6))                            // a stray sparkle
         }
-        let found = try XCTUnwrap(LowPaySheet.boxes(four, backing: RGB8(0, 177, 64), count: 4))
+        let found = try XCTUnwrap(SymbolSheet.boxes(four, backing: RGB8(0, 177, 64), count: 4))
         XCTAssertEqual(found.boxes.count, 4)
         XCTAssertEqual(found.boxes.map { Int(($0.midX / 10).rounded()) }, [23, 61, 99, 137])   // left to right
         XCTAssertEqual(found.boxes[0].minY, 900 - 650, accuracy: 4)                          // top-left origin
         XCTAssertEqual(Int(found.backdrop.g), 161, accuracy: 3)                               // its own green
-        XCTAssertNil(LowPaySheet.boxes(four, backing: RGB8(0, 177, 64), count: 5))           // not what was asked
+        XCTAssertNil(SymbolSheet.boxes(four, backing: RGB8(0, 177, 64), count: 5))           // not what was asked
         let joined = try sheet { ctx in
             ctx.setFillColor(red: 0.9, green: 0.1, blue: 0.1, alpha: 1)
             ctx.fill(CGRect(x: 100, y: 250, width: 700, height: 400))                        // two run together
             ctx.fill(CGRect(x: 1000, y: 250, width: 260, height: 400))
         }
-        XCTAssertNil(LowPaySheet.boxes(joined, backing: RGB8(0, 177, 64), count: 3))
+        XCTAssertNil(SymbolSheet.boxes(joined, backing: RGB8(0, 177, 64), count: 3))
 
         // A "10" drawn as two runs with a hairline between them is one symbol, not two.
         let ten = try sheet { ctx in
@@ -11629,10 +11752,10 @@ final class SetDesignTests: XCTestCase {
             for x in [100, 480, 860] { ctx.fill(CGRect(x: x, y: 250, width: 260, height: 400)) }
             ctx.fill(CGRect(x: 1240, y: 250, width: 90, height: 400)); ctx.fill(CGRect(x: 1350, y: 250, width: 150, height: 400))
         }
-        let tenBoxes = try XCTUnwrap(LowPaySheet.boxes(ten, backing: RGB8(0, 177, 64), count: 4)).boxes
+        let tenBoxes = try XCTUnwrap(SymbolSheet.boxes(ten, backing: RGB8(0, 177, 64), count: 4)).boxes
         XCTAssertEqual(tenBoxes[3].width, 260, accuracy: 6)
 
-        let cut = try XCTUnwrap(LowPaySheet.cut(four, box: found.boxes[1], backdrop: found.backdrop, width: 512, height: 512))
+        let cut = try XCTUnwrap(SymbolSheet.cut(four, box: found.boxes[1], backdrop: found.backdrop, width: 512, height: 512))
         XCTAssertEqual(cut.width, 512)
         let m = try XCTUnwrap(SymbolImageMetrics.measure(cut, backing: found.backdrop))
         XCTAssertEqual(m.hue, "blue")
@@ -11647,9 +11770,9 @@ final class SetDesignTests: XCTestCase {
                     j("MP2", .mediumPay, "axe", hue: "blue", shape: "shield", tier: 2),
                     j("MP3", .mediumPay, "hen", hue: "green", shape: "shield", tier: 3, frame: false)]
         let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
-        XCTAssertEqual(steps["MP1"]?.refs, ["HP1"])
-        XCTAssertEqual(steps["MP2"], RenderStep(id: "MP2", mode: .match, refs: ["HP1", "MP1"], after: ["HP1", "MP1"]))
-        XCTAssertEqual(steps["MP3"]?.refs, ["HP1"])   // frameless: nothing to copy
+        XCTAssertEqual(steps["MP1"]?.refs, ["HP1", RenderPlan.setSoFar])
+        XCTAssertEqual(steps["MP2"], RenderStep(id: "MP2", mode: .match, refs: ["HP1", "MP1", RenderPlan.setSoFar], after: ["HP1", "MP1"]))
+        XCTAssertEqual(steps["MP3"]?.refs, ["HP1", RenderPlan.setSoFar])   // frameless: nothing to copy
         let b = GDDAssetPrompts.brief(job: jobs[2], step: steps["MP2"]!, theme: GameTheme(name: "T"), design: SetDesign(anchorID: "HP1"),
                                       backing: (name: "chroma green", rgb: RGB8(0, 255, 0)), gameName: "", jobs: jobs)
         XCTAssertTrue(b.contains("Image 1 is the top high-pay symbol, already made"), b)
@@ -11663,8 +11786,11 @@ final class SetDesignTests: XCTestCase {
         let hp = [j("HP1", .highPay, "pig", hue: "gold", shape: "figure", tier: 1, frame: false),
                   j("HP2", .highPay, "vault door", hue: "green", shape: "round", tier: 2),
                   j("HP4", .highPay, "lockbox", hue: "teal", shape: "square", tier: 4)]
-        let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(hp, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
-        XCTAssertEqual(steps["HP4"]?.refs, ["HP1"])
+        // (High pays are drawn together on a sheet now; a tier drawn one by one is the medium pays.)
+        let mp = [hp[0], j("MP2", .mediumPay, "vault door", hue: "green", shape: "round", tier: 2),
+                  j("MP4", .mediumPay, "lockbox", hue: "teal", shape: "square", tier: 4)]
+        let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(mp, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
+        XCTAssertEqual(steps["MP4"]?.refs, ["HP1", RenderPlan.setSoFar])
 
         // A pay symbol on a family's outline reads as one of the family (HP2 round like the coins).
         let coins = [j("WY1", .wysiwyg, "coin", hue: "blue", shape: "round"),
