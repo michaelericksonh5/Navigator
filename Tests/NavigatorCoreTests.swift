@@ -11445,6 +11445,79 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(again["SF1"]?.refs.first, "HP1")
     }
 
+    // The rows keep each group together. A shared importance sorted by tier alone interleaved
+    // Loki's value symbols and multipliers: BWY1 MU1 WY1 BWY2 MU2 WY2…
+    func testSymbolRowsStayGroupedByKind() {
+        let codes: [(String, SlotSymbolRole)] = [("WY1", .wysiwyg), ("WY2", .wysiwyg), ("MU1", .multiplier), ("MU2", .multiplier),
+                                                  ("BWY1", .wysiwyg), ("BWY2", .wysiwyg), ("SC1", .scatter), ("BO1", .bonus),
+                                                  ("BO2", .bonus), ("SF1", .collector), ("AC1", .activator), ("SF2", .collector)]
+        let syms = codes.enumerated().map { i, c in
+            SlotSymbol(code: c.0, index: i, role: c.1, tier: Int(c.0.filter(\.isNumber)), note: "")
+        }
+        XCTAssertEqual(AssetPlanRules.symbolJobs(syms).map(\.id),
+                       ["SF1", "SF2", "AC1", "SC1", "BO1", "BO2", "WY1", "WY2", "MU1", "MU2", "BWY1", "BWY2"])
+        // SFs doing different jobs are still one block of SFs, in number order.
+        let sf = [("HP1", SlotSymbolRole.highPay), ("SF1", .collector), ("WD1", .wild), ("SF2", .multiplier),
+                  ("HP2", .highPay), ("SF3", .activator), ("WY1", .wysiwyg)]
+            .enumerated().map { i, c in SlotSymbol(code: c.0, index: i, role: c.1, tier: Int(c.0.filter(\.isNumber)), note: "") }
+        XCTAssertEqual(AssetPlanRules.symbolJobs(sf).map(\.id), ["HP1", "HP2", "WD1", "SF1", "SF2", "SF3", "WY1"])
+    }
+
+    // What a symbol does reaches the prompt writer and the image: the document's own passage
+    // under its heading (not only the heading), no reel-table code, and the planner's "job".
+    func testASymbolsJobReachesEveryStep() throws {
+        let gdd = """
+        * 10 — SF1 (Jackpot Coin)
+        * 11 — WY1 (WY1(blue))
+        //17=WY3 (special collector), 18=SF2 (WY2 + WY3)
+        stop: int,                         //   Bonus wheel stop index
+
+        SF1 Jackpot Coins - Appear on selected winning cells
+        Jackpot Coins are server-placed on winning cells during cascade steps. Like WY1s, they fall with gravity.
+        Each one awards the jackpot tier shown on it.
+        WY1 Scatter Coins - Appears on selected winning cells
+        WY1 Scatter Coins carry a credit value.
+        """
+        let doc = GDDFeatureContext.mentions(of: "SF1", in: gdd)
+        XCTAssertTrue(doc.contains("Jackpot Coins are server-placed"), doc)
+        XCTAssertTrue(doc.contains("awards the jackpot tier"), doc)
+        XCTAssertFalse(doc.contains("Scatter Coins carry"), doc)
+        let sf2 = GDDFeatureContext.mentions(of: "SF2", in: gdd)
+        XCTAssertTrue(sf2.contains("18=SF2 (WY2 + WY3)"), sf2)       // the note inside the comment stays
+        XCTAssertFalse(sf2.contains("stop: int"), sf2)                 // the reel table under it does not
+
+        let reply = #"{"anchor": "SF1", "assets": [{"id": "SF1", "subject": "a gold coin", "silhouette": "coin", "shape": "round", "hue": "gold", "frame": true, "finish": "gold", "job": "Lands on wins and awards the jackpot tier shown on it."}]}"#
+        let jobs = [AssetJob(id: "SF1", kind: .symbol, role: .collector, tier: 1, title: "", aspect: "1:1", size: "2K")]
+        let r = GDDAssetPrompts.apply(planJSON: try XCTUnwrap(GDDAssetPrompts.json(fromModelReply: reply)), to: jobs)
+        XCTAssertEqual(r.jobs[0].job, "Lands on wins and awards the jackpot tier shown on it.")
+        let line = GDDAssetPrompts.roleLine(r.jobs[0], jobs: r.jobs, design: r.design)
+        XCTAssertTrue(line.contains("What it does in this game: Lands on wins and awards the jackpot tier shown on it — its design makes that readable at a glance."), line)
+        // A multiplier is told how to look like one.
+        let mu = AssetJob(id: "MU1", kind: .symbol, role: .multiplier, tier: 1, title: "", aspect: "1:1", size: "2K")
+        XCTAssertTrue(GDDAssetPrompts.roleLine(mu, jobs: [mu], design: SetDesign()).contains("it boosts wins"))
+
+        // The row and the prompts use the document's name; the guessed hint gives way to its job.
+        let named = GDDAssetPrompts.apply(planJSON: try XCTUnwrap(GDDAssetPrompts.json(fromModelReply:
+            #"{"assets": [{"id": "SF1", "subject": "a gold coin", "silhouette": "coin", "shape": "round", "hue": "gold", "frame": true, "finish": "gold", "name": "Jackpot Coin", "job": "Awards the jackpot tier shown on it."}]}"#)), to: jobs).jobs[0]
+        XCTAssertEqual(GDDAssetPrompts.label(named), "Jackpot Coin")
+        XCTAssertEqual(GDDAssetPrompts.displayName(named), "the Jackpot Coin symbol")
+        let l = GDDAssetPrompts.roleLine(named, jobs: [named], design: SetDesign())
+        XCTAssertTrue(l.hasPrefix("It is the Jackpot Coin of this game's feature."), l)
+        XCTAssertFalse(l.contains("as if it gathers"), l)
+        XCTAssertEqual(GDDAssetPrompts.label(jobs[0]), "Collector")      // before the design: the role
+        let wild = [AssetJob(id: "WD1", kind: .symbol, role: .wild, tier: 1, title: "", aspect: "1:1", size: "2K")]
+        XCTAssertEqual(GDDAssetPrompts.apply(planJSON: try XCTUnwrap(GDDAssetPrompts.json(fromModelReply:
+            #"{"assets": [{"id": "WD1", "subject": "a star", "silhouette": "star", "shape": "pointed", "hue": "gold", "frame": false, "finish": "gold", "name": "Wild Symbol"}]}"#)), to: wild).jobs[0].docName, "")
+
+        // Dodge lists its symbols code first: "* 22 MU2        // bonus 1 horizontal multiplier".
+        XCTAssertEqual(GDDFeatureContext.mentions(of: "MU2", in: "* 22 MU2        // bonus 1 horizontal multiplier"),
+                       "MU2: bonus 1 horizontal multiplier")
+        // Notes the documents write: an adder of collections, and "mult" for multiplier.
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "bonus 1 collection adder"), .adder)
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "scatter game hotspot feature - mult random"), .multiplier)
+        XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "Base Game, collects and pays out WY1 and WY10 type symbols"), .collector)
+    }
+
     // No sentence compares a symbol with one the image model cannot see; the finish carries it.
     func testTheRoleLineStatesAFinishInsteadOfComparing() {
         var jobs = piggy

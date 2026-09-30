@@ -7315,8 +7315,11 @@ public enum SlotSymbolRole: String, Sendable, CaseIterable {
         // What the symbol DOES comes before what it acts on. "Collects all multiplier
         // values" is a collector; matching "multipl" first made it a multiplier, and the
         // two get drawn differently.
+        // "bonus 1 collection adder" is an adder: the noun names the symbol, "collection" its target.
+        if n.contains("adder") { return .adder }
         if n.contains("collect") || n.contains("gather") { return .collector }
-        if n.contains("multipl") { return .multiplier }
+        // "mult random", "mult all": the documents' own shorthand.
+        if n.contains("multipl") || n.range(of: #"\bmult\b"#, options: .regularExpression) != nil { return .multiplier }
         if n.contains("adds ") || n.contains("adder") || n.contains("addition") { return .adder }
         if n.contains("activat") || n.contains("trigger") || n.contains("unlock") { return .activator }
         return .collector
@@ -8476,6 +8479,13 @@ public struct AssetJob: Equatable, Sendable {
     public var finish: String = ""
     /// The cast member this symbol shows, by name as in SetDesign.cast; "" for none.
     public var cast: String = ""
+    /// What this symbol does in THIS game, in the planner's words from the document — "lands on
+    /// wins and awards a jackpot tier". The role name alone ("collector") is a guess from its
+    /// code: Tiki Titans' SF1 is filed as a collector and is the game's Jackpot Coin.
+    public var job: String = ""
+    /// What the document calls it — "Jackpot Coin" — in the planner's reading. The row's label
+    /// and the prompts' name for it; the role stays for how it is drawn.
+    public var docName: String = ""
     /// The full image prompt written for this one symbol by the second design step, and the
     /// subject it was written for — an edited subject makes it stale, and the subject is used.
     public var brief: String = ""
@@ -8512,12 +8522,20 @@ public enum AssetPlanRules {
     /// whether the set is working come first.
     public static func symbolJobs(_ symbols: [SlotSymbol], size: String = defaultSize,
                                   aspect: String = symbolAspect) -> [AssetJob] {
-        symbols.filter { $0.role.needsArt }
-            .sorted {
-                $0.role.priority == $1.role.priority
-                    ? ($0.tier ?? 0, $0.code) < ($1.tier ?? 0, $1.code)
-                    : $0.role.priority < $1.role.priority
-            }
+        // Every symbol type — the letters of its code: HP, SF, WD, BWY — stays in one block,
+        // whatever job each member does: SF1 a collector and SF2 a multiplier are still both SFs.
+        // Blocks go by their most important member, then the order the document lists them;
+        // inside a block, by number. Sorting by job and tier alone interleaved Loki's rows as
+        // BWY1 MU1 WY1 BWY2 MU2 WY2…
+        let art = symbols.filter { $0.role.needsArt }
+        func family(_ s: SlotSymbol) -> String { String(s.code.prefix { $0.isLetter }).uppercased() }
+        let rank = Dictionary(art.map { (family($0), $0.role.priority) }, uniquingKeysWith: min)
+        let listed = Dictionary(art.map { (family($0), $0.index) }, uniquingKeysWith: min)
+        func key(_ s: SlotSymbol) -> (Int, Int, String, Int, String) {
+            (rank[family(s)] ?? 9, listed[family(s)] ?? 0, family(s), s.tier ?? 0, s.code)
+        }
+        return art
+            .sorted { key($0) < key($1) }
             .map {
                 AssetJob(id: $0.code, kind: .symbol, role: $0.role, tier: $0.tier,
                          title: $0.note.isEmpty ? $0.role.label : $0.note,
@@ -8846,12 +8864,46 @@ enum GDDFeatureContext {
         guard !code.isEmpty, !gddText.isEmpty else { return "" }
         let lines = gddText.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
         let pattern = "\\b" + NSRegularExpression.escapedPattern(for: code) + "\\b"
+        // Each mention with the passage under it, up to a blank line or a line that names another
+        // symbol: "SF1 Jackpot Coins - Appear on selected winning cells" is a heading, and what the
+        // coin does is the paragraph after it, which never repeats the code.
+        let otherCode = try? NSRegularExpression(pattern: #"\b[A-Z]{1,5}[0-9]{1,2}\b"#)
+        // A line that opens with another symbol's code — the next heading or list entry. A code
+        // later in a sentence ("Like WY1s, they fall with gravity") is still this passage.
+        func namesAnother(_ l: String) -> Bool {
+            let head = String(l.prefix(20))
+            let r = NSRange(head.startIndex..., in: head)
+            return l.range(of: pattern, options: .regularExpression) == nil
+                && (otherCode?.matches(in: head, range: r) ?? []).contains { m in
+                    Range(m.range, in: head).map { String(head[$0]) != code } ?? false
+                }
+        }
         var out: [String] = [], total = 0, taken = Set<Int>()
-        for (i, l) in lines.enumerated() where l.range(of: pattern, options: .regularExpression) != nil && !isNoise(l) {
-            for k in [i, i + 1] where k < lines.count && !taken.contains(k) && !isNoise(lines[k]) {
-                let piece = String(lines[k].prefix(300))
-                guard total + piece.count <= limit else { return out.joined(separator: "\n") }
-                out.append(piece); total += piece.count; taken.insert(k)
+        for (i, l) in lines.enumerated() where l.range(of: pattern, options: .regularExpression) != nil {
+            // A code comment keeps only its words ("18=SF2 (WY2 + WY3)") and runs on no further:
+            // the lines under it are the rest of a reel table ("stop: int, // …").
+            if let c = l.range(of: "//") {
+                let comment = l[c.upperBound...].trimmingCharacters(in: .whitespaces)
+                let codeFirst = l[..<c.lowerBound].range(of: pattern, options: .regularExpression) != nil
+                // "* 22 MU2 // bonus 1 horizontal multiplier": the code, then what it is.
+                let note = codeFirst ? (comment.isEmpty ? "" : "\(code): \(comment)") : comment
+                if !note.isEmpty, codeFirst || note.range(of: pattern, options: .regularExpression) != nil, !taken.contains(i) {
+                    guard total + note.count <= limit else { break }
+                    out.append(String(note.prefix(400))); total += note.count; taken.insert(i)
+                }
+                continue
+            }
+            guard !isNoise(l) else { continue }
+            var k = i
+            while k < lines.count, k < i + 6 {
+                let line = lines[k]
+                if k > i && (line.isEmpty || namesAnother(line) || line.contains("//")) { break }
+                if !taken.contains(k) && !isNoise(line) {
+                    let piece = String(line.prefix(400))
+                    guard total + piece.count <= limit else { return out.joined(separator: "\n") }
+                    out.append(piece); total += piece.count; taken.insert(k)
+                }
+                k += 1
             }
         }
         return out.joined(separator: "\n")
@@ -9243,6 +9295,9 @@ public enum GDDAssetPrompts {
                             "finish": text(SetDesignRules.maxFinish,
                                            "Its material and ornament level in fixed terms, under 20 words.", perItem: true),
                             "cast": plain("The name of the cast member this symbol shows, exactly as in cast; else empty."),
+                            "name": plain("What the document calls this symbol, 1 to 4 words. Empty for plain pays."),
+                            "job": text(SetDesignRules.maxJob,
+                                        "What this symbol does in this game, from the document, under 20 words. Empty for plain pays.", perItem: true),
                         ],
                         "required": ["id", "subject", "silhouette", "shape", "hue", "frame", "finish"],
                     ],
@@ -9395,6 +9450,16 @@ public enum GDDAssetPrompts {
           lives in these words. HP1 has the most precious finish in the set; each rank below
           steps down in material and ornament while keeping its own hue; jackpots step down by
           tier; the low pays have the simplest finish.
+        - NAME: for the same symbols, write in "name" what the document calls it, 1 to 4 words, in
+          its own words where it has them ("Jackpot Coin", "Hotspot Collector", "Super Bonus") —
+          the row is labelled with it. Plain pays leave it empty.
+        - JOB: for every symbol that does something — wild, scatter, bonus, collector, multiplier,
+          activator, adder, value coin, jackpot, mystery — write in "job" what it does in THIS game,
+          from the document, under 20 words ("lands on wins and awards a jackpot tier", "collects
+          every coin value on the reels"). Its design has to make that job readable at a glance: a
+          collector looks like it gathers, a multiplier like it boosts, an activator like it is about
+          to go off. Where a slot's code and the document disagree about what it is, the document
+          wins. Plain pays leave "job" empty.
         - FRAMES: not every symbol has one. Decide per symbol: a frame suits characters and
           prized objects that need a plaque to sit in; coins, emblems, specials and objects with
           a strong silhouette often stand frameless. Card royals and backgrounds never have one.
@@ -9413,7 +9478,7 @@ public enum GDDAssetPrompts {
             {"id": "<slot id>", "subject": "<one sentence: what it is, its material and colour>",
              "silhouette": "<one or two words>", "shape": "<outline class>", "hue": "<colour family>",
              "frame": true, "finish": "<material and ornament, fixed terms>",
-             "cast": "<cast name, or empty>",
+             "cast": "<cast name, or empty>", "name": "<what the document calls it, or empty>", "job": "<what it does in this game, or empty>",
              "variation": "<for a family member: what differs from the first member>"}
           ]
         }
@@ -9961,7 +10026,7 @@ public enum GDDAssetPrompts {
         var bySubject: [String: (String, String)] = [:]
         var frames: [String: Bool] = [:]
         var extras: [String: (hue: String, shape: String, variation: String)] = [:]
-        var finishes: [String: String] = [:], castOf: [String: String] = [:]
+        var finishes: [String: String] = [:], castOf: [String: String] = [:], jobs_: [String: String] = [:], names: [String: String] = [:]
         func clean(_ v: Any?, allowed: [String]? = nil) -> String {
             let t = (v as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard let allowed else { return t }
@@ -9981,6 +10046,8 @@ public enum GDDAssetPrompts {
                           cap(clean(a["variation"]), SetDesignRules.maxVariation))
             finishes[id] = cap(clean(a["finish"]), SetDesignRules.maxFinish)
             castOf[id] = cap(clean(a["cast"]), 80)
+            jobs_[id] = cap(clean(a["job"]), SetDesignRules.maxJob)
+            names[id] = cap(clean(a["name"]), 40)
         }
         var cast: [CastMember] = []
         for case let c as [String: Any] in (planJSON["cast"] as? [Any] ?? []) {
@@ -10008,7 +10075,7 @@ public enum GDDAssetPrompts {
                 // carrying text, so generation drew it anyway and charged for it.
                 missing.append(j.id)
                 j.subject = ""; j.silhouette = ""; j.hue = ""; j.shape = ""; j.variation = ""
-                j.finish = ""; j.cast = ""; j.brief = ""; j.briefSubject = ""
+                j.finish = ""; j.cast = ""; j.job = ""; j.docName = ""; j.brief = ""; j.briefSubject = ""
                 out.append(j); continue
             }
             j.subject = subj
@@ -10018,6 +10085,13 @@ public enum GDDAssetPrompts {
             j.shape = extras[j.id]?.shape ?? ""
             j.variation = extras[j.id]?.variation ?? ""
             j.finish = finishes[j.id] ?? ""
+            j.job = jobs_[j.id] ?? ""
+            // Plain pays are named by rank; a name there would only restate "High pay".
+            // A name that only restates the role ("Wild Symbol", "Replacement 1") says nothing.
+            let n = names[j.id] ?? ""
+            let bare = n.lowercased().filter { $0.isLetter || $0 == " " }.trimmingCharacters(in: .whitespaces)
+            let restates = [j.role.label.lowercased(), j.role.label.lowercased() + " symbol"].contains(bare)
+            j.docName = [.highPay, .mediumPay, .lowPay].contains(j.role) || restates ? "" : n
             // Only a character the plan actually lists — a name with no look is nothing to draw.
             j.cast = design.member(castOf[j.id] ?? "")?.name ?? ""
             j.brief = ""; j.briefSubject = ""
@@ -10200,7 +10274,7 @@ public enum SetDesignRules {
     public static let shapes = ["round", "square", "shield", "tall", "wide", "pointed",
                                 "figure", "freeform", "letter"]
     // Field limits, in characters. The prompt asks for fewer words; these are the backstop.
-    static let maxSubject = 320, maxVariation = 180, maxLook = 700, maxFamily = 220, maxFinish = 200, maxCastLook = 400
+    static let maxSubject = 320, maxVariation = 180, maxLook = 700, maxFamily = 220, maxFinish = 200, maxCastLook = 400, maxJob = 220
 
     /// A field cut back to its limit at the last whole sentence (or word) — a runaway reply
     /// must never reach an image prompt at full length.
@@ -10246,7 +10320,7 @@ public enum SetDesignRules {
         "purple": ["purple", "violet", "amethyst", "lavender", "plum", "indigo", "mauve", "lilac"],
         "pink": ["pink", "rose", "fuchsia", "magenta", "blush", "bubblegum"],
         "white": ["white", "ivory", "pearl", "silver", "platinum", "porcelain", "snow", "alabaster", "chrome"],
-        "black": ["black", "obsidian", "onyx", "ebony", "jet", "charcoal"],
+        "black": ["black", "obsidian", "onyx", "ebony", "jet", "charcoal", "slate", "graphite", "basalt"],
         "brown": ["brown", "bronze", "wood", "wooden", "oak", "mahogany", "walnut", "chocolate",
                   "leather", "rust", "tan", "copper"],
     ]
@@ -11283,8 +11357,12 @@ extension GDDAssetPrompts {
     static let counts = ["one", "two", "three", "four", "five", "six", "seven", "eight"]
     static func countWord(_ n: Int) -> String { n >= 1 && n <= counts.count ? counts[n - 1] : "\(n)" }
 
+    /// The symbol's name on the row: what the document calls it when that is known.
+    public static func label(_ job: AssetJob) -> String { job.docName.isEmpty ? job.role.label : job.docName }
+
     /// What a symbol is called in a prompt — its job in words, never its slot code.
     static func displayName(_ job: AssetJob) -> String {
+        if !job.docName.isEmpty { return "the \(job.docName) symbol" }
         let t = job.tier ?? 1
         switch job.role {
         case .highPay: return t == 1 ? "the top high-pay symbol" : "the \(ordinal(t)) high-pay symbol"
@@ -11347,17 +11425,33 @@ extension GDDAssetPrompts {
             line = "It is the \(jackpotTierName(job)) jackpot symbol, one of a matching family of jackpot tiers\(built). The game prints the tier name on it, so keep a calm, clear area for that label."
         case .wysiwyg:
             line = "It is a value symbol, one of a matching family\(built). The game prints a credit amount on it during play, so keep a calm, clear area in its middle for the number."
-        case .collector:
-            line = "It is the collector symbol of this game's feature, made to look like a prize won: a heavy, ornate ring or setting around its treasure. The game prints a number on it, so keep a calm, clear area for it."
-        case .activator, .adder, .multiplier:
-            line = "It is the \(job.role.label.lowercased()) symbol of this game's feature. The game prints a number on it, so keep a calm, clear area for it."
+        case .collector, .multiplier, .activator, .adder:
+            // Named as the document names it. The look of the job comes from the planner's
+            // reading of the document when there is one; the role's own hint is only a fallback,
+            // because the role is read from a code and a short note and can be wrong.
+            let known = !job.job.isEmpty
+            let cue: String
+            switch job.role {
+            case .collector: cue = known ? "" : ", its design drawing the eye inward to its prize as if it gathers"
+            case .multiplier: cue = known ? "" : ": it boosts wins, so it looks charged with power — layered, doubled or surging forms bursting outward"
+            case .activator: cue = known ? "" : ": it sets the feature off, so it looks primed to go — a seal, key or core straining with energy"
+            default: cue = known ? "" : ": it adds to other symbols' values, so it looks like it gives — pouring, spilling or radiating outward"
+            }
+            let who = job.docName.isEmpty ? "the \(job.role.label.lowercased()) symbol" : "the \(job.docName)"
+            // SF symbols look high in value in this studio's games.
+            let prize = job.role == .collector ? " It is made to look like a prize won: a heavy, ornate ring or setting around its treasure." : ""
+            line = "It is \(who) of this game's feature\(cue).\(prize) The game prints a number on it, so keep a calm, clear area for it."
         case .replacement:
             line = "It is a mystery symbol: it lands, then transforms into another symbol, so it reads as sealed and full of anticipation."
         default:
             line = ""
         }
+        let does = job.job.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
         let finish = job.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
-        return line.isEmpty || finish.isEmpty ? line : line + " Its finish: \(finish)."
+        var out = line
+        if !does.isEmpty { out += (out.isEmpty ? "" : " ") + "What it does in this game: \(does) — its design makes that readable at a glance." }
+        if !out.isEmpty && !finish.isEmpty { out += " Its finish: \(finish)." }
+        return out
     }
 
     /// The set's shared style block — the same words in every image of the set. With no
@@ -11618,6 +11712,10 @@ extension GDDAssetPrompts {
 
     // MARK: The second design step: one symbol's full prompt
 
+    /// The most slots a design is asked for at HIGH thinking; bigger sets run past the service's
+    /// time limit at it (see planCall).
+    public static let highThinkingSlots = 26
+
     public static let briefSystem = """
     You are a senior slot game artist at High 5 Games. The symbol set has already been \
     designed; you write the image prompt for ONE of its symbols. The image model sees only \
@@ -11688,7 +11786,8 @@ extension GDDAssetPrompts {
             task = """
             Write the image prompt for this one symbol, \(words) words, as what to draw:
             1. What it is and what it is doing: for a character, the pose, gesture, expression and \
-            what they hold; for an object, its most striking angle and state — open, lit, mid-motion.
+            what they hold; for an object, its most striking angle and state — open, lit, mid-motion. \
+            For a symbol with a job in the game, how its design shows that job at a glance.
             2. The camera and composition in its square: the angle (three-quarter, low hero angle, \
             straight on…), how it fills the space\(job.hasFrame ? ", and whether part of it overlaps or breaks out of its frame" : "").
             3. The one eye-catching detail a player notices first.

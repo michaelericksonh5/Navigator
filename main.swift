@@ -21364,6 +21364,23 @@ if CommandLine.arguments.contains("--art-audit") {
     app.run()
 }
 
+// Free, no model:  Navigator --gdd-rows <gdd.txt>…
+// Each document's rows as the window lists them — order, role, label and the GDD's own note —
+// and how much of the document each symbol's prompt writer would be given.
+if let flag = CommandLine.arguments.firstIndex(of: "--gdd-rows") {
+    for path in CommandLine.arguments[(flag + 1)...] {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { print("unreadable: \(path)"); continue }
+        let read = GDDSymbolSetRules.parseWithProblems(text)
+        let jobs = AssetPlanRules.symbolJobs(read.symbols)
+        print("== \((path as NSString).lastPathComponent) — \(jobs.count) rows\(read.problems.isEmpty ? "" : " · unread: \(read.problems.joined(separator: ", "))")")
+        for j in jobs {
+            let doc = GDDFeatureContext.mentions(of: j.id, in: text)
+            print("  \(j.id.padding(toLength: 7, withPad: " ", startingAt: 0)) \(j.role.label.padding(toLength: 15, withPad: " ", startingAt: 0)) label: \(GDDAssetPrompts.label(j).padding(toLength: 22, withPad: " ", startingAt: 0)) note: \(j.title.prefix(60))  · doc \(doc.count) chars")
+        }
+    }
+    exit(0)
+}
+
 // Planner check:  Navigator --plan-test <gdd-text-file> <theme name>
 //
 // Exercises the call that actually decides the art: read a GDD, pick a theme, and have
@@ -23598,8 +23615,8 @@ final class GDDRunLog {
 
     /// The plan as a table a person can read, in slot order.
     static func planTable(_ jobs: [AssetJob]) -> String {
-        (["id\trole\thue\tshape\tframe\tsilhouette\tcast\tfinish\tvariation\tsubject"] + jobs.map {
-            "\($0.id)\t\($0.kind == .background ? "background" : $0.role.label)\t\($0.hue)\t\($0.shape)\t\($0.hasFrame ? "frame" : "-")\t\($0.silhouette)\t\($0.cast)\t\($0.finish)\t\($0.variation)\t\($0.subject)"
+        (["id\trole\tname\thue\tshape\tframe\tsilhouette\tcast\tjob\tfinish\tvariation\tsubject"] + jobs.map {
+            "\($0.id)\t\($0.kind == .background ? "background" : $0.role.label)\t\($0.docName)\t\($0.hue)\t\($0.shape)\t\($0.hasFrame ? "frame" : "-")\t\($0.silhouette)\t\($0.cast)\t\($0.job)\t\($0.finish)\t\($0.variation)\t\($0.subject)"
         }).joined(separator: "\n") + "\n"
     }
 }
@@ -24003,10 +24020,13 @@ final class GDDToAssetsRun: ObservableObject {
     private func planCall(_ prompt: String, system sys: String, ids: [String], log: GDDRunLog,
                           name: String, done: @escaping (_ text: String?, _ error: String?) -> Void) {
         // HIGH, the top level gemini-3.8-flash takes (low/medium/high, default medium — Gemini
-        // API thinking docs, checked 30 Sep 2026; the service lists vision.thinking_level).
-        // An earlier three-run test at HIGH scored adherence about even with MEDIUM, but the
-        // design is the creative core of the set and costs cents next to its images.
-        H5GService.thinkingLevel = "high"
+        // API thinking docs, checked 30 Sep 2026; the service lists vision.thinking_level) —
+        // for a set that can finish at it. Measured 30 Sep: 24 slots took 99–127 s at HIGH,
+        // and 30 and 40 slots were cut off at 268 s by the service's time limit, where MEDIUM
+        // had designed 45 slots in under a minute. A timeout is not retried (it may have been
+        // billed), so a big set starts at MEDIUM rather than failing at HIGH.
+        // ponytail: slot count stands in for answer length; raise it if the service's limit is raised.
+        H5GService.thinkingLevel = ids.count <= GDDAssetPrompts.highThinkingSlots ? "high" : "medium"
         // The ENVELOPE is constrained; subject and silhouette stay free text. Constraining
         // the creative fields is the one thing the published work on forced structured
         // output suggests costs quality, and it would buy nothing here.
@@ -24045,6 +24065,7 @@ final class GDDToAssetsRun: ObservableObject {
                 let secs = Date().timeIntervalSince(started)
                 log.write("\(name)-reply.json", r.text ?? "(no reply) \(r.error ?? "")")
                 log.event(["step": name, "cost": r.cost ?? 0, "seconds": secs,
+                           "thinking": ids.count <= GDDAssetPrompts.highThinkingSlots ? "high" : "medium",
                            "promptWords": prompt.split(whereSeparator: \.isWhitespace).count,
                            "error": r.error ?? ""])
                 navLog(String(format: "gdd %@: %@ × %@ — %d slots, $%.4f, %.1fs%@", name,
@@ -25989,9 +26010,12 @@ struct GDDToAssetsSheet: View {
                 HStack(alignment: .top, spacing: 8) {
                     Text(job.id).font(.system(.caption, design: .monospaced)).bold()
                         .lineLimit(1).frame(width: 100, alignment: .leading)
-                    Text(job.kind == .background ? "Background" : job.role.label)
-                        .font(.caption).foregroundColor(.secondary)
+                    // The document's name for it once the set is designed; the role and the
+                    // document's own note on hover.
+                    Text(job.kind == .background ? "Background" : GDDAssetPrompts.label(job))
+                        .font(.caption).foregroundColor(.secondary).lineLimit(2)
                         .frame(width: 130, alignment: .leading)
+                        .help([job.kind == .background ? "" : "Drawn as: \(job.role.label)", job.title == job.role.label ? "" : "Document: \(job.title)", job.job.isEmpty ? "" : "Does: \(job.job)"].filter { !$0.isEmpty }.joined(separator: "\n"))
                     TextField("subject", text: field(job.id, \.subject))
                         .font(.caption).textFieldStyle(.roundedBorder)
                         .disabled(run.running || run.busy)
@@ -26202,7 +26226,7 @@ struct GDDToAssetsSheet: View {
     /// Drop subjects designed for a theme that is no longer selected.
     private func clearPlanSubjects() {
         run.jobs = run.jobs.map { var j = $0; j.subject = ""; j.silhouette = ""; j.hue = ""; j.shape = ""; j.variation = ""
-            j.finish = ""; j.cast = ""; j.brief = ""; j.briefSubject = ""; return j }
+            j.finish = ""; j.cast = ""; j.job = ""; j.docName = ""; j.brief = ""; j.briefSubject = ""; return j }
         run.resetDesign()
         run.missing = []
         run.status = "Theme changed — design the set again."
@@ -26220,7 +26244,7 @@ struct GDDToAssetsSheet: View {
             if let k = keep[j.id] {
                 j.subject = k.subject; j.silhouette = k.silhouette; j.hasFrame = k.hasFrame
                 j.hue = k.hue; j.shape = k.shape; j.variation = k.variation
-                j.finish = k.finish; j.cast = k.cast; j.brief = k.brief; j.briefSubject = k.briefSubject
+                j.finish = k.finish; j.cast = k.cast; j.job = k.job; j.docName = k.docName; j.brief = k.brief; j.briefSubject = k.briefSubject
             }
             return j
         }
