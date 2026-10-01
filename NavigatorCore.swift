@@ -1745,15 +1745,20 @@ enum LayerizeRules {
         return basePrompt + "\n" + t
     }
 
-    /// fal bills this endpoint by COMPUTE SECONDS at $0.00017 — from fal's own pricing API, checked
-    /// 2026-08-12. The previous estimate invented a per-layer price and reported roughly 10x too
-    /// much; it also chose a tier from `image.width` in the response, and that field is never
-    /// present, so it silently fell to the cheap tier on every call anyway.
-    ///
-    /// Wall-clock is the only timing Navigator can see and it includes queueing, so this can only
-    /// ever be an upper bound — display it as approximate, never as a billed figure.
-    static let costPerComputeSecond = 0.00017
-    static func estimatedCost(seconds: Double) -> Double { max(0, seconds) * costPerComputeSecond }
+    /// fal bills PER GENERATED LAYER: $0.03375, or $0.0675 once the base image is over
+    /// 1536×1536 (fal's llms.txt and pricing API, checked 2026-10-01; the compute-second rate this
+    /// replaced was out of date). ByteDance counts the base among the generated images, so it is
+    /// counted here too — fal does not say either way, which is why this stays an estimate.
+    static let costPerLayer = 0.03375
+    static func estimatedCost(layers: Int, basePixels: Int) -> Double {
+        Double(max(0, layers)) * costPerLayer * (basePixels > 1536 * 1536 ? 2 : 1)
+    }
+    /// The base's size for a tier: `auto` keeps the input's long edge between 1K and 2K.
+    static func basePixels(width: Int, height: Int, tier: String) -> Int {
+        let cap: Double = tier == "auto_1K" ? 1024 : tier == "auto_1.5K" ? 1536 : tier == "auto_2K" ? 2048 : min(2048, max(1024, Double(max(width, height))))
+        let s = cap / Double(max(width, height, 1))
+        return Int((Double(width) * s).rounded()) * Int((Double(height) * s).rounded())
+    }
 
     /// Filesystem-safe WITHOUT destroying non-ASCII.
     ///
@@ -5171,6 +5176,265 @@ enum LayerizeElementRules {
         guard !kept.isEmpty else { return ("", dropped) }
         return ("Separate these elements out from the image as individual layers: "
                 + kept.joined(separator: ", "), dropped)
+    }
+}
+
+/// Layerize driven from the plan, for a framed GDD symbol: what to ask for, and how to read
+/// what comes back.
+///
+/// The documented levers (fal's and ByteDance's API pages): the prompt names what to
+/// separate; ByteDance's own decomposition example states the layer count and gives each
+/// element a `<bbox>x1 y1 x2 y2</bbox>` on a 0–999 grid; a box over several elements needs
+/// the element named; long prompts lose detail. What Navigator measured adds the rest:
+/// specific names beat a generic "separate everything", an unnamed frame came back as four
+/// rails, and the same prompt varies run to run. So each symbol gets its own short prompt
+/// for exactly its elements — the frame's backing panel, the frame, the subject, back to
+/// front as the shipped Spine files stack them (HP2_FrameBG under HP2_Frame) — described as
+/// a vision model sees THIS image, and boxed.
+public enum LayerizePlanRules {
+    public enum Role: String, CaseIterable, Sendable { case backing, frame, subject }
+
+    public struct Element: Equatable, Sendable {
+        public let role: Role
+        public let name: String
+        public let description: String
+        /// x1 y1 x2 y2 on Layerize's 0–999 grid.
+        public let box: [Int]
+        public init(role: Role, name: String, description: String, box: [Int]) {
+            self.role = role; self.name = name; self.description = description; self.box = box
+        }
+    }
+
+    /// 1.5K first. fal bills every generated layer, doubled once the base is over 1536×1536, so a
+    /// 2048px symbol at `auto` pays twice for layers that end up at reel size. `auto` is the last resort.
+    public static let ladder = ["auto_1.5K", "auto_1.5K", "auto"]
+
+    /// The Layerize prompt for these elements, back to front.
+    public static func prompt(_ elements: [Element]) -> String {
+        let subject = elements.first { $0.role == .subject }?.name ?? "symbol"
+        func rule(_ e: Element) -> String {
+            switch e.role {
+            case .backing: return "Exclude the frame and the \(subject); fill it in wherever the \(subject) covers it."
+            case .frame: return "The whole frame as ONE layer, every side together, with any ornament that reaches into the window. Exclude the backing and the \(subject); fill the frame in wherever the \(subject) covers it."
+            case .subject: return "Complete, including any part that reaches over the frame. Exclude the frame and the backing."
+            }
+        }
+        let lines = elements.enumerated().map { i, e in
+            "\(i + 1). \(e.name): \(e.description.trimmingCharacters(in: CharacterSet(charactersIn: ". "))), at <bbox>\(e.box.map(String.init).joined(separator: " "))</bbox>. \(rule(e))"
+        }
+        return LayerizeRules.basePrompt + "\n"
+            + "Separate this slot-game symbol into exactly \(elements.count) layers, back to front:\n"
+            + lines.joined(separator: "\n") + "\n"
+            + "Each layer keeps its original position, size and colours. Separate only these; do not split any of them further, and add nothing."
+    }
+
+    /// Gemini's `[ymin, xmin, ymax, xmax]` on 0–1000 as Layerize's `x1 y1 x2 y2` on 0–999, or nil
+    /// for a box that is not one.
+    public static func layerizeBox(fromGemini b: [Int]) -> [Int]? {
+        guard b.count == 4 else { return nil }
+        let c = { (v: Int) in max(0, min(999, v)) }
+        let out = [c(b[1]), c(b[0]), c(b[3]), c(b[2])]
+        return out[2] > out[0] && out[3] > out[1] ? out : nil
+    }
+
+    /// Boxes from the cut-out alone, when the vision call has none: the frame is the art's extent,
+    /// the backing its middle, the subject a little inside the frame. `extent` is x1 y1 x2 y2, 0–999.
+    public static func fallbackBox(_ role: Role, extent e: [Int]) -> [Int] {
+        let w = e[2] - e[0], h = e[3] - e[1]
+        let inset: Double = role == .frame ? 0 : role == .backing ? 0.15 : 0.08
+        return [e[0] + Int(Double(w) * inset), e[1] + Int(Double(h) * inset),
+                e[2] - Int(Double(w) * inset), e[3] - Int(Double(h) * inset)]
+    }
+
+    /// What the vision model is asked, given the plan.
+    public static func visionPrompt(subject: String, frame: String) -> String {
+        """
+        This is one slot-machine reel symbol, cut out on a transparent background. It was planned \
+        as: “\(subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))”, sitting in \(frame.isEmpty ? "a frame" : "this frame: “\(frame.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))”"). \
+        It is about to be split into layers for animation. Describe each part AS IT APPEARS in this \
+        image, not as planned, and box it as [ymin, xmin, ymax, xmax] on a 0–1000 scale:
+        - frame: the frame, rim or border around the symbol — shape, material, colours, ornaments — \
+        under 25 words. Its box is the frame's whole outer edge.
+        - backing: the plain panel inside the frame, behind the subject — colour and finish, under 12 \
+        words. Empty description and no box if there is none.
+        - subject: what sits in the frame — what it is, its colours, its pose — under 25 words. Its \
+        box includes any part that reaches over the frame.
+        - name: two or three words naming the subject, e.g. "tiki totem".
+        """
+    }
+
+    public static let visionSchema: [String: Any] = {
+        let part: [String: Any] = ["type": "OBJECT", "properties": [
+            "description": ["type": "STRING", "maxLength": 200],
+            "box": ["type": "ARRAY", "items": ["type": "INTEGER"]],
+        ], "required": ["description"]]
+        return ["type": "OBJECT",
+                "properties": ["frame": part, "backing": part, "subject": part,
+                               "name": ["type": "STRING", "maxLength": 40]],
+                "required": ["frame", "subject", "name"]]
+    }()
+
+    /// The elements to ask for: the vision reply's descriptions and boxes where it gave them, the
+    /// plan's words and the cut-out's extent where it did not. A backing only when there is one.
+    public static func elements(vision v: [String: Any]?, planSubject: String, planFrame: String,
+                                fallbackName: String, extent: [Int], backingPlanned: Bool) -> [Element] {
+        func part(_ k: String) -> (String, [Int]?) {
+            let d = v?[k] as? [String: Any]
+            let text = (d?["description"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw: [Int]? = (d?["box"] as? [Any])?.compactMap { ($0 as? NSNumber)?.intValue }
+            let box = raw.flatMap { layerizeBox(fromGemini: $0) }
+            return (text, box)
+        }
+        let name = ((v?["name"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let subjectName = name.isEmpty ? fallbackName : name
+        let (fd, fb) = part("frame"), (bd, bb) = part("backing"), (sd, sb) = part("subject")
+        var out: [Element] = []
+        if !bd.isEmpty || (v == nil && backingPlanned) {
+            out.append(Element(role: .backing, name: "Frame backing", description: bd.isEmpty ? "the plain panel inside the frame" : bd,
+                               box: bb ?? fallbackBox(.backing, extent: extent)))
+        }
+        out.append(Element(role: .frame, name: "Frame", description: fd.isEmpty ? (planFrame.isEmpty ? "the frame around the symbol" : planFrame) : fd,
+                           box: fb ?? fallbackBox(.frame, extent: extent)))
+        out.append(Element(role: .subject, name: subjectName.prefix(1).uppercased() + subjectName.dropFirst(),
+                           description: sd.isEmpty ? planSubject : sd, box: sb ?? fallbackBox(.subject, extent: extent)))
+        return out
+    }
+
+    /// Which requested element a returned layer is. By its name first, since Layerize names what it
+    /// separated; then by where it sits. A "background" bigger than the frame is not the backing but
+    /// the canvas around the symbol, which a cut-out's decomposition sometimes returns: nil, discard.
+    public static func role(name: String?, box: [Int]?, elements: [Element]) -> Role? {
+        let words = Set((name ?? "").lowercased().components(separatedBy: CharacterSet.letters.inverted).filter { !$0.isEmpty })
+        let frameBox = elements.first { $0.role == .frame }?.box
+        func area(_ b: [Int]) -> Int { max(0, b[2] - b[0]) * max(0, b[3] - b[1]) }
+        let backingWords: Set<String> = ["backing", "panel", "background", "backdrop", "inner", "inset", "plate"]
+        let frameWords: Set<String> = ["frame", "rim", "border", "bezel", "bar", "rail", "edge", "plaque", "trim", "corner"]
+        if !words.isDisjoint(with: backingWords) {
+            if let b = box, b.count == 4, let f = frameBox, area(b) * 10 > area(f) * 11 { return nil }
+            return elements.contains { $0.role == .backing } ? .backing : .frame
+        }
+        if !words.isDisjoint(with: frameWords) { return .frame }
+        let subjectWords = Set((elements.first { $0.role == .subject }?.name ?? "").lowercased()
+            .components(separatedBy: CharacterSet.letters.inverted).filter { $0.count >= 4 })
+        if !words.isDisjoint(with: subjectWords) { return .subject }
+        // Unnamed or renamed: the element whose box it overlaps most.
+        guard let b = box, b.count == 4 else { return .subject }
+        func overlap(_ e: Element) -> Int {
+            let x = max(0, min(b[2], e.box[2]) - max(b[0], e.box[0])), y = max(0, min(b[3], e.box[3]) - max(b[1], e.box[1]))
+            return x * y
+        }
+        // The backing spans its whole window, so only a layer covering most of it is the backing;
+        // otherwise the frame or the subject, whichever it overlaps more, the subject on a tie.
+        if let bk = elements.first(where: { $0.role == .backing }), overlap(bk) * 5 >= area(bk.box) * 4 { return .backing }
+        let fr = elements.first { $0.role == .frame }.map(overlap) ?? 0
+        let su = elements.first { $0.role == .subject }.map(overlap) ?? 0
+        return fr > su ? .frame : .subject
+    }
+}
+
+/// A planned decomposition put together: one layer per role, registered on the symbol's own
+/// canvas, with what Layerize left open filled. Free and local, on straight RGBA8 canvases.
+///
+/// ByteDance documents filling hidden areas only for the BASE image, so the frame may come back
+/// with a hole where the subject sat. The rim is the master frame every member was painted into
+/// (FrameRules), so the master's own pixels close it exactly. The backing has no such source,
+/// so a gap in it is reported, never painted over.
+public enum LayerizeAssembly {
+    /// `top` composited over `bottom`, straight alpha.
+    public static func over(_ bottom: inout [UInt8], _ top: [UInt8]) {
+        guard bottom.count == top.count else { return }
+        var i = 0
+        while i < top.count {
+            let ta = Double(top[i + 3]) / 255
+            if ta > 0 {
+                let ba = Double(bottom[i + 3]) / 255
+                let oa = ta + ba * (1 - ta)
+                for c in 0..<3 {
+                    let v = (Double(top[i + c]) * ta + Double(bottom[i + c]) * ba * (1 - ta)) / oa
+                    bottom[i + c] = UInt8(max(0, min(255, v.rounded())))
+                }
+                bottom[i + 3] = UInt8(max(0, min(255, (oa * 255).rounded())))
+            }
+            i += 4
+        }
+    }
+
+    /// The tight box of the pixels at or above `alpha`, as x, y, w, h; nil when there are none.
+    public static func extent(_ px: [UInt8], width w: Int, height h: Int, alpha: UInt8 = 128) -> (x: Int, y: Int, w: Int, h: Int)? {
+        var x0 = w, y0 = h, x1 = -1, y1 = -1
+        for y in 0..<h {
+            var i = y * w * 4 + 3
+            for x in 0..<w {
+                if px[i] >= alpha { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) }
+                i += 4
+            }
+        }
+        return x1 < 0 ? nil : (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+
+    /// The master frame's window: the plain panel around its centre, walked out along both axes
+    /// while the colour stays the panel's. Nil when the centre is not a plain panel.
+    public static func window(_ px: [UInt8], width w: Int, height h: Int, tolerance: Int = 48) -> (x: Int, y: Int, w: Int, h: Int)? {
+        let cx = w / 2, cy = h / 2
+        func at(_ x: Int, _ y: Int) -> (Int, Int, Int) { let i = (y * w + x) * 4; return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2])) }
+        let c = at(cx, cy)
+        func same(_ x: Int, _ y: Int) -> Bool { let p = at(x, y); return max(abs(p.0 - c.0), abs(p.1 - c.1), abs(p.2 - c.2)) <= tolerance }
+        var l = cx, r = cx, t = cy, b = cy
+        while l > 0 && same(l - 1, cy) { l -= 1 }
+        while r < w - 1 && same(r + 1, cy) { r += 1 }
+        while t > 0 && same(cx, t - 1) { t -= 1 }
+        while b < h - 1 && same(cx, b + 1) { b += 1 }
+        let ww = r - l + 1, hh = b - t + 1
+        // A real window is most of the frame, and not the whole image (that is the backdrop).
+        guard ww * 10 >= w * 3, hh * 10 >= h * 3, ww < w, hh < h else { return nil }
+        return (l, t, ww, hh)
+    }
+
+    /// The frame's opening: walked out from the centre of the canvas until the frame is met.
+    /// Nil when the centre is frame, or the opening is too small to be the window.
+    static func opening(_ frame: [UInt8], width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int)? {
+        let cx = w / 2, cy = h / 2
+        func open(_ x: Int, _ y: Int) -> Bool { frame[(y * w + x) * 4 + 3] < 128 }
+        guard open(cx, cy) else { return nil }
+        var l = cx, r = cx, t = cy, b = cy
+        while l > 0 && open(l - 1, cy) { l -= 1 }
+        while r < w - 1 && open(r + 1, cy) { r += 1 }
+        while t > 0 && open(cx, t - 1) { t -= 1 }
+        while b < h - 1 && open(cx, b + 1) { b += 1 }
+        let ww = r - l + 1, hh = b - t + 1
+        guard ww * 5 >= w, hh * 5 >= h, l > 0, t > 0, r < w - 1, b < h - 1 else { return nil }
+        return (l, t, ww, hh)
+    }
+
+    /// The panel's colour: the median of a patch at the window's centre.
+    static func panelColour(_ px: [UInt8], width w: Int, height h: Int) -> RGB8 {
+        var rs: [UInt8] = [], gs: [UInt8] = [], bs: [UInt8] = []
+        let r = max(1, min(w, h) / 20)
+        for y in (h / 2 - r)...(h / 2 + r) { for x in (w / 2 - r)...(w / 2 + r) where x >= 0 && y >= 0 && x < w && y < h {
+            let i = (y * w + x) * 4; rs.append(px[i]); gs.append(px[i + 1]); bs.append(px[i + 2])
+        } }
+        let m = { (a: [UInt8]) in a.sorted()[a.count / 2] }
+        return RGB8(m(rs), m(gs), m(bs))
+    }
+
+    /// Whether a master pixel is panel rather than rim, by colour: a window need not be a
+    /// rectangle — HP1's arched under its filigree, and a rectangle missed the arch.
+    static func isPanel(_ r: UInt8, _ g: UInt8, _ b: UInt8, panel p: RGB8, tolerance: Int = 48) -> Bool {
+        max(abs(Int(r) - Int(p.r)), abs(Int(g) - Int(p.g)), abs(Int(b) - Int(p.b))) <= tolerance
+    }
+
+    /// Copies the registered master's rim into `rim` wherever the rim is missing and the master
+    /// has rim: the part Layerize left open behind the subject. Returns how many pixels it filled.
+    @discardableResult
+    public static func fillRim(_ rim: inout [UInt8], master: [UInt8], rimMask: [Bool]) -> Int {
+        guard rim.count == master.count, rimMask.count * 4 == rim.count else { return 0 }
+        var filled = 0
+        for p in 0..<rimMask.count where rimMask[p] && rim[p * 4 + 3] < 128 {
+            let i = p * 4
+            rim[i] = master[i]; rim[i + 1] = master[i + 1]; rim[i + 2] = master[i + 2]; rim[i + 3] = 255
+            filled += 1
+        }
+        return filled
     }
 }
 
@@ -9289,6 +9553,9 @@ public enum GDDAssetPrompts {
                         "jackpot": text(SetDesignRules.maxFamily, "The shared construction, under 25 words."),
                         "wysiwyg": text(SetDesignRules.maxFamily, "The shared construction, under 25 words."),
                         "lowPay": text(SetDesignRules.maxFamily, "The shared construction, under 25 words."),
+                        "highPayFrame": text(SetDesignRules.maxFamily, "The high pays' square frame: material, rim, corners, backing panel; under 25 words."),
+                        "hp1Frame": text(SetDesignRules.maxFamily, "How HP1's version of that frame is richer, same outline; under 25 words."),
+                        "mediumPayFrame": text(SetDesignRules.maxFamily, "The medium pays' plainer square frame, under 25 words."),
                     ],
                 ],
             ],
@@ -9425,9 +9692,16 @@ public enum GDDAssetPrompts {
           collector looks like it gathers, a multiplier like it boosts, an activator like it is about
           to go off. Where a slot's code and the document disagree about what it is, the document
           wins. Plain pays leave "job" empty.
-        - FRAMES: not every symbol has one. Decide per symbol: a frame suits characters and
-          prized objects that need a plaque to sit in; coins, emblems, specials and objects with
-          a strong silhouette often stand frameless. Card royals and backgrounds never have one.
+        - FRAMES follow the symbol's type, as in this studio's shipped games. Every HIGH PAY sits
+          in a frame: HP2 and up share ONE square frame, the same construction recoloured by rank,
+          and HP1's is a richer version of that same frame. The MEDIUM PAYS share one plainer square
+          frame of their own. Describe these frames in "families" (highPayFrame, hp1Frame,
+          mediumPayFrame); they are drawn once and every pay symbol is painted into a copy, so a
+          pay symbol's subject never describes its frame. LOW PAYS and card royals never have a
+          frame. A WILD is its own emblem or plaque, never the pay symbols' frame. A BONUS is a
+          framed tile or an emblem of the theme, whichever suits it. Jackpots and value coins are
+          coins and medallions in their own right. For every other special, decide per symbol, and
+          give the framed symbols of one type the same outline. Backgrounds never have a frame.
         - Backgrounds are scenes, not objects, with an empty middle where the reels will sit.
         - The studio calls the free-spins mode BONUS GAMES. Never write "free games" or "free
           spins", even where the document does.
@@ -9438,7 +9712,8 @@ public enum GDDAssetPrompts {
           "cast": [{"name": "<name>", "kind": "<one word>", "look": "<how they look>", "inArt": false}],
           "anchor": "<slot id drawn first>",
           "look": "<one paragraph every image is given>",
-          "families": {"jackpot": "<shared construction>", "wysiwyg": "<…>", "lowPay": "<…>"},
+          "families": {"jackpot": "<shared construction>", "wysiwyg": "<…>", "lowPay": "<…>",
+                       "highPayFrame": "<the high pays' frame>", "hp1Frame": "<how HP1's is richer>", "mediumPayFrame": "<…>"},
           "assets": [
             {"id": "<slot id>", "subject": "<one sentence: what it is, its material and colour>",
              "silhouette": "<one or two words>", "shape": "<outline class>", "hue": "<colour family>",
@@ -9449,6 +9724,10 @@ public enum GDDAssetPrompts {
         }
         "palette" is the 5 dominant colours this game's art will actually use.
         "frame" says whether that symbol is drawn inside a frame, plaque or backing shape.
+        "highPayFrame" and "mediumPayFrame" are each tier's frame in fixed terms, under 25 words:
+        material, rim profile, corner ornaments, and the plain backing panel inside it. "hp1Frame"
+        is how HP1's version is richer — the same outline and construction, with more of it. Only
+        for the tiers this set has.
         Card royals carry NO frame — the letterform is the symbol — and backgrounds never do.
         Name a royal's rank in its silhouette, e.g. "letter K" or "rank 10".
         Include every slot id exactly once.
@@ -9524,9 +9803,10 @@ public enum GDDAssetPrompts {
                        + "different colour.")
         }
         if roles.contains(.bonus) {
-            lines.append("- BONUS (BO): in this studio's games usually CIRCULAR — a coin, badge or "
-                       + "medallion with a bold emblem of the theme at its centre — told apart from "
-                       + "the other coins by its colour, its emblem and the word the game prints on it.")
+            // Of 10 shipped bonus symbols, 5 were framed tiles and 5 emblems; none was a plain coin.
+            lines.append("- BONUS (BO): in this studio's games a framed tile or an emblem of the theme "
+                       + "— whichever suits it — with a bold image of the theme at its heart, told apart "
+                       + "from every other special by its colour, its emblem and the word the game prints on it.")
         }
         if roles.contains(.collector) {
             lines.append("- COLLECTOR (SF): the most VALUABLE-looking special in the set — rich gold, a "
@@ -10064,7 +10344,7 @@ public enum GDDAssetPrompts {
         }
         let palette = (planJSON["palette"] as? [Any] ?? [])
             .compactMap { ($0 as? String).flatMap(SlotBackingRules.hex) }
-        return (out, missing, palette, design)
+        return (FrameRules.apply(out), missing, palette, design)
     }
 
     /// The second design pass: the same designer, sent back with what the checks found.
@@ -10195,6 +10475,66 @@ public struct CastMember: Equatable, Sendable {
     public var refID: String {
         "cast-" + name.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }.joined(separator: "-")
+    }
+}
+
+/// Which symbols sit in a frame, and which frame: decided by symbol type, from the studio's
+/// shipped sets, not left to the planner one symbol at a time.
+///
+/// Left to the planner, 18 of 64 high pays and 1 of 16 medium pays were framed across 19
+/// runs (none in four Tiki Titans runs), and one game's four framed high pays came back
+/// pointed, round, tall and wide. All 11 shipped sets checked (the RedSquid deliveries and
+/// the Production_AI Spine projects) frame their high pays: HP2 and up in ONE square
+/// construction recoloured by rank, HP1 in a richer version of it in 8 of the 11. Low pays
+/// stand bare in 9 of 11. A shared frame is drawn once, empty, and every member is painted
+/// into a copy of it (RenderPlan), so the frame is one drawing instead of one per symbol.
+public enum FrameRules {
+    /// The tiers painted into one shared frame.
+    public static let sharedTiers: [SlotSymbolRole] = [.highPay, .mediumPay]
+    /// Their outline: square in every shipped set checked.
+    public static let sharedShape = "square"
+
+    /// The plan with the type rules applied: high and medium pays framed and square, low pays bare.
+    public static func apply(_ jobs: [AssetJob]) -> [AssetJob] {
+        jobs.map { j in
+            guard j.kind == .symbol else { return j }
+            var j = j
+            if sharedTiers.contains(j.role) { j.hasFrame = true; j.shape = sharedShape }
+            else if j.role == .lowPay { j.hasFrame = false }
+            return j
+        }
+    }
+
+    /// A tier's frames in drawing order: the shared one, then HP1's richer version when there
+    /// is more than one high pay to stand above.
+    public static func frameIDs(_ role: SlotSymbolRole, count: Int) -> [String] {
+        guard count > 0, let code = code(role) else { return [] }
+        return ["frame_\(code)"] + (role == .highPay && count > 1 ? ["frame_\(code)1"] : [])
+    }
+
+    /// The frame each framed member is painted into: HP1 (the first high pay) its own, the rest the tier's.
+    public static func assignments(_ symbols: [AssetJob]) -> [String: String] {
+        var out: [String: String] = [:]
+        for r in sharedTiers {
+            let members = symbols.filter { $0.role == r && $0.hasFrame }
+            let ids = frameIDs(r, count: members.count)
+            for (i, m) in members.enumerated() { out[m.id] = (i == 0 && ids.count > 1) ? ids[1] : ids.first }
+        }
+        return out
+    }
+
+    /// Whether `id` names one of these frames, and if so which tier's and whether it is HP1's.
+    public static func parse(_ id: String) -> (role: SlotSymbolRole, premium: Bool)? {
+        for r in sharedTiers {
+            guard let c = code(r) else { continue }
+            if id == "frame_\(c)" { return (r, false) }
+            if id == "frame_\(c)1" { return (r, true) }
+        }
+        return nil
+    }
+
+    static func code(_ role: SlotSymbolRole) -> String? {
+        switch role { case .highPay: return "HP"; case .mediumPay: return "MP"; default: return nil }
     }
 }
 
@@ -10469,7 +10809,10 @@ public enum SetDesignRules {
         }
         // Coins are round by convention, so they are left out of this count: in a hold-and-win
         // game they alone can be half the set.
-        let shaped = syms.filter { !$0.shape.isEmpty && !coinRoles.contains($0.role) }
+        // The shared-frame tiers are square by rule (FrameRules) and card royals are letters, so
+        // they are left out too: without the pays, four royals alone tripped this.
+        let shaped = syms.filter { !$0.shape.isEmpty && $0.shape != "letter" && !coinRoles.contains($0.role)
+                                   && !FrameRules.sharedTiers.contains($0.role) }
         if shaped.count >= 6, let (shape, n) = mostCommon(shaped.map(\.shape)),
            Double(n) / Double(shaped.count) > maxShareOfOneShape {
             out.append("\(n) of \(shaped.count) symbols have a \(shape) outline — vary the frames, "
@@ -10611,6 +10954,11 @@ public struct RenderStep: Equatable, Sendable {
         /// A character drawn once, for reference, before any symbol that shows them. Not a
         /// deliverable: it is saved under references/ and attached to those symbols.
         case character
+        /// A tier's empty frame, drawn once before any of its members (FrameRules). Saved as
+        /// frame_<tier>.png beside the symbols: it is a deliverable too.
+        case frame
+        /// One symbol painted into a copy of its tier's frame: an edit of the frame, which goes last.
+        case intoFrame
     }
     public let id: String
     public let mode: Mode
@@ -10621,6 +10969,8 @@ public struct RenderStep: Equatable, Sendable {
     public let after: [String]
     /// A sheet's symbols, left to right. `id` is the first of them.
     public var members: [String] = []
+    /// The frame each member is painted into, in member order; one entry for a single symbol.
+    public var frames: [String] = []
 }
 
 /// The order a set is drawn in, and what each image is shown.
@@ -10636,6 +10986,8 @@ public enum RenderPlan {
     /// The composite of every symbol already finished — built when the step runs, so a
     /// special is drawn knowing what it has to stand apart from.
     public static let setSoFar = "set-so-far"
+    /// A sheet's frames tiled in its layout, built when the step runs: the image the sheet edits.
+    public static let frameSheet = "frame-sheet"
     /// Groups drawn together on one sheet, when there are this many of them.
     static let sheetRoles: [SlotSymbolRole] = [.highPay, .jackpot, .lowPay]
     static let sheetSizes = 2...6
@@ -10658,6 +11010,17 @@ public enum RenderPlan {
             return Array(out.prefix(4))
         }
         var castSteps = recurring.map { RenderStep(id: $0.refID, mode: .character, refs: art, after: []) }
+        // Each shared-frame tier's empty frame, before anything is drawn into it. HP1's richer
+        // version is an edit of the shared one; the medium pays' frame is shown the high pays'.
+        var frameSteps: [RenderStep] = []
+        for r in FrameRules.sharedTiers {
+            let ids = FrameRules.frameIDs(r, count: symbols.filter { $0.role == r && $0.hasFrame }.count)
+            guard let shared = ids.first else { continue }
+            let sibling = r == .mediumPay ? frameSteps.first.map { [$0.id] } ?? [] : []
+            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling, after: sibling))
+            for p in ids.dropFirst() { frameSteps.append(RenderStep(id: p, mode: .frame, refs: art + [shared], after: [shared])) }
+        }
+        let frameOf = FrameRules.assignments(symbols)
 
         // Groups on one sheet. The low pays keep their rule (never the anchor's group).
         var sheets: [SlotSymbolRole: [AssetJob]] = [:]
@@ -10670,10 +11033,19 @@ public enum RenderPlan {
         let onSheet = Set(sheets.values.flatMap { $0.map(\.id) })
         let anchorSheet = sheets.first { $0.value.contains { $0.id == anchor.id } }
 
+        // A sheet of a shared-frame tier edits its frames, tiled in its layout: that image goes last.
+        func framed(_ g: [AssetJob]) -> [String] {
+            let f = g.compactMap { frameOf[$0.id] }
+            return f.count == g.count ? f : []
+        }
         var first: [RenderStep] = []
         if let (_, g) = anchorSheet {
-            let cr = castRefs(g)
-            first.append(RenderStep(id: g[0].id, mode: .sheet, refs: art + cr, after: cr, members: g.map(\.id)))
+            let cr = castRefs(g), f = framed(g)
+            first.append(RenderStep(id: g[0].id, mode: .sheet, refs: art + cr + (f.isEmpty ? [] : [Self.frameSheet]),
+                                    after: cr + Array(Set(f)).sorted(), members: g.map(\.id), frames: f))
+        } else if let f = frameOf[anchor.id] {
+            let cr = castRefs([anchor])
+            first.append(RenderStep(id: anchor.id, mode: .intoFrame, refs: art + cr + [f], after: cr + [f], frames: [f]))
         } else {
             let cr = castRefs([anchor])
             first.append(RenderStep(id: anchor.id, mode: .anchor, refs: art + cr, after: cr))
@@ -10682,9 +11054,9 @@ public enum RenderPlan {
         var sheetIDs: [String] = []
         for r in sheetRoles {
             guard let g = sheets[r], !g.contains(where: { $0.id == anchor.id }) else { continue }
-            let cr = castRefs(g)
-            first.append(RenderStep(id: g[0].id, mode: .sheet, refs: [anchor.id] + cr, after: [anchor.id] + cr,
-                                    members: g.map(\.id)))
+            let cr = castRefs(g), f = framed(g)
+            first.append(RenderStep(id: g[0].id, mode: .sheet, refs: [anchor.id] + cr + (f.isEmpty ? [] : [Self.frameSheet]),
+                                    after: [anchor.id] + cr + Array(Set(f)).sorted(), members: g.map(\.id), frames: f))
             sheetIDs.append(g[0].id)
         }
         let founders = SetDesignRules.founders(planned, anchorID: anchor.id)
@@ -10712,6 +11084,12 @@ public enum RenderPlan {
                 // into it, in four of five real themes.
                 later.append(RenderStep(id: j.id, mode: j.role == .lowPay ? .match : .familyEdit,
                                         refs: [f], after: [f]))
+            } else if let f = frameOf[j.id] {
+                // Painted into its tier's frame, which carries the frame; the anchor carries the look.
+                let cr = castRefs([j])
+                let look = !isFigure(j) ? (objectRef ?? anchor.id) : anchor.id
+                first.append(RenderStep(id: j.id, mode: .intoFrame, refs: [look] + cr + [Self.setSoFar, f],
+                                        after: [anchor.id] + cr + [f] + sheetIDs, frames: [f]))
             } else {
                 // The concept art is NOT attached here. The anchor already carries the look, and
                 // the concept art carries its scene: in real runs it painted Snow Queen's castle
@@ -10732,7 +11110,7 @@ public enum RenderPlan {
         // Only characters someone is still shown.
         let used = Set((first + later).flatMap(\.refs))
         castSteps = castSteps.filter { used.contains($0.id) }
-        return castSteps + first + later
+        return castSteps + frameSteps + first + later
     }
 
     /// The steps of a batch that makes only `ids`. A sheet is drawn whole only when all its low
@@ -10742,16 +11120,22 @@ public enum RenderPlan {
     /// reused when the step runs, not drawn again.
     public static func scoped(_ steps: [RenderStep], to ids: Set<String>) -> [RenderStep] {
         let kept = steps.flatMap { st -> [RenderStep] in
-            if st.mode == .character { return [] }
+            if st.mode == .character || st.mode == .frame { return [] }
             guard st.mode == .sheet else { return ids.contains(st.id) ? [st] : [] }
             if st.members.allSatisfy(ids.contains) { return [st] }
             let stay = st.members.first { !ids.contains($0) }
-            return st.members.filter(ids.contains).map {
-                RenderStep(id: $0, mode: .match, refs: (stay.map { [$0] } ?? []) + st.refs, after: st.after)
+            return st.members.enumerated().filter { ids.contains($0.element) }.map { i, m in
+                let others = (stay.map { [$0] } ?? []) + st.refs.filter { $0 != Self.frameSheet }
+                guard i < st.frames.count else { return RenderStep(id: m, mode: .match, refs: others, after: st.after) }
+                return RenderStep(id: m, mode: .intoFrame, refs: others + [st.frames[i]],
+                                  after: st.after.filter { FrameRules.parse($0) == nil } + [st.frames[i]], frames: [st.frames[i]])
             }
         }
-        let shown = Set(kept.flatMap(\.refs))
-        return steps.filter { $0.mode == .character && shown.contains($0.id) } + kept
+        // A frame is kept, like a character, while anything kept is drawn into it, and so is the
+        // frame it is itself drawn from. One already on disk is reused when the step runs.
+        var shown = Set(kept.flatMap { $0.refs + $0.after })
+        for st in steps where st.mode == .frame && shown.contains(st.id) { shown.formUnion(st.after) }
+        return steps.filter { ($0.mode == .character || $0.mode == .frame) && shown.contains($0.id) } + kept
     }
 
     /// Everything drawn in the step that draws the anchor: the anchor alone, or its whole sheet.
@@ -10798,6 +11182,13 @@ public struct ImageReview: Equatable, Sendable {
     /// Something behind the symbol that the backing key will leave in: a scene or a panel.
     public var unkeyable: Bool { scene || panel }
 
+    /// Unkeyable for this job. A symbol painted into its tier's frame has a panel by design
+    /// (FrameRules), and the review called it a "card or tile" twice in one test run, each time
+    /// paying for a redraw; a scene behind it still counts.
+    public func unkeyable(for job: AssetJob) -> Bool {
+        scene || (panel && !(job.hasFrame && FrameRules.sharedTiers.contains(job.role)))
+    }
+
     /// The model that looks. Measured on 17 images with known faults (25 September 2026):
     /// gemini-3.8-flash judged 16–17 right at $0.0027 an image; gemini-3.5-flash-lite 13 at
     /// $0.0006 — it missed a tile and the queen in the wild, and called a square pebble a tile.
@@ -10814,7 +11205,7 @@ public struct ImageReview: Equatable, Sendable {
         - scene: true if anything is painted behind the symbol — sky, landscape, buildings, a \
         room, ground, other objects — instead of the plain flat background.
         - panel: true if the symbol sits on a card, tile, panel or box of another colour that is \
-        not part of the symbol itself\(job.hasFrame ? " (it was planned inside its own frame or plaque: that frame is part of it and does not count)" : " (it was planned with no frame, plaque or tile of any kind)").
+        not part of the symbol itself\(job.hasFrame ? " (it was planned inside its own frame or plaque, with a coloured backing panel inside it: that frame and its panel are part of it and do not count)" : " (it was planned with no frame, plaque or tile of any kind)").
         - character: true if a person, a face or a humanoid figure appears anywhere.
         - matches: true if the image shows this: “\(job.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))”.
         - planned_person: true if that description itself is of a person, a face or a humanoid character.
@@ -10885,6 +11276,14 @@ public enum SymbolSheet {
         case .jackpot: return ("jackpot", "jackpot symbols")
         default: return ("low-pay", "low-pay symbols")
         }
+    }
+
+    /// One scale for every symbol of a framed sheet: they were painted into frames of one size, so
+    /// cut at one scale their frames stay one size. Scaled each on its own box, a gryphon whose
+    /// wings broke out came back in a frame three quarters the size of its neighbours'. The
+    /// smallest scale is taken, so the widest break-out still fits.
+    static func sharedScale(_ boxes: [CGRect], width: Int, height: Int, fill: Double = 0.86) -> Double? {
+        boxes.map { min(fill * Double(width) / $0.width, fill * Double(height) / $0.height) }.min()
     }
 
     /// The boxes of a grid, row by row and left to right: the rows split first on bands of
@@ -11020,7 +11419,7 @@ public enum SymbolSheet {
     /// — HP1's cape ran to the edge of its cell and left a sliver down the side of HP2 — so what
     /// falls inside another box is painted over with the backdrop.
     static func cut(_ image: CGImage, box: CGRect, backdrop: RGB8, width: Int, height: Int,
-                           fill: Double = 0.86, others: [CGRect] = []) -> CGImage? {
+                           fill: Double = 0.86, others: [CGRect] = [], scale fixed: Double? = nil) -> CGImage? {
         let pad = max(box.width, box.height) * 0.03
         let r = box.insetBy(dx: -pad, dy: -pad).intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
         guard let crop = image.cropping(to: r),
@@ -11030,7 +11429,7 @@ public enum SymbolSheet {
         ctx.setFillColor(red: Double(backdrop.r) / 255, green: Double(backdrop.g) / 255, blue: Double(backdrop.b) / 255, alpha: 1)
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
         // Scaled on the box, not the padded crop, so every symbol lands at the same size.
-        let scale = min(fill * Double(width) / box.width, fill * Double(height) / box.height)
+        let scale = fixed ?? min(fill * Double(width) / box.width, fill * Double(height) / box.height)
         let dw = Double(r.width) * scale, dh = Double(r.height) * scale
         ctx.interpolationQuality = .high
         let x0 = (Double(width) - dw) / 2, y0 = (Double(height) - dh) / 2
@@ -11501,10 +11900,12 @@ extension GDDAssetPrompts {
                 lines.append("\(n) is \(name) of this set: match its rendering and light, but do not put it, or any symbol, in the scene.")
             } else if let o = other, let theirs = royalRank(o), let mine = royalRank(job) {
                 lines.append("\(n) is the “\(theirs)” card symbol already made for this set. Draw the “\(mine)” in exactly its typeface style, material, bevel, colouring approach and finish — but as a NEW letter drawn from scratch. It is a different character: no stroke, shape or outline of the “\(theirs)” may remain in the “\(mine)”.")
-            } else if r != anchorID, let o = other, o.role == job.role, o.hasFrame, job.hasFrame {
+            } else if r != anchorID, step.mode != .intoFrame, let o = other, o.role == job.role, o.hasFrame, job.hasFrame {
                 lines.append("\(n) is \(name), from the same tier: give this symbol exactly its frame — the same construction, material and outline — around a different subject. Do not copy its subject or its colours.")
             } else {
-                let sameFrame = other.map { $0.role == job.role && $0.hasFrame && job.hasFrame } ?? false
+                // Painted into its own frame, a symbol takes only the LOOK from another: shown HP1 with
+                // "the same frame construction", HP4 came back in HP1's premium frame.
+                let sameFrame = step.mode != .intoFrame && (other.map { $0.role == job.role && $0.hasFrame && job.hasFrame } ?? false)
                 // A character in the reference leaks in: a Snow Queen wild asked for as "a frost
                 // crown cradling a flame" came back as the queen's own bust with a flame for a face.
                 let character = other?.shape == "figure" && job.shape != "figure" && job.cast.isEmpty
@@ -11555,6 +11956,52 @@ extension GDDAssetPrompts {
         ]).joined(separator: "\n\n")
     }
 
+    /// The brief for a tier's empty frame (FrameRules). It is drawn once and every member is
+    /// painted into a copy of it, so it suits all of them and carries nothing of any one.
+    static func frameBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
+                           backing: (name: String, rgb: RGB8)) -> String {
+        guard let (role, premium) = FrameRules.parse(step.id) else { return "" }
+        let plural = role == .highPay ? "high-pay symbols" : "medium-pay symbols"
+        let trim: (String) -> String = { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
+        let spec = (role == .highPay ? design.families["highPayFrame"] : design.families["mediumPayFrame"]).map(trim)
+            ?? (role == .highPay ? "a sturdy square frame in this set's own premium material, a bevelled rim with matching ornaments at the corners"
+                                 : "a plainer square frame in this set's own material, with a simple bevelled rim")
+        let art = step.refs.contains(RenderPlan.themeArt)
+        var parts: [String] = []
+        for (i, r) in step.refs.enumerated() {
+            let img = "Image \(i + 1)"
+            if r == RenderPlan.themeArt {
+                parts.append("\(img) is the approved concept art for this theme. Take only how it is painted — the technique, light, materials and finish. Nothing of its scene, characters, objects or text appears.")
+            } else if !premium, FrameRules.parse(r)?.role == .highPay {
+                parts.append("\(img) is this game's high-pay frame. The medium pays' frame is its plainer sibling: the same square outline and window, a simpler material and less ornament, so a player ranks them at a glance.")
+            }
+        }
+        let panel = "Inside the rim, a plain backing panel in a calm mid-tone, evenly lit, fills the whole window with nothing on it — no subject, emblem, pattern, text or symbol. The symbols are painted into it later."
+        if premium {
+            let rich = design.families["hp1Frame"].map(trim) ?? "heavier, brighter metal, gems set into the rim and a crest at the top centre"
+            return ([
+                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make HP1's version of it, for the top symbol: exactly the same outline, proportions, construction, size and window, so the two read as one set, but richer — \(rich).",
+            ] + parts + [
+                panel,
+                "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
+                backdropLine(backing),
+                "No text, lettering or numbers, no watermark, no user interface.",
+            ]).joined(separator: "\n\n")
+        }
+        return ([
+            "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is painted into a copy of this frame, so it holds each in turn and carries nothing of any of them.",
+            "THE FRAME: \(spec). A square frame seen straight on, upright and level, centred and filling about 85% of the image with an even margin. \(panel)",
+        ] + parts + [
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
+            backdropLine(backing),
+            "No text, lettering or numbers, no watermark, no user interface.",
+        ]).joined(separator: "\n\n")
+    }
+
+    /// What a symbol painted into a shared frame is told about the frame: it stays, and only
+    /// its panel takes the symbol's colour, as every shipped set recolours its pay frames by rank.
+    static let keepFrame = "Keep every frame exactly as it is — construction, material, outline, size and position. Only its backing panel changes, to its symbol's dominant colour. A symbol fills its window and may break a little over the frame's edge, but the frame stays whole."
+
     /// The brief for one sheet: a whole group — the low pays, the high pays or the jackpot
     /// tiers — drawn together so they match and their ranking is seen side by side.
     static func sheetBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
@@ -11572,7 +12019,12 @@ extension GDDAssetPrompts {
         let arrangement = layout.rows.count == 1
             ? "\(countWord(n)) separate symbols side by side in a single row, left to right in the order below"
             : "\(countWord(n)) separate symbols on a grid of \(countWord(layout.rows.count)) rows — \(layout.rows.map(countWord).joined(separator: " above ")) — read left to right, top row first, in the order below"
-        var parts = ["Create the \(countWord(n)) \(plural) of a video slot game themed “\(theme.name)”, drawn together on one sheet so they match: \(arrangement). They will be cut apart and shown small on spinning reels, where a player has to recognise each one at a glance."
+        let intoFrames = step.refs.last == RenderPlan.frameSheet
+        let premium = step.frames.first.flatMap(FrameRules.parse)?.premium == true
+        var parts = [(intoFrames
+            ? "Edit the last attached image: it is a sheet of \(countWord(n)) empty frames for the \(plural) of a video slot game themed “\(theme.name)” — \(arrangement). Paint one symbol into each frame, so they match."
+            : "Create the \(countWord(n)) \(plural) of a video slot game themed “\(theme.name)”, drawn together on one sheet so they match: \(arrangement).")
+                     + " They will be cut apart and shown small on spinning reels, where a player has to recognise each one at a glance."
                      + (isFirst ? " They are the first symbols of the set, and every other symbol will be drawn to match them." : "")]
         let shown = group.compactMap { design.member($0.cast) }
         for (i, r) in step.refs.enumerated() {
@@ -11584,7 +12036,11 @@ extension GDDAssetPrompts {
                 ? " It shows a character: nothing of that character — no figure, face, hair, clothing or pose — appears on this sheet." : ""
             parts.append("\(img) is \(displayName(o)), already made for this same set. Draw these so they sit beside it as one game — the same rendering, light direction, edge treatment and finish quality — each at its own finish below. Nothing of its subject, its colours or its outline appears on this sheet.\(character)")
         }
-        if step.refs.contains(where: { $0 != RenderPlan.themeArt }) {
+        if intoFrames {
+            if step.refs.dropLast().contains(where: { $0 != RenderPlan.themeArt }) {
+                parts.append("The other attached images are references, not something to edit or reproduce.")
+            }
+        } else if step.refs.contains(where: { $0 != RenderPlan.themeArt }) {
             parts.append("The attached images are references, not something to edit or reproduce: this sheet is a new picture.")
         }
         parts.append("THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: step.refs.contains(RenderPlan.themeArt)))")
@@ -11594,7 +12050,9 @@ extension GDDAssetPrompts {
             if !j.hue.isEmpty { line += " Dominant colour: \(j.hue)." }
             let f = j.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
             if !f.isEmpty { line += " Finish: \(f)." }
-            if role != .lowPay {
+            if intoFrames {
+                line += " In frame \(i + 1)\(i == 0 && premium ? ", the top symbol's richer frame" : "")."
+            } else if role != .lowPay {
                 line += j.hasFrame ? " In a frame that gives it \(outlinePhrase(j.shape))." : " No frame: it stands on its own silhouette, \(outlinePhrase(j.shape)).\(wholeFigure(j))"
             }
             return line
@@ -11614,7 +12072,12 @@ extension GDDAssetPrompts {
             let oneFrame = framed.count > 1 && Set(framed.map(\.shape)).count == 1
             parts.append(shared + "They are the \(plural), ranked in the order given, each a different subject with its own colour — the finish of each makes the ranking obvious side by side.\(oneFrame ? " The framed ones share one frame construction around their different subjects." : "")")
         }
+        if intoFrames {
+            parts.append("THE FRAMES: \(keepFrame)")
+            parts.append("LAYOUT: exactly as in the last image — every frame where it is, the same size, with the same plain background between them and around the edges. Nothing joins them — no shared base, shadow or glow.")
+        } else {
         parts.append("LAYOUT: \(layout.rows.count == 1 ? "the symbols in one straight row across the image, evenly spaced, centred vertically" : "an even grid, each symbol centred in its own cell") — all the same size, each as large as the spacing allows. A clear gap of plain background between neighbours\(layout.rows.count > 1 ? ", across and down," : "") and around every edge: no symbol touches another or the edge of the image, and nothing joins them — no shared base, frame, shadow or glow. \(group.contains(where: \.hasFrame) ? "Apart from a symbol's own frame, nothing is behind any of them" : "Each stands directly on the background, with nothing behind it") — no card, tile, panel or box.")
+        }
         parts.append("Each symbol faces the viewer straight on, upright and level — none tilted, turned or seen at an angle — with one clear focal point, bold shapes and strong light-and-dark contrast, so it reads at reel size.")
         parts.append(backdropLine(backing, several: true))
         parts.append(royal
@@ -11636,6 +12099,7 @@ extension GDDAssetPrompts {
         if step.mode == .character, let m = castMember(ref: step.id, design) {
             return characterBrief(m, step: step, theme: theme, design: design, backing: backing)
         }
+        if step.mode == .frame { return frameBrief(step: step, theme: theme, design: design, backing: backing) }
         let artAttached = step.refs.contains(RenderPlan.themeArt)
         let look = lookBlock(theme, design, artAttached: artAttached)
         let refs = referenceLines(step, job: job, jobs: jobs,
@@ -11676,6 +12140,21 @@ extension GDDAssetPrompts {
             ].joined(separator: "\n\n")
         }
 
+        if step.mode == .intoFrame, let fid = step.refs.last, let f = FrameRules.parse(fid) {
+            let isAnchor = SetDesignRules.anchor(jobs, design)?.id == job.id
+            let others = RenderStep(id: step.id, mode: .intoFrame, refs: Array(step.refs.dropLast()), after: step.after)
+            let whose = f.premium ? "HP1's frame, the top symbol's" : "the frame shared by this game's \(f.role == .highPay ? "high pays" : "medium pays")"
+            return ([
+                "Edit the last attached image: it is \(whose), empty, for \(game). Paint \(displayName(job)) into it.\(isAnchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : "")",
+                "THE SYMBOL: \(what). \(roleLine(job, jobs: jobs, design: design))\(hue)",
+                "THE FRAME: \(keepFrame)\(others.refs.isEmpty ? "" : " The other attached images are for the look only: their frames are not this symbol's.")",
+            ] + referenceLines(others, job: job, jobs: jobs, anchorID: SetDesignRules.anchor(jobs, design)?.id, design: design) + [
+                "THE LOOK OF THIS SET: \(look)",
+                "FOR THE REELS: facing the viewer straight on, upright and level, with one clear focal point, bold shapes and strong contrast, so a player recognises it at reel size.",
+                backdropLine(backing),
+                bans(job),
+            ]).joined(separator: "\n\n")
+        }
         let first = step.mode == .anchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : ""
         let outline = job.shape.isEmpty ? "a distinctive outline" : outlinePhrase(job.shape)
         let form = job.silhouette.isEmpty ? "" : " — \(job.silhouette)"
@@ -11749,8 +12228,10 @@ extension GDDAssetPrompts {
             let role = roleLine(job, jobs: jobs, design: design)
             if !role.isEmpty { facts.append(role) }
             if !job.hue.isEmpty { facts.append("Dominant colour: \(job.hue).") }
-            facts.append(job.hasFrame ? "It sits in a frame, and the frame gives it \(outlinePhrase(job.shape))."
-                                      : "No frame: it stands on its own silhouette, \(outlinePhrase(job.shape)).\(wholeFigure(job))")
+            facts.append(job.hasFrame && FrameRules.sharedTiers.contains(job.role)
+                ? "It is painted into its tier's frame, which is drawn separately and shared by the whole tier: describe only what sits inside the frame, and whether part of it breaks out over the frame's edge. Never describe the frame itself."
+                : job.hasFrame ? "It sits in a frame, and the frame gives it \(outlinePhrase(job.shape))."
+                : "No frame: it stands on its own silhouette, \(outlinePhrase(job.shape)).\(wholeFigure(job))")
             if let w = who { facts.append("It shows \(w.name): \(w.inArt ? Self.inArtLook : w.look)") }
         }
         let words = job.kind == .background ? "100 to 160" : onSheet ? "50 to 90" : "80 to 150"

@@ -5838,15 +5838,6 @@ final class LayerAssemblyRulesTests: XCTestCase {
         XCTAssertNil(LayerCoverageRules.normalizedBox(["normalized": ["a", "b", "c", "d"]]))
     }
 
-    /// Cost is billed per COMPUTE SECOND. The old per-layer estimate reported ~10x too much.
-    func testCostIsPerComputeSecondNotPerLayer() {
-        // The two probe calls measured 113s and 149s of wall time.
-        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 113), 0.01921, accuracy: 0.00001)
-        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 262), 0.04454, accuracy: 0.00001)
-        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: 0), 0)
-        XCTAssertEqual(LayerizeRules.estimatedCost(seconds: -5), 0)
-    }
-
     // MARK: - Node version ordering
 
     /// The bug this exists for: sorting version directory names as strings ranks "v9.0.0" above
@@ -8336,6 +8327,194 @@ final class GDDOutputTests: XCTestCase {
     }
 }
 
+final class LayerizePlanRulesTests: XCTestCase {
+    private let extent = [100, 80, 900, 920]
+
+    func testThePromptNamesCountsAndBoxesEachElementBackToFront() {
+        let v: [String: Any] = ["frame": ["description": "square frame of lashed bamboo with lava-stone corners", "box": [80, 100, 920, 900]],
+                                "backing": ["description": "plain deep teal panel", "box": [200, 210, 800, 790]],
+                                "subject": ["description": "a grinning tiki totem with red eyes", "box": [40, 220, 860, 780]],
+                                "name": "tiki totem"]
+        let e = LayerizePlanRules.elements(vision: v, planSubject: "a tiki", planFrame: "", fallbackName: "symbol",
+                                           extent: extent, backingPlanned: true)
+        XCTAssertEqual(e.map(\.role), [.backing, .frame, .subject])
+        XCTAssertEqual(e[1].box, [100, 80, 900, 920])                  // Gemini's y,x order turned into x,y
+        XCTAssertEqual(e[2].name, "Tiki totem")
+        let p = LayerizePlanRules.prompt(e)
+        XCTAssertTrue(p.hasPrefix(LayerizeRules.basePrompt), p)
+        XCTAssertTrue(p.contains("into exactly 3 layers, back to front"), p)
+        XCTAssertTrue(p.contains("2. Frame: square frame of lashed bamboo with lava-stone corners, at <bbox>100 80 900 920</bbox>. The whole frame as ONE layer"), p)
+        XCTAssertTrue(p.contains("fill the frame in wherever the Tiki totem covers it"), p)
+        XCTAssertLessThan(p.split(whereSeparator: \.isWhitespace).count, 600)   // ByteDance: long prompts lose detail
+    }
+
+    func testWithoutAVisionReplyThePlanAndTheCutoutsExtentAreUsed() {
+        let e = LayerizePlanRules.elements(vision: nil, planSubject: "a tiki totem", planFrame: "a bamboo frame",
+                                           fallbackName: "tiki", extent: extent, backingPlanned: true)
+        XCTAssertEqual(e.map(\.role), [.backing, .frame, .subject])
+        XCTAssertEqual(e[1].box, extent)
+        XCTAssertEqual(e[1].description, "a bamboo frame")
+        XCTAssertEqual(e[0].box, [220, 206, 780, 794])
+        // No backing seen and none planned: two layers.
+        let two = LayerizePlanRules.elements(vision: ["frame": ["description": "a gold ring"], "subject": ["description": "a cat"], "name": "cat"],
+                                             planSubject: "", planFrame: "", fallbackName: "", extent: extent, backingPlanned: false)
+        XCTAssertEqual(two.map(\.role), [.frame, .subject])
+    }
+
+    // Names from real decompositions: Lucky Cat, Tortoise, an SF frame split into four rails.
+    func testReturnedLayersAreAssignedByNameThenByPlace() {
+        let e = LayerizePlanRules.elements(vision: nil, planSubject: "a turtle", planFrame: "", fallbackName: "cartoon turtle",
+                                           extent: extent, backingPlanned: true)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Golden Circular Badge Border", box: nil, elements: e), .frame)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Inner Beach Sunset Background", box: [220, 200, 780, 800], elements: e), .backing)
+        XCTAssertNil(LayerizePlanRules.role(name: "Outer Magenta Background", box: [0, 0, 1000, 1000], elements: e))
+        XCTAssertEqual(LayerizePlanRules.role(name: "Stylized Cartoon Turtle", box: nil, elements: e), .subject)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Top frame buoy bar", box: [100, 80, 900, 160], elements: e), .frame)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Mystery thing", box: [300, 300, 700, 700], elements: e), .subject)
+    }
+
+    // fal: $0.03375 a layer, doubled over 1536×1536 — so a 2048 symbol at `auto` costs twice 1.5K.
+    func testLayerizeIsPricedPerLayerAndTheTierDecidesTheRate() {
+        XCTAssertEqual(LayerizeRules.basePixels(width: 2048, height: 2048, tier: "auto"), 2048 * 2048)
+        XCTAssertEqual(LayerizeRules.basePixels(width: 2048, height: 2048, tier: "auto_1.5K"), 1536 * 1536)
+        XCTAssertEqual(LayerizeRules.estimatedCost(layers: 4, basePixels: 1536 * 1536), 0.135, accuracy: 0.0001)
+        XCTAssertEqual(LayerizeRules.estimatedCost(layers: 4, basePixels: 2048 * 2048), 0.27, accuracy: 0.0001)
+    }
+}
+
+final class LayerizeAssemblyTests: XCTestCase {
+    private func canvas(_ w: Int, _ h: Int, _ f: (Int, Int) -> (UInt8, UInt8, UInt8, UInt8)) -> [UInt8] {
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<h { for x in 0..<w { let c = f(x, y), i = (y * w + x) * 4; px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = c.3 } }
+        return px
+    }
+
+    // The frame's opening is found from the centre; a canvas whose centre is frame has none.
+    func testTheFramesOpeningIsWalkedFromTheCentre() {
+        let f = canvas(40, 40) { x, y in (4...35).contains(x) && (4...35).contains(y) && !((9...30).contains(x) && (9...30).contains(y)) ? (200, 160, 40, 255) : (0, 0, 0, 0) }
+        let o = LayerizeAssembly.opening(f, width: 40, height: 40)!
+        XCTAssertEqual(o.x, 9); XCTAssertEqual(o.w, 22); XCTAssertEqual(o.y, 9); XCTAssertEqual(o.h, 22)
+        XCTAssertNil(LayerizeAssembly.opening(canvas(40, 40) { _, _ in (200, 160, 40, 255) }, width: 40, height: 40))
+    }
+
+    // The master's window is found from its plain centre; the rim is copied only where it is missing.
+    func testTheRimIsClosedFromTheMasterFrame() {
+        let master = canvas(40, 40) { x, y in
+            let rim = (4...35).contains(x) && (4...35).contains(y) && !((9...30).contains(x) && (9...30).contains(y))
+            let panel = (9...30).contains(x) && (9...30).contains(y)
+            return rim ? (200, 160, 40, 255) : panel ? (90, 90, 95, 255) : (255, 0, 255, 255)
+        }
+        let win = LayerizeAssembly.window(master, width: 40, height: 40)!
+        XCTAssertEqual(win.x, 9); XCTAssertEqual(win.w, 22)
+        let mask = (0..<1600).map { p -> Bool in
+            let x = p % 40, y = p / 40, i = p * 4
+            return !(x >= win.x && x < win.x + win.w && y >= win.y && y < win.y + win.h) && !(master[i] == 255 && master[i + 1] == 0)
+        }
+        // The rim Layerize returned, with its top rail gone where a subject broke out.
+        var rim = canvas(40, 40) { x, y in mask[y * 40 + x] && y > 8 ? (198, 158, 42, 255) : (0, 0, 0, 0) }
+        XCTAssertEqual(LayerizeAssembly.fillRim(&rim, master: master, rimMask: mask), 32 * 5)
+        XCTAssertEqual(rim[(5 * 40 + 20) * 4 + 3], 255)
+        XCTAssertEqual(rim[(20 * 40 + 20) * 4 + 3], 0)                  // the window stays open
+    }
+
+    // An arched window: the panel above the rectangle the centre-walk finds is still panel, by colour.
+    func testAPanelPixelOutsideTheRectangleIsStillPanel() {
+        let m = canvas(40, 40) { x, y in (12...27).contains(x) && (10...29).contains(y) ? (60, 60, 112, 255) : (200, 160, 40, 255) }
+        let p = LayerizeAssembly.panelColour(m, width: 40, height: 40)
+        XCTAssertEqual(p, RGB8(60, 60, 112))
+        XCTAssertTrue(LayerizeAssembly.isPanel(66, 58, 120, panel: p))
+        XCTAssertFalse(LayerizeAssembly.isPanel(200, 160, 40, panel: p))      // gold rim
+        XCTAssertFalse(LayerizeAssembly.isPanel(20, 25, 45, panel: p))        // obsidian rim
+    }
+
+    func testOverCompositesStraightAlpha() {
+        var b = [UInt8]([0, 0, 255, 255]); LayerizeAssembly.over(&b, [255, 0, 0, 128])
+        XCTAssertEqual(b[3], 255); XCTAssertEqual(Int(b[0]), 128, accuracy: 1); XCTAssertEqual(Int(b[2]), 127, accuracy: 1)
+    }
+}
+
+final class FramedReviewTests: XCTestCase {
+    // A pay symbol's panel is its frame's, by design; a scene behind it is still unkeyable.
+    func testAFramedPaySymbolsPanelIsNotATile() {
+        var hp = AssetJob(id: "HP4", kind: .symbol, role: .highPay, tier: 4, title: "", aspect: "1:1", size: "2K"); hp.hasFrame = true
+        var wd = AssetJob(id: "WD1", kind: .symbol, role: .wild, tier: nil, title: "", aspect: "1:1", size: "2K"); wd.hasFrame = true
+        var r = ImageReview(); r.panel = true
+        XCTAssertFalse(r.unkeyable(for: hp))
+        XCTAssertTrue(r.unkeyable(for: wd))
+        r.panel = false; r.scene = true
+        XCTAssertTrue(r.unkeyable(for: hp))
+    }
+}
+
+final class SharedScaleTests: XCTestCase {
+    // A framed sheet is cut at one scale: the widest break-out decides it, and every frame stays one size.
+    func testAFramedSheetIsCutAtOneScaleThatFitsTheWidestBreakOut() {
+        let boxes = [CGRect(x: 0, y: 0, width: 800, height: 800), CGRect(x: 900, y: 0, width: 1060, height: 820)]
+        let s = SymbolSheet.sharedScale(boxes, width: 2048, height: 2048)!
+        XCTAssertEqual(s, 0.86 * 2048 / 1060, accuracy: 1e-9)
+        XCTAssertLessThanOrEqual(1060 * s, 0.86 * 2048 + 1e-6)
+    }
+}
+
+final class FrameRulesTests: XCTestCase {
+    private func j(_ id: String, _ role: SlotSymbolRole, frame: Bool, shape: String) -> AssetJob {
+        var a = AssetJob(id: id, kind: .symbol, role: role, tier: 1, title: "", subject: "a \(id)", aspect: "1:1", size: "2K")
+        a.hasFrame = frame; a.shape = shape
+        return a
+    }
+
+    // Measured in 19 runs: 18 of 64 high pays framed, and four framed ones with four outlines.
+    func testPaySymbolsAreFramedAndSquareByTypeAndLowPaysAreBare() {
+        let r = FrameRules.apply([j("HP1", .highPay, frame: false, shape: "figure"), j("HP2", .highPay, frame: true, shape: "round"),
+                                  j("MP1", .mediumPay, frame: false, shape: "tall"), j("LP1", .lowPay, frame: true, shape: "letter"),
+                                  j("WD1", .wild, frame: true, shape: "shield")])
+        XCTAssertEqual(r.map(\.hasFrame), [true, true, true, false, true])   // the wild stays the planner's call
+        XCTAssertEqual(r.map(\.shape), ["square", "square", "square", "letter", "shield"])
+    }
+
+    // HP1 gets a richer version of the shared frame in 8 of the 11 shipped sets checked.
+    func testHP1HasItsOwnRicherFrameAndTheRestShareOne() {
+        let hps = (1...4).map { j("HP\($0)", .highPay, frame: true, shape: "square") } + [j("MP1", .mediumPay, frame: true, shape: "square")]
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 4), ["frame_HP", "frame_HP1"])
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 1), ["frame_HP"])   // nothing to stand above
+        XCTAssertEqual(FrameRules.frameIDs(.mediumPay, count: 3), ["frame_MP"])
+        XCTAssertEqual(FrameRules.frameIDs(.wild, count: 1), [])
+        let a = FrameRules.assignments(hps)
+        XCTAssertEqual(["HP1", "HP2", "HP3", "HP4", "MP1"].map { a[$0] }, ["frame_HP1", "frame_HP", "frame_HP", "frame_HP", "frame_MP"])
+        XCTAssertEqual(FrameRules.parse("frame_HP1")?.premium, true)
+        XCTAssertEqual(FrameRules.parse("frame_MP")?.role, .mediumPay)
+        XCTAssertNil(FrameRules.parse("HP1"))
+    }
+
+    func testTheFramePromptsCarryThePlannedFrameAndKeepTheFrame() {
+        let design = SetDesign(anchorID: "HP1", look: "Carved volcanic stone.",
+                               families: ["highPayFrame": "a square frame of lashed bamboo with lava-stone corners",
+                                          "hp1Frame": "gold leaf over the bamboo and a carved tiki crest"])
+        let backing = (name: "magenta", rgb: RGB8(255, 0, 255))
+        let theme = GameTheme(name: "Tiki Titans")
+        let shared = GDDAssetPrompts.brief(job: AssetJob(id: "x", kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K"),
+                                           step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []),
+                                           theme: theme, design: design, backing: backing, gameName: "", jobs: [])
+        XCTAssertTrue(shared.hasPrefix("Create one empty frame for the high-pay symbols"), shared)
+        XCTAssertTrue(shared.contains("THE FRAME: a square frame of lashed bamboo with lava-stone corners."), shared)
+        XCTAssertTrue(shared.contains("plain backing panel"), shared)
+        let rich = GDDAssetPrompts.brief(job: AssetJob(id: "x", kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K"),
+                                         step: RenderStep(id: "frame_HP1", mode: .frame, refs: ["frame_HP"], after: ["frame_HP"]),
+                                         theme: theme, design: design, backing: backing, gameName: "", jobs: [])
+        XCTAssertTrue(rich.hasPrefix("Edit the last attached image"), rich)
+        XCTAssertTrue(rich.contains("gold leaf over the bamboo and a carved tiki crest"), rich)
+        // A sheet painted into its frames edits them and keeps them.
+        let hps = (1...4).map { j("HP\($0)", .highPay, frame: true, shape: "square") }
+        let sheet = RenderStep(id: "HP1", mode: .sheet, refs: [RenderPlan.frameSheet], after: ["frame_HP", "frame_HP1"],
+                               members: hps.map(\.id), frames: ["frame_HP1", "frame_HP", "frame_HP", "frame_HP"])
+        let b = GDDAssetPrompts.brief(job: hps[0], step: sheet, theme: theme, design: design, backing: backing, gameName: "", jobs: hps)
+        XCTAssertTrue(b.hasPrefix("Edit the last attached image: it is a sheet of four empty frames"), b)
+        XCTAssertTrue(b.contains("In frame 1, the top symbol's richer frame."), b)
+        XCTAssertTrue(b.contains("THE FRAMES: Keep every frame exactly as it is"), b)
+        XCTAssertFalse(b.contains("this sheet is a new picture"), b)
+    }
+}
+
 final class CutoutEdgeRulesTests: XCTestCase {
     /// A cyan square cut from magenta: solid body, a rim Photoshop called 90% solid that is
     /// really half magenta, and a faint outer ring that is nearly all magenta.
@@ -9018,12 +9197,15 @@ final class SymbolFrameTests: XCTestCase {
         XCTAssertFalse(r.jobs.first { $0.id == "LP1" }?.hasFrame ?? true)
     }
 
-    // A plan that says nothing about frames must not silently frame everything.
+    // A plan that says nothing about frames must not silently frame everything: a type the
+    // planner decides stays frameless. A pay symbol is framed by type (FrameRules) either way.
     func testMissingFrameFieldMeansNoFrame() {
         let j = GDDAssetPrompts.json(fromModelReply:
-            #"{"assets":[{"id":"HP1","subject":"a giant","silhouette":"giant"}]}"#)!
-        XCTAssertFalse(GDDAssetPrompts.apply(planJSON: j, to: [job("HP1", .highPay)])
-                        .jobs[0].hasFrame)
+            #"{"assets":[{"id":"WD1","subject":"a giant","silhouette":"giant"},{"id":"HP1","subject":"a harp","silhouette":"harp"}]}"#)!
+        let r = GDDAssetPrompts.apply(planJSON: j, to: [job("WD1", .wild), job("HP1", .highPay)]).jobs
+        XCTAssertFalse(r[0].hasFrame)
+        XCTAssertTrue(r[1].hasFrame)
+        XCTAssertEqual(r[1].shape, "square")
     }
 
     func testPromptSaysWhichWay() {
@@ -11217,7 +11399,7 @@ final class SetDesignTests: XCTestCase {
         XCTAssertTrue(SetDesignRules.problems(alike, SetDesign()).contains { $0.hasPrefix("BO1 (Bonus) would pass for the value symbols") })
         // And the planner and the drawing brief say what they are.
         let brief = GDDAssetPrompts.roleBrief(for: coins)
-        XCTAssertTrue(brief.contains("BONUS (BO): in this studio's games usually CIRCULAR"), brief)
+        XCTAssertTrue(brief.contains("BONUS (BO): in this studio's games a framed tile or an emblem"), brief)
         XCTAssertTrue(brief.contains("COLLECTOR (SF): the most VALUABLE-looking special"), brief)
         XCTAssertTrue(GDDAssetPrompts.roleLine(coins[3], jobs: coins, design: SetDesign()).contains("made to look like a prize won"))
     }
@@ -11257,10 +11439,14 @@ final class SetDesignTests: XCTestCase {
         jobs.append(AssetJob(id: "bg_base", kind: .background, role: .unknown, tier: nil, title: "",
                              subject: "a bank vault hall", aspect: "3:4", size: "4K"))
         let steps = RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true)
-        // The anchor is a high pay, so all four high pays are drawn first, together: the ranking
-        // is seen on one image instead of described to images that cannot see each other.
-        XCTAssertEqual(steps.first, RenderStep(id: "HP1", mode: .sheet, refs: ["theme-art"], after: [],
-                                               members: ["HP1", "HP2", "HP3", "HP4"]))
+        // The high pays' frame comes first, empty, then HP1's richer version of it as an edit.
+        XCTAssertEqual(steps[0], RenderStep(id: "frame_HP", mode: .frame, refs: ["theme-art"], after: []))
+        XCTAssertEqual(steps[1], RenderStep(id: "frame_HP1", mode: .frame, refs: ["theme-art", "frame_HP"], after: ["frame_HP"]))
+        // The anchor is a high pay, so all four high pays are drawn next, together, painted into
+        // their frames tiled on the sheet: the ranking is seen on one image, and one frame is shared.
+        XCTAssertEqual(steps[2], RenderStep(id: "HP1", mode: .sheet, refs: ["theme-art", RenderPlan.frameSheet],
+                                            after: ["frame_HP", "frame_HP1"], members: ["HP1", "HP2", "HP3", "HP4"],
+                                            frames: ["frame_HP1", "frame_HP", "frame_HP", "frame_HP"]))
         XCTAssertEqual(RenderPlan.anchorGroup(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true), ["HP1", "HP2", "HP3", "HP4"])
         let byID = Dictionary(uniqueKeysWithValues: steps.map { ($0.id, $0) })
         XCTAssertNil(byID["HP2"])
@@ -11278,9 +11464,12 @@ final class SetDesignTests: XCTestCase {
         let bare = RenderPlan.steps(jobs, SetDesign(), hasThemeArt: false)
         XCTAssertEqual(bare.first?.refs, [])
         XCTAssertEqual(bare.first { $0.id == "bg_base" }?.refs, ["HP1"])
-        // A partial redo of the sheet draws its members alone, matched to one that stays.
+        // A partial redo of the sheet paints its members alone into their own frame, matched to
+        // one that stays; the frame is kept (reused from disk when it is there), HP1's is not needed.
         let redo = RenderPlan.scoped(steps, to: ["HP3"])
-        XCTAssertEqual(redo, [RenderStep(id: "HP3", mode: .match, refs: ["HP1", "theme-art"], after: [])])
+        XCTAssertEqual(redo, [steps[0],
+                              RenderStep(id: "HP3", mode: .intoFrame, refs: ["HP1", "theme-art", "frame_HP"],
+                                         after: ["frame_HP"], frames: ["frame_HP"])])
     }
 
     // A character on two symbols is drawn once, first, and attached to both; one on a single
@@ -11294,8 +11483,8 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(steps.first, RenderStep(id: "cast-porky", mode: .character, refs: ["theme-art"], after: []))
         XCTAssertFalse(steps.contains { $0.id == "cast-vault-wolf" })
         let byID = Dictionary(uniqueKeysWithValues: steps.map { ($0.id, $0) })
-        XCTAssertEqual(byID["HP1"]?.refs, ["theme-art", "cast-porky"])
-        XCTAssertEqual(byID["HP1"]?.after, ["cast-porky"])
+        XCTAssertEqual(byID["HP1"]?.refs, ["theme-art", "cast-porky", RenderPlan.frameSheet])
+        XCTAssertEqual(byID["HP1"]?.after, ["cast-porky", "frame_HP", "frame_HP1"])
         XCTAssertEqual(byID["WD1"]?.refs, ["HP1", "cast-porky", RenderPlan.setSoFar])
         // A retry of the wild keeps the reference it is shown; one of HP4 alone does not need it.
         XCTAssertEqual(RenderPlan.scoped(steps, to: ["WD1"]).map(\.id), ["cast-porky", "WD1"])
@@ -11534,7 +11723,7 @@ final class SetDesignTests: XCTestCase {
          "families": {"jackpot": "a round vault dial"},
          "assets": [{"id": "HP1", "subject": "a gold goose", "silhouette": "goose", "shape": "Figure",
                      "hue": "gold", "frame": false},
-                    {"id": "JP2", "subject": "a vault dial", "silhouette": "dial", "shape": "round",
+                    {"id": "JP2", "subject": "a vault dial", "silhouette": "dial", "shape": "Round",
                      "hue": "chartreuse", "frame": true, "variation": "ruby enamel"}]}
         """
         let jobs = [j("HP1", .highPay, "", hue: "", shape: "", tier: 1),
@@ -11543,7 +11732,10 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(r.design.anchorID, "HP1")
         XCTAssertEqual(r.design.hero, "")
         XCTAssertEqual(r.design.families["jackpot"], "a round vault dial")
-        XCTAssertEqual(r.jobs[0].shape, "figure")          // case-folded
+        // A high pay is framed and square by type, whatever the planner said (FrameRules).
+        XCTAssertEqual(r.jobs[0].shape, "square")
+        XCTAssertTrue(r.jobs[0].hasFrame)
+        XCTAssertEqual(r.jobs[1].shape, "round")           // case-folded
         XCTAssertEqual(r.jobs[1].hue, "")                  // not one of the names: dropped, not guessed
         XCTAssertEqual(r.jobs[1].variation, "ruby enamel")
     }
@@ -11568,10 +11760,11 @@ final class SetDesignTests: XCTestCase {
         // The anchor is a figure and the harp is not: the anchor's character stays out of it.
         XCTAssertTrue(b.contains("It shows a character: nothing of that character"), b)
         XCTAssertTrue(b.contains("gold strings. It is"), b)        // no doubled full stop
-        XCTAssertTrue(b.contains("None of the attached images is to be edited or reproduced"))
+        // A medium pay is painted into its tier's frame, which is the image being edited.
+        XCTAssertTrue(b.contains("Edit the last attached image: it is the frame shared by this game's medium pays"), b)
+        XCTAssertTrue(b.contains("THE FRAME: Keep every frame exactly as it is"), b)
         XCTAssertTrue(b.contains("THE LOOK OF THIS SET: Glossy lacquered ceramic"))
         XCTAssertTrue(b.contains("Its dominant colour is red."))
-        XCTAssertTrue(b.contains("a tall, narrow outline"))
         XCTAssertTrue(b.contains("#00FF00"))
         XCTAssertFalse(b.contains("THIS SYMBOL IS ONE OF A SET"))   // the unenforceable rule list is gone
         // No slot codes and no document game name: an image model paints codes, and the
@@ -11773,20 +11966,24 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(m.backdropPurity, 1, accuracy: 0.01)
     }
 
-    // A tier that shares a frame has a picture of that frame to match, not only the anchor's tier.
+    // A framed tier is painted into its one frame; a frameless member is drawn on its own outline.
     func testAFramedTierMatchesItsFirstMembersFrame() {
         let jobs = [j("HP1", .highPay, "goose", hue: "gold", shape: "figure", tier: 1, frame: false),
                     j("MP1", .mediumPay, "harp", hue: "red", shape: "shield", tier: 1),
                     j("MP2", .mediumPay, "axe", hue: "blue", shape: "shield", tier: 2),
                     j("MP3", .mediumPay, "hen", hue: "green", shape: "shield", tier: 3, frame: false)]
         let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
-        XCTAssertEqual(steps["MP1"]?.refs, ["HP1", RenderPlan.setSoFar])
-        XCTAssertEqual(steps["MP2"], RenderStep(id: "MP2", mode: .match, refs: ["HP1", "MP1", RenderPlan.setSoFar], after: ["HP1", "MP1"]))
-        XCTAssertEqual(steps["MP3"]?.refs, ["HP1", RenderPlan.setSoFar])   // frameless: nothing to copy
+        XCTAssertEqual(steps["frame_MP"], RenderStep(id: "frame_MP", mode: .frame, refs: ["theme-art"], after: []))
+        XCTAssertNil(steps["frame_HP"])                                    // no framed high pay, no frame for them
+        XCTAssertEqual(steps["MP1"]?.refs, ["HP1", RenderPlan.setSoFar, "frame_MP"])
+        XCTAssertEqual(steps["MP2"], RenderStep(id: "MP2", mode: .intoFrame, refs: ["HP1", RenderPlan.setSoFar, "frame_MP"],
+                                                after: ["HP1", "frame_MP"], frames: ["frame_MP"]))
+        XCTAssertEqual(steps["MP3"]?.refs, ["HP1", RenderPlan.setSoFar])   // frameless: nothing to paint into
         let b = GDDAssetPrompts.brief(job: jobs[2], step: steps["MP2"]!, theme: GameTheme(name: "T"), design: SetDesign(anchorID: "HP1"),
                                       backing: (name: "chroma green", rgb: RGB8(0, 255, 0)), gameName: "", jobs: jobs)
         XCTAssertTrue(b.contains("Image 1 is the top high-pay symbol, already made"), b)
-        XCTAssertTrue(b.contains("Image 2 is the first medium-pay symbol, from the same tier: give this symbol exactly its frame"), b)
+        XCTAssertTrue(b.contains("Edit the last attached image: it is the frame shared by this game's medium pays, empty"), b)
+        XCTAssertFalse(b.contains("Image 3"), b)                           // the frame is the edit target, not a reference
     }
 
     // Findings from the first full set: each is a rule the checks now enforce.
@@ -11800,7 +11997,8 @@ final class SetDesignTests: XCTestCase {
         let mp = [hp[0], j("MP2", .mediumPay, "vault door", hue: "green", shape: "round", tier: 2),
                   j("MP4", .mediumPay, "lockbox", hue: "teal", shape: "square", tier: 4)]
         let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(mp, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
-        XCTAssertEqual(steps["MP4"]?.refs, ["HP1", RenderPlan.setSoFar])
+        // Outlines no longer decide it: both framed medium pays are painted into the tier's one frame.
+        XCTAssertEqual(steps["MP4"]?.refs, ["HP1", RenderPlan.setSoFar, "frame_MP"])
 
         // A pay symbol on a family's outline reads as one of the family (HP2 round like the coins).
         let coins = [j("WY1", .wysiwyg, "coin", hue: "blue", shape: "round"),
