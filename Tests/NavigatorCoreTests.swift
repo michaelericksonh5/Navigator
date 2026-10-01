@@ -8336,73 +8336,47 @@ final class GDDOutputTests: XCTestCase {
     }
 }
 
-final class SymbolCanvasTests: XCTestCase {
+final class CutoutEdgeRulesTests: XCTestCase {
+    /// A cyan square cut from magenta: solid body, a rim Photoshop called 90% solid that is
+    /// really half magenta, and a faint outer ring that is nearly all magenta.
+    private func cutout(rim: RGB8, rimAlpha: UInt8, outer: RGB8?) -> [UInt8] {
+        let w = 24
+        var px = [UInt8](repeating: 0, count: w * w * 4)
+        for y in 0..<w { for x in 0..<w {
+            let d = max(abs(2 * x - (w - 1)), abs(2 * y - (w - 1))) / 2   // ring index from the centre
+            let (c, a): (RGB8, UInt8) = d < 8 ? (RGB8(0, 200, 200), 255)
+                : d == 8 ? (rim, rimAlpha) : (d == 9 && outer != nil ? (outer!, 40) : (RGB8(0, 0, 0), 0))
+            let i = (y * w + x) * 4
+            px[i] = c.r; px[i + 1] = c.g; px[i + 2] = c.b; px[i + 3] = a
+        } }
+        return px
+    }
     private let magenta = RGB8(255, 0, 255)
 
-    /// A 100x100 magenta field with a 20x30 opaque block at (30, 40).
-    private func field(_ w: Int, _ h: Int, box: (x: Int, y: Int, w: Int, h: Int)?) -> (Int, Int) -> RGB8 {
-        return { x, y in
-            guard let b = box, x >= b.x, x < b.x + b.w, y >= b.y, y < b.y + b.h else {
-                return RGB8(255, 0, 255)
-            }
-            return RGB8(20, 200, 40)
+    func testTintedEdgesTakeBackTheSubjectColourAndAlphaIsKept() {
+        var px = cutout(rim: RGB8(126, 101, 226), rimAlpha: 230, outer: RGB8(230, 20, 250))
+        let before = px
+        XCTAssertGreaterThan(CutoutEdgeRules.clean(&px, width: 24, height: 24, backing: magenta), 0)
+        for i in stride(from: 0, to: px.count, by: 4) {
+            XCTAssertEqual(px[i + 3], before[i + 3])                       // the matte is Photoshop's
+            guard px[i + 3] > 0 else { continue }
+            XCTAssertLessThanOrEqual(Int(px[i]), 6, "red (the magenta) is gone at \(i / 4)")
+            XCTAssertEqual(Double(px[i + 1]), 200, accuracy: 6)
+            XCTAssertEqual(Double(px[i + 2]), 200, accuracy: 6)
         }
     }
 
-    func testFindsTheSubjectBox() {
-        let b = SymbolCanvasRules.subjectBounds(width: 100, height: 100, backing: magenta,
-                                                sample: field(100, 100, box: (30, 40, 20, 30)))
-        XCTAssertEqual(b?.x, 30); XCTAssertEqual(b?.y, 40)
-        XCTAssertEqual(b?.w, 20); XCTAssertEqual(b?.h, 30)
+    func testAnEdgeTheSameColourAsItsBodyIsLeftAlone() {
+        // A soft edge the colour of the body behind it is the subject's own, not the sheet's.
+        var px = cutout(rim: RGB8(0, 200, 200), rimAlpha: 200, outer: nil)
+        let before = px
+        XCTAssertEqual(CutoutEdgeRules.clean(&px, width: 24, height: 24, backing: magenta), 0)
+        XCTAssertEqual(px, before)
     }
 
-    // An all-backing image has no subject. Inventing a box would drop the cut-out at
-    // an arbitrary spot, which looks fine in a folder and wrong on a reel.
-    func testEmptyFieldHasNoBox() {
-        XCTAssertNil(SymbolCanvasRules.subjectBounds(width: 40, height: 40, backing: magenta,
-                                                     sample: field(40, 40, box: nil)))
-    }
-
-    func testPlacementPutsTheCutoutBackWhereItCameFrom() {
-        let at = SymbolCanvasRules.placement(cutout: (20, 30), bounds: (30, 40, 20, 30),
-                                             canvas: (100, 100))
-        XCTAssertEqual(at?.x, 30); XCTAssertEqual(at?.y, 40)
-    }
-
-    // Photoshop's trim and our scan agree to within a pixel or two, not exactly.
-    func testSmallDisagreementIsCentred() {
-        let at = SymbolCanvasRules.placement(cutout: (18, 28), bounds: (30, 40, 20, 30),
-                                             canvas: (100, 100))
-        XCTAssertEqual(at?.x, 31); XCTAssertEqual(at?.y, 41)
-    }
-
-    // A big disagreement means the cut-out is not what the box describes. Refuse
-    // rather than place it wrong.
-    func testBigDisagreementIsRefused() {
-        XCTAssertNil(SymbolCanvasRules.placement(cutout: (200, 300), bounds: (30, 40, 20, 30),
-                                                 canvas: (100, 100)))
-    }
-
-    // Measured on the real run: the glowing wild's cut-out was 1748x1743 against a
-    // scanned box of 1767x1799 on a 2048 canvas — a 56px disagreement, because a soft
-    // glow fades into the backing. A flat 24px tolerance refused exactly the soft
-    // symbols and placed the hard ones, which is the opposite of a consistent set.
-    func testSoftEdgedSymbolIsStillPlaced() {
-        let at = SymbolCanvasRules.placement(cutout: (1748, 1743), bounds: (115, 161, 1767, 1799),
-                                             canvas: (2048, 2048))
-        XCTAssertNotNil(at)
-        XCTAssertEqual(at?.x, 115 + (1767 - 1748) / 2)
-        XCTAssertEqual(at?.y, 161 + (1799 - 1743) / 2)
-    }
-
-    func testToleranceScalesWithCanvas() {
-        XCTAssertEqual(SymbolCanvasRules.tolerance(canvas: (2048, 2048)), 102)
-        XCTAssertEqual(SymbolCanvasRules.tolerance(canvas: (100, 100)), 24)
-    }
-
-    func testPlacementNeverRunsOffTheCanvas() {
-        XCTAssertNil(SymbolCanvasRules.placement(cutout: (20, 30), bounds: (90, 90, 20, 30),
-                                                 canvas: (100, 100)))
+    func testAnOpaqueImageHasNoEdgeToClean() {
+        var px = [UInt8](repeating: 255, count: 8 * 8 * 4)
+        XCTAssertEqual(CutoutEdgeRules.clean(&px, width: 8, height: 8, backing: magenta), 0)
     }
 }
 

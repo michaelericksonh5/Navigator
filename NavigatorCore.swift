@@ -8579,82 +8579,132 @@ enum GDDOutputRules {
     }
 }
 
-/// Putting a cut-out symbol back on the canvas it was drawn on.
+/// Taking the sheet colour back out of a cut-out's edges.
 ///
-/// Photoshop's background removal TRIMS to the subject: a 2048x2048 symbol comes back
-/// 1653x1804. For one image that is fine, but a symbol SET has to register — every
-/// symbol sitting in the same square, in the same place, so the reel does not jitter
-/// when one lands next to another.
+/// Photoshop's Remove Background picks the subject well but leaves every edge pixel the
+/// colour it was on the sheet: part backdrop. Measured on a GDD set drawn on magenta, the
+/// edges leaned 79 levels toward magenta, a pink rim on any reel.
 ///
-/// The position is not guessed. The symbol was generated on a flat field of a known
-/// colour, so the pixels that are NOT that colour are the subject, and their bounding
-/// box in the source is exactly where the trimmed cut-out came from.
-enum SymbolCanvasRules {
+/// Its alpha can't simply be inverted (SpillRules' F = (S − B·(1−a))/a): Photoshop's edge is
+/// tighter than the real blend, so pixels it calls nearly solid are still half backdrop and
+/// keep their pink, and the faintest over-correct into a green line. So colour is judged by
+/// colour. Each edge pixel is compared with the subject's own colour just inside it, the share
+/// that leans from there toward the backdrop is what gets removed (SpillRules, run on that
+/// share), and the faintest pixels take the inside colour outright. A pixel the same colour as
+/// the body behind it is untouched, so crimson beside a magenta sheet stays crimson. Alpha is
+/// never changed.
+enum CutoutEdgeRules {
+    /// Solid pixels this close to the edge may themselves be tinted, so they are not used as
+    /// the reference colour.
+    static let margin = 3
+    /// How far the inside colour is carried outward. Translucent pixels further out than this
+    /// are free-floating FX with no body behind them, cleaned with Photoshop's alpha instead.
+    static let reach = 32
 
-    /// Squared distance between two colours, for the flat-field test. Plain RGB is
-    /// the right measure here: the question is "is this pixel the backing we just
-    /// asked for", not "do these look alike to a person".
-    static func distanceSquared(_ a: RGB8, _ b: RGB8) -> Int {
-        let dr = Int(a.r) - Int(b.r), dg = Int(a.g) - Int(b.g), db = Int(a.b) - Int(b.b)
-        return dr*dr + dg*dg + db*db
-    }
+    /// The source counts as cut from a flat backdrop when at least this much of its border is
+    /// one colour. Not KeyColorRules' 90%: a GDD symbol whose art touches the canvas edge
+    /// measured 75%, and a photo's border is nowhere near half one colour.
+    static let backdropFraction = 0.5
 
-    /// Anything this far from the backing counts as subject. Generous, because the
-    /// soft edge of the subject blends toward the backing and must not be clipped off
-    /// the bounding box.
-    static let subjectThreshold = 60 * 60
-
-    /// The subject's bounding box in a flat-backed image, as (x, y, w, h).
+    /// Cleans straight RGBA8 `px` in place against the flat `backing` the image was cut from.
+    /// Returns how many pixels changed.
     ///
-    /// `sample` answers the pixel at (x, y). Returns nil when nothing differs from the
-    /// backing — an empty image has no box, and inventing one would place the cut-out
-    /// somewhere arbitrary.
-    static func subjectBounds(width: Int, height: Int, backing: RGB8,
-                              sample: (Int, Int) -> RGB8) -> (x: Int, y: Int, w: Int, h: Int)? {
-        var minX = width, minY = height, maxX = -1, maxY = -1
-        for y in 0..<height {
-            for x in 0..<width where distanceSquared(sample(x, y), backing) > subjectThreshold {
-                if x < minX { minX = x }
-                if x > maxX { maxX = x }
-                if y < minY { minY = y }
-                if y > maxY { maxY = y }
+    /// Written with raw buffers and plain loops because Navigator builds unoptimised: the
+    /// Array version took 6.7 s on a 2048px symbol.
+    @discardableResult
+    static func clean(_ px: inout [UInt8], width w: Int, height h: Int, backing k: RGB8) -> Int {
+        let n = w * h
+        guard w > 0, h > 0, px.count == n * 4 else { return 0 }
+        return px.withUnsafeMutableBufferPointer { p -> Int in
+            let near = UnsafeMutablePointer<Bool>.allocate(capacity: n)
+            let tmp = UnsafeMutablePointer<Bool>.allocate(capacity: n)
+            let known = UnsafeMutablePointer<Bool>.allocate(capacity: n)
+            let ref = UnsafeMutablePointer<UInt8>.allocate(capacity: n * 4)   // reference colours
+            defer { near.deallocate(); tmp.deallocate(); known.deallocate(); ref.deallocate() }
+            ref.initialize(from: p.baseAddress!, count: n * 4)
+            // Not a reference: translucent, or within `margin` of something that is. A
+            // chessboard dilation, done as a row pass and a column pass so it costs O(pixels).
+            var i = 0
+            while i < n { near[i] = p[i * 4 + 3] < 255; i += 1 }
+            dilate(near, into: tmp, length: w, lines: h, step: 1, lineStep: w, radius: margin)
+            dilate(tmp, into: near, length: h, lines: w, step: w, lineStep: 1, radius: margin)
+            var band: [Int] = []
+            i = 0
+            while i < n {
+                known[i] = !near[i]
+                if near[i] && p[i * 4 + 3] > 0 { band.append(i) }
+                i += 1
             }
+            // Carry the inside colour outward, one ring per pass: each pixel takes the mean of
+            // the neighbours known before the pass began.
+            var todo = band, found: [Int] = [], rest: [Int] = [], pass = 0
+            while pass < reach && !todo.isEmpty {
+                found.removeAll(keepingCapacity: true); rest.removeAll(keepingCapacity: true)
+                for i in todo {
+                    let x = i % w, y = i / w
+                    var sr = 0, sg = 0, sb = 0, c = 0
+                    var yy = max(0, y - 1)
+                    while yy <= min(h - 1, y + 1) {
+                        var xx = max(0, x - 1)
+                        while xx <= min(w - 1, x + 1) {
+                            let j = yy * w + xx
+                            if known[j] { sr += Int(ref[j * 4]); sg += Int(ref[j * 4 + 1]); sb += Int(ref[j * 4 + 2]); c += 1 }
+                            xx += 1
+                        }
+                        yy += 1
+                    }
+                    if c > 0 {
+                        ref[i * 4] = UInt8((sr + c / 2) / c); ref[i * 4 + 1] = UInt8((sg + c / 2) / c); ref[i * 4 + 2] = UInt8((sb + c / 2) / c)
+                        found.append(i)
+                    } else { rest.append(i) }
+                }
+                for i in found { known[i] = true }
+                swap(&todo, &rest)
+                pass += 1
+            }
+            let kr = Double(k.r), kg = Double(k.g), kb = Double(k.b)
+            var changed = 0
+            for i in band {
+                let s = RGB8(p[i * 4], p[i * 4 + 1], p[i * 4 + 2])
+                let out: RGB8
+                if known[i] {
+                    let inside = RGB8(ref[i * 4], ref[i * 4 + 1], ref[i * 4 + 2])
+                    let nr = Double(inside.r), ng = Double(inside.g), nb = Double(inside.b)
+                    let dr = kr - nr, dg = kg - ng, db = kb - nb
+                    // How far the pixel sits from its inside colour toward the backdrop, 0…1.
+                    let t = ((Double(s.r) - nr) * dr + (Double(s.g) - ng) * dg + (Double(s.b) - nb) * db)
+                        / max(dr * dr + dg * dg + db * db, 1)
+                    let subject = UInt8(((1 - min(1, max(0, t))) * 255).rounded())
+                    out = ChromaKeyOutputRules.SpillRules.recovered(keyed: inside, source: s, backing: k, alpha: subject)
+                } else {
+                    out = ChromaKeyOutputRules.SpillRules.recovered(keyed: s, source: s, backing: k, alpha: p[i * 4 + 3])
+                }
+                if out != s { changed += 1; p[i * 4] = out.r; p[i * 4 + 1] = out.g; p[i * 4 + 2] = out.b }
+            }
+            return changed
         }
-        guard maxX >= minX, maxY >= minY else { return nil }
-        return (minX, minY, maxX - minX + 1, maxY - minY + 1)
     }
 
-    /// Where to place a trimmed cut-out on the original canvas.
-    ///
-    /// Photoshop's trim and this bounding box are computed from the same picture but
-    /// not by the same code, so they land within a pixel or two of each other rather
-    /// than exactly. The cut-out is centred on the box when they disagree slightly,
-    /// and the placement is REFUSED when they disagree a lot — a wrong offset is worse
-    /// than an untrimmed file, because it is invisible until the reel spins.
-    /// How far the two measurements may disagree: 5% of the canvas, or 24px, whichever
-    /// is larger.
-    ///
-    /// A flat 24px was too strict. A soft-edged symbol — a glowing vortex — fades into
-    /// the backing, so this scan's threshold keeps more of the glow than Photoshop's cut
-    /// does, and the two disagreed by 56px on a 2048 canvas. Refusing that left exactly
-    /// the symbols with soft edges untrimmed while the hard-edged ones were placed,
-    /// which is the opposite of a consistent set. Centring within the box bounds the
-    /// error at half the tolerance — about 1.4% of the canvas — which is invisible on a
-    /// reel, and still refuses a cut-out that is nothing like the box.
-    static func tolerance(canvas: (w: Int, h: Int)) -> Int {
-        max(24, max(canvas.w, canvas.h) / 20)
-    }
-
-    static func placement(cutout: (w: Int, h: Int), bounds: (x: Int, y: Int, w: Int, h: Int),
-                          canvas: (w: Int, h: Int), tolerance: Int? = nil)
-        -> (x: Int, y: Int)? {
-        let tolerance = tolerance ?? Self.tolerance(canvas: canvas)
-        guard abs(cutout.w - bounds.w) <= tolerance, abs(cutout.h - bounds.h) <= tolerance
-        else { return nil }
-        let x = bounds.x + (bounds.w - cutout.w) / 2
-        let y = bounds.y + (bounds.h - cutout.h) / 2
-        guard x >= 0, y >= 0, x + cutout.w <= canvas.w, y + cutout.h <= canvas.h else { return nil }
-        return (x, y)
+    /// dst = src dilated by `radius` along each line (true if any src within ±radius).
+    private static func dilate(_ src: UnsafeMutablePointer<Bool>, into dst: UnsafeMutablePointer<Bool>,
+                               length: Int, lines: Int, step: Int, lineStep: Int, radius r: Int) {
+        var line = 0
+        while line < lines {
+            let base = line * lineStep
+            var gap = r + 1, j = 0
+            while j < length {
+                let idx = base + j * step
+                gap = src[idx] ? 0 : min(gap + 1, r + 1); dst[idx] = gap <= r
+                j += 1
+            }
+            gap = r + 1; j = length - 1
+            while j >= 0 {
+                let idx = base + j * step
+                gap = src[idx] ? 0 : min(gap + 1, r + 1); if gap <= r { dst[idx] = true }
+                j -= 1
+            }
+            line += 1
+        }
     }
 }
 

@@ -4074,16 +4074,18 @@ func batchUpscaleFolderViaVertex(_ folder: URL, onDone: (() -> Void)? = nil) {
 // — only the LAST attempt is allowed to surface an error, so retries stay silent and a
 // genuine failure still reports through the same routing (automation-permission vs
 // script error) it always did.
-func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
+func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3, keepCanvas: Bool = false,
                           reportFinalError: Bool, recovery: AdobeRecovery? = nil) -> ScriptResult {
     let recovery = recovery ?? AdobeRecovery()
     var last = ScriptResult(ok: false, message: "not attempted")
     for i in 0..<attempts {
         let isLast = (i == attempts - 1)
-        last = runPhotoshopScript(resource: "NavigatorRemoveBG", arguments: [src.path, out.path],
+        last = runPhotoshopScript(resource: "NavigatorRemoveBG",
+                                 arguments: [src.path, out.path] + (keepCanvas ? ["keep-canvas"] : []),
                                  reportError: reportFinalError && isLast)
         if last.ok {
             if i > 0 { navLog("remove bg: \(src.lastPathComponent) succeeded on attempt \(i + 1)") }
+            cleanCutoutEdges(cutout: out, source: src)
             return last
         }
         guard !isLast else { break }
@@ -4119,6 +4121,26 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
 // can refresh.
 
 
+/// Photoshop leaves a cut-out's edges the colour they were on the sheet. When the source sat on
+/// a flat backdrop, take that colour back out of them (CutoutEdgeRules). Leaves the file as
+/// Photoshop made it on any doubt.
+func cleanCutoutEdges(cutout: URL, source: URL) {
+    guard let src = loadCGImage(source), let field = flatFieldColour(src),
+          field.fraction >= CutoutEdgeRules.backdropFraction,
+          let cut = loadCGImage(cutout), var px = ChromaKeyOutputRules.straightRGBA8(cut) else { return }
+    let changed = CutoutEdgeRules.clean(&px, width: cut.width, height: cut.height, backing: field.colour)
+    guard changed > 0,
+          let img = ChromaKeyOutputRules.image(straightRGBA8: px, width: cut.width, height: cut.height, space: cut.colorSpace),
+          let png = encodePNG(img) else { return }
+    let c = field.colour
+    do {
+        try png.write(to: cutout)
+        navLog("remove bg: \(cutout.lastPathComponent) — \(changed) edge pixels cleaned of the rgb(\(c.r),\(c.g),\(c.b)) backdrop")
+    } catch {
+        navLog("remove bg: \(cutout.lastPathComponent) — edge clean not saved: \(error.localizedDescription)")
+    }
+}
+
 func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
     let out = rmbgOutputURL(src)
@@ -4135,7 +4157,9 @@ func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
 // Remove BG for several images in one hidden Photoshop session (reuses the
 // proven single script per file). Shows non-blocking "N of M" progress and an
 // end-of-run summary (per-file errors collapsed into one dialog).
-func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+/// `keepCanvas` leaves each cut-out on the canvas it was drawn on instead of trimmed to the
+/// subject, for a symbol set that has to register.
+func removeBackgroundForImages(_ srcs: [URL], keepCanvas: Bool = false, onDone: (([URL]) -> Void)? = nil) {
     // Every exit calls back, including the failures — see chromaKeyForImages.
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
@@ -4146,7 +4170,7 @@ func removeBackgroundForImages(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) 
         let recovery = AdobeRecovery()   // at most one Photoshop restart for the whole batch
         for src in imgs {
             let out = rmbgOutputURL(src)
-            let r = removeBackgroundOnce(src: src, out: out, reportFinalError: false, recovery: recovery)
+            let r = removeBackgroundOnce(src: src, out: out, keepCanvas: keepCanvas, reportFinalError: false, recovery: recovery)
             if r.ok { outs.append(out) } else { errors.append("\(src.lastPathComponent): \(r.message)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
@@ -22978,46 +23002,6 @@ func downsamplePNG(_ data: Data, longEdge: Int) -> Data? {
     return encodePNG(out)
 }
 
-/// Put a trimmed cut-out back on the canvas its source was drawn on.
-///
-/// Photoshop trims to the subject, which breaks registration across a symbol set —
-/// see SymbolCanvasRules. Returns false (leaving the file alone) whenever the answer
-/// is not certain: a wrong offset is worse than a trimmed file, because it looks fine
-/// until the reel spins.
-@discardableResult
-func restoreSymbolCanvas(cutout: URL, source: URL, backing: RGB8) -> Bool {
-    guard let cSrc = CGImageSourceCreateWithURL(cutout as CFURL, nil),
-          let cut = CGImageSourceCreateImageAtIndex(cSrc, 0, nil),
-          let sSrc = CGImageSourceCreateWithURL(source as CFURL, nil),
-          let src = CGImageSourceCreateImageAtIndex(sSrc, 0, nil) else { return false }
-    let cw = src.width, ch = src.height
-    guard cut.width < cw || cut.height < ch else { return false }   // already full size
-
-    // Read the source into a buffer so the bounds scan is a plain array lookup.
-    var buf = [UInt8](repeating: 0, count: cw * ch * 4)
-    guard let sctx = CGContext(data: &buf, width: cw, height: ch, bitsPerComponent: 8,
-                               bytesPerRow: cw * 4, space: CGColorSpaceCreateDeviceRGB(),
-                               bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return false }
-    sctx.draw(src, in: CGRect(x: 0, y: 0, width: cw, height: ch))
-    guard let bounds = SymbolCanvasRules.subjectBounds(width: cw, height: ch, backing: backing,
-              sample: { x, y in
-                  let i = (y * cw + x) * 4
-                  return RGB8(buf[i], buf[i + 1], buf[i + 2])
-              }) else { return false }
-    guard let at = SymbolCanvasRules.placement(cutout: (cut.width, cut.height), bounds: bounds,
-                                               canvas: (cw, ch)) else { return false }
-
-    guard let out = CGContext(data: nil, width: cw, height: ch, bitsPerComponent: 8,
-                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
-    out.clear(CGRect(x: 0, y: 0, width: cw, height: ch))
-    // CoreGraphics counts y up from the bottom; the bounds were scanned top-down.
-    let flippedY = ch - at.y - cut.height
-    out.draw(cut, in: CGRect(x: at.x, y: flippedY, width: cut.width, height: cut.height))
-    guard let img = out.makeImage(), let png = encodePNG(img) else { return false }
-    do { try png.write(to: cutout); return true } catch { return false }
-}
-
 func pngPixelSize(_ data: Data) -> (w: Int, h: Int)? {
     guard let src = CGImageSourceCreateWithData(data as CFData, nil),
           let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
@@ -24862,25 +24846,14 @@ final class GDDToAssetsRun: ObservableObject {
                 if removeBackground && !symbolPNGs.isEmpty {
                     self.keying = true
                     self.status += "  Removing symbol backgrounds in Photoshop — carrying on in the background."
-                    let backingRGB = backing.rgb
-                    removeBackgroundForImages(symbolPNGs) { done in
-                        // Photoshop trims to the subject; a symbol SET has to register,
-                        // so each cut-out goes back on the canvas it was drawn on.
-                        var restored = 0
-                        for cut in done {
-                            let name = cut.lastPathComponent
-                                .replacingOccurrences(of: "_rmbg.png", with: ".png")
-                            let src = cut.deletingLastPathComponent().appendingPathComponent(name)
-                            if FileManager.default.fileExists(atPath: src.path),
-                               restoreSymbolCanvas(cutout: cut, source: src, backing: backingRGB) {
-                                restored += 1
-                            }
-                        }
+                    // Photoshop keeps each symbol on its own canvas, so the set registers. Putting a
+                    // trimmed cut-out back by finding the subject in the source was off by up to
+                    // 35px: the source's faint glow counts as subject, Photoshop's cut does not.
+                    removeBackgroundForImages(symbolPNGs, keepCanvas: true) { done in
                         self.keying = false
                         self.status = done.isEmpty
                             ? "Background removal didn’t produce anything — check Photoshop."
-                            : "Backgrounds removed from \(done.count) of \(symbolPNGs.count) symbols"
-                              + (restored > 0 ? ", \(restored) put back on full canvas." : ".")
+                            : "Backgrounds removed from \(done.count) of \(symbolPNGs.count) symbols."
                         // Frames were drawn WITH their symbols so the two would match. Splitting
                         // them afterwards is what makes the frame reusable and the symbol
                         // animatable — the old pipeline generated them apart and they never

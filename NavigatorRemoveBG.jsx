@@ -1,7 +1,7 @@
 /**
  * Navigator — Remove Background + Trim (single image).
  * Photoshop opens the ORIGINAL (SOURCE), removes the background (unified
- * `removeBackground`), trims transparent edges, and saves the result as a
+ * `removeBackground`), trims transparent edges (unless asked to keep the canvas), and saves the result as a
  * transparent PNG at OUTPUT ("<name>_rmbg.png"). The original is opened
  * read-only and never written.
  *
@@ -31,6 +31,10 @@ var SOURCE = (typeof arguments !== "undefined" && arguments.length > 0) ? String
 var OUTPUT = (typeof arguments !== "undefined" && arguments.length > 1) ? String(arguments[1])
     : (($.global && $.global.NAV_ARG2) ? String($.global.NAV_ARG2) : (SOURCE ? pngPathFor(SOURCE) : null));
 
+// "keep-canvas" (arguments[2]) skips the trim: GDD to Assets needs every symbol of a set on the
+// canvas it was drawn on, and putting a trimmed cut-out back afterwards was guesswork.
+var KEEP_CANVAS = ((typeof arguments !== "undefined" && arguments.length > 2) ? String(arguments[2])
+    : (($.global && $.global.NAV_ARG3) ? String($.global.NAV_ARG3) : "")) === "keep-canvas";
 // Which call we're on, so a failure names the step instead of just echoing
 // Photoshop's generic "General Photoshop error occurred". Photoshop intermittently
 // refuses one file in a long batch with 'The command "Get" is not currently
@@ -116,7 +120,7 @@ function doWork() {
         });
 
         STEP = "trim";
-        try { doc.trim(TrimType.TRANSPARENT, true, true, true, true); } catch (tErr) {}
+        if (!KEEP_CANVAS) { try { doc.trim(TrimType.TRANSPARENT, true, true, true, true); } catch (tErr) {} }
 
         // saveAs a NEW "<name>_rmbg.png" — the source is opened read-only and
         // never written. Explicit PNG (bare doc.save() on a PNG is unreliable).
