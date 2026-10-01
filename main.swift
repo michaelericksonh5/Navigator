@@ -19754,7 +19754,9 @@ enum H5GService {
             body["input_images"] = inputPNGs.map { ["mime": "image/png", "base64": $0.base64EncodedString()] }
         }
         if let aspect, !aspect.isEmpty { body["aspect_ratio"] = aspect }
-        if let size, !size.isEmpty { body["image_size"] = size }
+        // Only a size the model takes: the service refuses any other (1.2.0), and these
+        // models return their one size whatever is asked.
+        if let size, !size.isEmpty, GeneratedSizeRules.sizes(model: modelID).contains(size) { body["image_size"] = size }
         // Nano Banana 2 thinks at "minimal" unless asked; "high" is its other level (Gemini image
         // docs, checked 30 Sep 2026). Sent only once the service lists image.thinking_level:
         // it does not yet, and an unknown field on a paid call is not worth the risk.
@@ -24544,7 +24546,8 @@ final class GDDToAssetsRun: ObservableObject {
         -> (png: Data?, cost: Double, error: String?, escalations: Int) {
         var r = request(job, prompt: prompt, inputs: inputs, model: model, size: job.size)
         var tries = 0
-        while tries < 2, let png = r.png, let d = pngPixelSize(png),
+        // A model with no 4K cannot be escalated: asking again only pays for the same image.
+        while tries < 2, GeneratedSizeRules.sizes(model: model).contains("4K"), let png = r.png, let d = pngPixelSize(png),
               GeneratedSizeRules.isUndersized(longEdge: max(d.w, d.h), requested: job.size) {
             tries += 1
             navLog("gdd image: \(job.id) came back \(d.w)x\(d.h) for \(job.size) — asking again at 4K")
@@ -24602,7 +24605,8 @@ final class GDDToAssetsRun: ObservableObject {
             var pieces: [Piece] = []
             for (m, box) in zip(members, f.boxes) {
                 let size = GeneratedSizeRules.canvas(aspect: m.aspect, size: m.size)
-                guard let one = SymbolSheet.cut(cg, box: box, backdrop: f.backdrop, width: size.w, height: size.h),
+                guard let one = SymbolSheet.cut(cg, box: box, backdrop: f.backdrop, width: size.w, height: size.h,
+                                                others: f.boxes.filter { $0 != box }),
                       let png = encodePNG(one) else { continue }
                 let rev = review(png, job: m, log: log)
                 var redo: String?

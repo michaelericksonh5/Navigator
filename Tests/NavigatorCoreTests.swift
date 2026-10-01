@@ -11518,6 +11518,44 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(SlotSymbolRole.collector.refined(byNote: "Base Game, collects and pays out WY1 and WY10 type symbols"), .collector)
     }
 
+    // A frameless character is told how it ends; a framed one, or an object, is not.
+    func testAFramelessCharacterIsShownWhole() {
+        var hp1 = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "", subject: "Astraea", aspect: "1:1", size: "2K")
+        hp1.cast = "Astraea"; hp1.shape = "figure"
+        XCTAssertTrue(GDDAssetPrompts.wholeFigure(hp1).contains("never sliced off by the edge"))
+        hp1.hasFrame = true
+        XCTAssertEqual(GDDAssetPrompts.wholeFigure(hp1), "")
+        var orb = AssetJob(id: "HP3", kind: .symbol, role: .highPay, tier: 3, title: "", subject: "an orb", aspect: "1:1", size: "2K")
+        orb.shape = "round"
+        XCTAssertEqual(GDDAssetPrompts.wholeFigure(orb), "")
+    }
+
+    // Every symbol faces straight on. Offered "three-quarter" as a camera choice, the prompt
+    // writer tilted the value coin to show its edge, and its family edits kept the tilt.
+    func testSymbolsAreAskedToFaceStraightOn() {
+        let jobs = piggy
+        let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
+        let back = (name: "chroma green", rgb: RGB8(0, 177, 64))
+        let single = GDDAssetPrompts.brief(job: jobs[4], step: steps["WD1"]!, theme: GameTheme(name: "T"), design: SetDesign(anchorID: "HP1"),
+                                           backing: back, gameName: "", jobs: jobs)
+        let sheet = GDDAssetPrompts.brief(job: jobs[0], step: steps["HP1"]!, theme: GameTheme(name: "T"), design: SetDesign(anchorID: "HP1"),
+                                          backing: back, gameName: "", jobs: jobs)
+        let ask = GDDAssetPrompts.symbolBrief(job: jobs[11], jobs: jobs, design: SetDesign(), theme: GameTheme(name: "T"))
+        for p in [single, sheet, ask] {
+            XCTAssertTrue(p.contains("straight on"), p)
+            XCTAssertFalse(p.contains("three-quarter"), p)
+        }
+    }
+
+    // Only the sizes each image model takes are asked for (Vertex model cards; service 1.2.0
+    // refuses any other).
+    func testEachImageModelIsAskedOnlyForItsSizes() {
+        XCTAssertEqual(GeneratedSizeRules.sizes(model: "gemini-2.5-flash-image"), [])
+        XCTAssertEqual(GeneratedSizeRules.sizes(model: "gemini-3.1-flash-lite-image"), ["1K"])
+        XCTAssertEqual(GeneratedSizeRules.sizes(model: "gemini-3.1-flash-image"), ["1K", "2K", "4K"])
+        XCTAssertEqual(GeneratedSizeRules.sizes(model: "gemini-3-pro-image"), ["1K", "2K", "4K"])
+    }
+
     // No sentence compares a symbol with one the image model cannot see; the finish carries it.
     func testTheRoleLineStatesAFinishInsteadOfComparing() {
         var jobs = piggy
@@ -11553,6 +11591,22 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(found.boxes[2].height, 270, accuracy: 8)
         XCTAssertEqual(found.boxes[3].width, 200, accuracy: 6)
         XCTAssertNil(SymbolSheet.boxes(img, backing: RGB8(0, 177, 64), rows: [3, 2]))
+        // A neighbour that reaches the edge of its cell leaves no sliver in the next symbol's
+        // margin: HP1's cape ran to its cell edge and left a stripe down the side of HP2.
+        let left = CGRect(x: 60, y: 50, width: 280, height: 280), right = CGRect(x: 344, y: 50, width: 280, height: 280)
+        func stripe(_ others: [CGRect]) throws -> Int {
+            let c = try XCTUnwrap(SymbolSheet.cut(img, box: right, backdrop: found.backdrop, width: 256, height: 256, others: others))
+            let ctx = CGContext(data: nil, width: 256, height: 256, bitsPerComponent: 8, bytesPerRow: 1024,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+            ctx.draw(c, in: CGRect(x: 0, y: 0, width: 256, height: 256))
+            let px = ctx.data!.bindMemory(to: UInt8.self, capacity: 256 * 256 * 4)
+            // The red of the left square, anywhere in the left fifth of the cut.
+            var n = 0
+            for y in 0..<256 { for x in 0..<51 where px[(y * 256 + x) * 4] > 150 { n += 1 } }
+            return n
+        }
+        XCTAssertGreaterThan(try stripe([]), 0)          // without the neighbours: the sliver is there
+        XCTAssertEqual(try stripe([left]), 0)            // with them: painted over
         XCTAssertEqual(SymbolSheet.layout(count: 4, role: .highPay).aspect, "1:1")
         XCTAssertEqual(SymbolSheet.layout(count: 4, role: .lowPay).rows, [4])
     }
@@ -11584,7 +11638,10 @@ final class SetDesignTests: XCTestCase {
         XCTAssertNil(j.currentBrief)
         // The second step's request sees the whole set and the character's look.
         let ask = GDDAssetPrompts.symbolBrief(job: r.jobs[0], jobs: r.jobs, design: r.design, theme: GameTheme(name: "Moon Queens"))
-        XCTAssertTrue(ask.contains("It shows Selene: silver hair, a crescent crown"), ask)
+        // Selene is the figure in the art: the art decides how she looks, not the planner's guess.
+        XCTAssertTrue(ask.contains("It shows Selene: the figure in the theme's concept art"), ask)
+        XCTAssertFalse(ask.contains("silver hair"), ask)
+        XCTAssertTrue(ask.contains("- Nyx (villain): a shadow queen in black"), ask)
         XCTAssertTrue(ask.contains("a comet lantern"), ask)
         XCTAssertTrue(ask.contains("← THIS ONE"), ask)
         XCTAssertEqual(GDDAssetPrompts.brief(fromReply: #"{"brief": "  A lantern.  "}"#), "A lantern.")

@@ -8417,6 +8417,18 @@ enum SlotBackingRules {
 /// size that was asked for. So the size cannot be assumed; it is measured.
 enum GeneratedSizeRules {
 
+    /// The output sizes each Gemini image model takes, from its Vertex model card. Nano Banana 1
+    /// has a single size and Nano Banana 2 Lite is 1K only; since service 1.2.0 asking either for
+    /// another is a 400, where it used to be dropped (so a "2K" Lite image came back 1K, and the
+    /// GDD tool paid to ask again at 4K, twice, for the same 1K).
+    static func sizes(model: String) -> [String] {
+        switch model {
+        case "gemini-2.5-flash-image": return []
+        case "gemini-3.1-flash-lite-image": return ["1K"]
+        default: return ["1K", "2K", "4K"]
+        }
+    }
+
     /// The long edge each size name is asking for.
     static func targetLongEdge(_ size: String) -> Int {
         switch size {
@@ -11051,8 +11063,11 @@ public enum SymbolSheet {
 
     /// One symbol cut from the sheet onto its own canvas of the backdrop colour, centred, its
     /// larger side `fill` of the canvas's — the margin every other symbol is drawn with.
+    /// `others`: the sheet's other boxes. The margin around this one can reach into a neighbour's
+    /// — HP1's cape ran to the edge of its cell and left a sliver down the side of HP2 — so what
+    /// falls inside another box is painted over with the backdrop.
     static func cut(_ image: CGImage, box: CGRect, backdrop: RGB8, width: Int, height: Int,
-                           fill: Double = 0.86) -> CGImage? {
+                           fill: Double = 0.86, others: [CGRect] = []) -> CGImage? {
         let pad = max(box.width, box.height) * 0.03
         let r = box.insetBy(dx: -pad, dy: -pad).intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
         guard let crop = image.cropping(to: r),
@@ -11065,7 +11080,15 @@ public enum SymbolSheet {
         let scale = min(fill * Double(width) / box.width, fill * Double(height) / box.height)
         let dw = Double(r.width) * scale, dh = Double(r.height) * scale
         ctx.interpolationQuality = .high
-        ctx.draw(crop, in: CGRect(x: (Double(width) - dw) / 2, y: (Double(height) - dh) / 2, width: dw, height: dh))
+        let x0 = (Double(width) - dw) / 2, y0 = (Double(height) - dh) / 2
+        ctx.draw(crop, in: CGRect(x: x0, y: y0, width: dw, height: dh))
+        // Image rows run down from the top; the context's run up from the bottom.
+        for o in others {
+            let i = o.intersection(r)
+            guard !i.isNull, !i.isEmpty else { continue }
+            ctx.fill(CGRect(x: x0 + (i.minX - r.minX) * scale, y: y0 + dh - (i.maxY - r.minY) * scale,
+                            width: i.width * scale, height: i.height * scale))
+        }
         return ctx.makeImage()
     }
 }
@@ -11487,6 +11510,13 @@ extension GDDAssetPrompts {
         return "\(n) is the approved concept art for this theme. Take ONLY how it is painted — the technique, lighting, materials and finish. Nothing in it appears in the new image: not its characters, objects or text, and not its scene — no sky, buildings, landscape, ground or light behind the symbol. The symbol stands alone on the flat backing colour."
     }
 
+    /// A frameless figure has nothing to end it but itself: drawn as a waist-up portrait,
+    /// Galactic Goddesses' Astraea came back sliced off flat along the bottom of her square.
+    static func wholeFigure(_ job: AssetJob) -> String {
+        guard !job.hasFrame, job.shape == "figure" || !job.cast.isEmpty else { return "" }
+        return " Shown whole: the full figure, or a bust that ends in the design itself — an ornamental base, a sash or drapery that finishes it — never sliced off by the edge of the square."
+    }
+
     static func setSoFarLine(_ n: String) -> String {
         "\(n) shows the symbols already made for this set, side by side. This symbol joins them: the same rendering, light and quality of finish, with a subject, outline and colour clearly its own. Nothing in it is copied from them."
     }
@@ -11563,8 +11593,8 @@ extension GDDAssetPrompts {
             : "Image 1 is the approved concept art for this theme. Take ONLY how it is painted — the technique, lighting, materials and finish. None of its characters, objects, text or scene appears."
         return ([
             "Create a character reference of \(m.name)\(m.kind.isEmpty ? "" : ", the \(m.kind)") of a video slot game themed “\(theme.name)”. It is shown to the artist of every symbol that features \(m.name), so the character has to be clear and complete.",
-            "\(m.name.uppercased()): \(m.look.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))."
-        ] + (artLine.map { [$0] } ?? []) + [
+        ] + (m.inArt && art ? [] : ["\(m.name.uppercased()): \(m.look.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))."])
+          + (artLine.map { [$0] } ?? []) + [
             "Full figure, head to toe, standing in a relaxed three-quarter pose facing the viewer, arms slightly away from the body so the costume, hands and any props are all visible. Even, clear light; the face sharp and expressive.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
             backdropLine(backing),
@@ -11612,7 +11642,7 @@ extension GDDAssetPrompts {
             let f = j.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
             if !f.isEmpty { line += " Finish: \(f)." }
             if role != .lowPay {
-                line += j.hasFrame ? " In a frame that gives it \(outlinePhrase(j.shape))." : " No frame: it stands on its own silhouette, \(outlinePhrase(j.shape))."
+                line += j.hasFrame ? " In a frame that gives it \(outlinePhrase(j.shape))." : " No frame: it stands on its own silhouette, \(outlinePhrase(j.shape)).\(wholeFigure(j))"
             }
             return line
         }.joined(separator: "\n")
@@ -11632,7 +11662,7 @@ extension GDDAssetPrompts {
             parts.append(shared + "They are the \(plural), ranked in the order given, each a different subject with its own colour — the finish of each makes the ranking obvious side by side.\(oneFrame ? " The framed ones share one frame construction around their different subjects." : "")")
         }
         parts.append("LAYOUT: \(layout.rows.count == 1 ? "the symbols in one straight row across the image, evenly spaced, centred vertically" : "an even grid, each symbol centred in its own cell") — all the same size, each as large as the spacing allows. A clear gap of plain background between neighbours\(layout.rows.count > 1 ? ", across and down," : "") and around every edge: no symbol touches another or the edge of the image, and nothing joins them — no shared base, frame, shadow or glow. \(group.contains(where: \.hasFrame) ? "Apart from a symbol's own frame, nothing is behind any of them" : "Each stands directly on the background, with nothing behind it") — no card, tile, panel or box.")
-        parts.append("Each symbol has one clear focal point, bold shapes and strong light-and-dark contrast, so it reads at reel size.")
+        parts.append("Each symbol faces the viewer straight on, upright and level — none tilted, turned or seen at an angle — with one clear focal point, bold shapes and strong light-and-dark contrast, so it reads at reel size.")
         parts.append(backdropLine(backing, several: true))
         parts.append(royal
             ? "The only lettering is the ranks themselves, one per symbol. No other letters, numbers or labels, no watermark, no user interface."
@@ -11698,19 +11728,22 @@ extension GDDAssetPrompts {
         let form = job.silhouette.isEmpty ? "" : " — \(job.silhouette)"
         let frame = job.hasFrame
             ? " It sits in a frame drawn as part of the same painting and lit with it, and the frame gives it \(outline)."
-            : " No frame: it stands on its own silhouette, \(outline)\(form)."
+            : " No frame: it stands on its own silhouette, \(outline)\(form).\(wholeFigure(job))"
         return ([
             "Create one reel symbol for \(game).\(first)",
             "THE SYMBOL: \(what). \(roleLine(job, jobs: jobs, design: design))\(hue)\(frame)",
         ] + refs + [
             "THE LOOK OF THIS SET: \(look)",
-            "FOR THE REELS: centred, filling most of the square with a small even margin; one clear focal point, bold shapes and strong light-and-dark contrast, so it reads at reel size, where a player recognises it at a glance.",
+            "FOR THE REELS: facing the viewer straight on, upright and level — not tilted, turned or seen at an angle — centred, filling most of the square with a small even margin; one clear focal point, bold shapes and strong light-and-dark contrast, so it reads at reel size, where a player recognises it at a glance.",
             backdropLine(backing),
             bans(job),
         ]).joined(separator: "\n\n")
     }
 
     // MARK: The second design step: one symbol's full prompt
+
+    /// What a brief is told about a character who is the figure in the theme's reference art.
+    static let inArtLook = "the figure in the theme's concept art, which the image model is shown. Take her or his appearance from that art: describe the pose, expression, gesture and what they hold, and never the hair, eye or skin colour, which come from the art."
 
     /// The most slots a design is asked for at HIGH thinking; bigger sets run past the service's
     /// time limit at it (see planCall).
@@ -11751,9 +11784,11 @@ extension GDDAssetPrompts {
                                    gddText: String = "", onSheet: Bool = false) -> String {
         let symbols = jobs.filter { !$0.subject.isEmpty && ($0.kind == .symbol || $0.id == job.id) }
         let setList = symbols.map { setLine($0, this: $0.id == job.id) }.joined(separator: "\n")
+        // The planner writes a look without seeing the art, so for the figure IN the art the art
+        // decides: it gave Astraea silver-white hair where the hub art shows her dark-haired.
         let cast = design.cast.isEmpty
             ? "This game has no characters: every symbol is an object, creature or emblem."
-            : design.cast.map { "- \($0.name) (\($0.kind)): \($0.look)" }.joined(separator: "\n")
+            : design.cast.map { "- \($0.name) (\($0.kind)): \($0.inArt ? Self.inArtLook : $0.look)" }.joined(separator: "\n")
         let doc = GDDFeatureContext.mentions(of: job.id, in: gddText)
         let who = design.member(job.cast)
         var facts: [String] = ["Subject: \(job.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))."]
@@ -11762,8 +11797,8 @@ extension GDDAssetPrompts {
             if !role.isEmpty { facts.append(role) }
             if !job.hue.isEmpty { facts.append("Dominant colour: \(job.hue).") }
             facts.append(job.hasFrame ? "It sits in a frame, and the frame gives it \(outlinePhrase(job.shape))."
-                                      : "No frame: it stands on its own silhouette, \(outlinePhrase(job.shape)).")
-            if let w = who { facts.append("It shows \(w.name): \(w.look)") }
+                                      : "No frame: it stands on its own silhouette, \(outlinePhrase(job.shape)).\(wholeFigure(job))")
+            if let w = who { facts.append("It shows \(w.name): \(w.inArt ? Self.inArtLook : w.look)") }
         }
         let words = job.kind == .background ? "100 to 160" : onSheet ? "50 to 90" : "80 to 150"
         let task: String
@@ -11788,8 +11823,11 @@ extension GDDAssetPrompts {
             1. What it is and what it is doing: for a character, the pose, gesture, expression and \
             what they hold; for an object, its most striking angle and state — open, lit, mid-motion. \
             For a symbol with a job in the game, how its design shows that job at a glance.
-            2. The camera and composition in its square: the angle (three-quarter, low hero angle, \
-            straight on…), how it fills the space\(job.hasFrame ? ", and whether part of it overlaps or breaks out of its frame" : "").
+            2. The composition in its square. Every symbol faces the viewer straight on, upright and \
+            level, like the rest of the reel: a coin, medallion, shield, crest or letter is seen face-on, \
+            never tilted, turned or seen edge-on, and its depth comes from light and bevels, not from \
+            turning it. A character may turn their head or body within the pose, but the symbol as a \
+            whole sits straight. Then how it fills the space\(job.hasFrame ? ", and whether part of it overlaps or breaks out of its frame" : "").
             3. The one eye-catching detail a player notices first.
             4. Its materials and surfaces and where the light catches them, in this set's rendering.
             5. Its colour and its finish, as planned.
@@ -11823,8 +11861,8 @@ extension GDDAssetPrompts {
         \(task)
 
         The standard to write to — two prompts for a different game, for their level of detail only:
-        - "A weathered pirate captain in a crimson longcoat, leaning out over the lower edge of his frame with one boot planted on it, cutlass raised past its top corner. Low three-quarter hero angle, so he towers; his scarred, gold-toothed grin is lit warm from the upper left and is the first thing you see. Brass buttons and a braided tricorn catch crisp highlights while the velvet coat falls into deep shadow. He is framed by a ship's wheel of dark oak banded in polished gold."
-        - "A powder keg bursting open, its iron hoops snapping outward and a fan of gold doubloons spraying up and to the right. Seen from slightly below and to the side, so the splintered lid points at the viewer. The lit fuse's white-hot spark is the focal point, throwing orange light across the tarred staves. Frameless: the keg's barrel shape and the arc of coins make the outline."
+        - "A weathered pirate captain in a crimson longcoat, leaning out over the lower edge of his frame with one boot planted on it, cutlass raised past its top corner. Facing us straight on, chest out, so he fills the frame; his scarred, gold-toothed grin is lit warm from the upper left and is the first thing you see. Brass buttons and a braided tricorn catch crisp highlights while the velvet coat falls into deep shadow. He is framed by a ship's wheel of dark oak banded in polished gold."
+        - "A powder keg bursting open, its iron hoops snapping outward and a fan of gold doubloons spraying up and to the right. Upright and seen straight on, the splintered lid bursting toward the viewer. The lit fuse's white-hot spark is the focal point, throwing orange light across the tarred staves. Frameless: the keg's barrel shape and the arc of coins make the outline."
 
         Answer with {"brief": "<the prompt>"} and nothing else.
         """
