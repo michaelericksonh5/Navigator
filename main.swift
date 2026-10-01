@@ -2300,27 +2300,15 @@ private func compositeOnColor(_ cg: CGImage, _ color: CGColor) -> CGImage? {
     ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
     return ctx.makeImage()
 }
-private func compositeOnGreen(_ cg: CGImage) -> CGImage? { compositeOnColor(cg, CGColor(red: 0, green: 1, blue: 0, alpha: 1)) }
-
-// After upscaling a green-backed image, key the green (#00FF00) back to
-// transparent. ponytail: threshold chroma key, no edge despill — fine for clean
-// flat art; a fal matting model would give crisper edges if needed.
-private func stripGreen(_ data: Data) -> Data? {
-    guard let cg = loadCGImage(data: data) else { return nil }
-    let w = cg.width, h = cg.height
-    guard w > 0, h > 0, let ptr = calloc(w * h * 4, 1) else { return nil }
-    defer { free(ptr) }
-    guard let ctx = CGContext(data: ptr, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-    let px = ptr.bindMemory(to: UInt8.self, capacity: w * h * 4)
-    var i = 0
-    while i < w * h * 4 {
-        if px[i + 1] > 150, px[i] < 120, px[i + 2] < 120 { px[i] = 0; px[i + 1] = 0; px[i + 2] = 0; px[i + 3] = 0 }
-        i += 4
+/// The backing an upscaler sees behind a cutout: Prep for AI's adaptive pick, the colour
+/// furthest from everything in the art, so a green subject is never upscaled on green.
+func upscaleBacking(_ cg: CGImage, name: String) -> RGB8 {
+    switch KeyColorRules.choose(subject: subjectColours(cg), flatField: nil) {
+    case .extendField(let f): return f
+    case .keyColour(let k, let margin):
+        navLog("upscale backing: \(name) rgb(\(k.r),\(k.g),\(k.b)), ΔE \(String(format: "%.1f", margin)) from the art")
+        return k
     }
-    guard let outCG = ctx.makeImage() else { return nil }
-    return encodePNG(outCG)
 }
 
 // The upscalers return opaque RGB, so a transparent source is upscaled on an opaque
@@ -3185,19 +3173,8 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
             // then rebuilt from the ORIGINAL alpha channel, so no colour ever has to be keyed
             // back out and a collision cannot corrupt the cutout.
             var inputCG = cg
-            var backing = RGB8(0, 255, 0)
-            if transparent {
-                let choice = KeyColorRules.choose(subject: subjectColours(cg), flatField: nil)
-                let c: RGB8
-                switch choice {
-                case .extendField(let f): c = f
-                case .keyColour(let k, let margin):
-                    c = k
-                    navLog("upscale backing: \(src.lastPathComponent) rgb(\(k.r),\(k.g),\(k.b)), ΔE \(String(format: "%.1f", margin)) from the art")
-                }
-                inputCG = compositeOnColor(cg, nsColor(c).cgColor) ?? cg
-                backing = c
-            }
+            let backing = transparent ? upscaleBacking(cg, name: src.lastPathComponent) : RGB8(0, 255, 0)
+            if transparent { inputCG = compositeOnColor(cg, nsColor(backing).cgColor) ?? cg }
             var outData: Data?
             var err: String?
             if option.isLocal {
@@ -4021,10 +3998,13 @@ func upscaleImagesViaVertex(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                 continue
             }
             let transparent = imageHasTransparency(src)
-            var input = src, tmp: URL?
-            if transparent, let cg = loadCGImage(src), let g = compositeOnGreen(cg), let png = encodePNG(g) {
-                let t = FileManager.default.temporaryDirectory.appendingPathComponent("navigator-vupscale-\(UUID().uuidString).png")
-                if (try? png.write(to: t)) != nil { input = t; tmp = t }
+            var input = src, tmp: URL?, backing = RGB8(0, 255, 0)
+            if transparent, let cg = loadCGImage(src) {
+                backing = upscaleBacking(cg, name: src.lastPathComponent)
+                if let g = compositeOnColor(cg, nsColor(backing).cgColor), let png = encodePNG(g) {
+                    let t = FileManager.default.temporaryDirectory.appendingPathComponent("navigator-vupscale-\(UUID().uuidString).png")
+                    if (try? png.write(to: t)) != nil { input = t; tmp = t }
+                }
             }
             defer { if let tmp { try? FileManager.default.removeItem(at: tmp) } }
             // Restyle's request path: pads an odd shape to the nearest ratio the model takes and
@@ -4040,7 +4020,7 @@ func upscaleImagesViaVertex(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             }
             do {
                 if transparent, let data = try? Data(contentsOf: saved),
-                   let rebuilt = recombineUpscaledAlpha(source: src, upscaledOpaque: data, backing: RGB8(0, 255, 0)) {
+                   let rebuilt = recombineUpscaledAlpha(source: src, upscaledOpaque: data, backing: backing) {
                     try rebuilt.write(to: dst)
                     try? FileManager.default.removeItem(at: saved)
                 } else {

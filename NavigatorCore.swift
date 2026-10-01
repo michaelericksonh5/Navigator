@@ -4738,8 +4738,8 @@ enum VertexUpscaleRules {
         + "faces, colours, shapes, outlines, lettering and every detail, in the same place. Only make it "
         + "sharper, with finer, cleaner detail at the higher resolution. Do not add, remove, move, restyle "
         + "or reinterpret anything. "
-        // A transparent source is sent on flat green, and its own matte is put back afterwards.
-        + (transparent ? "Keep the flat green background exactly as it is." : "Keep the background exactly as it is.")
+        // A transparent source is sent on a flat key colour, and its own matte is put back afterwards.
+        + (transparent ? "Keep the flat background colour exactly as it is." : "Keep the background exactly as it is.")
     }
     /// Already about as large as 4K: a redraw would only buy a copy.
     static func isPointless(longEdge: Int) -> Bool { longEdge >= 3600 }

@@ -1713,7 +1713,7 @@ final class VertexUpscaleRulesTests: XCTestCase {
         let t = VertexUpscaleRules.prompt(transparent: true), o = VertexUpscaleRules.prompt(transparent: false)
         XCTAssertTrue(t.contains("Reproduce it exactly"))
         XCTAssertTrue(t.contains("Do not add, remove, move, restyle or reinterpret anything"))
-        XCTAssertTrue(t.hasSuffix("Keep the flat green background exactly as it is."))
+        XCTAssertTrue(t.hasSuffix("Keep the flat background colour exactly as it is."))
         XCTAssertTrue(o.hasSuffix("Keep the background exactly as it is."))
     }
     func testAnImageAlreadyNear4KIsSkipped() {
