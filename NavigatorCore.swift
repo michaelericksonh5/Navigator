@@ -5209,6 +5209,11 @@ public enum LayerizePlanRules {
     /// 2048px symbol at `auto` pays twice for layers that end up at reel size. `auto` is the last resort.
     public static let ladder = ["auto_1.5K", "auto_1.5K", "auto"]
 
+    /// What one planned split costs, for showing BEFORE it runs: three layers and the base at
+    /// 1.5K (fal, per layer) plus the Gemini call that plans it. Repairs, when coverage falls
+    /// short, are extra and are not in this.
+    public static let estimatePerSymbol = 4 * LayerizeRules.costPerLayer + 0.003
+
     /// The Layerize prompt for these elements, back to front.
     public static func prompt(_ elements: [Element]) -> String {
         let subject = elements.first { $0.role == .subject }?.name ?? "symbol"
@@ -5335,10 +5340,9 @@ public enum LayerizePlanRules {
 /// A planned decomposition put together: one layer per role, registered on the symbol's own
 /// canvas, with what Layerize left open filled. Free and local, on straight RGBA8 canvases.
 ///
-/// ByteDance documents filling hidden areas only for the BASE image, so the frame may come back
-/// with a hole where the subject sat. The rim is the master frame every member was painted into
-/// (FrameRules), so the master's own pixels close it exactly. The backing has no such source,
-/// so a gap in it is reported, never painted over.
+/// ByteDance documents filling hidden areas only for the BASE image; measured, Layerize filled the
+/// frame behind the subject on every pay symbol of two sets, and repainting it here did harm. So a
+/// gap is reported, never painted over.
 public enum LayerizeAssembly {
     /// `top` composited over `bottom`, straight alpha.
     public static func over(_ bottom: inout [UInt8], _ top: [UInt8]) {
@@ -5372,23 +5376,6 @@ public enum LayerizeAssembly {
         return x1 < 0 ? nil : (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
     }
 
-    /// The master frame's window: the plain panel around its centre, walked out along both axes
-    /// while the colour stays the panel's. Nil when the centre is not a plain panel.
-    public static func window(_ px: [UInt8], width w: Int, height h: Int, tolerance: Int = 48) -> (x: Int, y: Int, w: Int, h: Int)? {
-        let cx = w / 2, cy = h / 2
-        func at(_ x: Int, _ y: Int) -> (Int, Int, Int) { let i = (y * w + x) * 4; return (Int(px[i]), Int(px[i + 1]), Int(px[i + 2])) }
-        let c = at(cx, cy)
-        func same(_ x: Int, _ y: Int) -> Bool { let p = at(x, y); return max(abs(p.0 - c.0), abs(p.1 - c.1), abs(p.2 - c.2)) <= tolerance }
-        var l = cx, r = cx, t = cy, b = cy
-        while l > 0 && same(l - 1, cy) { l -= 1 }
-        while r < w - 1 && same(r + 1, cy) { r += 1 }
-        while t > 0 && same(cx, t - 1) { t -= 1 }
-        while b < h - 1 && same(cx, b + 1) { b += 1 }
-        let ww = r - l + 1, hh = b - t + 1
-        // A real window is most of the frame, and not the whole image (that is the backdrop).
-        guard ww * 10 >= w * 3, hh * 10 >= h * 3, ww < w, hh < h else { return nil }
-        return (l, t, ww, hh)
-    }
 
     /// The frame's opening: walked out from the centre of the canvas until the frame is met.
     /// Nil when the centre is frame, or the opening is too small to be the window.
@@ -5404,37 +5391,6 @@ public enum LayerizeAssembly {
         let ww = r - l + 1, hh = b - t + 1
         guard ww * 5 >= w, hh * 5 >= h, l > 0, t > 0, r < w - 1, b < h - 1 else { return nil }
         return (l, t, ww, hh)
-    }
-
-    /// The panel's colour: the median of a patch at the window's centre.
-    static func panelColour(_ px: [UInt8], width w: Int, height h: Int) -> RGB8 {
-        var rs: [UInt8] = [], gs: [UInt8] = [], bs: [UInt8] = []
-        let r = max(1, min(w, h) / 20)
-        for y in (h / 2 - r)...(h / 2 + r) { for x in (w / 2 - r)...(w / 2 + r) where x >= 0 && y >= 0 && x < w && y < h {
-            let i = (y * w + x) * 4; rs.append(px[i]); gs.append(px[i + 1]); bs.append(px[i + 2])
-        } }
-        let m = { (a: [UInt8]) in a.sorted()[a.count / 2] }
-        return RGB8(m(rs), m(gs), m(bs))
-    }
-
-    /// Whether a master pixel is panel rather than rim, by colour: a window need not be a
-    /// rectangle — HP1's arched under its filigree, and a rectangle missed the arch.
-    static func isPanel(_ r: UInt8, _ g: UInt8, _ b: UInt8, panel p: RGB8, tolerance: Int = 48) -> Bool {
-        max(abs(Int(r) - Int(p.r)), abs(Int(g) - Int(p.g)), abs(Int(b) - Int(p.b))) <= tolerance
-    }
-
-    /// Copies the registered master's rim into `rim` wherever the rim is missing and the master
-    /// has rim: the part Layerize left open behind the subject. Returns how many pixels it filled.
-    @discardableResult
-    public static func fillRim(_ rim: inout [UInt8], master: [UInt8], rimMask: [Bool]) -> Int {
-        guard rim.count == master.count, rimMask.count * 4 == rim.count else { return 0 }
-        var filled = 0
-        for p in 0..<rimMask.count where rimMask[p] && rim[p * 4 + 3] < 128 {
-            let i = p * 4
-            rim[i] = master[i]; rim[i + 1] = master[i + 1]; rim[i + 2] = master[i + 2]; rim[i + 3] = 255
-            filled += 1
-        }
-        return filled
     }
 }
 
@@ -12309,5 +12265,259 @@ extension GDDAssetPrompts {
 public enum SidebarReorder {
     public static func target(rows: [(path: String, minY: Double, maxY: Double)], y: Double) -> String? {
         rows.first { y >= $0.minY && y < $0.maxY }?.path
+    }
+}
+
+
+// MARK: - A finished set, on disk: reopened, reviewed, revised, handed on
+
+/// What a set folder needs to be reopened, reviewed and handed on without the window that made
+/// it: the game and theme, the design, every symbol's plan, the backing it was drawn on. Written
+/// beside the images as navigator-set.json whenever a batch runs.
+public struct SetManifest: Codable, Equatable {
+    public struct Symbol: Codable, Equatable {
+        public var id: String, kind: String, role: String, tier: Int?, title: String
+        public var subject: String, silhouette: String, hasFrame: Bool, hue: String, shape: String
+        public var variation: String, finish: String, cast: String, job: String, docName: String
+        public var brief: String, briefSubject: String, aspect: String, size: String
+        /// The master frame it is painted into (FrameRules), when it has one.
+        public var frame: String?
+    }
+    public struct Cast: Codable, Equatable { public var name: String, kind: String, look: String, inArt: Bool }
+
+    public static let fileName = "navigator-set.json"
+    public var format = 1
+    public var game: String
+    public var gdd: String
+    public var themeName: String, themeCategory: String, themeLook: String, themeStyle: String
+    public var backingName: String
+    public var backing: [Int]
+    public var model: String
+    public var hero: String, anchorID: String, look: String
+    public var families: [String: String]
+    public var cast: [Cast]
+    public var symbols: [Symbol]
+
+    init(game: String, gdd: String, theme: GameTheme, design: SetDesign, jobs: [AssetJob],
+                backing: (name: String, rgb: RGB8), model: String) {
+        self.game = game; self.gdd = gdd
+        themeName = theme.name; themeCategory = theme.category; themeLook = theme.look; themeStyle = theme.styleFromArt
+        backingName = backing.name; self.backing = [Int(backing.rgb.r), Int(backing.rgb.g), Int(backing.rgb.b)]
+        self.model = model
+        hero = design.hero; anchorID = design.anchorID; look = design.look; families = design.families
+        cast = design.cast.map { Cast(name: $0.name, kind: $0.kind, look: $0.look, inArt: $0.inArt) }
+        let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol })
+        symbols = jobs.filter { !$0.subject.isEmpty }.map { j in
+            Symbol(id: j.id, kind: j.kind.rawValue, role: j.role.rawValue, tier: j.tier, title: j.title,
+                   subject: j.subject, silhouette: j.silhouette, hasFrame: j.hasFrame, hue: j.hue, shape: j.shape,
+                   variation: j.variation, finish: j.finish, cast: j.cast, job: j.job, docName: j.docName,
+                   brief: j.brief, briefSubject: j.briefSubject, aspect: j.aspect, size: j.size, frame: frameOf[j.id])
+        }
+    }
+
+    var backingRGB: RGB8 {
+        backing.count == 3 ? RGB8(UInt8(clamping: backing[0]), UInt8(clamping: backing[1]), UInt8(clamping: backing[2])) : RGB8(0, 177, 64)
+    }
+    public func jobs() -> [AssetJob] {
+        symbols.map { s in
+            var j = AssetJob(id: s.id, kind: AssetJob.Kind(rawValue: s.kind) ?? .symbol, role: SlotSymbolRole(rawValue: s.role) ?? .unknown,
+                             tier: s.tier, title: s.title, subject: s.subject, silhouette: s.silhouette,
+                             aspect: s.aspect, size: s.size, hasFrame: s.hasFrame)
+            j.hue = s.hue; j.shape = s.shape; j.variation = s.variation; j.finish = s.finish; j.cast = s.cast
+            j.job = s.job; j.docName = s.docName; j.brief = s.brief; j.briefSubject = s.briefSubject
+            return j
+        }
+    }
+    public func design() -> SetDesign {
+        SetDesign(hero: hero, anchorID: anchorID, look: look, families: families,
+                  cast: cast.map { CastMember(name: $0.name, kind: $0.kind, look: $0.look, inArt: $0.inArt) })
+    }
+    public func encoded() -> Data? {
+        let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return try? e.encode(self)
+    }
+    public static func decode(_ data: Data) -> SetManifest? { try? JSONDecoder().decode(SetManifest.self, from: data) }
+}
+
+/// How a change asked for in review is made.
+public enum ReviewMode: String, Codable, CaseIterable, Sendable {
+    /// An edit of the current image: only what was asked changes. Gemini's documented edit mode,
+    /// the same one family members are drawn with.
+    case edit
+    /// A fresh draw from the symbol's plan with the change added to its description.
+    case redraw
+}
+
+/// A set's review: which images are approved, the change queued on each, and every version it has
+/// had. Kept beside the images as review.json, so a review survives closing the window.
+public struct SetReview: Codable, Equatable {
+    public struct Version: Codable, Equatable {
+        /// Where the earlier image was moved: versions/<id>.v<n>.png.
+        public var file: String
+        public var change: String
+        public var mode: String
+        public var cost: Double
+        public var at: Date
+    }
+    public struct Entry: Codable, Equatable {
+        public var approved = false
+        public var pending = ""
+        public var mode = ReviewMode.edit.rawValue
+        public var versions: [Version] = []
+    }
+    public static let fileName = "review.json"
+    public var entries: [String: Entry] = [:]
+    public init() {}
+
+    public func entry(_ id: String) -> Entry { entries[id] ?? Entry() }
+    public mutating func queue(_ id: String, change: String, mode: ReviewMode) {
+        var e = entry(id); e.pending = change.trimmingCharacters(in: .whitespacesAndNewlines); e.mode = mode.rawValue
+        if !e.pending.isEmpty { e.approved = false }
+        entries[id] = e
+    }
+    public mutating func setApproved(_ id: String, _ on: Bool) { var e = entry(id); e.approved = on; entries[id] = e }
+    /// A revision landed: the image it replaced is kept as `file`, and the change is no longer pending.
+    public mutating func record(_ id: String, replaced file: String, change: String, mode: ReviewMode, cost: Double, at: Date = Date()) {
+        var e = entry(id)
+        e.versions.append(Version(file: file, change: change, mode: mode.rawValue, cost: cost, at: at))
+        e.pending = ""
+        entries[id] = e
+    }
+    /// The next free archive name for an id's current image.
+    public func archiveName(_ id: String) -> String { "versions/\(id).v\(entry(id).versions.count + 1).png" }
+    /// Where a version's cut-out and split are kept: made from that image, they are wrong for any other.
+    public static func derivedFolder(_ archive: String) -> String {
+        (archive.hasSuffix(".png") ? String(archive.dropLast(4)) : archive) + "-cut"
+    }
+    /// The files made FROM an image — its cut-out, every split of it, the PSDs built from those —
+    /// by name, in a folder listing. All start "<id>_rmbg".
+    public static func isDerived(_ name: String, of id: String) -> Bool {
+        name.hasPrefix("\(id)_rmbg")
+    }
+    public func queued(in ids: [String]) -> [String] { ids.filter { !entry($0).pending.isEmpty } }
+    public func approvedCount(in ids: [String]) -> Int { ids.filter { entry($0).approved }.count }
+    /// Everything spent revising this set, across sessions.
+    public var revisionCost: Double { entries.values.flatMap(\.versions).reduce(0) { $0 + $1.cost } }
+
+    public func encoded() -> Data? {
+        let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys]; e.dateEncodingStrategy = .iso8601
+        return try? e.encode(self)
+    }
+    public static func decode(_ data: Data) -> SetReview? {
+        let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601
+        return try? d.decode(SetReview.self, from: data)
+    }
+}
+
+/// The order a set is reviewed in: every symbol type together, in the studio's usual order, the
+/// frames first because the pay symbols are drawn into them, the backgrounds last.
+public enum ReviewOrder {
+    public static let families = ["HP", "MP", "LP", "WD", "SF", "SC", "BO", "JP", "WY", "WYS", "BWY", "MU", "R"]
+    static let names: [String: String] = ["HP": "High pay", "MP": "Medium pay", "LP": "Low pay", "WD": "Wild",
+                                          "SF": "Special feature", "SC": "Scatter", "BO": "Bonus", "JP": "Jackpot",
+                                          "WY": "Value", "WYS": "Value", "BWY": "Bonus value", "MU": "Multiplier", "R": "Mystery"]
+
+    /// "HP" for HP12, "Frames" for a master frame, "Backgrounds" for a scene.
+    public static func family(_ id: String) -> String {
+        if FrameRules.parse(id) != nil { return "Frames" }
+        if id.hasPrefix("bg_") { return "Backgrounds" }
+        return String(id.prefix { $0.isLetter }).uppercased()
+    }
+    public static func title(_ family: String) -> String {
+        names[family].map { "\(family) · \($0)" } ?? family
+    }
+    /// Groups in review order; within one, by number (HP2 before HP10).
+    public static func groups(_ ids: [String]) -> [(family: String, ids: [String])] {
+        var by: [String: [String]] = [:]
+        for id in ids { by[family(id), default: []].append(id) }
+        func num(_ id: String) -> Int { Int(id.drop { !$0.isNumber }.prefix { $0.isNumber }) ?? 0 }
+        let rest = by.keys.filter { !families.contains($0) && $0 != "Frames" && $0 != "Backgrounds" }.sorted()
+        return (["Frames"] + families + rest + ["Backgrounds"]).compactMap { f in
+            by[f].map { (f, $0.sorted { (num($0), $0) < (num($1), $1) }) }
+        }
+    }
+    /// The ids flattened in that order, for stepping left and right.
+    public static func sequence(_ ids: [String]) -> [String] { groups(ids).flatMap(\.ids) }
+}
+
+extension GDDAssetPrompts {
+    /// A change asked for in review, made as an edit of the image as it is.
+    static func reviseBrief(job: AssetJob, change: String, theme: GameTheme, backing: (name: String, rgb: RGB8),
+                            isFrame: Bool = false) -> String {
+        let framed = job.hasFrame && FrameRules.sharedTiers.contains(job.role)
+        let keep = isFrame
+            ? "Keep everything else exactly as it is — its outline, size, position and window — and keep it EMPTY: nothing is drawn inside the window but its plain panel."
+            : "Keep everything else exactly as it is — the subject, its pose, colours, light, size and position"
+              + (framed ? ", and its frame exactly: the same construction, material, outline, size and position" : "")
+              + " — unless the change itself needs it to move."
+        let what = isFrame ? "the empty frame every \(job.role == .highPay ? "high" : "medium")-pay symbol is painted into" : displayName(job)
+        return [
+            "Edit the attached image: it is \(what) of a video slot game themed “\(theme.name)”. Change only this: \(change.trimmingCharacters(in: .whitespacesAndNewlines))",
+            keep,
+            backdropLine(backing),
+            bans(job),
+        ].joined(separator: "\n\n")
+    }
+}
+
+
+// MARK: - Handing a set on to the Spine generator
+
+/// The layer kit the Spine generator reads (Claude_Spine_Generator_Progressive,
+/// scripts/layerize_to_layer_kit.py): layers/<CODE>_<role>.png, each cropped to its alpha with
+/// its bounds on the document, and h5g_layer_manifest.json. Names follow its naming contract
+/// (references/layer_naming_contract.md): `_backing` reads as the static background, `_frame` as
+/// the frame, `_body` as the symbol itself; "Frame backing" with a space, or `_frame_bg`, read as
+/// unknown, which is why the roles are renamed here rather than passed through.
+public enum SpineKitRules {
+    public static let schema = "h5g_photoshop_layer_manifest_v1"
+    /// The working document height the generator's docs recommend (178–256 px symbol docs).
+    public static let workingHeight = 256
+
+    public static func layerName(_ id: String, role: LayerizePlanRules.Role) -> String {
+        "\(id)_\(role == .backing ? "backing" : role == .frame ? "frame" : "body")"
+    }
+    /// The role of an assembled Navigator layer, from the name it was written under.
+    public static func role(ofAssembledName n: String) -> LayerizePlanRules.Role {
+        let l = n.lowercased()
+        if l == "frame backing" || l.hasSuffix("backing") { return .backing }
+        if l == "frame" { return .frame }
+        return .subject
+    }
+    /// The generator's family for a symbol code (scripts/classify_family.py).
+    public static func family(_ id: String) -> String {
+        switch ReviewOrder.family(id) {
+        case "HP": return "hp_symbol"
+        case "MP": return "mp_symbol"
+        case "LP": return "lp_symbol"
+        case "WD": return "wild_symbol"
+        case "SC": return "scatter_symbol"
+        case "SF": return "special_feature_symbol"
+        case "JP": return "jackpot_symbol"
+        case "WY", "WYS", "BWY": return "value_symbol"
+        case "BO": return "bonus_symbol"
+        default: return "symbol"
+        }
+    }
+
+    public struct Bounds: Equatable { public let left: Int, top: Int, right: Int, bottom: Int }
+
+    /// One manifest row, in the field order and form the generator writes.
+    public static func layerEntry(index: Int, name: String, bounds b: Bounds, z: Int, source: [String: Any]) -> [String: Any] {
+        ["index": index, "name": name, "safe_name": name, "file": "layers/\(name).png",
+         "layer_kind": "LayerKind.NORMAL", "visible": true, "opacity": 100, "blend_mode": "BlendMode.NORMAL",
+         "bounds": ["left": b.left, "top": b.top, "right": b.right, "bottom": b.bottom,
+                    "width": b.right - b.left, "height": b.bottom - b.top,
+                    "center_x": Double(b.left + b.right) / 2, "center_y": Double(b.top + b.bottom) / 2],
+         "z": z, "source": source]
+    }
+    public static func manifest(id: String, width: Int, height: Int, layers: [[String: Any]], provenance: String) -> [String: Any] {
+        ["schema": schema, "source_psd": NSNull(), "provenance": provenance,
+         "document": ["name": "\(id)_navigator", "width": width, "height": height, "resolution": 72, "mode": "DocumentMode.RGB"],
+         "layer_count": layers.count, "layers": layers]
+    }
+    /// The working document for a source canvas: `workingHeight` tall, the width in proportion.
+    public static func workingSize(width w: Int, height h: Int) -> (w: Int, h: Int) {
+        (Int((Double(w) * Double(workingHeight) / Double(max(h, 1))).rounded()), workingHeight)
     }
 }

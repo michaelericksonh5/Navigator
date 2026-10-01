@@ -2795,16 +2795,12 @@ private func borderTransparentFraction(_ url: URL) -> (border: Double, overall: 
 struct LayerizePlan {
     let elements: [LayerizePlanRules.Element]
     let prompt: String
-    /// The master frame this symbol was painted into (FrameRules), on the backing: what closes the rim.
-    let masterFrame: URL?
-    let backing: RGB8
 }
 
 /// A planned split for one framed symbol, written from the plan and from what a Gemini vision
 /// model sees in the finished image. The vision call costs about a tenth of a cent; without it
 /// the plan's own words and the cut-out's extent are used, so a failure never stops the split.
-func planLayerize(_ cutout: URL, job: AssetJob, frameSpec: String, masterFrame: URL?, backing: RGB8)
-    -> (plan: LayerizePlan, cost: Double) {
+func planLayerize(_ cutout: URL, job: AssetJob, frameSpec: String) -> (plan: LayerizePlan, cost: Double) {
     var extent = [0, 0, 999, 999]
     if let cg = loadCGImage(cutout), let px = ChromaKeyOutputRules.straightRGBA8(cg),
        let e = LayerizeAssembly.extent(px, width: cg.width, height: cg.height) {
@@ -2821,15 +2817,17 @@ func planLayerize(_ cutout: URL, job: AssetJob, frameSpec: String, masterFrame: 
     let name = [job.docName, job.silhouette].first { !$0.isEmpty } ?? "symbol"
     let elements = LayerizePlanRules.elements(vision: vision, planSubject: job.subject, planFrame: frameSpec, fallbackName: name,
                                               extent: extent, backingPlanned: FrameRules.sharedTiers.contains(job.role))
-    return (LayerizePlan(elements: elements, prompt: LayerizePlanRules.prompt(elements),
-                         masterFrame: masterFrame.flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil },
-                         backing: backing), cost)
+    return (LayerizePlan(elements: elements, prompt: LayerizePlanRules.prompt(elements)), cost)
 }
 
 /// One layer per role from a planned decomposition, on the symbol's own canvas: the pieces of a
-/// role merged (an unnamed frame has come back as four rails), the backing and the rim closed
-/// where the subject covered them (LayerizeAssembly), each named by its role so a tier's files
-/// line up. Full-canvas layers, so the PSD and Spine place them without guessing.
+/// role merged (an unnamed frame has come back as four rails), each named by its role so a tier's
+/// files line up. Full-canvas layers, so the PSD and Spine place them without guessing.
+///
+/// Nothing is repainted. Filling the rim from the master frame was tried and measured: on all five
+/// symbols of the 4400 set, Layerize's own frame was complete and the fill only pasted the master's
+/// panel edge into it; the backing fill smeared a radiant panel. A gap behind the subject is
+/// reported in the log instead.
 ///
 /// Every layer is held inside the symbol's own silhouette (`source`, the cut-out): what the subject
 /// hides is inside it by definition, so nothing real is lost, and nothing pasted can stick out.
@@ -2857,26 +2855,6 @@ func assemblePlannedLayers(_ set: [(layer: LayerizeLayer, data: Data)], plan: La
         if layers[role] == nil { layers[role] = px }
         else { LayerizeAssembly.over(&layers[role]!, px); notes.append("merged “\(l.name ?? "unnamed")” into the \(role.rawValue)") }
     }
-    // The master frame placed over the frame Layerize returned: where its rim is, and its window.
-    let cutMaster = plan.masterFrame.map { $0.deletingLastPathComponent().appendingPathComponent($0.deletingPathExtension().lastPathComponent + "_rmbg.png") }
-    var placed: (crop: CGImage, cropPx: [UInt8], target: (x: Int, y: Int, w: Int, h: Int), window: (x: Int, y: Int, w: Int, h: Int))?
-    if let f = layers[.frame], let mURL = cutMaster.flatMap({ FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }) ?? plan.masterFrame,
-       let master = loadCGImage(mURL),
-       let box = (ChromaKeyOutputRules.straightRGBA8(master).flatMap { LayerizeAssembly.extent($0, width: master.width, height: master.height) }
-                    .map { e -> CGRect? in e.w * 10 < master.width * 9 || e.h * 10 < master.height * 9 ? CGRect(x: e.x, y: e.y, width: e.w, height: e.h) : nil } ?? nil)
-                  ?? SymbolSheet.boxes(master, backing: plan.backing, rows: [1])?.boxes.first,
-       let crop = master.cropping(to: box.integral), let cropPx = ChromaKeyOutputRules.straightRGBA8(crop),
-       let target = LayerizeAssembly.extent(f, width: W, height: H),
-       let win = LayerizeAssembly.window(cropPx, width: crop.width, height: crop.height) {
-        let aspect = (Double(target.w) / Double(target.h)) / (box.width / box.height)
-        if abs(aspect - 1) <= 0.06 {
-            let sx = Double(target.w) / Double(crop.width), sy = Double(target.h) / Double(crop.height)
-            placed = (crop, cropPx, target, (target.x + Int(Double(win.x) * sx), target.y + Int(Double(win.y) * sy),
-                                             Int(Double(win.w) * sx), Int(Double(win.h) * sy)))
-        } else {
-            notes.append(String(format: "rim not closed: its shape is %.0f%% off the master frame's", abs(aspect - 1) * 100))
-        }
-    }
     // The backing is NOT repainted here. ByteDance documents filling hidden areas only for the
     // base image; spreading the panel's own colours inward was tried and smeared a radiant panel
     // into mud. Where Layerize left the window empty behind the subject it is reported instead,
@@ -2890,26 +2868,6 @@ func assemblePlannedLayers(_ set: [(layer: LayerizeLayer, data: Data)], plan: La
         } }
         let share = Double(gap) / Double(max(1, win.w * win.h))
         if share > 0.02 { notes.append(String(format: "backing left open behind the subject over %.0f%% of the window", share * 100)) }
-    }
-    // The rim, closed from the placed master wherever the subject covered it.
-    if var f = layers[.frame], let sub = layers[.subject], let p = placed,
-       let reg = canvas(p.crop, in: CGRect(x: p.target.x, y: p.target.y, width: p.target.w, height: p.target.h)) {
-        let panel = LayerizeAssembly.panelColour(p.cropPx, width: p.crop.width, height: p.crop.height)
-        let k = plan.backing
-        var mask = [Bool](repeating: false, count: W * H)
-        for y in p.target.y..<min(H, p.target.y + p.target.h) {
-            for x in p.target.x..<min(W, p.target.x + p.target.w) {
-                let i = (y * W + x) * 4
-                let inWindow = x > p.window.x + 2 && x < p.window.x + p.window.w - 2 && y > p.window.y + 2 && y < p.window.y + p.window.h - 2
-                let d = abs(Int(reg[i]) - Int(k.r)) + abs(Int(reg[i + 1]) - Int(k.g)) + abs(Int(reg[i + 2]) - Int(k.b))
-                // Only the rim the subject covered: anything else missing is a coverage gap, not a hole.
-                mask[y * W + x] = !inWindow && reg[i + 3] > 200 && d > 90 && sub[i + 3] >= 128
-                    && !LayerizeAssembly.isPanel(reg[i], reg[i + 1], reg[i + 2], panel: panel)
-            }
-        }
-        let n = LayerizeAssembly.fillRim(&f, master: reg, rimMask: mask)
-        layers[.frame] = f
-        if n > 0 { notes.append("rim closed from the master frame (\(n) px)") }
     }
     if let srcPx = canvas(source, in: CGRect(x: 0, y: 0, width: W, height: H)) {
         var clipped = 0
@@ -3211,6 +3169,10 @@ func layerizeImages(_ srcs: [URL], plans: [URL: LayerizePlan] = [:], onDone: (([
                 }
                 if let j = try? JSONSerialization.data(withJSONObject: rawMeta, options: [.prettyPrinted]) {
                     try? j.write(to: raw.appendingPathComponent("_layers.json"))
+                }
+                let planRows = planned.elements.map { ["role": $0.role.rawValue, "name": $0.name, "description": $0.description, "box": $0.box] as [String: Any] }
+                if let j = try? JSONSerialization.data(withJSONObject: ["prompt": planned.prompt, "elements": planRows], options: [.prettyPrinted]) {
+                    try? j.write(to: raw.appendingPathComponent("_plan.json"))
                 }
                 let a = assemblePlannedLayers(chosen, plan: planned, source: cg, width: cg.width, height: cg.height, stem: stem)
                 files = a.files
@@ -18948,6 +18910,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let gddItem = aiMenu.addItem(withTitle: "GDD to Assets…",
                                      action: #selector(gddToAssetsAction(_:)), keyEquivalent: "")
         gddItem.target = self
+        let reviewItem = aiMenu.addItem(withTitle: "Review & Revise a Set…",
+                                        action: #selector(reviewSetAction(_:)), keyEquivalent: "")
+        reviewItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
         let keysItem = aiMenu.addItem(withTitle: "API Keys…", action: #selector(apiKeysAction(_:)), keyEquivalent: "")
         keysItem.target = self
@@ -18978,6 +18943,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     // hub, and generate the game's whole symbol set and backgrounds.
     @objc func gddToAssetsAction(_ sender: Any?) {
         Task { @MainActor in GDDToAssetsWindow.open() }
+    }
+
+    // AI → Review & Revise a Set… — reopen any set folder GDD to Assets made (it carries
+    // navigator-set.json) for the second pass, after the window that made it is closed.
+    @objc func reviewSetAction(_ sender: Any?) {
+        Task { @MainActor in
+            let p = NSOpenPanel()
+            p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
+            p.message = "Choose a set folder made by GDD to Assets"
+            guard p.runModal() == .OK, let folder = p.url else { return }
+            guard let run = GDDToAssetsRun.reopen(folder) else {
+                reportFileError("Not a GDD to Assets set", "“\(folder.lastPathComponent)” has no \(SetManifest.fileName). Sets made from 2.16.16 on carry one.")
+                return
+            }
+            GDDReviewWindow.open(run: run, folder: folder)
+        }
     }
 
     // AI → API Keys… — paste/store the fal.ai key (Keychain-backed).
@@ -21261,7 +21242,11 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
                         // image in the folder it is drawn first, with the rest of its sheet.
                         if !FileManager.default.fileExists(atPath: out.appendingPathComponent(a.filename).path) { ids.formUnion(run.anchorGroupIDs) }
                         try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-                        print("DRAWING: \(ids.sorted().joined(separator: ", ")) into \(out.path) — estimate $\(String(format: "%.2f", run.estimate(for: ids)))")
+                        let split = args.contains("--cut") || args.contains("--cut-only") ? run.layerizeEstimate(for: ids) : (symbols: 0, cost: 0)
+                        print("DRAWING: \(ids.sorted().joined(separator: ", ")) into \(out.path) — estimate $\(String(format: "%.2f", run.estimate(for: ids)))"
+                              + (split.symbols > 0 ? String(format: " + ~$%.2f Layerize for %d framed", split.cost, split.symbols) : ""))
+                        // --write-manifest: draw nothing; make --out self-describing (navigator-set.json) and stop.
+                        if args.contains("--write-manifest") { run.writeManifest(to: out); print("MANIFEST: \(out.appendingPathComponent(SetManifest.fileName).path)"); exit(0) }
                         // --cut-only: draw nothing; cut and split the listed symbols already in --out (and its frames).
                         if args.contains("--cut-only") {
                             let fm = FileManager.default
@@ -21330,7 +21315,117 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
     app.run()
 }
 
-// Free:  Navigator --assemble-layers <name_Layers folder> <W> <H> [subject name] [master frame png] [source cut-out png]
+
+// PAID, one image (~$0.10):  Navigator --revise <set folder> <id> <edit|redraw> "<change>"
+// One review change made headless, exactly as the Review & revise window makes it.
+if let flag = CommandLine.arguments.firstIndex(of: "--revise"), flag + 4 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1]), id = args[flag + 2]
+    let mode = ReviewMode(rawValue: args[flag + 3]) ?? .edit, change = args[flag + 4]
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        print(String(format: "REVISING: %@ (%@) — estimate $%.2f", id, mode.rawValue, run.revisionEstimate(id)))
+        run.revise(id, change: change, mode: mode, folder: folder) { err in
+            MainActor.assumeIsolated {
+                print(err.map { "FAILED: \($0)" } ?? "DONE: \(run.status)")
+                print("VERSIONS: \(run.review.entry(id).versions.map(\.file))")
+                print(String(format: "SPENT: $%.4f", run.spent))
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(err == nil ? 0 : 1) }
+        }
+    } }
+    app.run()
+}
+
+// Free:  Navigator --restore <set folder> <id> <versions/ID.vN.png>
+if let flag = CommandLine.arguments.firstIndex(of: "--restore"), flag + 3 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        run.restore(args[flag + 2], version: args[flag + 3], folder: folder)
+        print("RESTORED: \(args[flag + 3]) · versions now \(run.review.entry(args[flag + 2]).versions.map(\.file))")
+        exit(0)
+    } }
+    app.run()
+}
+
+// Free without --layerize, PAID with it:  Navigator --finish <set folder> <id,id,…> [--layerize]
+// The review window's last step: Remove BG (Photoshop) on those symbols and the frames, then the
+// planned split when asked. Waits for both.
+if let flag = CommandLine.arguments.firstIndex(of: "--finish"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        let ids = args[flag + 2].split(separator: ",").map(String.init)
+        run.finishSet(ids, folder: folder, layerize: args.contains("--layerize"))
+        func idle(_ n: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                let busy = MainActor.assumeIsolated { run.keying || run.layering }
+                if busy && n < 600 { idle(n + 1); return }
+                MainActor.assumeIsolated { print("STATUS: \(run.status)") }
+                exit(0)
+            }
+        }
+        idle(0)
+    } }
+    app.run()
+}
+
+// Free:  Navigator --review-snapshot <set folder> <out.png> [image id]
+// The Review & revise window for a set folder, drawn off screen into a PNG — to check the design
+// without opening anything on the display.
+if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1]), out = URL(fileURLWithPath: args[flag + 2])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName) in \(folder.path)"); exit(1) }
+        // Borderless and far off screen: drawn by the window server like any window, seen by no one.
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 1240, height: 860), styleMask: [.borderless],
+                         backing: .buffered, defer: false)
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.contentView = NSHostingView(rootView: GDDReviewView(run: run, folder: folder, startID: flag + 3 < args.count ? args[flag + 3] : nil))
+        w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            guard let v = w.contentView else { print("FAILED: no view"); exit(1) }
+            v.layoutSubtreeIfNeeded(); v.display()
+            // What the window server composited, controls and all; cacheDisplay leaves layer-drawn
+            // controls blank.
+            if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(w.windowNumber), [.boundsIgnoreFraming, .bestResolution]),
+               let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+                try? png.write(to: out)
+            } else if let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                v.cacheDisplay(in: v.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: out)
+            }
+            print("WROTE: \(out.path)"); exit(0)
+        }
+    } }
+    app.run()
+}
+
+// Free:  Navigator --spine-export <set folder> <id,id,…|all>
+// Spine layer kits for those symbols (SpineExport), as the review window's Export for Spine does.
+if let flag = CommandLine.arguments.firstIndex(of: "--spine-export"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName) in \(folder.path)"); exit(1) }
+        let ids = args[flag + 2] == "all" ? run.reviewIDs(folder).filter { FrameRules.parse($0) == nil && !$0.hasPrefix("bg_") }
+                                         : args[flag + 2].split(separator: ",").map(String.init)
+        let r = SpineExport.write(run: run, ids: ids, folder: folder)
+        print("KITS: \(r.kits) → \(r.out.path)" + (r.error.map { "\nNOTE: \($0)" } ?? ""))
+        exit(0)
+    } }
+    app.run()
+}
+
+// Free:  Navigator --assemble-layers <name_Layers/raw folder> <W> <H> [subject name] [source cut-out png]
 // Re-assembles a saved Layerize result by role (assemblePlannedLayers) into <folder>_assembled,
 // with the plan's words standing in for the vision reply — to check the assembly on real output.
 if let flag = CommandLine.arguments.firstIndex(of: "--assemble-layers"), flag + 3 < CommandLine.arguments.count {
@@ -21345,12 +21440,20 @@ if let flag = CommandLine.arguments.firstIndex(of: "--assemble-layers"), flag + 
         set.append((LayerizeLayer(zIndex: m["z_index"] as? Int ?? 0, name: m["name"] as? String, detail: m["description"] as? String,
                                   boundingBox: m["bounding_box"] as? [String: Any], url: "", width: nil), d))
     }
+    // The plan the split was made with, when it was kept (_plan.json); else the subject's name.
+    let saved: [LayerizePlanRules.Element]? = (try? Data(contentsOf: dir.appendingPathComponent("_plan.json")))
+        .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        .flatMap { $0["elements"] as? [[String: Any]] }
+        .map { rows in rows.compactMap { r in
+            guard let role = (r["role"] as? String).flatMap(LayerizePlanRules.Role.init(rawValue:)), let name = r["name"] as? String,
+                  let box = (r["box"] as? [Any])?.compactMap({ ($0 as? NSNumber)?.intValue }), box.count == 4 else { return nil }
+            return LayerizePlanRules.Element(role: role, name: name, description: r["description"] as? String ?? "", box: box)
+        } }
     let subject = flag + 4 < args.count ? args[flag + 4] : "symbol"
-    let master = flag + 5 < args.count ? URL(fileURLWithPath: args[flag + 5]) : nil
-    let elements = LayerizePlanRules.elements(vision: nil, planSubject: subject, planFrame: "", fallbackName: subject,
-                                              extent: [0, 0, 999, 999], backingPlanned: true)
-    let plan = LayerizePlan(elements: elements, prompt: LayerizePlanRules.prompt(elements), masterFrame: master, backing: RGB8(255, 0, 255))
-    guard let source = (flag + 6 < args.count ? loadCGImage(URL(fileURLWithPath: args[flag + 6])) : nil)
+    let elements = saved ?? LayerizePlanRules.elements(vision: nil, planSubject: subject, planFrame: "", fallbackName: subject,
+                                                       extent: [0, 0, 999, 999], backingPlanned: true)
+    let plan = LayerizePlan(elements: elements, prompt: LayerizePlanRules.prompt(elements))
+    guard let source = (flag + 5 < args.count ? loadCGImage(URL(fileURLWithPath: args[flag + 5])) : nil)
             ?? CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue).flatMap({ c -> CGImage? in
                 c.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1)); c.fill(CGRect(x: 0, y: 0, width: W, height: H)); return c.makeImage() })
@@ -23827,6 +23930,10 @@ final class GDDToAssetsRun: ObservableObject {
     /// Shared frames drawn in this batch (FrameRules). Not symbols, so not in `produced`, but
     /// cut out with them: each is an asset of its own.
     var framesMade: [URL] = []
+    /// The second pass over a finished set (GDDReviewView), kept as review.json in its folder.
+    @Published var review = SetReview()
+    /// Bumped whenever an image in the set folder is replaced, so views showing it reload.
+    @Published var imagesVersion = 0
     /// What each finished image actually came back as, e.g. "2048x2048". Shown per
     /// row because the requested size is not a promise — see GeneratedSizeRules.
     @Published var delivered: [String: String] = [:]
@@ -24522,6 +24629,13 @@ final class GDDToAssetsRun: ObservableObject {
 
     var estimate: Double { estimate(for: nil) }
 
+    /// What the automatic frame split will cost on fal.ai for `ids` (nil: all), billed apart from
+    /// Vertex: one planned Layerize call per framed symbol.
+    func layerizeEstimate(for ids: Set<String>?) -> (symbols: Int, cost: Double) {
+        let n = jobs.filter { $0.kind == .symbol && $0.hasFrame && !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }.count
+        return (n, Double(n) * LayerizePlanRules.estimatePerSymbol)
+    }
+
     /// What a batch will cost. `ids` scopes it to a retry.
     func estimate(for ids: Set<String>?) -> Double {
         let planned = jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
@@ -25060,6 +25174,7 @@ final class GDDToAssetsRun: ObservableObject {
         let model = NanoBananaModel.byFlag(self.modelFlag).id
         let batchLog = session()
         let themeArt = themeArtPNG()
+        writeManifest(to: folder)
         // In drawing order: the anchor, then what matches it, then each family's edits.
         let todoIDs = Set(todo.map(\.id))
         let steps = RenderPlan.scoped(RenderPlan.steps(jobs, design, hasThemeArt: themeArt != nil), to: todoIDs)
@@ -25224,7 +25339,7 @@ final class GDDToAssetsRun: ObservableObject {
                 guard !framed.isEmpty else { return }
                 self.layering = true
                 self.status += "  Planning how to split \(framed.count) frames…"
-                let jobs = self.jobs, design = self.design, key = self.backing.rgb
+                let jobs = self.jobs, design = self.design
                 let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol })
                 DispatchQueue.global(qos: .userInitiated).async {
                     var plans: [URL: LayerizePlan] = [:], cost = 0.0
@@ -25236,9 +25351,7 @@ final class GDDToAssetsRun: ObservableObject {
                             [design.families[f.role == .highPay ? "highPayFrame" : "mediumPayFrame"],
                              f.premium ? design.families["hp1Frame"] : nil].compactMap { $0 }.joined(separator: "; ")
                         } ?? ""
-                        let r = planLayerize(url, job: job, frameSpec: spec,
-                                             masterFrame: fid.map { url.deletingLastPathComponent().appendingPathComponent("\($0).png") },
-                                             backing: key)
+                        let r = planLayerize(url, job: job, frameSpec: spec)
                         plans[url] = r.plan; cost += r.cost
                         navLog("layerize plan: \(url.lastPathComponent) — \(r.plan.elements.map { "\($0.name) \($0.box)" }.joined(separator: " · "))")
                     }
@@ -25255,6 +25368,639 @@ final class GDDToAssetsRun: ObservableObject {
                 }
             }
         }
+    }
+}
+
+
+// MARK: - Review and revise: the second pass over a finished set
+
+extension GDDToAssetsRun {
+    /// navigator-set.json in `folder`: what the set needs to be reopened, revised and handed on.
+    func writeManifest(to folder: URL) {
+        guard let theme else { return }
+        let m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: design, jobs: jobs,
+                            backing: (backing.name, backing.rgb), model: modelFlag)
+        if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
+    }
+
+    /// A set folder rebuilt into a run from its manifest, with its review, so it can be revised
+    /// after the window that made it is gone. The theme's art is fetched again from the hub (free)
+    /// for redraws that use it; an edit never needs it.
+    static func reopen(_ folder: URL) -> GDDToAssetsRun? {
+        guard let d = try? Data(contentsOf: folder.appendingPathComponent(SetManifest.fileName)),
+              let m = SetManifest.decode(d) else { return nil }
+        let run = GDDToAssetsRun()
+        var t = GameTheme(name: m.themeName, category: m.themeCategory, look: m.themeLook)
+        t.styleFromArt = m.themeStyle
+        run.theme = t
+        run.gameName = m.gdd
+        run.jobs = m.jobs()
+        run.design = m.design()
+        run.backing = (name: m.backingName, rgb: m.backingRGB)
+        run.modelFlag = m.model
+        run.lastFolder = folder
+        run.loadReview(folder)
+        ThemeHubClient.themes { list, _ in
+            guard let hub = list?.first(where: { $0.name == m.themeName }) else { return }
+            DispatchQueue.main.async {
+                var t2 = hub; t2.styleFromArt = m.themeStyle
+                run.theme = t2
+            }
+        }
+        return run
+    }
+
+    func loadReview(_ folder: URL) {
+        review = (try? Data(contentsOf: folder.appendingPathComponent(SetReview.fileName))).flatMap(SetReview.decode) ?? SetReview()
+    }
+    func saveReview(_ folder: URL) {
+        if let d = review.encoded() { try? d.write(to: folder.appendingPathComponent(SetReview.fileName)) }
+    }
+
+    /// Every image of the set in `folder`, in review order: the master frames, each symbol type
+    /// together, the backgrounds last.
+    func reviewIDs(_ folder: URL) -> [String] {
+        let fm = FileManager.default
+        let frames = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? [])
+            .filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) }.filter { FrameRules.parse($0) != nil }
+        let made = jobs.filter { fm.fileExists(atPath: folder.appendingPathComponent($0.filename).path) }.map(\.id)
+        return ReviewOrder.sequence(made + frames)
+    }
+
+    /// The symbols drawn into a master frame, which a revised frame has to be repainted into.
+    func frameMembers(_ frameID: String, folder: URL) -> [String] {
+        let fm = FileManager.default
+        return FrameRules.assignments(jobs.filter { $0.kind == .symbol })
+            .filter { $0.value == frameID && fm.fileExists(atPath: folder.appendingPathComponent("\($0.key).png").path) }
+            .map(\.key).sorted { ReviewOrder.sequence([$0, $1]).first == $0 }
+    }
+
+    /// What one revision costs: one image at the symbol's size.
+    func revisionEstimate(_ id: String) -> Double {
+        nbEstimatedCost(size: jobs.first { $0.id == id }?.size ?? "2K", modelFlag: modelFlag)
+    }
+
+    /// The job a master frame is revised as.
+    private func frameJob(_ id: String) -> AssetJob? {
+        guard let f = FrameRules.parse(id) else { return nil }
+        return AssetJob(id: id, kind: .symbol, role: f.role, tier: nil, title: "", subject: "the empty frame",
+                        aspect: "1:1", size: jobs.first { $0.kind == .symbol }?.size ?? "2K", hasFrame: true)
+    }
+
+    /// One change asked for in review, made now. The current image is kept under versions/ first,
+    /// then it is EDITED (only what was asked changes — Gemini's edit mode, the image attached) or
+    /// REDRAWN from its plan with the change added to its description, drawn the way the set drew
+    /// it. `done` gets an error, or nil when the new image is in place.
+    func revise(_ id: String, change: String, mode: ReviewMode, folder: URL, done: @escaping (String?) -> Void) {
+        let isFrame = FrameRules.parse(id) != nil
+        guard let job = isFrame ? frameJob(id) : jobs.first(where: { $0.id == id }), let theme else { done("Nothing to revise for \(id)."); return }
+        let src = folder.appendingPathComponent("\(id).png")
+        guard FileManager.default.fileExists(atPath: src.path) else { done("\(id).png is not in the set folder."); return }
+        let archive = review.archiveName(id)
+        let model = NanoBananaModel.byFlag(modelFlag).id
+        let backing = self.backing
+        let before = spent
+        let steps = renderSteps()
+        status = "Revising \(id)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            let kept = folder.appendingPathComponent(archive)
+            try? fm.createDirectory(at: kept.deletingLastPathComponent(), withIntermediateDirectories: true)
+            do { try fm.copyItem(at: src, to: kept) } catch {
+                DispatchQueue.main.async { done("Couldn’t keep the current version: \(error.localizedDescription)") }
+                return
+            }
+            var err: String?
+            let log = DispatchQueue.main.sync { self.session() }
+            if mode == .edit || isFrame {
+                if let png = try? Data(contentsOf: src) {
+                    let prompt = GDDAssetPrompts.reviseBrief(job: job, change: change, theme: theme,
+                                                             backing: (backing.name, backing.rgb), isFrame: isFrame)
+                    log.write("prompts/\(id)-revision-\(archive.split(separator: ".").dropLast().last ?? "").txt", "MODE: review edit\nATTACHED: \(id) (the image being edited)\n\n\(prompt)")
+                    let r = self.sizedRequest(job, prompt: prompt, inputs: [downsamplePNG(png, longEdge: 1536) ?? png], model: model)
+                    DispatchQueue.main.async { self.spent += r.cost }
+                    if let out = r.png { do { try out.write(to: src) } catch { err = error.localizedDescription } }
+                    else { err = r.error ?? "No image came back." }
+                    log.event(["step": "review-edit", "id": id, "change": change, "cost": r.cost, "error": err ?? ""])
+                } else { err = "Couldn’t read \(id).png." }
+            } else {
+                var j = job
+                j.brief = (job.currentBrief ?? job.subject) + "\n\nIn review this change was asked for: \(change)"
+                j.briefSubject = j.subject
+                let step = RenderPlan.scoped(steps, to: [id]).first { $0.id == id }
+                    ?? RenderStep(id: id, mode: .match, refs: [], after: [])
+                DispatchQueue.main.sync { self.failures[id] = nil }
+                self.generateOne(job: j, step: step, themeArt: self.themeArtPNG(), model: model, folder: folder)
+                err = DispatchQueue.main.sync { self.failures[id] }
+                log.event(["step": "review-redraw", "id": id, "change": change, "error": err ?? ""])
+            }
+            DispatchQueue.main.async {
+                if err == nil {
+                    Self.archiveDerived(id, archive: archive, folder: folder)
+                    self.review.record(id, replaced: archive, change: change, mode: isFrame ? .edit : mode, cost: self.spent - before)
+                    self.saveReview(folder)
+                    self.imagesVersion += 1
+                    self.status = String(format: "Revised %@ · $%.2f", id, self.spent - before)
+                } else {
+                    try? fm.removeItem(at: kept)      // nothing changed: the copy is not a version
+                    self.status = "\(id) not revised: \(err!)"
+                }
+                done(err)
+            }
+        }
+    }
+
+    /// Moves what was made from the current image — its cut-out, every split — beside the version it
+    /// is being archived as. Left in place they describe a picture that is no longer there, and the
+    /// Spine export would ship the old layers for the new image.
+    nonisolated static func archiveDerived(_ id: String, archive: String, folder: URL) {
+        let fm = FileManager.default
+        let names = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []).filter { SetReview.isDerived($0, of: id) }
+        guard !names.isEmpty else { return }
+        let dest = folder.appendingPathComponent(SetReview.derivedFolder(archive))
+        try? fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        for n in names { try? fm.moveItem(at: folder.appendingPathComponent(n), to: dest.appendingPathComponent(n)) }
+    }
+
+    /// Puts an earlier version back. The image it replaces is kept as a version too, so nothing is lost.
+    func restore(_ id: String, version file: String, folder: URL) {
+        let fm = FileManager.default
+        let cur = folder.appendingPathComponent("\(id).png"), old = folder.appendingPathComponent(file)
+        guard fm.fileExists(atPath: old.path) else { return }
+        let archive = review.archiveName(id)
+        try? fm.createDirectory(at: folder.appendingPathComponent("versions"), withIntermediateDirectories: true)
+        try? fm.copyItem(at: cur, to: folder.appendingPathComponent(archive))
+        Self.archiveDerived(id, archive: archive, folder: folder)
+        try? fm.removeItem(at: cur)
+        try? fm.copyItem(at: old, to: cur)
+        // The restored picture's own cut-out and split, made from it, come back with it.
+        let kept = folder.appendingPathComponent(SetReview.derivedFolder(file))
+        for n in (try? fm.contentsOfDirectory(atPath: kept.path)) ?? [] {
+            try? fm.copyItem(at: kept.appendingPathComponent(n), to: folder.appendingPathComponent(n))
+        }
+        review.record(id, replaced: archive, change: "Restored \(file)", mode: .edit, cost: 0)
+        saveReview(folder)
+        imagesVersion += 1
+    }
+
+    /// Remove BG, then — when asked — the planned frame split, on the reviewed images.
+    func finishSet(_ ids: [String], folder: URL, layerize: Bool) {
+        let files = ids.map { folder.appendingPathComponent("\($0).png") }.filter { FileManager.default.fileExists(atPath: $0.path) }
+        cutAndSplit(files, removeBackground: true, separateFrames: layerize)
+    }
+}
+
+
+// ===== GDD to Assets: Review & revise =====
+
+/// Filmstrip-size images, decoded once per file version so a revised image shows at once.
+final class ReviewThumbs {
+    static let shared = ReviewThumbs()
+    private var cache: [String: NSImage] = [:]
+    func image(_ url: URL, version: Int, side: Int = 240) -> NSImage? {
+        let key = "\(url.path)#\(version)"
+        if let i = cache[key] { return i }
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                    kCGImageSourceThumbnailMaxPixelSize: side,
+                                                                    kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
+        else { return nil }
+        let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        cache[key] = img
+        return img
+    }
+}
+
+/// The second pass over a finished set. Every image large, stepped through left and right in
+/// review order (frames, then each symbol type together, backgrounds last); a change typed for
+/// any of them, made as an edit of the image or a redraw from its plan, each priced before it
+/// runs and every earlier version kept; approvals; then the backgrounds cut and the frames split
+/// on what was approved, and the set exported for Spine.
+struct GDDReviewView: View {
+    @ObservedObject var run: GDDToAssetsRun
+    let folder: URL
+    var startID: String? = nil
+    @State private var ids: [String] = []
+    @State private var index = 0
+    @State private var draft = ""
+    @State private var mode: ReviewMode = .edit
+    @State private var working: String?
+    @State private var queueRunning = false
+    @State private var layerizeToo = true
+    @FocusState private var editing: Bool
+    @StateObject private var zoom = ZoomController()
+
+    private var current: String? { ids.indices.contains(index) ? ids[index] : nil }
+    private var job: AssetJob? { current.flatMap { id in run.jobs.first { $0.id == id } } }
+    private var symbols: [String] { ids.filter { ReviewOrder.family($0) != "Backgrounds" } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            HStack(spacing: 0) {
+                viewer
+                Divider()
+                ScrollView { sidebar.padding(14) }.frame(width: 350)
+            }
+            Divider()
+            filmstrip
+            Divider()
+            footer
+        }
+        .frame(minWidth: 1100, minHeight: 760)
+        .onAppear { reload() }
+        .onChange(of: index) { _, _ in loadDraft() }
+    }
+
+    // MARK: Pieces
+
+    private var header: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(run.gameName) — \(run.theme?.name ?? "")").font(.headline)
+                Text(folder.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
+            Spacer()
+            Text("\(run.review.approvedCount(in: ids)) of \(ids.count) approved").font(.callout)
+            Text(String(format: "· $%.2f on revisions", run.review.revisionCost)).font(.callout).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+    }
+
+    private var viewer: some View {
+        ZStack {
+            Color(nsColor: .underPageBackgroundColor)
+            if let id = current {
+                ZoomableImageView(url: folder.appendingPathComponent("\(id).png"), controller: zoom)
+                    .id("\(id)#\(run.imagesVersion)")
+                if working == id {
+                    ProgressView("Revising \(id)…").padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                }
+            } else {
+                Text("No images in this set yet.").foregroundStyle(.secondary)
+            }
+            HStack {
+                Button { step(-1) } label: { Image(systemName: "chevron.left").font(.title) }
+                    .keyboardShortcut(editing ? nil : KeyboardShortcut(.leftArrow, modifiers: []))
+                    .disabled(index == 0).buttonStyle(.borderless).padding(12)
+                Spacer()
+                Button { step(1) } label: { Image(systemName: "chevron.right").font(.title) }
+                    .keyboardShortcut(editing ? nil : KeyboardShortcut(.rightArrow, modifiers: []))
+                    .disabled(index >= ids.count - 1).buttonStyle(.borderless).padding(12)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder private var sidebar: some View {
+        if let id = current {
+            let entry = run.review.entry(id)
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(job.map { $0.docName.isEmpty ? id : "\(id) · \($0.docName)" } ?? id).font(.title3).bold()
+                    Text(ReviewOrder.title(ReviewOrder.family(id))).font(.caption).foregroundStyle(.secondary)
+                }
+                if let j = job {
+                    if !j.job.isEmpty { labelled("What it does", j.job) }
+                    labelled("Planned", j.subject)
+                    if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol })[j.id] { labelled("Frame", f) }
+                } else if let f = FrameRules.parse(id) {
+                    labelled("Frame", "The empty frame every \(f.role == .highPay ? "high" : "medium") pay\(f.premium ? " — HP1's richer version" : "") is painted into. Editing it changes this file only: repaint the tier afterwards to use it.")
+                    let members = run.frameMembers(id, folder: folder)
+                    if !members.isEmpty {
+                        Button(String(format: "Repaint its %d symbols — ~$%.2f", members.count,
+                                      members.reduce(0) { $0 + run.revisionEstimate($1) })) {
+                            for m in members { run.review.queue(m, change: "Painted again into the revised frame", mode: .redraw) }
+                            run.saveReview(folder)
+                            apply(members, first: nil)
+                        }
+                        .disabled(working != nil || queueRunning)
+                        .help("\(members.joined(separator: ", ")) are each drawn again into the frame as it is now; every earlier image is kept as a version")
+                    }
+                }
+                if FrameRules.parse(id) == nil, ReviewOrder.family(id) != "Backgrounds",
+                   !FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(id)_rmbg.png").path) {
+                    Text(entry.versions.isEmpty ? "Not cut out yet." : "Revised since it was cut out: remove its background (and split it) again.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                Toggle("Approved", isOn: Binding(get: { run.review.entry(id).approved },
+                                                 set: { run.review.setApproved(id, $0); run.saveReview(folder) }))
+                    .disabled(!entry.pending.isEmpty || working != nil)
+                Divider()
+                Text("What should change?").font(.subheadline).bold()
+                TextEditor(text: $draft)
+                    .font(.body).frame(height: 96).focused($editing)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.35)))
+                Picker("", selection: $mode) {
+                    Text("Edit this image").tag(ReviewMode.edit)
+                    Text("Redraw").tag(ReviewMode.redraw)
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                .disabled(FrameRules.parse(id) != nil)
+                Text(mode == .edit || FrameRules.parse(id) != nil
+                     ? "Only what you describe changes; the rest of the image, and its frame, stay as they are."
+                     : "Drawn again from its plan with your change added, the way the set drew it.")
+                    .font(.caption).foregroundStyle(.secondary)
+                HStack {
+                    Button("Queue") { run.review.queue(id, change: draft, mode: mode); run.saveReview(folder) }
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Spacer()
+                    Button(String(format: "Apply now — ~$%.2f", run.revisionEstimate(id))) { apply([id], first: draft) }
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || working != nil || queueRunning)
+                }
+                if !entry.versions.isEmpty {
+                    Divider()
+                    Text("Earlier versions").font(.subheadline).bold()
+                    ForEach(Array(entry.versions.enumerated().reversed()), id: \.offset) { _, v in
+                        HStack(alignment: .top, spacing: 8) {
+                            if let img = ReviewThumbs.shared.image(folder.appendingPathComponent(v.file), version: 0, side: 120) {
+                                Image(nsImage: img).resizable().scaledToFit().frame(width: 56, height: 56)
+                            }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Replaced by: \(v.change)").font(.caption).lineLimit(3)
+                                Text(String(format: "%@ · $%.2f", v.mode, v.cost)).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Use") { run.restore(id, version: v.file, folder: folder) }.controlSize(.small)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var filmstrip: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 18) {
+                    ForEach(ReviewOrder.groups(ids), id: \.family) { g in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(ReviewOrder.title(g.family)).font(.caption).foregroundStyle(.secondary)
+                            HStack(spacing: 6) { ForEach(g.ids, id: \.self) { thumb($0).id($0) } }
+                        }
+                    }
+                }
+                .padding(.horizontal, 14).padding(.vertical, 8)
+            }
+            .onChange(of: index) { _, _ in if let c = current { withAnimation { proxy.scrollTo(c, anchor: .center) } } }
+        }
+        .frame(height: 138)
+    }
+
+    private func thumb(_ id: String) -> some View {
+        let e = run.review.entry(id)
+        return Button { if let i = ids.firstIndex(of: id) { index = i } } label: {
+            ZStack(alignment: .topTrailing) {
+                Group {
+                    if let img = ReviewThumbs.shared.image(folder.appendingPathComponent("\(id).png"), version: run.imagesVersion) {
+                        Image(nsImage: img).resizable().scaledToFit()
+                    } else { Color.gray.opacity(0.2) }
+                }
+                .frame(width: 84, height: 84)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(id == current ? Color.accentColor : .clear, lineWidth: 3))
+                if e.approved { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).padding(2) }
+                else if !e.pending.isEmpty { Image(systemName: "pencil.circle.fill").foregroundStyle(.orange).padding(2) }
+                if working == id { ProgressView().controlSize(.small).padding(2) }
+            }
+            .overlay(alignment: .bottom) { Text(id).font(.caption2).padding(.horizontal, 3).background(.thinMaterial) }
+        }
+        .buttonStyle(.plain)
+        .help(e.pending.isEmpty ? id : "\(id): \(e.pending)")
+    }
+
+    private var footer: some View {
+        let queued = run.review.queued(in: ids)
+        let cost = queued.reduce(0) { $0 + run.revisionEstimate($1) }
+        let ready = symbols.filter { run.review.entry($0).approved }
+        let split = run.layerizeEstimate(for: Set(ready))
+        return HStack(spacing: 12) {
+            Button(String(format: "Apply %d queued change%@ — ~$%.2f", queued.count, queued.count == 1 ? "" : "s", cost)) { apply(queued, first: nil) }
+                .disabled(queued.isEmpty || working != nil || queueRunning)
+            Text(run.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            Spacer()
+            Toggle("then split frames with Layerize\(split.symbols > 0 ? String(format: " (~$%.2f)", split.cost) : "")", isOn: $layerizeToo)
+                .disabled(ready.isEmpty)
+            Button("Remove backgrounds of \(ready.count) approved") {
+                run.finishSet(ready + ids.filter { FrameRules.parse($0) != nil }, folder: folder, layerize: layerizeToo)
+            }
+            .disabled(ready.isEmpty || run.keying || run.layering)
+            .help("Photoshop cuts each approved symbol and the frames out on their own canvas (free); Layerize, when ticked, then splits each framed symbol into backing, frame and subject on fal.ai")
+            Button("Export for Spine…") { exportForSpine() }
+                .disabled(ready.isEmpty)
+                .help("A layer kit per approved symbol, in the format the Spine generator reads")
+        }
+        .padding(12)
+    }
+
+    private func labelled(_ title: String, _ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: Actions
+
+    private func reload() {
+        ids = run.reviewIDs(folder)
+        if let s = startID, let i = ids.firstIndex(of: s) { index = i }
+        if index >= ids.count { index = max(0, ids.count - 1) }
+        loadDraft()
+    }
+    private func loadDraft() {
+        guard let id = current else { return }
+        let e = run.review.entry(id)
+        draft = e.pending
+        mode = ReviewMode(rawValue: e.mode) ?? .edit
+    }
+    private func step(_ d: Int) { index = max(0, min(ids.count - 1, index + d)) }
+
+    /// Runs the changes one after another; `first`, when given, is the typed change for the first id.
+    private func apply(_ list: [String], first: String?) {
+        guard !list.isEmpty else { return }
+        var todo = list
+        if let first, let id = todo.first { run.review.queue(id, change: first, mode: mode); run.saveReview(folder) }
+        queueRunning = true
+        func next() {
+            guard !todo.isEmpty else { queueRunning = false; working = nil; loadDraft(); return }
+            let id = todo.removeFirst()
+            let e = run.review.entry(id)
+            guard !e.pending.isEmpty else { next(); return }
+            working = id
+            run.revise(id, change: e.pending, mode: ReviewMode(rawValue: e.mode) ?? .edit, folder: folder) { _ in next() }
+        }
+        next()
+    }
+
+    private func exportForSpine() {
+        let ready = symbols.filter { run.review.entry($0).approved && FrameRules.parse($0) == nil }
+        let r = SpineExport.write(run: run, ids: ready, folder: folder)
+        run.status = r.error ?? "Spine kits for \(r.kits) symbols in \(r.out.lastPathComponent)"
+        if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
+    }
+}
+
+enum GDDReviewWindow {
+    private static var windows: [NSWindow] = []
+    @MainActor static func open(run: GDDToAssetsRun, folder: URL) {
+        if run.review == SetReview() { run.loadReview(folder) }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 860),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.title = "Review & revise — \(folder.lastPathComponent)"
+        w.contentView = NSHostingView(rootView: GDDReviewView(run: run, folder: folder))
+        w.center(); w.makeKeyAndOrderFront(nil)
+        windows.append(w)
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak w] _ in
+            windows.removeAll { $0 === w }
+            if let token { NotificationCenter.default.removeObserver(token) }
+        }
+    }
+}
+
+
+// MARK: - Export for Spine
+
+/// A layer kit per approved symbol in the format the Spine generator reads (SpineKitRules), and
+/// the set's context beside them, for whoever builds the animation — Claude or another agent.
+enum SpineExport {
+    /// The newest assembled split of a symbol, by role, at the symbol's own canvas size.
+    static func layers(_ id: String, folder: URL) -> [(role: LayerizePlanRules.Role, image: CGImage)]? {
+        let fm = FileManager.default
+        let dirs = ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix("\(id)_rmbg_Layers") && fm.fileExists(atPath: $0.appendingPathComponent("_layers.json").path) }
+            .sorted { (a, b) in
+                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return da > db
+            }
+        if let dir = dirs.first, let d = try? Data(contentsOf: dir.appendingPathComponent("_layers.json")),
+           let rows = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] {
+            let got = rows.sorted { ($0["z_index"] as? Int ?? 0) < ($1["z_index"] as? Int ?? 0) }.compactMap { r -> (LayerizePlanRules.Role, CGImage)? in
+                guard let f = r["file"] as? String, let n = r["name"] as? String,
+                      let img = loadCGImage(dir.appendingPathComponent(f)) else { return nil }
+                return (SpineKitRules.role(ofAssembledName: n), img)
+            }
+            if !got.isEmpty { return got }
+        }
+        // Not split: the cut-out is the symbol's one layer.
+        return loadCGImage(folder.appendingPathComponent("\(id)_rmbg.png")).map { [(.subject, $0)] }
+    }
+
+    /// Writes one kit: each layer drawn on a `docW`×`docH` document, cropped to its alpha.
+    static func kit(_ id: String, layers: [(role: LayerizePlanRules.Role, image: CGImage)], docW: Int, docH: Int,
+                    into dir: URL, provenance: String) -> Bool {
+        let fm = FileManager.default
+        try? fm.removeItem(at: dir)
+        guard (try? fm.createDirectory(at: dir.appendingPathComponent("layers"), withIntermediateDirectories: true)) != nil else { return false }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        var rows: [[String: Any]] = []
+        for (z, l) in layers.enumerated() {
+            guard let ctx = CGContext(data: nil, width: docW, height: docH, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.interpolationQuality = .high
+            ctx.draw(l.image, in: CGRect(x: 0, y: 0, width: docW, height: docH))
+            guard let doc = ctx.makeImage(), let px = ChromaKeyOutputRules.straightRGBA8(doc),
+                  let e = LayerizeAssembly.extent(px, width: docW, height: docH, alpha: 1) else { continue }
+            var crop = [UInt8](repeating: 0, count: e.w * e.h * 4)
+            for y in 0..<e.h {
+                let from = ((e.y + y) * docW + e.x) * 4
+                crop.replaceSubrange((y * e.w * 4)..<((y + 1) * e.w * 4), with: px[from..<(from + e.w * 4)])
+            }
+            let name = SpineKitRules.layerName(id, role: l.role)
+            guard let img = ChromaKeyOutputRules.image(straightRGBA8: crop, width: e.w, height: e.h, space: space),
+                  let png = encodePNG(img), (try? png.write(to: dir.appendingPathComponent("layers/\(name).png"))) != nil else { return false }
+            rows.append(SpineKitRules.layerEntry(index: rows.count, name: name,
+                                                 bounds: .init(left: e.x, top: e.y, right: e.x + e.w, bottom: e.y + e.h), z: z + 1,
+                                                 source: ["navigator_role": l.role.rawValue]))
+        }
+        guard !rows.isEmpty, let d = try? JSONSerialization.data(withJSONObject: SpineKitRules.manifest(id: id, width: docW, height: docH, layers: rows, provenance: provenance),
+                                                                  options: [.prettyPrinted, .sortedKeys]) else { return false }
+        return (try? d.write(to: dir.appendingPathComponent("h5g_layer_manifest.json"))) != nil
+    }
+
+    @MainActor static func write(run: GDDToAssetsRun, ids: [String], folder: URL) -> (kits: Int, out: URL, error: String?) {
+        let out = folder.appendingPathComponent("Spine kits")
+        try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let frameOf = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol })
+        var made: [[String: Any]] = [], missing: [String] = [], unsplit: [String] = []
+        for id in ids {
+            guard let layers = layers(id, folder: folder), let first = layers.first?.image else { missing.append(id); continue }
+            let W = first.width, H = first.height
+            let split = layers.count > 1
+            if !split, run.jobs.first(where: { $0.id == id })?.hasFrame == true { unsplit.append(id) }
+            let prov = "Navigator GDD to Assets: \(split ? "Seedream 5.0 Pro Layerize (fal.ai), planned per symbol by Gemini, assembled by role" : "Photoshop Remove Background cut-out, one layer")"
+                + "; source \(id).png on the \(run.backing.name) backing"
+            let w = SpineKitRules.workingSize(width: W, height: H)
+            guard kit(id, layers: layers, docW: w.w, docH: w.h, into: out.appendingPathComponent("\(id)/working"), provenance: prov),
+                  kit(id, layers: layers, docW: W, docH: H, into: out.appendingPathComponent("\(id)/high-resolution"), provenance: prov)
+            else { missing.append(id); continue }
+            let j = run.jobs.first { $0.id == id }
+            made.append(["id": id, "family": SpineKitRules.family(id), "rank": j?.tier as Any, "role": j?.role.label ?? "",
+                         "document_name": j?.docName ?? "", "what_it_does": j?.job ?? "", "subject": j?.subject ?? "",
+                         "shared_frame": frameOf[id] as Any, "layers": layers.map { SpineKitRules.layerName(id, role: $0.role) },
+                         "working_kit": "\(id)/working", "high_resolution_kit": "\(id)/high-resolution",
+                         "original": "../\(id).png", "cut_out": "../\(id)_rmbg.png"])
+        }
+        guard !made.isEmpty else { return (0, out, "Nothing to export: cut the approved symbols out first (Remove backgrounds).") }
+        let set: [String: Any] = ["format": 1, "made_by": "Navigator GDD to Assets", "game": run.gameName, "theme": run.theme?.name ?? "",
+                                  "look": run.design.look, "frames": run.design.families.filter { $0.key.hasSuffix("Frame") },
+                                  "symbols": made, "not_exported": missing]
+        if let d = try? JSONSerialization.data(withJSONObject: set, options: [.prettyPrinted, .sortedKeys]) {
+            try? d.write(to: out.appendingPathComponent("navigator-spine-set.json"))
+        }
+        try? brief(run: run, symbols: made).write(to: out.appendingPathComponent("AGENT_BRIEF.md"), atomically: true, encoding: .utf8)
+        var notes: [String] = []
+        if !missing.isEmpty { notes.append("not cut yet: \(missing.joined(separator: ", "))") }
+        if !unsplit.isEmpty { notes.append("framed but not split, so exported as one layer with the frame in it: \(unsplit.joined(separator: ", ")) — split them with Layerize to get the frame on its own") }
+        return (made.count, out, notes.isEmpty ? nil : "Exported \(made.count); " + notes.joined(separator: "; "))
+    }
+
+    /// What the agent building the animation is told: what each file is, the set's context, and the
+    /// Spine generator's own commands, quoted from its documentation rather than reinvented.
+    @MainActor static func brief(run: GDDToAssetsRun, symbols: [[String: Any]]) -> String {
+        let rows = symbols.map { s in
+            "| \(s["id"] as? String ?? "") | \(s["family"] as? String ?? "") | \((s["document_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "—") | \((s["what_it_does"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "—") | \((s["layers"] as? [String])?.joined(separator: ", ") ?? "") | \(s["shared_frame"] as? String ?? "—") |"
+        }.joined(separator: "\n")
+        return """
+        # \(run.gameName) — \(run.theme?.name ?? "") · Spine layer kits
+
+        Made by Navigator's GDD to Assets. One folder per symbol, each with two layer kits in the format the
+        Spine generator (Claude_Spine_Generator_Progressive) reads — `layers/<CODE>_<role>.png`, cropped to
+        alpha, plus `h5g_layer_manifest.json` (schema `h5g_photoshop_layer_manifest_v1`):
+
+        - `working/` — the document scaled to 256 px tall, the generator's working size.
+        - `high-resolution/` — the same layers at the symbol's own canvas.
+
+        Layer names follow the generator's naming contract: `<CODE>_backing` (static background),
+        `<CODE>_frame`, `<CODE>_body` (the symbol). A symbol that was not split is one `<CODE>_body` layer.
+        `navigator-spine-set.json` holds the same table with the set's look and frame descriptions.
+
+        | Symbol | Family | Name in the GDD | What it does | Layers | Shared frame |
+        |---|---|---|---|---|---|
+        \(rows)
+
+        ## Building the animation
+
+        Follow the generator's `skills/flat-image-to-spine/SKILL.md` from "Inspect the returned layers"
+        onwards — these kits replace its Layerize step. Its documented commands:
+
+        ```
+        .venv/bin/python scripts/verify_layer_naming.py packet --layer-dir <kit>/layers --out-dir <out> --manifest <kit>/h5g_layer_manifest.json
+        .venv/bin/python scripts/build_spine_package.py --layer-dir <kit>/layers --manifest <kit>/h5g_layer_manifest.json \\
+          --family <family> --rank <rank> --symbol-contract <CODE>.contract.json --out-dir <out> --build-preview
+        ```
+
+        Before compiling, confirm with the game team what is not decided here:
+
+        - **Frame policy** — fixed, follow or bounce (references/project_context.md). The generator pulses
+          `_frame` in idle and win by default; a fixed frame is marked in the layer-context plan.
+        - **Symbol contract** — `target_cell`, `overflow_policy` and clip lengths (animator_contract_v2).
+        - **Shared frames** — the generator has no shared-asset concept, so each symbol carries its own
+          copy of its tier's frame (`HP2_frame`, `HP3_frame`, …). The shared master is `../frame_<tier>.png`.
+        """
     }
 }
 
@@ -25347,7 +26093,8 @@ struct GDDToAssetsSheet: View {
     @State private var symbolAspect = AssetPlanRules.symbolAspect
     @State private var backgroundAspect = AssetPlanRules.backgroundAspect
     @State private var backgroundSize = AssetPlanRules.backgroundSize
-    @State private var removeBG = true
+    // Off by default: a set is reviewed and revised first (Review & revise…), then cut and split there.
+    @State private var removeBG = false
     @State private var separateFrames = false
     @State private var loadingThemes = false
     /// Which folder the in-app picker is choosing, if it is open.
@@ -26085,8 +26832,9 @@ struct GDDToAssetsSheet: View {
                 Toggle("Then split frames off the framed symbols with Layerize", isOn: $separateFrames)
                     .disabled(!removeBG)
                     .padding(.leading, 20)
-                    .help("Billed by fal.ai, separately from Vertex. Card royals have no frame "
-                        + "and are skipped.")
+                    .help(String(format: "Billed by fal.ai, separately from Vertex: about $%.2f per framed symbol "
+                        + "(%d in this set), more if a split needs repairing. Card royals have no frame and are skipped.",
+                        LayerizePlanRules.estimatePerSymbol, run.layerizeEstimate(for: nil).symbols))
             }
         }
     }
@@ -26357,6 +27105,10 @@ struct GDDToAssetsSheet: View {
                 Button("Retry \(run.failures.count) failed") { retryFailed() }
                     .help("Generate only the images that failed, into the same folder")
             }
+            if !run.running, let folder = run.lastFolder, !run.produced.isEmpty {
+                Button("Review & revise…") { GDDReviewWindow.open(run: run, folder: folder) }
+                    .help("Every image large, in order: ask for changes, approve, then cut the backgrounds and split the frames")
+            }
             Button("Close") { requestClose() }
             Button(generateLabel) { startGenerate() }
                 .keyboardShortcut(.defaultAction)
@@ -26406,22 +27158,29 @@ struct GDDToAssetsSheet: View {
     /// quietly use the reference-art style instead — the control would say one thing and
     /// the prompt do another — so it blocks rather than guesses.
     private var styleNotChosen: Bool { styleMode && SlotArtStyles.byID(styleID) == nil }
+    /// The fal.ai part, shown beside the Vertex estimate when the frames will be split: with no
+    /// dialog any more, this is the only place that cost is seen before it is spent.
+    private func splitCost(_ ids: Set<String>?) -> String {
+        guard removeBG && separateFrames else { return "" }
+        let l = run.layerizeEstimate(for: ids)
+        return l.symbols == 0 ? "" : String(format: " + ~$%.2f Layerize", l.cost)
+    }
     private var generateLabel: String {
         guard readyJobs > 0 else { return "Generate" }
         // "more", not a total: designing the set already cost something and it is
         // already counted in "Spent so far" below, so calling this the total would
         // double-count it or hide it depending on which number you believed.
         if anchorPending, run.anchorJob != nil {
-            return String(format: "Make %@ first — about $%.2f", anchorLabel, run.estimate(for: run.anchorGroupIDs))
+            return String(format: "Make %@ first — about $%.2f", anchorLabel, run.estimate(for: run.anchorGroupIDs)) + splitCost(Set(run.anchorGroupIDs))
         }
         if run.anchorImageURL != nil {
             let rest = restIDs
             guard !rest.isEmpty else { return "All generated" }
             return String(format: "Generate the other %d to match — about $%.2f more",
-                          rest.count, run.estimate(for: rest))
+                          rest.count, run.estimate(for: rest)) + splitCost(rest)
         }
         return String(format: "Generate %d image%@ — about $%.2f more",
-                      readyJobs, readyJobs == 1 ? "" : "s", run.estimate)
+                      readyJobs, readyJobs == 1 ? "" : "s", run.estimate) + splitCost(nil)
     }
 
     // MARK: Actions

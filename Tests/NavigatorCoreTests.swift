@@ -8397,36 +8397,6 @@ final class LayerizeAssemblyTests: XCTestCase {
         XCTAssertNil(LayerizeAssembly.opening(canvas(40, 40) { _, _ in (200, 160, 40, 255) }, width: 40, height: 40))
     }
 
-    // The master's window is found from its plain centre; the rim is copied only where it is missing.
-    func testTheRimIsClosedFromTheMasterFrame() {
-        let master = canvas(40, 40) { x, y in
-            let rim = (4...35).contains(x) && (4...35).contains(y) && !((9...30).contains(x) && (9...30).contains(y))
-            let panel = (9...30).contains(x) && (9...30).contains(y)
-            return rim ? (200, 160, 40, 255) : panel ? (90, 90, 95, 255) : (255, 0, 255, 255)
-        }
-        let win = LayerizeAssembly.window(master, width: 40, height: 40)!
-        XCTAssertEqual(win.x, 9); XCTAssertEqual(win.w, 22)
-        let mask = (0..<1600).map { p -> Bool in
-            let x = p % 40, y = p / 40, i = p * 4
-            return !(x >= win.x && x < win.x + win.w && y >= win.y && y < win.y + win.h) && !(master[i] == 255 && master[i + 1] == 0)
-        }
-        // The rim Layerize returned, with its top rail gone where a subject broke out.
-        var rim = canvas(40, 40) { x, y in mask[y * 40 + x] && y > 8 ? (198, 158, 42, 255) : (0, 0, 0, 0) }
-        XCTAssertEqual(LayerizeAssembly.fillRim(&rim, master: master, rimMask: mask), 32 * 5)
-        XCTAssertEqual(rim[(5 * 40 + 20) * 4 + 3], 255)
-        XCTAssertEqual(rim[(20 * 40 + 20) * 4 + 3], 0)                  // the window stays open
-    }
-
-    // An arched window: the panel above the rectangle the centre-walk finds is still panel, by colour.
-    func testAPanelPixelOutsideTheRectangleIsStillPanel() {
-        let m = canvas(40, 40) { x, y in (12...27).contains(x) && (10...29).contains(y) ? (60, 60, 112, 255) : (200, 160, 40, 255) }
-        let p = LayerizeAssembly.panelColour(m, width: 40, height: 40)
-        XCTAssertEqual(p, RGB8(60, 60, 112))
-        XCTAssertTrue(LayerizeAssembly.isPanel(66, 58, 120, panel: p))
-        XCTAssertFalse(LayerizeAssembly.isPanel(200, 160, 40, panel: p))      // gold rim
-        XCTAssertFalse(LayerizeAssembly.isPanel(20, 25, 45, panel: p))        // obsidian rim
-    }
-
     func testOverCompositesStraightAlpha() {
         var b = [UInt8]([0, 0, 255, 255]); LayerizeAssembly.over(&b, [255, 0, 0, 128])
         XCTAssertEqual(b[3], 255); XCTAssertEqual(Int(b[0]), 128, accuracy: 1); XCTAssertEqual(Int(b[2]), 127, accuracy: 1)
@@ -12167,5 +12137,98 @@ final class SidebarReorderTests: XCTestCase {
         XCTAssertEqual(SidebarReorder.target(rows: rows, y: 40), "/Docs")
         XCTAssertEqual(SidebarReorder.target(rows: rows, y: 56), "/Pics")
         XCTAssertNil(SidebarReorder.target(rows: rows, y: 120))
+    }
+}
+
+
+final class SetReviewTests: XCTestCase {
+    func testTheReviewOrderKeepsEveryTypeTogetherFramesFirstScenesLast() {
+        let g = ReviewOrder.groups(["LP2", "bg_base", "HP10", "WD1", "HP2", "frame_HP1", "LP1", "BO1", "frame_HP", "MUWD1", "HP1"])
+        XCTAssertEqual(g.map(\.family), ["Frames", "HP", "LP", "WD", "BO", "MUWD", "Backgrounds"])
+        XCTAssertEqual(g[1].ids, ["HP1", "HP2", "HP10"])
+        XCTAssertEqual(ReviewOrder.sequence(["LP1", "HP1"]), ["HP1", "LP1"])
+        XCTAssertEqual(ReviewOrder.title("BO"), "BO · Bonus")
+    }
+
+    func testAReviewQueuesChangesKeepsVersionsAndRoundTrips() {
+        var r = SetReview()
+        r.setApproved("HP1", true)
+        r.queue("HP1", change: "  make the crown taller  ", mode: .edit)
+        XCTAssertFalse(r.entry("HP1").approved)                      // a queued change un-approves
+        XCTAssertEqual(r.queued(in: ["HP1", "HP2"]), ["HP1"])
+        XCTAssertEqual(r.archiveName("HP1"), "versions/HP1.v1.png")
+        r.record("HP1", replaced: "versions/HP1.v1.png", change: "make the crown taller", mode: .edit, cost: 0.1,
+                 at: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(r.entry("HP1").pending, "")
+        XCTAssertEqual(r.archiveName("HP1"), "versions/HP1.v2.png")
+        r.record("MP1", replaced: "versions/MP1.v1.png", change: "x", mode: .redraw, cost: 0.05, at: Date(timeIntervalSince1970: 60))
+        XCTAssertEqual(r.revisionCost, 0.15, accuracy: 1e-9)
+        XCTAssertEqual(SetReview.decode(r.encoded()!), r)
+    }
+
+    // A revised image's cut-out and splits go with the version they were made from.
+    func testWhatIsMadeFromAnImageTravelsWithItsVersion() {
+        XCTAssertEqual(SetReview.derivedFolder("versions/MP2.v1.png"), "versions/MP2.v1-cut")
+        XCTAssertTrue(SetReview.isDerived("MP2_rmbg.png", of: "MP2"))
+        XCTAssertTrue(SetReview.isDerived("MP2_rmbg_Layers 2", of: "MP2"))
+        XCTAssertTrue(SetReview.isDerived("MP2_rmbg_assembled.psd", of: "MP2"))     // the PSD built from the split
+        XCTAssertFalse(SetReview.isDerived("MP2.png", of: "MP2"))
+        XCTAssertFalse(SetReview.isDerived("MP21_rmbg.png", of: "MP2"))
+    }
+
+    func testAManifestRebuildsTheJobsAndTheDesign() {
+        var hp = AssetJob(id: "HP1", kind: .symbol, role: .highPay, tier: 1, title: "High pay 1", subject: "a harp", aspect: "1:1", size: "2K", hasFrame: true)
+        hp.docName = "Golden Harp"; hp.shape = "square"
+        let lp = AssetJob(id: "LP1", kind: .symbol, role: .lowPay, tier: 1, title: "", subject: "the letter A", aspect: "1:1", size: "2K")
+        let design = SetDesign(hero: "Jack", anchorID: "HP1", look: "storybook", families: ["highPayFrame": "oak"],
+                               cast: [CastMember(name: "Jack", kind: "hero", look: "a farm boy")])
+        let m = SetManifest(game: "4400", gdd: "4400 Chevy-Hot GDD", theme: GameTheme(name: "Jack and the Beanstalk"), design: design,
+                            jobs: [hp, lp], backing: (name: "chroma green", rgb: RGB8(0, 177, 64)), model: "nb2")
+        let back = SetManifest.decode(m.encoded()!)!
+        XCTAssertEqual(back, m)
+        XCTAssertEqual(back.jobs(), [hp, lp])
+        XCTAssertEqual(back.design(), design)
+        XCTAssertEqual(back.symbols[0].frame, "frame_HP")
+        XCTAssertEqual(back.backingRGB, RGB8(0, 177, 64))
+    }
+
+    func testARevisionEditsTheImageAndKeepsAPaySymbolsFrame() {
+        var hp = AssetJob(id: "HP2", kind: .symbol, role: .highPay, tier: 2, title: "", subject: "a gryphon", aspect: "1:1", size: "2K", hasFrame: true)
+        hp.docName = ""
+        let b = GDDAssetPrompts.reviseBrief(job: hp, change: "turn its head to face us", theme: GameTheme(name: "Galactic Goddesses"),
+                                            backing: (name: "chroma green", rgb: RGB8(0, 177, 64)))
+        XCTAssertTrue(b.hasPrefix("Edit the attached image"), b)
+        XCTAssertTrue(b.contains("Change only this: turn its head to face us"), b)
+        XCTAssertTrue(b.contains("and its frame exactly"), b)
+        XCTAssertFalse(b.contains("HP2"), b)
+    }
+}
+
+
+final class SpineKitRulesTests: XCTestCase {
+    // The names the generator's naming contract reads as backing, frame and symbol body.
+    func testRolesAreNamedByTheGeneratorsContract() {
+        XCTAssertEqual(SpineKitRules.layerName("HP2", role: .backing), "HP2_backing")
+        XCTAssertEqual(SpineKitRules.layerName("HP2", role: .frame), "HP2_frame")
+        XCTAssertEqual(SpineKitRules.layerName("HP2", role: .subject), "HP2_body")
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Frame backing"), .backing)
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Frame"), .frame)
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Golden goose"), .subject)
+        XCTAssertEqual(SpineKitRules.family("MP3"), "mp_symbol")
+        XCTAssertEqual(SpineKitRules.family("WY2"), "value_symbol")
+        XCTAssertEqual(SpineKitRules.family("BO1"), "bonus_symbol")
+    }
+
+    func testAManifestRowMatchesTheKitWriter() {
+        let row = SpineKitRules.layerEntry(index: 0, name: "HP2_frame", bounds: .init(left: 10, top: 12, right: 246, bottom: 250), z: 2, source: [:])
+        XCTAssertEqual(row["file"] as? String, "layers/HP2_frame.png")
+        XCTAssertEqual(row["name"] as? String, row["safe_name"] as? String)
+        let b = row["bounds"] as! [String: Any]
+        XCTAssertEqual(b["width"] as? Int, 236); XCTAssertEqual(b["center_y"] as? Double, 131)
+        let m = SpineKitRules.manifest(id: "HP2", width: 256, height: 256, layers: [row], provenance: "x")
+        XCTAssertEqual(m["schema"] as? String, "h5g_photoshop_layer_manifest_v1")
+        XCTAssertEqual(m["layer_count"] as? Int, 1)
+        XCTAssertTrue(JSONSerialization.isValidJSONObject(m))
+        XCTAssertEqual(SpineKitRules.workingSize(width: 2048, height: 2048).w, 256)
     }
 }
