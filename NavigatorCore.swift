@@ -2022,93 +2022,6 @@ enum ThumbnailKeyRules {
     static func prefix(path: String, size: Int) -> String { "\(path)@\(size)" }
 }
 
-// MARK: - Photoshop Generative Upscale (Firefly / Gigapixel / Bloom) preflight
-
-/// What to do with one image before handing it to Generative Upscale.
-enum FireflyUpscalePlan: Equatable {
-    /// Ready as-is at this scale.
-    case upscale(scale: Int)
-    /// Aspect is outside 1:4–4:1, so pad the short side first (adaptive backing), upscale,
-    /// then crop the padding back off.
-    case padThenUpscale(scale: Int, padTo: (w: Int, h: Int))
-    /// No scale fits the output cap. `maxSide` is what the long edge would have to be.
-    case tooLargeForAnyScale(longEdge: Int, maxInputLongEdge: Int)
-    case notAnImage
-
-    static func == (a: FireflyUpscalePlan, b: FireflyUpscalePlan) -> Bool {
-        switch (a, b) {
-        case let (.upscale(x), .upscale(y)): return x == y
-        case let (.padThenUpscale(s1, p1), .padThenUpscale(s2, p2)): return s1 == s2 && p1 == p2
-        case let (.tooLargeForAnyScale(l1, m1), .tooLargeForAnyScale(l2, m2)): return l1 == l2 && m1 == m2
-        case (.notAnImage, .notAnImage): return true
-        default: return false
-        }
-    }
-}
-
-/// Constraints read straight out of Photoshop 2026's own Generative Upscale dialog, which is
-/// more authoritative than the docs:
-///
-///   "Output too large. Width or height exceeds 6144px. Try a smaller scale or reduce the
-///    image size."
-///   "Aspect ratio not supported. Please crop the image to be tall or wide, between 1:4 and 4:1."
-///
-/// Both were triggered by a real 2224×355 sheet (6.26:1), which fails aspect at ×2 and fails
-/// the size cap at ×4. Note the cap moved between versions — it was 4096 in the 2025 beta —
-/// so it is deliberately one constant here.
-enum FireflyUpscaleRules {
-    static let maxOutputSide = 6144
-    static let aspectMin = 0.25          // 1:4
-    static let aspectMax = 4.0           // 4:1
-    static let scales = [4, 2]           // preferred first
-
-    /// Largest input long edge that still fits the output cap at a given scale.
-    static func maxInputLongEdge(scale: Int) -> Int { maxOutputSide / max(scale, 1) }
-
-    static func aspectOK(width w: Int, height h: Int) -> Bool {
-        guard w > 0, h > 0 else { return false }
-        let r = Double(w) / Double(h)
-        return r >= aspectMin && r <= aspectMax
-    }
-
-    /// Smallest canvas containing the image whose aspect is inside the allowed band. Only the
-    /// SHORT side grows, so the long edge — and therefore which scales fit — never changes.
-    static func aspectPadCanvas(width w: Int, height h: Int) -> (w: Int, h: Int) {
-        guard w > 0, h > 0 else { return (max(w, 1), max(h, 1)) }
-        let r = Double(w) / Double(h)
-        if r > aspectMax { return (w, Int((Double(w) / aspectMax).rounded(.up))) }
-        if r < aspectMin { return (Int((Double(h) * aspectMin).rounded(.up)), h) }
-        return (w, h)
-    }
-
-    static func plan(width w: Int, height h: Int, preferred: Int? = nil) -> FireflyUpscalePlan {
-        guard w > 0, h > 0 else { return .notAnImage }
-        let longEdge = max(w, h)
-        let wanted = preferred.map { [$0] } ?? scales
-        guard let scale = wanted.first(where: { longEdge * $0 <= maxOutputSide }) else {
-            let smallest = scales.min() ?? 2
-            return .tooLargeForAnyScale(longEdge: longEdge, maxInputLongEdge: maxInputLongEdge(scale: smallest))
-        }
-        if aspectOK(width: w, height: h) { return .upscale(scale: scale) }
-        return .padThenUpscale(scale: scale, padTo: aspectPadCanvas(width: w, height: h))
-    }
-
-    /// Plain-language reason, for the batch preflight dialog and the log.
-    static func explain(_ plan: FireflyUpscalePlan, width w: Int, height h: Int) -> String {
-        switch plan {
-        case .notAnImage:
-            return "not a readable image"
-        case .upscale(let s):
-            return "×\(s) → \(w * s)×\(h * s)"
-        case .padThenUpscale(let s, let p):
-            let r = Double(w) / Double(max(h, 1))
-            return "\(w)×\(h) is \(String(format: "%.2f", r)):1, outside Generative Upscale's 1:4–4:1 range — pad to \(p.w)×\(p.h) first, then ×\(s) → \(p.w * s)×\(p.h * s), then crop the padding off"
-        case .tooLargeForAnyScale(let long, let maxIn):
-            return "\(w)×\(h) is already too big: even ×2 would exceed the 6144px output cap (long edge \(long) → \(long * 2)). The largest input that fits ×2 is \(maxIn)px on the long edge — split it or reduce it first"
-        }
-    }
-}
-
 // MARK: - Swipe Compare across N images
 
 /// Which image the right-hand side of Swipe Compare is showing.
@@ -4814,43 +4727,33 @@ enum ExportRules {
     }
 }
 
-// MARK: - Adobe generative credits
+// MARK: - Upscale (Nano Banana Pro) → 4K
 
-/// Navigator can spend Adobe generative credits (Firefly Generative Upscale is a *standard*
-/// feature at 1 credit each). On an enterprise plan without premium access that allowance is
-/// **25 a month** — measured, not assumed: the account page read "0/25 credits left, next reset
-/// August 30, 2026". Three exploratory calls is over a tenth of a month, which is how this app
-/// once drained a user's entire allowance without asking.
-///
-/// So: count every generative call Navigator issues, and never issue one without saying what it
-/// costs and what has already been spent.
-enum AdobeCreditRules {
-    /// What Adobe charges for the things Navigator can trigger. Firefly Generative Upscale is
-    /// absent from Adobe's premium table and from its "does not use credits" list, which makes it
-    /// a standard feature — "1 credit per generation".
-    static let fireflyUpscaleCost = 1
+/// The words and the one limit behind the Nano Banana Pro upscaler (upscaleImagesViaVertex).
+/// The prompt is the one measured on 2026-10-01: two symbols shrunk 2K→1K and brought back to 4K
+/// kept every feature in place (structure 0.970 / 0.959 against the originals).
+enum VertexUpscaleRules {
+    static func prompt(transparent: Bool) -> String {
+        "Upscale this image to a high resolution. Reproduce it exactly: the same composition, pose, "
+        + "faces, colours, shapes, outlines, lettering and every detail, in the same place. Only make it "
+        + "sharper, with finer, cleaner detail at the higher resolution. Do not add, remove, move, restyle "
+        + "or reinterpret anything. "
+        // A transparent source is sent on flat green, and its own matte is put back afterwards.
+        + (transparent ? "Keep the flat green background exactly as it is." : "Keep the background exactly as it is.")
+    }
+    /// Already about as large as 4K: a redraw would only buy a copy.
+    static func isPointless(longEdge: Int) -> Bool { longEdge >= 3600 }
 
-    /// The line shown before spending. Navigator knows what IT has spent exactly; it does not
-    /// know Adobe's live balance and must never imply otherwise.
-    static func confirmation(count: Int, cost: Int, spentThisCycle: Int,
-                             allowance: Int) -> (title: String, detail: String) {
-        let credits = count * cost
-        let unit = credits == 1 ? "credit" : "credits"
-        let title = count == 1
-            ? "Upscaling this image uses \(credits) Adobe \(unit)."
-            : "Upscaling \(count) images uses \(credits) Adobe \(unit)."
-        var lines: [String] = []
-        if spentThisCycle > 0 {
-            lines.append("Navigator has spent \(spentThisCycle) this cycle" +
-                         (allowance > 0 ? " of your \(allowance)." : "."))
-            if allowance > 0, spentThisCycle + credits > allowance {
-                lines.append("That would take you past your allowance.")
-            }
-        } else if allowance > 0 {
-            lines.append("Your monthly allowance is \(allowance).")
-        }
-        lines.append("Navigator only counts its own spending, so check Adobe for the real balance.")
-        return (title, lines.joined(separator: " "))
+}
+
+/// Rebuilding transparency after an upscale on an opaque backing. The upscaler saw
+/// C = F·a + K·(1−a) at every pixel (K the backing), so the premultiplied colour it is
+/// owed back is exactly C − K·(1−a): no division, no noise at low alpha, any backing
+/// colour. The old green clamp kept C and applied alpha again, which darkened every edge
+/// (red/blue ~31 low) and, run on solid pixels too, greyed every green in the art.
+enum UpscaleMatte {
+    static func unmixed(_ c: UInt8, backing k: UInt8, alpha: UInt8) -> UInt8 {
+        UInt8(min(Int(alpha), max(0, Int(c) - Int(k) * (255 - Int(alpha)) / 255)))
     }
 }
 

@@ -130,16 +130,10 @@ final class NavigatorFinderSync: FIFinderSync {
                 // Addressed by INDEX into Navigator's own `upscaleOptions`, so the two menus
                 // cannot drift: reorder that list and Finder follows. Titles are duplicated
                 // here because the extension is a separate target and can't import them.
-                add(m, "Crystal (best fidelity) ×4", "upscale-0", Self.falIcon)
-                add(m, "AuraSR (non-generative) ×4", "upscale-1", Self.falIcon)
-                add(m, "Topaz ×4", "upscale-2", Self.falIcon)
-                add(m, "Local resample ×4 (free)", "upscale-3", Self.icon(systemSymbol: "desktopcomputer"))
-                // Firefly runs inside Photoshop and takes images only, as in Navigator.
-                if hasPS, hasImage {
-                    m.addItem(.separator())
-                    add(m, "Firefly ×2", "firefly-2", Self.psIcon)
-                    add(m, "Firefly ×4", "firefly-4", Self.psIcon)
-                }
+                add(m, "→ 4K — Nano Banana Pro", "upscale-vertex", Self.vertexIcon)
+                m.addItem(.separator())
+                add(m, "Topaz ×4", "upscale-0", Self.falIcon)
+                add(m, "Local resample ×4 (free)", "upscale-1", Self.icon(systemSymbol: "desktopcomputer"))
             })
 
             // These open a Navigator window rather than running silently, so they read

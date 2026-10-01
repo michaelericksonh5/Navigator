@@ -1706,81 +1706,30 @@ final class ThumbnailKeyRulesTests: XCTestCase {
     }
 }
 
-// MARK: - Photoshop Generative Upscale preflight
+// MARK: - Upscale (Nano Banana Pro)
 
-final class FireflyUpscaleRulesTests: XCTestCase {
-    /// The exact image that produced BOTH of Photoshop's error dialogs: 6.26:1 fails the
-    /// aspect band, and ×4 (8896px) fails the 6144 output cap.
-    func testTheSheetThatFailedBothWays() {
-        XCTAssertFalse(FireflyUpscaleRules.aspectOK(width: 2224, height: 355))
-        // ×4 would be 8896 on the long edge, over the cap, so ×2 is the best available
-        guard case let .padThenUpscale(scale, padTo) = FireflyUpscaleRules.plan(width: 2224, height: 355) else {
-            return XCTFail("expected pad-then-upscale, got \(FireflyUpscaleRules.plan(width: 2224, height: 355))")
-        }
-        XCTAssertEqual(scale, 2)
-        XCTAssertEqual(padTo.w, 2224, "padding must not touch the long edge")
-        XCTAssertEqual(padTo.h, 556, "short edge padded to long/4 = 556")
-        XCTAssertTrue(FireflyUpscaleRules.aspectOK(width: padTo.w, height: padTo.h))
-        XCTAssertLessThanOrEqual(max(padTo.w, padTo.h) * scale, FireflyUpscaleRules.maxOutputSide)
+final class VertexUpscaleRulesTests: XCTestCase {
+    func testThePromptAsksForAnExactCopyAndNamesTheBackground() {
+        let t = VertexUpscaleRules.prompt(transparent: true), o = VertexUpscaleRules.prompt(transparent: false)
+        XCTAssertTrue(t.contains("Reproduce it exactly"))
+        XCTAssertTrue(t.contains("Do not add, remove, move, restyle or reinterpret anything"))
+        XCTAssertTrue(t.hasSuffix("Keep the flat green background exactly as it is."))
+        XCTAssertTrue(o.hasSuffix("Keep the background exactly as it is."))
     }
-
-    /// Padding for aspect must never change which scales fit — it only grows the SHORT side.
-    func testAspectPadNeverChangesTheLongEdge() {
-        for (w, h) in [(2224, 355), (355, 2224), (5977, 1460), (1000, 100), (100, 1000)] {
-            let p = FireflyUpscaleRules.aspectPadCanvas(width: w, height: h)
-            XCTAssertEqual(max(p.w, p.h), max(w, h))
-            XCTAssertGreaterThanOrEqual(p.w, w)
-            XCTAssertGreaterThanOrEqual(p.h, h)
-            XCTAssertTrue(FireflyUpscaleRules.aspectOK(width: p.w, height: p.h),
-                          "\(w)x\(h) padded to \(p.w)x\(p.h) is still out of band")
-        }
+    func testAnImageAlreadyNear4KIsSkipped() {
+        XCTAssertFalse(VertexUpscaleRules.isPointless(longEdge: 2048))
+        XCTAssertTrue(VertexUpscaleRules.isPointless(longEdge: 4096))
     }
-
-    func testAlreadyValidAspectIsUntouched() {
-        let p = FireflyUpscaleRules.aspectPadCanvas(width: 2048, height: 2048)
-        XCTAssertEqual(p.w, 2048); XCTAssertEqual(p.h, 2048)
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1024, height: 1024), .upscale(scale: 4))
-    }
-
-    /// The output cap is what actually rules out ×4 for most real slot art.
-    func testScaleIsPickedByTheOutputCap() {
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1536, height: 1536), .upscale(scale: 4))  // 6144 exactly
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1537, height: 1537), .upscale(scale: 2))  // 6148 > cap
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: 2048, height: 2048), .upscale(scale: 2))
-        XCTAssertEqual(FireflyUpscaleRules.maxInputLongEdge(scale: 4), 1536)
-        XCTAssertEqual(FireflyUpscaleRules.maxInputLongEdge(scale: 2), 3072)
-    }
-
-    /// Real assets that Generative Upscale simply cannot take, at any scale.
-    func testTooLargeIsReportedNotAttempted() {
-        for (w, h) in [(5977, 1460), (3072, 3924), (4000, 4000)] {
-            guard case let .tooLargeForAnyScale(longEdge, maxIn) = FireflyUpscaleRules.plan(width: w, height: h) else {
-                return XCTFail("\(w)x\(h) should be refused, got \(FireflyUpscaleRules.plan(width: w, height: h))")
-            }
-            XCTAssertEqual(longEdge, max(w, h))
-            XCTAssertEqual(maxIn, 3072)
-        }
-    }
-
-    /// An explicitly requested scale is honoured or refused — never silently swapped.
-    func testPreferredScaleIsNotSilentlyDowngraded() {
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: 1024, height: 1024, preferred: 2), .upscale(scale: 2))
-        guard case .tooLargeForAnyScale = FireflyUpscaleRules.plan(width: 2048, height: 2048, preferred: 4) else {
-            return XCTFail("×4 on a 2048 image exceeds the cap and must be refused, not downgraded")
-        }
-    }
-
-    func testDegenerateInputs() {
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: 0, height: 0), .notAnImage)
-        XCTAssertEqual(FireflyUpscaleRules.plan(width: -5, height: 10), .notAnImage)
-        XCTAssertFalse(FireflyUpscaleRules.aspectOK(width: 0, height: 10))
-    }
-
-    func testEveryPlanExplainsItself() {
-        for (w, h) in [(2224, 355), (1024, 1024), (5977, 1460), (0, 0)] {
-            let p = FireflyUpscaleRules.plan(width: w, height: h)
-            XCTAssertFalse(FireflyUpscaleRules.explain(p, width: w, height: h).isEmpty)
-        }
+    func testUnmixGivesBackTheForegroundForAnyBacking() {
+        // A solid pixel is the upscaler's colour, untouched (the old clamp greyed green 180 → 120).
+        XCTAssertEqual(UpscaleMatte.unmixed(180, backing: 255, alpha: 255), 180)
+        // Gold red 200 at half alpha over green: C = 100 + 0, owed premultiplied 100 (old: 50).
+        XCTAssertEqual(UpscaleMatte.unmixed(100, backing: 0, alpha: 128), 100)
+        // Its green 150 over a 255 backing: C = 75 + 127 = 202, owed back ≈ 75.
+        XCTAssertEqual(UpscaleMatte.unmixed(202, backing: 255, alpha: 128), 75)
+        // Fully transparent and an over-subtracted pixel both clamp to a valid premultiplied 0.
+        XCTAssertEqual(UpscaleMatte.unmixed(255, backing: 255, alpha: 0), 0)
+        XCTAssertEqual(UpscaleMatte.unmixed(40, backing: 255, alpha: 64), 0)
     }
 }
 
@@ -5345,49 +5294,6 @@ final class ExportRulesTests: XCTestCase {
 }
 
 
-// MARK: - Adobe generative credits
-
-final class AdobeCreditRulesTests: XCTestCase {
-
-    /// The whole point: state the cost, every time, without pretending to know Adobe's balance.
-    /// An earlier version scraped the live number out of Adobe's account page through two shadow
-    /// roots in a hidden web view — seven fragile links for one integer. This has none.
-    func testAlwaysStatesTheCost() {
-        let one = AdobeCreditRules.confirmation(count: 1, cost: 1, spentThisCycle: 0, allowance: 25)
-        XCTAssertTrue(one.title.contains("1 Adobe credit."))
-        let many = AdobeCreditRules.confirmation(count: 4, cost: 1, spentThisCycle: 0, allowance: 25)
-        XCTAssertTrue(many.title.contains("4 Adobe credits."))
-        XCTAssertTrue(many.title.contains("4 images"))
-    }
-
-    /// Navigator knows its OWN spending exactly, because it issues the calls. It must never imply
-    /// it knows more than that.
-    func testReportsOwnSpendAndDisclaimsTheRest() {
-        let m = AdobeCreditRules.confirmation(count: 1, cost: 1, spentThisCycle: 3, allowance: 25)
-        XCTAssertTrue(m.detail.contains("spent 3 this cycle of your 25"))
-        XCTAssertTrue(m.detail.contains("only counts its own spending"),
-                      "must not imply Navigator knows Adobe's real balance")
-    }
-
-    func testWarnsWhenTheRunWouldExceedTheAllowance() {
-        let m = AdobeCreditRules.confirmation(count: 5, cost: 1, spentThisCycle: 23, allowance: 25)
-        XCTAssertTrue(m.detail.contains("past your allowance"))
-        let ok = AdobeCreditRules.confirmation(count: 1, cost: 1, spentThisCycle: 1, allowance: 25)
-        XCTAssertFalse(ok.detail.contains("past your allowance"))
-    }
-
-    /// An allowance of 0 means "not told" — say nothing about limits rather than something wrong.
-    func testUnsetAllowanceMakesNoClaims() {
-        let m = AdobeCreditRules.confirmation(count: 1, cost: 1, spentThisCycle: 0, allowance: 0)
-        XCTAssertFalse(m.detail.contains("allowance is"))
-        XCTAssertTrue(m.detail.contains("only counts its own spending"))
-    }
-
-    /// Firefly Generative Upscale is a STANDARD Adobe feature: 1 credit per generation.
-    func testCostIsOneCredit() {
-        XCTAssertEqual(AdobeCreditRules.fireflyUpscaleCost, 1)
-    }
-}
 
 
 

@@ -40,7 +40,7 @@ cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
 [ -f "$DIR/Navigator.icns" ] && cp "$DIR/Navigator.icns" "$APP/Contents/Resources/Navigator.icns"
 # Bundle the Photoshop Remove-BG scripts so they ship inside the app — no one
 # needs a copy saved anywhere; Navigator points Photoshop at these.
-for jsx in NavigatorRemoveBG NavigatorChromaKeyStill NavigatorExportPNG NavigatorGenerativeUpscale NavigatorAssembleLayers; do
+for jsx in NavigatorRemoveBG NavigatorChromaKeyStill NavigatorExportPNG NavigatorAssembleLayers; do
   [ -f "$DIR/$jsx.jsx" ] && cp "$DIR/$jsx.jsx" "$APP/Contents/Resources/$jsx.jsx"
 done
 # Menu icons for services with no installed app to borrow an icon from (Vertex AI,

@@ -637,7 +637,7 @@ struct TagsCell: View {
 /// and to answer 401 without one, and read-only — it runs no model, so it costs nothing.
 /// Verified: a made-up key and no key both get 401.
 enum FalKeyCheck {
-    private static let url = URL(string: "https://api.fal.ai/v1/models/pricing?endpoint_id=fal-ai/aura-sr")!
+    private static let url = URL(string: "https://api.fal.ai/v1/models/pricing?endpoint_id=fal-ai/topaz/upscale/image")!
     private static let prefKey = "falKeyCheck"
 
     /// true = accepted, false = rejected, nil = couldn't tell (network) — never a guess.
@@ -772,21 +772,6 @@ enum Prefs {
     /// so it shadows nothing, and a global hotkey nobody knows about is a feature nobody
     /// finds. The teleport variant is off by default — it needs Accessibility, and asking
     /// for that unprompted is not something an app should do on its own.
-    // Adobe generative credits. NOT secret — "0 of 25, read at 14:32" is not a credential, so
-    // this lives in prefs rather than the keychain. No token is ever stored: reading the balance
-    // means showing the user Adobe's own signed-in page, never holding their session.
-    /// The monthly allowance, entered by the user — 25 on an enterprise plan without premium
-    /// access. Navigator counts down from this using only its OWN spending.
-    static var adobeAllowance: Int {
-        get { d.object(forKey: "adobeAllowance") as? Int ?? 25 }
-        set { d.set(newValue, forKey: "adobeAllowance") }
-    }
-    /// Credits Navigator itself has spent this cycle. The one number here that is exact, because
-    /// Navigator issued every one of those calls.
-    static var adobeCreditsSpentSinceReading: Int {
-        get { d.integer(forKey: "adobeCreditsSpentSinceReading") }
-        set { d.set(newValue, forKey: "adobeCreditsSpentSinceReading") }
-    }
 
     /// Set once the saved network arrangements have had their expensive columns stripped.
     static var networkColumnCleanupDone: Bool {
@@ -1997,24 +1982,16 @@ enum ServiceIcon {
     }.labelStyle(.titleAndIcon)
 }
 
-// "Upscale (AI)" submenu — the fal.ai presets, plus Photoshop's Firefly upscaler.
+// "Upscale (AI)" submenu — Nano Banana Pro on Vertex first, then the fal.ai and local presets.
+// (Imagen's upscaler is gone from Vertex: 404 in every region. Nano Banana Pro replaces it.)
 @ViewBuilder func upscaleMenu(label: String = "Upscale (AI)",
                               fal: @escaping (UpscaleOption) -> Void,
-                              firefly: ((Int) -> Void)? = nil) -> some View {
+                              vertex: @escaping () -> Void) -> some View {
     Menu {
+        Button { vertex() } label: { serviceLabel("Upscale → 4K — Nano Banana Pro", ServiceIcon.vertex) }
+        Divider()
         ForEach(upscaleOptions) { o in
-            Button { fal(o) } label: { serviceLabel(o.label, ServiceIcon.fal) }
-        }
-        // NOTE: "Upscale (Imagen 4) ×2/×4" used to sit here. Google RETIRED the model —
-        // imagen-4.0-upscale-preview returns 404 NOT_FOUND from Vertex, and Google's own
-        // documentation page for it is a 404 as well. It was a preview model, and preview models
-        // do not come back. Removed rather than left in place: a menu item that always errors is
-        // worse than one that isn't there.
-        // Only with Photoshop installed — it IS the engine here, unlike the two above.
-        if let firefly, PhotoshopIcon.image != nil {
-            Divider()
-            Button { firefly(2) } label: { psLabel("Upscale (Firefly) ×2") }
-            Button { firefly(4) } label: { psLabel("Upscale (Firefly) ×4") }
+            Button { fal(o) } label: { serviceLabel(o.label, o.isLocal ? nil : ServiceIcon.fal) }
         }
     } label: { Label(label, systemImage: "arrow.up.backward.and.arrow.down.forward") }
 }
@@ -2227,25 +2204,10 @@ struct UpscaleOption: Identifiable {
     var isLocal: Bool { endpoint.isEmpty }
 }
 
-/// Ordered by a measured round-trip test, not by vendor claims: a real 2048 frame was
-/// downscaled to 512, upscaled ×4, and compared against the true original.
-///
-///   model            PSNR    SSIM    edge-vs-original
-///   Crystal          28.43   0.9554  1.01x   <- best structural fidelity
-///   AuraSR v2        28.59   0.9379  1.25x   over-sharpens (invents edges)
-///   Lanczos (free)   28.17   0.9203  0.75x   soft, but beats two PAID models
-///   Topaz            25.50   0.9051  1.01x   was the default here; near worst
-///
-/// Edge energy 1.01x means Crystal reproduced the original's detail level rather than
-/// softening it or inventing it — exactly "not melty, not fake-crisp" for flat gold linework.
-/// Caveat: n=1 on graphic art; the generative models would score better on photographs.
-/// Crystal MUST be pinned to PNG — it defaults to JPEG, and JPEG ringing on a chroma edge
-/// destroys keying.
+/// The fal.ai and local upscalers, after Nano Banana Pro (upscaleImagesViaVertex), which leads
+/// every Upscale menu. Crystal, AuraSR and Photoshop's Firefly were taken out at the owner's
+/// request (2026-10-01). Finder's menu addresses this list by INDEX — keep FinderExt in step.
 let upscaleOptions: [UpscaleOption] = [
-    .init(label: "Upscale ×4 — Crystal (best fidelity)", endpoint: "clarityai/crystal-upscaler",
-          factor: 4, body: ["scale_factor": 4, "creativity": 0, "output_format": "png"]),
-    .init(label: "Upscale ×4 — AuraSR (non-generative)", endpoint: "fal-ai/aura-sr",
-          factor: 4, body: ["upscale_factor": 4, "overlapping_tiles": true, "checkpoint": "v2"]),
     .init(label: "Upscale ×4 — Topaz", endpoint: "fal-ai/topaz/upscale/image",
           factor: 4, body: ["model": "Standard V2", "upscale_factor": 4, "output_format": "png"]),
     // Free, instant, offline, and measurably better than Topaz and Creative on this art.
@@ -2361,14 +2323,11 @@ private func stripGreen(_ data: Data) -> Data? {
     return encodePNG(outCG)
 }
 
-// Imagen flattens alpha (returns opaque RGB), so for a transparent source we
-// upscale it on a green backing, then rebuild transparency from the ORIGINAL
-// matte — the alpha the background-removal already computed — instead of
-// chroma-keying green back out (which leaves a fringe on soft edges). The
-// original alpha is bilinearly upscaled to the output size for smooth edges;
-// green spill is despilled ONLY on partial-alpha edge pixels so subject colors
-// are untouched. Returns a transparent PNG, or nil to fall back to stripGreen.
-private func recombineUpscaledAlpha(source: URL, upscaledOpaque: Data) -> Data? {
+// The upscalers return opaque RGB, so a transparent source is upscaled on an opaque
+// backing and its transparency rebuilt from the ORIGINAL matte (bilinearly upscaled),
+// with the backing subtracted back out of the edges (UpscaleMatte). Returns a
+// transparent PNG, or nil to fall back to the opaque result.
+private func recombineUpscaledAlpha(source: URL, upscaledOpaque: Data, backing k: RGB8) -> Data? {
     guard let srcCG = loadCGImage(source), let upCG = loadCGImage(data: upscaledOpaque) else { return nil }
     let W = upCG.width, H = upCG.height
     guard W > 0, H > 0 else { return nil }
@@ -2380,23 +2339,16 @@ private func recombineUpscaledAlpha(source: URL, upscaledOpaque: Data) -> Data? 
           let uCtx = CGContext(data: uPtr, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4, space: cs, bitmapInfo: bmp) else { return nil }
     aCtx.interpolationQuality = .high
     aCtx.draw(srcCG, in: CGRect(x: 0, y: 0, width: W, height: H))   // upscaled source → its alpha is our matte
-    uCtx.draw(upCG, in: CGRect(x: 0, y: 0, width: W, height: H))    // Imagen's opaque RGB (alpha 255)
+    uCtx.draw(upCG, in: CGRect(x: 0, y: 0, width: W, height: H))    // the upscaler's opaque RGB (alpha 255)
     let a = aPtr.bindMemory(to: UInt8.self, capacity: W * H * 4)
     let u = uPtr.bindMemory(to: UInt8.self, capacity: W * H * 4)
     var i = 0
     while i < W * H * 4 {
         let alpha = a[i + 3]
-        if alpha == 0 {
-            u[i] = 0; u[i + 1] = 0; u[i + 2] = 0; u[i + 3] = 0
-        } else {
-            let r = u[i], b = u[i + 2]
-            // Standard green-screen despill: clamp green to the larger of the other
-            // two channels. Only removes green that EXCEEDS both (i.e. spill); a
-            // balanced subject color (gold/teal/skin) is left essentially untouched.
-            let g = min(u[i + 1], max(r, b))
-            let af = Double(alpha) / 255.0         // straight → premultiplied for this context
-            u[i] = UInt8(Double(r) * af); u[i + 1] = UInt8(Double(g) * af); u[i + 2] = UInt8(Double(b) * af); u[i + 3] = alpha
-        }
+        u[i] = UpscaleMatte.unmixed(u[i], backing: k.r, alpha: alpha)
+        u[i + 1] = UpscaleMatte.unmixed(u[i + 1], backing: k.g, alpha: alpha)
+        u[i + 2] = UpscaleMatte.unmixed(u[i + 2], backing: k.b, alpha: alpha)
+        u[i + 3] = alpha
         i += 4
     }
     guard let outCG = uCtx.makeImage() else { return nil }
@@ -3233,6 +3185,7 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
             // then rebuilt from the ORIGINAL alpha channel, so no colour ever has to be keyed
             // back out and a collision cannot corrupt the cutout.
             var inputCG = cg
+            var backing = RGB8(0, 255, 0)
             if transparent {
                 let choice = KeyColorRules.choose(subject: subjectColours(cg), flatField: nil)
                 let c: RGB8
@@ -3243,6 +3196,7 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
                     navLog("upscale backing: \(src.lastPathComponent) rgb(\(k.r),\(k.g),\(k.b)), ΔE \(String(format: "%.1f", margin)) from the art")
                 }
                 inputCG = compositeOnColor(cg, nsColor(c).cgColor) ?? cg
+                backing = c
             }
             var outData: Data?
             var err: String?
@@ -3254,7 +3208,7 @@ func upscaleImagesViaFal(_ srcs: [URL], option: UpscaleOption, onDone: (([URL]) 
                 (outData, err) = falUpscale(pngData: inputPNG, option: option, key: falKey ?? "")
             }
             if let outData {
-                let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: outData) ?? outData) : outData
+                let finalData = transparent ? (recombineUpscaledAlpha(source: src, upscaledOpaque: outData, backing: backing) ?? outData) : outData
                 let dst = upscaleOutputURL(src)
                 do { try finalData.write(to: dst); outs.append(dst) }
                 catch { errors.append("\(src.lastPathComponent): save failed — \(error.localizedDescription)") }
@@ -4028,6 +3982,94 @@ func batchUpscaleFolderViaFal(_ folder: URL, option: UpscaleOption, onDone: (() 
     upscaleImagesViaFal(imgs, option: option) { _ in onDone?() }
 }
 
+// ===== Upscale (Nano Banana Pro) → 4K =====
+//
+// Vertex's own upscaler is gone: imagen-4.0-upscale-preview answers 404 in every region
+// (checked 2026-10-01 in ten locations, against a live-model control). Nano Banana Pro redraws
+// the image at 4K with it as the input, told to reproduce it exactly. Measured 2026-10-01 on two
+// 2K symbols shrunk to 1K and brought back: structure 0.970 / 0.959 against the originals (a
+// plain resize 0.983 / 0.992, but blurrier), 40–55% more detail than the resize, every feature in
+// place, a slight warm shift (+3–4 on red and blue). A regeneration, not super-resolution — fine
+// detail can move a little — which is why the confirmation says so.
+let vertexUpscaleModelFlag = "nb-pro"
+
+/// Each image redrawn at 4K by Nano Banana Pro, saved as "<name>_upscaled.png" beside it. A
+/// transparent PNG is sent on green and its ORIGINAL matte is put back afterwards, as the Imagen
+/// upscaler did — keying the green out again leaves a fringe on soft edges.
+func upscaleImagesViaVertex(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_upscaled") }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
+    let perImage = nbEstimatedCost(size: "4K", modelFlag: vertexUpscaleModelFlag)
+    let a = NSAlert()
+    a.messageText = "Upscale \(imgs.count) image\(imgs.count == 1 ? "" : "s") to 4K with Nano Banana Pro?"
+    a.informativeText = (imgs.count == 1
+        ? String(format: "Estimated cost: ~$%.2f.", perImage)
+        : String(format: "Estimated cost: ~$%.2f (about $%.2f each).", Double(imgs.count) * perImage, perImage))
+        + "\n\nNano Banana Pro redraws the image at 4K, told to keep everything exactly as it is. It is sharper than a resize and keeps every feature in place, but it is a redraw: very fine detail can shift slightly."
+    a.addButton(withTitle: "Upscale"); a.addButton(withTitle: "Cancel")
+    guard a.runModal() == .alertFirstButtonReturn else { return }
+
+    DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling (Nano Banana Pro)", total: imgs.count) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = [], errors: [String] = [], spent = 0.0
+        for src in imgs {
+            defer { DispatchQueue.main.async { BGJobProgress.shared.advance() } }
+            guard let size = imagePixelSize(src) else { errors.append("\(src.lastPathComponent): can’t read the image"); continue }
+            if VertexUpscaleRules.isPointless(longEdge: max(size.w, size.h)) {
+                errors.append("\(src.lastPathComponent): already \(size.w)×\(size.h) — about as large as 4K, so it was skipped")
+                continue
+            }
+            let transparent = imageHasTransparency(src)
+            var input = src, tmp: URL?
+            if transparent, let cg = loadCGImage(src), let g = compositeOnGreen(cg), let png = encodePNG(g) {
+                let t = FileManager.default.temporaryDirectory.appendingPathComponent("navigator-vupscale-\(UUID().uuidString).png")
+                if (try? png.write(to: t)) != nil { input = t; tmp = t }
+            }
+            defer { if let tmp { try? FileManager.default.removeItem(at: tmp) } }
+            // Restyle's request path: pads an odd shape to the nearest ratio the model takes and
+            // crops the padding back off, so nothing is stretched or cut.
+            let r = runRestyle(source: input, prompt: VertexUpscaleRules.prompt(transparent: transparent),
+                               modelFlag: vertexUpscaleModelFlag, aspect: "auto", size: "4K", nameAfter: src,
+                               sendSourceImage: true, modeLabel: "Upscale (Nano Banana Pro) 4K")
+            spent += r.cost ?? 0
+            guard let saved = r.saved else { errors.append("\(src.lastPathComponent): \(r.error ?? "no image came back")"); continue }
+            let dst = PathRules.uniqueDest(src.deletingLastPathComponent(),
+                                           src.deletingPathExtension().lastPathComponent + "_upscaled.png") {
+                FileManager.default.fileExists(atPath: $0)
+            }
+            do {
+                if transparent, let data = try? Data(contentsOf: saved),
+                   let rebuilt = recombineUpscaledAlpha(source: src, upscaledOpaque: data, backing: RGB8(0, 255, 0)) {
+                    try rebuilt.write(to: dst)
+                    try? FileManager.default.removeItem(at: saved)
+                } else {
+                    try FileManager.default.moveItem(at: saved, to: dst)
+                }
+                outs.append(dst)
+                navLog("vertex upscale: \(src.lastPathComponent) \(size.w)×\(size.h) → \(dst.lastPathComponent)\(transparent ? " (matte rebuilt)" : "")")
+            } catch {
+                errors.append("\(src.lastPathComponent): generated, but couldn’t be saved as \(dst.lastPathComponent) — it is “\(saved.lastPathComponent)”")
+            }
+        }
+        let total = spent
+        DispatchQueue.main.async {
+            BGJobProgress.shared.finish(String(format: "Upscaled %d of %d · $%.2f", outs.count, imgs.count, total))
+            if !errors.isEmpty { showBGSummary(app: "Upscale (Nano Banana Pro)", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
+func batchUpscaleFolderViaVertex(_ folder: URL, onDone: (() -> Void)? = nil) {
+    let imgs = batchImageURLs(in: folder, skipSuffix: "_upscaled")
+    guard !imgs.isEmpty else {
+        DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
+        onDone?(); return
+    }
+    upscaleImagesViaVertex(imgs) { _ in onDone?() }
+}
+
 // Remove BG for ONE file, retrying a failure before giving up.
 //
 // Photoshop intermittently refuses a single file in a long run with a transient
@@ -4095,128 +4137,7 @@ func removeBackgroundOnce(src: URL, out: URL, attempts: Int = 3,
 // pre-copy (faster, especially on network/Drive), and the original is never
 // written. `onProgress` (main thread) fires after Photoshop finishes so callers
 // can refresh.
-/// Adobe generative credit bookkeeping.
-///
-/// Navigator can spend these — Firefly Generative Upscale is a standard feature at 1 credit, and
-/// on this account the whole monthly allowance is 25. This app once burned a user's entire month
-/// on exploratory calls without asking, so nothing generative runs now without a confirmation
-/// that states the cost and what has already been spent.
-enum AdobeCredits {
-    static var spentSinceReading: Int { Prefs.adobeCreditsSpentSinceReading }
 
-    /// Called after a generative call actually succeeded.
-    static func recordSpend(_ credits: Int) {
-        guard credits > 0 else { return }
-        Prefs.adobeCreditsSpentSinceReading += credits
-        navLog("adobe credits: spent \(credits); \(Prefs.adobeCreditsSpentSinceReading) by our count this cycle")
-    }
-
-    /// The gate, and the only protection that matters here. Modal on purpose: this spends real
-    /// money and must not be dismissable by accident.
-    ///
-    /// Deliberately has NO dependency on Adobe. It states the cost and what Navigator has spent,
-    /// both known locally and exactly, because Navigator issues the calls. An earlier version
-    /// scraped the live balance out of Adobe's account page — clicking a hidden avatar through two
-    /// shadow roots in an off-screen WKWebView, behind a retry loop. Seven fragile links for one
-    /// integer; it broke once during development and would have failed silently the next time
-    /// Adobe reskinned their nav. The number was never the protection. This dialog is.
-    ///
-    /// Callers are SwiftUI menu actions, already on the main thread, which NSAlert requires anyway.
-    static func confirmSpend(count: Int, cost: Int = AdobeCreditRules.fireflyUpscaleCost) -> Bool {
-        let msg = AdobeCreditRules.confirmation(count: count, cost: cost,
-                                                spentThisCycle: spentSinceReading,
-                                                allowance: Prefs.adobeAllowance)
-        let a = NSAlert()
-        a.alertStyle = .warning
-        a.messageText = msg.title
-        a.informativeText = msg.detail
-        a.addButton(withTitle: "Use \(count * cost) Credit\(count * cost == 1 ? "" : "s")")
-        a.addButton(withTitle: "Cancel")
-        a.addButton(withTitle: "Check Balance…")
-        switch a.runModal() {
-        case .alertFirstButtonReturn: return true
-        case .alertThirdButtonReturn:
-            // Adobe's page in the user's own browser. No scraping, nothing to break.
-            NSWorkspace.shared.open(URL(string: "https://account.adobe.com/")!)
-            return false                      // never spend straight after sending them to look
-        default: return false
-        }
-    }
-}
-
-/// Photoshop's Generative Upscale, Firefly engine only.
-///
-/// The script has existed since the typeID walk found `generativeUpscale`, but nothing ever
-/// called it — it was bundled into the app and unreachable, so the feature may as well not have
-/// been built. This is the missing half.
-///
-/// Firefly's upscaler consumes NO generative credits; the Topaz engines in the same dropdown do
-/// (10–35 depending on model and megapixels). The script sends no `upscaleModelId`, so Photoshop
-/// uses its Firefly default, and it verifies the result document's name contains "Firefly" before
-/// saving — a changed default fails the run instead of quietly billing an unlicensed engine.
-func fireflyUpscaleForImage(_ src: URL, scale: Int? = nil, onDone: ((URL) -> Void)? = nil) {
-    guard isImageFile(src) else { NSSound.beep(); return }
-    guard let size = imagePixelSize(src) else {
-        reportFileError("Couldn’t read “\(src.lastPathComponent)”.", "", permissionHint: false); return
-    }
-    // Preflight rather than let Photoshop refuse mid-run: it rejects aspects outside 1:4–4:1 and
-    // any output over 6144px a side. FireflyUpscaleRules works out whether padding is needed.
-    let plan = FireflyUpscaleRules.plan(width: size.w, height: size.h, preferred: scale)
-    let chosen: Int
-    var padTo = ""
-    switch plan {
-    case .upscale(let s):
-        chosen = s
-    case .padThenUpscale(let s, let pad):
-        chosen = s
-        padTo = "\(pad.w)x\(pad.h)"
-    case .notAnImage, .tooLargeForAnyScale:
-        reportFileError("Can’t upscale “\(src.lastPathComponent)”.",
-                        FireflyUpscaleRules.explain(plan, width: size.w, height: size.h),
-                        permissionHint: false)
-        return
-    }
-    // Padding colour picked so it can't collide with a colour in the art — the same choice the
-    // chroma paths make, so the crop-back afterwards is unambiguous.
-    // Backing colour picked from the art itself, so the padding can't collide with a colour in
-    // the image and the crop-back afterwards is unambiguous. Falls back to green only if the
-    // image can't be sampled.
-    var padHex = "00FF00"
-    if !padTo.isEmpty, let choice = adaptiveBacking(src) {
-        let c: RGB8
-        switch choice {
-        case .extendField(let rgb): c = rgb
-        case .keyColour(let rgb, _): c = rgb
-        }
-        padHex = String(format: "%02X%02X%02X", c.r, c.g, c.b)
-    }
-    let out = upscaleOutputURL(src)
-    BGJobProgress.shared.start("Upscaling (Firefly)", total: 1)
-    DispatchQueue.global(qos: .userInitiated).async {
-        let r = runPhotoshopScript(resource: "NavigatorGenerativeUpscale",
-                                   arguments: [src.path, out.path, String(chosen), padTo, padHex],
-                                   reportError: true)
-        DispatchQueue.main.async {
-            BGJobProgress.shared.finish(r.ok ? "Upscaled \(src.lastPathComponent) ×\(chosen)"
-                                             : "Upscale failed")
-            if r.ok { AdobeCredits.recordSpend(AdobeCreditRules.fireflyUpscaleCost) }
-            guard r.ok else {
-                // Adobe refusing the request is not a Navigator fault and retrying can't fix it.
-                // Say so plainly rather than surfacing "Unauthorized to perform request", which
-                // reads like a bug in us.
-                if r.message.contains("Unauthorized to perform request") {
-                    reportFileError("Photoshop wouldn’t run Generative Upscale.",
-                                    "Adobe refused the request, which is what it returns when the account has no generative credits left. Check your credit balance in Photoshop — Navigator can't work around this, and retrying won't help.",
-                                    permissionHint: false)
-                }
-                return
-            }
-            navLog("firefly upscale: \(src.lastPathComponent) x\(chosen) -> \(out.lastPathComponent)")
-            hideApp(bundleID: "com.adobe.Photoshop")
-            onDone?(out)
-        }
-    }
-}
 
 func removeBackgroundForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     guard isImageFile(src) else { NSSound.beep(); return }
@@ -11672,20 +11593,11 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
                 upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
-                            firefly: { f in
+                            vertex: {
                                 let targets = browser.items.filter {
                                     ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url)
                                 }.map(\.url)
-                                // Confirm ONCE for the whole selection, before anything runs —
-                                // a per-image prompt on a 20-image batch trains people to click
-                                // through, which defeats the point.
-                                guard !targets.isEmpty,
-                                      AdobeCredits.confirmSpend(count: targets.count) else { return }
-                                // Then one at a time: each is a cloud round trip and Photoshop
-                                // serialises them anyway.
-                                for u in targets {
-                                    fireflyUpscaleForImage(u, scale: f) { out in browser.refreshAndReveal([out]) }
-                                }
+                                upscaleImagesViaVertex(targets) { outs in browser.refreshAndReveal(outs) }
                             })
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
                     browser.refreshAndReveal([out])
@@ -11698,7 +11610,12 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             } else if browser.items.filter({ ids.contains($0.id) }).count == 1,
                       browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
                 upscaleMenu(label: "Batch Upscale (AI)",
-                            fal: { opt in browser.batchUpscale(ids, opt) })
+                            fal: { opt in browser.batchUpscale(ids, opt) },
+                            vertex: {
+                                for f in browser.items.filter({ ids.contains($0.id) && $0.isDirectory }) {
+                                    batchUpscaleFolderViaVertex(f.url) { browser.refresh() }
+                                }
+                            })
             }
             // A Layerize output folder can be rebuilt into a real layered PSD. Detected by its
             // manifest rather than by the "_Layers" name, so a renamed folder still works and a
@@ -15081,9 +14998,8 @@ struct ImageViewerView: View {
                 }
                 upscaleMenu(fal: { opt in
                     upscaleImagesViaFal([u], option: opt) { outs in if let o = outs.first { revealNewImage(o) } }
-                }, firefly: { f in
-                    guard AdobeCredits.confirmSpend(count: 1) else { return }
-                    fireflyUpscaleForImage(u, scale: f) { out in revealNewImage(out) }
+                }, vertex: {
+                    upscaleImagesViaVertex([u]) { outs in if let o = outs.first { revealNewImage(o) } }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
                 // Layerize belongs here for the same reason Restyle does: this viewer is where you
@@ -17351,10 +17267,10 @@ struct SetupItem: Identifiable {
                       // find the menu item that does this, which is a button that describes a button.
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.vertexSignInAction(_:)), to: nil, from: nil) }),
             SetupItem(id: "falkey", section: .connect, title: "fal.ai API key",
-                      short: !falStored ? "For Layerize and the Crystal, AuraSR and Topaz upscalers. Add Key opens a box to paste it, with a link to get one."
+                      short: !falStored ? "For Layerize and the Topaz upscaler. Add Key opens a box to paste it, with a link to get one."
                         : FalKeyCheck.last?.accepted == false ? "fal rejected the saved key. Replace it with a fresh one."
                         : FalKeyCheck.last == nil ? "Saved, but not checked yet. Check asks fal whether it accepts the key."
-                        : "For Layerize and the Crystal, AuraSR and Topaz upscalers. fal accepts the key.",
+                        : "For Layerize and the Topaz upscaler. fal accepts the key.",
                       why: "Green means fal itself accepted the key, not just that one is saved — checked with fal’s pricing lookup, which runs no model and costs nothing.\n\nCreate the key while switched to the High5games team in fal’s dashboard (account switcher, top left), so usage bills the team, not your personal account.\n\nExpect one keychain prompt after each Navigator update: updating re-signs the app, which invalidates the keychain’s saved permission. Choose Always Allow — the key itself is fine."
                          + (FalKeyCheck.last.map { "\n\nLast checked " + $0.at.formatted(date: .abbreviated, time: .shortened) + "." } ?? ""),
                       probe: { _ in
@@ -17446,8 +17362,8 @@ struct SetupItem: Identifiable {
         let notInstalled: [PermissionState: String] = [.off: "Not installed"]
         if !hasPhotoshop {
             rows.append(SetupItem(id: "app-ps", section: .apps, title: "Adobe Photoshop",
-                      short: "Needed for Remove BG, Quick Export as PNG, Firefly upscale, Assemble Layers, and GDD to Assets’ background removal.",
-                      why: "Install it from Creative Cloud with your studio Adobe account. Once it’s installed, reopen this window — this row becomes the permission Navigator needs to drive it. Firefly upscale also spends Adobe generative credits.",
+                      short: "Needed for Remove BG, Quick Export as PNG, Assemble Layers, and GDD to Assets’ background removal.",
+                      why: "Install it from Creative Cloud with your studio Adobe account. Once it’s installed, reopen this window — this row becomes the permission Navigator needs to drive it.",
                       probe: { _ in .off }, probeMayPrompt: false, canAsk: false,
                       settingsLabel: "Get Photoshop…", labels: notInstalled,
                       openSettings: getAdobe("photoshop")))
@@ -17485,7 +17401,7 @@ struct SetupItem: Identifiable {
         // one says nothing about the other.
         if hasPhotoshop {
             rows.append(SetupItem(id: "automation-ps", section: .apps, title: "Control Photoshop",
-                      short: "For Remove BG, Quick Export as PNG, Firefly upscale and Assemble Layers.",
+                      short: "For Remove BG, Quick Export as PNG and Assemble Layers.",
                       why: "macOS only lists Navigator under Automation once it has asked, so use the button.",
                       probe: { _ in PermissionProbe.appAutomation(bundleID: "com.adobe.Photoshop") },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
@@ -17618,8 +17534,6 @@ struct SetupAssistantView: View {
     @State private var states: [String: PermissionState] = [:]
     @State private var drivesText = ""
     /// Bumped to redraw after the credit reading changes (the store is plain prefs, not observable).
-    @State private var adobeTick = 0
-    @AppStorage("adobeAllowance") private var adobeAllowance = 25
     @State private var drivesAdded: Int?
     @State private var checking = false
     @State private var checkedAt: Date?
@@ -17660,34 +17574,6 @@ struct SetupAssistantView: View {
             // paste covers the lot. Nothing is mounted here on purpose: the addresses are saved as
             // sidebar drives, and the first click mounts through NetFS with THEIR login, which is
             // also the moment a missing VPN gets diagnosed properly (MountFailureRules).
-            // Adobe credits. No sign-in and no scraping: Navigator counts what IT spends, which
-            // it knows exactly, and you tell it the allowance once. An earlier version read the
-            // balance off Adobe's account page through two shadow roots in a hidden web view —
-            // clever, and one Adobe redesign away from failing silently.
-            Section("Adobe generative credits") {
-                Text(adobeCreditSummary)
-                    .font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Text("Monthly allowance")
-                    TextField("25", value: $adobeAllowance, format: .number)
-                        .frame(width: 70)
-                    Text("credits")
-                    Spacer()
-                }
-                HStack {
-                    Button("Check Balance in Browser…") {
-                        NSWorkspace.shared.open(URL(string: "https://account.adobe.com/")!)
-                    }
-                    if Prefs.adobeCreditsSpentSinceReading > 0 {
-                        Button("Reset Count") {
-                            Prefs.adobeCreditsSpentSinceReading = 0
-                            adobeTick &+= 1
-                        }.help("Do this after your monthly reset, or after checking the real balance.")
-                    }
-                    Spacer()
-                }
-            }
             Section("Network drives") {
                 Text("Paste the share addresses your team uses — one per line, optionally as “Label = address”. They’re saved as sidebar drives; clicking one connects with your own login. If these shares need the VPN, connect it first.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -17796,23 +17682,6 @@ struct SetupAssistantView: View {
         case .off, .notAsked: return .orange
         case .unknown: return .secondary
         }
-    }
-
-    /// What Navigator knows for certain — what it has spent — against the allowance you told it.
-    /// Never claims to know Adobe's live balance, because it doesn't.
-    private var adobeCreditSummary: String {
-        _ = adobeTick                        // redraw dependency
-        let spent = Prefs.adobeCreditsSpentSinceReading
-        let allowance = Prefs.adobeAllowance
-        var s = "Firefly Generative Upscale costs 1 credit per image. "
-        if spent == 0 {
-            s += "Navigator hasn’t spent any this cycle."
-        } else {
-            s += "Navigator has spent \(spent) this cycle"
-            s += allowance > 0 ? " of your \(allowance)." : "."
-        }
-        s += " Navigator only counts its own spending — anything you use directly in Photoshop or on the web isn’t included, so check the real balance when it matters."
-        return s
     }
 
     /// Save each pasted address as a sidebar drive. The stored path is a best guess
@@ -18268,11 +18137,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "chromakey-solid":
             folders.forEach { batchChromaKeyFolder($0, profile: .solidSymbol) }
             if !images.isEmpty { chromaKeyForImages(images, profile: .solidSymbol) }
+        case "upscale-vertex":
+            folders.forEach { batchUpscaleFolderViaVertex($0) }
+            if !images.isEmpty { upscaleImagesViaVertex(images) }
         // Upscalers are addressed by INDEX into `upscaleOptions` rather than by a name
         // string, so Finder's menu and Navigator's own can never drift apart: both are
         // built from the same list. "upscale-lowq" is kept as an alias because older
         // installed Quick Actions still send it.
-        case "upscale-lowq", "upscale-0", "upscale-1", "upscale-2", "upscale-3":
+        case "upscale-lowq", "upscale-0", "upscale-1":
             let idx = Int(url.host?.split(separator: "-").last ?? "0") ?? 0
             let opt = upscaleOptions.indices.contains(idx) ? upscaleOptions[idx] : upscaleOptions[0]
             folders.forEach { batchUpscaleFolderViaFal($0, option: opt) }
@@ -18296,11 +18168,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "fxalpha-2k", "fxalpha-4k":
             // fxAlphaUpscale shows the price and asks before spending.
             if !images.isEmpty { fxAlphaUpscale(images, size: url.host == "fxalpha-4k" ? "4K" : "2K") }
-        case "firefly-2", "firefly-4":
-            // Confirm once for the whole selection, as Navigator's own menu does.
-            guard !images.isEmpty, AdobeCredits.confirmSpend(count: images.count) else { return }
-            let scale = url.host == "firefly-4" ? 4 : 2
-            for u in images { fireflyUpscaleForImage(u, scale: scale) }
         case "compare":
             CompareController.show(images: images)
         case "assemblelayers":
@@ -18935,7 +18802,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func apiKeysAction(_ sender: Any?) {
         let a = NSAlert()
         a.messageText = "fal.ai API key"
-        a.informativeText = "Used by Layerize and the Crystal, AuraSR and Topaz upscalers. Stored in your macOS keychain, not in a file.\n\nNo key yet? Get Key opens fal’s dashboard. Switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
+        a.informativeText = "Used by Layerize and the Topaz upscaler. Stored in your macOS keychain, not in a file.\n\nNo key yet? Get Key opens fal’s dashboard. Switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         field.placeholderString = "fal.ai key (e.g. 1234abcd-…:…)"
         field.stringValue = APIKeys.fal ?? ""
