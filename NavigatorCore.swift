@@ -5421,7 +5421,23 @@ public enum FrameStack {
     /// outer edge `outer` of the image and its rim `rim` of its own width — the studio's frames are
     /// slim (Tiki Titans' file: rim 8%, window 84%), and told so in words Gemini drew 17–25% rims
     /// (2026-10-02). Drawn on a guide, as the gems are, the proportions are the code's.
-    static func frameTemplate(size n: Int, backing b: RGB8, outer: Double = 0.85, rim: Double = 0.085) -> [UInt8] {
+    static let ringOuter = 0.85, ringRim = 0.085
+    /// The ring's opening on an image of `w`×`h`: the window a frame drawn on it must keep.
+    public static func ringOpening(width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int) {
+        let inset = (1 - ringOuter) / 2 + ringOuter * ringRim
+        let x0 = Int((Double(w) * inset).rounded()), y0 = Int((Double(h) * inset).rounded())
+        return (x0, y0, w - 2 * x0, h - 2 * y0)
+    }
+    /// Everything a frame drawn on the ring put inside its opening, cleared to the backing: Gemini
+    /// kept the ring's outside and lined its inside (2026-10-02), so the window is the code's.
+    static func clearOpening(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8) {
+        let o = ringOpening(width: w, height: h)
+        for y in o.y..<(o.y + o.h) { for x in o.x..<(o.x + o.w) {
+            let i = (y * w + x) * 4
+            px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255
+        } }
+    }
+    static func frameTemplate(size n: Int, backing b: RGB8, outer: Double = ringOuter, rim: Double = ringRim) -> [UInt8] {
         var px = [UInt8](repeating: 255, count: n * n * 4)
         let o0 = Double(n) * (1 - outer) / 2, o1 = Double(n) - o0, t = (o1 - o0) * rim
         let edge = max(2, Double(n) / 300)
@@ -10215,7 +10231,9 @@ public enum GDDAssetPrompts {
         - FRAMES follow the symbol's type, as in this studio's shipped games. Every HIGH PAY sits
           in a frame: HP2 and up share ONE square frame, the same construction recoloured by rank,
           and HP1's is a richer version of that same frame. The MEDIUM PAYS share one plainer square
-          frame of their own, with no gems. Describe these frames in "families" (highPayFrame, hp1Frame,
+          frame of their own, with no gems. This studio's frames are SLIM — a narrow moulding about a
+          twelfth of the frame's width, ornament concentrated at the corners — never a wide carved border or
+          a second inner rim, so the symbol inside fills most of it. Describe these frames in "families" (highPayFrame, hp1Frame,
           mediumPayFrame); they are drawn once and every pay symbol is painted into a copy, so a
           pay symbol's subject never describes its frame. The top pays' frames are set with gems:
           write in "gems" the gem this theme would use — what it is, its cut and its setting, never
@@ -11160,7 +11178,7 @@ public enum FrameWriter {
         THE FRAMES AS PLANNED: high pays \(f("highPayFrame")); HP1's richer version \(f("hp1Frame")); medium pays \(f("mediumPayFrame")); the gem \(f("gems")).
         THE STYLE TO WRITE THEM IN: \(FrameStyle.direction(design) ?? "this theme's own, as the planned frames are").\(RankLadder(design).note.map { "\n        \($0)" } ?? "")\(Framing(design) == .layered ? "\n        \(FrameRules.layeredGemsNote)" : "")
         Write them again in that style, made from this theme's own materials and motifs:
-        - highPayFrame: the high pays' square frame — material, rim profile and corner ornaments, not the panel inside it; under 25 words.
+        - highPayFrame: the high pays' square frame — material, rim profile and corner ornaments, not the panel inside it; slim, as this studio's are (a narrow moulding, ornament at the corners, never a wide carved border or a second inner rim); under 25 words.
         - hp1Frame: how HP1's version of that frame is richer, with the same window; under 25 words.
         - mediumPayFrame: the medium pays' plainer square frame, of the same family, with no gems; under 25 words.
         - gems: the gem the top pays' frames are set with, in this theme's own terms — what it is, its cut and its setting, never its colour; under 15 words.
@@ -12957,13 +12975,18 @@ extension GDDAssetPrompts {
     /// The brief for a tier's empty frame (FrameRules). It is drawn once and every member is
     /// painted into a copy of it, so it suits all of them and carries nothing of any one.
     static func frameBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
-                           backing: (name: String, rgb: RGB8)) -> String {
+                           backing: (name: String, rgb: RGB8), jobs: [AssetJob] = []) -> String {
         guard let parsed = FrameRules.parse(step.id) else { return "" }
         let role = parsed.role
         // The only high pay's frame is HP1's: the richest, crested, set with HP1's gems — not the
         // plain rung a tier of several shares (Chevy-Hot, one HP and four MPs, 2026-10-02).
         let single = parsed.isShared && role == .highPay && step.members.count == 1
         let ref = single ? FrameRules.Ref(role: role, rank: 1) : parsed
+        // A character HP1's own head breaks out over the top of its frame: the studio's character HP1
+        // frames have no crest there (Bring 'Em In, Platinum Goddess, Da Vinci), so it has none.
+        let symbols = jobs.filter { $0.kind == .symbol }
+        let hp1 = symbols.first { $0.role == .highPay && $0.hasFrame && FrameRules.rank(of: $0.id, in: symbols) == 1 }
+        let crestOK = ref.rank == 1 && role == .highPay && !(hp1.map { PayLadder.face($0, in: symbols) != nil } ?? false)
         let plural = role == .highPay ? "high-pay symbols" : "medium-pay symbols"
         let trim: (String) -> String = { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
         let spec = FrameStyle.spec(design, highPay: role == .highPay).map(trim)
@@ -13004,7 +13027,8 @@ extension GDDAssetPrompts {
             default: change = "but richer — \(rich)\(gems)"
             }
             // Shipped top symbols often change shape too: Dodge's HP1 is octagonal, Billionaires Bank's crested.
-            let crest = ref.rank == 1 ? " Its outline may rise into a crest at the top centre; everywhere else it keeps the shared frame's outline." : ""
+            let crest = crestOK ? " Its outline may rise into a crest at the top centre, above its top edge; everywhere else it keeps the shared frame's outline."
+                : ref.rank == 1 ? " It keeps the shared frame's outline, with no crest: the top symbol's own head breaks out over its top." : ""
             return ([
                 "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make \(FrameRules.code(role) ?? "HP")\(ref.rank)'s version of it, for the \(ref.rank == 1 ? "top" : "second") symbol: the same construction, proportions and size, and exactly the same window, so they read as one set — \(change).\(crest)\(noGems)",
             ] + parts + [
@@ -13014,12 +13038,14 @@ extension GDDAssetPrompts {
                 "No text, lettering or numbers, no watermark, no user interface.",
             ]).joined(separator: "\n\n")
         }
-        let rung = single ? " The only high pay, so the richest frame of the set: \(rich)\(gems). Its outline may rise into a crest at the top centre."
+        let rung = single ? " The only high pay, so the richest frame of the set: \(rich)\(gems).\(crestOK ? " Its outline may rise into a crest at the top centre, above the ring." : " No crest: the symbol's own head breaks out over its top.")"
             + (layered ? noGems : "")
             : (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
             + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."
                 : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
-        let ring = "Edit the last attached image: its flat grey square ring marks exactly where the frame goes. Turn the ring into the frame described below — its outer edge, its opening and its narrow rim exactly where the ring's are\(single ? ", except for a crest it may rise into at the top centre" : "") — and keep everything outside it the flat background."
+        // Shown a ring, Gemini kept its outer edge and drew an inner liner inside its opening, which
+        // shrank the window to 49–63% of the frame (2026-10-02): the opening is said to be the window.
+        let ring = "Edit the last attached image: its flat grey square ring marks exactly where the frame goes. Turn the ring into the frame described below — its outer edge, its opening and its narrow rim exactly where the ring's are\(single && crestOK ? ", except for a crest that rises above the ring at the top centre" : "") — and keep everything outside it the flat background. The ring's opening IS the window: nothing is drawn inside it — no inner liner, bevel, step, moulding or second border inside the ring's inner edge."
         return ([
             template && single ? "\(ring) It is the empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
             : template ? "\(ring) It is the empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of it, so it holds each in turn and carries nothing of any of them."
@@ -13144,7 +13170,7 @@ extension GDDAssetPrompts {
         if step.mode == .character, let m = castMember(ref: step.id, design) {
             return characterBrief(m, step: step, theme: theme, design: design, backing: backing)
         }
-        if step.mode == .frame { return frameBrief(step: step, theme: theme, design: design, backing: backing) }
+        if step.mode == .frame { return frameBrief(step: step, theme: theme, design: design, backing: backing, jobs: jobs) }
         if step.mode == .panel { return panelBrief(theme: theme, design: design) }
         if step.mode == .gem { return gemsBrief(job: job, theme: theme, design: design, backing: backing, jobs: jobs) }
         let artAttached = step.refs.contains(RenderPlan.themeArt)

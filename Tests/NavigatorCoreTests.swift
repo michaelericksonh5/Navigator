@@ -12870,7 +12870,7 @@ final class PayLadderTests: XCTestCase {
         let b = GDDAssetPrompts.brief(job: jobs[0], step: f, theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
         XCTAssertTrue(b.hasPrefix("Edit the last attached image: its flat grey square ring"), b)
         XCTAssertTrue(b.contains("It is the empty frame for the top symbol"), b)
-        XCTAssertTrue(b.contains("except for a crest it may rise into at the top centre"), b)
+        XCTAssertTrue(b.contains("except for a crest that rises above the ring at the top centre"), b)
         XCTAssertTrue(b.contains("the richest frame of the set: doubled vines with a crown crest"), b)
         XCTAssertTrue(b.contains("rise into a crest at the top centre"), b)
         XCTAssertTrue(b.contains("one gem at the centre of its crest and four"), b)     // painted: HP1's gems
@@ -12928,6 +12928,22 @@ final class PayLadderTests: XCTestCase {
         XCTAssertEqual(Double(e.w) / Double(n), 0.85, accuracy: 0.01)
         XCTAssertEqual(Double(win.x - e.x) / Double(e.w), 0.085, accuracy: 0.01)
         XCTAssertEqual(Double(win.w) / Double(e.w), 0.83, accuracy: 0.01)
+        // Whatever is drawn inside the ring's opening is cleared: the window is the ring's.
+        XCTAssertEqual(FrameStack.ringOpening(width: n, height: n).x, win.x, accuracy: 1)
+        var lined = [UInt8](repeating: 200, count: n * n * 4)
+        FrameStack.clearOpening(&lined, width: n, height: n, backing: RGB8(255, 0, 255))
+        XCTAssertEqual(Array(lined[(200 * n + 200) * 4..<(200 * n + 200) * 4 + 3]), [255, 0, 255])
+        XCTAssertEqual(lined[(5 * n + 5) * 4], 200)
+        // A character HP1's frame has no crest — its head breaks out there; an object HP1's may.
+        let jack = [pay("HP1", .highPay, cast: "Jack", silhouette: "head-and-shoulders bust"), pay("MP1", .mediumPay)]
+        let item = [pay("HP1", .highPay, silhouette: "golden harp"), pay("MP1", .mediumPay)]
+        let d = SetDesign(anchorID: "HP1", look: "", families: ["framing": Framing.layered.rawValue])
+        let brief = { (jobs: [AssetJob]) in
+            GDDAssetPrompts.brief(job: jobs[0], step: RenderPlan.steps(jobs, d, hasThemeArt: false).first { $0.id == "frame_HP" }!,
+                                  theme: self.theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs) }
+        XCTAssertTrue(brief(jack).contains("No crest: the symbol's own head breaks out over its top."), brief(jack))
+        XCTAssertTrue(brief(jack).contains("The ring's opening IS the window"), brief(jack))
+        XCTAssertTrue(brief(item).contains("except for a crest that rises above the ring at the top centre"), brief(item))
     }
 
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.

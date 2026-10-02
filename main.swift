@@ -21462,6 +21462,44 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gems"), flag + 2 < Command
     app.run()
 }
 
+// PAID (~$0.10 a frame, $0.20 when its rim comes back thick):  Navigator --draw-frames <set folder> <frame_HP,…>
+// Those tier frames drawn again (the old kept as <id>.prev.png), their rims printed, their symbols built
+// again — without gems where a gem pass belonged to the old frame.
+if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    let ids = args[flag + 2].split(separator: ",").map(String.init)
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        let steps = run.renderSteps().filter { ids.contains($0.id) && $0.mode == .frame }
+        guard steps.count == ids.count else { print("FAILED: frames in this plan are \(run.renderSteps().filter { $0.mode == .frame }.map(\.id))"); exit(1) }
+        let fm = FileManager.default
+        for id in ids {
+            for n in ["\(id).png", "\(id)_rmbg.png"] {
+                let u = folder.appendingPathComponent(n), prev = folder.appendingPathComponent(n.replacingOccurrences(of: ".png", with: ".prev.png"))
+                try? fm.removeItem(at: prev); try? fm.moveItem(at: u, to: prev)
+            }
+        }
+        let model = NanoBananaModel.byFlag(run.modelFlag).id, art = run.themeArtPNG()
+        print(String(format: "FRAMES: %@ — estimate $%.2f", ids.joined(separator: ","), Double(ids.count) * nbEstimatedCost(size: "2K", modelFlag: run.modelFlag)))
+        DispatchQueue.global(qos: .userInitiated).async {
+            for st in steps { run.generateFrame(step: st, themeArt: art, model: model, folder: folder) }
+            DispatchQueue.main.async {
+                let members = ids.flatMap { run.frameMembers($0, folder: folder) }
+                run.stackFramed(folder, only: members) {
+                    MainActor.assumeIsolated {
+                        print("DONE: \(run.status)")
+                        print(String(format: "SPENT: $%.4f", run.spent))
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+                }
+            }
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --restack <set folder> [id,id,…]
 // Builds a layered set's framed symbols from their pieces again, as a frame or panel change does.
 if let flag = CommandLine.arguments.firstIndex(of: "--restack"), flag + 1 < CommandLine.arguments.count {
@@ -25330,12 +25368,20 @@ final class GDDToAssetsRun: ObservableObject {
                   let e = LayerizeAssembly.extent(k, width: cg.width, height: cg.height), e.w > 0 else { return nil }
             return Double(win.x - e.x) / Double(e.w)
         }
+        // The window is the ring's opening, whatever was drawn inside it; only then is the rim measured.
+        let templated = refs.last == RenderPlan.frameTemplate
+        func cleared(_ png: Data?) -> Data? {
+            guard templated, let png, let cg = loadCGImage(data: png), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { return png }
+            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b)
+            return ChromaKeyOutputRules.image(straightRGBA8: px, width: cg.width, height: cg.height, space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG) ?? png
+        }
         var r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
-        if refs.last == RenderPlan.frameTemplate, let png = r.png, let rim = sideRim(png), rim > 0.14 {
+        r.png = cleared(r.png)
+        if templated, let png = r.png, let rim = sideRim(png), rim > 0.14 {
             navLog(String(format: "gdd frame: %@ came back with a %.0f%% rim — drawing it once more", step.id, rim * 100))
             let again = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
             r.cost += again.cost
-            if let p2 = again.png, let rim2 = sideRim(p2), rim2 < rim { r.png = p2 }
+            if let p2 = cleared(again.png), let rim2 = sideRim(p2), rim2 < rim { r.png = p2 }
         }
         if let png = r.png {
             navLog(String(format: "gdd frame: %@ rim %.0f%% of its width", step.id, (sideRim(png) ?? 0) * 100))
