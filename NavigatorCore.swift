@@ -5417,67 +5417,67 @@ public enum LayerizeAssembly {
 public enum FrameStack {
     /// The grey panel every layered pay is set on, drawn once per set.
     public static let panelID = "panel"
-    /// The ring a tier's frame is drawn on (opaque RGBA, `size` square): flat grey on the backing, its
-    /// outer edge `outer` of the image and its rim `rim` of its own width — the studio's frames are
-    /// slim (Tiki Titans' file: rim 8%, window 84%), and told so in words Gemini drew 17–25% rims
-    /// (2026-10-02). Drawn on a guide, as the gems are, the proportions are the code's.
-    static let ringOuter = 0.85, ringRim = 0.085
-    /// The ring's opening on an image of `w`×`h`: the window a frame drawn on it must keep.
-    public static func ringOpening(width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int) {
-        let inset = (1 - ringOuter) / 2 + ringOuter * ringRim
-        let x0 = Int((Double(w) * inset).rounded()), y0 = Int((Double(h) * inset).rounded())
-        return (x0, y0, w - 2 * x0, h - 2 * y0)
-    }
-    /// Whether a point lies inside `shape` drawn in the box x0…x1, y0…y1 with corner size `c` px.
-    static func inside(_ x: Double, _ y: Double, _ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double, _ c: Double, _ shape: FrameShape) -> Bool {
-        guard x >= x0, x < x1, y >= y0, y < y1 else { return false }
-        guard c > 0 else { return true }
-        let dx = min(x - x0, x1 - x), dy = min(y - y0, y1 - y)
-        switch shape {
-        case .square: return true
-        case .octagon: return dx + dy >= c
-        case .rounded: return dx >= c || dy >= c || (c - dx) * (c - dx) + (c - dy) * (c - dy) <= c * c
+    /// Per column, the lowest open pixel of a frame's window (its floor), from the window's bottom up:
+    /// a straight window's is its bottom edge, a round, arched, shield or diamond one's its curve.
+    public static func windowFloor(_ frame: [UInt8], inside: [Bool], width w: Int, height h: Int, window o: (x: Int, y: Int, w: Int, h: Int)) -> [Int] {
+        var floor = [Int](repeating: o.y + o.h - 1, count: w)
+        for x in max(0, o.x)..<min(w, o.x + o.w) {
+            var y = min(h - 1, o.y + o.h - 1)
+            while y > o.y && !(frame[(y * w + x) * 4 + 3] < 128 && inside[y * w + x]) { y -= 1 }
+            floor[x] = y
         }
+        return floor
     }
-    /// The ring's inner corner: its outer corner moved in by the rim, so the rim keeps its width.
-    static func innerCorner(_ c: Double, rim t: Double, _ shape: FrameShape) -> Double {
-        switch shape {
-        case .square: return 0
-        // A diagonal x + y = c moved in by t is x + y = c + t√2; from the inner corner (t, t) that is c - t(2 - √2).
-        case .octagon: return max(0, c - t * (2 - 2.0.squareRoot()))
-        case .rounded: return max(0, c - t)
-        }
-    }
-    /// Everything a frame drawn on the ring put inside its opening, cleared to the backing: Gemini
-    /// kept the ring's outside and lined its inside (2026-10-02), so the window is the code's.
-    static func clearOpening(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, shape: FrameShape = .square) {
-        let o = ringOpening(width: w, height: h)
-        let side = Double(w) * ringOuter, ci = innerCorner(shape.corner * side, rim: side * ringRim, shape) * Double(o.w) / (side * (1 - 2 * ringRim))
-        for y in o.y..<(o.y + o.h) { for x in o.x..<(o.x + o.w)
-            where inside(Double(x), Double(y), Double(o.x), Double(o.y), Double(o.x + o.w), Double(o.y + o.h), ci, shape) {
-            let i = (y * w + x) * 4
-            px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255
-        } }
-    }
-    static func frameTemplate(size n: Int, backing b: RGB8, shape: FrameShape = .square, outer: Double = ringOuter, rim: Double = ringRim) -> [UInt8] {
+
+    /// The moulding a tier's frame is drawn on (opaque RGBA, `size` square): a plain grey frame of the
+    /// planned outline and width with a real cross-section — an outer bevel, a flat face, an inner lip
+    /// stepping down to the opening — lit from the upper left, on the backing. Gemini repaints its
+    /// surface in the theme's material, as the gem pass turns discs into gems: shown a flat ring it
+    /// kept only the ring's outside and built its own thick frame inward from it, liner and all
+    /// (17–25% rims, 2026-10-02); a moulding to restyle keeps its widths.
+    static func frameTemplate(size n: Int, backing b: RGB8, geometry g: FrameGeometry = FrameGeometry()) -> [UInt8] {
         var px = [UInt8](repeating: 255, count: n * n * 4)
-        let o0 = Double(n) * (1 - outer) / 2, o1 = Double(n) - o0, t = (o1 - o0) * rim
-        let c = shape.corner * (o1 - o0), ci = innerCorner(c, rim: t, shape)
-        let edge = max(2, Double(n) / 300)
+        let t = g.t, h = 1.5 / Double(n), lx = -0.7071, ly = -0.7071
         for y in 0..<n { for x in 0..<n {
-            let fx = Double(x), fy = Double(y), i = (y * n + x) * 4
-            let inOuter = inside(fx, fy, o0, o0, o1, o1, c, shape)
-            let inWindow = inside(fx, fy, o0 + t, o0 + t, o1 - t, o1 - t, ci, shape)
+            let i = (y * n + x) * 4
+            let px0 = (Double(x) + 0.5) / Double(n) - 0.5, py0 = (Double(y) + 0.5) / Double(n) - 0.5
+            let d = g.dist(px0, py0)
             var v: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
-            if inOuter && !inWindow {
-                // A dark line where the ring meets the backing and its opening, so both edges read.
-                let nearEdge = !inside(fx - edge, fy - edge, o0, o0, o1, o1, c, shape) || !inside(fx + edge, fy + edge, o0, o0, o1, o1, c, shape)
-                    || inside(fx - edge, fy - edge, o0 + t, o0 + t, o1 - t, o1 - t, ci, shape) || inside(fx + edge, fy + edge, o0 + t, o0 + t, o1 - t, o1 - t, ci, shape)
-                v = nearEdge ? (70, 70, 70) : (140, 140, 140)
+            if d <= 0 && d > -t {
+                let u = -d / t                                   // 0 at the outer edge, 1 at the inner
+                var gx = g.dist(px0 + h, py0) - g.dist(px0 - h, py0), gy = g.dist(px0, py0 + h) - g.dist(px0, py0 - h)
+                let gn = max(1e-9, (gx * gx + gy * gy).squareRoot()); gx /= gn; gy /= gn
+                let facing = gx * lx + gy * ly                   // the outward normal toward the light
+                let shade: Double
+                if u < 0.03 || u > 0.97 { shade = 55 }                       // the outlines
+                else if u < 0.2 { shade = 150 + 75 * facing }                // outer bevel
+                else if u > 0.8 { shade = 128 - 70 * facing }                // inner lip, facing in
+                else { shade = 158 + 14 * facing - 22 * abs(u - 0.5) }       // the face, a soft round
+                let c = UInt8(max(0, min(255, shade)))
+                v = (c, c, c)
             }
             px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2
         } }
         return px
+    }
+    /// A sliver drawn just inside the opening, cleared to the backing — only a sliver: a frame drawn
+    /// thicker than planned is drawn again, or kept whole, never cut (the art director, 2026-10-02).
+    static func clearOpening(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry = FrameGeometry()) {
+        let o = g.opening(width: w, height: h)
+        for y in max(0, o.y)..<min(h, o.y + o.h) { for x in max(0, o.x)..<min(w, o.x + o.w)
+            where g.dist((Double(x) + 0.5) / Double(w) - 0.5, (Double(y) + 0.5) / Double(h) - 0.5) <= -g.t {
+            let i = (y * w + x) * 4
+            px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255
+        } }
+    }
+    /// How far a frame drawn on the moulding reaches into its opening past the inner lip, the most of
+    /// any side, as a share of the image: 0 when it keeps to the lip.
+    static func encroachment(_ px: [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry) -> Double? {
+        let k = keyed(px, backing: b)
+        guard let win = LayerizeAssembly.opening(k, width: w, height: h) else { return nil }
+        let o = g.opening(width: w, height: h)
+        let sides = [win.x - o.x, win.y - o.y, (o.x + o.w) - (win.x + win.w), (o.y + o.h) - (win.y + win.h)]
+        return Double(max(0, sides.max() ?? 0)) / Double(w)
     }
 
     /// A gem pass: `gems_<symbol>.png` is the symbol's frame with its rank's gems set in by a guided
@@ -5529,19 +5529,13 @@ public enum FrameStack {
     /// of its edges; the crest jewel is the larger centrepiece, at the frame's top edge or raised into
     /// its crest by nearly half of how far the crest rises above the rim, whichever is higher.
     public static func gemCentres(_ slots: [GemSlot], window o: (x: Int, y: Int, w: Int, h: Int),
-                                  rim r: (across: Double, down: Double, crest: Double), shape: FrameShape = .square) -> [Gem] {
+                                  rim r: (across: Double, down: Double, crest: Double)) -> [Gem] {
         let x0 = Double(o.x) - r.across / 2, x1 = Double(o.x + o.w) + r.across / 2
         let y0 = Double(o.y) - r.down / 2, y1 = Double(o.y + o.h) + r.down / 2
         let t = min(r.across, r.down), corner = t * 0.85
-        // A clipped or rounded corner pulls its gem in along the diagonal, onto the rim's centre line
-        // there: an octagon's at the middle of its cut, a rounded square's on its arc.
-        let side = Double(o.w) + 2 * r.across, c = shape.corner * side
-        let inset: Double
-        switch shape {
-        case .square: inset = 0
-        case .octagon: inset = max(0, (c + t / 2.0.squareRoot()) / 2 - t / 2)
-        case .rounded: inset = c > t / 2 ? (c - (c - t / 2) / 2.0.squareRoot()) - t / 2 : 0
-        }
+        // Measured, for a frame not drawn on Navigator's moulding; one that was is placed by its own
+        // geometry (FrameGeometry.gems), every shape's corners and sides included.
+        let inset = 0.0
         var out: [Gem] = []
         if slots.contains(.corners) || slots.contains(.topCorners) {
             out += [Gem(x: x0 + inset, y: y0 + inset, size: corner, place: "top-left"), Gem(x: x1 - inset, y: y0 + inset, size: corner, place: "top-right")]
@@ -5567,13 +5561,23 @@ public enum FrameStack {
     /// each gem goes. Gemini turns the discs into gems (Google's sketch-to-finish and semantic-mask
     /// edits) so their number, places and sizes are the code's: told a number, the model "won't
     /// always follow the exact number" (Gemini image docs), and free-placed gems came back scattered.
-    public static func guide(_ frame: [UInt8], width w: Int, height h: Int, gems: [Gem]) -> [UInt8] {
+    public static func guide(_ frame: [UInt8], width w: Int, height h: Int, gems: [Gem], cut: GemCut = .round) -> [UInt8] {
         var px = frame
         for g in gems {
-            let r = g.size / 2, ring = max(2, g.size * 0.04)
-            for (x, y, d) in spot(g, radius: r, w, h) where d <= r {
-                let v: UInt8 = d > r - ring ? 20 : 255, i = (y * w + x) * 4
-                px[i] = v; px[i + 1] = v; px[i + 2] = v; px[i + 3] = 255
+            let r = g.size / 2
+            // Pointing out from the frame's centre — a marquise into its corner, a pear hanging from
+            // the bottom — or upright for a heart, a square and a crest jewel.
+            var dx = g.x - Double(w) / 2, dy = g.y - Double(h) / 2
+            if cut.upright || g.place == "crest" || (dx == 0 && dy == 0) { dx = 0; dy = -1 }
+            else if cut.alongBand { (dx, dy) = (-dy, dx) }
+            let n = (dx * dx + dy * dy).squareRoot(), cx = dx / n, cy = dy / n
+            for (x, y, _) in spot(g, radius: r * 1.05, w, h) {
+                let ox = Double(x) - g.x, oy = Double(y) - g.y
+                let u = (ox * cx + oy * cy) / r, v = (-ox * cy + oy * cx) / r
+                guard cut.contains(u, v) else { continue }
+                let edge = !cut.contains(u * 1.08, v * 1.08)
+                let value: UInt8 = edge ? 20 : 255, i = (y * w + x) * 4
+                px[i] = value; px[i + 1] = value; px[i + 2] = value; px[i + 3] = 255
             }
         }
         return px
@@ -5619,15 +5623,23 @@ public enum FrameStack {
     /// and the frame away from the gems must not have moved: the gems are cut from the edit by
     /// their spots and laid on the frame as drawn. Test 2's frames measured 0.56–0.74 changed,
     /// ≤ 11% off, 7.8–9.9:1 and ≤ 0.9% drift (2026-10-02).
-    public static func check(base: [UInt8], edit: [UInt8], width w: Int, height h: Int,
-                             window o: (x: Int, y: Int, w: Int, h: Int), down: Double, gems: [Gem]) -> GemCheck {
+    static func check(base: [UInt8], edit: [UInt8], width w: Int, height h: Int,
+                             window o: (x: Int, y: Int, w: Int, h: Int), down: Double, gems: [Gem], backing: RGB8? = nil) -> GemCheck {
         var c = GemCheck()
         guard base.count == w * h * 4, edit.count == base.count else { c.problems = ["the edit came back the wrong size"]; return c }
         func lum(_ px: [UInt8], _ i: Int) -> Double { luminance(px[i], px[i + 1], px[i + 2]) }
         // The rim between a corner and the centre, as drawn.
         var rim: [Double] = [], rimIdx: [Int] = []
-        for y in max(0, Int(Double(o.y) - down * 0.7))..<max(0, Int(Double(o.y) - down * 0.3)) {
-            for x in (o.x + o.w * 3 / 10)..<(o.x + o.w * 4 / 10) where x < w { rim.append(lum(base, (y * w + x) * 4)); rimIdx.append((y * w + x) * 4) }
+        if let b = backing {
+            // The frame just around each gem, any shape: its pixels between 1.3 and 1.7 of the gem's radius.
+            for g in gems { for (x, y, d) in spot(g, radius: g.size * 0.85, w, h) where d >= g.size * 0.65 {
+                let i = (y * w + x) * 4
+                if abs(Int(base[i]) - Int(b.r)) + abs(Int(base[i + 1]) - Int(b.g)) + abs(Int(base[i + 2]) - Int(b.b)) > 90 { rim.append(lum(base, i)); rimIdx.append(i) }
+            } }
+        } else {
+            for y in max(0, Int(Double(o.y) - down * 0.7))..<max(0, Int(Double(o.y) - down * 0.3)) {
+                for x in (o.x + o.w * 3 / 10)..<(o.x + o.w * 4 / 10) where x < w { rim.append(lum(base, (y * w + x) * 4)); rimIdx.append((y * w + x) * 4) }
+            }
         }
         let lf = rim.isEmpty ? 0 : rim.sorted()[rim.count / 2]
         let rimLab = medianLab(base, rimIdx)
@@ -10121,6 +10133,8 @@ public enum GDDAssetPrompts {
                         "gems": text(SetDesignRules.maxFamily, "The gem the top pays' frames are set with, in this theme's own terms, no colour; under 15 words."),
                         "gemLayout": ["type": "STRING", "enum": GemLayout.allCases.map(\.rawValue)],
                         "frameShape": ["type": "STRING", "enum": FrameShape.allCases.map(\.rawValue)],
+                        "frameWeight": ["type": "STRING", "enum": FrameWeight.allCases.map(\.rawValue)],
+                        "gemCut": ["type": "STRING", "enum": GemCut.allCases.map(\.rawValue)],
                     ],
                 ],
             ],
@@ -10276,10 +10290,15 @@ public enum GDDAssetPrompts {
           and HP1's is a richer version of that same frame. The MEDIUM PAYS share one plainer square
           frame of their own, with no gems. Write in "frameShape" the pay frames' outline, as this studio's
           themes have them: "Octagon" (clipped corners) for classic Vegas, sevens and bells; "Rounded" for
-          organic, tribal or cartoon worlds; "Square" for Egyptian, Asian and Renaissance frames and most
-          others. Write in "gemLayout" where the top pays' gems sit: "Top corners" for Egyptian (red
+          organic, tribal or cartoon worlds; "Round" for Asian or celestial ones; "Arched" for temples,
+          cathedrals and fairy-tale castles; "Shield" for knights and heraldry; "Diamond" for jewels; "Square"
+          for Egyptian and Renaissance frames and most others. "frameWeight" is its band: "Slim" for picture
+          frames, classic and glamour sets (most), "Medium" for carved wood or vines, "Heavy" for stone and
+          monumental worlds. Write in "gemLayout" where the top pays' gems sit: "Top corners" for Egyptian (red
           cabochons), "Side centres" for Asian (a gem at the middle of each side between lattice corners),
-          "Corners" for glamour, royal or treasure themes, "None" for classic Vegas. This studio's frames are SLIM — a narrow moulding about a
+          "Corners" for glamour, royal or treasure themes, "None" for classic Vegas; and in "gemCut" their cut,
+          as the theme would cut them (Egyptian cabochons, glamour round or heart brilliants, a fairy tale's
+          pear or oval, an Asian jade cabochon, an Art Deco emerald or princess cut). This studio's frames are SLIM — a narrow moulding about a
           twelfth of the frame's width, ornament concentrated at the corners — never a wide carved border or
           a second inner rim, so the symbol inside fills most of it. Describe these frames in "families" (highPayFrame, hp1Frame,
           mediumPayFrame); they are drawn once and every pay symbol is painted into a copy, so a
@@ -10304,7 +10323,8 @@ public enum GDDAssetPrompts {
           "families": {"jackpot": "<shared construction>", "wysiwyg": "<…>", "lowPay": "<…>",
                        "highPayFrame": "<the high pays' frame>", "hp1Frame": "<how HP1's is richer>", "mediumPayFrame": "<…>",
                        "gems": "<the gem the top pays' frames are set with>",
-                       "gemLayout": "<Corners | Top corners | Side centres | None>", "frameShape": "<Square | Rounded | Octagon>"},
+                       "gemLayout": "<Corners | Top corners | Side centres | None>", "gemCut": "<\(GemCut.allCases.map(\.rawValue).joined(separator: " | "))>",
+                       "frameShape": "<\(FrameShape.allCases.map(\.rawValue).joined(separator: " | "))>", "frameWeight": "<Slim | Medium | Heavy>"},
           "assets": [
             {"id": "<slot id>", "subject": "<one sentence: what it is, its material and colour>",
              "silhouette": "<one or two words>", "shape": "<outline class>", "hue": "<colour family>",
@@ -11285,25 +11305,157 @@ public enum GemLayout: String, CaseIterable, Sendable {
     }
 }
 
-/// The pay frames' outline, by theme: classic Vegas octagons with clipped corners (the sevens, bells
-/// and Dodge sets), rounded squares for organic and cartoon themes (Tiki Titans' stone), square for
-/// Egyptian, Asian and Renaissance frames. The planner's "frameShape"; the ring a frame is drawn on is
-/// cut to it (FrameStack.frameTemplate), so the outline is the code's.
+/// The pay frames' outline, by theme (114 games' shipped symbols, 2026-10-02): classic Vegas
+/// octagons with clipped corners (the sevens, bells and Dodge sets), rounded squares for organic and
+/// cartoon worlds (Tiki Titans' stone), round for Asian and celestial ones (Dragon's Blessings),
+/// arched tops for temples and fairy tales, shields for knights and heraldry, diamonds for jewels
+/// (101 Drums), square for Egyptian and Renaissance frames and most others. The planner's
+/// "frameShape"; the moulding a frame is drawn on is cut to it (FrameGeometry), so the outline is
+/// the code's while its ornament may spread past it.
 public enum FrameShape: String, CaseIterable, Sendable {
-    case square = "Square", rounded = "Rounded", octagon = "Octagon"
+    case square = "Square", rounded = "Rounded", octagon = "Octagon", round = "Round", arched = "Arched",
+         shield = "Shield", diamond = "Diamond"
     public static let key = "frameShape"
     public init(_ design: SetDesign) {
         let v = (design.families[Self.key] ?? "").lowercased()
-        self = v.contains("oct") || v.contains("clip") ? .octagon : v.contains("round") ? .rounded : .square
+        self = v.contains("oct") || v.contains("clip") ? .octagon : v.contains("arch") ? .arched : v.contains("shield") ? .shield
+            : v.contains("diamond") ? .diamond : v.hasPrefix("round") && !v.contains("rounded") ? .round
+            : v.contains("rounded") || v.contains("round") ? .rounded : .square
     }
-    /// Its corner — a rounded one's radius, an octagon's cut along each edge — as a share of its side.
-    public var corner: Double { switch self { case .square: return 0; case .rounded: return 0.12; case .octagon: return 0.13 } }
     var words: String {
         switch self {
         case .square: return "a square"
         case .rounded: return "a square with rounded corners"
         case .octagon: return "an octagon — a square with its corners clipped"
+        case .round: return "a circle"
+        case .arched: return "an arch — round at the top, square at the bottom"
+        case .shield: return "a shield — square at the top, pointed at the bottom"
+        case .diamond: return "a diamond — a square standing on its point"
         }
+    }
+}
+
+/// How wide a frame's band is, by style: slim for picture frames, classic and glamour sets (Tiki
+/// Titans' shipped file: 8% of the frame's width), heavier for carved wood and stone. The planner's
+/// "frameWeight". Told in words, Gemini drew 17–25% whatever was asked (2026-10-02).
+public enum FrameWeight: String, CaseIterable, Sendable {
+    case slim = "Slim", medium = "Medium", heavy = "Heavy"
+    public static let key = "frameWeight"
+    public init(_ design: SetDesign) {
+        let v = (design.families[Self.key] ?? "").lowercased()
+        self = v.hasPrefix("heavy") ? .heavy : v.hasPrefix("medium") ? .medium : .slim
+    }
+    /// The band's width as a share of the frame's.
+    public var rim: Double { switch self { case .slim: return 0.075; case .medium: return 0.095; case .heavy: return 0.12 } }
+}
+
+/// The cut of a set's gems — the planner's "gemCut", from its theme. Each gem's mark in the gem pass is
+/// drawn in it, pointing out from the frame's centre, so the stone comes back that shape: told only
+/// "bean-shaped", the round discs came back round or oval.
+public enum GemCut: String, CaseIterable, Sendable {
+    case round = "Round", oval = "Oval", marquise = "Marquise", pear = "Pear", emerald = "Emerald", princess = "Princess",
+         heart = "Heart", trillion = "Trillion", cabochon = "Cabochon"
+    public static let key = "gemCut"
+    public init(_ design: SetDesign) {
+        let v = (design.families[Self.key] ?? "").lowercased()
+        self = GemCut.allCases.first { v.hasPrefix($0.rawValue.lowercased()) } ?? .round
+    }
+    /// Whether a point is inside the cut: `u` along the gem's pointing axis and `v` across it, both in
+    /// half-sizes (−1…1).
+    func contains(_ u: Double, _ v: Double) -> Bool {
+        switch self {
+        case .round: return u * u + v * v <= 1
+        case .oval, .cabochon: return u * u + (v / 0.72) * (v / 0.72) <= 1
+        case .marquise: return abs(u) <= 1 && abs(v) <= 0.58 * (1 - u * u)
+        case .pear:
+            let c = (u + 0.25) * (u + 0.25) + v * v <= 0.72 * 0.72
+            return c || (u >= -0.25 && u <= 1 && abs(v) <= 0.72 * (1 - u) / 1.25)
+        case .emerald: return abs(u) <= 1 && abs(v) <= 0.72 && abs(u) + abs(v) <= 1.5
+        case .princess: return abs(u) <= 0.82 && abs(v) <= 0.82
+        case .heart:
+            let x = v * 1.15, y = -u * 1.15 + 0.15
+            let k = x * x + y * y - 1
+            return k * k * k - x * x * y * y * y <= 0
+        case .trillion: return u <= 0.95 && u >= -0.55 && abs(v) <= (0.95 - u) * 0.6
+        }
+    }
+    /// How its mark is turned: upright with the frame (a heart, a square, an emerald, a round), along
+    /// the band (an oval, a cabochon), or pointing out from the frame's centre (a marquise into its
+    /// corner, a pear hanging, a trillion).
+    var upright: Bool { self == .heart || self == .princess || self == .round || self == .emerald }
+    var alongBand: Bool { self == .oval || self == .cabochon }
+    var words: String { self == .cabochon ? "a smooth domed cabochon" : "\(rawValue.lowercased())-cut" }
+}
+
+/// A tier frame's geometry, as Navigator draws its moulding (FrameStack.frameTemplate): its outline
+/// (`shape`), its band's width (`rim`, a share of its side) and its size in the image (`outer`). The
+/// opening and the band's centre line come from it, so gems are placed and the window is known by
+/// construction, for every shape.
+public struct FrameGeometry: Sendable {
+    public var shape: FrameShape, rim: Double, outer: Double = 0.85
+    public init(shape: FrameShape = .square, rim: Double = FrameWeight.slim.rim, outer: Double = 0.85) { self.shape = shape; self.rim = rim; self.outer = outer }
+    public init(_ design: SetDesign) { self.init(shape: FrameShape(design), rim: FrameWeight(design).rim) }
+    var a: Double { outer / 2 }
+    /// The band's width in the image's units.
+    var t: Double { rim * outer }
+    /// Signed distance to the outline, in the image's units (negative inside), from the image's centre.
+    func dist(_ px: Double, _ py: Double) -> Double {
+        let x = abs(px), y = abs(py)
+        switch shape {
+        case .square: return max(x, y) - a
+        case .rounded:
+            let r = 0.12 * outer, qx = x - (a - r), qy = y - (a - r)
+            return (max(qx, 0) * max(qx, 0) + max(qy, 0) * max(qy, 0)).squareRoot() + min(max(qx, qy), 0) - r
+        case .octagon: return max(max(x, y) - a, (x + y - (2 * a - 0.13 * outer)) / 2.0.squareRoot())
+        case .round: return (px * px + py * py).squareRoot() - a
+        case .arched: return py < 0 ? (px * px + py * py).squareRoot() - a : max(x - a, py - a)
+        case .shield: return max(max(-py - a, x - a), 0.6 * x + 0.8 * py - 0.8 * a)
+        case .diamond: return (x + y - a) / 2.0.squareRoot()
+        }
+    }
+    /// The opening's bounding box on a `w`×`h` image.
+    public func opening(width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int) {
+        // Walk the centre lines out to the band's inner edge.
+        func reach(_ dx: Double, _ dy: Double) -> Double {
+            var lo = 0.0, hi = 0.75
+            for _ in 0..<40 { let m = (lo + hi) / 2; if dist(dx * m, dy * m) <= -t { lo = m } else { hi = m } }
+            return lo
+        }
+        let l = reach(-1, 0), r = reach(1, 0), u = reach(0, -1), d = reach(0, 1)
+        let x0 = Int(((0.5 - l) * Double(w)).rounded()), y0 = Int(((0.5 - u) * Double(h)).rounded())
+        return (x0, y0, Int(((0.5 + r) * Double(w)).rounded()) - x0, Int(((0.5 + d) * Double(h)).rounded()) - y0)
+    }
+    /// The point on the band's centre line out from the centre along (dx, dy), in the image's units.
+    func centreLine(_ dx: Double, _ dy: Double, depth: Double = 0.5) -> (Double, Double) {
+        let n = (dx * dx + dy * dy).squareRoot(), ux = dx / n, uy = dy / n
+        var lo = 0.0, hi = 0.75
+        for _ in 0..<40 { let m = (lo + hi) / 2; if dist(ux * m, uy * m) <= -t * depth { lo = m } else { hi = m } }
+        return (ux * lo, uy * lo)
+    }
+    /// Where each gem of `slots` sits on a `w`-wide image: on the band's centre line, by the shape's
+    /// own corners and sides (a diamond's corners are its points); the crest jewel near its top edge.
+    public func gems(_ slots: [GemSlot], width w: Int, height h: Int) -> [Gem] {
+        let tp = t * Double(w), corner = 0.85 * tp, side = 0.8 * tp
+        func at(_ dx: Double, _ dy: Double, _ size: Double, _ place: String, depth: Double = 0.5) -> Gem {
+            let p = centreLine(dx, dy, depth: depth)
+            return Gem(x: (0.5 + p.0) * Double(w), y: (0.5 + p.1) * Double(h), size: size, place: place)
+        }
+        let diag = shape == .diamond
+        var out: [Gem] = []
+        if slots.contains(.corners) || slots.contains(.topCorners) {
+            out += diag ? [at(-1, 0, corner, "left-point"), at(1, 0, corner, "right-point")]
+                        : [at(-1, -1, corner, "top-left"), at(1, -1, corner, "top-right")]
+        }
+        if slots.contains(.corners) {
+            out += diag ? [at(0, 1, corner, "bottom-point"), at(0, -1, corner, "top-point")]
+                        : [at(-1, 1, corner, "bottom-left"), at(1, 1, corner, "bottom-right")]
+        }
+        if slots.contains(.sides) {
+            out += diag ? [at(-1, -1, side, "top"), at(1, -1, side, "right"), at(1, 1, side, "bottom"), at(-1, 1, side, "left")]
+                        : [at(0, -1, side, "top"), at(1, 0, side, "right"), at(0, 1, side, "bottom"), at(-1, 0, side, "left")]
+        }
+        if slots.contains(.crest) { out.append(at(0, -1, 1.05 * tp, "crest", depth: 0.15)) }
+        return out
     }
 }
 
@@ -13170,16 +13322,17 @@ extension GDDAssetPrompts {
             : (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
             + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."
                 : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
-        // Shown a ring, Gemini kept its outer edge and drew an inner liner inside its opening, which
-        // shrank the window to 49–63% of the frame (2026-10-02): the opening is said to be the window.
-        let ring = "Edit the last attached image: its flat grey ring — \(FrameShape(design).words) — marks exactly where the frame goes. Turn the ring into the frame described below — its outer edge, its opening and its narrow rim exactly where the ring's are\(single && crestOK ? ", except for a crest that rises above the ring at the top centre" : "") — and keep everything outside it the flat background. The ring's opening IS the window: nothing is drawn inside it — no inner liner, bevel, step, moulding or second border inside the ring's inner edge."
+        // Shown a flat ring, Gemini kept its outer edge and designed its own thick frame inward (17–25%
+        // rims, 2026-10-02): it is shown a plain moulding of the right widths to repaint instead.
+        let geo = FrameGeometry(design)
+        let ring = "Edit the last attached image: it is a plain grey moulding — \(geo.shape.words) — with exactly this frame's outline, narrow width and inner lip. Repaint it as the frame described below: its surface becomes this theme's material, carving and ornament, keeping the same narrow band, the same inner lip and the same opening. Its ornament — corner pieces, flourishes\(single && crestOK ? ", and a crest at the top centre" : "") — may spread a little past its outer edge onto the background, never inward: the opening inside the inner lip stays the flat background, with nothing drawn in it — no liner, second border or step."
         return ([
             template && single ? "\(ring) It is the empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
             : template ? "\(ring) It is the empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of it, so it holds each in turn and carries nothing of any of them."
             : single
                 ? "Create one empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
                 : "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of this frame, so it holds each in turn and carries nothing of any of them.",
-            "THE FRAME: \(spec).\(rung) A square frame seen straight on, upright and level\(template ? "" : ", centred and filling about 85% of the image with an even margin"). \(slim) \(panel)",
+            "THE FRAME: \(spec).\(rung) Seen straight on, upright and level\(template ? "" : ", centred and filling about 85% of the image with an even margin"). \(template ? "" : slim) \(panel)",
         ] + parts + [
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
             backdropLine(backing),
@@ -13725,16 +13878,16 @@ extension GDDAssetPrompts {
         let count = ["", "one", "two", "three", "four", "five", "six"]
         let discs: String, alike: String
         if ring.n > 0 && slots.contains(.crest) {
-            discs = "the \(count[ring.n + 1]) flat white discs — the \(count[ring.n]) \(ring.words) and the larger one in the crest at the top centre"
+            discs = "the \(count[ring.n + 1]) flat white marks — the \(count[ring.n]) \(ring.words) and the larger one in the crest at the top centre"
             alike = "The \(count[ring.n]) gems \(ring.words) are identical; the crest gem is the larger centrepiece."
         } else if ring.n > 0 {
-            discs = "the \(count[ring.n]) flat white discs \(ring.words)"; alike = "The \(count[ring.n]) gems are identical."
-        } else { discs = "the one flat white disc in the crest at the top centre"; alike = "It is the frame's centrepiece." }
+            discs = "the \(count[ring.n]) flat white marks \(ring.words)"; alike = "The \(count[ring.n]) gems are identical."
+        } else { discs = "the one flat white mark in the crest at the top centre"; alike = "It is the frame's centrepiece." }
         var gem = FrameRules.gem(design)
         gem = gem.prefix(1).lowercased() + gem.dropFirst()
         return "Using the provided image of an empty slot-game frame for \(whose) of a game themed “\(theme.name)”, change only \(discs). "
-            + "Turn each disc into a gem of this kind — \(gem) — held by the frame's own ornament: at each spot the frame's own carving grows around the gem as its setting, curling over its edges like claws of the frame's own material, so the gem sits IN the frame — not on top of it as a separate plate, badge or bezel. "
-            + "Each gem is exactly where its disc is, at the disc's size. \(alike) "
+            + "Turn each mark into a gem of this kind — \(gem)\(design.families[GemCut.key] == nil ? "" : ", \(GemCut(design).words), its mark's outline being its cut") — held by the frame's own ornament: at each spot the frame's own carving grows around the gem as its setting, curling over its edges like claws of the frame's own material, so the gem sits IN the frame — not on top of it as a separate plate, badge or bezel. "
+            + "Each gem is exactly where its mark is, in its mark's shape and size. \(alike) "
             + "The stones are \(gemColour(job.hue)), glowing from within, with brilliant white glints — so they stand out clearly against the frame even when the symbol is shown small. "
             + "Keep everything else in the image exactly the same: the frame's shape, carving, metal and lighting, its size and position, and the flat \(backing.name) background — preserving the original style, lighting and composition. "
             + "The window inside the frame stays completely empty: flat \(backing.name), with nothing added there. No other gems, no text."

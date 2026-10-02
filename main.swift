@@ -24762,8 +24762,8 @@ final class GDDToAssetsRun: ObservableObject {
             if r == RenderPlan.themeArt { d = themeArt }
             else if r == RenderPlan.setSoFar { d = setSoFarPNG(excluding: id, folder: folder) }
             else if r == RenderPlan.frameTemplate {
-                let (b, shape) = Thread.isMainThread ? (backing.rgb, FrameShape(styledDesign)) : DispatchQueue.main.sync { (self.backing.rgb, FrameShape(self.styledDesign)) }
-                d = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: 1536, backing: b, shape: shape), width: 1536, height: 1536,
+                let (b, geo) = Thread.isMainThread ? (backing.rgb, FrameGeometry(styledDesign)) : DispatchQueue.main.sync { (self.backing.rgb, FrameGeometry(self.styledDesign)) }
+                d = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: 1536, backing: b, geometry: geo), width: 1536, height: 1536,
                                                space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG)
             }
             else {
@@ -25289,10 +25289,17 @@ final class GDDToAssetsRun: ObservableObject {
               let base = ChromaKeyOutputRules.straightRGBA8(cg) else { return fail("\(ctx.frame) is missing") }
         let w = cg.width, h = cg.height
         let keyed = FrameStack.keyed(base, backing: ctx.backing)
-        guard let win = LayerizeAssembly.opening(keyed, width: w, height: h),
-              let rim = FrameStack.rim(keyed, width: w, height: h, window: win) else { return fail("\(ctx.frame) has no open window to measure its rim from") }
-        let gems = FrameStack.gemCentres(ctx.slots, window: win, rim: rim, shape: DispatchQueue.main.sync { FrameShape(self.styledDesign) })
-        guard let guideCG = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.guide(base, width: w, height: h, gems: gems), width: w, height: h, space: space),
+        guard let win = LayerizeAssembly.opening(keyed, width: w, height: h) else { return fail("\(ctx.frame) has no open window") }
+        let rim = FrameStack.rim(keyed, width: w, height: h, window: win)
+        // A frame that keeps its moulding's opening is placed by its geometry, any shape; one that does
+        // not (drawn before the moulding, or kept thick) by its measured rim.
+        let (geo, cut) = DispatchQueue.main.sync { (FrameGeometry(self.styledDesign), GemCut(self.styledDesign)) }
+        let planned = geo.opening(width: w, height: h)
+        let keeps = [win.x - planned.x, win.y - planned.y, (planned.x + planned.w) - (win.x + win.w), (planned.y + planned.h) - (win.y + win.h)]
+            .allSatisfy { abs($0) <= w / 50 }
+        guard keeps || rim != nil else { return fail("\(ctx.frame) has no rim to measure its gems' places from") }
+        let gems = keeps ? geo.gems(ctx.slots, width: w, height: h) : FrameStack.gemCentres(ctx.slots, window: win, rim: rim!)
+        guard let guideCG = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.guide(base, width: w, height: h, gems: gems, cut: cut), width: w, height: h, space: space),
               let guidePNG = encodePNG(guideCG) else { return fail("the guide could not be drawn") }
         DispatchQueue.main.async { self.status = "Setting \(symbol)'s gems into its frame…" }
         ctx.log.write("prompts/\(id).txt", "MODE: gem pass\nATTACHED: \(ctx.frame), with a white disc where each gem goes\n\n\(ctx.prompt)")
@@ -25312,7 +25319,7 @@ final class GDDToAssetsRun: ObservableObject {
                 c.interpolationQuality = .high
                 c.draw(out, in: CGRect(x: 0, y: 0, width: w, height: h))
                 if let img = c.makeImage(), let edit = ChromaKeyOutputRules.straightRGBA8(img) {
-                    check = FrameStack.check(base: base, edit: edit, width: w, height: h, window: win, down: rim.down, gems: gems)
+                    check = FrameStack.check(base: base, edit: edit, width: w, height: h, window: win, down: rim?.down ?? geo.t * Double(h), gems: gems, backing: ctx.backing)
                     png = encodePNG(img)
                 }
             }
@@ -25366,7 +25373,7 @@ final class GDDToAssetsRun: ObservableObject {
         let started = Date()
         // Drawn on the slim ring, its rim is measured: one drawn thick is drawn once more (ponytail:
         // the thinner of the two is kept either way).
-        let (b, shape) = DispatchQueue.main.sync { (self.backing.rgb, FrameShape(self.styledDesign)) }
+        let (b, geo) = DispatchQueue.main.sync { (self.backing.rgb, FrameGeometry(self.styledDesign)) }
         func sideRim(_ png: Data) -> Double? {
             guard let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
             let k = FrameStack.keyed(px, backing: b)
@@ -25374,20 +25381,34 @@ final class GDDToAssetsRun: ObservableObject {
                   let e = LayerizeAssembly.extent(k, width: cg.width, height: cg.height), e.w > 0 else { return nil }
             return Double(win.x - e.x) / Double(e.w)
         }
-        // The window is the ring's opening, whatever was drawn inside it; only then is the rim measured.
+        // Drawn on the moulding, a frame keeps its inner lip, or it is drawn again: never cut back
+        // (the art director, 2026-10-02 — a cut-back inside looked chopped). A sliver just past the
+        // lip is cleaned; past 1.5% of the image it is drawn once more, and if it is still thick it is
+        // kept whole, as drawn, and said so.
         let templated = refs.last == RenderPlan.frameTemplate
-        func cleared(_ png: Data?) -> Data? {
+        func reach(_ png: Data?) -> Double? {
+            guard templated, let png, let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            return FrameStack.encroachment(px, width: cg.width, height: cg.height, backing: b, geometry: geo)
+        }
+        func cleaned(_ png: Data?) -> Data? {
             guard templated, let png, let cg = loadCGImage(data: png), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { return png }
-            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b, shape: shape)
+            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b, geometry: geo)
             return ChromaKeyOutputRules.image(straightRGBA8: px, width: cg.width, height: cg.height, space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG) ?? png
         }
         var r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
-        r.png = cleared(r.png)
-        if templated, let png = r.png, let rim = sideRim(png), rim > 0.14 {
-            navLog(String(format: "gdd frame: %@ came back with a %.0f%% rim — drawing it once more", step.id, rim * 100))
+        var into = reach(r.png) ?? 0
+        if templated, r.png != nil, into > 0.015 {
+            navLog(String(format: "gdd frame: %@ came back %.1f%% inside its lip — drawing it once more", step.id, into * 100))
             let again = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
             r.cost += again.cost
-            if let p2 = cleared(again.png), let rim2 = sideRim(p2), rim2 < rim { r.png = p2 }
+            if let p2 = again.png, let e2 = reach(p2), e2 < into { r.png = p2; into = e2 }
+        }
+        if templated, r.png != nil {
+            if into <= 0.015 { r.png = cleaned(r.png) }
+            else {
+                navLog(String(format: "gdd frame: %@ is %.1f%% thicker than planned on its inside — kept whole, as drawn; redraw it in review to try again", step.id, into * 100))
+                log.event(["step": "frame-thick", "id": step.id, "inside": into])
+            }
         }
         if let png = r.png {
             navLog(String(format: "gdd frame: %@ rim %.0f%% of its width", step.id, (sideRim(png) ?? 0) * 100))
@@ -26159,7 +26180,7 @@ extension GDDToAssetsRun {
             hue.merge(hs) { a, _ in a }
         }
         typealias Frame = (px: [UInt8], w: Int, h: Int, window: (x: Int, y: Int, w: Int, h: Int), inside: [Bool], grey: [UInt8], depth: Double,
-                           glow: [UInt8])
+                           glow: [UInt8], floor: [Int])
         var frames: [String: Frame] = [:]
         for id in ids {
             guard let fid = frameOf[id] else { failed[id] = "it has no frame"; continue }
@@ -26172,9 +26193,11 @@ extension GDDToAssetsRun {
                 else { failed[id] = "\(fid) has no open window"; continue }
                 // The glow around the frame: its own layer, which Spine pulses in a win (the
                 // generator's frame_glow; 51 of its 69 games have one).
-                frames[fid] = (f.px, f.w, f.h, win, FrameStack.interior(f.px, width: f.w, height: f.h), grey,
+                let inside = FrameStack.interior(f.px, width: f.w, height: f.h)
+                frames[fid] = (f.px, f.w, f.h, win, inside, grey,
                                FrameStack.depth(grey, width: f.w, window: win, target: 0.42),
-                               FrameStack.shadow(f.px, width: f.w, height: f.h, dx: 0, dy: 0, radius: f.w / 70, strength: 0.55))
+                               FrameStack.shadow(f.px, width: f.w, height: f.h, dx: 0, dy: 0, radius: f.w / 70, strength: 0.55),
+                               FrameStack.windowFloor(f.px, inside: inside, width: f.w, height: f.h, window: win))
             }
             guard let f = frames[fid] else { continue }
             guard let a = alone[id], let e = LayerizeAssembly.extent(a.px, width: a.w, height: a.h),
@@ -26190,6 +26213,9 @@ extension GDDToAssetsRun {
             var at = FrameStack.placement(subject: e, window: f.window, cut: cut, width: fit.width, height: fit.height,
                                           ceiling: crest.map { $0.y + $0.size / 4 })
             var clipBox = cut.any ? FrameStack.clip(cut, window: f.window) : nil
+            // Below, a bust ends behind the window's own floor — a round, arched, shield or diamond
+            // window's included, not only a straight one.
+            let followsFloor = cut.bottom || faces[id] != nil
             // A bust is set by its face when one is found: as close as its rank's, centred on the face,
             // its head over the rim and its cut edge behind the window's floor (PayLadder.face).
             if let rule = faces[id], let fb = largestFace(img) {
@@ -26204,8 +26230,10 @@ extension GDDToAssetsRun {
             guard var body = canvas(crop, CGRect(x: at.x, y: at.y, width: at.w, height: at.h), W, H) else { continue }
             if let c = clipBox {
                 body.withUnsafeMutableBufferPointer { p in
-                    for y in 0..<H { for x in 0..<W where Double(x) < c.x0 || Double(x) >= c.x1 || Double(y) < c.y0 || Double(y) >= c.y1 {
-                        p[(y * W + x) * 4 + 3] = 0
+                    let o = f.window
+                    for y in 0..<H { for x in 0..<W {
+                        let under = followsFloor && y > f.floor[min(o.x + o.w - 1, max(o.x, x))]
+                        if under || Double(x) < c.x0 || Double(x) >= c.x1 || Double(y) < c.y0 || Double(y) >= c.y1 { p[(y * W + x) * 4 + 3] = 0 }
                     } }
                 }
                 if cut.any { navLog("gdd stack: \(id) is cut off along its \([cut.left ? "left" : nil, cut.right ? "right" : nil, cut.top ? "top" : nil, cut.bottom ? "bottom" : nil].compactMap { $0 }.joined(separator: " and ")) — set behind the frame's rim there") }
@@ -27692,8 +27720,9 @@ struct GDDToAssetsSheet: View {
                 let rows: [(String, String?)] = [("High pays", FrameStyle.spec(d, highPay: true)),
                                                  ("HP1", FrameStyle.richer(d)),
                                                  ("Medium pays", FrameStyle.spec(d, highPay: false)),
-                                                 ("Shape", FrameShape(d).rawValue + (d.families[FrameShape.key] == nil ? " (the planner's default)" : "")),
-                                                 ("Gems", FrameRules.gem(d) + " — " + gemPlacement(d))]
+                                                 ("Shape", FrameShape(d).rawValue + ", " + FrameWeight(d).rawValue.lowercased() + " band"
+                                                    + (d.families[FrameShape.key] == nil ? " (the planner's default)" : "")),
+                                                 ("Gems", FrameRules.gem(d) + (d.families[GemCut.key] == nil ? "" : ", \(GemCut(d).words)") + " — " + gemPlacement(d))]
                 ForEach(rows.filter { $0.1 != nil }, id: \.0) { r in
                     Text("\(r.0): \(r.1!)").font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
