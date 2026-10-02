@@ -5429,110 +5429,6 @@ public enum FrameStack {
         return floor
     }
 
-    /// The moulding a tier's frame is drawn on (opaque RGBA, `size` square): a plain grey frame of the
-    /// planned outline and width with a real cross-section — an outer bevel, a flat face, an inner lip
-    /// stepping down to the opening — lit from the upper left, on the backing. Gemini repaints its
-    /// surface in the theme's material, as the gem pass turns discs into gems: shown a flat ring it
-    /// kept only the ring's outside and built its own thick frame inward from it, liner and all
-    /// (17–25% rims, 2026-10-02); a moulding to restyle keeps its widths.
-    static func frameTemplate(size n: Int, backing b: RGB8, geometry g: FrameGeometry = FrameGeometry()) -> [UInt8] {
-        var px = [UInt8](repeating: 255, count: n * n * 4)
-        let t = g.t, h = 1.5 / Double(n), lx = -0.7071, ly = -0.7071
-        for y in 0..<n { for x in 0..<n {
-            let i = (y * n + x) * 4
-            let px0 = (Double(x) + 0.5) / Double(n) - 0.5, py0 = (Double(y) + 0.5) / Double(n) - 0.5
-            let d = g.dist(px0, py0)
-            var v: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
-            if d <= 0 && d > -t {
-                let u = -d / t                                   // 0 at the outer edge, 1 at the inner
-                var gx = g.dist(px0 + h, py0) - g.dist(px0 - h, py0), gy = g.dist(px0, py0 + h) - g.dist(px0, py0 - h)
-                let gn = max(1e-9, (gx * gx + gy * gy).squareRoot()); gx /= gn; gy /= gn
-                let facing = gx * lx + gy * ly                   // the outward normal toward the light
-                let shade: Double
-                if u < 0.03 || u > 0.97 { shade = 55 }                       // the outlines
-                else if u < 0.2 { shade = 150 + 75 * facing }                // outer bevel
-                else if u > 0.8 { shade = 128 - 70 * facing }                // inner lip, facing in
-                else { shade = 158 + 14 * facing - 22 * abs(u - 0.5) }       // the face, a soft round
-                let c = UInt8(max(0, min(255, shade)))
-                v = (c, c, c)
-            }
-            px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2
-        } }
-        return px
-    }
-    /// A sliver drawn just inside the opening, cleared to the backing — only a sliver: a frame drawn
-    /// thicker than planned is drawn again, or kept whole, never cut (the art director, 2026-10-02).
-    static func clearOpening(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry = FrameGeometry()) {
-        let o = g.opening(width: w, height: h)
-        for y in max(0, o.y)..<min(h, o.y + o.h) { for x in max(0, o.x)..<min(w, o.x + o.w)
-            where g.dist((Double(x) + 0.5) / Double(w) - 0.5, (Double(y) + 0.5) / Double(h) - 0.5) <= -g.t {
-            let i = (y * w + x) * 4
-            px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255
-        } }
-    }
-    /// The inner lip a frame is finished with: the innermost `lip` of the image across its band, next to
-    /// the planned opening. `u` 0 at the opening, 1 at the lip's outer side; nil outside it.
-    static func lipDepth(_ g: FrameGeometry, _ x: Double, _ y: Double, lip: Double) -> Double? {
-        let d = g.dist(x, y)
-        guard d > -g.t, d <= -g.t + lip else { return nil }
-        return (d + g.t) / lip
-    }
-    /// The lip guide (the art director, 2026-10-02: a cut-back inside "looks really bad"): the frame cut
-    /// back to its planned opening plus a narrow lip, and the lip drawn in as a plain grey bevelled
-    /// moulding lit from the upper left — the small, marked area Gemini repaints, as it turns the gem
-    /// pass's discs into gems, so the frame's inside edge is designed, at exactly the planned size.
-    static func lipGuide(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry, lip: Double) {
-        let hh = 1.5 / Double(w), lx = -0.7071, ly = -0.7071
-        for y in 0..<h { for x in 0..<w {
-            let fx = (Double(x) + 0.5) / Double(w) - 0.5, fy = (Double(y) + 0.5) / Double(h) - 0.5
-            let d = g.dist(fx, fy), i = (y * w + x) * 4
-            if d <= -g.t { px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255; continue }
-            guard let u = lipDepth(g, fx, fy, lip: lip) else { continue }
-            var gx = g.dist(fx + hh, fy) - g.dist(fx - hh, fy), gy = g.dist(fx, fy + hh) - g.dist(fx, fy - hh)
-            let n = max(1e-9, (gx * gx + gy * gy).squareRoot()); gx /= n; gy /= n
-            let facing = gx * lx + gy * ly
-            let shade = u < 0.12 ? 50 : u > 0.85 ? 185 + 30 * facing : 135 - 65 * facing
-            let c = UInt8(max(0, min(255, shade)))
-            px[i] = c; px[i + 1] = c; px[i + 2] = c; px[i + 3] = 255
-        } }
-    }
-    /// The lip pass's result laid onto the frame it was given: Gemini's pixels in the lip, feathered half
-    /// a lip out into the frame where it joined its carving to it, and the frame as it was everywhere
-    /// else — whatever the edit moved elsewhere is left out — with the opening the plan's, empty.
-    static func lipComposite(base: [UInt8], edit: [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry, lip: Double) -> [UInt8] {
-        var out = base
-        for y in 0..<h { for x in 0..<w {
-            let fx = (Double(x) + 0.5) / Double(w) - 0.5, fy = (Double(y) + 0.5) / Double(h) - 0.5
-            let d = g.dist(fx, fy), i = (y * w + x) * 4
-            if d <= -g.t { out[i] = b.r; out[i + 1] = b.g; out[i + 2] = b.b; out[i + 3] = 255; continue }
-            let edge = -g.t + lip
-            let k = d <= edge ? 1 : d <= edge + lip / 2 ? 1 - (d - edge) / (lip / 2) : 0
-            guard k > 0 else { continue }
-            for c in 0..<3 { out[i + c] = UInt8((Double(edit[i + c]) * k + Double(base[i + c]) * (1 - k)).rounded()) }
-        } }
-        return out
-    }
-    /// How much the lip pass changed the lip, mean RGB difference: near 0, it was left grey.
-    static func lipChanged(guide: [UInt8], edit: [UInt8], width w: Int, height h: Int, geometry g: FrameGeometry, lip: Double) -> Double {
-        var sum = 0.0, n = 0.0
-        for y in stride(from: 0, to: h, by: 2) { for x in stride(from: 0, to: w, by: 2) {
-            guard lipDepth(g, (Double(x) + 0.5) / Double(w) - 0.5, (Double(y) + 0.5) / Double(h) - 0.5, lip: lip) != nil else { continue }
-            let i = (y * w + x) * 4
-            sum += Double(abs(Int(edit[i]) - Int(guide[i])) + abs(Int(edit[i + 1]) - Int(guide[i + 1])) + abs(Int(edit[i + 2]) - Int(guide[i + 2]))) / 3; n += 1
-        } }
-        return n > 0 ? sum / n : 0
-    }
-
-    /// How far a frame drawn on the moulding reaches into its opening past the inner lip, the most of
-    /// any side, as a share of the image: 0 when it keeps to the lip.
-    static func encroachment(_ px: [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry) -> Double? {
-        let k = keyed(px, backing: b)
-        guard let win = LayerizeAssembly.opening(k, width: w, height: h) else { return nil }
-        let o = g.opening(width: w, height: h)
-        let sides = [win.x - o.x, win.y - o.y, (o.x + o.w) - (win.x + win.w), (o.y + o.h) - (win.y + win.h)]
-        return Double(max(0, sides.max() ?? 0)) / Double(w)
-    }
-
     /// A gem pass: `gems_<symbol>.png` is the symbol's frame with its rank's gems set in by a guided
     /// edit, `gems_<symbol>.json` where they are (GemPass). One per symbol, in its own colour.
     public static func gemsID(_ symbol: String) -> String { "gems_\(symbol)" }
@@ -11440,7 +11336,7 @@ public enum GemCut: String, CaseIterable, Sendable {
     var words: String { self == .cabochon ? "a smooth domed cabochon" : "\(rawValue.lowercased())-cut" }
 }
 
-/// A tier frame's geometry, as Navigator draws its moulding (FrameStack.frameTemplate): its outline
+/// A tier frame's geometry, as Navigator builds it (FrameKit.sweep): its outline
 /// (`shape`), its band's width (`rim`, a share of its side) and its size in the image (`outer`). The
 /// opening and the band's centre line come from it, so gems are placed and the window is known by
 /// construction, for every shape.
@@ -11509,6 +11405,407 @@ public struct FrameGeometry: Sendable {
         }
         if slots.contains(.crest) { out.append(at(0, -1, 1.05 * tp, "crest", depth: 0.15)) }
         return out
+    }
+}
+
+/// A tier's frame built the way a framer builds one: from a length of moulding and its ornaments, which
+/// Gemini draws on a parts sheet (`kit_<frame>.png`), joined round the frame's outline in code at exactly
+/// its planned band. Drawn whole — on a flat ring, on a shaded moulding, told "slim" and "a twelfth of the
+/// width" — every Gemini frame kept the outer edge and came back 2–3 times as thick inward (opening inset
+/// 24–29% against a planned 13.9%, every round of 2026-10-02), and cutting the excess off looked chopped.
+/// Google documents no way to hold an edit to exact geometry (no masks, no edge control); a moulding drawn
+/// on its own has its whole cross-section — both edges finished — and its width is then code. Each side is
+/// mirrored about its middle and at the corners, so every join is seamless, and it is lit from the upper
+/// left across its profile, as a moulding is: drawn lit from the front for that. Ten themes, seven shapes
+/// tested (scratch `kits/`).
+public enum FrameKit {
+    /// The parts sheet a tier's frame is built from.
+    public static func id(_ frame: String) -> String { "kit_\(frame)" }
+
+    /// Straight RGBA8 pixels.
+    public struct Piece: Equatable {
+        public var px: [UInt8], w: Int, h: Int
+        public init(px: [UInt8], w: Int, h: Int) { self.px = px; self.w = w; self.h = h }
+    }
+    /// The moulding (its top `over` rows reach past the outer edge), the top-left corner ornament and the
+    /// centre ornament.
+    public struct Parts {
+        public var strip: Piece, over: Int, corner: Piece?, centre: Piece?
+    }
+    /// How a frame is built from its parts: HP1's and HP2's are the shared one, richer.
+    public struct Build: Equatable {
+        public var cornerScale = 1.0, centre = false, metal: String? = nil
+        public init(cornerScale: Double = 1.0, centre: Bool = false, metal: String? = nil) { self.cornerScale = cornerScale; self.centre = centre; self.metal = metal }
+    }
+    /// The tier's shared frame a frame is built from: frame_HP for frame_HP1 and frame_HP2.
+    public static func sharedID(_ frame: String) -> String {
+        guard let r = FrameRules.parse(frame), let c = FrameRules.code(r.role) else { return frame }
+        return "frame_\(c)"
+    }
+    /// Whether a frame has a parts sheet of its own: a tier's shared frame, and HP1's on a one-frame
+    /// ladder — the planner writes it its own richer frame (gold leaf, a crest), which code cannot make.
+    /// The rest are built from the shared sheet: HP2's, and a ladder's rungs, its metal tinted in code.
+    public static func ownSheet(_ frame: String, design: SetDesign) -> Bool {
+        guard let r = FrameRules.parse(frame) else { return false }
+        return r.isShared || (r.rank == 1 && RankLadder(design) == .one)
+    }
+    /// The parts sheet a frame is built from.
+    public static func sheetID(_ frame: String, design: SetDesign) -> String { id(ownSheet(frame, design: design) ? frame : sharedID(frame)) }
+    /// How a frame step's frame is built: a lone high pay's and HP1's are the richest, and only an object
+    /// HP1's carries the centre ornament — a character's own head breaks out over the top there (the
+    /// studio's character HP1 frames have none: Bring 'Em In, Platinum Goddess, Da Vinci).
+    public static func build(for step: RenderStep, design: SetDesign, jobs: [AssetJob]) -> Build? {
+        guard let ref = FrameRules.parse(step.id) else { return nil }
+        let single = ref.isShared && ref.role == .highPay && step.members.count == 1
+        let symbols = jobs.filter { $0.kind == .symbol }
+        let hp1 = symbols.first { $0.role == .highPay && $0.hasFrame && FrameRules.rank(of: $0.id, in: symbols) == 1 }
+        let crest = (single || ref.rank == 1) && ref.role == .highPay && !(hp1.map { PayLadder.face($0, in: symbols) != nil } ?? false)
+        return build(ref, design: design, single: single, crest: crest)
+    }
+    public static func build(_ ref: FrameRules.Ref, design: SetDesign, single: Bool, crest: Bool) -> Build {
+        let ladder = RankLadder(design)
+        if single || ref.rank == 1 { return Build(cornerScale: 1.25, centre: crest, metal: ladder == .metal ? "gold" : nil) }
+        if ref.rank == 2 { return Build(cornerScale: 1.1, metal: ladder == .metal ? "silver" : nil) }
+        return Build()
+    }
+
+    // MARK: Parts
+
+    /// The sheet keyed off its backing: soft alpha, the backing's colour taken back out of the edges.
+    static func keyed(_ px: [UInt8], backing b: RGB8) -> [UInt8] {
+        var out = px
+        let br = Double(b.r), bg = Double(b.g), bb = Double(b.b)
+        for i in stride(from: 0, to: px.count - 3, by: 4) {
+            let r = Double(px[i]), g = Double(px[i + 1]), bl = Double(px[i + 2])
+            let d = abs(r - br) + abs(g - bg) + abs(bl - bb)
+            let a = min(1, max(0, (d - 40) / 70))
+            if a < 0.01 { out[i] = 0; out[i + 1] = 0; out[i + 2] = 0; out[i + 3] = 0; continue }
+            out[i] = UInt8(min(255, max(0, (r - (1 - a) * br) / a)))
+            out[i + 1] = UInt8(min(255, max(0, (g - (1 - a) * bg) / a)))
+            out[i + 2] = UInt8(min(255, max(0, (bl - (1 - a) * bb) / a)))
+            out[i + 3] = UInt8(a * 255)
+        }
+        return out
+    }
+
+    /// Squared Euclidean distance to the nearest `seed` (Felzenszwalb–Huttenlocher), per pixel.
+    static func distance(_ seed: [Bool], width w: Int, height h: Int) -> [Double] {
+        // finite, so the envelope's arithmetic stays exact: any real distance on a sheet is far below it
+        let inf = 1e10
+        var f = seed.map { $0 ? 0 : inf }
+        func pass(_ get: (Int) -> Double, _ set: (Int, Double) -> Void, _ n: Int) {
+            var v = [Int](repeating: 0, count: n), z = [Double](repeating: 0, count: n + 1), d = [Double](repeating: 0, count: n)
+            let g = (0..<n).map(get)
+            var k = 0; v[0] = 0; z[0] = -inf; z[1] = inf
+            for q in 1..<max(1, n) {
+                var s = 0.0
+                repeat {
+                    let p = v[k]
+                    s = ((g[q] + Double(q * q)) - (g[p] + Double(p * p))) / Double(2 * q - 2 * p)
+                    if s <= z[k] { k -= 1 } else { break }
+                } while k >= 0
+                if k < 0 { k = 0; s = -inf }
+                k += 1; v[k] = q; z[k] = s; z[k + 1] = inf
+            }
+            k = 0
+            for q in 0..<n {
+                while z[k + 1] < Double(q) { k += 1 }
+                let p = v[k]; d[q] = Double((q - p) * (q - p)) + g[p]
+            }
+            for q in 0..<n { set(q, d[q]) }
+        }
+        for x in 0..<w { pass({ f[$0 * w + x] }, { f[$0 * w + x] = $1 }, h) }
+        for y in 0..<h { pass({ f[y * w + $0] }, { f[y * w + $0] = $1 }, w) }
+        return f
+    }
+    /// A mask opened by a disc of radius `r`: what is thinner than the disc goes.
+    static func opened(_ m: [Bool], width w: Int, height h: Int, radius r: Double) -> [Bool] {
+        let toBack = distance(m.map { !$0 }, width: w, height: h)
+        let core = toBack.map { $0 > r * r }
+        let toCore = distance(core, width: w, height: h)
+        return toCore.map { $0 <= r * r }
+    }
+    /// Connected regions of `m` (8-connected): each one's pixels' bounding box and size, and the label map.
+    static func regions(_ m: [Bool], width w: Int, height h: Int) -> (labels: [Int], boxes: [(x: Int, y: Int, w: Int, h: Int, n: Int)]) {
+        var lab = [Int](repeating: -1, count: m.count), boxes: [(x: Int, y: Int, w: Int, h: Int, n: Int)] = []
+        var stack: [Int] = []
+        for s in 0..<m.count where m[s] && lab[s] < 0 {
+            let id = boxes.count; var x0 = w, y0 = h, x1 = 0, y1 = 0, n = 0
+            lab[s] = id; stack.append(s)
+            while let i = stack.popLast() {
+                let x = i % w, y = i / w; n += 1
+                x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)
+                for dy in -1...1 { for dx in -1...1 {
+                    let nx = x + dx, ny = y + dy
+                    guard nx >= 0, ny >= 0, nx < w, ny < h else { continue }
+                    let j = ny * w + nx
+                    if m[j] && lab[j] < 0 { lab[j] = id; stack.append(j) }
+                } }
+            }
+            boxes.append((x0, y0, x1 - x0 + 1, y1 - y0 + 1, n))
+        }
+        return (lab, boxes)
+    }
+    static func crop(_ px: [UInt8], width w: Int, _ x: Int, _ y: Int, _ cw: Int, _ ch: Int, only: ((Int) -> Bool)? = nil) -> Piece {
+        var out = [UInt8](repeating: 0, count: cw * ch * 4)
+        for yy in 0..<ch { for xx in 0..<cw {
+            let s = ((y + yy) * w + x + xx), d = (yy * cw + xx) * 4
+            if let only, !only(s) { continue }
+            for c in 0..<4 { out[d + c] = px[s * 4 + c] }
+        } }
+        return Piece(px: out, w: cw, h: ch)
+    }
+
+    /// The three parts of a kit sheet on its backing: the moulding (the part spanning the sheet), the corner
+    /// ornament (the leftmost of the rest) and the centre ornament (the rightmost), or nil with no moulding.
+    static func parts(_ sheet: [UInt8], width w: Int, height h: Int, backing: RGB8) -> Parts? {
+        let px = keyed(sheet, backing: backing)
+        let solid = (0..<(w * h)).map { px[$0 * 4 + 3] > 165 }
+        // Small gaps in an ornament's carving are closed first, so it is found as one part.
+        let near = distance(solid, width: w, height: h).map { $0 <= 16 }
+        let closed = distance(near.map { !$0 }, width: w, height: h).map { $0 > 16 }
+        let (lab, boxes) = regions(closed, width: w, height: h)
+        let big = boxes.indices.filter { boxes[$0].n > w * h / 500 }
+        guard let s = big.max(by: { boxes[$0].w < boxes[$1].w }), boxes[s].w > w / 2 else { return nil }
+        let b = boxes[s]
+        // Its rows: where the middle three fifths of its length are solid in most columns.
+        let x0 = b.x + b.w / 5, x1 = b.x + b.w - b.w / 5
+        var rows: [Int] = []
+        for y in b.y..<(b.y + b.h) {
+            var n = 0; for x in x0..<x1 where solid[y * w + x] { n += 1 }
+            if n * 2 > x1 - x0 { rows.append(y) }
+        }
+        guard let top = rows.first, let bottom = rows.last, bottom > top else { return nil }
+        let over = min(top, (bottom - top + 1) / 4)               // a little above it, for its soft edge
+        let strip = crop(px, width: w, x0, top - over, x1 - x0, bottom + 1 - top + over)
+        let rest = big.filter { $0 != s }.sorted { boxes[$0].x < boxes[$1].x }
+        func piece(_ i: Int) -> Piece { let c = boxes[i]; return crop(px, width: w, c.x, c.y, c.w, c.h, only: { lab[$0] == i }) }
+        return Parts(strip: strip, over: over,
+                     corner: rest.first.map { unarmed(piece($0), arm: bottom + 1 - top) },
+                     centre: rest.count > 1 ? rest.last.map(piece) : nil)
+    }
+
+    /// A corner ornament without the lengths of moulding Gemini attaches to it, told not to (2026-10-02):
+    /// an arm is a straight bar about as thick as the moulding running out to the piece's far edges, and an
+    /// opening wider than it — never wider than the ornament — takes it off. A knot or a leaf bracket
+    /// reaching those edges is thinner there, or uneven, and is kept whole.
+    static func unarmed(_ p: Piece, arm: Int) -> Piece {
+        let w = p.w, h = p.h, a = Double(arm)
+        let m = (0..<(w * h)).map { p.px[$0 * 4 + 3] > 128 }
+        func bar(_ counts: [Double]) -> Bool {
+            let s = counts.sorted(), med = s[s.count / 2]
+            let mean = counts.reduce(0, +) / Double(counts.count)
+            let sd = (counts.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(counts.count)).squareRoot()
+            return med >= 0.55 * a && med <= 1.7 * a && sd < 0.2 * max(med, 1)
+        }
+        let cols = (Int(0.9 * Double(w))..<w).map { x in Double((0..<h).filter { m[$0 * w + x] }.count) }
+        let rws = (Int(0.9 * Double(h))..<h).map { y in Double((0..<w).filter { m[y * w + $0] }.count) }
+        guard !cols.isEmpty, !rws.isEmpty, bar(cols), bar(rws) else { return p }
+        let rmax = distance(m.map { !$0 }, width: w, height: h).max().map { $0.squareRoot() } ?? 0
+        let r = min(a * 1.35, 1.9 * rmax) / 2
+        let core = opened(m, width: w, height: h, radius: r)
+        guard core.contains(true) else { return p }
+        let (lab, boxes) = regions(core, width: w, height: h)
+        guard let keep = boxes.indices.max(by: { boxes[$0].n < boxes[$1].n }) else { return p }
+        // Grown back a little past the core and faded out over a short edge, so the sweep shows through.
+        let d = distance(lab.map { $0 == keep }, width: w, height: h).map { $0.squareRoot() }
+        var out = p.px; var x0 = w, y0 = h, x1 = 0, y1 = 0
+        for i in 0..<(w * h) {
+            let f = min(1, max(0, (r / 2 + r / 7 - d[i]) / (r / 3.5)))
+            out[i * 4 + 3] = UInt8(Double(out[i * 4 + 3]) * f)
+            if out[i * 4 + 3] > 8 { x0 = min(x0, i % w); x1 = max(x1, i % w); y0 = min(y0, i / w); y1 = max(y1, i / w) }
+        }
+        guard x1 > x0, y1 > y0 else { return p }
+        return crop(out, width: w, x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+
+    // MARK: Building
+
+    static func resized(_ p: Piece, _ w: Int, _ h: Int) -> Piece {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard w > 0, h > 0, let img = ChromaKeyOutputRules.image(straightRGBA8: p.px, width: p.w, height: p.h, space: space),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return p }
+        ctx.interpolationQuality = .high
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let out = ctx.makeImage(), let px = ChromaKeyOutputRules.straightRGBA8(out) else { return p }
+        return Piece(px: px, w: w, h: h)
+    }
+    static func flipped(_ p: Piece, x fx: Bool, y fy: Bool) -> Piece {
+        var out = p.px
+        for y in 0..<p.h { for x in 0..<p.w {
+            let s = ((fy ? p.h - 1 - y : y) * p.w + (fx ? p.w - 1 - x : x)) * 4, d = (y * p.w + x) * 4
+            for c in 0..<4 { out[d + c] = p.px[s + c] }
+        } }
+        return Piece(px: out, w: p.w, h: p.h)
+    }
+    /// Turned clockwise (on screen) by `deg`, onto a canvas that holds it.
+    static func turned(_ p: Piece, degrees deg: Double) -> Piece {
+        let a = deg * .pi / 180, c = cos(a), s = sin(a)
+        let w = Int((abs(Double(p.w) * c) + abs(Double(p.h) * s)).rounded(.up)), h = Int((abs(Double(p.w) * s) + abs(Double(p.h) * c)).rounded(.up))
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        let cx = Double(w) / 2, cy = Double(h) / 2, sx = Double(p.w) / 2, sy = Double(p.h) / 2
+        for y in 0..<h { for x in 0..<w {
+            let dx = Double(x) + 0.5 - cx, dy = Double(y) + 0.5 - cy
+            let ux = c * dx + s * dy + sx, uy = -s * dx + c * dy + sy
+            let ix = Int(ux), iy = Int(uy)
+            guard ix >= 0, iy >= 0, ix < p.w, iy < p.h else { continue }
+            let si = (iy * p.w + ix) * 4, d = (y * w + x) * 4
+            for k in 0..<4 { out[d + k] = p.px[si + k] }
+        } }
+        return Piece(px: out, w: w, h: h)
+    }
+    /// `p` laid over `dst` (straight alpha) with its top-left at (x, y).
+    static func over(_ dst: inout [UInt8], width n: Int, _ p: Piece, at x: Int, _ y: Int) {
+        for yy in 0..<p.h { for xx in 0..<p.w {
+            let X = x + xx, Y = y + yy
+            guard X >= 0, Y >= 0, X < n, Y < n else { continue }
+            let s = (yy * p.w + xx) * 4, d = (Y * n + X) * 4
+            let sa = Double(p.px[s + 3]) / 255; guard sa > 0 else { continue }
+            let da = Double(dst[d + 3]) / 255, oa = sa + da * (1 - sa)
+            for c in 0..<3 {
+                dst[d + c] = UInt8(min(255, (Double(p.px[s + c]) * sa + Double(dst[d + c]) * da * (1 - sa)) / oa))
+            }
+            dst[d + 3] = UInt8(min(255, oa * 255))
+        } }
+    }
+
+    /// The outline's points (clockwise on screen), found along rays from the centre: every frame shape is
+    /// star-shaped about its centre. In pixels on an `n`-wide image.
+    static func outline(_ g: FrameGeometry, size n: Int, samples m: Int = 1024) -> [(Double, Double)] {
+        (0..<m).map { i in
+            let th = -Double.pi + 2 * Double.pi * Double(i) / Double(m)
+            let ux = cos(th), uy = sin(th)
+            var lo = 0.0, hi = 0.75
+            for _ in 0..<40 { let r = (lo + hi) / 2; if g.dist(ux * r, uy * r) <= 0 { lo = r } else { hi = r } }
+            return ((0.5 + ux * lo) * Double(n), (0.5 + uy * lo) * Double(n))
+        }
+    }
+
+    /// The frame on an `n`×`n` canvas, straight RGBA8, transparent outside it: the moulding swept round
+    /// `g`'s outline at exactly its band, then the corner ornaments, then the centre one when asked for.
+    public static func sweep(_ parts: Parts, geometry g: FrameGeometry, size n: Int, build: Build = Build(), light: Double = 0.10) -> [UInt8] {
+        let t = g.t * Double(n)
+        // The moulding at the frame's own scale: its band part exactly t tall.
+        let s0 = parts.strip, band = Double(s0.h - parts.over)
+        let k = band / t
+        let sh = max(2, Int((Double(s0.h) / k).rounded())), sw = max(2, Int((Double(s0.w) / k).rounded()))
+        let strip = resized(s0, sw, sh)
+        let pad = Double(sh) - t
+        let pts = outline(g, size: n), m = pts.count
+        var tx = [Double](repeating: 0, count: m), ty = tx, ln = tx, cum = tx
+        var total = 0.0
+        for i in 0..<m {
+            let a = pts[i], b = pts[(i + 1) % m]
+            let dx = b.0 - a.0, dy = b.1 - a.1, l = max(1e-9, (dx * dx + dy * dy).squareRoot())
+            tx[i] = dx / l; ty[i] = dy / l; ln[i] = l; cum[i] = total; total += l
+        }
+        // Each side is mirrored at its middle and at its corners: the outline's points due up, down, left
+        // and right of the centre and on its diagonals.
+        let mirrors = (0..<8).map { j in cum[(m / 8 * j) % m] }
+        func mirrorDistance(_ s: Double) -> Double {
+            var best = Double.infinity
+            for q in mirrors { let d = abs(s - q); best = min(best, d, total - d) }
+            return best
+        }
+        let lx = -0.7071, ly = -0.7071
+        var out = [UInt8](repeating: 0, count: n * n * 4)
+        let win = m / 12
+        for y in 0..<n { for x in 0..<n {
+            let fx = (Double(x) + 0.5) / Double(n) - 0.5, fy = (Double(y) + 0.5) / Double(n) - 0.5
+            let depth = -g.dist(fx, fy) * Double(n)
+            guard depth >= -pad, depth <= t else { continue }
+            // The nearest stretch of outline, searched near the pixel's own direction from the centre.
+            let px = Double(x) + 0.5, py = Double(y) + 0.5
+            let th = atan2(fy, fx), i0 = Int(((th + .pi) / (2 * .pi) * Double(m)).rounded())
+            var bestD = Double.infinity, along = 0.0, seg = 0
+            for o in -win...win {
+                let i = ((i0 + o) % m + m) % m
+                let vx = px - pts[i].0, vy = py - pts[i].1
+                let s = min(ln[i], max(0, vx * tx[i] + vy * ty[i]))
+                let qx = vx - s * tx[i], qy = vy - s * ty[i], d = qx * qx + qy * qy
+                if d < bestD { bestD = d; along = cum[i] + s; seg = i }
+            }
+            var u = mirrorDistance(along).truncatingRemainder(dividingBy: Double(2 * sw))
+            if u >= Double(sw) { u = Double(2 * sw) - u - 1 }
+            let v = min(Double(sh - 1), max(0, depth + pad))
+            // bilinear
+            let u0 = min(sw - 1, max(0, Int(u))), v0 = min(sh - 1, Int(v)), u1 = min(sw - 1, u0 + 1), v1 = min(sh - 1, v0 + 1)
+            let au = u - Double(u0), av = v - Double(v0)
+            let nx = ty[seg], ny = -tx[seg]                                  // outward
+            let tilt = cos(Double.pi * min(1, max(0, (depth + pad) / (t + pad))))
+            let gain = 1 + light * 2.2 * tilt * (nx * lx + ny * ly) + light * 0.5 * (-fx - fy)
+            let d = (y * n + x) * 4
+            var r = 0.0, gg = 0.0, bb = 0.0, al = 0.0
+            func add(_ uu: Int, _ vv: Int, _ wgt: Double) {
+                let si = (vv * sw + uu) * 4, a = Double(strip.px[si + 3]) / 255 * wgt
+                r += Double(strip.px[si]) * a; gg += Double(strip.px[si + 1]) * a; bb += Double(strip.px[si + 2]) * a; al += a
+            }
+            add(u0, v0, (1 - au) * (1 - av)); add(u1, v0, au * (1 - av)); add(u0, v1, (1 - au) * av); add(u1, v1, au * av)
+            guard al > 0 else { continue }
+            out[d] = UInt8(min(255, max(0, r / al * gain)))
+            out[d + 1] = UInt8(min(255, max(0, gg / al * gain)))
+            out[d + 2] = UInt8(min(255, max(0, bb / al * gain)))
+            out[d + 3] = UInt8(min(255, al * 255))
+        } }
+        if let metal = build.metal { tint(&out, metal) }
+        // Corner pieces about three bands across, sized against the band (not the sheet), mirrored from the
+        // top-left one so the light stays on top; on a diamond's points, turned to face out.
+        if let c = parts.corner {
+            let f = 3.0 * t * build.cornerScale / Double(max(c.w, c.h))
+            let c0 = resized(c, max(1, Int((Double(c.w) * f).rounded())), max(1, Int((Double(c.h) * f).rounded())))
+            let at = { (th: Double) -> (Double, Double) in pts[Int(((th + .pi) / (2 * .pi) * Double(m)).rounded()) % m] }
+            let hang = 0.12
+            func corner(_ th: Double, _ sx: Double, _ sy: Double) {
+                let (x, y) = at(th), p = flipped(c0, x: sx > 0, y: sy > 0)
+                let X = sx < 0 ? x - hang * Double(p.w) : x + hang * Double(p.w) - Double(p.w)
+                let Y = sy < 0 ? y - hang * Double(p.h) : y + hang * Double(p.h) - Double(p.h)
+                over(&out, width: n, p, at: Int(X), Int(Y))
+            }
+            func point(_ th: Double) {
+                let (x, y) = at(th), p = turned(c0, degrees: th * 180 / .pi + 135)
+                let cx = Double(n) / 2, r = max(1, ((x - cx) * (x - cx) + (y - cx) * (y - cx)).squareRoot())
+                over(&out, width: n, p, at: Int(x + (cx - x) / r * t / 2 - Double(p.w) / 2), Int(y + (cx - y) / r * t / 2 - Double(p.h) / 2))
+            }
+            let tl = -3 * Double.pi / 4, tr = -Double.pi / 4, br = Double.pi / 4, bl = 3 * Double.pi / 4
+            switch g.shape {
+            case .square, .rounded: corner(tl, -1, -1); corner(tr, 1, -1); corner(br, 1, 1); corner(bl, -1, 1)
+            case .arched: corner(br, 1, 1); corner(bl, -1, 1)
+            case .shield: corner(tl, -1, -1); corner(tr, 1, -1)
+            case .diamond: for th in [-Double.pi / 2, 0, Double.pi / 2, Double.pi] { point(th) }
+            case .octagon, .round: break
+            }
+        }
+        if build.centre, let c = parts.centre {
+            let f = 3.4 * t / Double(max(c.w, c.h))
+            let p = resized(c, max(1, Int((Double(c.w) * f).rounded())), max(1, Int((Double(c.h) * f).rounded())))
+            let top = pts[m / 4].1
+            over(&out, width: n, p, at: n / 2 - p.w / 2, Int(top + t / 2 - 0.6 * Double(p.h)))
+        }
+        return out
+    }
+
+    /// The frame laid on its flat backing, opaque: what an image model draws, for everything that reads a
+    /// frame that way (the gem pass, a painted sheet's frames).
+    static func onBacking(_ px: [UInt8], _ b: RGB8) -> [UInt8] {
+        var out = px
+        for i in stride(from: 0, to: px.count, by: 4) {
+            let a = Double(px[i + 3]) / 255
+            out[i] = UInt8(Double(px[i]) * a + Double(b.r) * (1 - a))
+            out[i + 1] = UInt8(Double(px[i + 1]) * a + Double(b.g) * (1 - a))
+            out[i + 2] = UInt8(Double(px[i + 2]) * a + Double(b.b) * (1 - a))
+            out[i + 3] = 255
+        }
+        return out
+    }
+    /// A rank's metal on a metal ladder: the frame's light kept, its colour moved most of the way to it.
+    static func tint(_ px: inout [UInt8], _ metal: String) {
+        let c: (Double, Double, Double) = metal == "gold" ? (1.0, 0.80, 0.38) : metal == "silver" ? (0.86, 0.89, 0.95) : (0.80, 0.55, 0.35)
+        for i in stride(from: 0, to: px.count, by: 4) where px[i + 3] > 0 {
+            let y = 0.2126 * Double(px[i]) + 0.7152 * Double(px[i + 1]) + 0.0722 * Double(px[i + 2])
+            let to = [c.0 * y * 1.15, c.1 * y * 1.15, c.2 * y * 1.15]
+            for k in 0..<3 { px[i + k] = UInt8(min(255, 0.3 * Double(px[i + k]) + 0.7 * to[k])) }
+        }
     }
 }
 
@@ -11593,11 +11890,12 @@ public enum PayLadder {
         default: return "It sits inside its frame's window, close to the rim."
         }
     }
+    static let cropWins = "Whatever the description says, nothing below that cut is in the picture — no hands, arms or held props below it."
     /// The crop and the frame lines together, each led by a space; "" when there are none.
     static func lines(_ job: AssetJob, in jobs: [AssetJob], painted: Bool) -> String {
         // The cut wins over the brief: Jack's brief put a hand with a bean at his chest as the focal
         // point, and that pulled the picture back down to his chest (2026-10-02).
-        [crop(job, in: jobs).map { "It is shown as \($0). Whatever the description says, nothing below that cut is in the picture — no hands, arms or held props below it." }, painted ? inFrame(job, in: jobs) : nil]
+        [crop(job, in: jobs).map { "It is shown as \($0). \(cropWins)" }, painted ? inFrame(job, in: jobs) : nil]
             .compactMap { $0 }.filter { !$0.isEmpty }.map { " " + $0 }.joined()
     }
 
@@ -11805,16 +12103,6 @@ public enum PanelStyle: String, CaseIterable, Sendable {
     public static func brief(_ design: SetDesign) -> String {
         let s = PanelStyle(design)
         return s == .custom ? design.families[key] ?? "" : s.brief
-    }
-    /// What a symbol painted into the frame keeps of it.
-    public var kept: String {
-        switch self {
-        case .litDepth: return "its panel's depth"
-        case .lightRays: return "its panel's rays of light"
-        case .themePattern: return "its panel's pattern"
-        case .world: return "its panel's glimpse of the world"
-        case .custom: return "its panel's treatment"
-        }
     }
 }
 
@@ -12279,8 +12567,6 @@ public struct RenderStep: Equatable, Sendable {
 /// set consistent; this is that, arranged so each image sees what it has to agree with.
 public enum RenderPlan {
     public static let themeArt = "theme-art"
-    /// The flat ring a tier's frame is drawn on, made when its step runs (FrameStack.frameTemplate).
-    public static let frameTemplate = "frame-template"
 
     /// `hasThemeArt`: whether the theme's approved artwork is available AND governs the look.
     /// The composite of every symbol already finished — built when the step runs, so a
@@ -12319,7 +12605,7 @@ public enum RenderPlan {
             guard let shared = ids.first else { continue }
             let sibling = r == .mediumPay ? frameSteps.first.map { [$0.id] } ?? [] : []
             // A lone high pay's frame is HP1's, drawn rich: named in `members` (frameBrief).
-            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling + [frameTemplate], after: sibling,
+            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling, after: sibling,
                                          members: r == .highPay && framed.count == 1 ? framed.map(\.id) : []))
             for p in ids.dropFirst() { frameSteps.append(RenderStep(id: p, mode: .frame, refs: art + [shared], after: [shared])) }
         }
@@ -13308,108 +13594,55 @@ extension GDDAssetPrompts {
         ]).joined(separator: "\n\n")
     }
 
-    /// The brief for a tier's empty frame (FrameRules). It is drawn once and every member is
-    /// painted into a copy of it, so it suits all of them and carries nothing of any one.
+    /// The brief for a tier's frame: the parts sheet it is built from (FrameKit) — a length of its
+    /// moulding, its corner ornament and, for the high pays, a centre ornament — drawn once per tier.
+    /// HP1's and HP2's frames are built from the high pays' sheet in code, so they have no brief.
     static func frameBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
                            backing: (name: String, rgb: RGB8), jobs: [AssetJob] = []) -> String {
         guard let parsed = FrameRules.parse(step.id) else { return "" }
         let role = parsed.role
-        // The only high pay's frame is HP1's: the richest, crested, set with HP1's gems — not the
-        // plain rung a tier of several shares (Chevy-Hot, one HP and four MPs, 2026-10-02).
+        // The only high pay's frame is HP1's: the richest of the set (Chevy-Hot, one HP and four MPs).
         let single = parsed.isShared && role == .highPay && step.members.count == 1
-        let ref = single ? FrameRules.Ref(role: role, rank: 1) : parsed
-        // A character HP1's own head breaks out over the top of its frame: the studio's character HP1
-        // frames have no crest there (Bring 'Em In, Platinum Goddess, Da Vinci), so it has none.
-        let symbols = jobs.filter { $0.kind == .symbol }
-        let hp1 = symbols.first { $0.role == .highPay && $0.hasFrame && FrameRules.rank(of: $0.id, in: symbols) == 1 }
-        let crestOK = ref.rank == 1 && role == .highPay && !(hp1.map { PayLadder.face($0, in: symbols) != nil } ?? false)
+        guard FrameKit.ownSheet(step.id, design: design) else {
+            return "Built in code from \(FrameKit.sharedID(step.id))'s parts sheet (FrameKit): no image is drawn for it."
+        }
+        let top = single || parsed.rank == 1
+        let crestOK = FrameKit.build(for: step, design: design, jobs: jobs)?.centre ?? false
         let plural = role == .highPay ? "high-pay symbols" : "medium-pay symbols"
         let trim: (String) -> String = { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
         let spec = FrameStyle.spec(design, highPay: role == .highPay).map(trim)
             ?? (role == .highPay ? "a sturdy square frame in this set's own premium material, a bevelled rim with matching ornaments at the corners"
                                  : "a plainer square frame in this set's own material, with a simple bevelled rim")
+        // Without a crest, the richer words lose theirs too: told "a sculpted crown crest atop" and then
+        // "no crest", Gemini was handed an argument (2026-10-02).
+        let richWords = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with richer ornament"
+        let rich = crestOK ? richWords : Self.withoutCrest(richWords)
+        let rung = single ? " It is the only high pay's, so the richest frame of the set: \(rich)."
+            : top ? " This is HP1's version, for the top symbol: the same frame, but the richest of the set — \(rich)." : ""
         let art = step.refs.contains(RenderPlan.themeArt)
-        let template = step.refs.last == RenderPlan.frameTemplate
-        var parts: [String] = []
+        var refs: [String] = []
         for (i, r) in step.refs.enumerated() {
             let img = "Image \(i + 1)"
             if r == RenderPlan.themeArt {
-                parts.append("\(img) is the approved concept art for this theme. Take only how it is painted — the technique, light, materials and finish. Nothing of its scene, characters, objects or text appears.")
-            } else if parsed.isShared, role == .mediumPay, FrameRules.parse(r)?.role == .highPay {
-                parts.append("\(img) is this game's high-pay frame. The medium pays' frame is its plainer sibling: the same square outline and window, a simpler material and less ornament, so a player ranks them at a glance.")
+                refs.append("\(img) is the approved concept art for this theme. Take only how it is painted — the technique, materials and finish. Nothing of its scene, characters, objects or text appears.")
+            } else if role == .mediumPay, FrameRules.parse(r)?.role == .highPay {
+                refs.append("\(img) is this game's high-pay frame. The medium pays' frame is its plainer sibling: a simpler material and less ornament, so a player ranks them at a glance.")
+            } else if top, FrameRules.parse(r)?.isShared == true {
+                refs.append("\(img) is the frame the other high pays share. HP1's parts are its richer version: the same moulding profile, as slim, in the same construction, so the two read as one set.")
             }
         }
-        // The studio's frames are slim: Tiki Titans' rim is 8% of the frame's width and its window 84%
-        // of it; ours came back at 17–20%, which shrank every symbol inside (2026-10-02).
-        let slim = "Its rim is slim — about a twelfth of the frame's width on each side, its ornaments included — so the window inside takes most of the frame."
-        let panel = Framing(design) == .layered
-            ? "Inside the rim the window is open and EMPTY: it shows the same flat background as around the frame, right up to the rim — no panel, glass, shadow or glow inside it, whatever an attached image shows."
-            : "Inside the rim, the backing panel fills the whole window: \(PanelStyle.brief(design)), in a calm mid-tone. Nothing stands on it — no subject, emblem, text or symbol: the symbols are painted into it later."
-        // Painted, the gems are drawn in, clear, in exact places (FrameRules.gemSlots), and the paint-in
-        // gives them its panel's colour. Layered, the frame carries none: Navigator sets them in.
-        let gem = FrameRules.gem(design), ladder = RankLadder(design), layered = Framing(design) == .layered
-        let clear = "in clear, colourless stone, so each symbol's own colour can be given to them"
-        let places = FrameRules.gemPlaces(FrameRules.gemSlots(rank: ref.rank, role: role, design: design).filter { crestOK || $0 != .crest })
-        let gems = layered ? "" : FrameRules.hasGems(ref, design) && !places.isEmpty ? ", set with \(gem): \(places), \(clear)" : ""
-        let noGems = layered ? " No gems or jewels on it: they are set into it afterwards." : ""
-        // Without a crest, the richer words lose theirs too: told "a sculpted crown crest atop" and then
-        // "no crest", Gemini was handed an argument (2026-10-02).
-        let richWords = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with a crest at the top centre"
-        let rich = crestOK ? richWords : Self.withoutCrest(richWords)
-        if !ref.isShared && !single {
-            let change: String
-            switch (ladder, ref.rank) {
-            case (.gems, 2): change = "the same frame\(gems)"
-            case (.metal, 2): change = "with its metal in polished silver instead\(gems)"
-            case (.metal, _): change = "but richer: its metal in rich polished gold\(gems)"
-            case (.gems, _): change = "but the richest of the set\(gems)"
-            default: change = "but richer — \(rich)\(gems)"
-            }
-            // Shipped top symbols often change shape too: Dodge's HP1 is octagonal, Billionaires Bank's crested.
-            let crest = crestOK ? " Its outline may rise into a crest at the top centre, above its top edge; everywhere else it keeps the shared frame's outline."
-                : ref.rank == 1 ? " It keeps the shared frame's outline, with no crest: the top symbol's own head breaks out over its top." : ""
-            return ([
-                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make \(FrameRules.code(role) ?? "HP")\(ref.rank)'s version of it, for the \(ref.rank == 1 ? "top" : "second") symbol: the same construction, proportions and size, and exactly the same window, so they read as one set — \(change).\(crest)\(noGems)",
-            ] + parts + [
-                panel,
-                "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
-                backdropLine(backing),
-                "No text, lettering or numbers, no watermark, no user interface.",
-            ]).joined(separator: "\n\n")
-        }
-        let rung = single ? " The only high pay, so the richest frame of the set: \(rich)\(gems).\(crestOK ? " Its outline may rise into a crest at the top centre, above the ring." : " No crest or crown at its top centre, whatever the words above say: the symbol's own head breaks out over its top there.")"
-            + (layered ? noGems : "")
-            : (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
-            + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."
-                : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
-        // Shown a flat ring, Gemini kept its outer edge and designed its own thick frame inward (17–25%
-        // rims, 2026-10-02): it is shown a plain moulding of the right widths to repaint instead.
-        let geo = FrameGeometry(design)
-        let ring = "Edit the last attached image: it is a plain grey moulding — \(geo.shape.words) — with exactly this frame's outline, narrow width and inner lip. Repaint it as the frame described below: its surface becomes this theme's material, carving and ornament, keeping the same narrow band, the same inner lip and the same opening. Its ornament — corner pieces, flourishes\(single && crestOK ? ", and a crest at the top centre" : "") — may spread a little past its outer edge onto the background, never inward: the opening inside the inner lip stays the flat background, with nothing drawn in it — no liner, second border or step."
+        let centre = role == .highPay
+            ? "\n\n3. Bottom right: ONE centre ornament — a small emblem of this theme in the frame's own materials, set at the middle of its top edge — seen straight on, about a quarter of the image wide."
+            : ""
         return ([
-            template && single ? "\(ring) It is the empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
-            : template ? "\(ring) It is the empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of it, so it holds each in turn and carries nothing of any of them."
-            : single
-                ? "Create one empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
-                : "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of this frame, so it holds each in turn and carries nothing of any of them.",
-            "THE FRAME: \(spec).\(rung) Seen straight on, upright and level\(template ? "" : ", centred and filling about 85% of the image with an even margin"). \(template ? "" : slim) \(panel)",
-        ] + parts + [
-            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
-            backdropLine(backing),
-            "No text, lettering or numbers, no watermark, no user interface.",
+            "A parts sheet for the frame of the \(top ? "top symbol" : plural) of a video slot game themed “\(theme.name)”. The frame is built from these parts afterwards: its moulding is joined round the symbol and its ornaments are set on it, so each part is drawn once, whole and separate.",
+            "THE FRAME: \(spec).\(rung)",
+            "Draw \(role == .highPay ? "three" : "two") separate parts, well apart, nothing touching:\n\n1. Across the top third: ONE straight, horizontal length of the frame's moulding, running the full width of the image from the left edge to the right edge. A slim stick of moulding seen straight on: its whole cross-section shows, from its outer edge along the top to its finished inner edge — a narrow bead or lip — along the bottom, and it is the same all along its length, like a length of picture-frame moulding before it is cut. No corners, ends, gems or ornaments on it.\n\n2. Bottom left: ONE corner ornament — what sits on the frame's corners — set over its top-left corner, covering the joint where the top and left lengths meet. An ornament only, with no lengths of moulding attached to it, seen straight on, about a quarter of the image wide.\(centre)",
+        ] + refs + [
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art)) Except the light: every part is lit evenly from straight in front — soft, even light with gentle highlights along the middle of each form and no strong shadow to either side — because the light's direction is added when the frame is built.",
+            backdropLine(backing, several: true),
+            "No gems or jewels on any part: they are set in afterwards. No text, lettering or numbers, no watermark, no user interface.",
         ]).joined(separator: "\n\n")
-    }
-
-    /// The lip pass: Gemini repaints only the plain grey lip Navigator drew round the opening
-    /// (FrameStack.lipGuide), in the frame's own material — a local edit, as the gem pass is.
-    static func lipBrief(step: RenderStep, theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
-        let role = FrameRules.parse(step.id)?.role ?? .highPay
-        return [
-            "Edit the attached image: it is the empty frame of the \(role == .highPay ? "high-pay" : "medium-pay") symbols of a video slot game themed “\(theme.name)”, with a plain grey lip — a narrow bevelled moulding — running all the way round its opening. Repaint only that grey lip, as part of this frame: in the frame's own material, colour and finish, a clean narrow moulding lit from the upper left like the rest of it, joined neatly to the carving and ornament just outside it so that they end against it as a finished frame does.",
-            "Change nothing else. The frame's carving, ornament, outline and size stay exactly as they are, and the opening inside the lip stays completely empty: the flat background right up to the lip, nothing drawn in it.",
-            backdropLine(backing),
-            "No text, lettering or numbers, no watermark, no user interface.",
-        ].joined(separator: "\n\n")
     }
 
     /// Frame words without their crest or crown: the clauses (split at commas and "and") that name one.
@@ -13423,8 +13656,15 @@ extension GDDAssetPrompts {
     /// What a symbol painted into a shared frame is told about the frame: it stays, panel
     /// treatment and all, and only the panel's colour changes, as every shipped set recolours its
     /// pay frames by rank.
-    static func keepFrame(_ design: SetDesign, gems: Bool = false) -> String {
-        "Keep every frame exactly as it is — construction, material, outline, size, position and \(PanelStyle(design).kept). Only the panel's colour changes, to \(PanelColour(design).rule)\(gems ? ", and its gems take that same colour" : ""). A symbol fills its window and may break a little over the frame's edge, but the frame stays whole."
+    static func keepFrame(_ design: SetDesign, gems: String? = nil) -> String {
+        "Keep every frame exactly as it is — construction, material, outline, size and position. Fill its empty window with its panel — \(PanelStyle.brief(design)), in \(PanelColour(design).rule) — and paint the symbol on it.\(gems.map { " Set into its frame \($0), in the panel's colour." } ?? "") The symbol may break a little over the frame's edge, but the frame stays whole."
+    }
+    /// A painted pay's gems, in words, painted in with it: frames are built without them (FrameKit), and a
+    /// layered set's are set in by the gem pass. Nil when it has none.
+    static func paintedGems(_ job: AssetJob, jobs: [AssetJob], design: SetDesign) -> String? {
+        guard Framing(design) != .layered else { return nil }
+        let slots = FrameRules.gemSlots(for: job, in: jobs, design: design)
+        return slots.isEmpty ? nil : "\(FrameRules.gem(design)) — \(FrameRules.gemPlaces(slots))"
     }
 
     /// The brief for one sheet: a whole group — the low pays, the high pays or the jackpot
@@ -13476,11 +13716,12 @@ extension GDDAssetPrompts {
             if !j.hue.isEmpty { line += " Dominant colour: \(j.hue)." }
             let f = j.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
             if !f.isEmpty { line += " Finish: \(f)." }
-            if let c = PayLadder.crop(j, in: jobs) { line += " Shown as \(c)." }
+            if let c = PayLadder.crop(j, in: jobs) { line += " Shown as \(c). \(PayLadder.cropWins)" }
             if intoFrames {
                 let rank = i < step.frames.count ? FrameRules.parse(step.frames[i])?.rank ?? 0 : 0
                 let fits = PayLadder.inFrame(j, in: jobs)
                 line += " In frame \(i + 1)\(rank == 1 ? ", the top symbol's richer frame" : rank == 2 ? ", the second symbol's frame" : "").\(fits.isEmpty ? "" : " " + fits)"
+                if let g = paintedGems(j, jobs: jobs, design: design) { line += " Set into its frame \(g), in its panel's colour." }
             } else if Framing.stacks(j, design) {
                 line += " Drawn on its own, with no frame: it is set into its tier's frame afterwards."
             } else if role != .lowPay {
@@ -13504,7 +13745,7 @@ extension GDDAssetPrompts {
             parts.append(shared + "They are the \(plural), ranked in the order given, each a different subject with its own colour — the finish of each makes the ranking obvious side by side.\(oneFrame ? " The framed ones share one frame construction around their different subjects." : "")")
         }
         if intoFrames {
-            parts.append("THE FRAMES: \(keepFrame(design, gems: step.frames.contains { FrameRules.parse($0).map { FrameRules.hasGems($0, design) } == true }))")
+            parts.append("THE FRAMES: \(keepFrame(design))")
             parts.append("LAYOUT: exactly as in the last image — every frame where it is, the same size, with the same plain background between them and around the edges. Nothing joins them — no shared base, shadow or glow.")
         } else {
         parts.append("LAYOUT: \(layout.rows.count == 1 ? "the symbols in one straight row across the image, evenly spaced, centred vertically" : "an even grid, each symbol centred in its own cell") — all the same size, each as large as the spacing allows. A clear gap of plain background between neighbours\(layout.rows.count > 1 ? ", across and down," : "") and around every edge: no symbol touches another or the edge of the image, and nothing joins them — no shared base, frame, shadow or glow. \(group.contains(where: \.hasFrame) && !layered ? "Apart from a symbol's own frame, nothing is behind any of them" : "Each stands directly on the background, with nothing behind it") — no card, tile, panel or box.")
@@ -13584,7 +13825,7 @@ extension GDDAssetPrompts {
             return ([
                 "Edit the last attached image: it is \(whose), empty, for \(game). Paint \(displayName(job)) into it.\(isAnchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : "")",
                 "THE SYMBOL: \(what). \(roleLine(job, jobs: jobs, design: design))\(hue)\(PayLadder.lines(job, in: jobs, painted: true))",
-                "THE FRAME: \(keepFrame(design, gems: FrameRules.hasGems(f, design)))\(others.refs.isEmpty ? "" : " The other attached images are for the look only: their frames are not this symbol's.")",
+                "THE FRAME: \(keepFrame(design, gems: paintedGems(job, jobs: jobs, design: design)))\(others.refs.isEmpty ? "" : " The other attached images are for the look only: their frames are not this symbol's.")",
             ] + referenceLines(others, job: job, jobs: jobs, anchorID: SetDesignRules.anchor(jobs, design)?.id, design: design) + [
                 "THE LOOK OF THIS SET: \(look)",
                 "FOR THE REELS: facing the viewer straight on, upright and level, with one clear focal point, bold shapes and strong contrast, so a player recognises it at reel size.",

@@ -21462,9 +21462,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gems"), flag + 2 < Command
     app.run()
 }
 
-// PAID (~$0.10 a frame, $0.20 when its rim comes back thick):  Navigator --draw-frames <set folder> <frame_HP,…>
-// Those tier frames drawn again (the old kept as <id>.prev.png), their rims printed, their symbols built
-// again — without gems where a gem pass belonged to the old frame.
+// PAID (~$0.10 a shared frame's parts sheet; HP1's and HP2's are built from it free):
+//   Navigator --draw-frames <set folder> <frame_HP,…>
+// Those tier frames built again (the old kept as <id>.prev.png) — a shared frame from a new parts sheet —
+// and their symbols built again, without gems where a gem pass belonged to the old frame.
 if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
     let folder = URL(fileURLWithPath: args[flag + 1])
@@ -21476,13 +21477,16 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
         guard steps.count == ids.count else { print("FAILED: frames in this plan are \(run.renderSteps().filter { $0.mode == .frame }.map(\.id))"); exit(1) }
         let fm = FileManager.default
         for id in ids {
-            for n in ["\(id).png", "\(id)_rmbg.png"] {
-                let u = folder.appendingPathComponent(n), prev = folder.appendingPathComponent(n.replacingOccurrences(of: ".png", with: ".prev.png"))
+            var files = [folder.appendingPathComponent("\(id).png"), folder.appendingPathComponent("\(id)_rmbg.png")]
+            if FrameKit.ownSheet(id, design: run.styledDesign) { files.append(GDDToAssetsRun.referenceURL(FrameKit.id(id), in: folder)) }
+            for u in files {
+                let prev = u.deletingLastPathComponent().appendingPathComponent(u.lastPathComponent.replacingOccurrences(of: ".png", with: ".prev.png"))
                 try? fm.removeItem(at: prev); try? fm.moveItem(at: u, to: prev)
             }
         }
         let model = NanoBananaModel.byFlag(run.modelFlag).id, art = run.themeArtPNG()
-        print(String(format: "FRAMES: %@ — estimate $%.2f", ids.joined(separator: ","), Double(ids.count) * nbEstimatedCost(size: "2K", modelFlag: run.modelFlag)))
+        let sheets = ids.filter { FrameKit.ownSheet($0, design: run.styledDesign) }.count
+        print(String(format: "FRAMES: %@ — estimate $%.2f", ids.joined(separator: ","), Double(sheets) * nbEstimatedCost(size: "2K", modelFlag: run.modelFlag)))
         DispatchQueue.global(qos: .userInitiated).async {
             for st in steps { run.generateFrame(step: st, themeArt: art, model: model, folder: folder) }
             DispatchQueue.main.async {
@@ -21494,26 +21498,6 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
                 }
-            }
-        }
-    } }
-    app.run()
-}
-
-// PAID (~$0.10 a frame drawn thicker than planned):  Navigator --finish-frames <set folder> <frame_HP,…>
-// Those frames' inside edges finished at their planned size; their symbols built again.
-if let flag = CommandLine.arguments.firstIndex(of: "--finish-frames"), flag + 2 < CommandLine.arguments.count {
-    let args = CommandLine.arguments
-    let folder = URL(fileURLWithPath: args[flag + 1])
-    let ids = args[flag + 2].split(separator: ",").map(String.init)
-    app.setActivationPolicy(.accessory)
-    DispatchQueue.main.async { MainActor.assumeIsolated {
-        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
-        print(String(format: "FINISHING: %@ — up to $%.2f", ids.joined(separator: ","), Double(ids.count) * nbEstimatedCost(size: "2K", modelFlag: run.modelFlag)))
-        run.finishFrameEdges(ids, folder: folder, force: args.contains("--force")) {
-            run.stackFramed(folder, only: ids.flatMap { run.frameMembers($0, folder: folder) }) {
-                MainActor.assumeIsolated { print("DONE: \(run.status)"); print(String(format: "SPENT: $%.4f", run.spent)) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
             }
         }
     } }
@@ -24781,11 +24765,6 @@ final class GDDToAssetsRun: ObservableObject {
             let d: Data?
             if r == RenderPlan.themeArt { d = themeArt }
             else if r == RenderPlan.setSoFar { d = setSoFarPNG(excluding: id, folder: folder) }
-            else if r == RenderPlan.frameTemplate {
-                let (b, geo) = Thread.isMainThread ? (backing.rgb, FrameGeometry(styledDesign)) : DispatchQueue.main.sync { (self.backing.rgb, FrameGeometry(self.styledDesign)) }
-                d = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: 1536, backing: b, geometry: geo), width: 1536, height: 1536,
-                                               space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG)
-            }
             else {
                 let u = r.hasPrefix("cast-") ? Self.referenceURL(r, in: folder) : folder.appendingPathComponent("\(r).png")
                 d = (try? Data(contentsOf: u)).map { downsamplePNG($0, longEdge: 1536) ?? $0 }
@@ -24989,7 +24968,14 @@ final class GDDToAssetsRun: ObservableObject {
                 let have = lastFolder.flatMap { f in FrameStack.gemsOwner(st.id).flatMap { Self.currentGemPass($0, folder: f) } } != nil
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
             }
-            if st.mode == .frame || st.mode == .panel {
+            if st.mode == .frame {
+                // Only a parts sheet is drawn; every frame is built from one in code.
+                guard FrameKit.ownSheet(st.id, design: styledDesign) else { return sum }
+                let have = lastFolder.map { f in [f.appendingPathComponent("\(st.id).png"), Self.referenceURL(FrameKit.id(st.id), in: f)]
+                    .contains { FileManager.default.fileExists(atPath: $0.path) } } ?? false
+                return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
+            }
+            if st.mode == .panel {
                 let have = lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(st.id).png").path) } ?? false
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
             }
@@ -25373,137 +25359,67 @@ final class GDDToAssetsRun: ObservableObject {
         }
     }
 
+    /// A tier's frame, built from its parts sheet (FrameKit): the shared frame's sheet — a length of its
+    /// moulding and its ornaments — is drawn once (~$0.10) and kept in references/, and the frame is
+    /// swept round its planned outline in code at exactly its band; HP1's and HP2's frames are built from
+    /// the high pays' sheet, free. Writes the frame on its backing and its exact cut-out, newer, so the
+    /// stack takes it as it is: there is nothing for Photoshop to cut.
     fileprivate func generateFrame(step: RenderStep, themeArt: Data?, model: String, folder: URL) {
         let dst = folder.appendingPathComponent("\(step.id).png")
         if FileManager.default.fileExists(atPath: dst.path) { return }
-        let (refs, inputs) = resolveRefs(step.refs, for: step.id, themeArt: themeArt, folder: folder)
-        // HP1's and HP2's frames are edits of the shared one; with that missing there is nothing to
-        // edit, and they are painted into the shared frame instead (frameSheetPNG).
-        if FrameRules.parse(step.id)?.isShared == false, refs.last.flatMap(FrameRules.parse) == nil {
-            navLog("gdd frame: \(step.id) skipped — the shared frame it is made from is missing")
-            return
+        guard FrameRules.parse(step.id) != nil else { return }
+        let (own, kitURL) = DispatchQueue.main.sync { (FrameKit.ownSheet(step.id, design: self.styledDesign),
+                                                      Self.referenceURL(FrameKit.sheetID(step.id, design: self.styledDesign), in: folder)) }
+        let (b, geo, build, size, log) = DispatchQueue.main.sync { () -> (RGB8, FrameGeometry, FrameKit.Build, Int, GDDRunLog) in
+            (self.backing.rgb, FrameGeometry(self.styledDesign),
+             FrameKit.build(for: step, design: self.styledDesign, jobs: self.jobs) ?? FrameKit.Build(),
+             ["1K": 1024, "4K": 4096][self.jobs.first { $0.kind == .symbol }?.size ?? "2K"] ?? 2048, self.session())
         }
-        DispatchQueue.main.async { self.status = "Drawing \(step.id) once, for its tier to be painted into…" }
-        let st = RenderStep(id: step.id, mode: .frame, refs: refs, after: [], members: step.members)
-        let prompt = DispatchQueue.main.sync { self.prompt(for: Self.placeholder, step: st) }
-        let log = DispatchQueue.main.sync { self.session() }
-        log.write("prompts/\(step.id).txt", "MODE: frame\nATTACHED: \(refs.isEmpty ? "nothing" : refs.joined(separator: ", "))\n\n\(prompt)")
-        let size = DispatchQueue.main.sync { self.jobs.first { $0.kind == .symbol }?.size ?? "2K" }
-        let job = AssetJob(id: step.id, kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: size)
-        let started = Date()
-        // Drawn on the slim ring, its rim is measured: one drawn thick is drawn once more (ponytail:
-        // the thinner of the two is kept either way).
-        let (b, geo) = DispatchQueue.main.sync { (self.backing.rgb, FrameGeometry(self.styledDesign)) }
-        func sideRim(_ png: Data) -> Double? {
+        func parts(_ png: Data) -> FrameKit.Parts? {
             guard let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
-            let k = FrameStack.keyed(px, backing: b)
-            guard let win = LayerizeAssembly.opening(k, width: cg.width, height: cg.height),
-                  let e = LayerizeAssembly.extent(k, width: cg.width, height: cg.height), e.w > 0 else { return nil }
-            return Double(win.x - e.x) / Double(e.w)
+            return FrameKit.parts(px, width: cg.width, height: cg.height, backing: b)
         }
-        // Drawn on the moulding, a frame keeps its inner lip, or it is drawn again: never cut back
-        // (the art director, 2026-10-02 — a cut-back inside looked chopped). A sliver just past the
-        // lip is cleaned; past 1.5% of the image it is drawn once more, and if it is still thick it is
-        // kept whole, as drawn, and said so.
-        let templated = refs.last == RenderPlan.frameTemplate
-        func reach(_ png: Data?) -> Double? {
-            guard templated, let png, let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
-            return FrameStack.encroachment(px, width: cg.width, height: cg.height, backing: b, geometry: geo)
+        let started = Date()
+        var cost = 0.0, error: String? = nil, refs: [String] = []
+        if own && !FileManager.default.fileExists(atPath: kitURL.path) {
+            let resolved = resolveRefs(step.refs, for: step.id, themeArt: themeArt, folder: folder)
+            refs = resolved.refs
+            DispatchQueue.main.async { self.status = "Drawing the parts of \(step.id) once, for its tier's frames to be built from…" }
+            let st = RenderStep(id: step.id, mode: .frame, refs: refs, after: [], members: step.members)
+            let prompt = DispatchQueue.main.sync { self.prompt(for: Self.placeholder, step: st) }
+            log.write("prompts/\(step.id).txt", "MODE: frame parts\nATTACHED: \(refs.isEmpty ? "nothing" : refs.joined(separator: ", "))\n\n\(prompt)")
+            let job = AssetJob(id: step.id, kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K")
+            // A sheet with no length of moulding on it is drawn once more.
+            for _ in 1...2 {
+                let r = sizedRequest(job, prompt: prompt, inputs: resolved.inputs, model: model)
+                cost += r.cost
+                guard let png = r.png else { error = r.error ?? "no image returned"; break }
+                if parts(png) != nil {
+                    try? FileManager.default.createDirectory(at: kitURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? png.write(to: kitURL); error = nil; break
+                }
+                error = "its parts sheet had no length of moulding on it"
+            }
         }
-        func cleaned(_ png: Data?) -> Data? {
-            guard templated, let png, let cg = loadCGImage(data: png), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { return png }
-            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b, geometry: geo)
-            return ChromaKeyOutputRules.image(straightRGBA8: px, width: cg.width, height: cg.height, space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG) ?? png
-        }
-        var r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
-        var into = reach(r.png) ?? 0
-        // Thicker than planned on its inside: the overshoot is taken off, and Gemini finishes the new
-        // inside edge as the frame's own narrow lip (finishFrameEdge).
-        if templated, let drawn = r.png, into > 0.004 {
-            let f = finishFrameEdge(drawn, step: step, job: job, model: model, log: log, into: into)
-            r.cost += f.cost; r.png = f.png
-        }
-        // Whatever reaches past the lip now is a sliver of the new edge: cleaned, so the size is the plan's.
-        if templated, r.png != nil { r.png = cleaned(r.png) }
-        if let png = r.png {
-            navLog(String(format: "gdd frame: %@ rim %.0f%% of its width", step.id, (sideRim(png) ?? 0) * 100))
-            if (try? png.write(to: dst)) != nil { DispatchQueue.main.async { self.framesMade.append(dst) } }
+        if error == nil {
+            if let kit = try? Data(contentsOf: kitURL), let p = parts(kit) {
+                let px = FrameKit.sweep(p, geometry: geo, size: size, build: build)
+                let space = CGColorSpace(name: CGColorSpace.sRGB)!
+                if let onBack = ChromaKeyOutputRules.image(straightRGBA8: FrameKit.onBacking(px, b), width: size, height: size, space: space).flatMap(encodePNG),
+                   let cut = ChromaKeyOutputRules.image(straightRGBA8: px, width: size, height: size, space: space).flatMap(encodePNG),
+                   (try? onBack.write(to: dst)) != nil {
+                    try? cut.write(to: folder.appendingPathComponent("\(step.id)_rmbg.png"))
+                    DispatchQueue.main.async { self.framesMade.append(dst) }
+                } else { error = "it could not be written" }
+            } else {
+                error = own ? "its parts sheet could not be read" : "\(FrameKit.sharedID(step.id)) has no parts sheet yet: draw it first"
+            }
         }
         let secs = Date().timeIntervalSince(started)
-        log.event(["step": "frame", "id": step.id, "refs": refs, "model": model, "cost": r.cost, "seconds": secs,
-                   "error": r.png == nil ? (r.error ?? "no image returned") : ""])
-        navLog(String(format: "gdd frame: %@ → %@ $%.3f %.1fs", step.id, r.png == nil ? "FAILED" : "saved", r.cost, secs))
-        DispatchQueue.main.async { self.spent += r.cost }
+        log.event(["step": "frame", "id": step.id, "refs": refs, "model": model, "cost": cost, "seconds": secs, "error": error ?? ""])
+        navLog(String(format: "gdd frame: %@ → %@ $%.3f %.1fs", step.id, error.map { "FAILED: \($0)" } ?? "built", cost, secs))
+        DispatchQueue.main.async { self.spent += cost }
     }
-
-    /// A frame that reached past its planned opening, finished with a designed inner lip at exactly the
-    /// planned size: Navigator cuts it back to the opening plus a narrow lip and draws the lip as a plain
-    /// grey moulding (FrameStack.lipGuide); Gemini repaints only that lip in the frame's material
-    /// (GDDAssetPrompts.lipBrief), and only the lip is taken from its edit (FrameStack.lipComposite).
-    /// Cut back alone it looked chopped, and asked to "finish the edge" Gemini drew a 7% lip inward
-    /// again (2026-10-02). A lip left unpainted is asked for once more. ~$0.10, $0.20 with the retry.
-    fileprivate func finishFrameEdge(_ drawn: Data, step: RenderStep, job: AssetJob, model: String, log: GDDRunLog, into: Double) -> (png: Data, cost: Double) {
-        let (b, geo, brief) = DispatchQueue.main.sync { () -> (RGB8, FrameGeometry, String) in
-            (self.backing.rgb, FrameGeometry(self.styledDesign),
-             self.theme.map { GDDAssetPrompts.lipBrief(step: step, theme: $0, design: self.styledDesign, backing: (self.backing.name, self.backing.rgb)) } ?? "")
-        }
-        let space = CGColorSpace(name: CGColorSpace.sRGB)!, lip = 0.014
-        guard let cg = loadCGImage(data: drawn), let base = ChromaKeyOutputRules.straightRGBA8(cg) else { return (drawn, 0) }
-        let w = cg.width, h = cg.height
-        func png(_ px: [UInt8]) -> Data? { ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG) }
-        var guide = base
-        FrameStack.lipGuide(&guide, width: w, height: h, backing: b, geometry: geo, lip: lip)
-        guard let guidePNG = png(guide) else { return (drawn, 0) }
-        navLog(String(format: "gdd frame: %@ came back %.1f%% inside its lip — cut back to the plan and given a lip to finish", step.id, into * 100))
-        log.write("prompts/\(step.id)-lip.txt", "MODE: frame lip\nATTACHED: \(step.id), cut back to its planned opening, a grey lip drawn round it\n\n\(brief)")
-        if let gc = ChromaKeyOutputRules.image(straightRGBA8: guide, width: w, height: h, space: space) { log.writeJPEG("prompts/\(step.id)-lip-guide.jpg", gc) }
-        var cost = 0.0
-        for attempt in 1...2 {
-            let r = sizedRequest(job, prompt: brief, inputs: [downsamplePNG(guidePNG, longEdge: 1536) ?? guidePNG], model: model)
-            cost += r.cost
-            guard let d = r.png, let out = loadCGImage(data: d),
-                  let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
-                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { continue }
-            ctx.interpolationQuality = .high
-            ctx.draw(out, in: CGRect(x: 0, y: 0, width: w, height: h))
-            guard let img = ctx.makeImage(), let edit = ChromaKeyOutputRules.straightRGBA8(img) else { continue }
-            let changed = FrameStack.lipChanged(guide: guide, edit: edit, width: w, height: h, geometry: geo, lip: lip)
-            log.event(["step": "frame-lip", "id": step.id, "attempt": attempt, "changed": changed, "cost": r.cost])
-            navLog(String(format: "gdd frame: %@ lip pass %d — the lip changed by %.0f", step.id, attempt, changed))
-            if changed >= 12, let p = png(FrameStack.lipComposite(base: guide, edit: edit, width: w, height: h, backing: b, geometry: geo, lip: lip)) {
-                return (p, cost)
-            }
-        }
-        // Left grey both times: the frame at its planned size, its lip as Navigator drew it, and said so.
-        navLog("gdd frame: \(step.id) lip came back unpainted twice — kept at its planned size with the plain lip; redraw it in review")
-        return (guidePNG, cost)
-    }
-
-    /// Paid: the inside edges of frames already drawn finished with a lip at their planned size
-    /// (finishFrameEdge); `force` finishes even one that keeps to its opening.
-    func finishFrameEdges(_ ids: [String], folder: URL, force: Bool = false, done: @escaping () -> Void) {
-        let model = NanoBananaModel.byFlag(modelFlag).id
-        let steps = renderSteps().filter { ids.contains($0.id) && $0.mode == .frame }
-        let size = jobs.first { $0.kind == .symbol }?.size ?? "2K"
-        let log = session(), b = backing.rgb, geo = FrameGeometry(styledDesign)
-        DispatchQueue.global(qos: .userInitiated).async {
-            for st in steps {
-                let u = folder.appendingPathComponent("\(st.id).png")
-                guard let d = try? Data(contentsOf: u), let cg = loadCGImage(data: d), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
-                let into = FrameStack.encroachment(px, width: cg.width, height: cg.height, backing: b, geometry: geo) ?? 0
-                guard force || into > 0.004 else { navLog(String(format: "gdd frame: %@ keeps its lip (%.1f%%) — nothing to finish", st.id, into * 100)); continue }
-                let job = AssetJob(id: st.id, kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: size)
-                let f = self.finishFrameEdge(d, step: st, job: job, model: model, log: log, into: into)
-                try? self.fm_copy(u, to: folder.appendingPathComponent("\(st.id).prev.png"))
-                try? f.png.write(to: u)
-                try? FileManager.default.removeItem(at: folder.appendingPathComponent("\(st.id)_rmbg.png"))
-                DispatchQueue.main.async { self.spent += f.cost }
-            }
-            DispatchQueue.main.async { done() }
-        }
-    }
-
-    private func fm_copy(_ a: URL, to b: URL) throws { try? FileManager.default.removeItem(at: b); try FileManager.default.copyItem(at: a, to: b) }
 
     /// The image a framed sheet edits: each member's frame, in the sheet's layout on the flat
     /// backing, so every symbol starts from the one frame instead of drawing its own. HP1 falls

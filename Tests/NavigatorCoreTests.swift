@@ -8484,14 +8484,14 @@ final class FrameRulesTests: XCTestCase {
         let shared = GDDAssetPrompts.brief(job: AssetJob(id: "x", kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K"),
                                            step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []),
                                            theme: theme, design: design, backing: backing, gameName: "", jobs: [])
-        XCTAssertTrue(shared.hasPrefix("Create one empty frame for the high-pay symbols"), shared)
+        XCTAssertTrue(shared.hasPrefix("A parts sheet for the frame of the high-pay symbols"), shared)
         XCTAssertTrue(shared.contains("THE FRAME: a square frame of lashed bamboo with lava-stone corners."), shared)
-        XCTAssertTrue(shared.contains(PanelStyle.litDepth.brief), shared)        // a set planned before the pick existed
+        XCTAssertTrue(GDDAssetPrompts.keepFrame(design).contains(PanelStyle.litDepth.brief))   // a set planned before the pick existed
         let rich = GDDAssetPrompts.brief(job: AssetJob(id: "x", kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K"),
                                          step: RenderStep(id: "frame_HP1", mode: .frame, refs: ["frame_HP"], after: ["frame_HP"]),
                                          theme: theme, design: design, backing: backing, gameName: "", jobs: [])
-        XCTAssertTrue(rich.hasPrefix("Edit the last attached image"), rich)
-        XCTAssertTrue(rich.contains("gold leaf over the bamboo and a carved tiki crest"), rich)
+        XCTAssertTrue(rich.hasPrefix("A parts sheet for the frame of the top symbol"), rich)          // HP1's own, on one frame
+        XCTAssertTrue(rich.contains("the richest of the set — gold leaf over the bamboo and a carved tiki crest"), rich)
         // A sheet painted into its frames edits them and keeps them.
         let hps = (1...4).map { j("HP\($0)", .highPay, frame: true, shape: "square") }
         let sheet = RenderStep(id: "HP1", mode: .sheet, refs: [RenderPlan.frameSheet], after: ["frame_HP", "frame_HP1"],
@@ -8514,9 +8514,9 @@ final class FrameRulesTests: XCTestCase {
                                           step: RenderStep(id: "frame_MP", mode: .frame, refs: [], after: []),
                                           theme: GameTheme(name: "Tiki"), design: design, backing: (name: "magenta", rgb: RGB8(255, 0, 255)),
                                           gameName: "", jobs: [])
-        XCTAssertTrue(frame.contains(PanelStyle.lightRays.brief), frame)
+        XCTAssertFalse(frame.contains(PanelStyle.lightRays.brief), frame)          // drawn empty; the paint-in fills it
         let keep = GDDAssetPrompts.keepFrame(design)
-        XCTAssertTrue(keep.contains(PanelStyle.lightRays.kept), keep)
+        XCTAssertTrue(keep.contains(PanelStyle.lightRays.brief), keep)
         XCTAssertTrue(keep.contains(PanelColour.contrasting.rule), keep)
         // The artist's own words, for the panel and for the frame; the medium pays get a plainer frame.
         design.families[PanelStyle.key] = PanelStyle.stored(.custom, custom: " storm clouds lit by lightning ")
@@ -11473,7 +11473,7 @@ final class SetDesignTests: XCTestCase {
                              subject: "a bank vault hall", aspect: "3:4", size: "4K"))
         let steps = RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true)
         // The high pays' frame comes first, empty, then HP1's richer version of it as an edit.
-        XCTAssertEqual(steps[0], RenderStep(id: "frame_HP", mode: .frame, refs: ["theme-art", "frame-template"], after: []))   // drawn on the slim ring
+        XCTAssertEqual(steps[0], RenderStep(id: "frame_HP", mode: .frame, refs: ["theme-art"], after: []))   // its parts sheet
         XCTAssertEqual(steps[1], RenderStep(id: "frame_HP1", mode: .frame, refs: ["theme-art", "frame_HP"], after: ["frame_HP"]))
         // The anchor is a high pay, so all four high pays are drawn next, together, painted into
         // their frames tiled on the sheet: the ranking is seen on one image, and one frame is shared.
@@ -11495,7 +11495,7 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(byID["bg_base"], RenderStep(id: "bg_base", mode: .background, refs: ["theme-art"], after: []))
         // Without concept art the anchor carries the look, background included.
         let bare = RenderPlan.steps(jobs, SetDesign(), hasThemeArt: false)
-        XCTAssertEqual(bare.first?.refs, ["frame-template"])
+        XCTAssertEqual(bare.first?.refs, [])
         XCTAssertEqual(bare.first { $0.id == "bg_base" }?.refs, ["HP1"])
         // A partial redo of the sheet paints its members alone into their own frame, matched to
         // one that stays; the frame is kept (reused from disk when it is there), HP1's is not needed.
@@ -11805,7 +11805,7 @@ final class SetDesignTests: XCTestCase {
         XCTAssertFalse(b.contains("HP1") || b.contains("MP1"), b)
         XCTAssertTrue(b.contains("Image 2 shows the symbols already made for this set"), b)
         XCTAssertFalse(b.contains("Test Game"), b)
-        XCTAssertLessThan(b.split(whereSeparator: \.isWhitespace).count, 400, b)
+        XCTAssertLessThan(b.split(whereSeparator: \.isWhitespace).count, 450, b)   // the panel is painted in here now (keepFrame)
 
         // The low pays are drawn together, on one sheet, after the anchor.
         XCTAssertEqual(steps["LP1"], RenderStep(id: "LP1", mode: .sheet, refs: ["HP1"], after: ["HP1"], members: ["LP1", "LP2"]))
@@ -12024,7 +12024,7 @@ final class SetDesignTests: XCTestCase {
         XCTAssertTrue(b.contains("their frames are not this symbol's, and it has none"), b)
         XCTAssertFalse(b.contains("Edit the last attached image"), b)
         let f = GDDAssetPrompts.brief(job: jobs[2], step: by["frame_MP"]!, theme: theme, design: design, backing: backing, gameName: "", jobs: jobs)
-        XCTAssertTrue(f.contains("the window is open and EMPTY"), f)
+        XCTAssertTrue(f.hasPrefix("A parts sheet for the frame of the medium-pay symbols"), f)
         let p = GDDAssetPrompts.brief(job: jobs[2], step: by[FrameStack.panelID]!, theme: theme, design: design, backing: backing, gameName: "", jobs: jobs)
         XCTAssertTrue(p.hasPrefix("Create the backing panel"), p)
         // Revised: a layered frame keeps its window open; the panel stays grey.
@@ -12058,7 +12058,7 @@ final class SetDesignTests: XCTestCase {
                     j("MP2", .mediumPay, "axe", hue: "blue", shape: "shield", tier: 2),
                     j("MP3", .mediumPay, "hen", hue: "green", shape: "shield", tier: 3, frame: false)]
         let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
-        XCTAssertEqual(steps["frame_MP"], RenderStep(id: "frame_MP", mode: .frame, refs: ["theme-art", "frame-template"], after: []))
+        XCTAssertEqual(steps["frame_MP"], RenderStep(id: "frame_MP", mode: .frame, refs: ["theme-art"], after: []))
         XCTAssertNil(steps["frame_HP"])                                    // no framed high pay, no frame for them
         XCTAssertEqual(steps["MP1"]?.refs, ["HP1", RenderPlan.setSoFar, "frame_MP"])
         XCTAssertEqual(steps["MP2"], RenderStep(id: "MP2", mode: .intoFrame, refs: ["HP1", RenderPlan.setSoFar, "frame_MP"],
@@ -12613,37 +12613,28 @@ final class FrameRanksTests: XCTestCase {
         XCTAssertNil(FrameStack.gemsOwner("frame_HP1"))
     }
 
-    func testEachRungIsDrawnAsItsRank() {
+    func testEachRungIsBuiltAsItsRank() {
         func frame(_ id: String, _ d: SetDesign) -> String {
             GDDAssetPrompts.brief(job: hp(1), step: RenderStep(id: id, mode: .frame, refs: id == "frame_HP" ? [] : ["frame_HP"], after: []),
                                   theme: theme, design: d, backing: backing, gameName: "", jobs: [])
         }
+        let hps = (1...4).map { hp($0) }
         let g = design(.gems)
-        XCTAssertTrue(frame("frame_HP", g).contains("No gems on it"))
-        let hp1 = frame("frame_HP1", g)
-        XCTAssertTrue(hp1.contains("Make HP1's version of it, for the top symbol"), hp1)
-        XCTAssertTrue(hp1.contains("set with bean-shaped cabochons in leaf-claw settings: one gem at the centre of its crest and four of exactly the same size, one centred on each corner, placed symmetrically"), hp1)
-        XCTAssertTrue(hp1.contains("in clear, colourless stone"), hp1)
-        XCTAssertTrue(hp1.contains("may rise into a crest at the top centre"), hp1)          // E
-        XCTAssertTrue(hp1.contains("exactly the same window"), hp1)
-        let hp2 = frame("frame_HP2", g)
-        XCTAssertTrue(hp2.contains("Make HP2's version of it, for the second symbol"), hp2)
-        XCTAssertTrue(hp2.contains("four gems of exactly the same size, one centred on each corner"), hp2)
-        XCTAssertFalse(hp2.contains("crest"), hp2)
-        // Layered: no gems in any frame — Navigator places them.
-        let lay = design(.gems, framing: .layered)
-        for id in ["frame_HP", "frame_HP1"] {
-            let b = frame(id, lay)
-            XCTAssertTrue(b.contains("No gems or jewels on it: they are set into it afterwards."), b)
-            XCTAssertFalse(b.contains("cabochons"), b)
-        }
+        // On a ladder the rungs are built from the shared sheet in code; on one frame HP1 has its own.
+        XCTAssertTrue(frame("frame_HP1", g).hasPrefix("Built in code from frame_HP's parts sheet"))
+        XCTAssertTrue(frame("frame_HP1", design(.one)).hasPrefix("A parts sheet for the frame of the top symbol"))
+        XCTAssertTrue(frame("frame_HP", g).contains("No gems or jewels on any part"))
         let m = design(.metal)
-        XCTAssertTrue(frame("frame_HP", m).contains("Its metal parts are bronze"))
-        XCTAssertTrue(frame("frame_HP2", m).contains("polished silver"))
-        XCTAssertTrue(frame("frame_HP1", m).contains("rich polished gold, set with bean-shaped cabochons in leaf-claw settings: one gem at the centre of its crest"))
-        XCTAssertTrue(frame("frame_HP1", design(.one)).contains("set with bean-shaped cabochons in leaf-claw settings: one gem at the centre of its crest and four"))
+        XCTAssertEqual(FrameKit.build(FrameRules.Ref(role: .highPay, rank: 1), design: m, single: false, crest: true).metal, "gold")
+        XCTAssertEqual(FrameKit.build(FrameRules.Ref(role: .highPay, rank: 2), design: m, single: false, crest: false).metal, "silver")
+        XCTAssertNil(FrameKit.build(FrameRules.Ref(role: .highPay, rank: 0), design: m, single: false, crest: false).metal)
+        // Painted, each pay's gems are painted in with it, by rank: HP1 a crest jewel and corners, HP2 corners, the rest none.
+        XCTAssertTrue(GDDAssetPrompts.paintedGems(hps[0], jobs: hps, design: g)!.hasPrefix("bean-shaped cabochons in leaf-claw settings — one gem at the centre of its crest and four"))
+        XCTAssertTrue(GDDAssetPrompts.paintedGems(hps[1], jobs: hps, design: g)!.contains("four gems of exactly the same size, one centred on each corner"))
+        XCTAssertNil(GDDAssetPrompts.paintedGems(hps[2], jobs: hps, design: g))
+        XCTAssertNil(GDDAssetPrompts.paintedGems(hps[0], jobs: hps, design: design(.gems, framing: .layered)))   // the gem pass sets them
         // Jewelled corners on the shared frame, without a ladder.
-        XCTAssertTrue(frame("frame_HP", design(.one, style: .jewelled)).contains("It is set with bean-shaped cabochons in leaf-claw settings: four gems of exactly the same size"))
+        XCTAssertTrue(GDDAssetPrompts.paintedGems(hps[2], jobs: hps, design: design(.one, style: .jewelled))!.contains("four gems of exactly the same size"))
     }
 
     // The listing in the log is the prompt that is sent: a sheet's frames survive flat().
@@ -12657,7 +12648,8 @@ final class FrameRanksTests: XCTestCase {
         let b = GDDAssetPrompts.brief(job: hps[0], step: listed, theme: theme, design: d, backing: backing, gameName: "", jobs: hps)
         XCTAssertTrue(b.contains("In frame 1, the top symbol's richer frame."), b)
         XCTAssertTrue(b.contains("In frame 2, the second symbol's frame."), b)
-        XCTAssertTrue(b.contains("and its gems take that same colour"), b)
+        XCTAssertTrue(b.contains("In frame 1, the top symbol's richer frame. It fills its frame"), b)
+        XCTAssertTrue(b.contains("Set into its frame bean-shaped cabochons in leaf-claw settings — one gem at the centre of its crest"), b)
     }
 
     func testPaintedIntoAJewelledFrameTheGemsTakeThePanelsColour() {
@@ -12669,8 +12661,8 @@ final class FrameRanksTests: XCTestCase {
         }
         let b2 = into("HP2", "frame_HP2")
         XCTAssertTrue(b2.contains("HP2's frame, the second symbol's"), b2)
-        XCTAssertTrue(b2.contains("and its gems take that same colour"), b2)
-        XCTAssertFalse(into("HP3", "frame_HP").contains("its gems take"))
+        XCTAssertTrue(b2.contains("Set into its frame bean-shaped cabochons in leaf-claw settings — four gems of exactly the same size, one centred on each corner"), b2)
+        XCTAssertFalse(into("HP3", "frame_HP").contains("Set into its frame"))
     }
 
     func testThePlannerWritesTheGemAndAPickedStyleInTheThemesTerms() {
@@ -12862,18 +12854,17 @@ final class PayLadderTests: XCTestCase {
 
     // With one high pay, its frame is HP1's: the richest, crested, never the plain rung.
     func testALoneHighPaysFrameIsHP1sRichOne() {
-        let jobs = [pay("HP1", .highPay, cast: "Jack")] + (1...2).map { pay("MP\($0)", .mediumPay) }
+        let jobs = [pay("HP1", .highPay, cast: "Jack", silhouette: "head-and-shoulders bust")] + (1...2).map { pay("MP\($0)", .mediumPay) }
         let d = SetDesign(anchorID: "HP1", look: "Glossy.", families: ["highPayFrame": "golden vines", "hp1Frame": "doubled vines with a crown crest"])
         let steps = RenderPlan.steps(jobs, d, hasThemeArt: false)
         let f = try! XCTUnwrap(steps.first { $0.id == "frame_HP" })
         XCTAssertEqual(f.members, ["HP1"])
         let b = GDDAssetPrompts.brief(job: jobs[0], step: f, theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
-        XCTAssertTrue(b.hasPrefix("Edit the last attached image: it is a plain grey moulding — a square —"), b)
-        XCTAssertTrue(b.contains("It is the empty frame for the top symbol"), b)
-        XCTAssertTrue(b.contains("and a crest at the top centre — may spread a little past its outer edge"), b)
-        XCTAssertTrue(b.contains("the richest frame of the set: doubled vines with a crown crest"), b)
-        XCTAssertTrue(b.contains("rise into a crest at the top centre"), b)
-        XCTAssertTrue(b.contains("one gem at the centre of its crest and four"), b)     // painted: HP1's gems
+        XCTAssertTrue(b.hasPrefix("A parts sheet for the frame of the top symbol"), b)
+        XCTAssertTrue(b.contains("It is the only high pay's, so the richest frame of the set"), b)
+        XCTAssertFalse(b.contains("crest"), b)                                     // Jack's head is its crest
+        XCTAssertEqual(FrameKit.build(for: f, design: d, jobs: jobs), FrameKit.Build(cornerScale: 1.25, centre: false))
+        XCTAssertFalse(GDDAssetPrompts.paintedGems(jobs[0], jobs: jobs, design: d)?.contains("crest") ?? false)
         // The medium pays' frame still steps down from it.
         let mp = GDDAssetPrompts.brief(job: jobs[1], step: steps.first { $0.id == "frame_MP" }!, theme: theme, design: d,
                                        backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
@@ -12916,44 +12907,87 @@ final class PayLadderTests: XCTestCase {
         // And the frames are slim, as the studio's are.
         let f = GDDAssetPrompts.brief(job: hps[0], step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme, design: d,
                                       backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: hps)
-        XCTAssertTrue(f.contains("Its rim is slim — about a twelfth of the frame's width"), f)
+        XCTAssertTrue(f.contains("A slim stick of moulding seen straight on"), f)
     }
 
-    // The moulding a frame is drawn on has the planned outline and narrow band, a lit cross-section,
-    // and only a sliver past its lip is ever cleaned.
-    func testTheFrameMouldingIsSlimAndShaded() {
-        let n = 400, back = RGB8(255, 0, 255), geo = FrameGeometry()
-        let px = FrameStack.frameTemplate(size: n, backing: back, geometry: geo)
-        let keyed = FrameStack.keyed(px, backing: back)
-        let win = try! XCTUnwrap(LayerizeAssembly.opening(keyed, width: n, height: n))
-        let e = try! XCTUnwrap(LayerizeAssembly.extent(keyed, width: n, height: n))
-        XCTAssertEqual(Double(e.w) / Double(n), 0.85, accuracy: 0.01)
-        XCTAssertEqual(Double(win.x - e.x) / Double(e.w), FrameWeight.slim.rim, accuracy: 0.01)
-        let o = geo.opening(width: n, height: n)
-        XCTAssertEqual(o.x, win.x, accuracy: 1); XCTAssertEqual(o.w, win.w, accuracy: 2)
-        // Lit from the upper left: the top band's outer bevel is brighter than the bottom's.
-        let top = px[(Int(Double(n) * 0.083) * n + n / 2) * 4], bottom = px[(Int(Double(n) * 0.917) * n + n / 2) * 4]
+    // A synthetic parts sheet: a moulding across the top (bright at its outer edge, a dark lip at its
+    // inner one), a corner ornament with two moulding-thick arms, and a round centre ornament.
+    func kitSheet(armed: Bool = true) -> (px: [UInt8], n: Int) {
+        let n = 600
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        func put(_ x: Int, _ y: Int, _ c: (UInt8, UInt8, UInt8)) { let i = (y * n + x) * 4; px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2 }
+        for i in stride(from: 0, to: px.count, by: 4) { px[i] = 255; px[i + 1] = 0; px[i + 2] = 255; px[i + 3] = 255 }
+        for y in 60..<120 { for x in 0..<n { put(x, y, y < 80 ? (220, 180, 70) : y < 110 ? (170, 130, 50) : (90, 60, 20)) } }
+        for y in 280..<580 { for x in 40..<340 {
+            let disc = (x - 120) * (x - 120) + (y - 360) * (y - 360) < 70 * 70
+            let ring = abs(((x - 190) * (x - 190) + (y - 430) * (y - 430)) - 120 * 120) < 1400 && x < 310 && y < 550
+            let arms = armed && ((y >= 330 && y < 390 && x < 340) || (x >= 90 && x < 150 && y < 580))
+            if armed ? (disc || arms) : ring { put(x, y, (200, 160, 60)) }
+        } }
+        for y in 360..<480 { for x in 390..<510 where (x - 450) * (x - 450) + (y - 420) * (y - 420) < 60 * 60 { put(x, y, (210, 170, 70)) } }
+        return (px, n)
+    }
+
+    // A frame is built from its parts sheet: the moulding found and swept round the outline at exactly
+    // the planned band, the opening left clear by construction, lit from the upper left across its profile.
+    func testAFrameIsSweptFromItsPartsAtExactlyItsBand() throws {
+        let (sheet, n) = kitSheet()
+        let parts = try XCTUnwrap(FrameKit.parts(sheet, width: n, height: n, backing: RGB8(255, 0, 255)))
+        XCTAssertEqual(parts.strip.h - parts.over, 60, accuracy: 2)
+        XCTAssertNotNil(parts.corner); XCTAssertNotNil(parts.centre)
+        let w = 400
+        for shape in FrameShape.allCases {
+            let g = FrameGeometry(shape: shape)
+            let px = FrameKit.sweep(parts, geometry: g, size: w, build: FrameKit.Build(cornerScale: 0))
+            var inOpening = 0, inBand = 0, bandSolid = 0
+            for y in 0..<w { for x in 0..<w {
+                let d = g.dist((Double(x) + 0.5) / Double(w) - 0.5, (Double(y) + 0.5) / Double(w) - 0.5) * Double(w)
+                let a = px[(y * w + x) * 4 + 3]
+                if d < -g.t * Double(w) - 1.5 && a > 0 { inOpening += 1 }
+                if d < -2 && d > -g.t * Double(w) + 2 { inBand += 1; if a > 200 { bandSolid += 1 } }
+            } }
+            XCTAssertEqual(inOpening, 0, "\(shape): nothing past the band's inner edge")
+            XCTAssertGreaterThan(Double(bandSolid) / Double(inBand), 0.97, "\(shape): the band is filled")
+        }
+        // Profile light: the top side's outer edge is lit, the bottom side's outer edge is not.
+        let px = FrameKit.sweep(parts, geometry: FrameGeometry(), size: w, build: FrameKit.Build(cornerScale: 0))
+        let top = px[(Int(0.08 * Double(w)) * w + w / 2) * 4], bottom = px[(Int(0.92 * Double(w)) * w + w / 2) * 4]
         XCTAssertGreaterThan(top, bottom)
-        // A heavy band is wider; a frame keeping its lip reaches nothing into the opening.
-        let heavy = FrameGeometry(shape: .square, rim: FrameWeight.heavy.rim).opening(width: n, height: n)
-        XCTAssertGreaterThan(heavy.x, o.x)
-        XCTAssertEqual(FrameStack.encroachment(px, width: n, height: n, backing: back, geometry: geo)!, 0, accuracy: 0.004)
-        var lined = px
-        for y in (o.y)..<(o.y + 8) { for x in o.x..<(o.x + o.w) { let i = (y * n + x) * 4; lined[i] = 120; lined[i + 1] = 120; lined[i + 2] = 120 } }
-        XCTAssertEqual(FrameStack.encroachment(lined, width: n, height: n, backing: back, geometry: geo)!, 8.0 / Double(n), accuracy: 0.004)
-        FrameStack.clearOpening(&lined, width: n, height: n, backing: back, geometry: geo)
-        XCTAssertEqual(FrameStack.encroachment(lined, width: n, height: n, backing: back, geometry: geo)!, 0, accuracy: 0.004)
-        // A character HP1's frame has no crest — its head breaks out there; an object HP1's may.
+        // Corner pieces sit on a square's corners; an object HP1's centre ornament on its top edge.
+        let full = FrameKit.sweep(parts, geometry: FrameGeometry(), size: w, build: FrameKit.Build(centre: true))
+        XCTAssertGreaterThan(full[(59 * w + 59) * 4 + 3], 0)                     // the corner piece's middle
+        XCTAssertEqual(px[(59 * w + 59) * 4 + 3], 0)                                // not there without one
+        XCTAssertGreaterThan(full[(Int(0.05 * Double(w)) * w + w / 2) * 4 + 3], 0)
+    }
+
+    // Gemini attaches lengths of moulding to a corner ornament, told not to: they come off, a knot stays.
+    func testCornerArmsComeOffAndAKnotStays() throws {
+        let armed = try XCTUnwrap(FrameKit.parts(kitSheet().px, width: 600, height: 600, backing: RGB8(255, 0, 255))?.corner)
+        XCTAssertLessThan(armed.w, 200)                                   // the 300-wide piece, its arms gone
+        let (knotSheet, n) = kitSheet(armed: false)
+        let knot = try XCTUnwrap(FrameKit.parts(knotSheet, width: n, height: n, backing: RGB8(255, 0, 255))?.corner)
+        XCTAssertGreaterThan(knot.w, 220)                                 // kept whole
+    }
+
+    // A frame's brief is its parts sheet; HP1's frame has none, being built from the shared one's; only an
+    // object HP1 carries the centre ornament — a character's own head breaks out over the top there.
+    func testTheFrameBriefIsAPartsSheet() {
         let jack = [pay("HP1", .highPay, cast: "Jack", silhouette: "head-and-shoulders bust"), pay("MP1", .mediumPay)]
         let item = [pay("HP1", .highPay, silhouette: "golden harp"), pay("MP1", .mediumPay)]
         let d = SetDesign(anchorID: "HP1", look: "", families: ["framing": Framing.layered.rawValue])
+        let step = { (jobs: [AssetJob]) in RenderPlan.steps(jobs, d, hasThemeArt: false).first { $0.id == "frame_HP" }! }
         let brief = { (jobs: [AssetJob]) in
-            GDDAssetPrompts.brief(job: jobs[0], step: RenderPlan.steps(jobs, d, hasThemeArt: false).first { $0.id == "frame_HP" }!,
-                                  theme: self.theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs) }
-        XCTAssertTrue(brief(jack).contains("No crest or crown at its top centre, whatever the words above say"), brief(jack))
-        XCTAssertTrue(brief(jack).contains("the opening inside the inner lip stays the flat background"), brief(jack))
-        XCTAssertTrue(brief(jack).contains("it is a plain grey moulding — a square — with exactly this frame's outline"), brief(jack))
-        XCTAssertTrue(brief(item).contains("and a crest at the top centre — may spread a little past its outer edge"), brief(item))
+            GDDAssetPrompts.brief(job: jobs[0], step: step(jobs), theme: self.theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs) }
+        XCTAssertTrue(brief(jack).contains("A parts sheet for the frame of the top symbol"), brief(jack))
+        XCTAssertTrue(brief(jack).contains("ONE straight, horizontal length of the frame's moulding"), brief(jack))
+        XCTAssertFalse(step(jack).refs.contains("frame-template"))
+        XCTAssertEqual(FrameKit.build(for: step(jack), design: d, jobs: jack)?.centre, false)
+        XCTAssertEqual(FrameKit.build(for: step(item), design: d, jobs: item)?.centre, true)
+        let hp1 = GDDAssetPrompts.brief(job: jack[0], step: RenderStep(id: "frame_HP1", mode: .frame, refs: ["frame_HP"], after: ["frame_HP"]),
+                                        theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jack)
+        XCTAssertTrue(hp1.hasPrefix("A parts sheet for the frame of the top symbol"), hp1)        // its own, on one frame
+        XCTAssertTrue(hp1.contains("Image 1 is the frame the other high pays share"), hp1)
+        XCTAssertEqual(FrameKit.sharedID("frame_HP2"), "frame_HP")
     }
 
     // The frames' gems and outline follow the theme, as the studio's sets do.
@@ -12986,10 +13020,7 @@ final class PayLadderTests: XCTestCase {
                 }
             }
         }
-        // The moulding is cut to the shape: an octagon's corner is the backing, its edge midpoint the band.
-        let n = 400, px = FrameStack.frameTemplate(size: n, backing: RGB8(255, 0, 255), geometry: FrameGeometry(shape: .octagon))
-        XCTAssertEqual(Array(px[(34 * n + 34) * 4..<(34 * n + 34) * 4 + 3]), [255, 0, 255])
-        XCTAssertNotEqual(px[(36 * n + 200) * 4], 255)
+        let n = 400
         // A gem's mark is drawn in its cut: a marquise is long and narrow, pointing out to its corner.
         let mark = FrameStack.guide([UInt8](repeating: 0, count: n * n * 4), width: n, height: n,
                                     gems: [Gem(x: 100, y: 100, size: 80, place: "top-left")], cut: .marquise)
@@ -13025,34 +13056,6 @@ final class PayLadderTests: XCTestCase {
         XCTAssertEqual(GDDAssetPrompts.withoutCrest("flourishing leaf filigree at the corners and a sculpted crown crest atop"),
                        "flourishing leaf filigree at the corners")
         XCTAssertEqual(GDDAssetPrompts.withoutCrest("a crest at the top centre"), "richer, heavier ornament at the corners")
-    }
-
-    // The lip: the frame cut back to its opening plus a narrow lip, the lip drawn grey for Gemini to
-    // repaint, and only the lip taken back from the edit.
-    func testTheLipGuideAndCompositeTouchOnlyTheLip() {
-        let n = 400, back = RGB8(255, 0, 255), g = FrameGeometry(), lip = 0.014
-        var frame = [UInt8](repeating: 200, count: n * n * 4)
-        for i in stride(from: 0, to: frame.count, by: 4) { frame[i] = 180; frame[i + 1] = 140; frame[i + 2] = 40 }     // gold everywhere
-        var guide = frame
-        FrameStack.lipGuide(&guide, width: n, height: n, backing: back, geometry: g, lip: lip)
-        let o = g.opening(width: n, height: n), at = { (x: Int, y: Int) in (y * n + x) * 4 }
-        XCTAssertEqual(Array(guide[at(200, 200)..<at(200, 200) + 3]), [255, 0, 255])                 // the opening, empty
-        let inLip = at(o.x - 2, 200)
-        XCTAssertEqual(guide[inLip], guide[inLip + 1]); XCTAssertEqual(guide[inLip + 1], guide[inLip + 2])   // the lip, grey
-        XCTAssertEqual(Array(guide[at(o.x - 15, 200)..<at(o.x - 15, 200) + 3]), [180, 140, 40])      // the band beyond, as it was
-        // An edit that repainted the lip red and moved everything else: only the lip (and its feather) is kept.
-        var edit = [UInt8](repeating: 0, count: frame.count)
-        for i in stride(from: 0, to: edit.count, by: 4) { edit[i] = 220; edit[i + 1] = 30; edit[i + 2] = 30; edit[i + 3] = 255 }
-        XCTAssertGreaterThan(FrameStack.lipChanged(guide: guide, edit: edit, width: n, height: n, geometry: g, lip: lip), 12)
-        XCTAssertEqual(FrameStack.lipChanged(guide: guide, edit: guide, width: n, height: n, geometry: g, lip: lip), 0)
-        let out = FrameStack.lipComposite(base: guide, edit: edit, width: n, height: n, backing: back, geometry: g, lip: lip)
-        XCTAssertEqual(out[inLip], 220)
-        XCTAssertEqual(Array(out[at(o.x - 15, 200)..<at(o.x - 15, 200) + 3]), [180, 140, 40])
-        XCTAssertEqual(Array(out[at(200, 200)..<at(200, 200) + 3]), [255, 0, 255])
-        XCTAssertEqual(FrameStack.encroachment(out, width: n, height: n, backing: back, geometry: g)!, 0, accuracy: 0.004)
-        let b = GDDAssetPrompts.lipBrief(step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme, design: SetDesign(),
-                                         backing: (name: "chroma magenta", rgb: back))
-        XCTAssertTrue(b.contains("Repaint only that grey lip"), b)
     }
 
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.
@@ -13114,3 +13117,5 @@ final class PayLadderTests: XCTestCase {
         XCTAssertEqual(FrameStack.tone(named: "teal").saturation, 0.6)
     }
 }
+
+
