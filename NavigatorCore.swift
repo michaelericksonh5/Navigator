@@ -11261,7 +11261,7 @@ public enum FrameWriter {
         THE STYLE TO WRITE THEM IN: \(FrameStyle.direction(design) ?? "this theme's own, as the planned frames are").\(RankLadder(design).note.map { "\n        \($0)" } ?? "")\(Framing(design) == .layered ? "\n        \(FrameRules.layeredGemsNote)" : "")
         Write them again in that style, made from this theme's own materials and motifs:
         - highPayFrame: the high pays' square frame — material, rim profile and corner ornaments, not the panel inside it; slim, as this studio's are (a narrow moulding, ornament at the corners, never a wide carved border or a second inner rim); under 25 words.
-        - hp1Frame: how HP1's version of that frame is richer, with the same window; under 25 words.
+        - hp1Frame: how HP1's version of that frame is richer, with the same window — a crest only when HP1 is an object: a character HP1's own head breaks out over the top; under 25 words.
         - mediumPayFrame: the medium pays' plainer square frame, of the same family, with no gems; under 25 words.
         - gems: the gem the top pays' frames are set with, in this theme's own terms — what it is, its cut and its setting, never its colour; under 15 words.
         Answer with this JSON and nothing else: {"highPayFrame": "…", "hp1Frame": "…", "mediumPayFrame": "…", "gems": "…"}
@@ -13317,7 +13317,7 @@ extension GDDAssetPrompts {
                 "No text, lettering or numbers, no watermark, no user interface.",
             ]).joined(separator: "\n\n")
         }
-        let rung = single ? " The only high pay, so the richest frame of the set: \(rich)\(gems).\(crestOK ? " Its outline may rise into a crest at the top centre, above the ring." : " No crest: the symbol's own head breaks out over its top.")"
+        let rung = single ? " The only high pay, so the richest frame of the set: \(rich)\(gems).\(crestOK ? " Its outline may rise into a crest at the top centre, above the ring." : " No crest or crown at its top centre, whatever the words above say: the symbol's own head breaks out over its top there.")"
             + (layered ? noGems : "")
             : (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
             + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."

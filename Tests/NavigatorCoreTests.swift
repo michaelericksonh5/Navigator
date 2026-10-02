@@ -12950,7 +12950,7 @@ final class PayLadderTests: XCTestCase {
         let brief = { (jobs: [AssetJob]) in
             GDDAssetPrompts.brief(job: jobs[0], step: RenderPlan.steps(jobs, d, hasThemeArt: false).first { $0.id == "frame_HP" }!,
                                   theme: self.theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs) }
-        XCTAssertTrue(brief(jack).contains("No crest: the symbol's own head breaks out over its top."), brief(jack))
+        XCTAssertTrue(brief(jack).contains("No crest or crown at its top centre, whatever the words above say"), brief(jack))
         XCTAssertTrue(brief(jack).contains("the opening inside the inner lip stays the flat background"), brief(jack))
         XCTAssertTrue(brief(jack).contains("it is a plain grey moulding — a square — with exactly this frame's outline"), brief(jack))
         XCTAssertTrue(brief(item).contains("and a crest at the top centre — may spread a little past its outer edge"), brief(item))
