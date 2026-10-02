@@ -21543,6 +21543,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--write-frames"), flag + 1 <
 }
 
 // PAID (~$0.10 a symbol, $0.20 when a check fails):  Navigator --gems <set folder> <id,id,…> [--again]
+// Free with --recheck: the passes already drawn checked again by today's rules, and every framed pay built again.
 // Gem passes for those layered pays, then each built again. Kept while current, unless --again.
 if let flag = CommandLine.arguments.firstIndex(of: "--gems"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
@@ -21553,6 +21554,29 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gems"), flag + 2 < Command
         guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
         let owners = Set(run.gemOwners())
         guard ids.allSatisfy(owners.contains) else { print("FAILED: gems are set only for \(owners.sorted())"); exit(1) }
+        // --recheck: free — the gem passes already drawn checked again by today's rules, then built again.
+        if args.contains("--recheck") {
+            let space = CGColorSpace(name: CGColorSpace.sRGB)!, geo = FrameGeometry(run.styledDesign), b = run.backing.rgb
+            for id in ids {
+                let gid = FrameStack.gemsID(id), j = folder.appendingPathComponent("\(gid).json")
+                guard let d = try? Data(contentsOf: j), var pass = try? JSONDecoder().decode(GemPass.self, from: d),
+                      let fcg = loadCGImage(folder.appendingPathComponent("\(pass.frame).png")), let base = ChromaKeyOutputRules.straightRGBA8(fcg),
+                      let ecg = loadCGImage(folder.appendingPathComponent("\(gid).png")), let e0 = ChromaKeyOutputRules.straightRGBA8(ecg) else { print("\(id): no gem pass to check"); continue }
+                var edit = e0
+                if ecg.width != fcg.width, let c = CGContext(data: nil, width: fcg.width, height: fcg.height, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                    c.interpolationQuality = .high; c.draw(ecg, in: CGRect(x: 0, y: 0, width: fcg.width, height: fcg.height))
+                    edit = c.makeImage().flatMap(ChromaKeyOutputRules.straightRGBA8) ?? e0
+                }
+                pass.check = FrameStack.check(base: base, edit: edit, width: fcg.width, height: fcg.height, window: pass.windowBox,
+                                              down: geo.t * Double(fcg.height), gems: pass.gems, backing: b)
+                let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try? enc.encode(pass).write(to: j)
+                print("\(id): \(pass.check.passed ? "passed" : pass.check.problems.joined(separator: "; "))")
+            }
+            run.stackFramed(folder, only: nil) { MainActor.assumeIsolated { print("DONE: \(run.status)") }; DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) } }
+            return
+        }
         print(String(format: "GEMS: %@ — estimate $%.2f", ids.joined(separator: ","), Double(ids.count) * run.revisionEstimate(FrameStack.gemsID(ids[0]))))
         if args.contains("--again") { for id in ids { try? FileManager.default.removeItem(at: folder.appendingPathComponent("\(FrameStack.gemsID(id)).json")) } }
         run.redoGems(ids, folder: folder) { problems in
@@ -24218,15 +24242,19 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var rankLadder = RankLadder.one
     @Published var frameStyle = FrameStyle.fromTheme
     @Published var frameCustom = ""
-    @Published var panelStyle = PanelStyle.litDepth
+    /// The backing's style, picked; nil keeps the plan's own themed choice (the planner's "panel"). A fixed
+    /// default here overwrote the planner's pick in every set (2026-10-02).
+    @Published var panelStyle: PanelStyle? = nil
     @Published var panelCustom = ""
-    @Published var panelColour = PanelColour.matching
+    @Published var panelColour = PanelColour.ladder
+    @Published var frameArtist = FrameArtist.gpt
     var styledDesign: SetDesign {
         var d = design
         d.families[Framing.key] = framing.rawValue
         d.families[RankLadder.key] = rankLadder.rawValue
         d.families[FrameStyle.key] = FrameStyle.stored(frameStyle, custom: frameCustom)
-        d.families[PanelStyle.key] = PanelStyle.stored(panelStyle, custom: panelCustom)
+        if let p = panelStyle { d.families[PanelStyle.key] = PanelStyle.stored(p, custom: panelCustom) }
+        d.families[FrameArtist.key] = frameArtist.rawValue
         d.families[PanelColour.key] = panelColour.rawValue
         return d
     }
@@ -25417,9 +25445,13 @@ final class GDDToAssetsRun: ObservableObject {
         // A frame that keeps its moulding's opening is placed by its geometry, any shape; one that does
         // not (drawn before the moulding, or kept thick) by its measured rim.
         let (geo, cut) = DispatchQueue.main.sync { (FrameGeometry(self.styledDesign), GemCut(self.styledDesign)) }
+        let gpt = DispatchQueue.main.sync { FrameArtist(self.styledDesign) == .gpt } && OpenAIImages.available
         let planned = geo.opening(width: w, height: h)
+        // A frame GPT Image 2.5 drew keeps its window by its check (FrameStack.windowCovered): placed by its
+        // geometry too — a round one measured as a square put its corner gems off the ring (2026-10-02).
         let keeps = [win.x - planned.x, win.y - planned.y, (planned.x + planned.w) - (win.x + win.w), (planned.y + planned.h) - (win.y + win.h)]
             .allSatisfy { abs($0) <= w / 50 }
+            || FrameStack.windowCovered(base, width: w, height: h, backing: ctx.backing, geometry: geo) <= FrameStack.windowTolerance
         guard keeps || rim != nil else { return fail("\(ctx.frame) has no rim to measure its gems' places from") }
         let gems = keeps ? geo.gems(ctx.slots, width: w, height: h) : FrameStack.gemCentres(ctx.slots, window: win, rim: rim!)
         guard let guideCG = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.guide(base, width: w, height: h, gems: gems, cut: cut), width: w, height: h, space: space),
@@ -25432,7 +25464,11 @@ final class GDDToAssetsRun: ObservableObject {
         while attempts < 2 && best?.check.passed != true {
             attempts += 1
             let started = Date()
-            let r = sizedRequest(job, prompt: ctx.prompt, inputs: [downsamplePNG(guidePNG, longEdge: 1536) ?? guidePNG], model: model)
+            // A frame GPT Image 2.5 drew is edited by it too: Gemini repainted 30-50% of one while setting its
+            // gems, and its check failed twice (Galactic Goddess, 2026-10-02).
+            let r: (png: Data?, cost: Double, error: String?) = gpt
+                ? OpenAIImages.edit(prompt: ctx.prompt, images: [guidePNG], size: min(2048, w))
+                : { let x = sizedRequest(job, prompt: ctx.prompt, inputs: [downsamplePNG(guidePNG, longEdge: 1536) ?? guidePNG], model: model); return (x.png, x.cost, x.error) }()
             DispatchQueue.main.async { self.spent += r.cost }
             // Back at the frame's own size, so the gems sit where their discs were.
             var check: GemCheck?, png: Data?
@@ -25446,7 +25482,7 @@ final class GDDToAssetsRun: ObservableObject {
                     png = encodePNG(img)
                 }
             }
-            ctx.log.event(["step": "gems", "id": id, "attempt": attempts, "model": model, "cost": r.cost, "seconds": Date().timeIntervalSince(started),
+            ctx.log.event(["step": "gems", "id": id, "attempt": attempts, "model": gpt ? OpenAIImages.model : model, "cost": r.cost, "seconds": Date().timeIntervalSince(started),
                            "problems": check?.problems ?? [], "contrast": check?.contrast ?? [], "drift": check?.drift ?? 0,
                            "error": png == nil ? (r.error ?? "no image returned") : ""])
             navLog(String(format: "gdd gems: %@ attempt %d $%.3f — %@", id, attempts, r.cost, check.map { $0.passed ? "passed" : $0.problems.joined(separator: "; ") } ?? (r.error ?? "no image")))
@@ -26131,7 +26167,8 @@ extension GDDToAssetsRun {
         run.framing = Framing(picked)
         run.rankLadder = RankLadder(picked)
         run.frameStyle = FrameStyle(picked); run.frameCustom = run.frameStyle == .custom ? picked.families[FrameStyle.key] ?? "" : ""
-        run.panelStyle = PanelStyle(picked); run.panelCustom = run.panelStyle == .custom ? picked.families[PanelStyle.key] ?? "" : ""
+        run.panelStyle = nil; run.panelCustom = PanelStyle(picked) == .custom ? picked.families[PanelStyle.key] ?? "" : ""
+        run.frameArtist = FrameArtist(picked)
         run.panelColour = PanelColour(picked)
         run.backing = (name: m.backingName, rgb: m.backingRGB)
         run.modelFlag = m.model
@@ -26487,7 +26524,9 @@ extension GDDToAssetsRun {
                 ("Frame", f.px, "the tier's frame"),
             ]
             // Its rank's gems, cut from its gem pass by their places and laid on the frame as drawn.
-            if gemmed.contains(id), let pass = currentGemPass(id, folder: folder),
+            // Only a pass that passed its checks: a failed one's gems are cut from a frame that moved, and
+            // came out as stray dots off the ring (2026-10-02). It is built without, and said so.
+            if gemmed.contains(id), let pass = currentGemPass(id, folder: folder), pass.check.passed,
                var g = pixels("\(FrameStack.gemsID(id))_rmbg.png"), g.w == W, g.h == H {
                 CutoutEdgeRules.clean(&g.px, width: W, height: H, backing: backing)
                 layers.append(("Gems", FrameStack.gemLayer(g.px, width: W, height: H, window: pass.windowBox, gems: pass.gems),
@@ -27891,6 +27930,13 @@ struct GDDToAssetsSheet: View {
                     }
                 }
                 HStack(spacing: 6) {
+                    Text("Frames drawn by")
+                    Picker("Frames drawn by", selection: $run.frameArtist) {
+                        ForEach(FrameArtist.allCases, id: \.self) { Text($0.rawValue) }
+                    }.labelsHidden().fixedSize()
+                    .help("GPT Image 2.5 (your OpenAI key, AI ▸ API Keys…) paints each frame on Navigator's moulding and keeps its window; one that drifts is drawn again, then built from parts. Parts sheet: a length of moulding and its ornaments, swept round the outline in code — exact for every shape.")
+                }
+                HStack(spacing: 6) {
                     Text("High-pay ranks")
                     Picker("High-pay ranks", selection: $run.rankLadder) {
                         ForEach(RankLadder.allCases, id: \.self) { Text($0.rawValue) }
@@ -27901,13 +27947,14 @@ struct GDDToAssetsSheet: View {
                 HStack(spacing: 6) {
                     Text("Frame backing")
                     Picker("Frame backing", selection: $run.panelStyle) {
-                        ForEach(PanelStyle.allCases, id: \.self) { Text($0.rawValue) }
+                        Text("From the theme").tag(PanelStyle?.none)
+                        ForEach(PanelStyle.allCases, id: \.self) { Text($0.rawValue).tag(PanelStyle?.some($0)) }
                     }.labelsHidden().fixedSize()
                     .help("The panel inside the high- and medium-pay frames, behind each symbol")
                     Picker("Frame backing colour", selection: $run.panelColour) {
                         ForEach(PanelColour.allCases, id: \.self) { Text($0.rawValue) }
                     }.labelsHidden().fixedSize()
-                    .help("Matching: each panel in its symbol's own colour. Contrasting: a different colour that makes the symbol stand out.")
+                    .help("Rank ladder: the high pays' backings by rank as the studio's games colour them — HP1 red, HP2 purple, HP3 blue, HP4 green. Matching: each panel in its symbol's own colour. Contrasting: a different colour that makes the symbol stand out.")
                     if run.panelStyle == .custom {
                         TextField("Describe the panel behind the symbol", text: $run.panelCustom)
                     }

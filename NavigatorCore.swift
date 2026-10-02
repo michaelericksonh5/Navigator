@@ -5657,8 +5657,11 @@ public enum FrameStack {
             let changed = near.filter { (x, y, _) in let i = (y * w + x) * 4
                 return abs(Int(edit[i]) - Int(base[i])) + abs(Int(edit[i + 1]) - Int(base[i + 1])) + abs(Int(edit[i + 2]) - Int(base[i + 2])) > 60 }.count
             let coreIdx = spot(g, radius: r * 0.55, w, h).map { (x, y, _) in (y * w + x) * 4 }
-            let gl = medianLab(edit, coreIdx)
-            c.colour?.append(((gl.0 - rimLab.0) * (gl.0 - rimLab.0) + (gl.1 - rimLab.1) * (gl.1 - rimLab.1) + (gl.2 - rimLab.2) * (gl.2 - rimLab.2)).squareRoot())
+            // Read by its most distinct quarter: a gem drawn smaller than its mark (GPT Image 2.5's red
+            // marquises, 2026-10-02) leaves rim inside the core, and the median read it as gold.
+            let des = coreIdx.map { i -> Double in let l = lab(edit[i], edit[i + 1], edit[i + 2])
+                return ((l.0 - rimLab.0) * (l.0 - rimLab.0) + (l.1 - rimLab.1) * (l.1 - rimLab.1) + (l.2 - rimLab.2) * (l.2 - rimLab.2)).squareRoot() }.sorted()
+            c.colour?.append(des.isEmpty ? 0 : des[des.count * 3 / 4])
             let core = coreIdx.map { lum(edit, $0) }.sorted()
             let lg = core.isEmpty ? 0 : core[core.count * 3 / 4]
             // A disc left as it was is flat; a gem, even a clear one, is all facets.
@@ -5695,8 +5698,30 @@ public enum FrameStack {
             if abs(Int(edit[i]) - Int(base[i])) + abs(Int(edit[i + 1]) - Int(base[i + 1])) + abs(Int(edit[i + 2]) - Int(base[i + 2])) > 90 { moved += 1 }
         } }
         c.drift = Double(moved) / Double(max(1, total))
-        if c.drift > 0.02 { c.problems.append(String(format: "the frame itself changed (%.1f%% of it)", c.drift * 100)) }
+        // What matters is whether the frame MOVED under the gems — they are cut from the edit by their
+        // spots and laid on the frame as drawn. GPT Image 2.5 re-renders a whole image in place (8% of
+        // its pixels changed, none moved, 2026-10-02): changed but in place is fine.
+        if c.drift > 0.02 && shift(base, edit, width: w, height: h) > 2 {
+            c.problems.append(String(format: "the frame itself changed (%.1f%% of it)", c.drift * 100))
+        }
         return c
+    }
+    /// How far an edit moved its image, in pixels: the best whole-pixel offset between the two, searched
+    /// on an eighth-size copy (±4 there) and read back at full size.
+    static func shift(_ a: [UInt8], _ b: [UInt8], width w: Int, height h: Int) -> Double {
+        let f = 8, sw = w / f, sh = h / f
+        func small(_ px: [UInt8]) -> [Double] {
+            (0..<(sw * sh)).map { i in let x = (i % sw) * f + f / 2, y = (i / sw) * f + f / 2, j = (y * w + x) * 4
+                return 0.299 * Double(px[j]) + 0.587 * Double(px[j + 1]) + 0.114 * Double(px[j + 2]) }
+        }
+        let A = small(a), B = small(b)
+        var best = (err: Double.infinity, dx: 0, dy: 0)
+        for dy in -4...4 { for dx in -4...4 {
+            var e = 0.0, n = 0
+            for y in 4..<(sh - 4) { for x in 4..<(sw - 4) { e += abs(A[y * sw + x] - B[(y + dy) * sw + x + dx]); n += 1 } }
+            if n > 0, e / Double(n) < best.err { best = (e / Double(n), dx, dy) }
+        } }
+        return (Double(best.dx * best.dx + best.dy * best.dy)).squareRoot() * Double(f)
     }
 
     /// The gems alone, from the cut-out of a gem pass (straight RGBA): each spot out to 1.6× its
@@ -5855,8 +5880,11 @@ public enum FrameStack {
     /// the backing colour (the composite is keyed against it) and off the hues its tier has taken,
     /// so the tier stays colour-coded.
     public static func panelHue(symbol: Double?, mode: PanelColour, taken: [Double], backing: Double?) -> Double {
-        var hue = mode == .matching ? (symbol ?? 210) : ((symbol ?? 30) + 180).truncatingRemainder(dividingBy: 360)
-        func clear(_ h: Double) -> Bool { (backing.map { hueGap(h, $0) >= 35 } ?? true) && taken.allSatisfy { hueGap(h, $0) >= 30 } }
+        var hue = mode == .contrasting ? ((symbol ?? 30) + 180).truncatingRemainder(dividingBy: 360) : (symbol ?? 210)
+        // A rank's colour is the hierarchy itself: kept unless it all but is the backing (the stack cuts
+        // its own layers, so it need not be far) — purple, 30° from magenta, turned to pink otherwise.
+        let gap = mode == .ladder ? 20.0 : 35.0
+        func clear(_ h: Double) -> Bool { (backing.map { hueGap(h, $0) >= gap } ?? true) && (mode == .ladder || taken.allSatisfy { hueGap(h, $0) >= 30 }) }
         var turns = 0
         while !clear(hue) && turns < 9 { hue = (hue + 40).truncatingRemainder(dividingBy: 360); turns += 1 }
         return hue
@@ -8134,7 +8162,8 @@ public enum GDDSymbolSetRules {
     static let prefixes: [(String, SlotSymbolRole)] = [
         // Longest first: BWY1 is a bonus WYSIWYG, not a blank that happens to start
         // with B, and DHP a doubled high pay rather than an unknown.
-        ("BWY", .wysiwyg), ("DHP", .highPay),
+        // WDWY1, a wild carrying a value (Toyota's "Wild+Way"), is a wild before it is a WD-something.
+        ("WDWY", .wild), ("BWY", .wysiwyg), ("DHP", .highPay),
         ("WD", .wild), ("HP", .highPay), ("MP", .mediumPay), ("LP", .lowPay),
         ("SC", .scatter), ("BO", .bonus), ("BN", .bonus), ("JP", .jackpot),
         ("WY", .wysiwyg), ("SF", .collector), ("MU", .multiplier), ("BL", .blank),
@@ -11226,7 +11255,12 @@ public enum FrameRules {
         let symbols = jobs.filter { $0.kind == .symbol }
         let rank = FrameRules.rank(of: job.id, in: symbols)
         let slots = gemSlots(rank: rank, role: job.role, design: design)
-        return rank == 1 && PayLadder.face(job, in: symbols) != nil ? slots.filter { $0 != .crest } : slots
+        // A character HP1's head breaks out over its frame's top, so nothing may sit at the top centre —
+        // no crest jewel, no side-centre gem: the studio's character HP1 frames carry corner gems only.
+        // A top gem also capped the head under it (Galactic Goddess, 2026-10-02: 2% over the top).
+        guard rank == 1, PayLadder.face(job, in: symbols) != nil else { return slots }
+        let kept = slots.filter { $0 != .crest }
+        return kept.contains(.sides) ? kept.filter { $0 != .sides } + [.corners] : kept
     }
 
     /// Whether a frame is drawn with gems in it — a painted set's; a layered set's frames have none.
@@ -14398,7 +14432,7 @@ extension GDDAssetPrompts {
         return "Using the provided image of an empty slot-game frame for \(whose) of a game themed “\(theme.name)”, change only \(discs). "
             + "Turn each mark into a gem of this kind — \(gem)\(design.families[GemCut.key] == nil ? "" : ", \(GemCut(design).words), its mark's outline being its cut") — held by the frame's own ornament: at each spot the frame's own carving grows around the gem as its setting, curling over its edges like claws of the frame's own material, so the gem sits IN the frame — not on top of it as a separate plate, badge or bezel. "
             + "Each gem is exactly where its mark is, in its mark's shape and size. \(alike) "
-            + "The stones are \(gemColour(job.hue)), glowing from within, with brilliant white glints — so they stand out clearly against the frame even when the symbol is shown small. "
+            + "The stones are \(gemColour(panelColour(job, jobs: jobs, design: design) ?? job.hue)), glowing from within, with brilliant white glints — so they stand out clearly against the frame even when the symbol is shown small. "
             + "Keep everything else in the image exactly the same: the frame's shape, carving, metal and lighting, its size and position, and the flat \(backing.name) background — preserving the original style, lighting and composition. "
             + "The window inside the frame stays completely empty: flat \(backing.name), with nothing added there. No other gems, no text."
     }

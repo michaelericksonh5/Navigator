@@ -12724,10 +12724,13 @@ final class FrameRanksTests: XCTestCase {
         XCTAssertTrue(g1.hasPrefix("Using the provided image of an empty slot-game frame for the top high-pay symbol"), g1)
         XCTAssertTrue(g1.contains("change only the five flat white marks — the four at the corners and the larger one in the crest at the top centre"), g1)
         XCTAssertTrue(g1.contains("a gem of this kind — bean-shaped cabochons in leaf-claw settings —"), g1)   // no cut planned: the words alone
-        XCTAssertTrue(g1.contains("The stones are a bright, luminous teal — far lighter and more saturated than the frame"), g1)
+        XCTAssertTrue(g1.contains("The stones are a bright, luminous red — far lighter and more saturated than the frame"), g1)   // its rank's, as its backing
         XCTAssertTrue(g1.contains("preserving the original style, lighting and composition"), g1)
         XCTAssertTrue(g2.contains("for the second high-pay symbol") && g2.contains("the four flat white marks at the corners"), g2)
-        XCTAssertTrue(g2.contains("golden yellow, like a citrine"), g2)
+        XCTAssertTrue(g2.contains("a bright, luminous purple"), g2)
+        let matching = SetDesign(anchorID: "HP1", look: d.look, families: d.families.merging([PanelColour.key: PanelColour.matching.rawValue]) { $1 })
+        XCTAssertTrue(GDDAssetPrompts.brief(job: hps[1], step: steps.first { $0.id == "gems_HP2" }!, theme: theme, design: matching, backing: backing, gameName: "", jobs: hps)
+            .contains("golden yellow, like a citrine"))                                                     // matching: the symbol's own
         XCTAssertTrue(GDDAssetPrompts.gemColour("white").hasPrefix("brilliant clear diamonds"))
         XCTAssertLessThan(g1.split(separator: " ").count, 260)
     }
@@ -13133,6 +13136,10 @@ final class SetLookTests: XCTestCase {
         XCTAssertEqual(GDDAssetPrompts.panelColour(jobs[1], jobs: jobs, design: SetDesign()), "purple")
         XCTAssertNil(GDDAssetPrompts.panelColour(jobs[1], jobs: jobs, design: SetDesign(families: [PanelColour.key: "Matching"])))
         XCTAssertFalse(PanelColour.ladder.rule.contains("HP"))                               // no codes in a prompt
+        // In the stack, each rank keeps its colour on a magenta backing: red not flipped, purple not turned pink.
+        let hues = FrameStack.panelHues([(id: "HP1", hue: 0, planned: true), (id: "HP2", hue: 270, planned: true), (id: "HP3", hue: 240, planned: true)],
+                                        mode: .ladder, backing: 300)
+        XCTAssertEqual(hues["HP1"], 0); XCTAssertEqual(hues["HP2"], 270); XCTAssertEqual(hues["HP3"], 240)
     }
     // Each kind stands in its cell at its shipped size: low pays three quarters of a high pay.
     func testSymbolsAreSizedForTheReelsByKind() {
@@ -13184,5 +13191,6 @@ final class MarkdownGDDTests: XCTestCase {
         let codes = GDDSymbolSetRules.parse(md).map(\.code)
         XCTAssertEqual(codes, ["WD1", "HP1", "HP2", "LP1", "BO1", "WDWY1"])
         XCTAssertTrue(GDDSymbolSetRules.parseWithProblems(md).problems.isEmpty)
+        XCTAssertEqual(GDDSymbolSetRules.classify("WDWY1").role, .wild)
     }
 }
