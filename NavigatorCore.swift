@@ -11595,7 +11595,9 @@ public enum PayLadder {
     }
     /// The crop and the frame lines together, each led by a space; "" when there are none.
     static func lines(_ job: AssetJob, in jobs: [AssetJob], painted: Bool) -> String {
-        [crop(job, in: jobs).map { "It is shown as \($0)." }, painted ? inFrame(job, in: jobs) : nil]
+        // The cut wins over the brief: Jack's brief put a hand with a bean at his chest as the focal
+        // point, and that pulled the picture back down to his chest (2026-10-02).
+        [crop(job, in: jobs).map { "It is shown as \($0). Whatever the description says, nothing below that cut is in the picture — no hands, arms or held props below it." }, painted ? inFrame(job, in: jobs) : nil]
             .compactMap { $0 }.filter { !$0.isEmpty }.map { " " + $0 }.joined()
     }
 
@@ -11792,7 +11794,9 @@ public enum PanelStyle: String, CaseIterable, Sendable {
     /// How the empty frame's panel is drawn.
     public var brief: String {
         switch self {
-        case .litDepth, .custom: return "a panel with depth — darker toward the rim, glowing softly in the middle where a symbol will sit, with a stepped inset bevel just inside the frame"
+        // Not "a stepped inset bevel just inside the frame": that is an inner liner, the thick inside
+        // edge the art director rejected (2026-10-02).
+        case .litDepth, .custom: return "a panel with depth — darker toward the rim, glowing softly in the middle where a symbol will sit, flat right up to the frame's edge"
         case .lightRays: return "a panel with soft, straight rays of light radiating from its middle out to every edge, like a sunburst — brightest in the middle, where a symbol will sit, and darker toward the edges"
         case .themePattern: return "a panel carrying a subtle tone-on-tone pattern of this theme's own motifs, low in contrast so a symbol reads over it, glowing softly in the middle and darker toward the rim"
         case .world: return "a panel showing a soft, simple glimpse of this game's world — its sky, landscape or setting, with no figures or objects — low in detail and slightly out of focus so a symbol reads over it, darker toward the rim"
@@ -11805,7 +11809,7 @@ public enum PanelStyle: String, CaseIterable, Sendable {
     /// What a symbol painted into the frame keeps of it.
     public var kept: String {
         switch self {
-        case .litDepth: return "its panel's depth and bevel"
+        case .litDepth: return "its panel's depth"
         case .lightRays: return "its panel's rays of light"
         case .themePattern: return "its panel's pattern"
         case .world: return "its panel's glimpse of the world"
@@ -13345,10 +13349,13 @@ extension GDDAssetPrompts {
         // gives them its panel's colour. Layered, the frame carries none: Navigator sets them in.
         let gem = FrameRules.gem(design), ladder = RankLadder(design), layered = Framing(design) == .layered
         let clear = "in clear, colourless stone, so each symbol's own colour can be given to them"
-        let places = FrameRules.gemPlaces(FrameRules.gemSlots(rank: ref.rank, role: role, design: design))
+        let places = FrameRules.gemPlaces(FrameRules.gemSlots(rank: ref.rank, role: role, design: design).filter { crestOK || $0 != .crest })
         let gems = layered ? "" : FrameRules.hasGems(ref, design) && !places.isEmpty ? ", set with \(gem): \(places), \(clear)" : ""
         let noGems = layered ? " No gems or jewels on it: they are set into it afterwards." : ""
-        let rich = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with a crest at the top centre"
+        // Without a crest, the richer words lose theirs too: told "a sculpted crown crest atop" and then
+        // "no crest", Gemini was handed an argument (2026-10-02).
+        let richWords = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with a crest at the top centre"
+        let rich = crestOK ? richWords : Self.withoutCrest(richWords)
         if !ref.isShared && !single {
             let change: String
             switch (ladder, ref.rank) {
@@ -13405,19 +13412,13 @@ extension GDDAssetPrompts {
         ].joined(separator: "\n\n")
     }
 
-    /// The edit that finishes a frame cut back to its planned opening: Gemini drew the frame's band
-    /// wider than planned, inward, so the overshoot is taken off and the new inside edge is finished
-    /// as the frame's own narrow lip — a slim frame that reads as designed, not one that looks chopped
-    /// (the art director, 2026-10-02), at exactly the planned size.
-    static func finishInnerEdge(step: RenderStep, theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
-        let role = FrameRules.parse(step.id)?.role ?? .highPay
-        return [
-            "Edit the attached image: it is the empty frame of the \(role == .highPay ? "high-pay" : "medium-pay") symbols of a video slot game themed “\(theme.name)”, cut straight along its opening — its inside edge is cut off. Finish that inside edge as part of the frame: a clean, narrow bevelled lip in the frame's own material, colour and light, running all the way round the opening, so the frame reads as a finished, slim frame.",
-            "Change nothing else. The opening stays exactly as large and completely empty — the flat background right up to the new lip, nothing drawn in it. The frame's carving, ornament, outline and size stay exactly as they are.",
-            backdropLine(backing),
-            "No text, lettering or numbers, no watermark, no user interface.",
-        ].joined(separator: "\n\n")
+    /// Frame words without their crest or crown: the clauses (split at commas and "and") that name one.
+    static func withoutCrest(_ text: String) -> String {
+        let parts = text.components(separatedBy: ", ").flatMap { $0.components(separatedBy: " and ") }
+        let kept = parts.filter { p in !["crest", "crown"].contains { p.lowercased().contains($0) } }
+        return kept.isEmpty ? "richer, heavier ornament at the corners" : kept.joined(separator: ", ")
     }
+
 
     /// What a symbol painted into a shared frame is told about the frame: it stays, panel
     /// treatment and all, and only the panel's colour changes, as every shipped set recolours its
@@ -13675,7 +13676,7 @@ extension GDDAssetPrompts {
                 ? "It is painted into its tier's frame, which is drawn separately and shared by the whole tier: describe only what sits inside the frame.\(PayLadder.lines(job, in: jobs, painted: true)) Never describe the frame itself."
                 : job.hasFrame ? "It sits in a frame, and the frame gives it \(outlinePhrase(job.shape))."
                 : "No frame: it stands on its own silhouette, \(outlinePhrase(job.shape)).\(wholeFigure(job))")
-            if Framing.stacks(job, design), let c = PayLadder.crop(job, in: jobs) { facts.append("It is shown as \(c).") }
+            if Framing.stacks(job, design), let c = PayLadder.crop(job, in: jobs) { facts.append("It is shown as \(c). Describe only what shows within that cut — no hands, arms or held props below it.") }
             if let w = who { facts.append("It shows \(w.name): \(w.inArt ? Self.inArtLook : w.look)") }
         }
         let words = job.kind == .background ? "100 to 160" : onSheet ? "50 to 90" : "80 to 150"

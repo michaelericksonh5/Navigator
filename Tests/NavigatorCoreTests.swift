@@ -13020,12 +13020,11 @@ final class PayLadderTests: XCTestCase {
         XCTAssertFalse(b.contains("The game prints the word WILD"), b)
     }
 
-    // A frame drawn thick inside is taken back to its plan and its new inside edge finished, not left chopped.
-    func testAThickFramesInsideEdgeIsFinishedNotChopped() {
-        let b = GDDAssetPrompts.finishInnerEdge(step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme,
-                                                design: SetDesign(), backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)))
-        XCTAssertTrue(b.contains("cut straight along its opening") && b.contains("a clean, narrow bevelled lip in the frame's own material"), b)
-        XCTAssertTrue(b.contains("The opening stays exactly as large and completely empty"), b)
+    // A character HP1's frame words lose their crest: its head is the crest.
+    func testFrameWordsLoseTheirCrest() {
+        XCTAssertEqual(GDDAssetPrompts.withoutCrest("flourishing leaf filigree at the corners and a sculpted crown crest atop"),
+                       "flourishing leaf filigree at the corners")
+        XCTAssertEqual(GDDAssetPrompts.withoutCrest("a crest at the top centre"), "richer, heavier ornament at the corners")
     }
 
     // The lip: the frame cut back to its opening plus a narrow lip, the lip drawn grey for Gemini to
@@ -13086,7 +13085,7 @@ final class PayLadderTests: XCTestCase {
         let step = RenderStep(id: "HP1", mode: .anchor, refs: [], after: [])
         let d = GDDAssetPrompts.brief(job: hp1, step: step, theme: theme, design: layered,
                                       backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
-        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, cut off straight across just below the shoulders."), d)
+        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, cut off straight across just below the shoulders. Whatever the description says, nothing below that cut is in the picture"), d)
         XCTAssertFalse(d.contains("whole and uncropped"), d)
         // Painted into its frame, HP1 is told to break out of it.
         let painted = GDDAssetPrompts.symbolBrief(job: hp1, jobs: jobs, design: SetDesign(anchorID: "HP1", look: "Glossy."), theme: theme)
