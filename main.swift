@@ -677,6 +677,24 @@ enum FalKeyCheck {
     }
 }
 
+/// Does OpenAI accept a key, and can it reach GPT Image 2.5? Asked of the model lookup
+/// (GET /v1/models/<model>): it runs nothing, so it costs nothing. Blocks.
+enum OpenAIKeyCheck {
+    static func verify(_ key: String) -> String {
+        var req = URLRequest(url: URL(string: "https://api.openai.com/v1/models/\(OpenAIImages.model)")!, timeoutInterval: 15)
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        let done = DispatchSemaphore(value: 0); var status = 0
+        URLSession.shared.dataTask(with: req) { _, r, _ in status = (r as? HTTPURLResponse)?.statusCode ?? 0; done.signal() }.resume()
+        done.wait()
+        switch status {
+        case 200: return "OpenAI accepted the key, and it can use \(OpenAIImages.model)."
+        case 401: return "OpenAI rejected this key (401)."
+        case 403, 404: return "OpenAI accepted the key but it cannot use \(OpenAIImages.model) (\(status)): the organisation may need verifying."
+        default: return "Couldn’t reach OpenAI (\(status)) — the key isn’t proven wrong."
+        }
+    }
+}
+
 enum APIKeys {
     private static let service = "com.merickson.navigator.apikeys"
     static func get(_ account: String) -> String? { lookup(account).key }
@@ -729,7 +747,7 @@ enum APIKeys {
         SecItemAdd(add as CFDictionary, nil)
     }
     /// The environment variable the H5G AI Connect hub keeps an account's key under.
-    static let hubNames = ["fal.ai": "FAL_KEY"]
+    static let hubNames = ["fal.ai": "FAL_KEY", "OpenAI": "OPENAI_API_KEY"]
     /// That key, from the environment (a run started from Claude Code inherits it) or from the hub's
     /// store, the `env` block of ~/.claude/settings.json (what Navigator sees when opened from Finder).
     static func hubKey(_ account: String) -> String? {
@@ -750,6 +768,71 @@ enum APIKeys {
     static var falAvailable: Bool { PermissionProbe.keyStored(account: "fal.ai") == .granted }
     // The fal.ai API key (used for AI upscaling).
     static var fal: String? { get { get("fal.ai") } set { set(newValue ?? "", "fal.ai") } }
+    // The OpenAI API key (GPT Image 2.5 frames): the art director's own, set with the H5G AI Connect hub
+    // (`keys.mjs set openai`, masked) or in AI → API Keys…
+    static var openAI: String? { get { get("OpenAI") } set { set(newValue ?? "", "OpenAI") } }
+}
+
+// MARK: - OpenAI images (GPT Image 2.5)
+
+/// GPT Image 2.5 edits on OpenAI's own API, with the art director's key (not through fal). Billed by
+/// token: $5 / 1M text in, $8 / 1M image in, $30 / 1M image out (OpenAI pricing, 2026-10-02), so each
+/// call's cost is worked out from the usage it returns. Blocks; call off the main thread.
+enum OpenAIImages {
+    static let model = "gpt-image-2.5-sunburst"
+    /// A 2048 high-quality edit, before its usage is known: the fal reference table's 1024 high is $0.22.
+    static let estimate = 0.30
+    static var available: Bool { APIKeys.lookup("OpenAI").key != nil }
+
+    static func edit(prompt: String, images: [Data], size: Int = 2048, quality: String = "high") -> (png: Data?, cost: Double, error: String?) {
+        guard let key = APIKeys.openAI else { return (nil, 0, "No OpenAI API key: set one in AI → API Keys…") }
+        guard !PaidCalls.disabled else { return (nil, 0, PaidCalls.refusal) }
+        var req = URLRequest(url: URL(string: "https://api.openai.com/v1/images/edits")!, timeoutInterval: 360)
+        req.httpMethod = "POST"
+        let boundary = "navigator-\(UUID().uuidString)"
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        var body = Data()
+        func field(_ name: String, _ value: String) {
+            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
+        }
+        for (k, v) in [("model", model), ("prompt", prompt), ("size", "\(size)x\(size)"), ("quality", quality),
+                       ("background", "opaque"), ("output_format", "png"), ("n", "1")] { field(k, v) }
+        for (i, img) in images.enumerated() {
+            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"image\(i).png\"\r\nContent-Type: image/png\r\n\r\n".data(using: .utf8)!)
+            body.append(img); body.append("\r\n".data(using: .utf8)!)
+        }
+        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        req.httpBody = body
+        let done = DispatchSemaphore(value: 0)
+        var data: Data?, status = 0, failure: String?
+        URLSession.shared.dataTask(with: req) { d, r, e in
+            data = d; status = (r as? HTTPURLResponse)?.statusCode ?? 0; failure = e?.localizedDescription; done.signal()
+        }.resume()
+        done.wait()
+        guard let data, let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return (nil, 0, failure ?? "OpenAI answered \(status) with nothing readable")
+        }
+        let cost = Self.cost(j["usage"] as? [String: Any])
+        if let e = j["error"] as? [String: Any] {
+            navLog("openai image: \(status) \(e["message"] as? String ?? "")")
+            return (nil, cost, "OpenAI: \(e["message"] as? String ?? "error \(status)")")
+        }
+        guard let first = (j["data"] as? [[String: Any]])?.first, let b64 = first["b64_json"] as? String,
+              let png = Data(base64Encoded: b64) else { return (nil, cost, "OpenAI returned no image (\(status))") }
+        navLog(String(format: "openai image: %@ %dx%d %@ $%.4f", model, size, size, quality, cost))
+        return (png, cost, nil)
+    }
+
+    /// The cost of a call from its usage: text and image input tokens, image output tokens.
+    static func cost(_ usage: [String: Any]?) -> Double {
+        guard let u = usage else { return 0 }
+        let inDetail = u["input_tokens_details"] as? [String: Any]
+        let text = Double(inDetail?["text_tokens"] as? Int ?? (u["input_tokens"] as? Int ?? 0))
+        let image = Double(inDetail?["image_tokens"] as? Int ?? 0)
+        let out = Double(u["output_tokens"] as? Int ?? 0)
+        return text * 5e-6 + image * 8e-6 + out * 30e-6
+    }
 }
 
 // MARK: - Persistence (UserDefaults-backed view settings)
@@ -18991,31 +19074,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
-    // AI → API Keys… — paste/store the fal.ai key (Keychain-backed).
+    // AI → API Keys… — the fal.ai key and the OpenAI key (Keychain-backed; the H5G AI Connect store,
+    // ~/.claude/settings.json, is read first when a key is set there).
     @objc func apiKeysAction(_ sender: Any?) {
         let a = NSAlert()
-        a.messageText = "fal.ai API key"
-        a.informativeText = "Used by Layerize and the Topaz upscaler. Stored in your macOS keychain, not in a file.\n\nNo key yet? Get Key opens fal’s dashboard. Switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        field.placeholderString = "fal.ai key (e.g. 1234abcd-…:…)"
-        field.stringValue = APIKeys.fal ?? ""
-        a.accessoryView = field
+        a.messageText = "API keys"
+        a.informativeText = "fal.ai: Layerize and the Topaz upscaler. OpenAI: GPT Image 2.5, which draws the symbol frames. Stored in your macOS keychain, not in a file. A key set with the H5G AI Connect hub is used first.\n\nNo fal key yet? Get Key opens fal’s dashboard. Switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
+        func field(_ placeholder: String, _ value: String?) -> NSSecureTextField {
+            let f = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+            f.placeholderString = placeholder; f.stringValue = value ?? ""
+            return f
+        }
+        let fal = field("fal.ai key (e.g. 1234abcd-…:…)", APIKeys.fal)
+        let openAI = field("OpenAI key (sk-…)", APIKeys.lookup("OpenAI").key)
+        let stack = NSStackView(views: [fal, openAI]); stack.orientation = .vertical; stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 380, height: 56)
+        a.accessoryView = stack
         a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel"); a.addButton(withTitle: "Get Key…")
-        a.window.initialFirstResponder = field
+        a.window.initialFirstResponder = fal
         switch a.runModal() {
         case .alertFirstButtonReturn:
-            let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            APIKeys.fal = key
-            FalKeyCheck.last = nil   // a new key has no verdict yet
-            guard !key.isEmpty else { return }
-            // Checked now, while the key is in hand — no keychain read, so no prompt.
+            let key = fal.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let oKey = openAI.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if key != (APIKeys.fal ?? "") { APIKeys.fal = key; FalKeyCheck.last = nil }   // a new key has no verdict yet
+            if APIKeys.hubKey("OpenAI") == nil { APIKeys.openAI = oKey }
+            // Checked now, while the keys are in hand — no keychain read, so no prompt.
             DispatchQueue.global(qos: .userInitiated).async {
-                let r = FalKeyCheck.verify(key)
+                var lines: [String] = []
+                if !key.isEmpty { lines.append(FalKeyCheck.verify(key).message) }
+                if !oKey.isEmpty { lines.append(OpenAIKeyCheck.verify(oKey)) }
                 DispatchQueue.main.async {
                     let done = NSAlert()
-                    done.alertStyle = r.accepted == false ? .warning : .informational
-                    done.messageText = r.accepted == true ? "Key saved and working" : "Key saved"
-                    done.informativeText = r.message
+                    done.messageText = "Keys saved"
+                    done.informativeText = lines.isEmpty ? "No keys set." : lines.joined(separator: "\n")
                     done.addButton(withTitle: "OK"); done.runModal()
                 }
             }
@@ -21232,21 +21323,35 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
     app.setActivationPolicy(.accessory)
     DispatchQueue.main.async { MainActor.assumeIsolated {
         func fail(_ m: String) -> Never { print("FAILED: \(m)"); exit(1) }
-        guard let folder = GDDLibrary.folder else { fail("no GDD folder is set") }
-        guard let entry = GDDLibrary.entries(in: folder).first(where: { $0.name == gddName })
-        else { fail("no document named “\(gddName)”") }
+        // --gdd-file <path>: the document's text from a file, for a GDD the library cannot read now.
+        // --new-theme: a theme not on the hub yet, planned from its name alone (no hub sign-in needed).
+        let gddFile = value("--gdd-file"), newTheme = args.contains("--new-theme")
+        let entry: GDDLibrary.Entry?
+        if gddFile == nil {
+            guard let folder = GDDLibrary.folder else { fail("no GDD folder is set") }
+            guard let e = GDDLibrary.entries(in: folder).first(where: { $0.name == gddName }) else { fail("no document named “\(gddName)”") }
+            entry = e
+        } else { entry = nil }
         let run = GDDToAssetsRun()
         if lowPayArg.hasPrefix("custom:") {
             run.lowPays = .custom; run.lowPayCustom = String(lowPayArg.dropFirst("custom:".count))
         } else if let k = LowPayKind(rawValue: lowPayArg) {
             run.lowPays = k
         } else { fail("--low-pays is one of \(LowPayKind.allCases.map(\.rawValue).joined(separator: ", ")), or custom:<what>") }
-        GDDLibrary.text(of: entry) { text, err in MainActor.assumeIsolated {
+        @MainActor func readText(_ body: @escaping (String?, String?) -> Void) {
+            if let f = gddFile { body(try? String(contentsOfFile: f, encoding: .utf8), "couldn’t read \(f)") }
+            else if let entry { GDDLibrary.text(of: entry, completion: body) }
+        }
+        @MainActor func themes(_ body: @escaping ([GameTheme]?, String?) -> Void) {
+            if newTheme { body([GameTheme(name: themeName)], nil) } else { ThemeHubClient.themes(completion: body) }
+        }
+        readText { text, err in MainActor.assumeIsolated {
             guard let text else { fail(err ?? "the document could not be read") }
-            run.load(gddText: text, gameName: entry.name, size: "2K", symbolAspect: "1:1",
+            run.load(gddText: text, gameName: gddName, size: "2K", symbolAspect: "1:1",
                      backgroundAspect: "3:4", backgroundSize: "4K")
             print("GDD: \(run.symbols.count) symbols, \(run.jobs.count) images to plan")
-            ThemeHubClient.themes { list, err in MainActor.assumeIsolated {
+            guard !run.jobs.isEmpty else { fail("the document declares no symbol set Navigator can read") }
+            themes { list, err in MainActor.assumeIsolated {
                 guard let t = list?.first(where: { $0.name == themeName }) else { fail(err ?? "no theme named “\(themeName)”") }
                 run.theme = t
                 run.rehydrate()
@@ -21297,7 +21402,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
                         }
                         // --cut: then Remove BG and the planned frame split, as the window does, waiting for both.
                         let cut = args.contains("--cut")
-                        run.generate(into: out, removeBackground: cut, separateFrames: cut, only: ids) { urls in
+                        // A layered set's framed pays are built from layers: there is nothing for Layerize to split.
+                        run.generate(into: out, removeBackground: cut, separateFrames: cut && run.framing != .layered, only: ids) { urls in
                             MainActor.assumeIsolated {
                                 print("MADE: \(urls.map(\.lastPathComponent).sorted()) · failures \(run.failures)")
                                 print(String(format: "SPENT: $%.4f", run.spent))
@@ -21393,7 +21499,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--generate-set"), flag + 2 <
     DispatchQueue.main.async { MainActor.assumeIsolated {
         guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
         print(String(format: "GENERATING: %@ (%@) — estimate $%.2f", ids.sorted().joined(separator: ","), run.framing.rawValue, run.estimate(for: ids)))
-        run.generate(into: folder, removeBackground: false, separateFrames: false, only: ids) { made in
+        // --cut: Photoshop takes each symbol off its backing, and each is sized for the reels by its kind.
+        run.generate(into: folder, removeBackground: args.contains("--cut"), separateFrames: false, only: ids) { made in
             print("MADE: \(made.map(\.lastPathComponent))")
             // A layered set is built after the batch; wait for it. Exits only after saying so: a
             // separate exit timer beat the last DONE line to it (2026-10-02).
@@ -24187,7 +24294,13 @@ final class GDDToAssetsRun: ObservableObject {
     @Published private(set) var lastFolder: URL?
 
     /// After Effects is still keying, but the paid work is over and the window is free.
-    @Published var keying = false
+    /// Cut-outs, stacks and sizing in flight: counted, so one finishing does not clear another (a headless
+    /// run waits for all of them).
+    @Published private(set) var keyingCount = 0
+    var keying: Bool {
+        get { keyingCount > 0 }
+        set { keyingCount = max(0, keyingCount + (newValue ? 1 : -1)) }
+    }
     /// Nano Banana 2 by default. Pro is offered because NB2 does not reliably honour
     /// a 2K request and Pro did in testing.
     @Published var modelFlag = "nb2"
@@ -24969,8 +25082,12 @@ final class GDDToAssetsRun: ObservableObject {
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
             }
             if st.mode == .frame {
-                // Only a parts sheet is drawn; every frame is built from one in code.
+                // Only a parts sheet — or GPT Image 2.5's whole frame — is drawn; rungs are built in code.
                 guard FrameKit.ownSheet(st.id, design: styledDesign) else { return sum }
+                if FrameArtist(styledDesign) == .gpt && OpenAIImages.available {
+                    let have = lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(st.id).png").path) } ?? false
+                    return sum + (have ? 0 : OpenAIImages.estimate)
+                }
                 let have = lastFolder.map { f in [f.appendingPathComponent("\(st.id).png"), Self.referenceURL(FrameKit.id(st.id), in: f)]
                     .contains { FileManager.default.fileExists(atPath: $0.path) } } ?? false
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
@@ -25368,6 +25485,8 @@ final class GDDToAssetsRun: ObservableObject {
         let dst = folder.appendingPathComponent("\(step.id).png")
         if FileManager.default.fileExists(atPath: dst.path) { return }
         guard FrameRules.parse(step.id) != nil else { return }
+        let gpt = DispatchQueue.main.sync { FrameArtist(self.styledDesign) == .gpt } && OpenAIImages.available
+        if gpt && drawFrameWithGPT(step: step, themeArt: themeArt, folder: folder) { return }
         let (own, kitURL) = DispatchQueue.main.sync { (FrameKit.ownSheet(step.id, design: self.styledDesign),
                                                       Self.referenceURL(FrameKit.sheetID(step.id, design: self.styledDesign), in: folder)) }
         let (b, geo, build, size, log) = DispatchQueue.main.sync { () -> (RGB8, FrameGeometry, FrameKit.Build, Int, GDDRunLog) in
@@ -25419,6 +25538,83 @@ final class GDDToAssetsRun: ObservableObject {
         log.event(["step": "frame", "id": step.id, "refs": refs, "model": model, "cost": cost, "seconds": secs, "error": error ?? ""])
         navLog(String(format: "gdd frame: %@ → %@ $%.3f %.1fs", step.id, error.map { "FAILED: \($0)" } ?? "built", cost, secs))
         DispatchQueue.main.async { self.spent += cost }
+    }
+
+    /// A frame drawn whole by GPT Image 2.5 Sunburst (FrameArtist): the shared frame on Navigator's grey
+    /// moulding, HP1's own as an edit of the shared one, each checked against its planned window
+    /// (FrameStack.windowCovered) and drawn once more when it drifted. A ladder's rungs are the shared
+    /// frame, their metal tinted in code. False when it could not be drawn to plan: the frame is then
+    /// built from its parts sheet instead (generateFrame).
+    fileprivate func drawFrameWithGPT(step: RenderStep, themeArt: Data?, folder: URL) -> Bool {
+        let dst = folder.appendingPathComponent("\(step.id).png")
+        let (design, b, geo, build, size, log, theme, jobs, backing) = DispatchQueue.main.sync {
+            (self.styledDesign, self.backing.rgb, FrameGeometry(self.styledDesign),
+             FrameKit.build(for: step, design: self.styledDesign, jobs: self.jobs) ?? FrameKit.Build(),
+             ["1K": 1024, "4K": 4096][self.jobs.first { $0.kind == .symbol }?.size ?? "2K"] ?? 2048,
+             self.session(), self.theme, self.jobs, self.backing)
+        }
+        guard let theme, let ref = FrameRules.parse(step.id) else { return false }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        func pixels(_ png: Data) -> [UInt8]? {
+            guard let cg = loadCGImage(data: png) else { return nil }
+            let fitted = (cg.width == size && cg.height == size) ? cg : (ChromaKeyOutputRules.straightRGBA8(cg).flatMap { px in
+                ChromaKeyOutputRules.image(straightRGBA8: FrameKit.resized(FrameKit.Piece(px: px, w: cg.width, h: cg.height), size, size).px,
+                                           width: size, height: size, space: space) } ?? cg)
+            return ChromaKeyOutputRules.straightRGBA8(fitted)
+        }
+        func write(_ px: [UInt8]) -> Bool {
+            guard let onBack = ChromaKeyOutputRules.image(straightRGBA8: px, width: size, height: size, space: space).flatMap(encodePNG),
+                  let cut = ChromaKeyOutputRules.image(straightRGBA8: FrameKit.keyed(px, backing: b), width: size, height: size, space: space).flatMap(encodePNG),
+                  (try? onBack.write(to: dst)) != nil else { return false }
+            try? cut.write(to: folder.appendingPathComponent("\(step.id)_rmbg.png"))
+            DispatchQueue.main.async { self.framesMade.append(dst) }
+            return true
+        }
+        // A rung with no sheet of its own: the shared frame, its metal tinted for its rank.
+        if !FrameKit.ownSheet(step.id, design: design) {
+            let shared = folder.appendingPathComponent("\(FrameKit.sharedID(step.id)).png")
+            guard let d = try? Data(contentsOf: shared), var px = pixels(d) else { return false }
+            if let metal = build.metal {
+                var cut = FrameKit.keyed(px, backing: b); FrameKit.tint(&cut, metal); px = FrameKit.onBacking(cut, b)
+            }
+            let ok = write(px)
+            navLog("gdd frame: \(step.id) → built from \(FrameKit.sharedID(step.id))\(build.metal.map { " in \($0)" } ?? "") $0")
+            return ok
+        }
+        let resolved = resolveRefs(step.refs, for: step.id, themeArt: themeArt, folder: folder)
+        var inputs = resolved.inputs, refs = resolved.refs
+        if ref.isShared {
+            guard let t = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: size, backing: b, geometry: geo), width: size, height: size, space: space).flatMap(encodePNG) else { return false }
+            inputs.append(t); refs.append(RenderPlan.frameTemplate)
+        }
+        let st = RenderStep(id: step.id, mode: .frame, refs: refs, after: [], members: step.members)
+        let prompt = GDDAssetPrompts.drawnFrameBrief(step: st, theme: theme, design: design, backing: (backing.name, backing.rgb), jobs: jobs)
+        log.write("prompts/\(step.id).txt", "MODE: frame (GPT Image 2.5)\nATTACHED: \(refs.joined(separator: ", "))\n\n\(prompt)")
+        DispatchQueue.main.async { self.status = "GPT Image 2.5 is drawing \(step.id) on its moulding…" }
+        let started = Date()
+        var cost = 0.0, best: (px: [UInt8], covered: Double)? = nil, error: String? = nil
+        for attempt in 1...2 {
+            let r = OpenAIImages.edit(prompt: prompt, images: inputs.map { downsamplePNG($0, longEdge: 2048) ?? $0 }, size: size == 4096 ? 2048 : size)
+            cost += r.cost
+            guard let png = r.png, let px = pixels(png) else { error = r.error ?? "no image returned"; break }
+            let covered = FrameStack.windowCovered(px, width: size, height: size, backing: b, geometry: geo)
+            navLog(String(format: "gdd frame: %@ attempt %d covers %.1f%% of its planned window", step.id, attempt, covered * 100))
+            if best == nil || covered < best!.covered { best = (px, covered) }
+            if covered <= FrameStack.windowTolerance { break }
+        }
+        let secs = Date().timeIntervalSince(started)
+        let kept = best.map { $0.covered <= FrameStack.windowTolerance } ?? false
+        log.event(["step": "frame", "id": step.id, "refs": refs, "model": OpenAIImages.model, "cost": cost, "seconds": secs,
+                   "covered": best?.covered ?? 1, "error": kept ? "" : (error ?? "drifted off its planned window: built from parts instead")])
+        DispatchQueue.main.async { self.spent += cost }
+        guard kept, let best else {
+            navLog(String(format: "gdd frame: %@ → GPT Image 2.5 %@ $%.3f — built from its parts sheet instead", step.id,
+                          error ?? String(format: "drifted (%.1f%% of its window covered)", (best?.covered ?? 1) * 100), cost))
+            return false
+        }
+        let ok = write(best.px)
+        navLog(String(format: "gdd frame: %@ → GPT Image 2.5, %.1f%% of its window covered $%.3f %.1fs", step.id, best.covered * 100, cost, secs))
+        return ok
     }
 
     /// The image a framed sheet edits: each member's frame, in the sheet's layout on the flat
@@ -25821,6 +26017,28 @@ final class GDDToAssetsRun: ObservableObject {
 
     /// After a batch, or on its own for symbols already drawn: Remove BG in Photoshop on the
     /// symbols and frames, then each framed symbol split by a Layerize call planned for it.
+    /// Each cut-out sized for the reels by its kind (ReelSizing): low pays smaller than the high pays,
+    /// specials as large — the same however big each was drawn. In place, on its own canvas.
+    func sizeForReels(_ cutouts: [URL]) {
+        let roles = Dictionary(jobs.map { ($0.id, $0.role) }, uniquingKeysWith: { a, _ in a })
+        let design = styledDesign, jobs = self.jobs
+        keying = true                                   // a headless run waits for it (--generate-set)
+        DispatchQueue.global(qos: .utility).async {
+            defer { DispatchQueue.main.async { self.keying = false } }
+            let space = CGColorSpace(name: CGColorSpace.sRGB)!
+            for u in cutouts {
+                let id = u.lastPathComponent.replacingOccurrences(of: "_rmbg.png", with: "")
+                guard let role = roles[id], let job = jobs.first(where: { $0.id == id }), !Framing.stacks(job, design),
+                      let cg = loadCGImage(u), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+                let out = ReelSizing.fit(px, width: cg.width, height: cg.height, share: ReelSizing.share(role))
+                if let img = ChromaKeyOutputRules.image(straightRGBA8: out, width: cg.width, height: cg.height, space: space), let png = encodePNG(img) {
+                    try? png.write(to: u)
+                }
+            }
+            navLog("gdd sizing: \(cutouts.count) cut-outs sized for the reels by kind")
+        }
+    }
+
     func cutAndSplit(_ symbolPNGs: [URL], removeBackground: Bool, separateFrames: Bool) {
         if removeBackground && !symbolPNGs.isEmpty {
             self.keying = true
@@ -25833,6 +26051,7 @@ final class GDDToAssetsRun: ObservableObject {
                 self.status = done.isEmpty
                     ? "Background removal didn’t produce anything — check Photoshop."
                     : "Backgrounds removed from \(done.count) of \(symbolPNGs.count) symbols."
+                self.sizeForReels(done)
                 // Frames were drawn WITH their symbols so the two would match. Splitting
                 // them afterwards is what makes the frame reusable and the symbol
                 // animatable — the old pipeline generated them apart and they never
@@ -26098,8 +26317,10 @@ extension GDDToAssetsRun {
         guard !targets.isEmpty else { done?(); return }
         let tiers = FrameRules.sharedTiers.map { r in ReviewOrder.sequence(members.filter { id in self.jobs.first { $0.id == id }?.role == r }) }
         let colour = PanelColour(design), backing = self.backing.rgb
-        // The plan's colour code for each: the planner chose them to keep the set distinct.
-        let planned = Dictionary(jobs.map { ($0.id, $0.hue) }, uniquingKeysWith: { a, _ in a })
+        // The plan's colour code for each: the planner chose them to keep the set distinct. On the rank
+        // ladder a high pay's backing is its rank's colour instead (PanelColour.ladderColour).
+        let planned = Dictionary(jobs.map { j in (j.id, colour == .ladder ? PanelColour.ladderColour(j, in: jobs.filter { $0.kind == .symbol }) ?? j.hue : j.hue) },
+                                 uniquingKeysWith: { a, _ in a })
         // How big each sits in its frame, by rank and its frame's rim: HP1 breaks out, the rest step inside.
         let symbolJobs = jobs.filter { $0.kind == .symbol }
         let fits = Dictionary(uniqueKeysWithValues: members.compactMap { id in symbolJobs.first { $0.id == id }.map { j in

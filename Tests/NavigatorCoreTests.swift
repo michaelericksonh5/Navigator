@@ -13119,3 +13119,70 @@ final class PayLadderTests: XCTestCase {
 }
 
 
+
+final class SetLookTests: XCTestCase {
+    func pay(_ id: String, _ role: SlotSymbolRole) -> AssetJob {
+        AssetJob(id: id, kind: .symbol, role: role, tier: nil, title: id, subject: "a thing", aspect: "1:1", size: "2K")
+    }
+    // The high pays' backings follow the studio's ladder by rank; the rest keep their own colour.
+    func testHighPayBackingsFollowTheRankLadder() {
+        let jobs = (1...5).map { pay("HP\($0)", .highPay) } + [pay("MP1", .mediumPay)]
+        XCTAssertEqual(jobs.prefix(5).map { PanelColour.ladderColour($0, in: jobs) }, ["red", "purple", "blue", "green", "orange"])
+        XCTAssertNil(PanelColour.ladderColour(jobs[5], in: jobs))
+        XCTAssertEqual(PanelColour(SetDesign()), .ladder)                                  // the default
+        XCTAssertEqual(GDDAssetPrompts.panelColour(jobs[1], jobs: jobs, design: SetDesign()), "purple")
+        XCTAssertNil(GDDAssetPrompts.panelColour(jobs[1], jobs: jobs, design: SetDesign(families: [PanelColour.key: "Matching"])))
+        XCTAssertFalse(PanelColour.ladder.rule.contains("HP"))                               // no codes in a prompt
+    }
+    // Each kind stands in its cell at its shipped size: low pays three quarters of a high pay.
+    func testSymbolsAreSizedForTheReelsByKind() {
+        XCTAssertEqual(ReelSizing.share(.lowPay) / ReelSizing.share(.highPay), 0.75, accuracy: 1e-9)
+        XCTAssertGreaterThan(ReelSizing.share(.bonus), ReelSizing.share(.wild))
+        let n = 200
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 20..<180 { for x in 40..<160 { let i = (y * n + x) * 4; px[i] = 200; px[i + 3] = 255 } }   // 120 x 160, off-centre
+        let out = ReelSizing.fit(px, width: n, height: n, share: 0.64)
+        var y0 = n, y1 = 0, x0 = n, x1 = 0
+        for y in 0..<n { for x in 0..<n where out[(y * n + x) * 4 + 3] > 128 { y0 = min(y0, y); y1 = max(y1, y); x0 = min(x0, x); x1 = max(x1, x) } }
+        XCTAssertEqual(Double(y1 - y0 + 1), 128, accuracy: 2)                               // 0.64 of 200
+        XCTAssertEqual(Double(x0 + x1) / 2, 99.5, accuracy: 2)                              // centred
+        let again = ReelSizing.fit(out, width: n, height: n, share: 0.64)
+        XCTAssertEqual(again.count, out.count)
+    }
+    // The planner chooses a themed backing, from the backings there are.
+    func testThePlannerChoosesAThemedBacking() {
+        let plan = GDDAssetPrompts.planning(theme: GameTheme(name: "Galactic Goddess"), gameName: "G", jobs: [pay("HP1", .highPay)])
+        XCTAssertTrue(plan.contains("\"Glimpse of the world\" for cosmic"), plan)
+        XCTAssertTrue(plan.contains("HP1 red, HP2 purple, HP3"), plan)
+    }
+    // GPT Image 2.5 draws frames by default; a drawn frame is kept only while it keeps its window.
+    func testAFrameThatDriftsOffItsWindowIsNotKept() {
+        XCTAssertEqual(FrameArtist(SetDesign()), .gpt)
+        let n = 200, b = RGB8(255, 0, 255), g = FrameGeometry()
+        let good = FrameStack.frameTemplate(size: n, backing: b, geometry: g)
+        XCTAssertLessThan(FrameStack.windowCovered(good, width: n, height: n, backing: b, geometry: g), 0.01)
+        var thick = good
+        let o = g.opening(width: n, height: n)
+        for y in o.y..<(o.y + o.h) { for x in o.x..<(o.x + 14) { let i = (y * n + x) * 4; thick[i] = 120; thick[i + 1] = 120; thick[i + 2] = 120 } }
+        XCTAssertGreaterThan(FrameStack.windowCovered(thick, width: n, height: n, backing: b, geometry: g), FrameStack.windowTolerance)
+        // Its brief: the moulding repainted, its window kept; HP1's an edit of the shared frame.
+        let jobs = (1...4).map { i -> AssetJob in var j = pay("HP\(i)", .highPay); j.hasFrame = true; return j }
+        let d = SetDesign(anchorID: "HP1", families: ["framing": Framing.layered.rawValue])
+        let steps = RenderPlan.steps(jobs, d, hasThemeArt: false)
+        let back = (name: "chroma magenta", rgb: b)
+        let shared = GDDAssetPrompts.drawnFrameBrief(step: steps.first { $0.id == "frame_HP" }!, theme: GameTheme(name: "T"), design: d, backing: back, jobs: jobs)
+        XCTAssertTrue(shared.hasPrefix("Edit the last attached image: it is a plain grey moulding — a square —"), shared)
+        let hp1 = GDDAssetPrompts.drawnFrameBrief(step: steps.first { $0.id == "frame_HP1" }!, theme: GameTheme(name: "T"), design: d, backing: back, jobs: jobs)
+        XCTAssertTrue(hp1.contains("Make HP1's version of it"), hp1)
+    }
+}
+
+final class MarkdownGDDTests: XCTestCase {
+    // Drive's Markdown export heads the block "## Symbol Set" and bullets its lines with "-".
+    func testASymbolSetUnderAMarkdownHeadingIsRead() {
+        let md = "# 9002 Example Markdown\n\n## Symbol Set\n\n  - 0 WD1 // Wild\n  - 1 HP1 // High-pay 1\n  - 2 HP2 // High-pay 2\n  - 5 LP1 // Low-pay 1\n  - 10 BO1 // Bonus 1\n  - 14 WDWY1 // Wild+Way\n\n## Special Symbols\n\nProse."
+        let codes = GDDSymbolSetRules.parse(md).map(\.code)
+        XCTAssertEqual(codes, ["WD1", "HP1", "HP2", "LP1", "BO1", "WDWY1"])
+        XCTAssertTrue(GDDSymbolSetRules.parseWithProblems(md).problems.isEmpty)
+    }
+}

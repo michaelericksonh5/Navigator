@@ -5429,6 +5429,62 @@ public enum FrameStack {
         return floor
     }
 
+    /// The moulding a tier's frame is drawn on (opaque RGBA, `size` square): a plain grey frame of the
+    /// planned outline and width with a real cross-section — an outer bevel, a flat face, an inner lip
+    /// stepping down to the opening — lit from the upper left, on the backing. GPT Image 2.5 Sunburst
+    /// repaints its surface in the theme's material and keeps its widths (FrameArtist); Gemini did not
+    /// (24–29% openings against 13.9%, 2026-10-02).
+    static func frameTemplate(size n: Int, backing b: RGB8, geometry g: FrameGeometry = FrameGeometry()) -> [UInt8] {
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        let t = g.t, h = 1.5 / Double(n), lx = -0.7071, ly = -0.7071
+        for y in 0..<n { for x in 0..<n {
+            let i = (y * n + x) * 4
+            let px0 = (Double(x) + 0.5) / Double(n) - 0.5, py0 = (Double(y) + 0.5) / Double(n) - 0.5
+            let d = g.dist(px0, py0)
+            var v: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
+            if d <= 0 && d > -t {
+                let u = -d / t                                   // 0 at the outer edge, 1 at the inner
+                var gx = g.dist(px0 + h, py0) - g.dist(px0 - h, py0), gy = g.dist(px0, py0 + h) - g.dist(px0, py0 - h)
+                let gn = max(1e-9, (gx * gx + gy * gy).squareRoot()); gx /= gn; gy /= gn
+                let facing = gx * lx + gy * ly                   // the outward normal toward the light
+                let shade: Double
+                if u < 0.03 || u > 0.97 { shade = 55 }                       // the outlines
+                else if u < 0.2 { shade = 150 + 75 * facing }                // outer bevel
+                else if u > 0.8 { shade = 128 - 70 * facing }                // inner lip, facing in
+                else { shade = 158 + 14 * facing - 22 * abs(u - 0.5) }       // the face, a soft round
+                let c = UInt8(max(0, min(255, shade)))
+                v = (c, c, c)
+            }
+            px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2
+        } }
+        return px
+    }
+    /// How well a frame drawn on the moulding kept its window: the share of the planned opening the frame
+    /// covers, from the backing region around the centre (opaque RGBA on the backing). Sunburst's good
+    /// frames covered 0.9–3.9%; the ones that drifted (an octagon's corners rounded off, a circle gone
+    /// oval, a square squeezed) 6.9–15.7% (2026-10-02).
+    static func windowCovered(_ px: [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry) -> Double {
+        let open = keyed(px, backing: b).enumerated().filter { $0.offset % 4 == 3 }.map { $0.element == 0 }
+        var seen = [Bool](repeating: false, count: w * h), stack = [(h / 2) * w + w / 2]
+        guard open[stack[0]] else { return 1 }
+        seen[stack[0]] = true
+        while let i = stack.popLast() {
+            let x = i % w, y = i / w
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let nx = x + dx, ny = y + dy
+                guard nx >= 0, ny >= 0, nx < w, ny < h else { continue }
+                let j = ny * w + nx
+                if open[j] && !seen[j] { seen[j] = true; stack.append(j) }
+            }
+        }
+        var planned = 0, covered = 0
+        for y in 0..<h { for x in 0..<w where g.dist((Double(x) + 0.5) / Double(w) - 0.5, (Double(y) + 0.5) / Double(h) - 0.5) <= -g.t {
+            planned += 1; if !seen[y * w + x] { covered += 1 }
+        } }
+        return planned > 0 ? Double(covered) / Double(planned) : 1
+    }
+    /// The most of its planned window a drawn frame may cover and still be kept.
+    public static let windowTolerance = 0.04
     /// A gem pass: `gems_<symbol>.png` is the symbol's frame with its rank's gems set in by a guided
     /// edit, `gems_<symbol>.json` where they are (GemPass). One per symbol, in its own colour.
     public static func gemsID(_ symbol: String) -> String { "gems_\(symbol)" }
@@ -8277,7 +8333,7 @@ public enum GDDSymbolSetRules {
         guard !symbols.isEmpty else { return (symbols, []) }
         let lines = gddText.components(separatedBy: .newlines)
         guard let start = lines.firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("symbol set")
+            $0.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "#*"))).lowercased().hasPrefix("symbol set")
         }) else { return (symbols, []) }
 
         var problems: [String] = [], misses = 0, seenAny = false
@@ -8474,8 +8530,9 @@ public enum GDDSymbolSetRules {
     /// The indexed "Symbol Set" block: "0 WD1 // wild", "1-4 HP1-4 // HPs".
     static func parseIndexedList(_ gddText: String) -> [SlotSymbol] {
         let lines = gddText.components(separatedBy: .newlines)
+        // A Markdown heading ("## Symbol Set", Drive's Markdown export) is the same heading.
         guard let start = lines.firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces)
+            $0.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "#*")))
               .lowercased().hasPrefix("symbol set")
         }) else { return [] }
 
@@ -10084,6 +10141,8 @@ public enum GDDAssetPrompts {
                         "frameShape": ["type": "STRING", "enum": FrameShape.allCases.map(\.rawValue)],
                         "frameWeight": ["type": "STRING", "enum": FrameWeight.allCases.map(\.rawValue)],
                         "gemCut": ["type": "STRING", "enum": GemCut.allCases.map(\.rawValue)],
+                        "panel": ["type": "STRING", "enum": PanelStyle.allCases.filter { $0 != .custom }.map(\.rawValue),
+                                  "description": "The backing inside the pay frames, themed: Glimpse of the world for cosmic, sky, ocean and landscape themes; Theme pattern for patterned cultures; Light rays for Vegas, treasure and celebration; Lit depth only when none fits."],
                     ],
                 ],
             ],
@@ -10249,7 +10308,13 @@ public enum GDDAssetPrompts {
           as the theme would cut them (Egyptian cabochons, glamour round or heart brilliants, a fairy tale's
           pear or oval, an Asian jade cabochon, an Art Deco emerald or princess cut). This studio's frames are SLIM — a narrow moulding about a
           twelfth of the frame's width, ornament concentrated at the corners — never a wide carved border or
-          a second inner rim, so the symbol inside fills most of it. Describe these frames in "families" (highPayFrame, hp1Frame,
+          a second inner rim, so the symbol inside fills most of it. Write in "panel" the backing inside the
+          pay frames, themed: "Glimpse of the world" for cosmic, sky, ocean and landscape worlds (a soft nebula,
+          sky or sea behind the symbol), "Theme pattern" for patterned cultures (Egyptian, Asian, Celtic, Aztec
+          motifs, tone on tone), "Light rays" for classic Vegas, treasure and celebration sets, "Lit depth" for
+          the rest. The high pays' backings are coloured by rank, as the studio's are — HP1 red, HP2 purple, HP3
+          blue, HP4 green — so give each high pay a subject that reads clearly against its backing's colour.
+          Describe these frames in "families" (highPayFrame, hp1Frame,
           mediumPayFrame); they are drawn once and every pay symbol is painted into a copy, so a
           pay symbol's subject never describes its frame. The top pays' frames are set with gems:
           write in "gems" the gem this theme would use — what it is, its cut and its setting, never
@@ -10273,7 +10338,8 @@ public enum GDDAssetPrompts {
                        "highPayFrame": "<the high pays' frame>", "hp1Frame": "<how HP1's is richer>", "mediumPayFrame": "<…>",
                        "gems": "<the gem the top pays' frames are set with>",
                        "gemLayout": "<Corners | Top corners | Side centres | None>", "gemCut": "<\(GemCut.allCases.map(\.rawValue).joined(separator: " | "))>",
-                       "frameShape": "<\(FrameShape.allCases.map(\.rawValue).joined(separator: " | "))>", "frameWeight": "<Slim | Medium | Heavy>"},
+                       "frameShape": "<\(FrameShape.allCases.map(\.rawValue).joined(separator: " | "))>", "frameWeight": "<Slim | Medium | Heavy>",
+                       "panel": "<Lit depth | Light rays | Theme pattern | Glimpse of the world>"},
           "assets": [
             {"id": "<slot id>", "subject": "<one sentence: what it is, its material and colour>",
              "silhouette": "<one or two words>", "shape": "<outline class>", "hue": "<colour family>",
@@ -11809,6 +11875,51 @@ public enum FrameKit {
     }
 }
 
+/// How big each kind of symbol stands in its cell: its solid body's longest side as a share of the cell.
+/// Measured on the studio's shipped symbols, each game's exported at one scale (1,753 symbols, 114 games,
+/// 2026-10-02): against the game's high pays, low pays are 0.75 (IQR 0.68–0.99), medium pays 0.98, wilds,
+/// scatters, jackpots and value coins 1.00–1.02, bonus symbols 1.03. A framed high pay's frame is 0.85 of
+/// its cell (FrameGeometry.outer), so that is 1.0. Framed pays are sized by their stack, backgrounds never.
+public enum ReelSizing {
+    static let highPay = 0.85
+    public static func share(_ role: SlotSymbolRole) -> Double {
+        switch role {
+        case .lowPay: return highPay * 0.75
+        case .mediumPay: return highPay * 0.98
+        case .bonus: return highPay * 1.03
+        default: return highPay
+        }
+    }
+    /// The symbol on its own canvas, its solid body scaled about its middle to `share` of the cell and
+    /// centred: the same however big it was drawn, so the set reads as one on the reels. Straight RGBA8.
+    static func fit(_ px: [UInt8], width w: Int, height h: Int, share: Double) -> [UInt8] {
+        var x0 = w, y0 = h, x1 = -1, y1 = -1
+        for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 128 {
+            x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y)
+        } }
+        guard x1 > x0, y1 > y0 else { return px }
+        let long = Double(max(x1 - x0 + 1, y1 - y0 + 1)), want = share * Double(min(w, h))
+        let k = min(1.25, want / long)                       // never blown up past a quarter
+        let cx = Double(x0 + x1 + 1) / 2, cy = Double(y0 + y1 + 1) / 2
+        var out = [UInt8](repeating: 0, count: px.count)
+        for y in 0..<h { for x in 0..<w {
+            let sx = (Double(x) + 0.5 - Double(w) / 2) / k + cx, sy = (Double(y) + 0.5 - Double(h) / 2) / k + cy
+            let ix = Int(sx.rounded(.down)), iy = Int(sy.rounded(.down))
+            guard ix >= 0, iy >= 0, ix < w - 1, iy < h - 1 else { continue }
+            let fx = sx - Double(ix), fy = sy - Double(iy), d = (y * w + x) * 4
+            var a = 0.0, c = [0.0, 0.0, 0.0]
+            for (dx, dy, wt) in [(0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)), (0, 1, (1 - fx) * fy), (1, 1, fx * fy)] {
+                let i = ((iy + dy) * w + ix + dx) * 4, al = Double(px[i + 3]) * wt
+                a += al; for ch in 0..<3 { c[ch] += Double(px[i + ch]) * al }
+            }
+            guard a > 0 else { continue }
+            for ch in 0..<3 { out[d + ch] = UInt8(min(255, c[ch] / a)) }
+            out[d + 3] = UInt8(min(255, a))
+        } }
+        return out
+    }
+}
+
 /// One gem's place on its frame (FrameStack.gemCentres): centre and diameter, in the frame's pixels.
 public struct Gem: Codable, Equatable, Sendable {
     public var x: Double, y: Double, size: Double, place: String
@@ -12009,6 +12120,16 @@ public enum Framing: String, CaseIterable, Sendable {
     }
 }
 
+/// Who draws a set's frames. GPT Image 2.5 Sunburst paints the whole frame on Navigator's grey moulding
+/// and keeps its window (a frame that drifts is drawn again, then built from parts instead); a parts
+/// sheet is swept round the outline in code, exact by construction (FrameKit). The art director chose
+/// GPT Image 2.5's frames (2026-10-02); Gemini drawing whole frames thickened them 2–3x inward.
+public enum FrameArtist: String, CaseIterable, Sendable {
+    case gpt = "GPT Image 2.5", parts = "Parts sheet"
+    public static let key = "frameArtist"
+    public init(_ design: SetDesign) { self = FrameArtist(rawValue: design.families[Self.key] ?? "") ?? .gpt }
+}
+
 /// The pay frames' construction: the planner's, from the theme, unless the artist picks a style.
 /// The presets are the constructions of this studio's shipped sets: bevelled gold (Olympus, Clover
 /// Rush, Dodge), ornate gilded (Da Vinci, Billionaires Bank), jewelled corners (Money Mayhem,
@@ -12108,11 +12229,26 @@ public enum PanelStyle: String, CaseIterable, Sendable {
 
 /// The panel's colour against its symbol's.
 public enum PanelColour: String, CaseIterable, Sendable {
-    case matching = "Matching", contrasting = "Contrasting"
+    case ladder = "Rank ladder", matching = "Matching", contrasting = "Contrasting"
     public static let key = "panelColour"
-    public init(_ design: SetDesign) { self = PanelColour(rawValue: design.families[Self.key] ?? "") ?? .matching }
+    /// The studio's own ladder unless the artist picks otherwise.
+    public init(_ design: SetDesign) { self = PanelColour(rawValue: design.families[Self.key] ?? "") ?? .ladder }
+    /// The high pays' backings by rank, as the studio's sets colour them: measured inside the window of
+    /// 38 shipped games with four framed high pays (B2B asset packs, 2026-10-02), HP1 red (44%), HP2 purple
+    /// (41%), HP3 blue (55%), HP4 green (56%); red-purple-blue-green is the commonest whole ladder.
+    /// Beyond HP4 the planned colour family's neighbours, so a fifth and sixth stay distinct.
+    public static let ladderColours = ["red", "purple", "blue", "green", "orange", "teal"]
+    /// A pay's backing colour on the ladder, by its rank in its tier: high pays only.
+    public static func ladderColour(_ job: AssetJob, in jobs: [AssetJob]) -> String? {
+        guard job.role == .highPay else { return nil }
+        let r = PayLadder.rank(job, in: jobs)
+        return r >= 1 && r <= ladderColours.count ? ladderColours[r - 1] : nil
+    }
     public var rule: String {
         switch self {
+        // A high pay is given its rank's colour by name (GDDAssetPrompts.panelColour): never slot codes in a
+        // prompt, which an image model paints.
+        case .ladder: return "its symbol's dominant colour"
         case .matching: return "its symbol's dominant colour"
         // ponytail: the image model picks each contrasting colour; plan them per symbol if two in a tier collide.
         case .contrasting: return "a deep colour that contrasts with its symbol's own, so the subject stands out against it — a different colour for each symbol of the tier"
@@ -12567,6 +12703,8 @@ public struct RenderStep: Equatable, Sendable {
 /// set consistent; this is that, arranged so each image sees what it has to agree with.
 public enum RenderPlan {
     public static let themeArt = "theme-art"
+    /// The grey moulding a frame is drawn on by GPT Image 2.5 (FrameStack.frameTemplate), made when its step runs.
+    public static let frameTemplate = "frame-template"
 
     /// `hasThemeArt`: whether the theme's approved artwork is available AND governs the look.
     /// The composite of every symbol already finished — built when the step runs, so a
@@ -13645,6 +13783,52 @@ extension GDDAssetPrompts {
         ]).joined(separator: "\n\n")
     }
 
+    /// The brief GPT Image 2.5 draws a whole frame from: the shared frame (or a lone high pay's) painted
+    /// onto Navigator's grey moulding, which it keeps the widths of; HP1's own as an edit of the shared
+    /// frame. The wording is the run that made the frames the art director chose (2026-10-02).
+    static func drawnFrameBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
+                                backing: (name: String, rgb: RGB8), jobs: [AssetJob] = []) -> String {
+        guard let parsed = FrameRules.parse(step.id) else { return "" }
+        let role = parsed.role
+        let single = parsed.isShared && role == .highPay && step.members.count == 1
+        let crestOK = FrameKit.build(for: step, design: design, jobs: jobs)?.centre ?? false
+        let plural = role == .highPay ? "high-pay symbols" : "medium-pay symbols"
+        let trim: (String) -> String = { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
+        let spec = FrameStyle.spec(design, highPay: role == .highPay).map(trim)
+            ?? (role == .highPay ? "a sturdy square frame in this set's own premium material, a bevelled rim with matching ornaments at the corners"
+                                 : "a plainer square frame in this set's own material, with a simple bevelled rim")
+        let richWords = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with richer ornament"
+        let rich = crestOK ? richWords : Self.withoutCrest(richWords)
+        let crest = crestOK ? " Its outline may rise into a crest at the top centre, above its top edge; everywhere else it keeps its outline."
+            : role == .highPay && (single || parsed.rank == 1) ? " No crest or crown at its top centre: the top symbol's own head breaks out over its top there." : ""
+        let art = step.refs.contains(RenderPlan.themeArt)
+        var refs: [String] = []
+        for (i, r) in step.refs.enumerated() {
+            let img = "Image \(i + 1)"
+            if r == RenderPlan.themeArt {
+                refs.append("\(img) is the approved concept art for this theme. Take only how it is painted — the technique, light, materials and finish. Nothing of its scene, characters, objects or text appears.")
+            } else if role == .mediumPay, FrameRules.parse(r)?.role == .highPay {
+                refs.append("\(img) is this game's high-pay frame. The medium pays' frame is its plainer sibling: the same outline and window, a simpler material and less ornament, so a player ranks them at a glance.")
+            }
+        }
+        let tail = [
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
+            backdropLine(backing),
+            "No text, lettering or numbers, no watermark, no user interface.",
+        ]
+        if !parsed.isShared {
+            return ([
+                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make HP1's version of it, for the top symbol: the same construction, proportions and size, and exactly the same window and inner lip, so they read as one set — but the richest of the set: \(rich).\(crest) No gems or jewels on it: they are set into it afterwards. The opening stays the flat background, with nothing drawn in it.",
+            ] + refs + tail).joined(separator: "\n\n")
+        }
+        let geo = FrameGeometry(design)
+        let rung = single ? " It is the only high pay's, so the richest frame of the set: \(rich).\(crest)" : ""
+        return ([
+            "Edit the last attached image: it is a plain grey moulding — \(geo.shape.words) — with exactly this frame's outline, narrow width and inner lip. Repaint it as the frame described below: its surface becomes this theme's material, carving and ornament, keeping the same narrow band, the same inner lip and the same opening. Its ornament — corner pieces, flourishes\(single && crestOK ? ", and a crest at the top centre" : "") — may spread a little past its outer edge onto the background, never inward: the opening inside the inner lip stays the flat background, with nothing drawn in it — no liner, second border or step. It is the empty frame for the \(single ? "top symbol" : plural) of a video slot game themed “\(theme.name)”. \(single ? "It is" : "Every one of them is") set into \(single ? "this frame" : "a copy of it"), so it carries nothing of \(single ? "it" : "any of them").",
+            "THE FRAME: \(spec).\(rung) No gems or jewels on it: they are set into it afterwards. Seen straight on, upright and level.",
+        ] + refs + tail).joined(separator: "\n\n")
+    }
+
     /// Frame words without their crest or crown: the clauses (split at commas and "and") that name one.
     static func withoutCrest(_ text: String) -> String {
         let parts = text.components(separatedBy: ", ").flatMap { $0.components(separatedBy: " and ") }
@@ -13656,8 +13840,12 @@ extension GDDAssetPrompts {
     /// What a symbol painted into a shared frame is told about the frame: it stays, panel
     /// treatment and all, and only the panel's colour changes, as every shipped set recolours its
     /// pay frames by rank.
-    static func keepFrame(_ design: SetDesign, gems: String? = nil) -> String {
-        "Keep every frame exactly as it is — construction, material, outline, size and position. Fill its empty window with its panel — \(PanelStyle.brief(design)), in \(PanelColour(design).rule) — and paint the symbol on it.\(gems.map { " Set into its frame \($0), in the panel's colour." } ?? "") The symbol may break a little over the frame's edge, but the frame stays whole."
+    static func keepFrame(_ design: SetDesign, gems: String? = nil, colour: String? = nil) -> String {
+        "Keep every frame exactly as it is — construction, material, outline, size and position. Fill its empty window with its panel — \(PanelStyle.brief(design)), in \(colour ?? PanelColour(design).rule) — and paint the symbol on it.\(gems.map { " Set into its frame \($0), in the panel's colour." } ?? "") The symbol may break a little over the frame's edge, but the frame stays whole."
+    }
+    /// A painted pay's own panel colour, when the ladder sets it.
+    static func panelColour(_ job: AssetJob, jobs: [AssetJob], design: SetDesign) -> String? {
+        PanelColour(design) == .ladder ? PanelColour.ladderColour(job, in: jobs) : nil
     }
     /// A painted pay's gems, in words, painted in with it: frames are built without them (FrameKit), and a
     /// layered set's are set in by the gem pass. Nil when it has none.
@@ -13721,6 +13909,7 @@ extension GDDAssetPrompts {
                 let rank = i < step.frames.count ? FrameRules.parse(step.frames[i])?.rank ?? 0 : 0
                 let fits = PayLadder.inFrame(j, in: jobs)
                 line += " In frame \(i + 1)\(rank == 1 ? ", the top symbol's richer frame" : rank == 2 ? ", the second symbol's frame" : "").\(fits.isEmpty ? "" : " " + fits)"
+                if let c = panelColour(j, jobs: jobs, design: design) { line += " Its panel is \(c)." }
                 if let g = paintedGems(j, jobs: jobs, design: design) { line += " Set into its frame \(g), in its panel's colour." }
             } else if Framing.stacks(j, design) {
                 line += " Drawn on its own, with no frame: it is set into its tier's frame afterwards."
@@ -13825,7 +14014,7 @@ extension GDDAssetPrompts {
             return ([
                 "Edit the last attached image: it is \(whose), empty, for \(game). Paint \(displayName(job)) into it.\(isAnchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : "")",
                 "THE SYMBOL: \(what). \(roleLine(job, jobs: jobs, design: design))\(hue)\(PayLadder.lines(job, in: jobs, painted: true))",
-                "THE FRAME: \(keepFrame(design, gems: paintedGems(job, jobs: jobs, design: design)))\(others.refs.isEmpty ? "" : " The other attached images are for the look only: their frames are not this symbol's.")",
+                "THE FRAME: \(keepFrame(design, gems: paintedGems(job, jobs: jobs, design: design), colour: panelColour(job, jobs: jobs, design: design)))\(others.refs.isEmpty ? "" : " The other attached images are for the look only: their frames are not this symbol's.")",
             ] + referenceLines(others, job: job, jobs: jobs, anchorID: SetDesignRules.anchor(jobs, design)?.id, design: design) + [
                 "THE LOOK OF THIS SET: \(look)",
                 "FOR THE REELS: facing the viewer straight on, upright and level, with one clear focal point, bold shapes and strong contrast, so a player recognises it at reel size.",
