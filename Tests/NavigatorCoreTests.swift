@@ -8361,6 +8361,25 @@ final class LayerizePlanRulesTests: XCTestCase {
         XCTAssertEqual(two.map(\.role), [.frame, .subject])
     }
 
+    // Rays on the panel come off as their own layer, between the panel and the frame, so Spine can shimmer them.
+    func testLightOnThePanelIsItsOwnLayer() {
+        let v: [String: Any] = ["frame": ["description": "oak frame"], "backing": ["description": "deep blue panel"],
+                                "light": ["description": "soft golden rays from the centre", "box": [150, 150, 850, 850]],
+                                "subject": ["description": "a golden harp"], "name": "golden harp"]
+        let e = LayerizePlanRules.elements(vision: v, planSubject: "", planFrame: "", fallbackName: "", extent: extent, backingPlanned: true)
+        XCTAssertEqual(e.map(\.role), [.backing, .light, .frame, .subject])
+        let p = LayerizePlanRules.prompt(e)
+        XCTAssertTrue(p.contains("into exactly 4 layers"), p)
+        XCTAssertTrue(p.contains("Exclude the frame, the light on it and the Golden harp"), p)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Golden Light Rays", box: nil, elements: e), .light)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Blue Backing Panel", box: nil, elements: e), .backing)
+        XCTAssertEqual(SpineKitRules.layerName("MP1", role: .light), "MP1_glow")
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Light"), .light)
+        // Without a light element, rays are not a layer of their own.
+        let plain = LayerizePlanRules.elements(vision: nil, planSubject: "a harp", planFrame: "", fallbackName: "harp", extent: extent, backingPlanned: true)
+        XCTAssertNotEqual(LayerizePlanRules.role(name: "Light rays", box: [150, 150, 850, 850], elements: plain), .light)
+    }
+
     // Names from real decompositions: Lucky Cat, Tortoise, an SF frame split into four rails.
     func testReturnedLayersAreAssignedByNameThenByPlace() {
         let e = LayerizePlanRules.elements(vision: nil, planSubject: "a turtle", planFrame: "", fallbackName: "cartoon turtle",
@@ -8467,7 +8486,7 @@ final class FrameRulesTests: XCTestCase {
                                            theme: theme, design: design, backing: backing, gameName: "", jobs: [])
         XCTAssertTrue(shared.hasPrefix("Create one empty frame for the high-pay symbols"), shared)
         XCTAssertTrue(shared.contains("THE FRAME: a square frame of lashed bamboo with lava-stone corners."), shared)
-        XCTAssertTrue(shared.contains("plain backing panel"), shared)
+        XCTAssertTrue(shared.contains(PanelStyle.litDepth.brief), shared)        // a set planned before the pick existed
         let rich = GDDAssetPrompts.brief(job: AssetJob(id: "x", kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K"),
                                          step: RenderStep(id: "frame_HP1", mode: .frame, refs: ["frame_HP"], after: ["frame_HP"]),
                                          theme: theme, design: design, backing: backing, gameName: "", jobs: [])
@@ -8481,7 +8500,47 @@ final class FrameRulesTests: XCTestCase {
         XCTAssertTrue(b.hasPrefix("Edit the last attached image: it is a sheet of four empty frames"), b)
         XCTAssertTrue(b.contains("In frame 1, the top symbol's richer frame."), b)
         XCTAssertTrue(b.contains("THE FRAMES: Keep every frame exactly as it is"), b)
+        XCTAssertTrue(b.contains(PanelColour.matching.rule), b)
         XCTAssertFalse(b.contains("this sheet is a new picture"), b)
+    }
+
+    func testTheArtistsPanelPickReachesTheFrameAndEveryPaintIn() {
+        var design = SetDesign(anchorID: "HP1", look: "", families: [:])
+        design.families[PanelStyle.key] = PanelStyle.lightRays.rawValue
+        design.families[PanelColour.key] = PanelColour.contrasting.rawValue
+        XCTAssertEqual(PanelStyle(design), .lightRays)
+        XCTAssertEqual(PanelColour(design), .contrasting)
+        let frame = GDDAssetPrompts.brief(job: AssetJob(id: "x", kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K"),
+                                          step: RenderStep(id: "frame_MP", mode: .frame, refs: [], after: []),
+                                          theme: GameTheme(name: "Tiki"), design: design, backing: (name: "magenta", rgb: RGB8(255, 0, 255)),
+                                          gameName: "", jobs: [])
+        XCTAssertTrue(frame.contains(PanelStyle.lightRays.brief), frame)
+        let keep = GDDAssetPrompts.keepFrame(design)
+        XCTAssertTrue(keep.contains(PanelStyle.lightRays.kept), keep)
+        XCTAssertTrue(keep.contains(PanelColour.contrasting.rule), keep)
+        // The artist's own words, for the panel and for the frame; the medium pays get a plainer frame.
+        design.families[PanelStyle.key] = PanelStyle.stored(.custom, custom: " storm clouds lit by lightning ")
+        design.families[FrameStyle.key] = FrameStyle.stored(.custom, custom: "riveted iron")
+        XCTAssertEqual(PanelStyle(design), .custom)
+        XCTAssertEqual(PanelStyle.brief(design), "storm clouds lit by lightning")
+        // Not yet written for this game, the pick is told to use the theme's own materials and motifs.
+        XCTAssertEqual(FrameStyle.spec(design, highPay: true), "riveted iron, made from this theme's own materials and motifs")
+        XCTAssertTrue(FrameStyle.spec(design, highPay: false)!.hasPrefix("riveted iron, made from this theme's own materials and motifs, plainer"))
+        XCTAssertFalse(FrameStyle.written(design))
+        // Written for it (by the planner or the frame writer), the theme's own words are used.
+        design.families["highPayFrame"] = "riveted iron bands over carved oak, iron bean-pod corners"
+        design.families[FrameStyle.writtenForKey] = FrameStyle.pick(design)
+        XCTAssertTrue(FrameStyle.written(design))
+        XCTAssertEqual(FrameStyle.spec(design, highPay: true), "riveted iron bands over carved oak, iron bean-pod corners")
+        design.families[FrameStyle.writtenForKey] = nil
+        XCTAssertFalse(FrameStyle.richer(design)!.contains("filigree"))
+        // From the theme leaves the planner's frames, and an empty custom field picks nothing.
+        design.families["highPayFrame"] = "carved oak"; design.families["hp1Frame"] = "gold filigree"
+        design.families[FrameStyle.key] = FrameStyle.stored(.fromTheme, custom: "ignored")
+        XCTAssertEqual(FrameStyle.spec(design, highPay: true), "carved oak")
+        XCTAssertEqual(FrameStyle.richer(design), "gold filigree")
+        XCTAssertNil(FrameStyle.stored(.custom, custom: "  "))
+        XCTAssertEqual(PanelStyle.stored(.custom, custom: ""), PanelStyle.litDepth.rawValue)
     }
 }
 
@@ -11936,6 +11995,58 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(m.backdropPurity, 1, accuracy: 0.01)
     }
 
+    // Layered: the framed pays are drawn on their own, nothing waits for a frame, and the panel is drawn once.
+    func testALayeredSetDrawsItsFramedPaysAloneAndThePanelOnce() {
+        let jobs = [j("HP1", .highPay, "goose", hue: "gold", shape: "figure", tier: 1),
+                    j("MP1", .mediumPay, "harp", hue: "red", shape: "shield", tier: 1),
+                    j("MP2", .mediumPay, "axe", hue: "blue", shape: "shield", tier: 2)]
+        var design = SetDesign(anchorID: "HP1")
+        XCTAssertEqual(Framing(design), .painted)                              // a set saved before the choice
+        design.families[Framing.key] = Framing.layered.rawValue
+        let steps = RenderPlan.layered(RenderPlan.steps(jobs, design, hasThemeArt: true), anchor: "HP1")
+        XCTAssertEqual(steps.first, RenderStep(id: FrameStack.panelID, mode: .panel, refs: [], after: []))
+        XCTAssertEqual(steps.filter { $0.mode == .panel }.count, 1)
+        XCTAssertEqual(RenderPlan.layered(steps, anchor: "HP1"), steps)        // applying it twice changes nothing
+        let by = Dictionary(uniqueKeysWithValues: steps.map { ($0.id, $0) })
+        XCTAssertEqual(by["HP1"]?.mode, .anchor)
+        XCTAssertEqual(by["MP2"], RenderStep(id: "MP2", mode: .match, refs: ["HP1", RenderPlan.setSoFar], after: ["HP1"]))
+        XCTAssertEqual(by["frame_MP"]?.mode, .frame)                          // the frames are still drawn
+        XCTAssertFalse(steps.contains { $0.mode == .intoFrame })
+        XCTAssertTrue(Framing.stacks(jobs[2], design))
+        // Drawn alone, told so; the frame drawn with its window open.
+        let theme = GameTheme(name: "T"), backing = (name: "chroma green", rgb: RGB8(0, 255, 0))
+        let b = GDDAssetPrompts.brief(job: jobs[2], step: by["MP2"]!, theme: theme, design: design, backing: backing, gameName: "", jobs: jobs)
+        XCTAssertTrue(b.contains("It is drawn on its own — no frame, panel"), b)
+        XCTAssertTrue(b.contains("their frames are not this symbol's, and it has none"), b)
+        XCTAssertFalse(b.contains("Edit the last attached image"), b)
+        let f = GDDAssetPrompts.brief(job: jobs[2], step: by["frame_MP"]!, theme: theme, design: design, backing: backing, gameName: "", jobs: jobs)
+        XCTAssertTrue(f.contains("the window is open and EMPTY"), f)
+        let p = GDDAssetPrompts.brief(job: jobs[2], step: by[FrameStack.panelID]!, theme: theme, design: design, backing: backing, gameName: "", jobs: jobs)
+        XCTAssertTrue(p.hasPrefix("Create the backing panel"), p)
+        // Revised: a layered frame keeps its window open; the panel stays grey.
+        let frameJob = AssetJob(id: "frame_MP", kind: .symbol, role: .mediumPay, tier: nil, title: "", subject: "", aspect: "1:1", size: "2K", hasFrame: true)
+        XCTAssertTrue(GDDAssetPrompts.reviseBrief(job: frameJob, change: "x", theme: theme, backing: backing, isFrame: true, layered: true).contains("keep its window open"))
+        let panelJob = AssetJob(id: FrameStack.panelID, kind: .symbol, role: .unknown, tier: nil, title: "", subject: "", aspect: "1:1", size: "2K")
+        XCTAssertTrue(GDDAssetPrompts.reviseBrief(job: panelJob, change: "x", theme: theme, backing: backing, isFrame: true, layered: true).contains("neutral greys only"))
+        XCTAssertFalse(GDDAssetPrompts.reviseBrief(job: jobs[2], change: "x", theme: theme, backing: backing, layered: true).contains("its frame exactly"))
+        XCTAssertEqual(ReviewOrder.family(FrameStack.panelID), "Frames")
+        XCTAssertTrue(SetReview.isDerived("MP2_alone_rmbg.png", of: "MP2"))
+        XCTAssertFalse(SetReview.isDerived("MP2_alone.png", of: "MP2"))       // the source, not made from one
+        // Four high pays share a sheet: drawn together, each on its own, no frames to edit.
+        let hps = (1...4).map { j("HP\($0)", .highPay, ["crown", "helmet", "ring", "cup"][$0 - 1], hue: "gold", shape: "square", tier: $0) }
+        let sheetSteps = RenderPlan.layered(RenderPlan.steps(hps, design, hasThemeArt: false), anchor: "HP1")
+        let sheet = try! XCTUnwrap(sheetSteps.first { $0.mode == .sheet })
+        XCTAssertFalse(sheet.refs.contains(RenderPlan.frameSheet))
+        XCTAssertTrue(sheet.after.allSatisfy { FrameRules.parse($0) == nil })
+        let sb = GDDAssetPrompts.brief(job: hps[0], step: sheet, theme: theme, design: design, backing: backing, gameName: "", jobs: hps)
+        XCTAssertTrue(sb.contains("Drawn on its own, with no frame"), sb)
+        XCTAssertFalse(sb.contains("Edit the last attached image") || sb.contains("share one frame construction"), sb)
+        // Each symbol of a tier on its own panel colour.
+        let hues = FrameStack.panelHues([("MP1", 45, false), ("MP2", 47, false)], mode: .matching, backing: 120)
+        XCTAssertEqual(hues["MP1"], 45)
+        XCTAssertGreaterThanOrEqual(FrameStack.hueGap(hues["MP2"]!, 45), 30)
+    }
+
     // A framed tier is painted into its one frame; a frameless member is drawn on its own outline.
     func testAFramedTierMatchesItsFirstMembersFrame() {
         let jobs = [j("HP1", .highPay, "goose", hue: "gold", shape: "figure", tier: 1, frame: false),
@@ -12230,5 +12341,332 @@ final class SpineKitRulesTests: XCTestCase {
         XCTAssertEqual(m["layer_count"] as? Int, 1)
         XCTAssertTrue(JSONSerialization.isValidJSONObject(m))
         XCTAssertEqual(SpineKitRules.workingSize(width: 2048, height: 2048).w, 256)
+    }
+}
+
+final class FrameStackTests: XCTestCase {
+    /// A 20px canvas with a solid square ring from 4 to 15, `fill` inside it.
+    private func ring(fill: (UInt8, UInt8, UInt8, UInt8)) -> [UInt8] {
+        var px = [UInt8](repeating: 0, count: 20 * 20 * 4)
+        for y in 4...15 { for x in 4...15 {
+            let i = (y * 20 + x) * 4
+            let rim = x < 6 || x > 13 || y < 6 || y > 13
+            let c: (UInt8, UInt8, UInt8, UInt8) = rim ? (120, 80, 40, 255) : fill
+            px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = c.3
+        } }
+        return px
+    }
+
+    func testThePanelGoesInsideTheFramesOutlineAndNowhereElse() {
+        let inside = FrameStack.interior(ring(fill: (0, 0, 0, 0)), width: 20, height: 20)
+        XCTAssertTrue(inside[10 * 20 + 10])       // the open window
+        XCTAssertTrue(inside[4 * 20 + 4])         // the rim itself
+        XCTAssertFalse(inside[2 * 20 + 2])        // the canvas around it
+        XCTAssertEqual(inside.filter { $0 }.count, 144)
+    }
+
+    func testAWindowLeftAsBackdropIsOpenedAndTheRimKept() {
+        var px = ring(fill: (255, 0, 255, 255))
+        XCTAssertEqual(FrameStack.openWindow(&px, width: 20, height: 20, backing: RGB8(255, 0, 255)), 64)
+        XCTAssertEqual(px[(10 * 20 + 10) * 4 + 3], 0)
+        XCTAssertEqual(px[(5 * 20 + 10) * 4 + 3], 255)
+        // A window that is already clear changes nothing; a solid centre is not a window.
+        var open = ring(fill: (0, 0, 0, 0))
+        XCTAssertEqual(FrameStack.openWindow(&open, width: 20, height: 20, backing: RGB8(255, 0, 255)), 0)
+        var solid = ring(fill: (200, 160, 40, 255))
+        XCTAssertEqual(FrameStack.openWindow(&solid, width: 20, height: 20, backing: RGB8(255, 0, 255)), 0)
+    }
+
+    func testThePanelColourIsTheSymbolsOwnOrItsOppositeAndNeverTheBackingOrATakenOne() {
+        let gold = [UInt8](repeating: 0, count: 0) + Array([[UInt8]](repeating: [230, 180, 40, 255], count: 64).joined())
+        let h = FrameStack.dominantHue(gold, width: 8, height: 8)!
+        XCTAssertEqual(h, 45, accuracy: 6)
+        XCTAssertNil(FrameStack.dominantHue(Array([[UInt8]](repeating: [240, 240, 240, 255], count: 64).joined()), width: 8, height: 8))
+        XCTAssertEqual(FrameStack.panelHue(symbol: 45, mode: .matching, taken: [], backing: 300), 45)
+        XCTAssertEqual(FrameStack.panelHue(symbol: 45, mode: .contrasting, taken: [], backing: 300), 225)
+        // Green's opposite is the magenta backing: turned off it.
+        XCTAssertGreaterThanOrEqual(FrameStack.hueGap(FrameStack.panelHue(symbol: 125, mode: .contrasting, taken: [], backing: 300), 300), 35)
+        // A hue the tier already has is not used twice.
+        XCTAssertGreaterThanOrEqual(FrameStack.hueGap(FrameStack.panelHue(symbol: 50, mode: .matching, taken: [45], backing: 300), 45), 30)
+    }
+
+    func testTintingKeepsThePanelsLight() {
+        var px: [UInt8] = [64, 64, 64, 255, 200, 200, 200, 255]
+        FrameStack.tint(&px, hue: 225, saturation: 0.7)
+        XCTAssertGreaterThan(px[2], px[0])                        // blue
+        XCTAssertLessThan(Int(px[0]) + Int(px[1]) + Int(px[2]), Int(px[4]) + Int(px[5]) + Int(px[6]))   // dark stays darker
+        XCTAssertEqual(px[3], 255)
+    }
+
+    func testATallSymbolBreaksOutOverTheTopAndAWideOneFillsAcross() {
+        let tall = FrameStack.placement(subject: (x: 100, y: 50, w: 400, h: 800), window: (x: 200, y: 200, w: 1000, h: 1000))
+        XCTAssertEqual(tall.h, 1120, accuracy: 0.01); XCTAssertEqual(tall.w, 560, accuracy: 0.01)
+        XCTAssertEqual(tall.x, 420, accuracy: 0.01)
+        XCTAssertEqual(tall.y + tall.h, 1170, accuracy: 0.01)      // stands just above the window's floor
+        XCTAssertLessThan(tall.y, 200)                              // and reaches over the top of the frame
+        let wide = FrameStack.placement(subject: (x: 0, y: 0, w: 800, h: 400), window: (x: 200, y: 200, w: 1000, h: 1000))
+        XCTAssertEqual(wide.w, 960, accuracy: 0.01); XCTAssertGreaterThan(wide.y, 200)
+    }
+}
+
+final class AloneBriefTests: XCTestCase {
+    // The 4400 set's own briefs, written for symbols painted into their frame.
+    func testABriefLosesOnlyWhatPlacesItAgainstTheFrame() {
+        XCTAssertEqual(GDDAssetPrompts.withoutFrame("An ornate winged golden harp stands upright, facing forward with a stately, symmetrical posture, its topmost sculpted feather wingtip breaking cleanly out over the upper frame edge. A crisp, radiant golden rim light traces the elegant outer silhouette."),
+                       "An ornate winged golden harp stands upright, facing forward with a stately, symmetrical posture. A crisp, radiant golden rim light traces the elegant outer silhouette.")
+        XCTAssertEqual(GDDAssetPrompts.withoutFrame("The goose holds its head high with an aristocratic, watchful gaze, its curved neck and sleek crest breaking cleanly out over the top boundary, while the frontmost gleaming egg slightly overlaps the lower border. Around its neck is a ribbon."),
+                       "The goose holds its head high with an aristocratic, watchful gaze. Around its neck is a ribbon.")
+    }
+}
+
+final class FrameStackShadowTests: XCTestCase {
+    func testTheShadowFallsAwayFromTheLightAndIsSoft() {
+        var px = [UInt8](repeating: 0, count: 40 * 40 * 4)
+        for y in 15..<25 { for x in 15..<25 { px[(y * 40 + x) * 4 + 3] = 255 } }
+        let s = FrameStack.shadow(px, width: 40, height: 40, dx: -4, dy: 4, radius: 2, strength: 0.5)
+        let a = { (x: Int, y: Int) in s[(y * 40 + x) * 4 + 3] }
+        XCTAssertGreaterThan(a(16, 24), a(24, 16))          // down and to the left
+        XCTAssertLessThanOrEqual(a(16, 24), 128)              // at half strength
+        XCTAssertGreaterThan(a(9, 22), 0); XCTAssertLessThan(a(9, 22), a(16, 24))   // a soft edge
+        XCTAssertEqual(s[(20 * 40 + 20) * 4], 0)              // black
+    }
+}
+
+final class FrameStackDepthTests: XCTestCase {
+    func testAPalePanelIsBroughtDownToTheSameDepthAsADarkOne() {
+        let pale = [UInt8](Array([[UInt8]](repeating: [204, 204, 204, 255], count: 64).joined()))
+        let d = FrameStack.depth(pale, width: 8, window: (x: 0, y: 0, w: 8, h: 8), target: 0.4)
+        XCTAssertEqual(d, 0.5, accuracy: 0.01)
+        var px = Array(pale.prefix(4))
+        FrameStack.tint(&px, hue: 220, saturation: 0.6, depth: d)
+        XCTAssertLessThan(0.299 * Double(px[0]) + 0.587 * Double(px[1]) + 0.114 * Double(px[2]), 120)
+    }
+}
+
+final class FrameRanksTests: XCTestCase {
+    private func hp(_ n: Int, _ role: SlotSymbolRole = .highPay) -> AssetJob {
+        var a = AssetJob(id: "\(role == .highPay ? "HP" : "MP")\(n)", kind: .symbol, role: role, tier: n, title: "",
+                         subject: "a symbol \(n)", silhouette: "thing", aspect: "1:1", size: "2K", hasFrame: true)
+        a.hue = ["gold", "blue", "green", "red"][(n - 1) % 4]; a.shape = "square"
+        return a
+    }
+    private func design(_ ladder: RankLadder, style: FrameStyle = .fromTheme, framing: Framing = .painted) -> SetDesign {
+        var d = SetDesign(anchorID: "HP1", look: "Carved oak.", families: ["highPayFrame": "a carved oak frame with brass corners",
+                                                                         "gems": "bean-shaped cabochons in leaf-claw settings"])
+        d.families[RankLadder.key] = ladder.rawValue
+        d.families[Framing.key] = framing.rawValue
+        if let st = FrameStyle.stored(style, custom: "") { d.families[FrameStyle.key] = st }
+        return d
+    }
+    private let theme = GameTheme(name: "Jack and the Beanstalk")
+    private let backing = (name: "magenta", rgb: RGB8(255, 0, 255))
+
+    func testALadderGivesHP2ItsOwnFrameOnlyWhenThereIsAThirdToStandAbove() {
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 4, ladder: .gems), ["frame_HP", "frame_HP1", "frame_HP2"])
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 2, ladder: .gems), ["frame_HP", "frame_HP1"])
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 4, ladder: .one), ["frame_HP", "frame_HP1"])
+        XCTAssertEqual(FrameRules.frameIDs(.mediumPay, count: 4, ladder: .metal), ["frame_MP"])     // ranks are the high pays'
+        let hps = (1...4).map { hp($0) }
+        XCTAssertEqual(FrameRules.assignments(hps, ladder: .gems), ["HP1": "frame_HP1", "HP2": "frame_HP2", "HP3": "frame_HP", "HP4": "frame_HP"])
+        XCTAssertEqual(FrameRules.assignments(hps, ladder: .one), ["HP1": "frame_HP1", "HP2": "frame_HP", "HP3": "frame_HP", "HP4": "frame_HP"])
+        XCTAssertEqual(FrameRules.assignments(Array(hps.prefix(2)), ladder: .metal), ["HP1": "frame_HP1", "HP2": "frame_HP"])
+        XCTAssertEqual(FrameRules.parse("frame_HP2"), FrameRules.Ref(role: .highPay, rank: 2))
+        XCTAssertFalse(FrameRules.parse("frame_HP2")!.premium)
+        XCTAssertFalse(FrameRules.parse("frame_HP2")!.isShared)
+        XCTAssertNil(FrameRules.parse("frame_MP2"))
+        XCTAssertEqual(ReviewOrder.family("frame_HP2"), "Frames")
+        XCTAssertEqual(FrameRules.parse("frame_HP2")!.owner, "HP2's")
+        // HP2's frame is an edit of the shared one, drawn after it.
+        let steps = RenderPlan.steps(hps, design(.gems), hasThemeArt: false)
+        XCTAssertEqual(steps.first { $0.id == "frame_HP2" }, RenderStep(id: "frame_HP2", mode: .frame, refs: ["frame_HP"], after: ["frame_HP"]))
+    }
+
+    func testWhichFramesAreSetWithGems() {
+        let one = design(.one), gems = design(.gems), metal = design(.metal), jewelled = design(.one, style: .jewelled)
+        let r = { (id: String) in FrameRules.parse(id)! }
+        XCTAssertTrue(FrameRules.hasGems(r("frame_HP1"), one))           // the top symbol's frame is the jewelled one
+        XCTAssertFalse(FrameRules.hasGems(r("frame_HP"), one))
+        XCTAssertTrue(FrameRules.hasGems(r("frame_HP2"), gems))
+        XCTAssertFalse(FrameRules.hasGems(r("frame_HP2"), metal))
+        XCTAssertTrue(FrameRules.hasGems(r("frame_HP2"), design(.metal, style: .jewelled)))   // silver, but still the jewelled frame
+        XCTAssertTrue(FrameRules.hasGems(r("frame_HP"), jewelled))
+        XCTAssertFalse(FrameRules.hasGems(r("frame_HP"), design(.gems, style: .jewelled)))   // a gem ladder keeps the rest plain
+        XCTAssertEqual(FrameRules.gem(gems), "bean-shaped cabochons in leaf-claw settings")
+        XCTAssertEqual(FrameRules.gem(SetDesign()), "faceted cut gemstones in claw settings")
+    }
+
+    func testEachRungIsDrawnAsItsRank() {
+        func frame(_ id: String, _ d: SetDesign) -> String {
+            GDDAssetPrompts.brief(job: hp(1), step: RenderStep(id: id, mode: .frame, refs: id == "frame_HP" ? [] : ["frame_HP"], after: []),
+                                  theme: theme, design: d, backing: backing, gameName: "", jobs: [])
+        }
+        let g = design(.gems)
+        XCTAssertTrue(frame("frame_HP", g).contains("No gems on it"))
+        let hp1 = frame("frame_HP1", g)
+        XCTAssertTrue(hp1.contains("Make HP1's version of it, for the top symbol"), hp1)
+        XCTAssertTrue(hp1.contains("bean-shaped cabochons in leaf-claw settings set all along its rim"), hp1)
+        XCTAssertTrue(hp1.contains("in clear, colourless stone"), hp1)
+        XCTAssertTrue(hp1.contains("may rise into a crest at the top centre"), hp1)          // E
+        XCTAssertTrue(hp1.contains("exactly the same window"), hp1)
+        let hp2 = frame("frame_HP2", g)
+        XCTAssertTrue(hp2.contains("Make HP2's version of it, for the second symbol"), hp2)
+        XCTAssertTrue(hp2.contains("one at each of its four corners"), hp2)
+        XCTAssertFalse(hp2.contains("crest"), hp2)
+        let m = design(.metal)
+        XCTAssertTrue(frame("frame_HP", m).contains("Its metal parts are bronze"))
+        XCTAssertTrue(frame("frame_HP2", m).contains("polished silver"))
+        XCTAssertTrue(frame("frame_HP1", m).contains("rich polished gold"))
+        XCTAssertTrue(frame("frame_HP1", design(.one)).contains("and set with bean-shaped cabochons"))
+        // Jewelled corners on the shared frame, without a ladder.
+        XCTAssertTrue(frame("frame_HP", design(.one, style: .jewelled)).contains("A gem — bean-shaped cabochons in leaf-claw settings — sits at each corner"))
+    }
+
+    // The listing in the log is the prompt that is sent: a sheet's frames survive flat().
+    func testTheLoggedSheetPromptKeepsItsFrames() {
+        let hps = (1...4).map { hp($0) }
+        let d = design(.gems)
+        let sheet = RenderPlan.steps(hps, d, hasThemeArt: false).first { $0.mode == .sheet }!
+        XCTAssertEqual(sheet.frames, ["frame_HP1", "frame_HP2", "frame_HP", "frame_HP"])
+        let listed = RenderPlan.flat([sheet]).first!
+        XCTAssertEqual(listed.frames, sheet.frames)
+        let b = GDDAssetPrompts.brief(job: hps[0], step: listed, theme: theme, design: d, backing: backing, gameName: "", jobs: hps)
+        XCTAssertTrue(b.contains("In frame 1, the top symbol's richer frame."), b)
+        XCTAssertTrue(b.contains("In frame 2, the second symbol's frame."), b)
+        XCTAssertTrue(b.contains("and its gems take that same colour"), b)
+    }
+
+    func testPaintedIntoAJewelledFrameTheGemsTakeThePanelsColour() {
+        let d = design(.gems)
+        let hps = (1...4).map { hp($0) }
+        let into = { (id: String, f: String) in
+            GDDAssetPrompts.brief(job: hps.first { $0.id == id }!, step: RenderStep(id: id, mode: .intoFrame, refs: ["HP1", f], after: [], frames: [f]),
+                                  theme: self.theme, design: d, backing: self.backing, gameName: "", jobs: hps)
+        }
+        let b2 = into("HP2", "frame_HP2")
+        XCTAssertTrue(b2.contains("HP2's frame, the second symbol's"), b2)
+        XCTAssertTrue(b2.contains("and its gems take that same colour"), b2)
+        XCTAssertFalse(into("HP3", "frame_HP").contains("its gems take"))
+    }
+
+    func testThePlannerWritesTheGemAndAPickedStyleInTheThemesTerms() {
+        let jobs = (1...4).map { hp($0) }
+        let plain = GDDAssetPrompts.planning(theme: theme, gameName: "G", jobs: jobs)
+        XCTAssertTrue(plain.contains("\"gems\": \"<the gem the top pays' frames are set with>\""), plain)
+        XCTAssertFalse(plain.contains("The artist picked the frames' style"))
+        let styled = GDDAssetPrompts.planning(theme: theme, gameName: "G", jobs: jobs,
+                                              frameStyle: FrameStyle.direction(design(.one, style: .jewelled)))
+        XCTAssertTrue(styled.contains("The artist picked the frames' style: Jewelled corners — a square metal frame"), styled)
+        XCTAssertTrue(styled.contains("made from this theme's own materials and motifs"), styled)
+        // The ladder is told too, so the shared frame described is its plainest rung.
+        let laddered = GDDAssetPrompts.planning(theme: theme, gameName: "G", jobs: jobs, ladder: .gems)
+        XCTAssertTrue(laddered.contains("so highPayFrame, the frame the rest share, has no gems"), laddered)
+        XCTAssertTrue(FrameWriter.prompt(theme: theme, design: design(.metal)).contains("highPayFrame's metal parts are bronze"))
+        // Jewelled corners under a gem ladder: the ladder places the gems.
+        XCTAssertFalse(FrameStyle.spec(design(.gems, style: .jewelled), highPay: true)!.contains("gem"))
+        XCTAssertTrue(FrameStyle.spec(design(.one, style: .jewelled), highPay: true)!.contains("a cut gem set into each corner"))
+        let schema = GDDAssetPrompts.planSchema(ids: jobs.map(\.id))
+        let fam = ((schema["properties"] as? [String: Any])?["families"] as? [String: Any])?["properties"] as? [String: Any]
+        XCTAssertNotNil(fam?["gems"])
+    }
+
+    func testTheFrameWriterWritesTheFramesForThePickAndSaysSo() {
+        var d = design(.one, style: .natural)
+        XCTAssertFalse(FrameStyle.written(d))
+        let p = FrameWriter.prompt(theme: theme, design: d)
+        XCTAssertTrue(p.contains("THE STYLE TO WRITE THEM IN: Natural materials"), p)
+        XCTAssertTrue(p.contains("high pays “a carved oak frame with brass corners”"), p)
+        XCTAssertFalse(FrameWriter.apply([:], to: &d, writtenFor: FrameStyle.pick(d)))
+        XCTAssertTrue(FrameWriter.apply(["highPayFrame": " lashed beanstalk branches with knotted vine corners ", "gems": "dew-drop crystals"],
+                                        to: &d, writtenFor: FrameStyle.pick(d)))
+        XCTAssertTrue(FrameStyle.written(d))
+        XCTAssertEqual(FrameStyle.spec(d, highPay: true), "lashed beanstalk branches with knotted vine corners")
+        XCTAssertEqual(FrameRules.gem(d), "dew-drop crystals")
+        XCTAssertNotNil((FrameWriter.schema["properties"] as? [String: Any])?["gems"])
+    }
+
+    func testAFramesGemsAreLiftedOffAsTheirOwnLayer() {
+        let e = LayerizePlanRules.frameGems(extent: [100, 100, 900, 900], gem: "turquoise scarabs")
+        XCTAssertEqual(e.map(\.role), [.frame, .gems])
+        let p = LayerizePlanRules.prompt(e)
+        XCTAssertTrue(p.contains("into exactly 2 layers"), p)
+        XCTAssertTrue(p.contains("without its gems: fill the frame in wherever a gem covers it"), p)
+        XCTAssertTrue(p.contains("Every gem set into the frame, together as ONE layer"), p)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Corner gems", box: nil, elements: e), .gems)      // not the frame's "corner"
+        XCTAssertEqual(LayerizePlanRules.role(name: "Turquoise scarab jewels", box: nil, elements: e), .gems)
+        XCTAssertEqual(LayerizePlanRules.role(name: "Gold frame rim", box: nil, elements: e), .frame)
+        // In the kit: the generator's frame glow, and its rigid glinting frame part for the gems.
+        XCTAssertEqual(SpineKitRules.layerName("HP1", role: .frameGlow), "HP1_frame_glow")
+        XCTAssertEqual(SpineKitRules.layerName("HP1", role: .gems), "HP1_glass")
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Gems"), .gems)
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Frame glow"), .frameGlow)
+        XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Frame"), .frame)
+    }
+
+    func testTheSavedSetKnowsHP2sFrame() {
+        let jobs = (1...4).map { hp($0) }
+        let m = SetManifest(game: "G", gdd: "G", theme: theme, design: design(.gems), jobs: jobs,
+                            backing: (name: "magenta", rgb: RGB8(255, 0, 255)), model: "nb2")
+        XCTAssertEqual(m.symbols.first { $0.id == "HP2" }?.frame, "frame_HP2")
+        XCTAssertEqual(RankLadder(m.design()), .gems)
+    }
+}
+
+final class FrameStackCutTests: XCTestCase {
+    // At the scale of a real cut-out (the 3px tolerance was measured on 2048px symbols).
+    private let n = 400
+    /// A head (disc) on shoulders that end in a straight line — a bust.
+    private func bust() -> [UInt8] {
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let head = (x - 200) * (x - 200) + (y - 140) * (y - 140) < 72 * 72
+            let shoulders = y >= 220 && y < 340 && abs(x - 200) < 140 - max(0, 280 - y) / 2
+            if head || shoulders { px[(y * n + x) * 4 + 3] = 255 }
+        } }
+        return px
+    }
+    private func egg() -> [UInt8] {
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n where Double((x - 200) * (x - 200)) / 14400 + Double((y - 200) * (y - 200)) / 25600 < 1 {
+            px[(y * n + x) * 4 + 3] = 255
+        } }
+        return px
+    }
+
+    func testABustIsCutAlongItsChestAndARoundThingIsNot() {
+        XCTAssertEqual(FrameStack.cut(bust(), width: n, height: n), FrameStack.Cut(bottom: true))
+        XCTAssertFalse(FrameStack.cut(egg(), width: n, height: n).any)
+    }
+
+    func testACutSideRunsPastTheWindowAndIsClippedAtIt() {
+        let win = (x: 200, y: 200, w: 1000, h: 1000)
+        let at = FrameStack.placement(subject: (x: 0, y: 0, w: 600, h: 800), window: win, cut: FrameStack.Cut(bottom: true))
+        XCTAssertEqual(at.y + at.h, 1240, accuracy: 0.01)                    // 4% past the window's floor
+        let c = FrameStack.clip(FrameStack.Cut(bottom: true), window: win)
+        XCTAssertEqual(c.y1, 1200)                                             // clipped at the floor
+        XCTAssertEqual(c.y0, -.infinity); XCTAssertEqual(c.x0, -.infinity); XCTAssertEqual(c.x1, .infinity)
+        // Whole symbols still stand just above the floor.
+        let whole = FrameStack.placement(subject: (x: 0, y: 0, w: 600, h: 800), window: win)
+        XCTAssertEqual(whole.y + whole.h, 1170, accuracy: 0.01)
+    }
+}
+
+final class PanelHueTests: XCTestCase {
+    func testThePlansColourNamesAreTheirCSSHues() {
+        XCTAssertEqual(FrameStack.hue(named: "teal"), 180)
+        XCTAssertEqual(FrameStack.hue(named: "Gold"), 51)
+        XCTAssertEqual(FrameStack.hue(named: "purple"), 270)      // off the magenta backing
+        XCTAssertNil(FrameStack.hue(named: "white"))
+        XCTAssertNil(FrameStack.hue(named: nil))
+        // Every name the planner can give is covered, the achromatic ones aside.
+        for n in SetDesignRules.hues where !["white", "black"].contains(n) { XCTAssertNotNil(FrameStack.hue(named: n), n) }
+        // The 4400 high pays keep their codes: teal, gold, (white: measured), brown, green.
+        let hs = FrameStack.panelHues([("HP1", 180, true), ("HP2", 51, true), ("HP3", 45, false), ("HP4", 25, true), ("HP5", 120, true)],
+                                      mode: .matching, backing: 300)
+        XCTAssertEqual(hs["HP1"], 180); XCTAssertEqual(hs["HP2"], 51); XCTAssertEqual(hs["HP4"], 25); XCTAssertEqual(hs["HP5"], 120)
+        for h in [180.0, 51, 25, 120] { XCTAssertGreaterThanOrEqual(FrameStack.hueGap(hs["HP3"]!, h), 30) }   // the white goose's, measured, fits between
+        // Contrasting keeps the planner's distinctness, turned off the backing only.
+        let c = FrameStack.panelHues([("A", 120, true), ("B", 240, true)], mode: .contrasting, backing: 300)
+        XCTAssertGreaterThanOrEqual(FrameStack.hueGap(c["A"]!, 300), 35)
+        XCTAssertEqual(c["B"], 60)
     }
 }

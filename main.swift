@@ -690,6 +690,12 @@ enum APIKeys {
     /// about a key sitting right there. Self-signed apps hit this on every update, the same
     /// way the Accessibility grant gets dropped (see PERMISSIONS.md §4).
     static func lookup(_ account: String) -> (key: String?, accessDenied: Bool) {
+        // The H5G AI Connect store first: the one every H5G tool reads, outside the keychain, so a
+        // rebuild never asks for the login password. The keychain stays the fallback for a key
+        // set only in Navigator. A self-signed app with no Team ID gets a "cdhash:" keychain
+        // partition per build — 18 of them on the fal.ai item by 2026-10-02 — so "Always Allow"
+        // cannot outlast a rebuild.
+        if let k = hubKey(account) { return (k, false) }
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -721,6 +727,23 @@ enum APIKeys {
         guard !trimmed.isEmpty else { return }
         var add = base; add[kSecValueData as String] = Data(trimmed.utf8)
         SecItemAdd(add as CFDictionary, nil)
+    }
+    /// The environment variable the H5G AI Connect hub keeps an account's key under.
+    static let hubNames = ["fal.ai": "FAL_KEY"]
+    /// That key, from the environment (a run started from Claude Code inherits it) or from the hub's
+    /// store, the `env` block of ~/.claude/settings.json (what Navigator sees when opened from Finder).
+    static func hubKey(_ account: String) -> String? {
+        guard let name = hubNames[account] else { return nil }
+        func clean(_ s: String?) -> String? {
+            let t = s?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return t.isEmpty ? nil : t
+        }
+        if let k = clean(ProcessInfo.processInfo.environment[name]) { return k }
+        let url = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".claude/settings.json")
+        guard let d = try? Data(contentsOf: url),
+              let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let env = j["env"] as? [String: Any] else { return nil }
+        return clean(env[name] as? String)
     }
     // The fal.ai API key (used for AI upscaling).
     static var fal: String? { get { get("fal.ai") } set { set(newValue ?? "", "fal.ai") } }
@@ -2800,6 +2823,61 @@ struct LayerizePlan {
 /// A planned split for one framed symbol, written from the plan and from what a Gemini vision
 /// model sees in the finished image. The vision call costs about a tenth of a cent; without it
 /// the plan's own words and the cut-out's extent are used, so a failure never stops the split.
+/// The split that lifts a frame's gems off it (FrameStack): two elements over the frame's extent,
+/// no vision call — the gems are all over the rim and the frame is everything around them.
+func planFrameGems(_ cutout: URL, gem: String) -> LayerizePlan {
+    var extent = [0, 0, 999, 999]
+    if let cg = loadCGImage(cutout), let px = ChromaKeyOutputRules.straightRGBA8(cg),
+       let e = LayerizeAssembly.extent(px, width: cg.width, height: cg.height) {
+        extent = [e.x * 999 / cg.width, e.y * 999 / cg.height, (e.x + e.w) * 999 / cg.width, (e.y + e.h) * 999 / cg.height]
+    }
+    let elements = LayerizePlanRules.frameGems(extent: extent, gem: gem)
+    return LayerizePlan(elements: elements, prompt: LayerizePlanRules.prompt(elements))
+}
+
+/// Whether lifting a frame's gems off has been tried since its cut-out was made: a split newer
+/// than it, or a note that the split came back without them. Tried once per cut, so a failed or
+/// gemless split is not paid for again on every rebuild.
+func frameGemSplitTried(_ frameID: String, folder: URL) -> Bool {
+    let fm = FileManager.default
+    func modified(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast }
+    let cut = modified(folder.appendingPathComponent("\(frameID)_rmbg.png"))
+    if modified(folder.appendingPathComponent(frameGemSplitFailedNote(frameID))) >= cut { return true }
+    return ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+        .filter { $0.lastPathComponent.hasPrefix("\(frameID)_rmbg_Layers") }
+        .contains { modified($0.appendingPathComponent("_layers.json")) >= cut }
+}
+/// The note left when a frame's gems could not be lifted off. Starts "<id>_rmbg", so a revision
+/// of the frame moves it aside with the cut-out (SetReview.isDerived).
+func frameGemSplitFailedNote(_ frameID: String) -> String { "\(frameID)_rmbg_gems-not-lifted.txt" }
+
+/// A frame's gems as lifted off it, with the frame they came off: the newest split of its cut-out,
+/// when that split is newer than the cut-out. Nil when there is none, or it is stale.
+func frameGemSplit(_ frameID: String, folder: URL) -> (frame: CGImage, gems: CGImage)? {
+    let fm = FileManager.default
+    func modified(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast }
+    let cut = folder.appendingPathComponent("\(frameID)_rmbg.png")
+    let dirs = ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+        .filter { $0.lastPathComponent.hasPrefix("\(frameID)_rmbg_Layers") }
+        .map { $0.appendingPathComponent("_layers.json") }
+        .filter { fm.fileExists(atPath: $0.path) && modified($0) >= modified(cut) }
+        .sorted { modified($0) > modified($1) }
+    guard let json = dirs.first, let d = try? Data(contentsOf: json),
+          let rows = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return nil }
+    var frame: CGImage?, gems: CGImage?
+    for r in rows {
+        guard let f = r["file"] as? String, let n = r["name"] as? String,
+              let img = loadCGImage(json.deletingLastPathComponent().appendingPathComponent(f)) else { continue }
+        switch SpineKitRules.role(ofAssembledName: n) {
+        case .frame: frame = img
+        case .gems: gems = img
+        default: break
+        }
+    }
+    guard let frame, let gems else { return nil }
+    return (frame, gems)
+}
+
 func planLayerize(_ cutout: URL, job: AssetJob, frameSpec: String) -> (plan: LayerizePlan, cost: Double) {
     var extent = [0, 0, 999, 999]
     if let cg = loadCGImage(cutout), let px = ChromaKeyOutputRules.straightRGBA8(cg),
@@ -2892,7 +2970,9 @@ func assemblePlannedLayers(_ set: [(layer: LayerizeLayer, data: Data)], plan: La
 
 /// `plans` makes the split automatic: each image planned gets its own prompt and its layers
 /// assembled by role, with no question asked. Without one, the user says what to separate.
-func layerizeImages(_ srcs: [URL], plans: [URL: LayerizePlan] = [:], onDone: (([URL]) -> Void)? = nil) {
+/// `onDone` is called with the layers, then — when Photoshop assembles them — again with the PSDs.
+/// `assemble: false` skips the PSDs, for a split that only Navigator reads.
+func layerizeImages(_ srcs: [URL], plans: [URL: LayerizePlan] = [:], assemble: Bool = true, onDone: (([URL]) -> Void)? = nil) {
     // Every exit calls back — see chromaKeyForImages.
     let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_Layers") }
     guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
@@ -3236,7 +3316,7 @@ func layerizeImages(_ srcs: [URL], plans: [URL: LayerizePlan] = [:], onDone: (([
             // folder whose layers all failed is never handed to Photoshop.
             // Skipped without Photoshop: the layer PNGs are still there, and the folder's
             // right-click "Assemble Layers into PSD" runs this later on any machine that has it.
-            guard PhotoshopIcon.url != nil, !outs.isEmpty else { return }
+            guard assemble, PhotoshopIcon.url != nil, !outs.isEmpty else { return }
             var seen = Set<String>()
             let dirs = outs.map { $0.deletingLastPathComponent() }
                            .filter { seen.insert($0.path).inserted }
@@ -17242,6 +17322,8 @@ enum PermissionProbe {
     /// pop the "Navigator wants to access key…" password prompt. A checklist that prompted
     /// for a password just to draw a row would be worse than not having the row.
     static func keyStored(account: String) -> PermissionState {
+        // The H5G AI Connect key counts: it is the one lookup uses first.
+        if APIKeys.hubKey(account) != nil { return .granted }
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "com.merickson.navigator.apikeys",
@@ -21338,6 +21420,89 @@ if let flag = CommandLine.arguments.firstIndex(of: "--revise"), flag + 4 < Comma
     app.run()
 }
 
+// Free:  Navigator --prompts <set folder> <out.md>
+// Every image's prompt and attached pictures, as the set would be drawn now — nothing is drawn.
+if let flag = CommandLine.arguments.firstIndex(of: "--prompts"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(URL(fileURLWithPath: args[flag + 1])) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        try? run.ideasAndPrompts().write(toFile: args[flag + 2], atomically: true, encoding: .utf8)
+        print("WROTE: \(args[flag + 2])")
+        exit(0)
+    } }
+    app.run()
+}
+
+// PAID (~$0.10 an image):  Navigator --generate-set <set folder> <id,id,…>
+// (Not --generate: --design-test and --plan-test take that as an option.)
+// The GDD window's batch, headless, for those images of a reopened set — a layered set builds its
+// framed symbols at the end, as the window does.
+if let flag = CommandLine.arguments.firstIndex(of: "--generate-set"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    let ids = Set(args[flag + 2].split(separator: ",").map(String.init))
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        print(String(format: "GENERATING: %@ (%@) — estimate $%.2f", ids.sorted().joined(separator: ","), run.framing.rawValue, run.estimate(for: ids)))
+        run.generate(into: folder, removeBackground: false, separateFrames: false, only: ids) { made in
+            print("MADE: \(made.map(\.lastPathComponent))")
+            // A layered set is built after the batch; wait for it.
+            func wait() {
+                MainActor.assumeIsolated {
+                    if run.keying { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { wait() }; return }
+                    print("DONE: \(run.status)")
+                    print(String(format: "SPENT: $%.4f", run.spent))
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { MainActor.assumeIsolated { if !run.keying { exit(0) } } }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { wait() }
+        }
+    } }
+    app.run()
+}
+
+// PAID (~$0.003):  Navigator --write-frames <set folder>
+// The frame writer, headless: the set's frames written again for its picked style, then saved.
+if let flag = CommandLine.arguments.firstIndex(of: "--write-frames"), flag + 1 < CommandLine.arguments.count {
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        run.writeFrames()
+        func wait() {
+            MainActor.assumeIsolated {
+                if run.busy { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { wait() }; return }
+                run.writeManifest(to: folder)
+                let d = run.styledDesign
+                print("DONE: \(run.status)")
+                for k in FrameWriter.keys { print("  \(k): \(d.families[k] ?? "—")") }
+                print(String(format: "SPENT: $%.4f", run.spent))
+                exit(0)
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { wait() }
+    } }
+    app.run()
+}
+
+// Free:  Navigator --restack <set folder> [id,id,…]
+// Builds a layered set's framed symbols from their pieces again, as a frame or panel change does.
+if let flag = CommandLine.arguments.firstIndex(of: "--restack"), flag + 1 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    let ids = flag + 2 < args.count ? args[flag + 2].split(separator: ",").map(String.init) : nil
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        run.stackFramed(folder, only: ids) {
+            MainActor.assumeIsolated { print("DONE: \(run.status)") }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --restore <set folder> <id> <versions/ID.vN.png>
 if let flag = CommandLine.arguments.firstIndex(of: "--restore"), flag + 3 < CommandLine.arguments.count {
     let args = CommandLine.arguments
@@ -21378,6 +21543,35 @@ if let flag = CommandLine.arguments.firstIndex(of: "--finish"), flag + 2 < Comma
 // Free:  Navigator --review-snapshot <set folder> <out.png> [image id]
 // The Review & revise window for a set folder, drawn off screen into a PNG — to check the design
 // without opening anything on the display.
+// Free, and only with NAVIGATOR_NO_PAID_CALLS=1:  Navigator --gdd-snapshot <set folder> <out.png>
+// The GDD window around a reopened set, off screen — its plan's frames and picks as the window shows them.
+if let flag = CommandLine.arguments.firstIndex(of: "--gdd-snapshot"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    // The window can start a paid style read on its own; it is only ever shown here with every paid call blocked.
+    guard PaidCalls.disabled else { print("Refusing: set NAVIGATOR_NO_PAID_CALLS=1"); exit(2) }
+    let folder = URL(fileURLWithPath: args[flag + 1]), out = URL(fileURLWithPath: args[flag + 2])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName) in \(folder.path)"); exit(1) }
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 980, height: 1500), styleMask: [.borderless],
+                         backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.contentView = NSHostingView(rootView: GDDToAssetsSheet(run: run, initialDocument: nil, onClose: {}))
+        w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            w.contentView?.layoutSubtreeIfNeeded(); w.contentView?.display()
+            if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(w.windowNumber), [.boundsIgnoreFraming, .bestResolution]),
+               let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+                try? png.write(to: out)
+            }
+            print("WROTE: \(out.path)"); exit(0)
+        }
+    } }
+    app.run()
+}
+
 if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
     let folder = URL(fileURLWithPath: args[flag + 1]), out = URL(fileURLWithPath: args[flag + 2])
@@ -22307,6 +22501,9 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
         w.navigationDelegate = self
         let win = NSWindow(contentRect: w.frame, styleMask: [.borderless],
                            backing: .buffered, defer: false)
+        // Kept by `host`, so not freed by close() as well: closing it after a sign-in freed it
+        // twice and crashed in AppKit's window animation (2026-10-01, closing "Sign in to Google").
+        win.isReleasedWhenClosed = false
         win.alphaValue = 0
         win.ignoresMouseEvents = true
         win.setFrameOrigin(NSPoint(x: -20000, y: -20000))
@@ -23883,6 +24080,25 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var styleRead: StyleRead = .idle
     /// The set-level decisions from the last design: hero, the slot drawn first, the shared look.
     @Published var design = SetDesign()
+    /// The pay frames and their panel — the artist's picks. Kept apart from the design, which a new
+    /// plan replaces, and put into it wherever it is used, so the prompts, the saved set and every
+    /// later revision have them.
+    @Published var framing = Framing.layered
+    @Published var rankLadder = RankLadder.one
+    @Published var frameStyle = FrameStyle.fromTheme
+    @Published var frameCustom = ""
+    @Published var panelStyle = PanelStyle.litDepth
+    @Published var panelCustom = ""
+    @Published var panelColour = PanelColour.matching
+    var styledDesign: SetDesign {
+        var d = design
+        d.families[Framing.key] = framing.rawValue
+        d.families[RankLadder.key] = rankLadder.rawValue
+        d.families[FrameStyle.key] = FrameStyle.stored(frameStyle, custom: frameCustom)
+        d.families[PanelStyle.key] = PanelStyle.stored(panelStyle, custom: panelCustom)
+        d.families[PanelColour.key] = panelColour.rawValue
+        return d
+    }
     /// What the low pays are to be — the artist's pick, Royals unless they choose — and what
     /// the plan on screen was designed with, so a changed pick is noticed before paying for it.
     @Published var lowPays: LowPayKind = .royals
@@ -24266,6 +24482,38 @@ final class GDDToAssetsRun: ObservableObject {
     /// every slot and makes the set-level decisions — then the free checks, and ONE revision
     /// pass when they find something. Revising costs about what designing did; drawing a
     /// flawed set costs a hundred times more.
+    /// The frame style the plan being made was asked to write its frames in.
+    private var framesPlannedFor: String?
+
+    /// The frames written again for the style picked now (FrameWriter): one cheap text call, so a
+    /// style picked after planning still comes out in this game's own materials and motifs.
+    func writeFrames() {
+        guard let theme else { return }
+        let d = styledDesign, pick = FrameStyle.pick(d)
+        let prompt = FrameWriter.prompt(theme: theme, design: d)
+        let log = session()
+        busy = true
+        status = "Writing the frames as “\(pick)”, in \(theme.name)'s own materials and motifs…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = H5GService.describe(prompt: prompt, systemPrompt: nil, imagePNG: nil,
+                                        model: H5GService.wantedVisionModel, schema: FrameWriter.schema)
+            DispatchQueue.main.async {
+                self.busy = false
+                self.spent += r.cost ?? 0
+                log.write("prompts/frame-writer.txt", prompt)
+                var ok = false
+                if let reply = r.text.flatMap({ GDDAssetPrompts.json(fromModelReply: $0) }) {
+                    ok = FrameWriter.apply(reply, to: &self.design, writtenFor: pick)
+                }
+                log.event(["step": "frame-writer", "style": pick, "cost": r.cost ?? 0,
+                           "error": ok ? "" : (r.error ?? "no frames in the reply")])
+                navLog(String(format: "gdd frames: written as %@ — %@ $%.4f", pick, ok ? "ok" : "FAILED", r.cost ?? 0))
+                let why = (r.error ?? "the reply had none").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+                self.status = ok ? "Frames written as “\(pick)”." : "Couldn’t write the frames: \(why)."
+            }
+        }
+    }
+
     func designSet(completion: (() -> Void)? = nil) {
         guard let theme else { status = "Pick a theme first."; return }
         guard !jobs.isEmpty else { status = "Load a GDD first."; return }
@@ -24273,9 +24521,11 @@ final class GDDToAssetsRun: ObservableObject {
         chooseBacking()
         let reserved = reservedHues
         let picked = (kind: lowPays, custom: lowPayCustom)
+        framesPlannedFor = FrameStyle.pick(styledDesign)
         let prompt = GDDAssetPrompts.planning(theme: theme, gameName: gameName, jobs: jobs,
                                               gddText: gddText, backing: backing.name, reserved: reserved,
-                                              lowPays: picked.kind, customLowPays: picked.custom)
+                                              lowPays: picked.kind, customLowPays: picked.custom,
+                                              frameStyle: FrameStyle.direction(styledDesign), ladder: rankLadder)
         let sys = GDDAssetPrompts.planningSystem
         let snapshot = jobs, ids = jobs.map(\.id)
         let rev = revision
@@ -24354,7 +24604,7 @@ final class GDDToAssetsRun: ObservableObject {
         GDDRunLog.Snapshot(game: gameName, theme: theme?.name ?? "",
                            model: NanoBananaModel.byFlag(modelFlag).name, backing: backing.name,
                            backingRGB: backing.rgb,
-                           design: design, jobs: jobs, steps: RenderPlan.flat(renderSteps()),
+                           design: styledDesign, jobs: jobs, steps: RenderPlan.flat(renderSteps()),
                            problems: designProblems, fixed: fixedProblems, spent: spent)
     }
     func writeLogSummary() { session().writeSummary(logSnapshot()) }
@@ -24381,6 +24631,8 @@ final class GDDToAssetsRun: ObservableObject {
         missing = applied.missing
         palette = applied.palette
         design = applied.design
+        // The planner wrote the frames for the style picked when it was asked (FrameStyle.written).
+        if let f = framesPlannedFor { design.families[FrameStyle.writtenForKey] = f }
         fixedProblems = fixed
         // The backing was chosen BEFORE the design, and the design kept its colours off the
         // symbols — so it stays; re-choosing it now could land on a colour the set uses.
@@ -24424,9 +24676,12 @@ final class GDDToAssetsRun: ObservableObject {
         return small
     }
 
-    /// The order the planned set is drawn in, and what each image is shown.
-    func renderSteps() -> [RenderStep] {
-        RenderPlan.steps(jobs, design, hasThemeArt: themeArtPNG() != nil)
+    /// The order the planned set is drawn in, and what each image is shown; scoped to `ids` for a
+    /// batch that makes only those. A layered set's framed pays are drawn on their own.
+    func renderSteps(only ids: Set<String>? = nil) -> [RenderStep] {
+        let all = RenderPlan.steps(jobs, styledDesign, hasThemeArt: themeArtPNG() != nil)
+        let steps = ids.map { RenderPlan.scoped(all, to: $0) } ?? all
+        return framing == .layered ? RenderPlan.layered(steps, anchor: SetDesignRules.anchor(jobs, design)?.id) : steps
     }
 
     /// Everything the anchor's own step draws: the anchor alone, or its whole sheet.
@@ -24578,7 +24833,7 @@ final class GDDToAssetsRun: ObservableObject {
     /// The exact Nano Banana 2 prompt for one planned image.
     func prompt(for job: AssetJob, step: RenderStep) -> String {
         guard let theme else { return "" }
-        return GDDAssetPrompts.brief(job: job, step: step, theme: theme, design: design,
+        return GDDAssetPrompts.brief(job: job, step: step, theme: theme, design: styledDesign,
                                      backing: backing, gameName: gameName, jobs: jobs)
     }
 
@@ -24611,8 +24866,8 @@ final class GDDToAssetsRun: ObservableObject {
         }
         md += "\n## Nano Banana 2 prompts, in drawing order\n"
         for st in steps {
-            if st.mode == .character || st.mode == .frame {
-                md += "\n### \(st.id) — \(st.mode == .frame ? "empty frame for its tier" : "character reference"), drawn once · attached: \(refsText(st))\n\n```\n\(prompt(for: Self.placeholder, step: st))\n```\n"
+            if st.mode == .character || st.mode == .frame || st.mode == .panel {
+                md += "\n### \(st.id) — \(st.mode == .frame ? "empty frame for its tier" : st.mode == .panel ? "the grey panel every framed pay is set on" : "character reference"), drawn once · attached: \(refsText(st))\n\n```\n\(prompt(for: Self.placeholder, step: st))\n```\n"
                 continue
             }
             guard let j = byID[st.id] else { continue }
@@ -24632,8 +24887,28 @@ final class GDDToAssetsRun: ObservableObject {
     /// What the automatic frame split will cost on fal.ai for `ids` (nil: all), billed apart from
     /// Vertex: one planned Layerize call per framed symbol.
     func layerizeEstimate(for ids: Set<String>?) -> (symbols: Int, cost: Double) {
-        let n = jobs.filter { $0.kind == .symbol && $0.hasFrame && !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }.count
+        let design = styledDesign
+        let n = jobs.filter { $0.kind == .symbol && $0.hasFrame && !$0.subject.isEmpty && !Framing.stacks($0, design)
+            && (ids == nil || ids!.contains($0.id)) }.count
         return (n, Double(n) * LayerizePlanRules.estimatePerSymbol)
+    }
+
+    /// What lifting the gems off a layered set's jewelled frames costs on fal.ai, billed apart from
+    /// Vertex: one Layerize call per gem frame this batch draws (FrameStack).
+    func gemSplitEstimate(for ids: Set<String>?) -> (frames: Int, cost: Double) {
+        guard framing == .layered else { return (0, 0) }
+        let design = styledDesign
+        let n = renderSteps(only: ids.map { Set($0) } ?? Set(jobs.map(\.id))).filter { st in
+            st.mode == .frame && FrameRules.parse(st.id).map { FrameRules.hasGems($0, design) } == true
+                && !(lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(st.id).png").path) } ?? false)
+        }.count
+        return (n, Double(n) * LayerizePlanRules.frameGemsEstimate)
+    }
+    /// The gem split's line for a confirmation, empty when there is none.
+    func gemSplitNote(for ids: Set<String>?) -> String {
+        let g = gemSplitEstimate(for: ids)
+        return g.frames == 0 ? "" : String(format: "\n\nPlus about $%.2f on fal.ai: Layerize lifts the gems off %d frame%@, so each symbol's take its colour and glint in Spine.",
+                                          g.cost, g.frames, g.frames == 1 ? "" : "s")
     }
 
     /// What a batch will cost. `ids` scopes it to a retry.
@@ -24641,13 +24916,13 @@ final class GDDToAssetsRun: ObservableObject {
         let planned = jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
         let byID = Dictionary(planned.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         // The low pays' sheet is ONE 4K image, whatever the number of low pays on it.
-        return RenderPlan.scoped(renderSteps(), to: Set(byID.keys)).reduce(0) { sum, st in
+        return renderSteps(only: Set(byID.keys)).reduce(0) { sum, st in
             if st.mode == .character {
                 // Drawn once per run folder; one already there costs nothing.
                 let have = lastFolder.map { FileManager.default.fileExists(atPath: Self.referenceURL(st.id, in: $0).path) } ?? false
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
             }
-            if st.mode == .frame {
+            if st.mode == .frame || st.mode == .panel {
                 let have = lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(st.id).png").path) } ?? false
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
             }
@@ -24815,14 +25090,16 @@ final class GDDToAssetsRun: ObservableObject {
                 guard let one = SymbolSheet.cut(cg, box: box, backdrop: f.backdrop, width: size.w, height: size.h,
                                                 others: f.boxes.filter { $0 != box }, scale: shared),
                       let png = encodePNG(one) else { continue }
-                let rev = review(png, job: m, log: log)
+                var checked = m
+                if DispatchQueue.main.sync(execute: { Framing.stacks(m, self.styledDesign) }) { checked.hasFrame = false }
+                let rev = review(png, job: checked, log: log)
                 var redo: String?
                 if let rank = GDDAssetPrompts.royalRank(m),
                    let read = (TestFaults.take("misread", m.id) ? (rank == "A" ? "K" : "A") : nil)
                        ?? (rev != nil ? rev?.cardText : GDDRunLog.readRank(png, backing: backingRGB)), read != rank {
                     redo = "should read “\(rank)” but reads “\(read)”"
                     log.event(["step": "sheet-misread", "id": m.id, "wanted": rank, "read": read])
-                } else if rev?.unkeyable(for: m) == true {
+                } else if rev?.unkeyable(for: checked) == true {
                     redo = rev?.panel == true ? "sits on a card or tile" : "has a scene behind it"
                 }
                 pieces.append((m, png, box, size, rev, redo))
@@ -24857,7 +25134,8 @@ final class GDDToAssetsRun: ObservableObject {
             return
         }
         for p in pieces {
-            let dst = folder.appendingPathComponent(p.job.filename)
+            let stacks = DispatchQueue.main.sync { Framing.stacks(p.job, self.styledDesign) }
+            let dst = folder.appendingPathComponent(stacks ? FrameStack.aloneName(p.job.id) : p.job.filename)
             do {
                 try p.png.write(to: dst)
                 DispatchQueue.main.async {
@@ -24916,13 +25194,32 @@ final class GDDToAssetsRun: ObservableObject {
 
     /// A shared tier's empty frame (FrameRules), drawn once into the run folder as frame_<tier>.png.
     /// One already there is reused: it is what the tier's symbols are painted into.
+    /// A layered set's panel, drawn once, in grey (FrameStack tints it for each symbol).
+    fileprivate func generatePanel(step: RenderStep, model: String, folder: URL) {
+        let dst = folder.appendingPathComponent("\(step.id).png")
+        if FileManager.default.fileExists(atPath: dst.path) { return }
+        guard let job = DispatchQueue.main.sync(execute: { self.frameJob(step.id) }) else { return }
+        DispatchQueue.main.async { self.status = "Drawing the panel every framed symbol is set on…" }
+        let prompt = DispatchQueue.main.sync { self.prompt(for: job, step: step) }
+        let log = DispatchQueue.main.sync { self.session() }
+        log.write("prompts/\(step.id).txt", "MODE: panel\nATTACHED: nothing\n\n\(prompt)")
+        let started = Date()
+        let r = sizedRequest(job, prompt: prompt, inputs: [], model: model)
+        if let png = r.png { try? png.write(to: dst) }
+        let secs = Date().timeIntervalSince(started)
+        log.event(["step": "panel", "id": step.id, "model": model, "cost": r.cost, "seconds": secs,
+                   "error": r.png == nil ? (r.error ?? "no image returned") : ""])
+        navLog(String(format: "gdd panel: %@ $%.3f %.1fs", r.png == nil ? "FAILED" : "saved", r.cost, secs))
+        DispatchQueue.main.async { self.spent += r.cost }
+    }
+
     fileprivate func generateFrame(step: RenderStep, themeArt: Data?, model: String, folder: URL) {
         let dst = folder.appendingPathComponent("\(step.id).png")
         if FileManager.default.fileExists(atPath: dst.path) { return }
         let (refs, inputs) = resolveRefs(step.refs, for: step.id, themeArt: themeArt, folder: folder)
-        // HP1's frame is an edit of the shared one; with that missing there is nothing to edit,
-        // and HP1 is painted into the shared frame instead (frameSheetPNG).
-        if FrameRules.parse(step.id)?.premium == true, refs.last.flatMap(FrameRules.parse) == nil {
+        // HP1's and HP2's frames are edits of the shared one; with that missing there is nothing to
+        // edit, and they are painted into the shared frame instead (frameSheetPNG).
+        if FrameRules.parse(step.id)?.isShared == false, refs.last.flatMap(FrameRules.parse) == nil {
             navLog("gdd frame: \(step.id) skipped — the shared frame it is made from is missing")
             return
         }
@@ -24949,7 +25246,7 @@ final class GDDToAssetsRun: ObservableObject {
     /// backing, so every symbol starts from the one frame instead of drawing its own. HP1 falls
     /// back to the shared frame when its own is missing; nil when the shared one is.
     fileprivate func frameSheetPNG(frames: [String], layout: (aspect: String, rows: [Int]), folder: URL, backing: RGB8) -> Data? {
-        let shared = frames.first { FrameRules.parse($0)?.premium == false }.map { folder.appendingPathComponent("\($0).png") }
+        let shared = frames.first { FrameRules.parse($0)?.isShared == true }.map { folder.appendingPathComponent("\($0).png") }
         var imgs: [CGImage] = []
         for f in frames {
             guard let cg = loadCGImage(folder.appendingPathComponent("\(f).png")) ?? shared.flatMap(loadCGImage) else { return nil }
@@ -25014,6 +25311,11 @@ final class GDDToAssetsRun: ObservableObject {
         }
         let prompt = DispatchQueue.main.sync { self.prompt(for: job, step: step) }
         let log = DispatchQueue.main.sync { self.session() }
+        // A layered pay is drawn alone, so it is checked as a symbol with no frame and saved as
+        // <id>_alone.png; <id>.png is what stacking builds from it.
+        let stacks = DispatchQueue.main.sync { Framing.stacks(job, self.styledDesign) }
+        var checked = job
+        if stacks { checked.hasFrame = false }
         log.write("prompts/\(job.id).txt", "MODE: \(step.mode.rawValue)\nATTACHED: \(step.refs.isEmpty ? "nothing" : step.refs.joined(separator: ", "))\n\n\(prompt)")
         let started = Date()
 
@@ -25042,10 +25344,10 @@ final class GDDToAssetsRun: ObservableObject {
             return SymbolImageMetrics.measure(cg, backing: backingRGB)
         }
         // The Gemini review of what came back — what the pixel checks can only guess at.
-        var rev = job.kind == .symbol ? r.png.flatMap { review($0, job: job, log: log) } : nil
+        var rev = job.kind == .symbol ? r.png.flatMap { review($0, job: checked, log: log) } : nil
         var redrawn = false
         if job.kind == .symbol, let png = r.png, let m = measure(png),
-           m.backingMissing || rev?.unkeyable(for: job) == true || TestFaults.take("scene", job.id) {
+           m.backingMissing || rev?.unkeyable(for: checked) == true || TestFaults.take("scene", job.id) {
             navLog("gdd image: \(job.id) came back with a scene behind it (\(Int(m.edgeBacked * 100))% of its edge is backing) — redrawing once without the concept art")
             let pairs = zip(step.refs, inputs).filter { $0.0 != RenderPlan.themeArt }
             let lean = RenderStep(id: step.id, mode: step.mode, refs: pairs.map(\.0), after: step.after)
@@ -25055,8 +25357,8 @@ final class GDDToAssetsRun: ObservableObject {
             let again = draw(p2, pairs.map(\.1))
             r.cost += again.cost
             if let png2 = again.png, let m2 = measure(png2) {
-                let rev2 = review(png2, job: job, log: log)
-                if (rev?.unkeyable(for: job) == true && rev2?.unkeyable(for: job) == false) || m2.edgeBacked > m.edgeBacked {
+                let rev2 = review(png2, job: checked, log: log)
+                if (rev?.unkeyable(for: checked) == true && rev2?.unkeyable(for: checked) == false) || m2.edgeBacked > m.edgeBacked {
                     r.png = png2; rev = rev2; redrawn = true
                 }
             }
@@ -25081,7 +25383,7 @@ final class GDDToAssetsRun: ObservableObject {
             let again = draw(p2, pairs.map(\.1))
             r.cost += again.cost
             if let png2 = again.png {
-                let rev2 = review(png2, job: job, log: log)
+                let rev2 = review(png2, job: checked, log: log)
                 if rev2?.characterLeak != true { r.png = png2; rev = rev2; redrawn = true }
             }
         }
@@ -25108,7 +25410,7 @@ final class GDDToAssetsRun: ObservableObject {
             r.cost += again.cost
             var kept = false
             if let png2 = again.png {
-                let rev2 = review(png2, job: job, log: log)
+                let rev2 = review(png2, job: checked, log: log)
                 if ((rev2 != nil ? rev2?.cardText : GDDRunLog.readRank(png2, backing: backingRGB)) ?? rank) == rank {
                     r.png = png2; rev = rev2; redrawn = true; kept = true
                 }
@@ -25121,7 +25423,7 @@ final class GDDToAssetsRun: ObservableObject {
                 let text = GeneratedSizeRules.describe(width: d.w, height: d.h)
                 DispatchQueue.main.async { self.delivered[job.id] = text }
             }
-            let dst = folder.appendingPathComponent(job.filename)
+            let dst = folder.appendingPathComponent(stacks ? FrameStack.aloneName(job.id) : job.filename)
             do {
                 try png.write(to: dst)
                 // A low pay redrawn after the sheet is already listed from its first cut.
@@ -25174,10 +25476,11 @@ final class GDDToAssetsRun: ObservableObject {
         let model = NanoBananaModel.byFlag(self.modelFlag).id
         let batchLog = session()
         let themeArt = themeArtPNG()
+        let began = Date()
         writeManifest(to: folder)
         // In drawing order: the anchor, then what matches it, then each family's edits.
         let todoIDs = Set(todo.map(\.id))
-        let steps = RenderPlan.scoped(RenderPlan.steps(jobs, design, hasThemeArt: themeArt != nil), to: todoIDs)
+        let steps = renderSteps(only: todoIDs)
         // A character or frame drawn in this batch is waited for like any image in it: its symbols are drawn from it.
         let waitIDs = todoIDs.union(steps.filter { $0.mode == .character || $0.mode == .frame }.map(\.id))
         let jobByID = Dictionary(todo.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -25254,6 +25557,11 @@ final class GDDToAssetsRun: ObservableObject {
                             done(st.id)
                             continue
                         }
+                        if st.mode == .panel {
+                            self.generatePanel(step: st, model: model, folder: folder)
+                            done(st.id)
+                            continue
+                        }
                         guard let job = jobByID[st.id] else { done(st.id); continue }
                         self.generateOne(job: job, step: st, themeArt: themeArt,
                                          model: model, folder: folder)
@@ -25284,9 +25592,11 @@ final class GDDToAssetsRun: ObservableObject {
                                      stopped && skipped > 0 ? ", \(skipped) not started (stopped)" : "",
                                      self.spent)
                 // Only the symbols are keyed — a background is meant to stay opaque.
+                // A layered set cuts its frames and framed pays itself, to build them.
+                let layered = self.framing == .layered
                 let symbolPNGs = out.filter { u in
                     todo.first { $0.filename == u.lastPathComponent }?.kind == .symbol
-                } + self.framesMade
+                } + (layered ? [] : self.framesMade)
                 self.framesMade = []
                 // The run is FINISHED when the images are made and paid for. Background
                 // removal is a long local After Effects job with its own progress bar, and
@@ -25309,6 +25619,17 @@ final class GDDToAssetsRun: ObservableObject {
                 // kind == .symbol. A background IS the background; there is nothing to
                 // take off it.
                 self.cutAndSplit(symbolPNGs, removeBackground: removeBackground, separateFrames: separateFrames)
+                // Built again: what this batch drew, and every symbol in a frame or panel it drew.
+                if layered {
+                    func fresh(_ name: String) -> Bool {
+                        ((try? folder.appendingPathComponent(name).resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast) > began
+                    }
+                    let design = self.styledDesign
+                    let frameOf = FrameRules.assignments(self.jobs.filter { $0.kind == .symbol }, ladder: self.rankLadder)
+                    let ids = fresh("\(FrameStack.panelID).png") ? nil : self.jobs.filter { Framing.stacks($0, design) }.map(\.id)
+                        .filter { fresh(FrameStack.aloneName($0)) || frameOf[$0].map { fresh("\($0).png") } == true }
+                    if ids?.isEmpty != true { self.stackFramed(folder, only: ids) }
+                }
             }
         }
     }
@@ -25339,8 +25660,8 @@ final class GDDToAssetsRun: ObservableObject {
                 guard !framed.isEmpty else { return }
                 self.layering = true
                 self.status += "  Planning how to split \(framed.count) frames…"
-                let jobs = self.jobs, design = self.design
-                let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol })
+                let jobs = self.jobs, design = self.styledDesign
+                let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, ladder: self.rankLadder)
                 DispatchQueue.global(qos: .userInitiated).async {
                     var plans: [URL: LayerizePlan] = [:], cost = 0.0
                     for url in framed {
@@ -25348,8 +25669,9 @@ final class GDDToAssetsRun: ObservableObject {
                         guard let job = jobs.first(where: { $0.id == base }) else { continue }
                         let fid = frameOf[job.id]
                         let spec = fid.flatMap(FrameRules.parse).map { f in
-                            [design.families[f.role == .highPay ? "highPayFrame" : "mediumPayFrame"],
-                             f.premium ? design.families["hp1Frame"] : nil].compactMap { $0 }.joined(separator: "; ")
+                            [FrameStyle.spec(design, highPay: f.role == .highPay),
+                             f.premium ? FrameStyle.richer(design) : nil,
+                             FrameRules.hasGems(f, design) ? "set with \(FrameRules.gem(design))" : nil].compactMap { $0 }.joined(separator: "; ")
                         } ?? ""
                         let r = planLayerize(url, job: job, frameSpec: spec)
                         plans[url] = r.plan; cost += r.cost
@@ -25378,7 +25700,7 @@ extension GDDToAssetsRun {
     /// navigator-set.json in `folder`: what the set needs to be reopened, revised and handed on.
     func writeManifest(to folder: URL) {
         guard let theme else { return }
-        let m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: design, jobs: jobs,
+        let m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
                             backing: (backing.name, backing.rgb), model: modelFlag)
         if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
     }
@@ -25396,6 +25718,12 @@ extension GDDToAssetsRun {
         run.gameName = m.gdd
         run.jobs = m.jobs()
         run.design = m.design()
+        let picked = run.design
+        run.framing = Framing(picked)
+        run.rankLadder = RankLadder(picked)
+        run.frameStyle = FrameStyle(picked); run.frameCustom = run.frameStyle == .custom ? picked.families[FrameStyle.key] ?? "" : ""
+        run.panelStyle = PanelStyle(picked); run.panelCustom = run.panelStyle == .custom ? picked.families[PanelStyle.key] ?? "" : ""
+        run.panelColour = PanelColour(picked)
         run.backing = (name: m.backingName, rgb: m.backingRGB)
         run.modelFlag = m.model
         run.lastFolder = folder
@@ -25422,7 +25750,7 @@ extension GDDToAssetsRun {
     func reviewIDs(_ folder: URL) -> [String] {
         let fm = FileManager.default
         let frames = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? [])
-            .filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) }.filter { FrameRules.parse($0) != nil }
+            .filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) }.filter { FrameRules.parse($0) != nil || $0 == FrameStack.panelID }
         let made = jobs.filter { fm.fileExists(atPath: folder.appendingPathComponent($0.filename).path) }.map(\.id)
         return ReviewOrder.sequence(made + frames)
     }
@@ -25430,7 +25758,7 @@ extension GDDToAssetsRun {
     /// The symbols drawn into a master frame, which a revised frame has to be repainted into.
     func frameMembers(_ frameID: String, folder: URL) -> [String] {
         let fm = FileManager.default
-        return FrameRules.assignments(jobs.filter { $0.kind == .symbol })
+        return FrameRules.assignments(jobs.filter { $0.kind == .symbol }, ladder: rankLadder)
             .filter { $0.value == frameID && fm.fileExists(atPath: folder.appendingPathComponent("\($0.key).png").path) }
             .map(\.key).sorted { ReviewOrder.sequence([$0, $1]).first == $0 }
     }
@@ -25442,6 +25770,10 @@ extension GDDToAssetsRun {
 
     /// The job a master frame is revised as.
     private func frameJob(_ id: String) -> AssetJob? {
+        if id == FrameStack.panelID {
+            return AssetJob(id: id, kind: .symbol, role: .unknown, tier: nil, title: "", subject: "the panel",
+                            aspect: "1:1", size: jobs.first { $0.kind == .symbol }?.size ?? "2K")
+        }
         guard let f = FrameRules.parse(id) else { return nil }
         return AssetJob(id: id, kind: .symbol, role: f.role, tier: nil, title: "", subject: "the empty frame",
                         aspect: "1:1", size: jobs.first { $0.kind == .symbol }?.size ?? "2K", hasFrame: true)
@@ -25452,15 +25784,21 @@ extension GDDToAssetsRun {
     /// REDRAWN from its plan with the change added to its description, drawn the way the set drew
     /// it. `done` gets an error, or nil when the new image is in place.
     func revise(_ id: String, change: String, mode: ReviewMode, folder: URL, done: @escaping (String?) -> Void) {
-        let isFrame = FrameRules.parse(id) != nil
+        let isPanel = id == FrameStack.panelID
+        let isFrame = FrameRules.parse(id) != nil || isPanel
         guard let job = isFrame ? frameJob(id) : jobs.first(where: { $0.id == id }), let theme else { done("Nothing to revise for \(id)."); return }
-        let src = folder.appendingPathComponent("\(id).png")
-        guard FileManager.default.fileExists(atPath: src.path) else { done("\(id).png is not in the set folder."); return }
+        // A layered pay is revised as drawn, on its own, and built again; a frame or the panel
+        // builds again every symbol set in it. Building is free.
+        let layered = framing == .layered
+        let stacks = !isFrame && Framing.stacks(job, styledDesign)
+        let rebuild: [String]? = !layered ? [] : stacks ? [id] : isPanel ? nil : FrameRules.parse(id) != nil ? frameMembers(id, folder: folder) : []
+        let src = folder.appendingPathComponent(stacks ? FrameStack.aloneName(id) : "\(id).png")
+        guard FileManager.default.fileExists(atPath: src.path) else { done("\(src.lastPathComponent) is not in the set folder."); return }
         let archive = review.archiveName(id)
         let model = NanoBananaModel.byFlag(modelFlag).id
         let backing = self.backing
         let before = spent
-        let steps = renderSteps()
+        let steps = renderSteps(only: [id])
         status = "Revising \(id)…"
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
@@ -25475,7 +25813,7 @@ extension GDDToAssetsRun {
             if mode == .edit || isFrame {
                 if let png = try? Data(contentsOf: src) {
                     let prompt = GDDAssetPrompts.reviseBrief(job: job, change: change, theme: theme,
-                                                             backing: (backing.name, backing.rgb), isFrame: isFrame)
+                                                             backing: (backing.name, backing.rgb), isFrame: isFrame, layered: layered)
                     log.write("prompts/\(id)-revision-\(archive.split(separator: ".").dropLast().last ?? "").txt", "MODE: review edit\nATTACHED: \(id) (the image being edited)\n\n\(prompt)")
                     let r = self.sizedRequest(job, prompt: prompt, inputs: [downsamplePNG(png, longEdge: 1536) ?? png], model: model)
                     DispatchQueue.main.async { self.spent += r.cost }
@@ -25487,27 +25825,244 @@ extension GDDToAssetsRun {
                 var j = job
                 j.brief = (job.currentBrief ?? job.subject) + "\n\nIn review this change was asked for: \(change)"
                 j.briefSubject = j.subject
-                let step = RenderPlan.scoped(steps, to: [id]).first { $0.id == id }
-                    ?? RenderStep(id: id, mode: .match, refs: [], after: [])
+                let step = steps.first { $0.id == id } ?? RenderStep(id: id, mode: .match, refs: [], after: [])
                 DispatchQueue.main.sync { self.failures[id] = nil }
                 self.generateOne(job: j, step: step, themeArt: self.themeArtPNG(), model: model, folder: folder)
                 err = DispatchQueue.main.sync { self.failures[id] }
                 log.event(["step": "review-redraw", "id": id, "change": change, "error": err ?? ""])
             }
             DispatchQueue.main.async {
-                if err == nil {
-                    Self.archiveDerived(id, archive: archive, folder: folder)
+                guard err == nil else {
+                    try? fm.removeItem(at: kept)      // nothing changed: the copy is not a version
+                    self.status = "\(id) not revised: \(err!)"
+                    done(err)
+                    return
+                }
+                Self.archiveDerived(id, archive: archive, folder: folder)
+                let finish = {
                     self.review.record(id, replaced: archive, change: change, mode: isFrame ? .edit : mode, cost: self.spent - before)
                     self.saveReview(folder)
                     self.imagesVersion += 1
                     self.status = String(format: "Revised %@ · $%.2f", id, self.spent - before)
-                } else {
-                    try? fm.removeItem(at: kept)      // nothing changed: the copy is not a version
-                    self.status = "\(id) not revised: \(err!)"
+                        + (rebuild?.isEmpty == false || rebuild == nil ? " — framed symbols built again" : "")
+                    done(nil)
                 }
-                done(err)
+                if rebuild?.isEmpty == true { finish() } else { self.stackFramed(folder, only: rebuild) { finish() } }
             }
         }
+    }
+
+    /// Builds the layered pays of `ids` (nil: every one) from their pieces. Photoshop first cuts
+    /// any frame or symbol drawn since it was last cut; then each is stacked (`stack`). Free.
+    func stackFramed(_ folder: URL, only ids: [String]? = nil, done: (() -> Void)? = nil) {
+        let design = styledDesign
+        let members = jobs.filter { Framing.stacks($0, design) }.map(\.id)
+        let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, ladder: rankLadder)
+        let fm = FileManager.default
+        func modified(_ u: URL) -> Date? { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate }
+        func cut(_ u: URL) -> URL { u.deletingLastPathComponent().appendingPathComponent(u.deletingPathExtension().lastPathComponent + "_rmbg.png") }
+        let sources = Set(members.compactMap { frameOf[$0] }).map { folder.appendingPathComponent("\($0).png") }
+            + members.map { folder.appendingPathComponent(FrameStack.aloneName($0)) }
+        let uncut = sources.filter { u in
+            guard fm.fileExists(atPath: u.path) else { return false }
+            guard let c = modified(cut(u)), let m = modified(u) else { return true }
+            return c < m
+        }
+        let targets = (ids ?? members).filter { members.contains($0) && fm.fileExists(atPath: folder.appendingPathComponent(FrameStack.aloneName($0)).path) }
+        guard !targets.isEmpty else { done?(); return }
+        let tiers = FrameRules.sharedTiers.map { r in ReviewOrder.sequence(members.filter { id in self.jobs.first { $0.id == id }?.role == r }) }
+        let colour = PanelColour(design), backing = self.backing.rgb
+        // The plan's colour code for each: the planner chose them to keep the set distinct.
+        let planned = Dictionary(jobs.map { ($0.id, $0.hue) }, uniquingKeysWith: { a, _ in a })
+        let gemFrames = Set(targets.compactMap { frameOf[$0] }).filter { fid in FrameRules.parse(fid).map { FrameRules.hasGems($0, design) } == true }
+        let gem = FrameRules.gem(design)
+        keying = true
+        status = "Building \(targets.count) framed symbol\(targets.count == 1 ? "" : "s") from their layers…"
+        let build = {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, folder: folder, colour: colour, backing: backing)
+                DispatchQueue.main.async {
+                    self.keying = false
+                    self.imagesVersion += 1
+                    for (id, why) in failed { navLog("gdd stack: \(id) — \(why)") }
+                    let made = targets.count - failed.count
+                    self.status = "Built \(made) of \(targets.count) framed symbol\(targets.count == 1 ? "" : "s") from their layers"
+                        + (failed.isEmpty ? "." : " — not built: " + failed.map { "\($0.key) (\($0.value))" }.sorted().joined(separator: ", "))
+                    done?()
+                }
+            }
+        }
+        // Each frame set with gems has them lifted off by Layerize, once per cut of it, so every
+        // symbol's take its colour and they glint in Spine. Without a split they stay in the frame.
+        let split = {
+            let need = gemFrames.filter { fid in
+                fm.fileExists(atPath: folder.appendingPathComponent("\(fid)_rmbg.png").path) && !frameGemSplitTried(fid, folder: folder)
+            }.sorted()
+            guard !need.isEmpty else { build(); return }
+            self.status = "Lifting the gems off \(need.joined(separator: ", ")) with Layerize, then building the framed symbols…"
+            var plans: [URL: LayerizePlan] = [:]
+            for fid in need {
+                let u = folder.appendingPathComponent("\(fid)_rmbg.png")
+                plans[u] = planFrameGems(u, gem: gem)
+            }
+            layerizeImages(need.map { folder.appendingPathComponent("\($0)_rmbg.png") }, plans: plans, assemble: false) { _ in
+                for fid in need where frameGemSplit(fid, folder: folder) == nil {
+                    navLog("gdd stack: \(fid) — its gems could not be lifted off; they stay in the frame, in its own colour")
+                    try? "Layerize returned no separate gems for this cut of \(fid).\n"
+                        .write(to: folder.appendingPathComponent(frameGemSplitFailedNote(fid)), atomically: true, encoding: .utf8)
+                }
+                build()
+            }
+        }
+        if uncut.isEmpty { split() } else {
+            status = "Cutting out \(uncut.count) piece\(uncut.count == 1 ? "" : "s") in Photoshop, then building the framed symbols…"
+            removeBackgroundForImages(uncut, keepCanvas: true) { _ in split() }
+        }
+    }
+
+    /// Puts each layered pay of `ids` together from its cut pieces: the panel tinted for it (its
+    /// hue chosen across its tier, `tiers`), the glow behind it and its shadow, its frame, the
+    /// symbol. Writes `<id>.png` on the backing, the cut-out `<id>_rmbg.png`, and the layers as
+    /// `<id>_rmbg_Layers/` the way a split writes them, so review, the Spine export and everything
+    /// after treat it like a split symbol. Returns what could not be built, and why.
+    nonisolated static func stack(_ ids: [String], tiers: [[String]], frameOf: [String: String], planned: [String: String] = [:],
+                                  folder: URL, colour: PanelColour, backing: RGB8) -> [String: String] {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
+        func pixels(_ name: String) -> (px: [UInt8], w: Int, h: Int)? {
+            guard let cg = loadCGImage(folder.appendingPathComponent(name)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            return (px, cg.width, cg.height)
+        }
+        func png(_ px: [UInt8], _ w: Int, _ h: Int) -> Data? {
+            ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG)
+        }
+        func canvas(_ img: CGImage, _ r: CGRect, _ W: Int, _ H: Int) -> [UInt8]? {
+            guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            ctx.interpolationQuality = .high
+            ctx.draw(img, in: CGRect(x: r.minX, y: Double(H) - r.maxY, width: r.width, height: r.height))
+            return ctx.makeImage().flatMap { ChromaKeyOutputRules.straightRGBA8($0) }
+        }
+        var failed: [String: String] = [:]
+        guard let panelImage = loadCGImage(folder.appendingPathComponent("\(FrameStack.panelID).png")) else {
+            for id in ids { failed[id] = "the panel is missing" }
+            return failed
+        }
+        // Each symbol as drawn, cut and cleaned; its hue is what its tier's panel colours are chosen from.
+        var alone: [String: (px: [UInt8], w: Int, h: Int)] = [:]
+        for id in Set(tiers.flatMap { $0 }) {
+            guard var a = pixels("\(id)_alone_rmbg.png") else { continue }
+            CutoutEdgeRules.clean(&a.px, width: a.w, height: a.h, backing: backing)
+            alone[id] = a
+        }
+        let backingHue = FrameStack.dominantHue([backing.r, backing.g, backing.b, 255], width: 1, height: 1)
+        var hue: [String: Double] = [:]
+        for tier in tiers {
+            // The planned colour, measured from the symbol only where the plan names none (white, black).
+            let hs = FrameStack.panelHues(tier.filter { alone[$0] != nil }.map { id in
+                let p = FrameStack.hue(named: planned[id])
+                return (id, p ?? alone[id].flatMap { FrameStack.dominantHue($0.px, width: $0.w, height: $0.h) }, p != nil)
+            }, mode: colour, backing: backingHue)
+            hue.merge(hs) { a, _ in a }
+        }
+        typealias Frame = (px: [UInt8], w: Int, h: Int, window: (x: Int, y: Int, w: Int, h: Int), inside: [Bool], grey: [UInt8], depth: Double,
+                           gems: [UInt8]?, glow: [UInt8])
+        var frames: [String: Frame] = [:]
+        for id in ids {
+            guard let fid = frameOf[id] else { failed[id] = "it has no frame"; continue }
+            if frames[fid] == nil {
+                guard var f = pixels("\(fid)_rmbg.png") else { failed[id] = "\(fid) is not cut out"; continue }
+                // Its gems lifted off, the frame is the split's, on the cut-out's canvas.
+                var gemPx: [UInt8]?
+                if let s = frameGemSplit(fid, folder: folder),
+                   let fp = canvas(s.frame, CGRect(x: 0, y: 0, width: f.w, height: f.h), f.w, f.h),
+                   let gp = canvas(s.gems, CGRect(x: 0, y: 0, width: f.w, height: f.h), f.w, f.h) {
+                    f.px = fp; gemPx = gp
+                }
+                FrameStack.openWindow(&f.px, width: f.w, height: f.h, backing: backing)
+                CutoutEdgeRules.clean(&f.px, width: f.w, height: f.h, backing: backing)
+                guard let win = LayerizeAssembly.opening(f.px, width: f.w, height: f.h),
+                      let grey = canvas(panelImage, CGRect(x: 0, y: 0, width: f.w, height: f.h), f.w, f.h)
+                else { failed[id] = "\(fid) has no open window"; continue }
+                // The glow around the frame, from its outline and its gems': its own layer, which
+                // Spine pulses in a win (the generator's frame_glow; 51 of its 69 games have one).
+                var outline = f.px
+                if let g = gemPx { LayerizeAssembly.over(&outline, g) }
+                frames[fid] = (f.px, f.w, f.h, win, FrameStack.interior(f.px, width: f.w, height: f.h), grey,
+                               FrameStack.depth(grey, width: f.w, window: win, target: 0.42), gemPx,
+                               FrameStack.shadow(outline, width: f.w, height: f.h, dx: 0, dy: 0, radius: f.w / 70, strength: 0.55))
+            }
+            guard let f = frames[fid] else { continue }
+            guard let a = alone[id], let e = LayerizeAssembly.extent(a.px, width: a.w, height: a.h),
+                  let img = ChromaKeyOutputRules.image(straightRGBA8: a.px, width: a.w, height: a.h, space: space),
+                  let crop = img.cropping(to: CGRect(x: e.x, y: e.y, width: e.w, height: e.h)) else { failed[id] = "it is not cut out"; continue }
+            let W = f.w, H = f.h
+            // A bust is cut off at its chest: set past the window's floor and clipped there, behind the rim.
+            let cut = FrameStack.cut(a.px, width: a.w, height: a.h)
+            let at = FrameStack.placement(subject: e, window: f.window, cut: cut)
+            guard var body = canvas(crop, CGRect(x: at.x, y: at.y, width: at.w, height: at.h), W, H) else { continue }
+            if cut.any {
+                let c = FrameStack.clip(cut, window: f.window)
+                body.withUnsafeMutableBufferPointer { p in
+                    for y in 0..<H { for x in 0..<W where Double(x) < c.x0 || Double(x) >= c.x1 || Double(y) < c.y0 || Double(y) >= c.y1 {
+                        p[(y * W + x) * 4 + 3] = 0
+                    } }
+                }
+                navLog("gdd stack: \(id) is cut off along its \([cut.left ? "left" : nil, cut.right ? "right" : nil, cut.top ? "top" : nil, cut.bottom ? "bottom" : nil].compactMap { $0 }.joined(separator: " and ")) — set behind the frame's rim there")
+            }
+            // A tight shadow away from the light, and a wide glow behind: the light behind the
+            // subject is what made the painted ones read as one object. The glow is its own layer.
+            var panel = f.grey
+            let h = hue[id] ?? 210
+            FrameStack.tint(&panel, hue: h, saturation: 0.6, depth: f.depth)
+            let shade = FrameStack.shadow(body, width: W, height: H, dx: -W / 90, dy: H / 60, radius: W / 120, strength: 0.35)
+            var glow = FrameStack.shadow(body, width: W, height: H, dx: 0, dy: 0, radius: W / 18, strength: 1.6)
+            var light: [UInt8] = [240, 240, 240, 255]
+            FrameStack.tint(&light, hue: h, saturation: 0.6)
+            for i in 0..<(W * H) {
+                glow[i * 4] = light[0]; glow[i * 4 + 1] = light[1]; glow[i * 4 + 2] = light[2]
+                if !f.inside[i] { panel[i * 4 + 3] = 0; glow[i * 4 + 3] = 0 }
+            }
+            var backingLayer = panel
+            var clipped = shade
+            for i in 0..<(W * H) where !f.inside[i] { clipped[i * 4 + 3] = 0 }
+            LayerizeAssembly.over(&backingLayer, clipped)
+            // The frame's glow and its gems in this symbol's colour, as Money Mayhem's match each panel.
+            var frameGlow = f.glow
+            for i in 0..<(W * H) { frameGlow[i * 4] = light[0]; frameGlow[i * 4 + 1] = light[1]; frameGlow[i * 4 + 2] = light[2] }
+            var layers: [(name: String, px: [UInt8], about: String)] = [
+                ("Frame backing", backingLayer, "the panel, tinted for this symbol, with its shadow"),
+                ("Light", glow, "the glow behind the symbol"),
+                ("Frame glow", frameGlow, "the glow around the frame"),
+                ("Frame", f.px, "the tier's frame"),
+            ]
+            if var g = f.gems {
+                FrameStack.tint(&g, hue: h, saturation: 0.75)
+                layers.append(("Gems", g, "the frame's gems, in this symbol's colour"))
+            }
+            layers.append(("Symbol", body, "the symbol itself"))
+            var cutout = layers[0].px
+            for l in layers.dropFirst() { LayerizeAssembly.over(&cutout, l.px) }
+            var flat = [UInt8](repeating: 255, count: W * H * 4)
+            for i in 0..<(W * H) { flat[i * 4] = backing.r; flat[i * 4 + 1] = backing.g; flat[i * 4 + 2] = backing.b }
+            LayerizeAssembly.over(&flat, cutout)
+            let dir = folder.appendingPathComponent("\(id)_rmbg_Layers")
+            try? fm.removeItem(at: dir)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            var rows: [[String: Any]] = []
+            for (z, l) in layers.enumerated() {
+                let file = LayerizeRules.fileName(stem: "\(id)_rmbg", zIndex: z + 1, name: l.name)
+                guard let d = png(l.px, W, H), (try? d.write(to: dir.appendingPathComponent(file))) != nil else { continue }
+                rows.append(["z_index": z + 1, "file": file, "name": l.name, "description": l.about,
+                             "bounding_box": ["absolute": [0, 0, W, H], "normalized": [0, 0, 1000, 1000]]])
+            }
+            guard let rowsJSON = try? JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted]),
+                  (try? rowsJSON.write(to: dir.appendingPathComponent("_layers.json"))) != nil,
+                  let cutPNG = png(cutout, W, H), (try? cutPNG.write(to: folder.appendingPathComponent("\(id)_rmbg.png"))) != nil,
+                  let flatPNG = png(flat, W, H), (try? flatPNG.write(to: folder.appendingPathComponent("\(id).png"))) != nil
+            else { failed[id] = "its files could not be written"; continue }
+            navLog(String(format: "gdd stack: %@ in %@, panel %.0f°", id, fid, h))
+        }
+        return failed
     }
 
     /// Moves what was made from the current image — its cut-out, every split — beside the version it
@@ -25525,7 +26080,9 @@ extension GDDToAssetsRun {
     /// Puts an earlier version back. The image it replaces is kept as a version too, so nothing is lost.
     func restore(_ id: String, version file: String, folder: URL) {
         let fm = FileManager.default
-        let cur = folder.appendingPathComponent("\(id).png"), old = folder.appendingPathComponent(file)
+        let isPanel = id == FrameStack.panelID, layered = framing == .layered
+        let stacks = jobs.first { $0.id == id }.map { Framing.stacks($0, styledDesign) } == true
+        let cur = folder.appendingPathComponent(stacks ? FrameStack.aloneName(id) : "\(id).png"), old = folder.appendingPathComponent(file)
         guard fm.fileExists(atPath: old.path) else { return }
         let archive = review.archiveName(id)
         try? fm.createDirectory(at: folder.appendingPathComponent("versions"), withIntermediateDirectories: true)
@@ -25541,11 +26098,17 @@ extension GDDToAssetsRun {
         review.record(id, replaced: archive, change: "Restored \(file)", mode: .edit, cost: 0)
         saveReview(folder)
         imagesVersion += 1
+        if layered && (stacks || isPanel || FrameRules.parse(id) != nil) {
+            stackFramed(folder, only: stacks ? [id] : isPanel ? nil : frameMembers(id, folder: folder))
+        }
     }
 
     /// Remove BG, then — when asked — the planned frame split, on the reviewed images.
     func finishSet(_ ids: [String], folder: URL, layerize: Bool) {
-        let files = ids.map { folder.appendingPathComponent("\($0).png") }.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let design = styledDesign, layered = framing == .layered
+        let built = { (id: String) in layered && (FrameRules.parse(id) != nil || id == FrameStack.panelID
+            || self.jobs.first { $0.id == id }.map { Framing.stacks($0, design) } == true) }
+        let files = ids.filter { !built($0) }.map { folder.appendingPathComponent("\($0).png") }.filter { FileManager.default.fileExists(atPath: $0.path) }
         cutAndSplit(files, removeBackground: true, separateFrames: layerize)
     }
 }
@@ -25664,9 +26227,15 @@ struct GDDReviewView: View {
                 if let j = job {
                     if !j.job.isEmpty { labelled("What it does", j.job) }
                     labelled("Planned", j.subject)
-                    if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol })[j.id] { labelled("Frame", f) }
+                    if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, ladder: run.rankLadder)[j.id] { labelled("Frame", f) }
+                } else if id == FrameStack.panelID {
+                    labelled("Panel", "The grey panel every framed pay is set on, tinted for each one. Editing it builds them all again, free.")
+                } else if let f = FrameRules.parse(id), run.framing == .layered {
+                    labelled("Frame", f.isShared ? "The frame \(f.owner) share. Editing it builds them all again, free."
+                                                 : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's. Editing it builds that symbol again, free.")
                 } else if let f = FrameRules.parse(id) {
-                    labelled("Frame", "The empty frame every \(f.role == .highPay ? "high" : "medium") pay\(f.premium ? " — HP1's richer version" : "") is painted into. Editing it changes this file only: repaint the tier afterwards to use it.")
+                    labelled("Frame", (f.isShared ? "The empty frame \(f.owner) are painted into." : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's.")
+                             + " Editing it changes this file only: repaint into it afterwards to use it.")
                     let members = run.frameMembers(id, folder: folder)
                     if !members.isEmpty {
                         Button(String(format: "Repaint its %d symbols — ~$%.2f", members.count,
@@ -25679,7 +26248,7 @@ struct GDDReviewView: View {
                         .help("\(members.joined(separator: ", ")) are each drawn again into the frame as it is now; every earlier image is kept as a version")
                     }
                 }
-                if FrameRules.parse(id) == nil, ReviewOrder.family(id) != "Backgrounds",
+                if ReviewOrder.family(id) != "Frames", ReviewOrder.family(id) != "Backgrounds",
                    !FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(id)_rmbg.png").path) {
                     Text(entry.versions.isEmpty ? "Not cut out yet." : "Revised since it was cut out: remove its background (and split it) again.")
                         .font(.caption).foregroundStyle(.orange)
@@ -25697,8 +26266,8 @@ struct GDDReviewView: View {
                     Text("Redraw").tag(ReviewMode.redraw)
                 }
                 .pickerStyle(.segmented).labelsHidden()
-                .disabled(FrameRules.parse(id) != nil)
-                Text(mode == .edit || FrameRules.parse(id) != nil
+                .disabled(ReviewOrder.family(id) == "Frames")
+                Text(mode == .edit || ReviewOrder.family(id) == "Frames"
                      ? "Only what you describe changes; the rest of the image, and its frame, stay as they are."
                      : "Drawn again from its plan with your change added, the way the set drew it.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -25924,7 +26493,7 @@ enum SpineExport {
     @MainActor static func write(run: GDDToAssetsRun, ids: [String], folder: URL) -> (kits: Int, out: URL, error: String?) {
         let out = folder.appendingPathComponent("Spine kits")
         try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        let frameOf = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol })
+        let frameOf = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, ladder: run.rankLadder)
         var made: [[String: Any]] = [], missing: [String] = [], unsplit: [String] = []
         for id in ids {
             guard let layers = layers(id, folder: folder), let first = layers.first?.image else { missing.append(id); continue }
@@ -26827,6 +27396,48 @@ struct GDDToAssetsSheet: View {
                 .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
                 .fixedSize(horizontal: false, vertical: true)
             VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text("Frames built")
+                    Picker("Frames built", selection: $run.framing) {
+                        ForEach(Framing.allCases, id: \.self) { Text($0.rawValue) }
+                    }.labelsHidden().fixedSize()
+                    .help("How the high and medium pays get their frames. Layered: the frame, its panel and each symbol are drawn apart and put together in Navigator — the same frame in every symbol, whole layers for Spine, no Layerize. Painted together: each symbol is painted into its frame — richer light across the two — and Layerize splits them afterwards.")
+                }
+                HStack(spacing: 6) {
+                    Text("Frame style")
+                    Picker("Frame style", selection: $run.frameStyle) {
+                        ForEach(FrameStyle.allCases, id: \.self) { Text($0.rawValue) }
+                    }.labelsHidden().fixedSize()
+                    .help("The high- and medium-pay frames. From the theme: as the plan describes them. The medium pays always get a plainer version, HP1 a richer one.")
+                    if run.frameStyle == .custom {
+                        TextField("Describe the frame — material, rim, corners", text: $run.frameCustom)
+                    }
+                }
+                HStack(spacing: 6) {
+                    Text("High-pay ranks")
+                    Picker("High-pay ranks", selection: $run.rankLadder) {
+                        ForEach(RankLadder.allCases, id: \.self) { Text($0.rawValue) }
+                    }.labelsHidden().fixedSize()
+                    .help("How the high pays' frames show their rank. One frame: HP1 gets a richer, jewelled version of the frame the rest share. Gem ladder: HP1's rim set with gems, HP2's corners, the rest plain. Metal ladder: gold, silver, then bronze. A ladder needs three high pays.")
+                }
+                frameWords
+                HStack(spacing: 6) {
+                    Text("Frame backing")
+                    Picker("Frame backing", selection: $run.panelStyle) {
+                        ForEach(PanelStyle.allCases, id: \.self) { Text($0.rawValue) }
+                    }.labelsHidden().fixedSize()
+                    .help("The panel inside the high- and medium-pay frames, behind each symbol")
+                    Picker("Frame backing colour", selection: $run.panelColour) {
+                        ForEach(PanelColour.allCases, id: \.self) { Text($0.rawValue) }
+                    }.labelsHidden().fixedSize()
+                    .help("Matching: each panel in its symbol's own colour. Contrasting: a different colour that makes the symbol stand out.")
+                    if run.panelStyle == .custom {
+                        TextField("Describe the panel behind the symbol", text: $run.panelCustom)
+                    }
+                }
+            }
+            .disabled(run.busy || run.running)
+            VStack(alignment: .leading, spacing: 6) {
                 Text("After generating").font(.subheadline).bold().padding(.top, 4)
                 Toggle("Remove symbol backgrounds with Photoshop", isOn: $removeBG)
                 Toggle("Then split frames off the framed symbols with Layerize", isOn: $separateFrames)
@@ -26836,6 +27447,36 @@ struct GDDToAssetsSheet: View {
                         + "(%d in this set), more if a split needs repairing. Card royals have no frame and are skipped.",
                         LayerizePlanRules.estimatePerSymbol, run.layerizeEstimate(for: nil).symbols))
             }
+        }
+    }
+
+    /// The frames as they will be drawn, before anything is: the planner's words, or the picked
+    /// style's — and, when a style was picked after planning, the cheap call that writes it in
+    /// this game's own materials and motifs.
+    @ViewBuilder private var frameWords: some View {
+        let d = run.styledDesign
+        if d.families["highPayFrame"] != nil || FrameStyle(d) != .fromTheme {
+            VStack(alignment: .leading, spacing: 3) {
+                let rows: [(String, String?)] = [("High pays", FrameStyle.spec(d, highPay: true)),
+                                                 ("HP1", FrameStyle.richer(d)),
+                                                 ("Medium pays", FrameStyle.spec(d, highPay: false)),
+                                                 ("Gems", FrameRules.gem(d))]
+                ForEach(rows.filter { $0.1 != nil }, id: \.0) { r in
+                    Text("\(r.0): \(r.1!)").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if d.families["highPayFrame"] != nil && !FrameStyle.written(d) {
+                    HStack(spacing: 6) {
+                        Label("Planned for another style: these are the picked style's words, told to use the theme's materials.", systemImage: "info.circle")
+                            .font(.caption).foregroundStyle(.orange)
+                        Button("Write them for \(run.theme?.name ?? "this theme") — ~$0.01") { run.writeFrames() }
+                            .controlSize(.small)
+                            .disabled(run.busy || run.running)
+                            .help("One short Gemini call writes the high-pay, HP1 and medium-pay frames and the gem in the picked style, from this theme's own materials and motifs.")
+                    }
+                }
+            }
+            .padding(.leading, 4)
         }
     }
 
@@ -27483,7 +28124,7 @@ struct GDDToAssetsSheet: View {
                 format: "Each is drawn with %@ attached%@. High pays, jackpot tiers and low pays are each drawn together on one sheet; value symbols are edits of the first one.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent. They are saved into “%@” as they arrive.",
                 run.anchorJob?.id ?? "the first symbol",
                 run.themeArtPNG() != nil ? " and the theme’s concept art" : "",
-                run.estimate(for: rest), folder.lastPathComponent)
+                run.estimate(for: rest), folder.lastPathComponent) + run.gemSplitNote(for: rest)
             a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
             run.generate(into: folder, removeBackground: removeBG, separateFrames: separateFrames,
@@ -27503,7 +28144,7 @@ struct GDDToAssetsSheet: View {
             a.messageText = "Generate \(n) image\(n == 1 ? "" : "s")?"
             a.informativeText = String(
                 format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into a new folder “%@” as they arrive.",
-                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName)
+                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName) + run.gemSplitNote(for: nil)
             a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
