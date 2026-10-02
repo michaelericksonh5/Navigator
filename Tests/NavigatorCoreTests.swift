@@ -12481,18 +12481,122 @@ final class FrameRanksTests: XCTestCase {
         XCTAssertEqual(steps.first { $0.id == "frame_HP2" }, RenderStep(id: "frame_HP2", mode: .frame, refs: ["frame_HP"], after: ["frame_HP"]))
     }
 
-    func testWhichFramesAreSetWithGems() {
+    func testEachRanksGemsSitInFixedSymmetricalPlaces() {
         let one = design(.one), gems = design(.gems), metal = design(.metal), jewelled = design(.one, style: .jewelled)
-        let r = { (id: String) in FrameRules.parse(id)! }
-        XCTAssertTrue(FrameRules.hasGems(r("frame_HP1"), one))           // the top symbol's frame is the jewelled one
-        XCTAssertFalse(FrameRules.hasGems(r("frame_HP"), one))
-        XCTAssertTrue(FrameRules.hasGems(r("frame_HP2"), gems))
-        XCTAssertFalse(FrameRules.hasGems(r("frame_HP2"), metal))
-        XCTAssertTrue(FrameRules.hasGems(r("frame_HP2"), design(.metal, style: .jewelled)))   // silver, but still the jewelled frame
-        XCTAssertTrue(FrameRules.hasGems(r("frame_HP"), jewelled))
-        XCTAssertFalse(FrameRules.hasGems(r("frame_HP"), design(.gems, style: .jewelled)))   // a gem ladder keeps the rest plain
+        XCTAssertEqual(Set(FrameRules.gemSlots(rank: 1, role: .highPay, design: one)), [.corners, .crest])   // HP1: corners and a crest jewel
+        XCTAssertEqual(FrameRules.gemSlots(rank: 2, role: .highPay, design: one), [])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 2, role: .highPay, design: gems), [.corners])              // HP2: four
+        XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .highPay, design: gems), [])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 1, role: .highPay, design: metal), [.crest])
+        XCTAssertEqual(Set(FrameRules.gemSlots(rank: 1, role: .highPay, design: design(.metal, style: .jewelled))), [.corners, .crest])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .highPay, design: jewelled), [.corners])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .mediumPay, design: jewelled), [.corners])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .highPay, design: design(.gems, style: .jewelled)), [])
+        let hps = (1...4).map { hp($0) }
+        XCTAssertEqual(hps.map { FrameRules.rank(of: $0.id, in: hps) }, [1, 2, 0, 0])
+        // Painted frames are drawn with them; a layered set's frames carry none.
+        XCTAssertTrue(FrameRules.hasGems(FrameRules.parse("frame_HP1")!, one))
+        XCTAssertFalse(FrameRules.hasGems(FrameRules.parse("frame_HP1")!, design(.one, framing: .layered)))
         XCTAssertEqual(FrameRules.gem(gems), "bean-shaped cabochons in leaf-claw settings")
         XCTAssertEqual(FrameRules.gem(SetDesign()), "faceted cut gemstones in claw settings")
+        // A layered gem ladder places HP2's gems itself, so HP2 shares the frame; a metal one still silvers it.
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 4, design: design(.gems, framing: .layered)), ["frame_HP", "frame_HP1"])
+        XCTAssertEqual(FrameRules.frameIDs(.highPay, count: 4, design: design(.metal, framing: .layered)), ["frame_HP", "frame_HP1", "frame_HP2"])
+        XCTAssertEqual(FrameRules.assignments(hps, design: design(.gems, framing: .layered))["HP2"], "frame_HP")
+        // …and the plan draws no frame_HP2 for it: one would be paid for and never used.
+        XCTAssertEqual(RenderPlan.steps(hps, design(.gems, framing: .layered), hasThemeArt: false).filter { $0.mode == .frame }.map(\.id),
+                       ["frame_HP", "frame_HP1"])
+    }
+
+    /// A 400px frame on a magenta backing: rim 40px across, 30px down, a crest rising 40px above
+    /// the top rim at the centre, window from (100,90) to (300,310). Bronze, opaque.
+    private func plainFrame() -> (px: [UInt8], win: (x: Int, y: Int, w: Int, h: Int)) {
+        let w = 400
+        var px = [UInt8](repeating: 255, count: w * w * 4)
+        for i in 0..<(w * w) { px[i * 4] = 246; px[i * 4 + 1] = 45; px[i * 4 + 2] = 246 }
+        for y in 20..<340 { for x in 60..<340 where !(x >= 100 && x < 300 && y >= 90 && y < 310) && (y >= 60 || abs(x - 200) < 40) {
+            // Carved, not flat: a little texture, as a drawn frame has.
+            let t = UInt8((x * 7 + y * 13) % 23)
+            let i = (y * w + x) * 4
+            px[i] = 150 + t; px[i + 1] = 95 + t; px[i + 2] = 55 + t
+        } }
+        return (px, (100, 90, 200, 220))
+    }
+
+    func testGemsArePlacedSymmetricallyOnTheRimsCentreLine() {
+        let (px, win) = plainFrame(), w = 400
+        let keyed = FrameStack.keyed(px, backing: RGB8(246, 45, 246))
+        XCTAssertEqual(LayerizeAssembly.opening(keyed, width: w, height: w).map { [$0.x, $0.y, $0.w, $0.h] }, [100, 90, 200, 220])
+        let r = try! XCTUnwrap(FrameStack.rim(keyed, width: w, height: w, window: win))
+        XCTAssertEqual(r.across, 40); XCTAssertEqual(r.down, 30); XCTAssertEqual(r.crest, 70)
+        let c = FrameStack.gemCentres([.corners, .crest], window: win, rim: r)
+        XCTAssertEqual(c.map(\.place), ["top-left", "top-right", "bottom-left", "bottom-right", "crest"])
+        XCTAssertEqual(c[0].x, 80); XCTAssertEqual(c[0].y, 75); XCTAssertEqual(c[0].size, 25.5, accuracy: 0.001)   // top-left corner, on the rim
+        XCTAssertEqual(c[3].x, 320); XCTAssertEqual(c[3].y, 325)                                         // bottom-right, its mirror
+        // Every corner gem has a mirror image across the window's centre.
+        for g in c.prefix(4) { XCTAssertTrue(c.contains { abs($0.x - (400 - g.x)) < 0.001 && abs($0.y - (400 - g.y)) < 0.001 }) }
+        // The crest jewel: centred, larger, raised into the crest by 45% of its rise above the rim.
+        XCTAssertEqual(c[4].x, 200); XCTAssertEqual(c[4].y, 75 - 40 * 0.45, accuracy: 0.001); XCTAssertEqual(c[4].size, 31.5, accuracy: 0.001)
+        XCTAssertEqual(FrameStack.gemCentres([.corners], window: win, rim: r).count, 4)
+    }
+
+    /// The guide puts a flat white disc at each gem's place; the checks pass a gem drawn there and
+    /// say what is wrong with a disc left alone, a gem that blends in, one off its place, and a
+    /// frame that moved; the gem layer is only the gems.
+    func testAGemPassIsGuidedCheckedAndCutByItsPlaces() {
+        let (base, win) = plainFrame(), w = 400
+        let gems = FrameStack.gemCentres([.corners], window: win, rim: (40, 30, 30))
+        let guide = FrameStack.guide(base, width: w, height: w, gems: gems)
+        let at = { (x: Double, y: Double) in (Int(y) * w + Int(x)) * 4 }
+        XCTAssertEqual(Array(guide[at(80, 75)..<at(80, 75) + 3]), [255, 255, 255])           // white at its centre
+        XCTAssertEqual(guide[at(80 + 12.5, 75)], 20)                                         // ringed dark
+        XCTAssertEqual(Array(guide[at(200, 75)..<at(200, 75) + 3]), Array(base[at(200, 75)..<at(200, 75) + 3]))   // the rest as drawn
+        // Gems: faceted bright teal where the discs were, each with its setting's claws past its edge.
+        func paint(_ px: inout [UInt8], _ g: Gem, dx: Double = 0, colour: (UInt8, UInt8, UInt8) = (90, 235, 225)) {
+            for y in 0..<w { for x in 0..<w {
+                let d = ((Double(x) - g.x - dx) * (Double(x) - g.x - dx) + (Double(y) - g.y) * (Double(y) - g.y)).squareRoot()
+                guard d <= g.size * 0.6 else { continue }
+                let i = (y * w + x) * 4, facet = UInt8((x / 3 + y / 3) % 2 * 30)
+                if d <= g.size / 2 { px[i] = colour.0 - facet / 2; px[i + 1] = colour.1 - facet; px[i + 2] = colour.2 - facet }
+                else { px[i] = 120; px[i + 1] = 75; px[i + 2] = 40 }
+            } }
+        }
+        var good = base
+        for g in gems { paint(&good, g) }
+        let ok = FrameStack.check(base: base, edit: good, width: w, height: w, window: win, down: 30, gems: gems)
+        XCTAssertTrue(ok.passed, ok.problems.joined(separator: "; "))
+        XCTAssertGreaterThan(ok.contrast.min()!, 3)
+        XCTAssertLessThan(ok.drift, 0.001)
+        // The disc left alone; a gem the frame's own colour; one drawn beside its place.
+        var bad = guide
+        for g in gems.dropFirst() { paint(&bad, g) }
+        XCTAssertEqual(FrameStack.check(base: base, edit: bad, width: w, height: w, window: win, down: 30, gems: gems).problems,
+                       ["the top-left gem is still a flat disc"])
+        var dull = good
+        paint(&dull, gems[1], colour: (170, 115, 75))
+        XCTAssertTrue(FrameStack.check(base: base, edit: dull, width: w, height: w, window: win, down: 30, gems: gems).problems.first?
+            .hasPrefix("the top-right gem blends into the frame") == true)
+        var off = base
+        for g in gems { paint(&off, g, dx: g.place == "bottom-left" ? 8 : 0) }
+        XCTAssertEqual(FrameStack.check(base: base, edit: off, width: w, height: w, window: win, down: 30, gems: gems).problems.count, 1)
+        // The whole frame moved four pixels: its gems would not sit on it.
+        var moved = [UInt8](repeating: 0, count: base.count)
+        for y in 0..<w { for x in 0..<w { let s = (y * w + max(0, x - 4)) * 4, d = (y * w + x) * 4; for k in 0..<4 { moved[d + k] = good[s + k] } } }
+        XCTAssertTrue(FrameStack.check(base: base, edit: moved, width: w, height: w, window: win, down: 30, gems: gems).problems
+            .contains { $0.hasPrefix("the frame itself changed") })
+        // Cut by their places: the gems and their claws, nothing of the rest, nothing in the window.
+        var cut = good
+        let inWindow = (y: 200, x: 200)
+        cut[(inWindow.y * w + inWindow.x) * 4] = 0
+        let layer = FrameStack.gemLayer(cut, width: w, height: w, window: win, gems: gems)
+        XCTAssertEqual(layer[at(80, 75) + 3], 255)
+        XCTAssertEqual(layer[at(80 + 12.5 * 1.15, 75) + 3], 255)                              // the claws
+        XCTAssertEqual(layer[at(200, 75) + 3], 0)                                             // the rim between
+        XCTAssertEqual(layer[at(200, 200) + 3], 0)                                            // the window
+        XCTAssertEqual(layer[at(320, 325)], good[at(320, 325)])
+        XCTAssertEqual(FrameStack.gemsOwner(FrameStack.gemsID("HP1")), "HP1")
+        XCTAssertNil(FrameStack.gemsOwner("gems_HP1_rmbg"))
+        XCTAssertNil(FrameStack.gemsOwner("frame_HP1"))
     }
 
     func testEachRungIsDrawnAsItsRank() {
@@ -12504,21 +12608,28 @@ final class FrameRanksTests: XCTestCase {
         XCTAssertTrue(frame("frame_HP", g).contains("No gems on it"))
         let hp1 = frame("frame_HP1", g)
         XCTAssertTrue(hp1.contains("Make HP1's version of it, for the top symbol"), hp1)
-        XCTAssertTrue(hp1.contains("bean-shaped cabochons in leaf-claw settings set all along its rim"), hp1)
+        XCTAssertTrue(hp1.contains("set with bean-shaped cabochons in leaf-claw settings: one gem at the centre of its crest and four of exactly the same size, one centred on each corner, placed symmetrically"), hp1)
         XCTAssertTrue(hp1.contains("in clear, colourless stone"), hp1)
         XCTAssertTrue(hp1.contains("may rise into a crest at the top centre"), hp1)          // E
         XCTAssertTrue(hp1.contains("exactly the same window"), hp1)
         let hp2 = frame("frame_HP2", g)
         XCTAssertTrue(hp2.contains("Make HP2's version of it, for the second symbol"), hp2)
-        XCTAssertTrue(hp2.contains("one at each of its four corners"), hp2)
+        XCTAssertTrue(hp2.contains("four gems of exactly the same size, one centred on each corner"), hp2)
         XCTAssertFalse(hp2.contains("crest"), hp2)
+        // Layered: no gems in any frame — Navigator places them.
+        let lay = design(.gems, framing: .layered)
+        for id in ["frame_HP", "frame_HP1"] {
+            let b = frame(id, lay)
+            XCTAssertTrue(b.contains("No gems or jewels on it: they are set into it afterwards."), b)
+            XCTAssertFalse(b.contains("cabochons"), b)
+        }
         let m = design(.metal)
         XCTAssertTrue(frame("frame_HP", m).contains("Its metal parts are bronze"))
         XCTAssertTrue(frame("frame_HP2", m).contains("polished silver"))
-        XCTAssertTrue(frame("frame_HP1", m).contains("rich polished gold"))
-        XCTAssertTrue(frame("frame_HP1", design(.one)).contains("and set with bean-shaped cabochons"))
+        XCTAssertTrue(frame("frame_HP1", m).contains("rich polished gold, set with bean-shaped cabochons in leaf-claw settings: one gem at the centre of its crest"))
+        XCTAssertTrue(frame("frame_HP1", design(.one)).contains("set with bean-shaped cabochons in leaf-claw settings: one gem at the centre of its crest and four"))
         // Jewelled corners on the shared frame, without a ladder.
-        XCTAssertTrue(frame("frame_HP", design(.one, style: .jewelled)).contains("A gem — bean-shaped cabochons in leaf-claw settings — sits at each corner"))
+        XCTAssertTrue(frame("frame_HP", design(.one, style: .jewelled)).contains("It is set with bean-shaped cabochons in leaf-claw settings: four gems of exactly the same size"))
     }
 
     // The listing in the log is the prompt that is sent: a sheet's frames survive flat().
@@ -12584,22 +12695,35 @@ final class FrameRanksTests: XCTestCase {
         XCTAssertNotNil((FrameWriter.schema["properties"] as? [String: Any])?["gems"])
     }
 
-    func testAFramesGemsAreLiftedOffAsTheirOwnLayer() {
-        let e = LayerizePlanRules.frameGems(extent: [100, 100, 900, 900], gem: "turquoise scarabs")
-        XCTAssertEqual(e.map(\.role), [.frame, .gems])
-        let p = LayerizePlanRules.prompt(e)
-        XCTAssertTrue(p.contains("into exactly 2 layers"), p)
-        XCTAssertTrue(p.contains("without its gems: fill the frame in wherever a gem covers it"), p)
-        XCTAssertTrue(p.contains("Every gem set into the frame, together as ONE layer"), p)
-        XCTAssertEqual(LayerizePlanRules.role(name: "Corner gems", box: nil, elements: e), .gems)      // not the frame's "corner"
-        XCTAssertEqual(LayerizePlanRules.role(name: "Turquoise scarab jewels", box: nil, elements: e), .gems)
-        XCTAssertEqual(LayerizePlanRules.role(name: "Gold frame rim", box: nil, elements: e), .frame)
-        // In the kit: the generator's frame glow, and its rigid glinting frame part for the gems.
+    func testGemsAndTheFrameGlowAreLayersOfTheirOwnInTheKit() {
+        // The generator's frame glow, and its rigid glinting frame part for the gems.
         XCTAssertEqual(SpineKitRules.layerName("HP1", role: .frameGlow), "HP1_frame_glow")
         XCTAssertEqual(SpineKitRules.layerName("HP1", role: .gems), "HP1_glass")
         XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Gems"), .gems)
         XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Frame glow"), .frameGlow)
         XCTAssertEqual(SpineKitRules.role(ofAssembledName: "Frame"), .frame)
+        // A gem pass for each pay its rank sets gems on, right after the frame it edits, listed with the frames.
+        var hps = (1...4).map { hp($0) }
+        hps[0].hue = "teal"; hps[1].hue = "gold"
+        let d = design(.gems, framing: .layered)
+        let steps = RenderPlan.layered(RenderPlan.steps(hps, d, hasThemeArt: false), anchor: "HP1",
+                                       gems: [(symbol: "HP1", frame: "frame_HP1"), (symbol: "HP2", frame: "frame_HP")])
+        XCTAssertEqual(steps.filter { $0.mode == .gem }, [RenderStep(id: "gems_HP2", mode: .gem, refs: ["frame_HP"], after: ["frame_HP"]),
+                                                          RenderStep(id: "gems_HP1", mode: .gem, refs: ["frame_HP1"], after: ["frame_HP1"])])
+        XCTAssertEqual(steps.firstIndex { $0.id == "gems_HP1" }, steps.firstIndex { $0.id == "frame_HP1" }.map { $0 + 1 })
+        XCTAssertEqual(ReviewOrder.family("gems_HP1"), "Frames")
+        let brief = { (i: Int) in GDDAssetPrompts.brief(job: hps[i], step: steps.first { $0.id == "gems_HP\(i + 1)" }!, theme: self.theme, design: d,
+                                                        backing: self.backing, gameName: "", jobs: hps) }
+        let g1 = brief(0), g2 = brief(1)
+        XCTAssertTrue(g1.hasPrefix("Using the provided image of an empty slot-game frame for the top high-pay symbol"), g1)
+        XCTAssertTrue(g1.contains("change only the five flat white discs — the four at the corners and the larger one in the crest at the top centre"), g1)
+        XCTAssertTrue(g1.contains("a gem of this kind — bean-shaped cabochons in leaf-claw settings —"), g1)
+        XCTAssertTrue(g1.contains("The stones are a bright, luminous teal — far lighter and more saturated than the frame"), g1)
+        XCTAssertTrue(g1.contains("preserving the original style, lighting and composition"), g1)
+        XCTAssertTrue(g2.contains("for the second high-pay symbol") && g2.contains("the four flat white discs at the corners"), g2)
+        XCTAssertTrue(g2.contains("golden yellow, like a citrine"), g2)
+        XCTAssertTrue(GDDAssetPrompts.gemColour("white").hasPrefix("brilliant clear diamonds"))
+        XCTAssertLessThan(g1.split(separator: " ").count, 260)
     }
 
     func testTheSavedSetKnowsHP2sFrame() {

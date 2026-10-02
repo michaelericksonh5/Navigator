@@ -5222,11 +5222,7 @@ public enum LayerizePlanRules {
     public static func prompt(_ elements: [Element]) -> String {
         let subject = elements.first { $0.role == .subject }?.name ?? "symbol"
         let lit = elements.contains { $0.role == .light }
-        let gemmed = elements.contains { $0.role == .gems }
         func rule(_ e: Element) -> String {
-            if gemmed && e.role == .frame {
-                return "The whole frame as ONE layer, every side together, without its gems: fill the frame in wherever a gem covers it."
-            }
             switch e.role {
             case .gems: return "Every gem set into the frame, together as ONE layer, each one whole. Exclude the frame."
             case .frameGlow: return "Only the glow around the frame, on transparency. Exclude the frame."
@@ -5253,15 +5249,6 @@ public enum LayerizePlanRules {
         let out = [c(b[1]), c(b[0]), c(b[3]), c(b[2])]
         return out[2] > out[0] && out[3] > out[1] ? out : nil
     }
-
-    /// A frame with gems split in two: the frame, and its gems on their own. The whole cut-out is
-    /// each one's box — the gems are all over the rim, and the frame is everything around them.
-    public static func frameGems(extent: [Int], gem: String) -> [Element] {
-        [Element(role: .frame, name: "Frame", description: "the frame itself, every side, without its gems", box: extent),
-         Element(role: .gems, name: "Gems", description: gem, box: extent)]
-    }
-    /// What lifting the gems off one frame costs: two layers and the base, at 1.5K.
-    public static let frameGemsEstimate = 3 * LayerizeRules.costPerLayer
 
     /// Boxes from the cut-out alone, when the vision call has none: the frame is the art's extent,
     /// the backing its middle, the subject a little inside the frame. `extent` is x1 y1 x2 y2, 0–999.
@@ -5341,10 +5328,6 @@ public enum LayerizePlanRules {
         func area(_ b: [Int]) -> Int { max(0, b[2] - b[0]) * max(0, b[3] - b[1]) }
         let backingWords: Set<String> = ["backing", "panel", "background", "backdrop", "inner", "inset", "plate"]
         let lightWords: Set<String> = ["light", "lights", "ray", "rays", "glow", "beam", "beams", "burst", "sunburst", "sparkle", "sparkles", "shine", "radiance"]
-        let gemWords: Set<String> = ["gem", "gems", "gemstone", "gemstones", "jewel", "jewels", "diamond", "diamonds", "stone", "stones",
-                                     "ruby", "rubies", "emerald", "emeralds", "sapphire", "sapphires", "crystal", "crystals", "cabochon", "cabochons", "inlay", "inlays"]
-        // Before the frame's own words: Layerize names them "Corner gems" or "Rim jewels".
-        if elements.contains(where: { $0.role == .gems }), !words.isDisjoint(with: gemWords) { return .gems }
         if elements.contains(where: { $0.role == .light }), !words.isDisjoint(with: lightWords) { return .light }
         let frameWords: Set<String> = ["frame", "rim", "border", "bezel", "bar", "rail", "edge", "plaque", "trim", "corner"]
         if !words.isDisjoint(with: backingWords) {
@@ -5434,6 +5417,177 @@ public enum LayerizeAssembly {
 public enum FrameStack {
     /// The grey panel every layered pay is set on, drawn once per set.
     public static let panelID = "panel"
+    /// A gem pass: `gems_<symbol>.png` is the symbol's frame with its rank's gems set in by a guided
+    /// edit, `gems_<symbol>.json` where they are (GemPass). One per symbol, in its own colour.
+    public static func gemsID(_ symbol: String) -> String { "gems_\(symbol)" }
+    /// The symbol a gem pass is for; nil when `id` is not one (or is its cut-out).
+    public static func gemsOwner(_ id: String) -> String? {
+        id.hasPrefix("gems_") && !id.hasSuffix("_rmbg") && id.count > 5 ? String(id.dropFirst(5)) : nil
+    }
+
+    /// A frame drawn on its flat backing (opaque RGBA) with the backing made clear: enough to find
+    /// its window and measure its rim before Photoshop has cut it out.
+    static func keyed(_ px: [UInt8], backing b: RGB8) -> [UInt8] {
+        var out = px
+        for i in stride(from: 0, to: px.count - 3, by: 4) {
+            let d = abs(Int(px[i]) - Int(b.r)) + abs(Int(px[i + 1]) - Int(b.g)) + abs(Int(px[i + 2]) - Int(b.b))
+            out[i + 3] = d <= 90 ? 0 : 255
+        }
+        return out
+    }
+
+    /// A frame's rim where gems sit: how thick it is across (left and right) and down (top and
+    /// bottom), measured a fifth of the way along the window from each corner — clear of a crest
+    /// at the top centre — the thinner of each opposite pair, so the gems sit symmetrically; and
+    /// `crest`, how thick it is at the top centre, crest and rim together.
+    public static func rim(_ frame: [UInt8], width w: Int, height h: Int, window o: (x: Int, y: Int, w: Int, h: Int)) -> (across: Double, down: Double, crest: Double)? {
+        guard frame.count == w * h * 4, o.w > 4, o.h > 4 else { return nil }
+        return frame.withUnsafeBufferPointer { p -> (across: Double, down: Double, crest: Double)? in
+            func solid(_ x: Int, _ y: Int) -> Bool { x >= 0 && y >= 0 && x < w && y < h && p[(y * w + x) * 4 + 3] >= 128 }
+            // From just outside the window, outward while the frame is solid.
+            func thick(_ x0: Int, _ y0: Int, _ dx: Int, _ dy: Int) -> Int {
+                var x = x0, y = y0, n = 0
+                while !solid(x, y) && n < 12 { x += dx; y += dy; n += 1 }     // across a seam at the window's edge
+                var t = 0
+                while solid(x, y) { x += dx; y += dy; t += 1 }
+                return t
+            }
+            let xs = [o.x + o.w / 5, o.x + o.w * 4 / 5], ys = [o.y + o.h / 5, o.y + o.h * 4 / 5]
+            let top = xs.map { thick($0, o.y - 1, 0, -1) }.min() ?? 0, bottom = xs.map { thick($0, o.y + o.h, 0, 1) }.min() ?? 0
+            let left = ys.map { thick(o.x - 1, $0, -1, 0) }.min() ?? 0, right = ys.map { thick(o.x + o.w, $0, 1, 0) }.min() ?? 0
+            let across = Double(min(left, right)), down = Double(min(top, bottom))
+            let crest = Double(thick(o.x + o.w / 2, o.y - 1, 0, -1))
+            return across > 2 && down > 2 ? (across, down, max(down, crest)) : nil
+        }
+    }
+
+    /// Where each gem of `slots` goes, centre and size (its diameter, px), on the rim's centre line:
+    /// symmetrical about the window by construction. Corner gems are 85% of the rim's width, clear
+    /// of its edges; the crest jewel is the larger centrepiece, raised into the crest by nearly half
+    /// of how far the crest rises above the rim — where it sat in the frames of test 2 (2026-10-02).
+    public static func gemCentres(_ slots: [GemSlot], window o: (x: Int, y: Int, w: Int, h: Int),
+                                  rim r: (across: Double, down: Double, crest: Double)) -> [Gem] {
+        let x0 = Double(o.x) - r.across / 2, x1 = Double(o.x + o.w) + r.across / 2
+        let y0 = Double(o.y) - r.down / 2, y1 = Double(o.y + o.h) + r.down / 2
+        let t = min(r.across, r.down), corner = t * 0.85
+        var out: [Gem] = []
+        if slots.contains(.corners) {
+            out += [Gem(x: x0, y: y0, size: corner, place: "top-left"), Gem(x: x1, y: y0, size: corner, place: "top-right"),
+                    Gem(x: x0, y: y1, size: corner, place: "bottom-left"), Gem(x: x1, y: y1, size: corner, place: "bottom-right")]
+        }
+        if slots.contains(.crest) { out.append(Gem(x: Double(o.x) + Double(o.w) / 2, y: y0 - max(0, r.crest - r.down) * 0.45, size: t * 1.05, place: "crest")) }
+        return out
+    }
+
+    /// What a gem pass edits: the frame on its backing with a flat white disc, ringed dark, where
+    /// each gem goes. Gemini turns the discs into gems (Google's sketch-to-finish and semantic-mask
+    /// edits) so their number, places and sizes are the code's: told a number, the model "won't
+    /// always follow the exact number" (Gemini image docs), and free-placed gems came back scattered.
+    public static func guide(_ frame: [UInt8], width w: Int, height h: Int, gems: [Gem]) -> [UInt8] {
+        var px = frame
+        for g in gems {
+            let r = g.size / 2, ring = max(2, g.size * 0.04)
+            for (x, y, d) in spot(g, radius: r, w, h) where d <= r {
+                let v: UInt8 = d > r - ring ? 20 : 255, i = (y * w + x) * 4
+                px[i] = v; px[i + 1] = v; px[i + 2] = v; px[i + 3] = 255
+            }
+        }
+        return px
+    }
+
+    /// Every pixel within `radius` of a gem's centre, with its distance.
+    static func spot(_ g: Gem, radius: Double, _ w: Int, _ h: Int) -> [(Int, Int, Double)] {
+        let xa = max(0, Int(g.x - radius)), xb = min(w - 1, Int(g.x + radius))
+        let ya = max(0, Int(g.y - radius)), yb = min(h - 1, Int(g.y + radius))
+        guard xa <= xb, ya <= yb else { return [] }
+        var out: [(Int, Int, Double)] = []
+        for y in ya...yb { for x in xa...xb {
+            let d = ((Double(x) - g.x) * (Double(x) - g.x) + (Double(y) - g.y) * (Double(y) - g.y)).squareRoot()
+            if d <= radius { out.append((x, y, d)) }
+        } }
+        return out
+    }
+
+    /// WCAG 2.x relative luminance of an sRGB pixel.
+    static func luminance(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Double {
+        func c(_ v: UInt8) -> Double { let s = Double(v) / 255; return s <= 0.03928 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4) }
+        return 0.2126 * c(r) + 0.7152 * c(g) + 0.0722 * c(b)
+    }
+
+    /// A gem pass checked against the frame it edited (`base`, `edit`: opaque RGBA, the same size).
+    /// Each gem must be there (its spot changed), no longer the flat disc, centred on its spot, and
+    /// at least 3:1 against the rim — WCAG 2.1's floor for graphics that must be seen (SC 1.4.11) —
+    /// and the frame away from the gems must not have moved: the gems are cut from the edit by
+    /// their spots and laid on the frame as drawn. Test 2's frames measured 0.56–0.74 changed,
+    /// ≤ 11% off, 7.8–9.9:1 and ≤ 0.9% drift (2026-10-02).
+    public static func check(base: [UInt8], edit: [UInt8], width w: Int, height h: Int,
+                             window o: (x: Int, y: Int, w: Int, h: Int), down: Double, gems: [Gem]) -> GemCheck {
+        var c = GemCheck()
+        guard base.count == w * h * 4, edit.count == base.count else { c.problems = ["the edit came back the wrong size"]; return c }
+        func lum(_ px: [UInt8], _ i: Int) -> Double { luminance(px[i], px[i + 1], px[i + 2]) }
+        // The rim between a corner and the centre, as drawn.
+        var rim: [Double] = []
+        for y in max(0, Int(Double(o.y) - down * 0.7))..<max(0, Int(Double(o.y) - down * 0.3)) {
+            for x in (o.x + o.w * 3 / 10)..<(o.x + o.w * 4 / 10) where x < w { rim.append(lum(base, (y * w + x) * 4)) }
+        }
+        let lf = rim.isEmpty ? 0 : rim.sorted()[rim.count / 2]
+        var away = [Bool](repeating: true, count: w * h)
+        for (n, g) in gems.enumerated() {
+            let r = g.size / 2
+            let near = spot(g, radius: r * 1.25, w, h)
+            for (x, y, _) in spot(g, radius: r * 1.6, w, h) { away[y * w + x] = false }
+            let changed = near.filter { (x, y, _) in let i = (y * w + x) * 4
+                return abs(Int(edit[i]) - Int(base[i])) + abs(Int(edit[i + 1]) - Int(base[i + 1])) + abs(Int(edit[i + 2]) - Int(base[i + 2])) > 60 }.count
+            let core = spot(g, radius: r * 0.55, w, h).map { (x, y, _) in lum(edit, (y * w + x) * 4) }.sorted()
+            let lg = core.isEmpty ? 0 : core[core.count * 3 / 4]
+            // A disc left as it was is flat; a gem, even a clear one, is all facets.
+            let inner = spot(g, radius: r * 0.8, w, h).map { (x, y, _) -> Double in let i = (y * w + x) * 4
+                return 0.299 * Double(edit[i]) + 0.587 * Double(edit[i + 1]) + 0.114 * Double(edit[i + 2]) }
+            let mean = inner.reduce(0, +) / Double(max(1, inner.count))
+            let spread = (inner.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(max(1, inner.count))).squareRoot()
+            // Where the gem's light is: its pixels at 2:1 or more against the rim.
+            var sx = 0.0, sy = 0.0, k = 0.0
+            for (x, y, _) in near where lum(edit, (y * w + x) * 4) + 0.05 >= 2 * (lf + 0.05) { sx += Double(x); sy += Double(y); k += 1 }
+            let off = k > 0 ? ((sx / k - g.x) * (sx / k - g.x) + (sy / k - g.y) * (sy / k - g.y)).squareRoot() / g.size : 1
+            c.changed.append(Double(changed) / Double(max(1, near.count)))
+            c.spread.append(spread)
+            c.offset.append(off)
+            c.contrast.append((lg + 0.05) / (lf + 0.05))
+            let name = "the \(g.place) gem"
+            if c.changed[n] < 0.3 { c.problems.append("\(name) is missing") }
+            else if spread < 8 { c.problems.append("\(name) is still a flat disc") }
+            else if c.contrast[n] < 3 { c.problems.append(String(format: "%@ blends into the frame (%.1f:1, needs 3:1)", name, c.contrast[n])) }
+            else if off > 0.15 { c.problems.append(String(format: "%@ sits off its place (by %.0f%% of its size)", name, off * 100)) }
+        }
+        var moved = 0, total = 0
+        for y in 0..<h { for x in 0..<w where away[y * w + x] && !(x >= o.x && x < o.x + o.w && y >= o.y && y < o.y + o.h) {
+            let i = (y * w + x) * 4
+            total += 1
+            if abs(Int(edit[i]) - Int(base[i])) + abs(Int(edit[i + 1]) - Int(base[i + 1])) + abs(Int(edit[i + 2]) - Int(base[i + 2])) > 90 { moved += 1 }
+        } }
+        c.drift = Double(moved) / Double(max(1, total))
+        if c.drift > 0.02 { c.problems.append(String(format: "the frame itself changed (%.1f%% of it)", c.drift * 100)) }
+        return c
+    }
+
+    /// The gems alone, from the cut-out of a gem pass (straight RGBA): each spot out to 1.6× its
+    /// radius, where its setting's claws reach, feathered from 1.3× into the frame beneath it, and
+    /// never inside the window. Whatever the edit changed anywhere else is left out by construction.
+    public static func gemLayer(_ cut: [UInt8], width w: Int, height h: Int, window o: (x: Int, y: Int, w: Int, h: Int), gems: [Gem]) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        guard cut.count == w * h * 4 else { return out }
+        for g in gems {
+            let r = g.size / 2
+            for (x, y, d) in spot(g, radius: r * 1.6, w, h) where !(x >= o.x && x < o.x + o.w && y >= o.y && y < o.y + o.h) {
+                let i = (y * w + x) * 4
+                let a = Double(cut[i + 3]) * min(1, (r * 1.6 - d) / (r * 0.3))
+                guard a > Double(out[i + 3]) else { continue }
+                out[i] = cut[i]; out[i + 1] = cut[i + 1]; out[i + 2] = cut[i + 2]; out[i + 3] = UInt8(a.rounded())
+            }
+        }
+        return out
+    }
+
     /// A layered pay as drawn, on its own; `<id>.png` is the stacked symbol.
     public static func aloneName(_ id: String) -> String { "\(id)_alone.png" }
 
@@ -9827,11 +9981,12 @@ public enum GDDAssetPrompts {
                                 gddText: String = "", backing: String = "",
                                 reserved: Set<String> = [],
                                 lowPays: LowPayKind = .royals, customLowPays: String = "",
-                                frameStyle: String? = nil, ladder: RankLadder = .one) -> String {
+                                frameStyle: String? = nil, ladder: RankLadder = .one, layered: Bool = false) -> String {
         // A picked style is written in this theme's terms here, so a preset still belongs to the game.
         let frameStyleRule = (frameStyle.map {
             "\n          The artist picked the frames' style: \($0). Write highPayFrame, hp1Frame and\n          mediumPayFrame in that style, made from this theme's own materials and motifs."
         } ?? "") + (ladder.note.map { "\n          \($0)" } ?? "")
+            + (layered ? "\n          \(FrameRules.layeredGemsNote)" : "")
         let hueList = SetDesignRules.hues.filter { !reserved.contains($0) }.joined(separator: ", ")
         let backingRule = reserved.isEmpty ? "" :
             "\n    Every symbol is drawn on a flat \(backing) backing that is cut away afterwards, so "
@@ -10777,19 +10932,28 @@ public enum FrameRules {
     /// A tier's frames in drawing order: the shared one, then HP1's richer version when there
     /// is more than one high pay to stand above, then — on a rank ladder with a third high pay to
     /// stand above — HP2's.
-    public static func frameIDs(_ role: SlotSymbolRole, count: Int, ladder: RankLadder = .one) -> [String] {
+    /// HP2's frame is its own on a metal ladder (silver), and on a painted gem ladder (its corner
+    /// gems are drawn into it); a layered set places gems itself, so its HP2 shares the frame.
+    public static func frameIDs(_ role: SlotSymbolRole, count: Int, ladder: RankLadder = .one, layered: Bool = false) -> [String] {
         guard count > 0, let code = code(role) else { return [] }
         let hp = role == .highPay
-        return ["frame_\(code)"] + (hp && count > 1 ? ["frame_\(code)1"] : []) + (hp && ladder != .one && count > 2 ? ["frame_\(code)2"] : [])
+        let ownHP2 = ladder == .metal || (ladder == .gems && !layered)
+        return ["frame_\(code)"] + (hp && count > 1 ? ["frame_\(code)1"] : []) + (hp && ownHP2 && count > 2 ? ["frame_\(code)2"] : [])
+    }
+    public static func frameIDs(_ role: SlotSymbolRole, count: Int, design: SetDesign) -> [String] {
+        frameIDs(role, count: count, ladder: RankLadder(design), layered: Framing(design) == .layered)
     }
 
     /// The frame each framed member is painted into: HP1 (the first high pay) its own, HP2 its own
     /// on a ladder, the rest the tier's.
-    public static func assignments(_ symbols: [AssetJob], ladder: RankLadder = .one) -> [String: String] {
+    public static func assignments(_ symbols: [AssetJob], design: SetDesign) -> [String: String] {
+        assignments(symbols, ladder: RankLadder(design), layered: Framing(design) == .layered)
+    }
+    public static func assignments(_ symbols: [AssetJob], ladder: RankLadder = .one, layered: Bool = false) -> [String: String] {
         var out: [String: String] = [:]
         for r in sharedTiers {
             let members = symbols.filter { $0.role == r && $0.hasFrame }
-            let ids = frameIDs(r, count: members.count, ladder: ladder)
+            let ids = frameIDs(r, count: members.count, ladder: ladder, layered: layered)
             for (i, m) in members.enumerated() {
                 let own = i < 2 && i + 1 < ids.count ? ids[i + 1] : nil     // HP1 → ids[1], HP2 → ids[2]
                 out[m.id] = own ?? ids.first
@@ -10820,17 +10984,42 @@ public enum FrameRules {
         return nil
     }
 
-    /// Whether a frame is set with gems: HP1's always — the top symbol's frame is the jewelled one
-    /// in this studio's sets (Money Mayhem, Majestic Cats) — HP2's on a gem ladder, and the shared
-    /// frames when the artist picked jewelled corners, unless a gem ladder keeps them plain.
-    public static func hasGems(_ ref: Ref, _ design: SetDesign) -> Bool {
-        let ladder = RankLadder(design)
-        switch ref.rank {
-        case 1: return true
-        case 2: return ladder == .gems || FrameStyle(design) == .jewelled     // an edit of the jewelled shared frame keeps its gems
-        default: return FrameStyle(design) == .jewelled && ladder != .gems
-        }
+    /// A framed pay's rank in its tier: 1 for HP1, 2 for HP2 — the ranks a frame can show — 0 otherwise.
+    public static func rank(of id: String, in symbols: [AssetJob]) -> Int {
+        guard let j = symbols.first(where: { $0.id == id }), j.role == .highPay else { return 0 }
+        let members = symbols.filter { $0.role == .highPay && $0.hasFrame }.map(\.id)
+        let i = (members.firstIndex(of: id) ?? 9) + 1
+        return i <= 2 ? i : 0
     }
+
+    /// Where a rank's gems sit. Placed by rule, as the shipped sets place them — Money Mayhem's HP2
+    /// the four corners, the rest plain — so they are symmetrical, the same size and few enough to
+    /// read at reel size. Free-placed by the image model ("all along its rim") they came back
+    /// scattered and uneven (2026-10-02). HP1's are the top symbol's: its four corners and a larger
+    /// jewel in its crest (the artist's pick over eight, 2026-10-02); a metal ladder ranks by
+    /// metal, with the one crest jewel; jewelled corners put a gem at each corner of the rest,
+    /// unless a gem ladder keeps them plain.
+    public static func gemSlots(rank: Int, role: SlotSymbolRole, design: SetDesign) -> [GemSlot] {
+        let ladder = RankLadder(design), jewelled = FrameStyle(design) == .jewelled
+        if role == .highPay && rank == 1 { return ladder == .metal && !jewelled ? [.crest] : [.corners, .crest] }
+        if role == .highPay && rank == 2 && ladder == .gems { return [.corners] }
+        return jewelled && !(role == .highPay && ladder == .gems) ? [.corners] : []
+    }
+    /// Whether a frame is drawn with gems in it — a painted set's; a layered set's frames have none.
+    public static func hasGems(_ ref: Ref, _ design: SetDesign) -> Bool {
+        Framing(design) != .layered && !gemSlots(rank: ref.rank, role: ref.role, design: design).isEmpty
+    }
+    /// The slots in words, for a painted frame: an exact count in exact places, all the same size.
+    public static func gemPlaces(_ slots: [GemSlot]) -> String {
+        let s = Set(slots)
+        if s == [.corners] { return "four gems of exactly the same size, one centred on each corner, placed symmetrically" }
+        if s == [.crest, .corners] { return "one gem at the centre of its crest and four of exactly the same size, one centred on each corner, placed symmetrically" }
+        if s == [.crest] { return "one gem at the centre of its crest" }
+        return ""
+    }
+
+    /// What the planner and the frame writer are told of a layered set's gems.
+    public static let layeredGemsNote = "The frames themselves carry no gems — Navigator sets them in afterwards, in fixed places — so highPayFrame, hp1Frame and mediumPayFrame name no gems or jewels."
 
     /// The gem those frames are set with: the planner's, in the theme's own terms, or a plain one.
     public static func gem(_ design: SetDesign) -> String {
@@ -10854,7 +11043,7 @@ public enum FrameWriter {
         THEME: \(theme.name)\(theme.category.isEmpty ? "" : " [\(theme.category)]")
         THE LOOK OF THIS SET: \(GDDAssetPrompts.lookBlock(theme, design, artAttached: false))
         THE FRAMES AS PLANNED: high pays \(f("highPayFrame")); HP1's richer version \(f("hp1Frame")); medium pays \(f("mediumPayFrame")); the gem \(f("gems")).
-        THE STYLE TO WRITE THEM IN: \(FrameStyle.direction(design) ?? "this theme's own, as the planned frames are").\(RankLadder(design).note.map { "\n        \($0)" } ?? "")
+        THE STYLE TO WRITE THEM IN: \(FrameStyle.direction(design) ?? "this theme's own, as the planned frames are").\(RankLadder(design).note.map { "\n        \($0)" } ?? "")\(Framing(design) == .layered ? "\n        \(FrameRules.layeredGemsNote)" : "")
         Write them again in that style, made from this theme's own materials and motifs:
         - highPayFrame: the high pays' square frame — material, rim profile and corner ornaments, not the panel inside it; under 25 words.
         - hp1Frame: how HP1's version of that frame is richer, with the same window; under 25 words.
@@ -10881,6 +11070,41 @@ public enum FrameWriter {
     }
 }
 
+/// Where gems sit on a frame (FrameRules.gemSlots): its four corners, the centre of its crest.
+public enum GemSlot: String, Sendable, Hashable { case corners, crest }
+
+/// One gem's place on its frame (FrameStack.gemCentres): centre and diameter, in the frame's pixels.
+public struct Gem: Codable, Equatable, Sendable {
+    public var x: Double, y: Double, size: Double, place: String
+    public init(x: Double, y: Double, size: Double, place: String) { self.x = x; self.y = y; self.size = size; self.place = place }
+}
+
+/// A gem pass checked, gem by gem (FrameStack.check).
+public struct GemCheck: Codable, Equatable, Sendable {
+    public var changed: [Double] = [], spread: [Double] = [], offset: [Double] = [], contrast: [Double] = []
+    public var drift = 0.0
+    public var problems: [String] = []
+    public var passed: Bool { problems.isEmpty }
+    public init() {}
+}
+
+/// What a gem pass made and from what: `gems_<symbol>.json` beside its image.
+public struct GemPass: Codable, Equatable, Sendable {
+    /// The frame it edited, and that frame's PNG digest: revised or restored since, it is stale.
+    public var frame: String, frameDigest: String
+    public var window: [Int]
+    public var gems: [Gem]
+    public var check: GemCheck
+    public var attempts: Int
+    public init(frame: String, frameDigest: String, window: [Int], gems: [Gem], check: GemCheck, attempts: Int) {
+        self.frame = frame; self.frameDigest = frameDigest; self.window = window; self.gems = gems; self.check = check; self.attempts = attempts
+    }
+    public var windowBox: (x: Int, y: Int, w: Int, h: Int) {
+        window.count == 4 ? (window[0], window[1], window[2], window[3]) : (0, 0, 0, 0)
+    }
+    public static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+}
+
 /// How the high pays' frames show their rank, the GDD window's "High-pay ranks". One frame: HP1
 /// a richer, jewelled version of the one frame the rest share. Gem ladder: HP1's rim set with gems,
 /// HP2's corners, the rest plain (Money Mayhem). Metal ladder: gold, silver, then bronze (IGT's
@@ -10894,7 +11118,7 @@ public enum RankLadder: String, CaseIterable, Sendable {
     public var note: String? {
         switch self {
         case .one: return nil
-        case .gems: return "The high pays rank by gems: HP1's frame is set with gems all along its rim, HP2's at its four corners, and the rest have none — so highPayFrame, the frame the rest share, has no gems."
+        case .gems: return "The high pays rank by gems: HP1's frame is set with a gem at each corner and a larger jewel at its crest, HP2's with a gem at each corner, and the rest have none — so highPayFrame, the frame the rest share, has no gems."
         case .metal: return "The high pays rank by metal: HP1's frame in gold, HP2's in silver, the rest in bronze — so highPayFrame's metal parts are bronze."
         }
     }
@@ -10960,7 +11184,7 @@ public enum FrameStyle: String, CaseIterable, Sendable {
         let style = FrameStyle(design)
         if style == .fromTheme || written(design) { return design.families[highPay ? "highPayFrame" : "mediumPayFrame"] }
         // A gem ladder places the gems itself: its shared frame is the plain rung, jewelled or not.
-        let base = style == .jewelled && RankLadder(design) == .gems ? "a square metal frame with a bevelled rim" : style.preset
+        let base = style == .jewelled && (RankLadder(design) == .gems || Framing(design) == .layered) ? "a square metal frame with a bevelled rim" : style.preset
         let text = (style == .custom ? design.families[key] ?? "" : base) + ", made from this theme's own materials and motifs"
         return highPay ? text : "\(text), plainer than the high pays' — a simpler material and less ornament"
     }
@@ -11457,6 +11681,8 @@ public struct RenderStep: Equatable, Sendable {
         case intoFrame
         /// The grey panel a layered set's framed pays are stacked on, drawn once (FrameStack).
         case panel
+        /// A gem pass: a symbol's frame with its rank's gems set in, a guided edit of that frame.
+        case gem
     }
     public let id: String
     public let mode: Mode
@@ -11512,13 +11738,13 @@ public enum RenderPlan {
         // version is an edit of the shared one; the medium pays' frame is shown the high pays'.
         var frameSteps: [RenderStep] = []
         for r in FrameRules.sharedTiers {
-            let ids = FrameRules.frameIDs(r, count: symbols.filter { $0.role == r && $0.hasFrame }.count, ladder: RankLadder(design))
+            let ids = FrameRules.frameIDs(r, count: symbols.filter { $0.role == r && $0.hasFrame }.count, design: design)
             guard let shared = ids.first else { continue }
             let sibling = r == .mediumPay ? frameSteps.first.map { [$0.id] } ?? [] : []
             frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling, after: sibling))
             for p in ids.dropFirst() { frameSteps.append(RenderStep(id: p, mode: .frame, refs: art + [shared], after: [shared])) }
         }
-        let frameOf = FrameRules.assignments(symbols, ladder: RankLadder(design))
+        let frameOf = FrameRules.assignments(symbols, design: design)
 
         // Groups on one sheet. The low pays keep their rule (never the anchor's group).
         var sheets: [SlotSymbolRole: [AssetJob]] = [:]
@@ -11638,8 +11864,9 @@ public enum RenderPlan {
 
     /// The same plan for a set built in layers (Framing.layered): the framed pays drawn on their
     /// own — nothing waits for or edits a frame — and the panel once. Apply after `scoped`, which
-    /// keeps a frame only while something is drawn into it.
-    public static func layered(_ steps: [RenderStep], anchor: String?) -> [RenderStep] {
+    /// keeps a frame only while something is drawn into it. `gems`: each symbol whose rank sets
+    /// gems in its frame, and that frame — a gem pass each, right after the frame it edits.
+    public static func layered(_ steps: [RenderStep], anchor: String?, gems: [(symbol: String, frame: String)] = []) -> [RenderStep] {
         let unframed = { (r: [String]) in r.filter { FrameRules.parse($0) == nil && $0 != Self.frameSheet } }
         var out = steps.map { st -> RenderStep in
             switch st.mode {
@@ -11650,6 +11877,10 @@ public enum RenderPlan {
         }
         if out.contains(where: { $0.mode == .frame }) && !out.contains(where: { $0.mode == .panel }) {
             out.insert(RenderStep(id: FrameStack.panelID, mode: .panel, refs: [], after: []), at: 0)
+        }
+        for g in gems where !out.contains(where: { $0.id == FrameStack.gemsID(g.symbol) }) {
+            let at = out.firstIndex { $0.id == g.frame }.map { $0 + 1 } ?? out.count
+            out.insert(RenderStep(id: FrameStack.gemsID(g.symbol), mode: .gem, refs: [g.frame], after: [g.frame]), at: at)
         }
         return out
     }
@@ -12496,24 +12727,27 @@ extension GDDAssetPrompts {
         let panel = Framing(design) == .layered
             ? "Inside the rim the window is open and EMPTY: it shows the same flat background as around the frame, right up to the rim — no panel, glass, shadow or glow inside it, whatever an attached image shows."
             : "Inside the rim, the backing panel fills the whole window: \(PanelStyle.brief(design)), in a calm mid-tone. Nothing stands on it — no subject, emblem, text or symbol: the symbols are painted into it later."
-        // Gems are drawn clear: a symbol painted into the frame gives them its panel's colour, and a
-        // layered one has them lifted off and tinted, as Money Mayhem's match each symbol's colour.
-        let gem = FrameRules.gem(design), ladder = RankLadder(design)
+        // Painted, the gems are drawn in, clear, in exact places (FrameRules.gemSlots), and the paint-in
+        // gives them its panel's colour. Layered, the frame carries none: Navigator sets them in.
+        let gem = FrameRules.gem(design), ladder = RankLadder(design), layered = Framing(design) == .layered
         let clear = "in clear, colourless stone, so each symbol's own colour can be given to them"
+        let places = FrameRules.gemPlaces(FrameRules.gemSlots(rank: ref.rank, role: role, design: design))
+        let gems = layered ? "" : FrameRules.hasGems(ref, design) && !places.isEmpty ? ", set with \(gem): \(places), \(clear)" : ""
+        let noGems = layered ? " No gems or jewels on it: they are set into it afterwards." : ""
         if !ref.isShared {
             let rich = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with a crest at the top centre"
             let change: String
             switch (ladder, ref.rank) {
-            case (.gems, 2): change = "set with \(gem) — one at each of its four corners and none along the rest of the rim — \(clear)"
-            case (.metal, 2): change = "with its metal in polished silver instead"
-            case (.metal, _): change = "but richer: its metal in rich polished gold, with \(gem) set at its crest, \(clear)"
-            case (.gems, _): change = "but the richest of the set: \(gem) set all along its rim, \(clear)"
-            default: change = "but richer — \(rich) — and set with \(gem), \(clear)"
+            case (.gems, 2): change = "the same frame\(gems)"
+            case (.metal, 2): change = "with its metal in polished silver instead\(gems)"
+            case (.metal, _): change = "but richer: its metal in rich polished gold\(gems)"
+            case (.gems, _): change = "but the richest of the set\(gems)"
+            default: change = "but richer — \(rich)\(gems)"
             }
             // Shipped top symbols often change shape too: Dodge's HP1 is octagonal, Billionaires Bank's crested.
             let crest = ref.rank == 1 ? " Its outline may rise into a crest at the top centre; everywhere else it keeps the shared frame's outline." : ""
             return ([
-                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make \(FrameRules.code(role) ?? "HP")\(ref.rank)'s version of it, for the \(ref.rank == 1 ? "top" : "second") symbol: the same construction, proportions and size, and exactly the same window, so they read as one set — \(change).\(crest)",
+                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make \(FrameRules.code(role) ?? "HP")\(ref.rank)'s version of it, for the \(ref.rank == 1 ? "top" : "second") symbol: the same construction, proportions and size, and exactly the same window, so they read as one set — \(change).\(crest)\(noGems)",
             ] + parts + [
                 panel,
                 "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
@@ -12521,10 +12755,9 @@ extension GDDAssetPrompts {
                 "No text, lettering or numbers, no watermark, no user interface.",
             ]).joined(separator: "\n\n")
         }
-        let rung = role != .highPay ? (FrameRules.hasGems(ref, design) ? " A gem — \(gem) — sits at each corner, \(clear)." : "")
-            : ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones."
-            : ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold."
-            : FrameRules.hasGems(ref, design) ? " A gem — \(gem) — sits at each corner, \(clear)." : ""
+        let rung = (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
+            + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."
+                : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
         return ([
             "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of this frame, so it holds each in turn and carries nothing of any of them.",
             "THE FRAME: \(spec).\(rung) A square frame seen straight on, upright and level, centred and filling about 85% of the image with an even margin. \(panel)",
@@ -12645,6 +12878,7 @@ extension GDDAssetPrompts {
         }
         if step.mode == .frame { return frameBrief(step: step, theme: theme, design: design, backing: backing) }
         if step.mode == .panel { return panelBrief(theme: theme, design: design) }
+        if step.mode == .gem { return gemsBrief(job: job, theme: theme, design: design, backing: backing, jobs: jobs) }
         let artAttached = step.refs.contains(RenderPlan.themeArt)
         let look = lookBlock(theme, design, artAttached: artAttached)
         let refs = referenceLines(step, job: job, jobs: jobs,
@@ -13012,7 +13246,7 @@ public enum ReviewOrder {
 
     /// "HP" for HP12, "Frames" for a master frame, "Backgrounds" for a scene.
     public static func family(_ id: String) -> String {
-        if FrameRules.parse(id) != nil || id == FrameStack.panelID { return "Frames" }
+        if FrameRules.parse(id) != nil || id == FrameStack.panelID || FrameStack.gemsOwner(id) != nil { return "Frames" }
         if id.hasPrefix("bg_") { return "Backgrounds" }
         return String(id.prefix { $0.isLetter }).uppercased()
     }
@@ -13045,6 +13279,47 @@ extension GDDAssetPrompts {
             "Paint it in neutral greys only — no colour at all — so it can be tinted for each symbol: its light, shadow and detail carry everything.",
             "No text, lettering or numbers, no watermark, no user interface.",
         ].joined(separator: "\n\n")
+    }
+
+    /// A gem pass, for `job` (the symbol whose frame it is): the edit that turns the flat white
+    /// discs of FrameStack.guide into its rank's gems, held by the frame's own ornament and in the
+    /// symbol's colour, made bright. Google's semantic-mask edit template ("Using the provided
+    /// image … change only … Keep everything else … exactly the same, preserving the original
+    /// style, lighting, and composition"), in the wording test 2 passed with (2026-10-02).
+    static func gemsBrief(job: AssetJob, theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), jobs: [AssetJob]) -> String {
+        let rank = FrameRules.rank(of: job.id, in: jobs)
+        let slots = Set(FrameRules.gemSlots(rank: rank, role: job.role, design: design))
+        let whose = job.role != .highPay ? "a medium-pay symbol" : rank == 1 ? "the top high-pay symbol" : rank == 2 ? "the second high-pay symbol" : "a high-pay symbol"
+        let discs: String, alike: String
+        switch (slots.contains(.corners), slots.contains(.crest)) {
+        case (true, true):
+            discs = "the five flat white discs — the four at the corners and the larger one in the crest at the top centre"
+            alike = "The four corner gems are identical; the crest gem is the larger centrepiece."
+        case (true, false): discs = "the four flat white discs at the corners"; alike = "The four gems are identical."
+        default: discs = "the one flat white disc in the crest at the top centre"; alike = "It is the frame's centrepiece."
+        }
+        var gem = FrameRules.gem(design)
+        gem = gem.prefix(1).lowercased() + gem.dropFirst()
+        return "Using the provided image of an empty slot-game frame for \(whose) of a game themed “\(theme.name)”, change only \(discs). "
+            + "Turn each disc into a gem of this kind — \(gem) — held by the frame's own ornament: at each spot the frame's own carving grows around the gem as its setting, curling over its edges like claws of the frame's own material, so the gem sits IN the frame — not on top of it as a separate plate, badge or bezel. "
+            + "Each gem is exactly where its disc is, at the disc's size. \(alike) "
+            + "The stones are \(gemColour(job.hue)), glowing from within, with brilliant white glints — so they stand out clearly against the frame even when the symbol is shown small. "
+            + "Keep everything else in the image exactly the same: the frame's shape, carving, metal and lighting, its size and position, and the flat \(backing.name) background — preserving the original style, lighting and composition. "
+            + "The window inside the frame stays completely empty: flat \(backing.name), with nothing added there. No other gems, no text."
+    }
+
+    /// A gem's colour in words an image model draws bright: the symbol's planned colour as a
+    /// gemstone, far lighter than the frame (the artist's call, 2026-10-02). Gold and brown, which
+    /// vanish into a gold or bronze frame, as the stones that carry them bright; white, black or
+    /// none as clear diamonds.
+    static func gemColour(_ name: String?) -> String {
+        let lighter = "far lighter and more saturated than the frame"
+        switch (name ?? "").lowercased().trimmingCharacters(in: .whitespaces) {
+        case "", "white", "black": return "brilliant clear diamonds — colourless and far lighter than the frame"
+        case "gold": return "a bright, luminous golden yellow, like a citrine catching the light — \(lighter)"
+        case "brown": return "a bright, luminous warm amber, like a topaz catching the light — \(lighter)"
+        case let c: return "a bright, luminous \(c) — \(lighter)"
+        }
     }
 
     /// A brief written for a symbol painted into its frame, for the same symbol drawn on its own:

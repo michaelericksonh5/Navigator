@@ -745,6 +745,9 @@ enum APIKeys {
               let env = j["env"] as? [String: Any] else { return nil }
         return clean(env[name] as? String)
     }
+    /// Whether a fal.ai key is set up anywhere Navigator reads — checked without reading the keychain
+    /// item, so it never asks for a password.
+    static var falAvailable: Bool { PermissionProbe.keyStored(account: "fal.ai") == .granted }
     // The fal.ai API key (used for AI upscaling).
     static var fal: String? { get { get("fal.ai") } set { set(newValue ?? "", "fal.ai") } }
 }
@@ -2823,61 +2826,6 @@ struct LayerizePlan {
 /// A planned split for one framed symbol, written from the plan and from what a Gemini vision
 /// model sees in the finished image. The vision call costs about a tenth of a cent; without it
 /// the plan's own words and the cut-out's extent are used, so a failure never stops the split.
-/// The split that lifts a frame's gems off it (FrameStack): two elements over the frame's extent,
-/// no vision call — the gems are all over the rim and the frame is everything around them.
-func planFrameGems(_ cutout: URL, gem: String) -> LayerizePlan {
-    var extent = [0, 0, 999, 999]
-    if let cg = loadCGImage(cutout), let px = ChromaKeyOutputRules.straightRGBA8(cg),
-       let e = LayerizeAssembly.extent(px, width: cg.width, height: cg.height) {
-        extent = [e.x * 999 / cg.width, e.y * 999 / cg.height, (e.x + e.w) * 999 / cg.width, (e.y + e.h) * 999 / cg.height]
-    }
-    let elements = LayerizePlanRules.frameGems(extent: extent, gem: gem)
-    return LayerizePlan(elements: elements, prompt: LayerizePlanRules.prompt(elements))
-}
-
-/// Whether lifting a frame's gems off has been tried since its cut-out was made: a split newer
-/// than it, or a note that the split came back without them. Tried once per cut, so a failed or
-/// gemless split is not paid for again on every rebuild.
-func frameGemSplitTried(_ frameID: String, folder: URL) -> Bool {
-    let fm = FileManager.default
-    func modified(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast }
-    let cut = modified(folder.appendingPathComponent("\(frameID)_rmbg.png"))
-    if modified(folder.appendingPathComponent(frameGemSplitFailedNote(frameID))) >= cut { return true }
-    return ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
-        .filter { $0.lastPathComponent.hasPrefix("\(frameID)_rmbg_Layers") }
-        .contains { modified($0.appendingPathComponent("_layers.json")) >= cut }
-}
-/// The note left when a frame's gems could not be lifted off. Starts "<id>_rmbg", so a revision
-/// of the frame moves it aside with the cut-out (SetReview.isDerived).
-func frameGemSplitFailedNote(_ frameID: String) -> String { "\(frameID)_rmbg_gems-not-lifted.txt" }
-
-/// A frame's gems as lifted off it, with the frame they came off: the newest split of its cut-out,
-/// when that split is newer than the cut-out. Nil when there is none, or it is stale.
-func frameGemSplit(_ frameID: String, folder: URL) -> (frame: CGImage, gems: CGImage)? {
-    let fm = FileManager.default
-    func modified(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast }
-    let cut = folder.appendingPathComponent("\(frameID)_rmbg.png")
-    let dirs = ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
-        .filter { $0.lastPathComponent.hasPrefix("\(frameID)_rmbg_Layers") }
-        .map { $0.appendingPathComponent("_layers.json") }
-        .filter { fm.fileExists(atPath: $0.path) && modified($0) >= modified(cut) }
-        .sorted { modified($0) > modified($1) }
-    guard let json = dirs.first, let d = try? Data(contentsOf: json),
-          let rows = try? JSONSerialization.jsonObject(with: d) as? [[String: Any]] else { return nil }
-    var frame: CGImage?, gems: CGImage?
-    for r in rows {
-        guard let f = r["file"] as? String, let n = r["name"] as? String,
-              let img = loadCGImage(json.deletingLastPathComponent().appendingPathComponent(f)) else { continue }
-        switch SpineKitRules.role(ofAssembledName: n) {
-        case .frame: frame = img
-        case .gems: gems = img
-        default: break
-        }
-    }
-    guard let frame, let gems else { return nil }
-    return (frame, gems)
-}
-
 func planLayerize(_ cutout: URL, job: AssetJob, frameSpec: String) -> (plan: LayerizePlan, cost: Double) {
     var extent = [0, 0, 999, 999]
     if let cg = loadCGImage(cutout), let px = ChromaKeyOutputRules.straightRGBA8(cg),
@@ -21486,6 +21434,33 @@ if let flag = CommandLine.arguments.firstIndex(of: "--write-frames"), flag + 1 <
     app.run()
 }
 
+// PAID (~$0.10 a symbol, $0.20 when a check fails):  Navigator --gems <set folder> <id,id,…> [--again]
+// Gem passes for those layered pays, then each built again. Kept while current, unless --again.
+if let flag = CommandLine.arguments.firstIndex(of: "--gems"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    let ids = args[flag + 2].split(separator: ",").map(String.init)
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        let owners = Set(run.gemOwners())
+        guard ids.allSatisfy(owners.contains) else { print("FAILED: gems are set only for \(owners.sorted())"); exit(1) }
+        print(String(format: "GEMS: %@ — estimate $%.2f", ids.joined(separator: ","), Double(ids.count) * run.revisionEstimate(FrameStack.gemsID(ids[0]))))
+        if args.contains("--again") { for id in ids { try? FileManager.default.removeItem(at: folder.appendingPathComponent("\(FrameStack.gemsID(id)).json")) } }
+        run.redoGems(ids, folder: folder) { problems in
+            run.stackFramed(folder, only: ids) {
+                MainActor.assumeIsolated {
+                    for id in ids { print("\(id): \(GDDToAssetsRun.currentGemPass(id, folder: folder).map { p in p.check.passed ? "passed" : p.check.problems.joined(separator: "; ") } ?? (problems[id] ?? "not made"))") }
+                    print("DONE: \(run.status)")
+                    print(String(format: "SPENT: $%.4f", run.spent))
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+            }
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --restack <set folder> [id,id,…]
 // Builds a layered set's framed symbols from their pieces again, as a frame or panel change does.
 if let flag = CommandLine.arguments.firstIndex(of: "--restack"), flag + 1 < CommandLine.arguments.count {
@@ -24525,7 +24500,7 @@ final class GDDToAssetsRun: ObservableObject {
         let prompt = GDDAssetPrompts.planning(theme: theme, gameName: gameName, jobs: jobs,
                                               gddText: gddText, backing: backing.name, reserved: reserved,
                                               lowPays: picked.kind, customLowPays: picked.custom,
-                                              frameStyle: FrameStyle.direction(styledDesign), ladder: rankLadder)
+                                              frameStyle: FrameStyle.direction(styledDesign), ladder: rankLadder, layered: framing == .layered)
         let sys = GDDAssetPrompts.planningSystem
         let snapshot = jobs, ids = jobs.map(\.id)
         let rev = revision
@@ -24681,7 +24656,38 @@ final class GDDToAssetsRun: ObservableObject {
     func renderSteps(only ids: Set<String>? = nil) -> [RenderStep] {
         let all = RenderPlan.steps(jobs, styledDesign, hasThemeArt: themeArtPNG() != nil)
         let steps = ids.map { RenderPlan.scoped(all, to: $0) } ?? all
-        return framing == .layered ? RenderPlan.layered(steps, anchor: SetDesignRules.anchor(jobs, design)?.id) : steps
+        guard framing == .layered else { return steps }
+        // A gem pass for each pay whose rank sets gems: in a whole set, or a batch drawing its frame or it.
+        let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, design: styledDesign)
+        let gems = gemOwners().compactMap { s in frameOf[s].map { (symbol: s, frame: $0) } }
+            .filter { g in ids == nil || ids!.contains(g.symbol) || ids!.contains(FrameStack.gemsID(g.symbol)) || steps.contains { $0.id == g.frame } }
+        return RenderPlan.layered(steps, anchor: SetDesignRules.anchor(jobs, design)?.id, gems: gems)
+    }
+
+    /// The layered pays whose rank sets gems in their frame (FrameRules.gemSlots).
+    // ponytail: a gem pass per pay, in its colour — so jewelled corners pay one edit per framed
+    // symbol; one clear pass per frame, tinted per symbol, if those sets get large.
+    func gemOwners() -> [String] {
+        let d = styledDesign, symbols = jobs.filter { $0.kind == .symbol }
+        guard framing == .layered else { return [] }
+        return symbols.filter { Framing.stacks($0, d) && !FrameRules.gemSlots(rank: FrameRules.rank(of: $0.id, in: symbols), role: $0.role, design: d).isEmpty }.map(\.id)
+    }
+
+    /// Why a symbol has no current gem pass, in words.
+    nonisolated static func gemsMissing(_ symbol: String, folder: URL) -> String {
+        FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(FrameStack.gemsID(symbol)).json").path)
+            ? "its frame changed after its gems were set: set them in again" : "its gems are not set in yet"
+    }
+
+    /// A symbol's gem pass as recorded, if it is still the pass of its frame as it is now.
+    nonisolated static func currentGemPass(_ symbol: String, folder: URL) -> GemPass? {
+        let id = FrameStack.gemsID(symbol)
+        guard FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(id).png").path),
+              let j = try? Data(contentsOf: folder.appendingPathComponent("\(id).json")),
+              let pass = try? JSONDecoder().decode(GemPass.self, from: j),
+              let frame = try? Data(contentsOf: folder.appendingPathComponent("\(pass.frame).png")),
+              GemPass.digest(frame) == pass.frameDigest else { return nil }
+        return pass
     }
 
     /// Everything the anchor's own step draws: the anchor alone, or its whole sheet.
@@ -24870,6 +24876,10 @@ final class GDDToAssetsRun: ObservableObject {
                 md += "\n### \(st.id) — \(st.mode == .frame ? "empty frame for its tier" : st.mode == .panel ? "the grey panel every framed pay is set on" : "character reference"), drawn once · attached: \(refsText(st))\n\n```\n\(prompt(for: Self.placeholder, step: st))\n```\n"
                 continue
             }
+            if st.mode == .gem, let owner = FrameStack.gemsOwner(st.id).flatMap({ o in jobs.first { $0.id == o } }) {
+                md += "\n### \(st.id) — \(owner.id)'s gems set into its frame · attached: \(refsText(st)), with a white disc where each gem goes\n\n```\n\(prompt(for: owner, step: st))\n```\n"
+                continue
+            }
             guard let j = byID[st.id] else { continue }
             if st.mode == .sheet {
                 // One prompt draws the whole group; it is listed once.
@@ -24893,24 +24903,6 @@ final class GDDToAssetsRun: ObservableObject {
         return (n, Double(n) * LayerizePlanRules.estimatePerSymbol)
     }
 
-    /// What lifting the gems off a layered set's jewelled frames costs on fal.ai, billed apart from
-    /// Vertex: one Layerize call per gem frame this batch draws (FrameStack).
-    func gemSplitEstimate(for ids: Set<String>?) -> (frames: Int, cost: Double) {
-        guard framing == .layered else { return (0, 0) }
-        let design = styledDesign
-        let n = renderSteps(only: ids.map { Set($0) } ?? Set(jobs.map(\.id))).filter { st in
-            st.mode == .frame && FrameRules.parse(st.id).map { FrameRules.hasGems($0, design) } == true
-                && !(lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(st.id).png").path) } ?? false)
-        }.count
-        return (n, Double(n) * LayerizePlanRules.frameGemsEstimate)
-    }
-    /// The gem split's line for a confirmation, empty when there is none.
-    func gemSplitNote(for ids: Set<String>?) -> String {
-        let g = gemSplitEstimate(for: ids)
-        return g.frames == 0 ? "" : String(format: "\n\nPlus about $%.2f on fal.ai: Layerize lifts the gems off %d frame%@, so each symbol's take its colour and glint in Spine.",
-                                          g.cost, g.frames, g.frames == 1 ? "" : "s")
-    }
-
     /// What a batch will cost. `ids` scopes it to a retry.
     func estimate(for ids: Set<String>?) -> Double {
         let planned = jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
@@ -24920,6 +24912,11 @@ final class GDDToAssetsRun: ObservableObject {
             if st.mode == .character {
                 // Drawn once per run folder; one already there costs nothing.
                 let have = lastFolder.map { FileManager.default.fileExists(atPath: Self.referenceURL(st.id, in: $0).path) } ?? false
+                return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
+            }
+            if st.mode == .gem {
+                // One edit; its one retry, when a check fails, is extra.
+                let have = lastFolder.flatMap { f in FrameStack.gemsOwner(st.id).flatMap { Self.currentGemPass($0, folder: f) } } != nil
                 return sum + (have ? 0 : nbEstimatedCost(size: "2K", modelFlag: modelFlag))
             }
             if st.mode == .frame || st.mode == .panel {
@@ -25194,7 +25191,7 @@ final class GDDToAssetsRun: ObservableObject {
 
     /// A shared tier's empty frame (FrameRules), drawn once into the run folder as frame_<tier>.png.
     /// One already there is reused: it is what the tier's symbols are painted into.
-    /// A layered set's panel, drawn once, in grey (FrameStack tints it for each symbol).
+    /// A layered set's panel, drawn once in grey: FrameStack tints it for each symbol.
     fileprivate func generatePanel(step: RenderStep, model: String, folder: URL) {
         let dst = folder.appendingPathComponent("\(step.id).png")
         if FileManager.default.fileExists(atPath: dst.path) { return }
@@ -25202,15 +25199,101 @@ final class GDDToAssetsRun: ObservableObject {
         DispatchQueue.main.async { self.status = "Drawing the panel every framed symbol is set on…" }
         let prompt = DispatchQueue.main.sync { self.prompt(for: job, step: step) }
         let log = DispatchQueue.main.sync { self.session() }
-        log.write("prompts/\(step.id).txt", "MODE: panel\nATTACHED: nothing\n\n\(prompt)")
+        log.write("prompts/\(step.id).txt", "MODE: \(step.mode.rawValue)\nATTACHED: nothing\n\n\(prompt)")
         let started = Date()
         let r = sizedRequest(job, prompt: prompt, inputs: [], model: model)
         if let png = r.png { try? png.write(to: dst) }
         let secs = Date().timeIntervalSince(started)
-        log.event(["step": "panel", "id": step.id, "model": model, "cost": r.cost, "seconds": secs,
+        log.event(["step": step.mode.rawValue, "id": step.id, "model": model, "cost": r.cost, "seconds": secs,
                    "error": r.png == nil ? (r.error ?? "no image returned") : ""])
-        navLog(String(format: "gdd panel: %@ $%.3f %.1fs", r.png == nil ? "FAILED" : "saved", r.cost, secs))
+        navLog(String(format: "gdd %@: %@ $%.3f %.1fs", step.id, r.png == nil ? "FAILED" : "saved", r.cost, secs))
         DispatchQueue.main.async { self.spent += r.cost }
+    }
+
+    /// A gem pass: `symbol`'s frame with its rank's gems set in. Navigator marks each gem's place
+    /// on the frame with a flat white disc (FrameStack.guide) and Gemini turns the discs into gems
+    /// (GDDAssetPrompts.gemsBrief); the result is checked (FrameStack.check) and drawn once more
+    /// if it fails, the better kept. Saved as gems_<symbol>.png, with gems_<symbol>.json saying
+    /// where the gems are and how they checked. A pass still current for its frame is kept.
+    /// Returns what is wrong with it, for review, or nil.
+    @discardableResult
+    fileprivate func generateGems(_ symbol: String, change: String? = nil, model: String, folder: URL) -> String? {
+        let id = FrameStack.gemsID(symbol)
+        let ctx: (job: AssetJob, frame: String, slots: [GemSlot], prompt: String, backing: RGB8, log: GDDRunLog)? = DispatchQueue.main.sync {
+            let design = self.styledDesign, symbols = self.jobs.filter { $0.kind == .symbol }
+            guard let job = symbols.first(where: { $0.id == symbol }),
+                  let frame = FrameRules.assignments(symbols, design: design)[symbol] else { return nil }
+            var p = self.prompt(for: job, step: RenderStep(id: id, mode: .gem, refs: [frame], after: []))
+            if let change { p += "\n\nIn review this change was asked for: \(change.trimmingCharacters(in: .whitespacesAndNewlines))" }
+            return (job, frame, FrameRules.gemSlots(rank: FrameRules.rank(of: symbol, in: symbols), role: job.role, design: design), p, self.backing.rgb, self.session())
+        }
+        guard let ctx, !ctx.slots.isEmpty else { return nil }
+        if change == nil, Self.currentGemPass(symbol, folder: folder) != nil { return nil }
+        let frameURL = folder.appendingPathComponent("\(ctx.frame).png"), space = CGColorSpace(name: CGColorSpace.sRGB)!
+        func fail(_ why: String) -> String {
+            navLog("gdd gems: \(id) — \(why)")
+            ctx.log.event(["step": "gems", "id": id, "error": why])
+            return why
+        }
+        guard let frameData = try? Data(contentsOf: frameURL), let cg = loadCGImage(data: frameData),
+              let base = ChromaKeyOutputRules.straightRGBA8(cg) else { return fail("\(ctx.frame) is missing") }
+        let w = cg.width, h = cg.height
+        let keyed = FrameStack.keyed(base, backing: ctx.backing)
+        guard let win = LayerizeAssembly.opening(keyed, width: w, height: h),
+              let rim = FrameStack.rim(keyed, width: w, height: h, window: win) else { return fail("\(ctx.frame) has no open window to measure its rim from") }
+        let gems = FrameStack.gemCentres(ctx.slots, window: win, rim: rim)
+        guard let guideCG = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.guide(base, width: w, height: h, gems: gems), width: w, height: h, space: space),
+              let guidePNG = encodePNG(guideCG) else { return fail("the guide could not be drawn") }
+        DispatchQueue.main.async { self.status = "Setting \(symbol)'s gems into its frame…" }
+        ctx.log.write("prompts/\(id).txt", "MODE: gem pass\nATTACHED: \(ctx.frame), with a white disc where each gem goes\n\n\(ctx.prompt)")
+        ctx.log.writeJPEG("prompts/\(id)-guide.jpg", guideCG)
+        let job = AssetJob(id: id, kind: .symbol, role: ctx.job.role, tier: nil, title: "", aspect: "1:1", size: ctx.job.size)
+        var best: (png: Data, check: GemCheck)?, attempts = 0
+        while attempts < 2 && best?.check.passed != true {
+            attempts += 1
+            let started = Date()
+            let r = sizedRequest(job, prompt: ctx.prompt, inputs: [downsamplePNG(guidePNG, longEdge: 1536) ?? guidePNG], model: model)
+            DispatchQueue.main.async { self.spent += r.cost }
+            // Back at the frame's own size, so the gems sit where their discs were.
+            var check: GemCheck?, png: Data?
+            if let d = r.png, let out = loadCGImage(data: d),
+               let c = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                c.interpolationQuality = .high
+                c.draw(out, in: CGRect(x: 0, y: 0, width: w, height: h))
+                if let img = c.makeImage(), let edit = ChromaKeyOutputRules.straightRGBA8(img) {
+                    check = FrameStack.check(base: base, edit: edit, width: w, height: h, window: win, down: rim.down, gems: gems)
+                    png = encodePNG(img)
+                }
+            }
+            ctx.log.event(["step": "gems", "id": id, "attempt": attempts, "model": model, "cost": r.cost, "seconds": Date().timeIntervalSince(started),
+                           "problems": check?.problems ?? [], "contrast": check?.contrast ?? [], "drift": check?.drift ?? 0,
+                           "error": png == nil ? (r.error ?? "no image returned") : ""])
+            navLog(String(format: "gdd gems: %@ attempt %d $%.3f — %@", id, attempts, r.cost, check.map { $0.passed ? "passed" : $0.problems.joined(separator: "; ") } ?? (r.error ?? "no image")))
+            // Asked again only when a check failed: an error asked again is the same error, paid for twice.
+            guard let png, let check else { break }
+            if best == nil || check.problems.count < best!.check.problems.count { best = (png, check) }
+        }
+        guard let best else { return fail("no image came back") }
+        let pass = GemPass(frame: ctx.frame, frameDigest: GemPass.digest(frameData), window: [win.x, win.y, win.w, win.h],
+                           gems: gems, check: best.check, attempts: attempts)
+        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard (try? best.png.write(to: folder.appendingPathComponent("\(id).png"))) != nil,
+              let j = try? enc.encode(pass), (try? j.write(to: folder.appendingPathComponent("\(id).json"))) != nil
+        else { return fail("its files could not be written") }
+        return best.check.passed ? nil : best.check.problems.joined(separator: "; ")
+    }
+
+    /// Gem passes for `symbols` (each skipped while current, unless `change` asks for another),
+    /// one after another; build them afterwards. Paid: one edit each, two when a check fails.
+    func redoGems(_ symbols: [String], change: String? = nil, folder: URL, done: (([String: String]) -> Void)? = nil) {
+        let model = NanoBananaModel.byFlag(modelFlag).id
+        status = "Setting the gems of \(symbols.joined(separator: ", ")) into their frames…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            var problems: [String: String] = [:]
+            for s in symbols { problems[s] = self.generateGems(s, change: change, model: model, folder: folder) }
+            DispatchQueue.main.async { done?(problems) }
+        }
     }
 
     fileprivate func generateFrame(step: RenderStep, themeArt: Data?, model: String, folder: URL) {
@@ -25562,6 +25645,11 @@ final class GDDToAssetsRun: ObservableObject {
                             done(st.id)
                             continue
                         }
+                        if st.mode == .gem, let owner = FrameStack.gemsOwner(st.id) {
+                            self.generateGems(owner, model: model, folder: folder)
+                            done(st.id)
+                            continue
+                        }
                         guard let job = jobByID[st.id] else { done(st.id); continue }
                         self.generateOne(job: job, step: st, themeArt: themeArt,
                                          model: model, folder: folder)
@@ -25625,9 +25713,9 @@ final class GDDToAssetsRun: ObservableObject {
                         ((try? folder.appendingPathComponent(name).resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast) > began
                     }
                     let design = self.styledDesign
-                    let frameOf = FrameRules.assignments(self.jobs.filter { $0.kind == .symbol }, ladder: self.rankLadder)
+                    let frameOf = FrameRules.assignments(self.jobs.filter { $0.kind == .symbol }, design: self.styledDesign)
                     let ids = fresh("\(FrameStack.panelID).png") ? nil : self.jobs.filter { Framing.stacks($0, design) }.map(\.id)
-                        .filter { fresh(FrameStack.aloneName($0)) || frameOf[$0].map { fresh("\($0).png") } == true }
+                        .filter { fresh(FrameStack.aloneName($0)) || fresh("\(FrameStack.gemsID($0)).png") || frameOf[$0].map { fresh("\($0).png") } == true }
                     if ids?.isEmpty != true { self.stackFramed(folder, only: ids) }
                 }
             }
@@ -25653,6 +25741,11 @@ final class GDDToAssetsRun: ObservableObject {
                 // animatable — the old pipeline generated them apart and they never
                 // lined up. Only the framed ones: a card royal has nothing to split.
                 guard separateFrames else { return }
+                // Every split comes through here: without a fal.ai key it is skipped, said once, not failed.
+                guard APIKeys.falAvailable else {
+                    self.status += "  Frames not split: Layerize needs a fal.ai key (AI ▸ API Keys…)."
+                    return
+                }
                 let framed = done.filter { url in
                     let base = url.lastPathComponent.replacingOccurrences(of: "_rmbg.png", with: "")
                     return self.jobs.first { $0.id == base }?.hasFrame == true
@@ -25661,7 +25754,7 @@ final class GDDToAssetsRun: ObservableObject {
                 self.layering = true
                 self.status += "  Planning how to split \(framed.count) frames…"
                 let jobs = self.jobs, design = self.styledDesign
-                let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, ladder: self.rankLadder)
+                let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, design: self.styledDesign)
                 DispatchQueue.global(qos: .userInitiated).async {
                     var plans: [URL: LayerizePlan] = [:], cost = 0.0
                     for url in framed {
@@ -25750,7 +25843,7 @@ extension GDDToAssetsRun {
     func reviewIDs(_ folder: URL) -> [String] {
         let fm = FileManager.default
         let frames = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? [])
-            .filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) }.filter { FrameRules.parse($0) != nil || $0 == FrameStack.panelID }
+            .filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) }.filter { FrameRules.parse($0) != nil || $0 == FrameStack.panelID || FrameStack.gemsOwner($0) != nil }
         let made = jobs.filter { fm.fileExists(atPath: folder.appendingPathComponent($0.filename).path) }.map(\.id)
         return ReviewOrder.sequence(made + frames)
     }
@@ -25758,14 +25851,18 @@ extension GDDToAssetsRun {
     /// The symbols drawn into a master frame, which a revised frame has to be repainted into.
     func frameMembers(_ frameID: String, folder: URL) -> [String] {
         let fm = FileManager.default
-        return FrameRules.assignments(jobs.filter { $0.kind == .symbol }, ladder: rankLadder)
+        return FrameRules.assignments(jobs.filter { $0.kind == .symbol }, design: styledDesign)
             .filter { $0.value == frameID && fm.fileExists(atPath: folder.appendingPathComponent("\($0.key).png").path) }
             .map(\.key).sorted { ReviewOrder.sequence([$0, $1]).first == $0 }
     }
 
-    /// What one revision costs: one image at the symbol's size.
+    /// What one revision costs: one image at the symbol's size — and a layered frame's, one more
+    /// for each of its symbols whose gems are set into it again.
     func revisionEstimate(_ id: String) -> Double {
-        nbEstimatedCost(size: jobs.first { $0.id == id }?.size ?? "2K", modelFlag: modelFlag)
+        let one = nbEstimatedCost(size: jobs.first { $0.id == id }?.size ?? "2K", modelFlag: modelFlag)
+        guard framing == .layered, FrameRules.parse(id) != nil, let folder = lastFolder else { return one }
+        let gemmed = Set(gemOwners())
+        return one * Double(1 + frameMembers(id, folder: folder).filter(gemmed.contains).count)
     }
 
     /// The job a master frame is revised as.
@@ -25784,6 +25881,31 @@ extension GDDToAssetsRun {
     /// REDRAWN from its plan with the change added to its description, drawn the way the set drew
     /// it. `done` gets an error, or nil when the new image is in place.
     func revise(_ id: String, change: String, mode: ReviewMode, folder: URL, done: @escaping (String?) -> Void) {
+        // A gem pass is made again from its frame, with the change added: the gems stay in their places.
+        if let owner = FrameStack.gemsOwner(id) {
+            let fm = FileManager.default, src = folder.appendingPathComponent("\(id).png")
+            let archive = review.archiveName(id), kept = folder.appendingPathComponent(archive), before = spent
+            func modified() -> Date? { (try? src.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate }
+            let was = modified()
+            try? fm.createDirectory(at: kept.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard (try? fm.copyItem(at: src, to: kept)) != nil else { done("\(id).png is not in the set folder."); return }
+            redoGems([owner], change: change, folder: folder) { problems in
+                guard modified() != was else {
+                    try? fm.removeItem(at: kept)
+                    self.status = "\(id) not revised: \(problems[owner] ?? "no image came back")"
+                    done(problems[owner] ?? "No image came back.")
+                    return
+                }
+                Self.archiveDerived(id, archive: archive, folder: folder)
+                self.stackFramed(folder, only: [owner]) {
+                    self.review.record(id, replaced: archive, change: change, mode: .edit, cost: self.spent - before)
+                    self.saveReview(folder)
+                    self.imagesVersion += 1
+                    done(nil)
+                }
+            }
+            return
+        }
         let isPanel = id == FrameStack.panelID
         let isFrame = FrameRules.parse(id) != nil || isPanel
         guard let job = isFrame ? frameJob(id) : jobs.first(where: { $0.id == id }), let theme else { done("Nothing to revise for \(id)."); return }
@@ -25847,7 +25969,11 @@ extension GDDToAssetsRun {
                         + (rebuild?.isEmpty == false || rebuild == nil ? " — framed symbols built again" : "")
                     done(nil)
                 }
-                if rebuild?.isEmpty == true { finish() } else { self.stackFramed(folder, only: rebuild) { finish() } }
+                // A revised frame's gems are set into it again: they are cut from the frame as it was.
+                let regem = isFrame && !isPanel ? (rebuild ?? []).filter(Set(self.gemOwners()).contains) : []
+                if rebuild?.isEmpty == true { finish() }
+                else if regem.isEmpty { self.stackFramed(folder, only: rebuild) { finish() } }
+                else { self.redoGems(regem, folder: folder) { _ in self.stackFramed(folder, only: rebuild) { finish() } } }
             }
         }
     }
@@ -25857,12 +25983,15 @@ extension GDDToAssetsRun {
     func stackFramed(_ folder: URL, only ids: [String]? = nil, done: (() -> Void)? = nil) {
         let design = styledDesign
         let members = jobs.filter { Framing.stacks($0, design) }.map(\.id)
-        let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, ladder: rankLadder)
+        let frameOf = FrameRules.assignments(jobs.filter { $0.kind == .symbol }, design: styledDesign)
         let fm = FileManager.default
         func modified(_ u: URL) -> Date? { (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate }
         func cut(_ u: URL) -> URL { u.deletingLastPathComponent().appendingPathComponent(u.deletingPathExtension().lastPathComponent + "_rmbg.png") }
+        // Each pay's gem pass, cut like the rest, while it is still its frame's (currentGemPass).
+        let gemmed = Set(gemOwners())
         let sources = Set(members.compactMap { frameOf[$0] }).map { folder.appendingPathComponent("\($0).png") }
             + members.map { folder.appendingPathComponent(FrameStack.aloneName($0)) }
+            + gemmed.map { folder.appendingPathComponent("\(FrameStack.gemsID($0)).png") }
         let uncut = sources.filter { u in
             guard fm.fileExists(atPath: u.path) else { return false }
             guard let c = modified(cut(u)), let m = modified(u) else { return true }
@@ -25874,13 +26003,16 @@ extension GDDToAssetsRun {
         let colour = PanelColour(design), backing = self.backing.rgb
         // The plan's colour code for each: the planner chose them to keep the set distinct.
         let planned = Dictionary(jobs.map { ($0.id, $0.hue) }, uniquingKeysWith: { a, _ in a })
-        let gemFrames = Set(targets.compactMap { frameOf[$0] }).filter { fid in FrameRules.parse(fid).map { FrameRules.hasGems($0, design) } == true }
-        let gem = FrameRules.gem(design)
         keying = true
         status = "Building \(targets.count) framed symbol\(targets.count == 1 ? "" : "s") from their layers…"
         let build = {
             DispatchQueue.global(qos: .userInitiated).async {
-                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, folder: folder, colour: colour, backing: backing)
+                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, gemmed: gemmed, folder: folder, colour: colour, backing: backing)
+                // Gems that are missing, out of date or failed their checks: said, for review.
+                let gemNotes = targets.filter(gemmed.contains).compactMap { id -> String? in
+                    guard let pass = Self.currentGemPass(id, folder: folder) else { return "\(id) (\(Self.gemsMissing(id, folder: folder)))" }
+                    return pass.check.passed ? nil : "\(id) (\(pass.check.problems.joined(separator: "; ")))"
+                }
                 DispatchQueue.main.async {
                     self.keying = false
                     self.imagesVersion += 1
@@ -25888,35 +26020,14 @@ extension GDDToAssetsRun {
                     let made = targets.count - failed.count
                     self.status = "Built \(made) of \(targets.count) framed symbol\(targets.count == 1 ? "" : "s") from their layers"
                         + (failed.isEmpty ? "." : " — not built: " + failed.map { "\($0.key) (\($0.value))" }.sorted().joined(separator: ", "))
+                        + (gemNotes.isEmpty ? "" : "  Check the gems of " + gemNotes.joined(separator: ", ") + ".")
                     done?()
                 }
             }
         }
-        // Each frame set with gems has them lifted off by Layerize, once per cut of it, so every
-        // symbol's take its colour and they glint in Spine. Without a split they stay in the frame.
-        let split = {
-            let need = gemFrames.filter { fid in
-                fm.fileExists(atPath: folder.appendingPathComponent("\(fid)_rmbg.png").path) && !frameGemSplitTried(fid, folder: folder)
-            }.sorted()
-            guard !need.isEmpty else { build(); return }
-            self.status = "Lifting the gems off \(need.joined(separator: ", ")) with Layerize, then building the framed symbols…"
-            var plans: [URL: LayerizePlan] = [:]
-            for fid in need {
-                let u = folder.appendingPathComponent("\(fid)_rmbg.png")
-                plans[u] = planFrameGems(u, gem: gem)
-            }
-            layerizeImages(need.map { folder.appendingPathComponent("\($0)_rmbg.png") }, plans: plans, assemble: false) { _ in
-                for fid in need where frameGemSplit(fid, folder: folder) == nil {
-                    navLog("gdd stack: \(fid) — its gems could not be lifted off; they stay in the frame, in its own colour")
-                    try? "Layerize returned no separate gems for this cut of \(fid).\n"
-                        .write(to: folder.appendingPathComponent(frameGemSplitFailedNote(fid)), atomically: true, encoding: .utf8)
-                }
-                build()
-            }
-        }
-        if uncut.isEmpty { split() } else {
+        if uncut.isEmpty { build() } else {
             status = "Cutting out \(uncut.count) piece\(uncut.count == 1 ? "" : "s") in Photoshop, then building the framed symbols…"
-            removeBackgroundForImages(uncut, keepCanvas: true) { _ in split() }
+            removeBackgroundForImages(uncut, keepCanvas: true) { _ in build() }
         }
     }
 
@@ -25926,7 +26037,7 @@ extension GDDToAssetsRun {
     /// `<id>_rmbg_Layers/` the way a split writes them, so review, the Spine export and everything
     /// after treat it like a split symbol. Returns what could not be built, and why.
     nonisolated static func stack(_ ids: [String], tiers: [[String]], frameOf: [String: String], planned: [String: String] = [:],
-                                  folder: URL, colour: PanelColour, backing: RGB8) -> [String: String] {
+                                  gemmed: Set<String> = [], folder: URL, colour: PanelColour, backing: RGB8) -> [String: String] {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
         func pixels(_ name: String) -> (px: [UInt8], w: Int, h: Int)? {
             guard let cg = loadCGImage(folder.appendingPathComponent(name)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
@@ -25965,31 +26076,22 @@ extension GDDToAssetsRun {
             hue.merge(hs) { a, _ in a }
         }
         typealias Frame = (px: [UInt8], w: Int, h: Int, window: (x: Int, y: Int, w: Int, h: Int), inside: [Bool], grey: [UInt8], depth: Double,
-                           gems: [UInt8]?, glow: [UInt8])
+                           glow: [UInt8])
         var frames: [String: Frame] = [:]
         for id in ids {
             guard let fid = frameOf[id] else { failed[id] = "it has no frame"; continue }
             if frames[fid] == nil {
                 guard var f = pixels("\(fid)_rmbg.png") else { failed[id] = "\(fid) is not cut out"; continue }
-                // Its gems lifted off, the frame is the split's, on the cut-out's canvas.
-                var gemPx: [UInt8]?
-                if let s = frameGemSplit(fid, folder: folder),
-                   let fp = canvas(s.frame, CGRect(x: 0, y: 0, width: f.w, height: f.h), f.w, f.h),
-                   let gp = canvas(s.gems, CGRect(x: 0, y: 0, width: f.w, height: f.h), f.w, f.h) {
-                    f.px = fp; gemPx = gp
-                }
                 FrameStack.openWindow(&f.px, width: f.w, height: f.h, backing: backing)
                 CutoutEdgeRules.clean(&f.px, width: f.w, height: f.h, backing: backing)
                 guard let win = LayerizeAssembly.opening(f.px, width: f.w, height: f.h),
                       let grey = canvas(panelImage, CGRect(x: 0, y: 0, width: f.w, height: f.h), f.w, f.h)
                 else { failed[id] = "\(fid) has no open window"; continue }
-                // The glow around the frame, from its outline and its gems': its own layer, which
-                // Spine pulses in a win (the generator's frame_glow; 51 of its 69 games have one).
-                var outline = f.px
-                if let g = gemPx { LayerizeAssembly.over(&outline, g) }
+                // The glow around the frame: its own layer, which Spine pulses in a win (the
+                // generator's frame_glow; 51 of its 69 games have one).
                 frames[fid] = (f.px, f.w, f.h, win, FrameStack.interior(f.px, width: f.w, height: f.h), grey,
-                               FrameStack.depth(grey, width: f.w, window: win, target: 0.42), gemPx,
-                               FrameStack.shadow(outline, width: f.w, height: f.h, dx: 0, dy: 0, radius: f.w / 70, strength: 0.55))
+                               FrameStack.depth(grey, width: f.w, window: win, target: 0.42),
+                               FrameStack.shadow(f.px, width: f.w, height: f.h, dx: 0, dy: 0, radius: f.w / 70, strength: 0.55))
             }
             guard let f = frames[fid] else { continue }
             guard let a = alone[id], let e = LayerizeAssembly.extent(a.px, width: a.w, height: a.h),
@@ -26035,9 +26137,12 @@ extension GDDToAssetsRun {
                 ("Frame glow", frameGlow, "the glow around the frame"),
                 ("Frame", f.px, "the tier's frame"),
             ]
-            if var g = f.gems {
-                FrameStack.tint(&g, hue: h, saturation: 0.75)
-                layers.append(("Gems", g, "the frame's gems, in this symbol's colour"))
+            // Its rank's gems, cut from its gem pass by their places and laid on the frame as drawn.
+            if gemmed.contains(id), let pass = currentGemPass(id, folder: folder),
+               var g = pixels("\(FrameStack.gemsID(id))_rmbg.png"), g.w == W, g.h == H {
+                CutoutEdgeRules.clean(&g.px, width: W, height: H, backing: backing)
+                layers.append(("Gems", FrameStack.gemLayer(g.px, width: W, height: H, window: pass.windowBox, gems: pass.gems),
+                               "the frame's gems, set in by rank, in this symbol's colour"))
             }
             layers.append(("Symbol", body, "the symbol itself"))
             var cutout = layers[0].px
@@ -26082,6 +26187,7 @@ extension GDDToAssetsRun {
         let fm = FileManager.default
         let isPanel = id == FrameStack.panelID, layered = framing == .layered
         let stacks = jobs.first { $0.id == id }.map { Framing.stacks($0, styledDesign) } == true
+        let gemsOf = FrameStack.gemsOwner(id)
         let cur = folder.appendingPathComponent(stacks ? FrameStack.aloneName(id) : "\(id).png"), old = folder.appendingPathComponent(file)
         guard fm.fileExists(atPath: old.path) else { return }
         let archive = review.archiveName(id)
@@ -26098,8 +26204,8 @@ extension GDDToAssetsRun {
         review.record(id, replaced: archive, change: "Restored \(file)", mode: .edit, cost: 0)
         saveReview(folder)
         imagesVersion += 1
-        if layered && (stacks || isPanel || FrameRules.parse(id) != nil) {
-            stackFramed(folder, only: stacks ? [id] : isPanel ? nil : frameMembers(id, folder: folder))
+        if layered && (stacks || isPanel || gemsOf != nil || FrameRules.parse(id) != nil) {
+            stackFramed(folder, only: stacks ? [id] : isPanel ? nil : gemsOf.map { [$0] } ?? frameMembers(id, folder: folder))
         }
     }
 
@@ -26227,12 +26333,21 @@ struct GDDReviewView: View {
                 if let j = job {
                     if !j.job.isEmpty { labelled("What it does", j.job) }
                     labelled("Planned", j.subject)
-                    if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, ladder: run.rankLadder)[j.id] { labelled("Frame", f) }
+                    if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, design: run.styledDesign)[j.id] { labelled("Frame", f) }
                 } else if id == FrameStack.panelID {
                     labelled("Panel", "The grey panel every framed pay is set on, tinted for each one. Editing it builds them all again, free.")
+                } else if let owner = FrameStack.gemsOwner(id) {
+                    let pass = GDDToAssetsRun.currentGemPass(owner, folder: folder)
+                    labelled("Gems", "\(owner)'s frame with its gems set in, in \(owner)'s colour; the gems are cut from it by their places. "
+                             + "Editing it sets them in again, in the same places, and builds \(owner) again.")
+                    labelled("Checks", pass.map { p in p.check.passed
+                        ? String(format: "Passed: every gem in place, %.1f:1 or more against the frame (needs 3:1).", p.check.contrast.min() ?? 0)
+                        : "Look at: " + p.check.problems.joined(separator: "; ") + "." } ?? GDDToAssetsRun.gemsMissing(owner, folder: folder).prefix(1).uppercased() + GDDToAssetsRun.gemsMissing(owner, folder: folder).dropFirst() + ".")
                 } else if let f = FrameRules.parse(id), run.framing == .layered {
-                    labelled("Frame", f.isShared ? "The frame \(f.owner) share. Editing it builds them all again, free."
-                                                 : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's. Editing it builds that symbol again, free.")
+                    let gemmed = run.frameMembers(id, folder: folder).filter(Set(run.gemOwners()).contains)
+                    labelled("Frame", (f.isShared ? "The frame \(f.owner) share. Editing it builds them all again"
+                                                  : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's. Editing it builds that symbol again")
+                             + (gemmed.isEmpty ? ", free." : " and sets the gems of \(gemmed.joined(separator: ", ")) into it again, one edit each."))
                 } else if let f = FrameRules.parse(id) {
                     labelled("Frame", (f.isShared ? "The empty frame \(f.owner) are painted into." : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's.")
                              + " Editing it changes this file only: repaint into it afterwards to use it.")
@@ -26348,10 +26463,13 @@ struct GDDReviewView: View {
                 .disabled(queued.isEmpty || working != nil || queueRunning)
             Text(run.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             Spacer()
-            Toggle("then split frames with Layerize\(split.symbols > 0 ? String(format: " (~$%.2f)", split.cost) : "")", isOn: $layerizeToo)
-                .disabled(ready.isEmpty)
+            let fal = APIKeys.falAvailable
+            Toggle("then split frames with Layerize" + (fal ? (split.symbols > 0 ? String(format: " (~$%.2f)", split.cost) : "") : " — needs a fal.ai key"),
+                   isOn: Binding(get: { layerizeToo && fal }, set: { layerizeToo = $0 }))
+                .disabled(ready.isEmpty || !fal)
+                .help(fal ? "Splits the framed symbols that were painted with their frames." : "Layerize runs on fal.ai. Add a key in AI ▸ API Keys… to use it.")
             Button("Remove backgrounds of \(ready.count) approved") {
-                run.finishSet(ready + ids.filter { FrameRules.parse($0) != nil }, folder: folder, layerize: layerizeToo)
+                run.finishSet(ready + ids.filter { FrameRules.parse($0) != nil }, folder: folder, layerize: layerizeToo && fal)
             }
             .disabled(ready.isEmpty || run.keying || run.layering)
             .help("Photoshop cuts each approved symbol and the frames out on their own canvas (free); Layerize, when ticked, then splits each framed symbol into backing, frame and subject on fal.ai")
@@ -26493,7 +26611,7 @@ enum SpineExport {
     @MainActor static func write(run: GDDToAssetsRun, ids: [String], folder: URL) -> (kits: Int, out: URL, error: String?) {
         let out = folder.appendingPathComponent("Spine kits")
         try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        let frameOf = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, ladder: run.rankLadder)
+        let frameOf = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, design: run.styledDesign)
         var made: [[String: Any]] = [], missing: [String] = [], unsplit: [String] = []
         for id in ids {
             guard let layers = layers(id, folder: folder), let first = layers.first?.image else { missing.append(id); continue }
@@ -27440,12 +27558,16 @@ struct GDDToAssetsSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("After generating").font(.subheadline).bold().padding(.top, 4)
                 Toggle("Remove symbol backgrounds with Photoshop", isOn: $removeBG)
-                Toggle("Then split frames off the framed symbols with Layerize", isOn: $separateFrames)
-                    .disabled(!removeBG)
+                // Layerize is fal.ai's: without a key it is not offered, so nothing can start and then fail on it.
+                let fal = APIKeys.falAvailable
+                Toggle("Then split frames off the framed symbols with Layerize" + (fal ? "" : " — needs a fal.ai key"),
+                       isOn: Binding(get: { separateFrames && fal }, set: { separateFrames = $0 }))
+                    .disabled(!removeBG || !fal)
                     .padding(.leading, 20)
-                    .help(String(format: "Billed by fal.ai, separately from Vertex: about $%.2f per framed symbol "
+                    .help(fal ? String(format: "Billed by fal.ai, separately from Vertex: about $%.2f per framed symbol "
                         + "(%d in this set), more if a split needs repairing. Card royals have no frame and are skipped.",
-                        LayerizePlanRules.estimatePerSymbol, run.layerizeEstimate(for: nil).symbols))
+                        LayerizePlanRules.estimatePerSymbol, run.layerizeEstimate(for: nil).symbols)
+                        : "Layerize runs on fal.ai. Add a key in AI ▸ API Keys… to use it; everything else works without one.")
             }
         }
     }
@@ -27460,7 +27582,7 @@ struct GDDToAssetsSheet: View {
                 let rows: [(String, String?)] = [("High pays", FrameStyle.spec(d, highPay: true)),
                                                  ("HP1", FrameStyle.richer(d)),
                                                  ("Medium pays", FrameStyle.spec(d, highPay: false)),
-                                                 ("Gems", FrameRules.gem(d))]
+                                                 ("Gems", FrameRules.gem(d) + " — " + gemPlacement(d))]
                 ForEach(rows.filter { $0.1 != nil }, id: \.0) { r in
                     Text("\(r.0): \(r.1!)").font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
@@ -27478,6 +27600,24 @@ struct GDDToAssetsSheet: View {
             }
             .padding(.leading, 4)
         }
+    }
+
+    /// Where each rank's gems go, in a few words: "HP1 five (crest and corners), HP2 four (corners)".
+    private func gemPlacement(_ d: SetDesign) -> String {
+        func words(_ slots: [GemSlot]) -> String? {
+            let s = Set(slots)
+            return s.isEmpty ? nil : s == [.corners] ? "four (corners)"
+                : s == [.crest] ? "one (crest)" : "five (crest and corners)"
+        }
+        // Only the tiers this set has.
+        let hps = run.jobs.filter { $0.role == .highPay && $0.hasFrame }.count
+        let mps = run.jobs.contains { $0.role == .mediumPay && $0.hasFrame }
+        let parts = [("HP1", hps >= 1 ? words(FrameRules.gemSlots(rank: 1, role: .highPay, design: d)) : nil),
+                     ("HP2", hps >= 2 ? words(FrameRules.gemSlots(rank: 2, role: .highPay, design: d)) : nil),
+                     ("the other high pays", hps >= 3 ? words(FrameRules.gemSlots(rank: 0, role: .highPay, design: d)) : nil),
+                     ("the medium pays", mps ? words(FrameRules.gemSlots(rank: 0, role: .mediumPay, design: d)) : nil)]
+            .compactMap { p in p.1.map { "\(p.0) \($0)" } }
+        return parts.isEmpty ? "none" : parts.joined(separator: ", ") + (Framing(d) == .layered ? ", placed by rule" : "")
     }
 
     // MARK: Step 4 — the plan
@@ -28124,7 +28264,7 @@ struct GDDToAssetsSheet: View {
                 format: "Each is drawn with %@ attached%@. High pays, jackpot tiers and low pays are each drawn together on one sheet; value symbols are edits of the first one.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent. They are saved into “%@” as they arrive.",
                 run.anchorJob?.id ?? "the first symbol",
                 run.themeArtPNG() != nil ? " and the theme’s concept art" : "",
-                run.estimate(for: rest), folder.lastPathComponent) + run.gemSplitNote(for: rest)
+                run.estimate(for: rest), folder.lastPathComponent)
             a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
             run.generate(into: folder, removeBackground: removeBG, separateFrames: separateFrames,
@@ -28144,7 +28284,7 @@ struct GDDToAssetsSheet: View {
             a.messageText = "Generate \(n) image\(n == 1 ? "" : "s")?"
             a.informativeText = String(
                 format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into a new folder “%@” as they arrive.",
-                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName) + run.gemSplitNote(for: nil)
+                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName)
             a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
