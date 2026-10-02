@@ -5428,27 +5428,51 @@ public enum FrameStack {
         let x0 = Int((Double(w) * inset).rounded()), y0 = Int((Double(h) * inset).rounded())
         return (x0, y0, w - 2 * x0, h - 2 * y0)
     }
+    /// Whether a point lies inside `shape` drawn in the box x0…x1, y0…y1 with corner size `c` px.
+    static func inside(_ x: Double, _ y: Double, _ x0: Double, _ y0: Double, _ x1: Double, _ y1: Double, _ c: Double, _ shape: FrameShape) -> Bool {
+        guard x >= x0, x < x1, y >= y0, y < y1 else { return false }
+        guard c > 0 else { return true }
+        let dx = min(x - x0, x1 - x), dy = min(y - y0, y1 - y)
+        switch shape {
+        case .square: return true
+        case .octagon: return dx + dy >= c
+        case .rounded: return dx >= c || dy >= c || (c - dx) * (c - dx) + (c - dy) * (c - dy) <= c * c
+        }
+    }
+    /// The ring's inner corner: its outer corner moved in by the rim, so the rim keeps its width.
+    static func innerCorner(_ c: Double, rim t: Double, _ shape: FrameShape) -> Double {
+        switch shape {
+        case .square: return 0
+        // A diagonal x + y = c moved in by t is x + y = c + t√2; from the inner corner (t, t) that is c - t(2 - √2).
+        case .octagon: return max(0, c - t * (2 - 2.0.squareRoot()))
+        case .rounded: return max(0, c - t)
+        }
+    }
     /// Everything a frame drawn on the ring put inside its opening, cleared to the backing: Gemini
     /// kept the ring's outside and lined its inside (2026-10-02), so the window is the code's.
-    static func clearOpening(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8) {
+    static func clearOpening(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, shape: FrameShape = .square) {
         let o = ringOpening(width: w, height: h)
-        for y in o.y..<(o.y + o.h) { for x in o.x..<(o.x + o.w) {
+        let side = Double(w) * ringOuter, ci = innerCorner(shape.corner * side, rim: side * ringRim, shape) * Double(o.w) / (side * (1 - 2 * ringRim))
+        for y in o.y..<(o.y + o.h) { for x in o.x..<(o.x + o.w)
+            where inside(Double(x), Double(y), Double(o.x), Double(o.y), Double(o.x + o.w), Double(o.y + o.h), ci, shape) {
             let i = (y * w + x) * 4
             px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255
         } }
     }
-    static func frameTemplate(size n: Int, backing b: RGB8, outer: Double = ringOuter, rim: Double = ringRim) -> [UInt8] {
+    static func frameTemplate(size n: Int, backing b: RGB8, shape: FrameShape = .square, outer: Double = ringOuter, rim: Double = ringRim) -> [UInt8] {
         var px = [UInt8](repeating: 255, count: n * n * 4)
         let o0 = Double(n) * (1 - outer) / 2, o1 = Double(n) - o0, t = (o1 - o0) * rim
+        let c = shape.corner * (o1 - o0), ci = innerCorner(c, rim: t, shape)
         let edge = max(2, Double(n) / 300)
         for y in 0..<n { for x in 0..<n {
             let fx = Double(x), fy = Double(y), i = (y * n + x) * 4
-            let inOuter = fx >= o0 && fx < o1 && fy >= o0 && fy < o1
-            let inWindow = fx >= o0 + t && fx < o1 - t && fy >= o0 + t && fy < o1 - t
+            let inOuter = inside(fx, fy, o0, o0, o1, o1, c, shape)
+            let inWindow = inside(fx, fy, o0 + t, o0 + t, o1 - t, o1 - t, ci, shape)
             var v: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
             if inOuter && !inWindow {
-                let nearEdge = min(fx - o0, o1 - fx, fy - o0, o1 - fy) < edge
-                    || min(abs(fx - (o0 + t)), abs(fx - (o1 - t)), abs(fy - (o0 + t)), abs(fy - (o1 - t))) < edge
+                // A dark line where the ring meets the backing and its opening, so both edges read.
+                let nearEdge = !inside(fx - edge, fy - edge, o0, o0, o1, o1, c, shape) || !inside(fx + edge, fy + edge, o0, o0, o1, o1, c, shape)
+                    || inside(fx - edge, fy - edge, o0 + t, o0 + t, o1 - t, o1 - t, ci, shape) || inside(fx + edge, fy + edge, o0 + t, o0 + t, o1 - t, o1 - t, ci, shape)
                 v = nearEdge ? (70, 70, 70) : (140, 140, 140)
             }
             px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2
@@ -5505,14 +5529,30 @@ public enum FrameStack {
     /// of its edges; the crest jewel is the larger centrepiece, at the frame's top edge or raised into
     /// its crest by nearly half of how far the crest rises above the rim, whichever is higher.
     public static func gemCentres(_ slots: [GemSlot], window o: (x: Int, y: Int, w: Int, h: Int),
-                                  rim r: (across: Double, down: Double, crest: Double)) -> [Gem] {
+                                  rim r: (across: Double, down: Double, crest: Double), shape: FrameShape = .square) -> [Gem] {
         let x0 = Double(o.x) - r.across / 2, x1 = Double(o.x + o.w) + r.across / 2
         let y0 = Double(o.y) - r.down / 2, y1 = Double(o.y + o.h) + r.down / 2
         let t = min(r.across, r.down), corner = t * 0.85
+        // A clipped or rounded corner pulls its gem in along the diagonal, onto the rim's centre line
+        // there: an octagon's at the middle of its cut, a rounded square's on its arc.
+        let side = Double(o.w) + 2 * r.across, c = shape.corner * side
+        let inset: Double
+        switch shape {
+        case .square: inset = 0
+        case .octagon: inset = max(0, (c + t / 2.0.squareRoot()) / 2 - t / 2)
+        case .rounded: inset = c > t / 2 ? (c - (c - t / 2) / 2.0.squareRoot()) - t / 2 : 0
+        }
         var out: [Gem] = []
+        if slots.contains(.corners) || slots.contains(.topCorners) {
+            out += [Gem(x: x0 + inset, y: y0 + inset, size: corner, place: "top-left"), Gem(x: x1 - inset, y: y0 + inset, size: corner, place: "top-right")]
+        }
         if slots.contains(.corners) {
-            out += [Gem(x: x0, y: y0, size: corner, place: "top-left"), Gem(x: x1, y: y0, size: corner, place: "top-right"),
-                    Gem(x: x0, y: y1, size: corner, place: "bottom-left"), Gem(x: x1, y: y1, size: corner, place: "bottom-right")]
+            out += [Gem(x: x0 + inset, y: y1 - inset, size: corner, place: "bottom-left"), Gem(x: x1 - inset, y: y1 - inset, size: corner, place: "bottom-right")]
+        }
+        if slots.contains(.sides) {
+            let cx = Double(o.x) + Double(o.w) / 2, cy = Double(o.y) + Double(o.h) / 2, sz = t * 0.8
+            out += [Gem(x: cx, y: y0, size: sz, place: "top"), Gem(x: x1, y: cy, size: sz, place: "right"),
+                    Gem(x: cx, y: y1, size: sz, place: "bottom"), Gem(x: x0, y: cy, size: sz, place: "left")]
         }
         // Up at the frame's top edge, a crest above the rim, so HP1's head can break out under it:
         // on the rim's centre line it sat where the head goes (2026-10-02).
@@ -10079,6 +10119,8 @@ public enum GDDAssetPrompts {
                         "hp1Frame": text(SetDesignRules.maxFamily, "How HP1's version of that frame is richer, same outline; under 25 words."),
                         "mediumPayFrame": text(SetDesignRules.maxFamily, "The medium pays' plainer square frame, under 25 words."),
                         "gems": text(SetDesignRules.maxFamily, "The gem the top pays' frames are set with, in this theme's own terms, no colour; under 15 words."),
+                        "gemLayout": ["type": "STRING", "enum": GemLayout.allCases.map(\.rawValue)],
+                        "frameShape": ["type": "STRING", "enum": FrameShape.allCases.map(\.rawValue)],
                     ],
                 ],
             ],
@@ -10170,8 +10212,9 @@ public enum GDDAssetPrompts {
           thing or character and what it holds or does, its material and its dominant colour. A
           second step writes each symbol's full picture from this — pose, camera, light and
           detail — so spend your words on choosing the right thing. It describes the symbol alone: no scene or
-          setting behind it, no backdrop colour, and no words, numbers or labels painted on it
-          (the game prints those at runtime; a card royal is its letter). It must agree with the
+          setting behind it, no backdrop colour, and no words, numbers or labels in it (the drawing
+          step letters the word a wild, bonus, scatter or jackpot carries; the game prints values at
+          runtime; a card royal is its letter). It must agree with the
           symbol's "hue" and "shape": a symbol labelled red whose subject reads "a gold coin"
           will be drawn gold — the label changes nothing in the picture.
         - SILHOUETTE: its form in one or two words. A character shown as a bust names its crop, and
@@ -10231,7 +10274,12 @@ public enum GDDAssetPrompts {
         - FRAMES follow the symbol's type, as in this studio's shipped games. Every HIGH PAY sits
           in a frame: HP2 and up share ONE square frame, the same construction recoloured by rank,
           and HP1's is a richer version of that same frame. The MEDIUM PAYS share one plainer square
-          frame of their own, with no gems. This studio's frames are SLIM — a narrow moulding about a
+          frame of their own, with no gems. Write in "frameShape" the pay frames' outline, as this studio's
+          themes have them: "Octagon" (clipped corners) for classic Vegas, sevens and bells; "Rounded" for
+          organic, tribal or cartoon worlds; "Square" for Egyptian, Asian and Renaissance frames and most
+          others. Write in "gemLayout" where the top pays' gems sit: "Top corners" for Egyptian (red
+          cabochons), "Side centres" for Asian (a gem at the middle of each side between lattice corners),
+          "Corners" for glamour, royal or treasure themes, "None" for classic Vegas. This studio's frames are SLIM — a narrow moulding about a
           twelfth of the frame's width, ornament concentrated at the corners — never a wide carved border or
           a second inner rim, so the symbol inside fills most of it. Describe these frames in "families" (highPayFrame, hp1Frame,
           mediumPayFrame); they are drawn once and every pay symbol is painted into a copy, so a
@@ -10255,7 +10303,8 @@ public enum GDDAssetPrompts {
           "look": "<one paragraph every image is given>",
           "families": {"jackpot": "<shared construction>", "wysiwyg": "<…>", "lowPay": "<…>",
                        "highPayFrame": "<the high pays' frame>", "hp1Frame": "<how HP1's is richer>", "mediumPayFrame": "<…>",
-                       "gems": "<the gem the top pays' frames are set with>"},
+                       "gems": "<the gem the top pays' frames are set with>",
+                       "gemLayout": "<Corners | Top corners | Side centres | None>", "frameShape": "<Square | Rounded | Octagon>"},
           "assets": [
             {"id": "<slot id>", "subject": "<one sentence: what it is, its material and colour>",
              "silhouette": "<one or two words>", "shape": "<outline class>", "hue": "<colour family>",
@@ -10324,15 +10373,17 @@ public enum GDDAssetPrompts {
         let roles = Set(jobs.filter { $0.kind == .symbol }.map(\.role))
         if roles.contains(.jackpot) {
             lines.append("- JACKPOTS: GRAND, MAJOR, MINOR and MINI must be ONE FAMILY — the same "
-                       + "object or construction, separated by colour and by the tier name the "
-                       + "game prints on them. Do NOT pick four unrelated treasures; a player "
-                       + "cannot rank a crown against a chalice against a chest.")
+                       + "object or construction, separated by colour and by the tier name lettered "
+                       + "on them. Do NOT pick four unrelated treasures; a player "
+                       + "cannot rank a crown against a chalice against a chest. A coin's rim stays "
+                       + "plain; a jackpot tile's corners may be set with small diamonds, as this studio's are.")
         }
         if roles.contains(.wild) {
             lines.append("- WILD: a specific character, emblem, animal or signature object from "
                        + "this theme — a lead the pays had no room for, the game's emblem, or its "
-                       + "signature item. NOT a vortex, swirl, spiral or abstract energy — that is "
-                       + "the weakest answer and every game already has one.")
+                       + "signature item — with WILD lettered on its own plaque or banner, which in "
+                       + "this studio's games often carries one large gem at its top centre. NOT a "
+                       + "vortex, swirl, spiral or abstract energy — that is the weakest answer and every game already has one.")
         }
         if roles.contains(.lowPay) {
             lines.append(lowPayBrief(jobs.filter { $0.role == .lowPay }, kind: lowPays, custom: custom))
@@ -11123,10 +11174,15 @@ public enum FrameRules {
     /// high pays, unless a gem ladder keeps them plain. The medium pays never have gems.
     public static func gemSlots(rank: Int, role: SlotSymbolRole, design: SetDesign) -> [GemSlot] {
         let ladder = RankLadder(design), jewelled = FrameStyle(design) == .jewelled
-        if role == .highPay && rank == 1 { return ladder == .metal && !jewelled ? [.crest] : [.corners, .crest] }
-        if role == .highPay && rank == 2 && ladder == .gems { return [.corners] }
+        // The theme's layout (GemLayout); a ladder or jewelled frames picked by the artist still need gems.
+        var base = GemLayout(design).slots
+        if base.isEmpty && (ladder == .gems || jewelled) { base = [.corners] }
+        // A side-centre layout has its own gem at the top centre: no crest above it.
+        let crest: [GemSlot] = base.contains(.sides) ? [] : [.crest]
+        if role == .highPay && rank == 1 { return ladder == .metal && !jewelled ? [.crest] : base + crest }
+        if role == .highPay && rank == 2 && ladder == .gems { return base }
         // The medium pays never: they are set apart from the high pays (the art director, 2026-10-02).
-        return jewelled && role == .highPay && ladder != .gems ? [.corners] : []
+        return jewelled && role == .highPay && ladder != .gems ? base : []
     }
     /// A pay's gem slots, knowing what it shows: a character HP1 whose head breaks out over the top
     /// of its frame keeps the corners and gives up the crest jewel there — the studio's character
@@ -11145,6 +11201,12 @@ public enum FrameRules {
     /// The slots in words, for a painted frame: an exact count in exact places, all the same size.
     public static func gemPlaces(_ slots: [GemSlot]) -> String {
         let s = Set(slots)
+        let where_ = s.contains(.corners) ? "four gems of exactly the same size, one centred on each corner"
+            : s.contains(.topCorners) ? "two gems of exactly the same size, one at each top corner"
+            : s.contains(.sides) ? "four gems of exactly the same size, one at the middle of each side" : ""
+        if s.contains(.topCorners) || s.contains(.sides) {
+            return (s.contains(.crest) ? "one gem at the centre of its crest and " : "") + where_ + ", placed symmetrically"
+        }
         if s == [.corners] { return "four gems of exactly the same size, one centred on each corner, placed symmetrically" }
         if s == [.crest, .corners] { return "one gem at the centre of its crest and four of exactly the same size, one centred on each corner, placed symmetrically" }
         if s == [.crest] { return "one gem at the centre of its crest" }
@@ -11203,8 +11265,47 @@ public enum FrameWriter {
     }
 }
 
-/// Where gems sit on a frame (FrameRules.gemSlots): its four corners, the centre of its crest.
-public enum GemSlot: String, Sendable, Hashable { case corners, crest }
+/// Where gems sit on a frame (FrameRules.gemSlots): its four corners, its two top corners, the
+/// middle of each side, the centre of its crest.
+public enum GemSlot: String, Sendable, Hashable { case corners, topCorners, sides, crest }
+
+/// Where a set's frames carry their gems, by theme — the studio's sets (114 games' shipped symbols,
+/// 2026-10-02): Egyptian frames red cabochons at their two top corners (Egyptian Queen, Golden Asp),
+/// Asian ones a gem at the middle of each side between lattice corners, glamour ones a gem at every
+/// corner (Platinum Goddess), classic Vegas octagons none. The planner's "gemLayout".
+public enum GemLayout: String, CaseIterable, Sendable {
+    case corners = "Corners", topCorners = "Top corners", sides = "Side centres", none = "None"
+    public static let key = "gemLayout"
+    public init(_ design: SetDesign) {
+        let v = (design.families[Self.key] ?? "").lowercased()
+        self = GemLayout.allCases.first { v.hasPrefix($0.rawValue.lowercased()) } ?? (v.contains("side") ? .sides : v.contains("top") ? .topCorners : v.hasPrefix("no") ? .none : .corners)
+    }
+    var slots: [GemSlot] {
+        switch self { case .corners: return [.corners]; case .topCorners: return [.topCorners]; case .sides: return [.sides]; case .none: return [] }
+    }
+}
+
+/// The pay frames' outline, by theme: classic Vegas octagons with clipped corners (the sevens, bells
+/// and Dodge sets), rounded squares for organic and cartoon themes (Tiki Titans' stone), square for
+/// Egyptian, Asian and Renaissance frames. The planner's "frameShape"; the ring a frame is drawn on is
+/// cut to it (FrameStack.frameTemplate), so the outline is the code's.
+public enum FrameShape: String, CaseIterable, Sendable {
+    case square = "Square", rounded = "Rounded", octagon = "Octagon"
+    public static let key = "frameShape"
+    public init(_ design: SetDesign) {
+        let v = (design.families[Self.key] ?? "").lowercased()
+        self = v.contains("oct") || v.contains("clip") ? .octagon : v.contains("round") ? .rounded : .square
+    }
+    /// Its corner — a rounded one's radius, an octagon's cut along each edge — as a share of its side.
+    public var corner: Double { switch self { case .square: return 0; case .rounded: return 0.12; case .octagon: return 0.13 } }
+    var words: String {
+        switch self {
+        case .square: return "a square"
+        case .rounded: return "a square with rounded corners"
+        case .octagon: return "an octagon — a square with its corners clipped"
+        }
+    }
+}
 
 /// One gem's place on its frame (FrameStack.gemCentres): centre and diameter, in the frame's pixels.
 public struct Gem: Codable, Equatable, Sendable {
@@ -12737,6 +12838,29 @@ extension GDDAssetPrompts {
         return out
     }
 
+    /// The word a symbol carries lettered into its art — the studio's wilds, bonus, scatter and
+    /// jackpot symbols all do (WILD, BONUS, GRAND: 114 games' shipped statics, 2026-10-02; the art
+    /// director's call to follow them). Nil for the rest: values and multipliers stay the game's.
+    public static func letteredWord(_ job: AssetJob) -> String? {
+        guard job.kind == .symbol else { return nil }
+        switch job.role {
+        case .wild: return "WILD"
+        case .scatter: return "SCATTER"
+        case .bonus:
+            let n = (job.docName + " " + job.title).uppercased()
+            return n.contains("SUPER") ? "SUPER BONUS" : "BONUS"
+        case .jackpot:
+            let t = jackpotTierName(job)
+            let ladder = ["GRAND", "MAJOR", "MINOR", "MINI"]
+            return t.hasPrefix("tier") ? ladder[min(ladder.count - 1, max(0, (job.tier ?? 1) - 1))] : t
+        default: return nil
+        }
+    }
+    /// How it is lettered, for the drawing prompt.
+    static func letteringLine(_ word: String) -> String {
+        "The word “\(word)” is lettered across it as part of the art, as this studio's symbols are: bold, dimensional letters in the set's own material and finish, spelled exactly so, on the symbol's own banner, plaque or face — large and legible at reel size."
+    }
+
     static func jackpotTierName(_ job: AssetJob) -> String {
         let t = (job.title + " " + job.subject).lowercased()
         for n in ["grand", "mega", "major", "minor", "mini"] where t.contains(n) { return n.uppercased() }
@@ -12807,13 +12931,13 @@ extension GDDAssetPrompts {
                 line = "It is a low-pay symbol, one of a matching row of low pays\(built) — but its own thing, not another one recoloured."
             }
         case .wild:
-            line = "It is the WILD, which stands in for other symbols: the most eye-catching symbol on the reel, with the strongest contrast in the set. The game prints the word WILD over it, so keep one calm, uncluttered area of the artwork for that label — do not draw a band, bar or panel for it."
+            line = "It is the WILD, which stands in for other symbols: the most eye-catching symbol on the reel, with the strongest contrast in the set. \(letteringLine("WILD"))"
         case .scatter:
-            line = "It is the SCATTER, which triggers the bonus feature: special at a glance, and unlike every other symbol in colour and subject."
+            line = "It is the SCATTER, which triggers the bonus feature: special at a glance, and unlike every other symbol in colour and subject. \(letteringLine("SCATTER"))"
         case .bonus:
-            line = "It is the BONUS symbol, which triggers the bonus game: a bold, rich coin, badge or medallion — special at a glance, and unmistakably different from the scatter."
+            line = "It is the BONUS symbol, which triggers the bonus game: a bold, rich coin, badge or medallion — special at a glance, and unmistakably different from the scatter. \(letteringLine(letteredWord(job) ?? "BONUS"))"
         case .jackpot:
-            line = "It is the \(jackpotTierName(job)) jackpot symbol, one of a matching family of jackpot tiers\(built). The game prints the tier name on it, so keep a calm, clear area for that label."
+            line = "It is the \(jackpotTierName(job)) jackpot symbol, one of a matching family of jackpot tiers\(built). \(letteringLine(letteredWord(job) ?? "JACKPOT"))"
         case .wysiwyg:
             line = "It is a value symbol, one of a matching family\(built). The game prints a credit amount on it during play, so keep a calm, clear area in its middle for the number."
         case .collector, .multiplier, .activator, .adder:
@@ -12950,6 +13074,9 @@ extension GDDAssetPrompts {
         if let r = royalRank(job) {
             return "Exactly one character, the “\(r)”, whole and unmistakable — no second letter, no other lettering, no numbers, no watermark, no user interface."
         }
+        if let w = letteredWord(job) {
+            return "The only lettering is “\(w)”, spelled exactly so — no other text, letters or numbers, no watermark, no user interface."
+        }
         return "No text, lettering or numbers, no watermark, no user interface."
     }
 
@@ -13045,7 +13172,7 @@ extension GDDAssetPrompts {
                 : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
         // Shown a ring, Gemini kept its outer edge and drew an inner liner inside its opening, which
         // shrank the window to 49–63% of the frame (2026-10-02): the opening is said to be the window.
-        let ring = "Edit the last attached image: its flat grey square ring marks exactly where the frame goes. Turn the ring into the frame described below — its outer edge, its opening and its narrow rim exactly where the ring's are\(single && crestOK ? ", except for a crest that rises above the ring at the top centre" : "") — and keep everything outside it the flat background. The ring's opening IS the window: nothing is drawn inside it — no inner liner, bevel, step, moulding or second border inside the ring's inner edge."
+        let ring = "Edit the last attached image: its flat grey ring — \(FrameShape(design).words) — marks exactly where the frame goes. Turn the ring into the frame described below — its outer edge, its opening and its narrow rim exactly where the ring's are\(single && crestOK ? ", except for a crest that rises above the ring at the top centre" : "") — and keep everything outside it the flat background. The ring's opening IS the window: nothing is drawn inside it — no inner liner, bevel, step, moulding or second border inside the ring's inner edge."
         return ([
             template && single ? "\(ring) It is the empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
             : template ? "\(ring) It is the empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of it, so it holds each in turn and carries nothing of any of them."
@@ -13137,7 +13264,7 @@ extension GDDAssetPrompts {
                 ? "Each is one card rank — the letter itself is the artwork, with no frame. All \(countWord(n)) are set in ONE proper typeface with correct letterforms: the same height, weight, construction and finish, differing only in the letter and its colour. Every letter complete and correct — \(ranks.map { "“\($0)”" }.joined(separator: ", ")) — one character per symbol."
                 : "Each one is its own thing — its own outline and its own colour, never another one of the row recoloured — made of the same material, with the same finish, size and light."))
         case .jackpot:
-            parts.append(shared + "They are ONE family: the same object, construction and outline, differing in colour and finish from the first to the last tier. The game prints each tier's name on it, so each keeps the same calm, clear area for that label — painted plainly, with no lettering in it.")
+            parts.append(shared + "They are ONE family: the same object, construction and outline, differing in colour and finish from the first to the last tier. Each carries its tier's name lettered across it — \(group.compactMap(letteredWord).map { "“\($0)”" }.joined(separator: ", ")), in that order — in one matching style of bold, dimensional lettering in the set's material.")
         default:
             let framed = group.filter(\.hasFrame)
             let oneFrame = !layered && framed.count > 1 && Set(framed.map(\.shape)).count == 1
@@ -13151,8 +13278,10 @@ extension GDDAssetPrompts {
         }
         parts.append("Each symbol faces the viewer straight on, upright and level — none tilted, turned or seen at an angle — with one clear focal point, bold shapes and strong light-and-dark contrast, so it reads at reel size.")
         parts.append(backdropLine(backing, several: true))
+        let words = group.compactMap(letteredWord)
         parts.append(royal
             ? "The only lettering is the ranks themselves, one per symbol. No other letters, numbers or labels, no watermark, no user interface."
+            : !words.isEmpty ? "The only lettering is each symbol's own word, one per symbol (\(words.map { "“\($0)”" }.joined(separator: ", "))). No other letters, numbers or labels, no watermark, no user interface."
             : "No text, lettering, numbers or labels, no watermark, no user interface.")
         return parts.joined(separator: "\n\n")
     }
@@ -13206,8 +13335,8 @@ extension GDDAssetPrompts {
             let finish = !job.finish.isEmpty && job.finish != founder.finish
                 ? " Its finish becomes: \(job.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". ")))." : ""
             let rank = royalRank(job).map { " The letter becomes “\($0)”, in exactly the same typeface, material and construction as the original letter." } ?? ""
-            let calm = [.jackpot, .wysiwyg].contains(job.role)
-                ? " Keep the same calm, clear area for the \(job.role == .jackpot ? "tier name" : "value") the game prints on it." : ""
+            let calm = job.role == .wysiwyg ? " Keep the same calm, clear area for the value the game prints on it."
+                : letteredWord(job).map { " Its lettered word becomes “\($0)”, in exactly the same lettering as the original's." } ?? ""
             return [
                 "Edit the attached image: it is \(displayName(founder)) of \(game). Turn it into \(displayName(job)) — the same symbol with the same construction, outline, frame, pose, camera angle, lighting, size and finish, changed only in this way: \(change).\(recolour)\(finish)\(hue)\(rank)\(calm)",
                 backdropLine(backing),
@@ -13355,7 +13484,7 @@ extension GDDAssetPrompts {
             a wild, a special, a prize — as a soft glow hugging its silhouette in its own colours; a plain \
             symbol needs none. No rays, sparkles or backdrop filling the square, and nothing described behind it: \
             no "against" anything, no sky, darkness or backdrop. \
-            Leave out any backing colour, words or numbers, reels, interface and the other symbols: \
+            Leave out any backing colour, words or numbers (except the one word its role line letters), reels, interface and the other symbols: \
             those are handled separately. Never write a slot code such as HP2.
             """
         }
@@ -13590,14 +13719,17 @@ extension GDDAssetPrompts {
         let rank = FrameRules.rank(of: job.id, in: jobs)
         let slots = Set(FrameRules.gemSlots(for: job, in: jobs, design: design))
         let whose = job.role != .highPay ? "a medium-pay symbol" : rank == 1 ? "the top high-pay symbol" : rank == 2 ? "the second high-pay symbol" : "a high-pay symbol"
+        let ring: (n: Int, words: String) = slots.contains(.corners) ? (4, "at the corners")
+            : slots.contains(.topCorners) ? (2, "at the two top corners")
+            : slots.contains(.sides) ? (4, "at the middle of each side") : (0, "")
+        let count = ["", "one", "two", "three", "four", "five", "six"]
         let discs: String, alike: String
-        switch (slots.contains(.corners), slots.contains(.crest)) {
-        case (true, true):
-            discs = "the five flat white discs — the four at the corners and the larger one in the crest at the top centre"
-            alike = "The four corner gems are identical; the crest gem is the larger centrepiece."
-        case (true, false): discs = "the four flat white discs at the corners"; alike = "The four gems are identical."
-        default: discs = "the one flat white disc in the crest at the top centre"; alike = "It is the frame's centrepiece."
-        }
+        if ring.n > 0 && slots.contains(.crest) {
+            discs = "the \(count[ring.n + 1]) flat white discs — the \(count[ring.n]) \(ring.words) and the larger one in the crest at the top centre"
+            alike = "The \(count[ring.n]) gems \(ring.words) are identical; the crest gem is the larger centrepiece."
+        } else if ring.n > 0 {
+            discs = "the \(count[ring.n]) flat white discs \(ring.words)"; alike = "The \(count[ring.n]) gems are identical."
+        } else { discs = "the one flat white disc in the crest at the top centre"; alike = "It is the frame's centrepiece." }
         var gem = FrameRules.gem(design)
         gem = gem.prefix(1).lowercased() + gem.dropFirst()
         return "Using the provided image of an empty slot-game frame for \(whose) of a game themed “\(theme.name)”, change only \(discs). "

@@ -12868,7 +12868,7 @@ final class PayLadderTests: XCTestCase {
         let f = try! XCTUnwrap(steps.first { $0.id == "frame_HP" })
         XCTAssertEqual(f.members, ["HP1"])
         let b = GDDAssetPrompts.brief(job: jobs[0], step: f, theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
-        XCTAssertTrue(b.hasPrefix("Edit the last attached image: its flat grey square ring"), b)
+        XCTAssertTrue(b.hasPrefix("Edit the last attached image: its flat grey ring — a square — marks"), b)
         XCTAssertTrue(b.contains("It is the empty frame for the top symbol"), b)
         XCTAssertTrue(b.contains("except for a crest that rises above the ring at the top centre"), b)
         XCTAssertTrue(b.contains("the richest frame of the set: doubled vines with a crown crest"), b)
@@ -12944,6 +12944,53 @@ final class PayLadderTests: XCTestCase {
         XCTAssertTrue(brief(jack).contains("No crest: the symbol's own head breaks out over its top."), brief(jack))
         XCTAssertTrue(brief(jack).contains("The ring's opening IS the window"), brief(jack))
         XCTAssertTrue(brief(item).contains("except for a crest that rises above the ring at the top centre"), brief(item))
+    }
+
+    // The frames' gems and outline follow the theme, as the studio's sets do.
+    func testGemLayoutAndFrameShapeFollowTheTheme() {
+        func d(_ layout: String, _ shape: String = "Square") -> SetDesign {
+            SetDesign(anchorID: "HP1", look: "", families: ["gemLayout": layout, "frameShape": shape, "framing": Framing.layered.rawValue])
+        }
+        XCTAssertEqual(Set(FrameRules.gemSlots(rank: 1, role: .highPay, design: d("Top corners"))), [.topCorners, .crest])
+        XCTAssertEqual(Set(FrameRules.gemSlots(rank: 1, role: .highPay, design: d("Side centres"))), [.sides])   // its top gem is the crest
+        XCTAssertEqual(FrameRules.gemSlots(rank: 1, role: .highPay, design: d("None")), [.crest])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 2, role: .highPay, design: SetDesign(families: ["gemLayout": "None", "rankLadder": RankLadder.gems.rawValue])), [.corners])
+        // Placed on the rim's centre line: top corners two, side centres four, symmetrical.
+        let win = (x: 100, y: 90, w: 200, h: 220), rim = (across: 40.0, down: 30.0, crest: 30.0)
+        XCTAssertEqual(FrameStack.gemCentres([.topCorners], window: win, rim: rim).map(\.place), ["top-left", "top-right"])
+        let sides = FrameStack.gemCentres([.sides], window: win, rim: rim)
+        XCTAssertEqual(sides.map(\.place), ["top", "right", "bottom", "left"])
+        XCTAssertEqual(sides[0].x, 200); XCTAssertEqual(sides[0].y, 75); XCTAssertEqual(sides[3].x, 80)
+        // An octagon's corner gem moves in along the diagonal, onto its clipped corner.
+        let sq = FrameStack.gemCentres([.corners], window: win, rim: rim)[0], oct = FrameStack.gemCentres([.corners], window: win, rim: rim, shape: .octagon)[0]
+        XCTAssertGreaterThan(oct.x, sq.x); XCTAssertEqual(oct.x - sq.x, oct.y - sq.y, accuracy: 0.001)
+        // The ring is cut to the shape: an octagon's corner is the backing, its edge midpoint the ring.
+        let n = 400, px = FrameStack.frameTemplate(size: n, backing: RGB8(255, 0, 255), shape: .octagon)
+        XCTAssertEqual(Array(px[(32 * n + 32) * 4..<(32 * n + 32) * 4 + 3]), [255, 0, 255])
+        XCTAssertNotEqual(px[(40 * n + 200) * 4], 255)
+        // The planner is told both, and the gem pass's discs follow the layout.
+        let plan = GDDAssetPrompts.planning(theme: theme, gameName: "G", jobs: [pay("HP1", .highPay)])
+        XCTAssertTrue(plan.contains("\"Top corners\" for Egyptian") && plan.contains("\"Octagon\" (clipped corners) for classic Vegas"), plan)
+        let g = GDDAssetPrompts.gemsBrief(job: pay("HP1", .highPay, silhouette: "golden harp"), theme: theme, design: d("Side centres"),
+                                          backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), jobs: [pay("HP1", .highPay, silhouette: "golden harp")])
+        XCTAssertTrue(g.contains("change only the four flat white discs at the middle of each side"), g)
+    }
+
+    // Wilds, bonus symbols and jackpots carry their word, lettered into the art as the studio's do.
+    func testTheSpecialsCarryTheirWord() {
+        var wd = pay("WD1", .wild); wd.hasFrame = false
+        var jp = AssetJob(id: "JP2", kind: .symbol, role: .jackpot, tier: 2, title: "Jackpot Major", subject: "a coin", aspect: "1:1", size: "2K")
+        jp.hasFrame = false
+        var bo = pay("BO1", .bonus); bo.docName = "Super Bonus"; bo.hasFrame = false
+        XCTAssertEqual(GDDAssetPrompts.letteredWord(wd), "WILD")
+        XCTAssertEqual(GDDAssetPrompts.letteredWord(jp), "MAJOR")
+        XCTAssertEqual(GDDAssetPrompts.letteredWord(bo), "SUPER BONUS")
+        XCTAssertNil(GDDAssetPrompts.letteredWord(pay("WY1", .wysiwyg)))
+        let b = GDDAssetPrompts.brief(job: wd, step: RenderStep(id: "WD1", mode: .match, refs: [], after: []), theme: theme, design: SetDesign(anchorID: "HP1"),
+                                      backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: [wd])
+        XCTAssertTrue(b.contains("The word “WILD” is lettered across it as part of the art"), b)
+        XCTAssertTrue(b.contains("The only lettering is “WILD”, spelled exactly so"), b)
+        XCTAssertFalse(b.contains("The game prints the word WILD"), b)
     }
 
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.

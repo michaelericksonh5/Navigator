@@ -23698,7 +23698,7 @@ final class GDDRunLog {
     /// A 256-px thumbnail for the summary, and — for a symbol — its measured scores.
     /// A card symbol (`expectsText`) is read for its rank instead of for stray lettering.
     func record(image png: Data, id: String, backing: RGB8, isSymbol: Bool, expectsText: Bool = false,
-                rank: String? = nil, review: ImageReview? = nil) {
+                rank: String? = nil, review: ImageReview? = nil, word: String? = nil) {
         guard let src = CGImageSourceCreateWithData(png as CFData, nil),
               let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return }
         let side = 256
@@ -23718,7 +23718,13 @@ final class GDDRunLog {
         }
         let m = isSymbol ? SymbolImageMetrics.measure(cg, backing: backing) : nil
         // The review's reading when there is one; the reader on this Mac otherwise.
-        let text = expectsText ? "" : (review?.text ?? Self.readText(cg))
+        // A symbol lettered by design (GDDAssetPrompts.letteredWord) is checked for anything besides its word.
+        var text = expectsText ? "" : (review?.text ?? Self.readText(cg))
+        if let w = word {
+            text = text.replacingOccurrences(of: w, with: "", options: [.caseInsensitive])
+            for part in w.split(separator: " ") { text = text.replacingOccurrences(of: String(part), with: "", options: [.caseInsensitive]) }
+            if text.filter(\.isLetter).count < 3 { text = "" }
+        }
         let read = expectsText ? (review != nil ? review?.cardText : Self.readRank(png, backing: backing)) : nil
         lock.lock()
         thumbs[id] = thumb; if let m { scores[id] = m }
@@ -24756,8 +24762,8 @@ final class GDDToAssetsRun: ObservableObject {
             if r == RenderPlan.themeArt { d = themeArt }
             else if r == RenderPlan.setSoFar { d = setSoFarPNG(excluding: id, folder: folder) }
             else if r == RenderPlan.frameTemplate {
-                let b = Thread.isMainThread ? backing.rgb : DispatchQueue.main.sync { self.backing.rgb }
-                d = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: 1536, backing: b), width: 1536, height: 1536,
+                let (b, shape) = Thread.isMainThread ? (backing.rgb, FrameShape(styledDesign)) : DispatchQueue.main.sync { (self.backing.rgb, FrameShape(self.styledDesign)) }
+                d = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: 1536, backing: b, shape: shape), width: 1536, height: 1536,
                                                space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG)
             }
             else {
@@ -25191,7 +25197,7 @@ final class GDDToAssetsRun: ObservableObject {
                        "cost": cost / Double(members.count), "seconds": secs, "error": ""])
             let rank = GDDAssetPrompts.royalRank(p.job)
             log.record(image: p.png, id: p.job.id, backing: backingRGB, isSymbol: true, expectsText: rank != nil,
-                       rank: rank, review: p.review)
+                       rank: rank, review: p.review, word: GDDAssetPrompts.letteredWord(p.job))
         }
         // What came out wrong on an otherwise good sheet is drawn again alone, matched to a low
         // pay that came out right.
@@ -25285,7 +25291,7 @@ final class GDDToAssetsRun: ObservableObject {
         let keyed = FrameStack.keyed(base, backing: ctx.backing)
         guard let win = LayerizeAssembly.opening(keyed, width: w, height: h),
               let rim = FrameStack.rim(keyed, width: w, height: h, window: win) else { return fail("\(ctx.frame) has no open window to measure its rim from") }
-        let gems = FrameStack.gemCentres(ctx.slots, window: win, rim: rim)
+        let gems = FrameStack.gemCentres(ctx.slots, window: win, rim: rim, shape: DispatchQueue.main.sync { FrameShape(self.styledDesign) })
         guard let guideCG = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.guide(base, width: w, height: h, gems: gems), width: w, height: h, space: space),
               let guidePNG = encodePNG(guideCG) else { return fail("the guide could not be drawn") }
         DispatchQueue.main.async { self.status = "Setting \(symbol)'s gems into its frame…" }
@@ -25360,7 +25366,7 @@ final class GDDToAssetsRun: ObservableObject {
         let started = Date()
         // Drawn on the slim ring, its rim is measured: one drawn thick is drawn once more (ponytail:
         // the thinner of the two is kept either way).
-        let b = DispatchQueue.main.sync { self.backing.rgb }
+        let (b, shape) = DispatchQueue.main.sync { (self.backing.rgb, FrameShape(self.styledDesign)) }
         func sideRim(_ png: Data) -> Double? {
             guard let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
             let k = FrameStack.keyed(px, backing: b)
@@ -25372,7 +25378,7 @@ final class GDDToAssetsRun: ObservableObject {
         let templated = refs.last == RenderPlan.frameTemplate
         func cleared(_ png: Data?) -> Data? {
             guard templated, let png, let cg = loadCGImage(data: png), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { return png }
-            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b)
+            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b, shape: shape)
             return ChromaKeyOutputRules.image(straightRGBA8: px, width: cg.width, height: cg.height, space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG) ?? png
         }
         var r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
@@ -25595,7 +25601,8 @@ final class GDDToAssetsRun: ObservableObject {
                    "error": r.png == nil ? (r.error ?? "no image returned") : ""])
         if let png = r.png {
             log.record(image: png, id: job.id, backing: backingRGB, isSymbol: job.kind == .symbol,
-                       expectsText: GDDAssetPrompts.royalRank(job) != nil, rank: GDDAssetPrompts.royalRank(job), review: rev)
+                       expectsText: GDDAssetPrompts.royalRank(job) != nil, rank: GDDAssetPrompts.royalRank(job), review: rev,
+                       word: GDDAssetPrompts.letteredWord(job))
         }
         navLog(String(format: "gdd image: %@ %@ %@ → %@ $%.3f %.1fs%@", job.id, model, job.size,
                       dims.isEmpty ? "nothing" : dims, c, secs,
@@ -26179,7 +26186,7 @@ extension GDDToAssetsRun {
             let rim = FrameStack.rim(f.px, width: W, height: H, window: f.window).map { (across: $0.across / Double(f.window.w), down: $0.down / Double(f.window.h)) }
             let fit = fits[id]?(rim) ?? (width: 0.96, height: 1.12)
             // Under its crest jewel, tucked behind no more than its lowest quarter.
-            let crest = gemmed.contains(id) ? currentGemPass(id, folder: folder)?.gems.first { $0.place == "crest" } : nil
+            let crest = gemmed.contains(id) ? currentGemPass(id, folder: folder)?.gems.first { $0.place == "crest" || $0.place == "top" } : nil
             var at = FrameStack.placement(subject: e, window: f.window, cut: cut, width: fit.width, height: fit.height,
                                           ceiling: crest.map { $0.y + $0.size / 4 })
             var clipBox = cut.any ? FrameStack.clip(cut, window: f.window) : nil
@@ -27685,6 +27692,7 @@ struct GDDToAssetsSheet: View {
                 let rows: [(String, String?)] = [("High pays", FrameStyle.spec(d, highPay: true)),
                                                  ("HP1", FrameStyle.richer(d)),
                                                  ("Medium pays", FrameStyle.spec(d, highPay: false)),
+                                                 ("Shape", FrameShape(d).rawValue + (d.families[FrameShape.key] == nil ? " (the planner's default)" : "")),
                                                  ("Gems", FrameRules.gem(d) + " — " + gemPlacement(d))]
                 ForEach(rows.filter { $0.1 != nil }, id: \.0) { r in
                     Text("\(r.0): \(r.1!)").font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -27709,8 +27717,12 @@ struct GDDToAssetsSheet: View {
     private func gemPlacement(_ d: SetDesign) -> String {
         func words(_ slots: [GemSlot]) -> String? {
             let s = Set(slots)
-            return s.isEmpty ? nil : s == [.corners] ? "four (corners)"
-                : s == [.crest] ? "one (crest)" : "five (crest and corners)"
+            let ring: (Int, String)? = s.contains(.corners) ? (4, "corners") : s.contains(.topCorners) ? (2, "top corners")
+                : s.contains(.sides) ? (4, "side centres") : nil
+            let n = (ring?.0 ?? 0) + (s.contains(.crest) ? 1 : 0)
+            guard n > 0 else { return nil }
+            let places = [s.contains(.crest) ? "crest" : nil, ring?.1].compactMap { $0 }.joined(separator: " and ")
+            return "\(["", "one", "two", "three", "four", "five"][n]) (\(places))"
         }
         // Only the tiers this set has.
         let hps = run.jobs.filter { $0.role == .highPay && $0.hasFrame }.count
