@@ -21395,14 +21395,15 @@ if let flag = CommandLine.arguments.firstIndex(of: "--generate-set"), flag + 2 <
         print(String(format: "GENERATING: %@ (%@) — estimate $%.2f", ids.sorted().joined(separator: ","), run.framing.rawValue, run.estimate(for: ids)))
         run.generate(into: folder, removeBackground: false, separateFrames: false, only: ids) { made in
             print("MADE: \(made.map(\.lastPathComponent))")
-            // A layered set is built after the batch; wait for it.
+            // A layered set is built after the batch; wait for it. Exits only after saying so: a
+            // separate exit timer beat the last DONE line to it (2026-10-02).
             func wait() {
                 MainActor.assumeIsolated {
                     if run.keying { DispatchQueue.main.asyncAfter(deadline: .now() + 1) { wait() }; return }
                     print("DONE: \(run.status)")
                     print(String(format: "SPENT: $%.4f", run.spent))
+                    exit(0)
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { MainActor.assumeIsolated { if !run.keying { exit(0) } } }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { wait() }
         }
@@ -26003,11 +26004,15 @@ extension GDDToAssetsRun {
         let colour = PanelColour(design), backing = self.backing.rgb
         // The plan's colour code for each: the planner chose them to keep the set distinct.
         let planned = Dictionary(jobs.map { ($0.id, $0.hue) }, uniquingKeysWith: { a, _ in a })
+        // How big each sits in its frame, by rank and its frame's rim: HP1 breaks out, the rest step inside.
+        let symbolJobs = jobs.filter { $0.kind == .symbol }
+        let fits = Dictionary(uniqueKeysWithValues: members.compactMap { id in symbolJobs.first { $0.id == id }.map { j in
+            (id, { (rim: (across: Double, down: Double)?) in PayLadder.fit(j, in: symbolJobs, rim: rim) }) } })
         keying = true
         status = "Building \(targets.count) framed symbol\(targets.count == 1 ? "" : "s") from their layers…"
         let build = {
             DispatchQueue.global(qos: .userInitiated).async {
-                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, gemmed: gemmed, folder: folder, colour: colour, backing: backing)
+                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, gemmed: gemmed, fits: fits, folder: folder, colour: colour, backing: backing)
                 // Gems that are missing, out of date or failed their checks: said, for review.
                 let gemNotes = targets.filter(gemmed.contains).compactMap { id -> String? in
                     guard let pass = Self.currentGemPass(id, folder: folder) else { return "\(id) (\(Self.gemsMissing(id, folder: folder)))" }
@@ -26037,7 +26042,8 @@ extension GDDToAssetsRun {
     /// `<id>_rmbg_Layers/` the way a split writes them, so review, the Spine export and everything
     /// after treat it like a split symbol. Returns what could not be built, and why.
     nonisolated static func stack(_ ids: [String], tiers: [[String]], frameOf: [String: String], planned: [String: String] = [:],
-                                  gemmed: Set<String> = [], folder: URL, colour: PanelColour, backing: RGB8) -> [String: String] {
+                                  gemmed: Set<String> = [], fits: [String: ((across: Double, down: Double)?) -> (width: Double, height: Double)] = [:],
+                                  folder: URL, colour: PanelColour, backing: RGB8) -> [String: String] {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
         func pixels(_ name: String) -> (px: [UInt8], w: Int, h: Int)? {
             guard let cg = loadCGImage(folder.appendingPathComponent(name)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
@@ -26100,7 +26106,12 @@ extension GDDToAssetsRun {
             let W = f.w, H = f.h
             // A bust is cut off at its chest: set past the window's floor and clipped there, behind the rim.
             let cut = FrameStack.cut(a.px, width: a.w, height: a.h)
-            let at = FrameStack.placement(subject: e, window: f.window, cut: cut)
+            let rim = FrameStack.rim(f.px, width: W, height: H, window: f.window).map { (across: $0.across / Double(f.window.w), down: $0.down / Double(f.window.h)) }
+            let fit = fits[id]?(rim) ?? (width: 0.96, height: 1.12)
+            // Under its crest jewel, tucked behind no more than its lowest quarter.
+            let crest = gemmed.contains(id) ? currentGemPass(id, folder: folder)?.gems.first { $0.place == "crest" } : nil
+            let at = FrameStack.placement(subject: e, window: f.window, cut: cut, width: fit.width, height: fit.height,
+                                          ceiling: crest.map { $0.y + $0.size / 4 })
             guard var body = canvas(crop, CGRect(x: at.x, y: at.y, width: at.w, height: at.h), W, H) else { continue }
             if cut.any {
                 let c = FrameStack.clip(cut, window: f.window)
@@ -26115,11 +26126,12 @@ extension GDDToAssetsRun {
             // subject is what made the painted ones read as one object. The glow is its own layer.
             var panel = f.grey
             let h = hue[id] ?? 210
-            FrameStack.tint(&panel, hue: h, saturation: 0.6, depth: f.depth)
+            let tone = FrameStack.tone(named: planned[id])
+            FrameStack.tint(&panel, hue: h, saturation: tone.saturation, depth: f.depth * tone.lightness)
             let shade = FrameStack.shadow(body, width: W, height: H, dx: -W / 90, dy: H / 60, radius: W / 120, strength: 0.35)
             var glow = FrameStack.shadow(body, width: W, height: H, dx: 0, dy: 0, radius: W / 18, strength: 1.6)
             var light: [UInt8] = [240, 240, 240, 255]
-            FrameStack.tint(&light, hue: h, saturation: 0.6)
+            FrameStack.tint(&light, hue: h, saturation: tone.saturation)
             for i in 0..<(W * H) {
                 glow[i * 4] = light[0]; glow[i * 4 + 1] = light[1]; glow[i * 4 + 2] = light[2]
                 if !f.inside[i] { panel[i * 4 + 3] = 0; glow[i * 4 + 3] = 0 }
@@ -27640,6 +27652,11 @@ struct GDDToAssetsSheet: View {
             Text("drawn together on one 4K sheet").font(.caption).foregroundColor(.secondary)
         }
         .disabled(run.busy || run.running)
+        // The art director's tiers (PayLadder): with medium pays, they are the lore items.
+        if ![.royals, .gemstones].contains(run.lowPays), run.jobs.contains(where: { $0.role == .mediumPay }) {
+            Text("This game has medium pays, and they are its lore items: royals or gems keep the low pays apart from them.")
+                .font(.caption).foregroundColor(.secondary)
+        }
     }
 
     @ViewBuilder private var planStep: some View {

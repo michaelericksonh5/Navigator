@@ -5463,8 +5463,8 @@ public enum FrameStack {
 
     /// Where each gem of `slots` goes, centre and size (its diameter, px), on the rim's centre line:
     /// symmetrical about the window by construction. Corner gems are 85% of the rim's width, clear
-    /// of its edges; the crest jewel is the larger centrepiece, raised into the crest by nearly half
-    /// of how far the crest rises above the rim — where it sat in the frames of test 2 (2026-10-02).
+    /// of its edges; the crest jewel is the larger centrepiece, at the frame's top edge or raised into
+    /// its crest by nearly half of how far the crest rises above the rim, whichever is higher.
     public static func gemCentres(_ slots: [GemSlot], window o: (x: Int, y: Int, w: Int, h: Int),
                                   rim r: (across: Double, down: Double, crest: Double)) -> [Gem] {
         let x0 = Double(o.x) - r.across / 2, x1 = Double(o.x + o.w) + r.across / 2
@@ -5475,7 +5475,12 @@ public enum FrameStack {
             out += [Gem(x: x0, y: y0, size: corner, place: "top-left"), Gem(x: x1, y: y0, size: corner, place: "top-right"),
                     Gem(x: x0, y: y1, size: corner, place: "bottom-left"), Gem(x: x1, y: y1, size: corner, place: "bottom-right")]
         }
-        if slots.contains(.crest) { out.append(Gem(x: Double(o.x) + Double(o.w) / 2, y: y0 - max(0, r.crest - r.down) * 0.45, size: t * 1.05, place: "crest")) }
+        // Up at the frame's top edge, a crest above the rim, so HP1's head can break out under it:
+        // on the rim's centre line it sat where the head goes (2026-10-02).
+        if slots.contains(.crest) {
+            out.append(Gem(x: Double(o.x) + Double(o.w) / 2, y: min(Double(o.y) - r.down * 0.85, y0 - max(0, r.crest - r.down) * 0.45),
+                           size: t * 1.05, place: "crest"))
+        }
         return out
     }
 
@@ -5607,6 +5612,22 @@ public enum FrameStack {
         case "pink": return 350
         case "brown": return 25
         default: return nil
+        }
+    }
+
+    /// How saturated and how light a planned colour's panel is, against the plain tint's (0.6, 1):
+    /// at one saturation and depth brown came out rust-orange and gold an olive mustard (2026-10-02).
+    /// White and black are near-neutral, white pale. ponytail: by eye from one set; tune on more.
+    public static func tone(named name: String?) -> (saturation: Double, lightness: Double) {
+        switch (name ?? "").lowercased().trimmingCharacters(in: .whitespaces) {
+        case "gold": return (0.8, 1.3)
+        case "yellow": return (0.8, 1.35)
+        case "orange": return (0.75, 1.1)
+        case "brown": return (0.45, 0.8)
+        // White and black set on contrast: a white goose on a pale panel, a black key on a dark one, vanish.
+        case "white": return (0.35, 0.85)
+        case "black": return (0.15, 1.2)
+        default: return (0.6, 1)
         }
     }
 
@@ -5838,14 +5859,19 @@ public enum FrameStack {
     /// window's floor — so a tall symbol breaks out over the top of the frame, as the painted ones
     /// and the shipped sets' do, and never out of the bottom.
     /// A side it is cut along runs on past the window by `tuck` of the window, to be clipped there.
+    /// `ceiling`, a y it may not rise above.
     public static func placement(subject e: (x: Int, y: Int, w: Int, h: Int), window o: (x: Int, y: Int, w: Int, h: Int),
                                  cut: Cut = Cut(), width: Double = 0.96, height: Double = 1.12,
-                                 tuck: Double = 0.04) -> (x: Double, y: Double, w: Double, h: Double) {
-        let scale = min(width * Double(o.w) / Double(max(1, e.w)), height * Double(o.h) / Double(max(1, e.h)))
-        let w = Double(e.w) * scale, h = Double(e.h) * scale
+                                 tuck: Double = 0.04, ceiling: Double? = nil) -> (x: Double, y: Double, w: Double, h: Double) {
+        var scale = min(width * Double(o.w) / Double(max(1, e.w)), height * Double(o.h) / Double(max(1, e.h)))
         let ox = Double(o.x), oy = Double(o.y), ow = Double(o.w), oh = Double(o.h)
-        var x = ox + (ow - w) / 2, y = oy + oh * 0.97 - h
-        if cut.bottom { y = oy + oh * (1 + tuck) - h } else if cut.top { y = oy - oh * tuck }
+        // Standing on its floor, it rises no higher than `ceiling`: HP1's head stops under its crest
+        // jewel rather than hiding it (2026-10-02).
+        let floor = cut.bottom ? oy + oh * (1 + tuck) : oy + oh * 0.97
+        if let c = ceiling, !cut.top, floor - Double(e.h) * scale < c { scale = max(0, floor - c) / Double(max(1, e.h)) }
+        let w = Double(e.w) * scale, h = Double(e.h) * scale
+        var x = ox + (ow - w) / 2, y = floor - h
+        if cut.top { y = oy - oh * tuck }
         if cut.left && !cut.right { x = ox - ow * tuck } else if cut.right && !cut.left { x = ox + ow * (1 + tuck) - w }
         return (x, y, w, h)
     }
@@ -8738,9 +8764,9 @@ public enum SlotArtDirection {
       high pay.
     - The gap between HP1 and LP1 should be obvious side by side: HP1 is the single most
       desirable object in the game, LP1 is plain by comparison.
-    - HP are the most prized subjects of this world — characters or objects, whichever the
-      theme is made of; MP are its supporting cast (creatures or objects, never human); LP
-      are the plain foundation.
+    - HP are this world's living cast, in story order — or its most prized objects, in a
+      theme made of objects; MP, set apart from them, are its lore items; LP are the plain
+      foundation. A tier is all living or all items, never mixed.
     - All LP symbols are the SAME family — all card ranks, or all gems, or all icons.
       Never mixed.
     - The wild, the scatter and the bonus each read as SPECIAL at a glance — their own
@@ -8778,9 +8804,9 @@ public enum SlotArtDirection {
             let frame: String
             switch t {
             case 1: frame = "The tightest crop and the most ornate thing in the entire game. A character: head and upper shoulders only, eyes large and frontal, direct eye contact, an expression of authority. Or, if an object instead: the single most precious object in the game. Ornament concentrated in one or two places — a crown, a jewelled band — not spread over everything."
-            case 2: frame = "A little wider than HP1 — head, neck and upper chest — and visibly less ornate. As an object: premium, but clearly second to HP1's. Where it looks is a character choice, not a rank: HP2 does not have to look away from the player."
-            case 3: frame = "Wider still: a bust, with distinctive accessories that establish who or what this is. Noticeably simpler than HP2."
-            default: frame = "The widest and plainest of the high pays — full costume or full object visible, clean lines, the least ornament of the four."
+            case 2: frame = "A little wider than HP1 — head and full shoulders, not the chest — and visibly less ornate. As an object: premium, but clearly second to HP1's. Where it looks is a character choice, not a rank: HP2 does not have to look away from the player."
+            case 3: frame = "Wider still: head, shoulders and the top of the chest, with distinctive accessories that establish who or what this is. Noticeably simpler than HP2."
+            default: frame = "The widest and plainest of the high pays — head down to the chest, or the whole object — clean lines, the least ornament of the four."
             }
             return """
             HIGH PAY \(t) of 4 — "the rulers". \(frame)
@@ -8789,16 +8815,16 @@ public enum SlotArtDirection {
             The four high pays are a LADDER and a player must be able to rank them at a glance,
             side by side, without knowing the paytable. Each step down loses something specific
             and visible: less precious material (gold, then bronze, then wood or stone), fewer
-            gems, less ornament, cooler colour, less light on it. Do not make a lower tier
-            smaller to say it is worth less — make it plainer.
+            gems, less ornament, cooler colour, less light on it — and it sits smaller in its
+            frame: HP1 fills its frame and breaks out over it, each rank below sits further inside.
             \(t == 1 ? "HP1 is the single most desirable object in the entire game. If it does not look like the thing the player most wants to land, it is wrong." : "")
             """
         case .mediumPay:
             let t = tier ?? 1
             return """
-            MEDIUM PAY \(t) — the middle band of the paytable. Objects, creatures, characters \
-            and artefacts are all fair game — there is no rule against a person here; what \
-            matters is that it sits clearly between the high pays and the low pays. \
+            MEDIUM PAY \(t) — the middle band of the paytable, set apart from the high pays: one of \
+            this theme's lore items, an object its story turns on, never a character. It sits \
+            clearly between the high pays and the low pays, whole, in a plain frame with no gems. \
             Clearly richer than the low pays and clearly subordinate to the high pays: fewer \
             decorative elements than a high pay, more than a low pay, and less of them with each \
             step down the medium-pay tiers. Curved, organic shape language. Moderate saturation.
@@ -10039,6 +10065,8 @@ public enum GDDAssetPrompts {
           fruit), one hero, several, a hero and a villain, enemies, companions, creatures or
           supporting characters — whatever is there. Never invent one the theme does not have,
           and where the theme card asks for one lead ("pick one goddess concept"), keep to one.
+          Living things a symbol shows are cast too — creatures, and anything that speaks, sings or
+          moves of its own accord (a singing harp) — so a symbol's "cast" says it is alive.
           For each: "name"; "kind", one word; "look", under 40 words — build, face and hair,
           costume, signature colours and props, enough that every picture of them is plainly the
           same person; and "inArt": true when it is the figure in the theme's reference art.
@@ -10063,6 +10091,11 @@ public enum GDDAssetPrompts {
           (the game prints those at runtime; a card royal is its letter). It must agree with the
           symbol's "hue" and "shape": a symbol labelled red whose subject reads "a gold coin"
           will be drawn gold — the label changes nothing in the picture.
+        - SILHOUETTE: its form in one or two words. A character shown as a bust names its crop, and
+          the crop widens by rank, so the top pays are the closest: HP1 "head-and-shoulders bust",
+          HP2 "bust with full shoulders", HP3 "bust to the upper chest", HP4 "bust to the chest",
+          lower "waist-up bust". A creature or living thing a crop would spoil — a bird, a harp — is
+          shown whole.
         - Every symbol must be told apart INSTANTLY by its OUTLINE and its COLOUR, not only by
           what is painted inside it — and never by colour alone:
           * "shape" is the OUTER outline class, frame included: \(SetDesignRules.shapes.joined(separator: ", ")).
@@ -10115,7 +10148,7 @@ public enum GDDAssetPrompts {
         - FRAMES follow the symbol's type, as in this studio's shipped games. Every HIGH PAY sits
           in a frame: HP2 and up share ONE square frame, the same construction recoloured by rank,
           and HP1's is a richer version of that same frame. The MEDIUM PAYS share one plainer square
-          frame of their own. Describe these frames in "families" (highPayFrame, hp1Frame,
+          frame of their own, with no gems. Describe these frames in "families" (highPayFrame, hp1Frame,
           mediumPayFrame); they are drawn once and every pay symbol is painted into a copy, so a
           pay symbol's subject never describes its frame. The top pays' frames are set with gems:
           write in "gems" the gem this theme would use — what it is, its cut and its setting, never
@@ -10212,16 +10245,14 @@ public enum GDDAssetPrompts {
         }
         if roles.contains(.wild) {
             lines.append("- WILD: a specific character, emblem, animal or signature object from "
-                       + "this theme. NOT a vortex, swirl, spiral or abstract energy — that is "
+                       + "this theme — a lead the pays had no room for, the game's emblem, or its "
+                       + "signature item. NOT a vortex, swirl, spiral or abstract energy — that is "
                        + "the weakest answer and every game already has one.")
         }
         if roles.contains(.lowPay) {
             lines.append(lowPayBrief(jobs.filter { $0.role == .lowPay }, kind: lowPays, custom: custom))
         }
-        if roles.contains(.highPay) {
-            lines.append("- HIGH PAYS: rankable at a glance, HP1 the most desirable object in "
-                       + "the game and each one below it visibly less so.")
-        }
+        lines += PayLadder.plannerLines(jobs, lowPays: lowPays)
         if roles.contains(.scatter) && roles.contains(.bonus) {
             lines.append("- SCATTER and BONUS must be impossible to confuse: different subject and "
                        + "different colour.")
@@ -10814,6 +10845,13 @@ public enum GDDAssetPrompts {
                                          "enchanted", "ornate", "giant", "great", "the",
                                          "shining", "sparkling", "bright", "large", "small"]
 
+    /// A bust's crop words, which a rank ladder of busts shares by design (PayLadder.crop).
+    static let cropWords: Set<String> = ["bust", "portrait", "head", "shoulders", "chest", "waist", "upper", "full", "with"]
+    static func cropless(_ j: AssetJob) -> Set<String> {
+        let w = significantWords(j.silhouette)
+        return w.contains("bust") || w.contains("portrait") ? w.subtracting(cropWords) : w
+    }
+
     /// The words in a silhouette that actually distinguish it.
     static func significantWords(_ s: String) -> Set<String> {
         Set(s.lowercased()
@@ -10844,8 +10882,7 @@ public enum GDDAssetPrompts {
                 // "wooden (LP1…LP4)" or "chest (JP1…JP4)" told the user their correct set
                 // was broken. Two members of a family clash only when literally identical.
                 if named[i].role == named[k].role && named[i].role.isFamily { continue }
-                let shared = significantWords(named[i].silhouette)
-                    .intersection(significantWords(named[k].silhouette))
+                let shared = cropless(named[i]).intersection(cropless(named[k]))
                 guard let word = shared.sorted().first else { continue }
                 out[word, default: []].append(contentsOf: [named[i].id, named[k].id])
             }
@@ -10997,13 +11034,14 @@ public enum FrameRules {
     /// read at reel size. Free-placed by the image model ("all along its rim") they came back
     /// scattered and uneven (2026-10-02). HP1's are the top symbol's: its four corners and a larger
     /// jewel in its crest (the artist's pick over eight, 2026-10-02); a metal ladder ranks by
-    /// metal, with the one crest jewel; jewelled corners put a gem at each corner of the rest,
-    /// unless a gem ladder keeps them plain.
+    /// metal, with the one crest jewel; jewelled corners put a gem at each corner of the other
+    /// high pays, unless a gem ladder keeps them plain. The medium pays never have gems.
     public static func gemSlots(rank: Int, role: SlotSymbolRole, design: SetDesign) -> [GemSlot] {
         let ladder = RankLadder(design), jewelled = FrameStyle(design) == .jewelled
         if role == .highPay && rank == 1 { return ladder == .metal && !jewelled ? [.crest] : [.corners, .crest] }
         if role == .highPay && rank == 2 && ladder == .gems { return [.corners] }
-        return jewelled && !(role == .highPay && ladder == .gems) ? [.corners] : []
+        // The medium pays never: they are set apart from the high pays (the art director, 2026-10-02).
+        return jewelled && role == .highPay && ladder != .gems ? [.corners] : []
     }
     /// Whether a frame is drawn with gems in it — a painted set's; a layered set's frames have none.
     public static func hasGems(_ ref: Ref, _ design: SetDesign) -> Bool {
@@ -11047,7 +11085,7 @@ public enum FrameWriter {
         Write them again in that style, made from this theme's own materials and motifs:
         - highPayFrame: the high pays' square frame — material, rim profile and corner ornaments, not the panel inside it; under 25 words.
         - hp1Frame: how HP1's version of that frame is richer, with the same window; under 25 words.
-        - mediumPayFrame: the medium pays' plainer square frame, of the same family; under 25 words.
+        - mediumPayFrame: the medium pays' plainer square frame, of the same family, with no gems; under 25 words.
         - gems: the gem the top pays' frames are set with, in this theme's own terms — what it is, its cut and its setting, never its colour; under 15 words.
         Answer with this JSON and nothing else: {"highPayFrame": "…", "hp1Frame": "…", "mediumPayFrame": "…", "gems": "…"}
         """
@@ -11103,6 +11141,110 @@ public struct GemPass: Codable, Equatable, Sendable {
         window.count == 4 ? (window[0], window[1], window[2], window[3]) : (0, 0, 0, 0)
     }
     public static func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+}
+
+/// Who and what each pay tier is, and how big each pay sits in its frame — the art director's
+/// rules (2026-10-02), which shipping beanstalk slots bear out (Jack and the Giant are HP1 and HP2
+/// in all five found). The high pays are the theme's living cast in story order; the medium pays,
+/// set apart from them, its lore items, in plainer frames with no gems; a tier is never mixed; and
+/// when the medium pays are the items, the low pays are royals or gems. By rank, HP1 fills its
+/// frame and breaks out over its top and sides, HP2 is large but less so and shows more of its
+/// shoulders, and each rank below shows more of the body and sits further inside.
+public enum PayLadder {
+    /// A pay's rank in its tier, from 1, by its number.
+    public static func rank(_ job: AssetJob, in jobs: [AssetJob]) -> Int {
+        let tier = jobs.filter { $0.kind == .symbol && $0.role == job.role }.map(\.id)
+        return ReviewOrder.sequence(tier).firstIndex(of: job.id).map { $0 + 1 } ?? 1
+    }
+    /// Whether a symbol shows one of the cast: a character, a creature, a thing that lives.
+    public static func living(_ job: AssetJob) -> Bool { !job.cast.trimmingCharacters(in: .whitespaces).isEmpty }
+    /// A living pay planned as a bust ("hero bust", "head-and-shoulders portrait").
+    static func bust(_ job: AssetJob) -> Bool {
+        let s = job.silhouette.lowercased()
+        return living(job) && ["bust", "portrait", "head", "shoulders", "waist"].contains { s.contains($0) }
+    }
+
+    /// How much of a bust shows, by rank, cut off straight across so the cut sets behind its
+    /// frame's rim (FrameStack.cut). Nil for anything shown whole.
+    public static func crop(_ job: AssetJob, in jobs: [AssetJob]) -> String? {
+        guard bust(job), FrameRules.sharedTiers.contains(job.role) else { return nil }
+        if job.role == .mediumPay { return "from the waist up, cut off straight across at the waist" }
+        switch rank(job, in: jobs) {
+        case 1: return "a close head-and-shoulders portrait, the head large, cut off straight across just below the shoulders"
+        case 2: return "head and full shoulders, cut off straight across at the top of the chest"
+        case 3: return "head, shoulders and the top of the chest, cut off straight across there"
+        case 4: return "head down to the chest, cut off straight across below it"
+        default: return "from the waist up, cut off straight across at the waist"
+        }
+    }
+
+    /// How a high pay sits in its frame, by rank, when painted into it; "" for the rest, which
+    /// sit inside theirs as painting into a frame already does.
+    public static func inFrame(_ job: AssetJob, in jobs: [AssetJob]) -> String {
+        guard job.role == .highPay else { return "" }
+        switch rank(job, in: jobs) {
+        case 1: return "It fills its frame, and its top and sides break out over the frame's rim."
+        case 2: return "It is large in its frame, its top rising a little over the frame's upper rim."
+        default: return "It sits inside its frame's window, close to the rim."
+        }
+    }
+    /// The crop and the frame lines together, each led by a space; "" when there are none.
+    static func lines(_ job: AssetJob, in jobs: [AssetJob], painted: Bool) -> String {
+        [crop(job, in: jobs).map { "It is shown as \($0)." }, painted ? inFrame(job, in: jobs) : nil]
+            .compactMap { $0 }.filter { !$0.isEmpty }.map { " " + $0 }.joined()
+    }
+
+    /// The most of its window a layered pay may take, across and down (FrameStack.placement): past
+    /// 1 it breaks out over the rim. HP1's reach is measured in its frame's own rim — `rim` is its
+    /// thickness across and down as shares of the window (FrameStack.rim) — so its shoulders reach
+    /// well over each side and its head the frame's outer edge, however thick the frame: a fixed 16%
+    /// stopped halfway up one frame's rim (2026-10-02). The ladder is the art director's; the
+    /// numbers are not published anywhere, so these are the knob to tune.
+    public static func fit(_ job: AssetJob, in jobs: [AssetJob], rim: (across: Double, down: Double)? = nil) -> (width: Double, height: Double) {
+        let r = rim ?? (0.22, 0.22)
+        if job.role != .highPay { return (0.86, 0.88) }
+        switch rank(job, in: jobs) {
+        case 1: return (1 + 1.2 * r.across, 1.04 + r.down)
+        case 2: return (1.0, 1.04 + 0.3 * r.down)
+        case 3: return (0.94, 0.98)
+        default: return (0.9, 0.92)
+        }
+    }
+
+    /// The tiers' rules for the planner, for the tiers this set has.
+    public static func plannerLines(_ jobs: [AssetJob], lowPays: LowPayKind) -> [String] {
+        let has = { (r: SlotSymbolRole) in jobs.contains { $0.kind == .symbol && $0.role == r } }
+        var out: [String] = []
+        if has(.highPay) {
+            out.append("- HIGH PAYS, rankable at a glance, are this theme's LIVING CAST, in story order: the hero at HP1, then the villain or second lead, then its creatures — "
+                     + "and anything in the story that speaks, sings or moves of its own accord counts as living (a harp that sings, a talking mirror). "
+                     + "Each names its character in \"cast\". Never an item ranked above a living one; only when the story has fewer living beings than "
+                     + "high pays do the last ones become its most precious treasures. A theme made of objects (fruit, gems, cars) ranks its most prized objects instead.")
+        }
+        if has(.mediumPay) {
+            out.append("- MEDIUM PAYS are set apart from the high pays: this theme's LORE ITEMS — the objects its story turns on (in a fairy tale, the magic "
+                     + "beans or the bag of gold), never a character or creature, even one the high pays had no room for. All of them items, whole and "
+                     + "plainer than any high pay, in a plainer frame with no gems.")
+        }
+        if has(.lowPay) && has(.mediumPay) && [.royals, .gemstones].contains(lowPays) {
+            out.append("- With the medium pays as the lore items, the LOW PAYS stay \(lowPays == .royals ? "card ranks" : "gemstones"): never a second row of items.")
+        }
+        out.append("- Below the high pays, a tier is ALL living or ALL items, never mixed. A lead with no pay slot may be the wild or a feature symbol.")
+        return out
+    }
+
+    /// What a plan gets wrong about who is in which tier.
+    public static func problems(_ jobs: [AssetJob]) -> [String] {
+        var out: [String] = []
+        let hps = jobs.filter { $0.kind == .symbol && $0.role == .highPay && !$0.subject.isEmpty }.sorted { rank($0, in: jobs) < rank($1, in: jobs) }
+        if let item = hps.firstIndex(where: { !living($0) }), let after = hps[item...].first(where: living) {
+            out.append("\(hps[item].id) is an item ranked above \(after.id), who shows \(after.cast): the living cast takes the top high pays, in story order.")
+        }
+        for m in jobs where m.kind == .symbol && m.role == .mediumPay && living(m) {
+            out.append("\(m.id) shows \(m.cast), but the medium pays are this theme's lore items, set apart from the high pays: give it an object from the story.")
+        }
+        return out
+    }
 }
 
 /// How the high pays' frames show their rank, the GDD window's "High-pay ranks". One frame: HP1
@@ -11183,8 +11325,9 @@ public enum FrameStyle: String, CaseIterable, Sendable {
     public static func spec(_ design: SetDesign, highPay: Bool) -> String? {
         let style = FrameStyle(design)
         if style == .fromTheme || written(design) { return design.families[highPay ? "highPayFrame" : "mediumPayFrame"] }
-        // A gem ladder places the gems itself: its shared frame is the plain rung, jewelled or not.
-        let base = style == .jewelled && (RankLadder(design) == .gems || Framing(design) == .layered) ? "a square metal frame with a bevelled rim" : style.preset
+        // A gem ladder places the gems itself: its shared frame is the plain rung, jewelled or not;
+        // and the medium pays' frame never has gems.
+        let base = style == .jewelled && (!highPay || RankLadder(design) == .gems || Framing(design) == .layered) ? "a square metal frame with a bevelled rim" : style.preset
         let text = (style == .custom ? design.families[key] ?? "" : base) + ", made from this theme's own materials and motifs"
         return highPay ? text : "\(text), plainer than the high pays' — a simpler material and less ornament"
     }
@@ -11459,7 +11602,7 @@ public enum SetDesignRules {
                                 reserved: Set<String> = [], lowPays: LowPayKind? = nil) -> [String] {
         let syms = jobs.filter { $0.kind == .symbol && !$0.subject.isEmpty }
         guard syms.count >= 2 else { return [] }
-        var out: [String] = []
+        var out: [String] = PayLadder.problems(jobs)
 
         // 0. The backing's own colours stay off the symbols.
         for s in syms where reserved.contains(s.hue) {
@@ -12824,9 +12967,11 @@ extension GDDAssetPrompts {
             if !j.hue.isEmpty { line += " Dominant colour: \(j.hue)." }
             let f = j.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
             if !f.isEmpty { line += " Finish: \(f)." }
+            if let c = PayLadder.crop(j, in: jobs) { line += " Shown as \(c)." }
             if intoFrames {
                 let rank = i < step.frames.count ? FrameRules.parse(step.frames[i])?.rank ?? 0 : 0
-                line += " In frame \(i + 1)\(rank == 1 ? ", the top symbol's richer frame" : rank == 2 ? ", the second symbol's frame" : "")."
+                let fits = PayLadder.inFrame(j, in: jobs)
+                line += " In frame \(i + 1)\(rank == 1 ? ", the top symbol's richer frame" : rank == 2 ? ", the second symbol's frame" : "").\(fits.isEmpty ? "" : " " + fits)"
             } else if Framing.stacks(j, design) {
                 line += " Drawn on its own, with no frame: it is set into its tier's frame afterwards."
             } else if role != .lowPay {
@@ -12927,7 +13072,7 @@ extension GDDAssetPrompts {
             let whose = f.premium ? "HP1's frame, the top symbol's" : f.rank == 2 ? "HP2's frame, the second symbol's" : "the frame shared by this game's \(f.role == .highPay ? "high pays" : "medium pays")"
             return ([
                 "Edit the last attached image: it is \(whose), empty, for \(game). Paint \(displayName(job)) into it.\(isAnchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : "")",
-                "THE SYMBOL: \(what). \(roleLine(job, jobs: jobs, design: design))\(hue)",
+                "THE SYMBOL: \(what). \(roleLine(job, jobs: jobs, design: design))\(hue)\(PayLadder.lines(job, in: jobs, painted: true))",
                 "THE FRAME: \(keepFrame(design, gems: FrameRules.hasGems(f, design)))\(others.refs.isEmpty ? "" : " The other attached images are for the look only: their frames are not this symbol's.")",
             ] + referenceLines(others, job: job, jobs: jobs, anchorID: SetDesignRules.anchor(jobs, design)?.id, design: design) + [
                 "THE LOOK OF THIS SET: \(look)",
@@ -12939,10 +13084,11 @@ extension GDDAssetPrompts {
         let first = step.mode == .anchor ? " It is the first symbol of the set, and every other symbol will be drawn to match it." : ""
         let outline = job.shape.isEmpty ? "a distinctive outline" : outlinePhrase(job.shape)
         let form = job.silhouette.isEmpty ? "" : " — \(job.silhouette)"
+        let crop = PayLadder.crop(job, in: jobs)
         let frame = alone
-            ? " It is drawn on its own — no frame, panel, card, badge or backdrop behind it — and is set into a square frame afterwards, so it fills a square: about as wide as it is tall, whole and uncropped."
+            ? " It is drawn on its own — no frame, panel, card, badge or backdrop behind it — and is set into a square frame afterwards, so it fills a square: about as wide as it is tall\(crop == nil ? ", whole and uncropped." : ".")\(PayLadder.lines(job, in: jobs, painted: false))"
             : job.hasFrame
-            ? " It sits in a frame drawn as part of the same painting and lit with it, and the frame gives it \(outline)."
+            ? " It sits in a frame drawn as part of the same painting and lit with it, and the frame gives it \(outline).\(PayLadder.lines(job, in: jobs, painted: FrameRules.sharedTiers.contains(job.role)))"
             : " No frame: it stands on its own silhouette, \(outline)\(form).\(wholeFigure(job))"
         return ([
             "Create one reel symbol for \(game).\(first)",
@@ -13011,10 +13157,15 @@ extension GDDAssetPrompts {
             let role = roleLine(job, jobs: jobs, design: design)
             if !role.isEmpty { facts.append(role) }
             if !job.hue.isEmpty { facts.append("Dominant colour: \(job.hue).") }
-            facts.append(job.hasFrame && FrameRules.sharedTiers.contains(job.role)
-                ? "It is painted into its tier's frame, which is drawn separately and shared by the whole tier: describe only what sits inside the frame, and whether part of it breaks out over the frame's edge. Never describe the frame itself."
+            // A layered pay is drawn alone: told about its frame, the writer wrote "breaks past the
+            // upper frame boundary" into a clause that also held Jack's raised bean.
+            facts.append(Framing.stacks(job, design)
+                ? "It is drawn on its own and set into its tier's frame afterwards: never mention a frame, border or edge."
+                : job.hasFrame && FrameRules.sharedTiers.contains(job.role)
+                ? "It is painted into its tier's frame, which is drawn separately and shared by the whole tier: describe only what sits inside the frame.\(PayLadder.lines(job, in: jobs, painted: true)) Never describe the frame itself."
                 : job.hasFrame ? "It sits in a frame, and the frame gives it \(outlinePhrase(job.shape))."
                 : "No frame: it stands on its own silhouette, \(outlinePhrase(job.shape)).\(wholeFigure(job))")
+            if Framing.stacks(job, design), let c = PayLadder.crop(job, in: jobs) { facts.append("It is shown as \(c).") }
             if let w = who { facts.append("It shows \(w.name): \(w.inArt ? Self.inArtLook : w.look)") }
         }
         let words = job.kind == .background ? "100 to 160" : onSheet ? "50 to 90" : "80 to 150"
@@ -13044,16 +13195,16 @@ extension GDDAssetPrompts {
             level, like the rest of the reel: a coin, medallion, shield, crest or letter is seen face-on, \
             never tilted, turned or seen edge-on, and its depth comes from light and bevels, not from \
             turning it. A character may turn their head or body within the pose, but the symbol as a \
-            whole sits straight. Then how it fills the space\(job.hasFrame ? ", and whether part of it overlaps or breaks out of its frame" : "").
+            whole sits straight. Then how it fills the space.
             3. The one eye-catching detail a player notices first.
             4. Its materials and surfaces and where the light catches them, in this set's rendering.
             5. Its colour and its finish, as planned.
             Keep everything decided for it — subject, colour, outline, frame and finish — and make it \
             vivid rather than changing it. It must be clearly different from every other symbol listed.
-            It is drawn on a flat green screen that is keyed out afterwards (a production step, not a \
-            look). An outer glow is welcome where the symbol calls for it — a wild, a special, a prize — \
-            as a soft glow hugging its silhouette in its own colours, never green; a plain symbol needs \
-            none. No rays, sparkles or backdrop filling the square, and nothing described behind it: \
+            It is drawn on a flat backing colour that is keyed out afterwards (a production step, not a \
+            look, and never named in the prompt). An outer glow is welcome where the symbol calls for it — \
+            a wild, a special, a prize — as a soft glow hugging its silhouette in its own colours; a plain \
+            symbol needs none. No rays, sparkles or backdrop filling the square, and nothing described behind it: \
             no "against" anything, no sky, darkness or backdrop. \
             Leave out any backing colour, words or numbers, reels, interface and the other symbols: \
             those are handled separately. Never write a slot code such as HP2.
@@ -13324,13 +13475,26 @@ extension GDDAssetPrompts {
 
     /// A brief written for a symbol painted into its frame, for the same symbol drawn on its own:
     /// the clauses that place it against the frame ("breaking out over the upper frame edge") go.
-    // ponytail: a clause filter; the real fix is a brief step told the symbol stands alone.
+    /// Briefs written since are told the symbol stands alone (symbolBrief); this cleans older ones.
+    /// A clause that places the subject against the frame loses only that placing: "thrusting a
+    /// magic bean aloft in his raised hand so it breaks cleanly past the upper frame boundary"
+    /// keeps the bean. And the brief writer's old "on a flat green screen" goes, whatever the backing.
     static func withoutFrame(_ text: String) -> String {
         let words = ["frame", "boundary", "border"]
-        return text.components(separatedBy: ". ").map { sentence -> String in
+        // Only where the placing is its own clause: before "breaking out over…" there is only a noun.
+        let joins = [" so it ", " so that ", " so they ", " that ", " which ", " until it "]
+        let cleaned = text.replacingOccurrences(of: #"\s*(on|against) a flat green screen"#, with: "", options: .regularExpression)
+        return cleaned.components(separatedBy: ". ").map { sentence -> String in
             let ends = sentence.hasSuffix(".")
             let parts = (ends ? String(sentence.dropLast()) : sentence).components(separatedBy: ",")
-            let kept = parts.filter { p in !words.contains { p.lowercased().contains($0) } }
+            let kept = parts.compactMap { p -> String? in
+                let low = p.lowercased()
+                guard let hit = words.compactMap({ low.range(of: $0)?.lowerBound }).min() else { return p }
+                // Cut at the last such join before the frame word; with none, the clause is only placing.
+                guard let cut = joins.compactMap({ j in low.range(of: j, options: .backwards, range: low.startIndex..<hit)?.lowerBound }).max(),
+                      low.distance(from: low.startIndex, to: cut) > 12 else { return nil }
+                return String(p[..<cut])
+            }
             return kept.isEmpty ? "" : kept.joined(separator: ",") + (ends ? "." : "")
         }.filter { !$0.isEmpty }.joined(separator: ". ")
     }

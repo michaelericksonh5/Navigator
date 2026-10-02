@@ -8877,8 +8877,10 @@ final class ArtDirectionQualityTests: XCTestCase {
     }
 
     // "Never a human" in medium pays had no basis.
-    func testMediumPayDoesNotBanPeople() {
-        XCTAssertFalse(SlotArtDirection.direction(for: .mediumPay, tier: 1).contains("never a human"))
+    // The medium pays are set apart from the high pays: lore items (the art director, 2026-10-02).
+    func testMediumPaysAreLoreItems() {
+        let mp = SlotArtDirection.direction(for: .mediumPay, tier: 1)
+        XCTAssertTrue(mp.contains("lore items") && mp.contains("never a character") && mp.contains("no gems"), mp)
     }
 
     // The high pays are a ladder a player can rank without the paytable.
@@ -8888,8 +8890,10 @@ final class ArtDirectionQualityTests: XCTestCase {
         XCTAssertTrue(one.contains("most desirable object in the entire game"))
         XCTAssertFalse(four.contains("most desirable object in the entire game"))
         XCTAssertTrue(one.contains("LADDER"))
-        // Value is lost by becoming plainer, not by becoming smaller.
-        XCTAssertTrue(one.contains("Do not make a lower tier"))
+        // And by sitting smaller in its frame: HP1 breaks out over it (the art director, 2026-10-02).
+        XCTAssertTrue(one.contains("HP1 fills its frame and breaks out over it"), one)
+        XCTAssertFalse(one.contains("Do not make a lower tier"))
+        XCTAssertTrue(SlotArtDirection.direction(for: .highPay, tier: 2).contains("head and full shoulders, not the chest"))
     }
 
     // Richer = higher paying, warmth as a preference with an honest escape for cool themes —
@@ -12490,7 +12494,8 @@ final class FrameRanksTests: XCTestCase {
         XCTAssertEqual(FrameRules.gemSlots(rank: 1, role: .highPay, design: metal), [.crest])
         XCTAssertEqual(Set(FrameRules.gemSlots(rank: 1, role: .highPay, design: design(.metal, style: .jewelled))), [.corners, .crest])
         XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .highPay, design: jewelled), [.corners])
-        XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .mediumPay, design: jewelled), [.corners])
+        XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .mediumPay, design: jewelled), [])   // medium pays never
+        XCTAssertFalse(FrameStyle.spec(jewelled, highPay: false)!.contains("gem"))
         XCTAssertEqual(FrameRules.gemSlots(rank: 0, role: .highPay, design: design(.gems, style: .jewelled)), [])
         let hps = (1...4).map { hp($0) }
         XCTAssertEqual(hps.map { FrameRules.rank(of: $0.id, in: hps) }, [1, 2, 0, 0])
@@ -12537,6 +12542,9 @@ final class FrameRanksTests: XCTestCase {
         for g in c.prefix(4) { XCTAssertTrue(c.contains { abs($0.x - (400 - g.x)) < 0.001 && abs($0.y - (400 - g.y)) < 0.001 }) }
         // The crest jewel: centred, larger, raised into the crest by 45% of its rise above the rim.
         XCTAssertEqual(c[4].x, 200); XCTAssertEqual(c[4].y, 75 - 40 * 0.45, accuracy: 0.001); XCTAssertEqual(c[4].size, 31.5, accuracy: 0.001)
+        // A frame with no crest: the jewel sits up at its top edge, a crest above the rim.
+        let flat = FrameStack.gemCentres([.crest], window: win, rim: (40, 30, 30))[0]
+        XCTAssertEqual(flat.y, 90 - 30 * 0.85, accuracy: 0.001)
         XCTAssertEqual(FrameStack.gemCentres([.corners], window: win, rim: r).count, 4)
     }
 
@@ -12792,5 +12800,116 @@ final class PanelHueTests: XCTestCase {
         let c = FrameStack.panelHues([("A", 120, true), ("B", 240, true)], mode: .contrasting, backing: 300)
         XCTAssertGreaterThanOrEqual(FrameStack.hueGap(c["A"]!, 300), 35)
         XCTAssertEqual(c["B"], 60)
+    }
+}
+
+// The art director's tiers (2026-10-02): the living cast at the top, the medium pays set apart as
+// lore items, never a mixed tier; and a crop and size ladder by rank, HP1 breaking out of its frame.
+final class PayLadderTests: XCTestCase {
+    private func pay(_ id: String, _ role: SlotSymbolRole, cast: String = "", silhouette: String = "thing") -> AssetJob {
+        var j = AssetJob(id: id, kind: .symbol, role: role, tier: Int(id.drop { !$0.isNumber }), title: "",
+                         subject: "a \(id) subject", silhouette: silhouette, aspect: "1:1", size: "2K", hasFrame: true)
+        j.cast = cast; j.shape = "square"; j.hue = "teal"
+        return j
+    }
+    private let theme = GameTheme(name: "Jack and the Beanstalk")
+
+    func testTheCropWidensAndTheFitShrinksByRank() {
+        let hps = [pay("HP1", .highPay, cast: "Jack", silhouette: "head-and-shoulders bust"),
+                   pay("HP2", .highPay, cast: "The Giant", silhouette: "bust with full shoulders"),
+                   pay("HP3", .highPay, cast: "The Harp", silhouette: "singing harp"),
+                   pay("HP4", .highPay, cast: "The Hen", silhouette: "bust to the chest")]
+        XCTAssertEqual(hps.map { PayLadder.rank($0, in: hps) }, [1, 2, 3, 4])
+        XCTAssertTrue(PayLadder.crop(hps[0], in: hps)!.contains("head-and-shoulders"))
+        XCTAssertTrue(PayLadder.crop(hps[1], in: hps)!.contains("top of the chest"))
+        XCTAssertNil(PayLadder.crop(hps[2], in: hps))                          // a harp is shown whole
+        XCTAssertTrue(PayLadder.crop(hps[3], in: hps)!.contains("down to the chest"))
+        XCTAssertNil(PayLadder.crop(pay("HP1", .highPay, silhouette: "bust"), in: hps))   // an item is never cropped
+        let fits = hps.map { PayLadder.fit($0, in: hps) }
+        XCTAssertGreaterThan(fits[0].width, 1); XCTAssertGreaterThan(fits[0].height, 1)   // HP1 breaks out
+        for k in 1..<fits.count { XCTAssertLessThan(fits[k].height, fits[k - 1].height) }
+        XCTAssertLessThan(PayLadder.fit(pay("MP1", .mediumPay), in: hps).height, 1)        // inside its frame
+        // Placed so: HP1's bust runs over both sides of the window and up over its top, cut at its floor.
+        let at = FrameStack.placement(subject: (x: 0, y: 0, w: 900, h: 900), window: (x: 200, y: 200, w: 1000, h: 1000),
+                                      cut: FrameStack.Cut(bottom: true), width: fits[0].width, height: fits[0].height)
+        XCTAssertLessThan(at.x, 200); XCTAssertGreaterThan(at.x + at.w, 1200); XCTAssertLessThan(at.y, 200)
+        // Under a crest jewel whose bottom is at y 150, it stops there, still standing on its floor.
+        let capped = FrameStack.placement(subject: (x: 0, y: 0, w: 900, h: 900), window: (x: 200, y: 200, w: 1000, h: 1000),
+                                          cut: FrameStack.Cut(bottom: true), width: fits[0].width, height: fits[0].height, ceiling: 150)
+        XCTAssertEqual(capped.y, 150, accuracy: 0.01); XCTAssertEqual(capped.y + capped.h, at.y + at.h, accuracy: 0.01)
+        let low = FrameStack.placement(subject: (x: 0, y: 0, w: 900, h: 900), window: (x: 200, y: 200, w: 1000, h: 1000),
+                                       width: fits[3].width, height: fits[3].height)
+        XCTAssertGreaterThan(low.x, 200); XCTAssertGreaterThan(low.y, 200)
+    }
+
+    func testTheTiersAreTheLivingCastThenLoreItemsNeverMixed() {
+        let ok = [pay("HP1", .highPay, cast: "Jack"), pay("MP1", .mediumPay), pay("MP2", .mediumPay)]
+        XCTAssertEqual(PayLadder.problems(ok), [])
+        let itemFirst = [pay("HP1", .highPay, cast: "Jack"), pay("HP2", .highPay), pay("HP3", .highPay, cast: "The Goose")]
+        XCTAssertEqual(PayLadder.problems(itemFirst).count, 1)
+        XCTAssertTrue(PayLadder.problems(itemFirst)[0].hasPrefix("HP2 is an item ranked above HP3"))
+        let livingMP = [pay("HP1", .highPay, cast: "Jack"), pay("MP1", .mediumPay, cast: "The Giant")]
+        XCTAssertTrue(PayLadder.problems(livingMP)[0].contains("the medium pays are this theme's lore items"))
+        // The cast running out is fine: items below the living.
+        XCTAssertEqual(PayLadder.problems([pay("HP1", .highPay, cast: "Jack"), pay("HP2", .highPay)]), [])
+    }
+
+    // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.
+    func testThePlannerIsToldTheTiersOfThisGame() {
+        let chevy = [pay("HP1", .highPay)] + (1...4).map { pay("MP\($0)", .mediumPay) } + [pay("LP1", .lowPay)]
+        let c = GDDAssetPrompts.roleBrief(for: chevy, lowPays: .royals)
+        XCTAssertTrue(c.contains("HIGH PAYS, rankable at a glance, are this theme's LIVING CAST"), c)
+        XCTAssertTrue(c.contains("MEDIUM PAYS are set apart from the high pays: this theme's LORE ITEMS"), c)
+        XCTAssertTrue(c.contains("the LOW PAYS stay card ranks"), c)
+        XCTAssertTrue(c.contains("Below the high pays, a tier is ALL living or ALL items"), c)
+        let tiki = (1...4).map { pay("HP\($0)", .highPay) } + [pay("LP1", .lowPay)]
+        let t = GDDAssetPrompts.roleBrief(for: tiki, lowPays: .royals)
+        XCTAssertTrue(t.contains("LIVING CAST") && !t.contains("MEDIUM PAYS") && !t.contains("LOW PAYS stay"), t)
+        let plan = GDDAssetPrompts.planning(theme: theme, gameName: "G", jobs: chevy)
+        XCTAssertTrue(plan.contains("HP1 \"head-and-shoulders bust\""), plan)
+        XCTAssertTrue(plan.contains("anything that speaks, sings or"), plan)
+        XCTAssertFalse(plan.contains("never human"), plan)
+        XCTAssertFalse(plan.contains("most desirable object in"), plan)
+    }
+
+    func testTheBriefsCarryTheCropAndNoFrameOrGreenScreen() {
+        var hp1 = pay("HP1", .highPay, cast: "Jack", silhouette: "head-and-shoulders bust")
+        hp1.subject = "Jack holding a glowing magic bean aloft."
+        let jobs = [hp1, pay("HP2", .highPay, cast: "The Giant", silhouette: "bust with full shoulders")]
+        let layered = SetDesign(anchorID: "HP1", look: "Glossy.", families: ["framing": Framing.layered.rawValue])
+        let w = GDDAssetPrompts.symbolBrief(job: hp1, jobs: jobs, design: layered, theme: theme)
+        XCTAssertFalse(w.contains("green screen"), w)
+        XCTAssertTrue(w.contains("never mention a frame"), w)
+        XCTAssertTrue(w.contains("It is shown as a close head-and-shoulders portrait"), w)
+        let step = RenderStep(id: "HP1", mode: .anchor, refs: [], after: [])
+        let d = GDDAssetPrompts.brief(job: hp1, step: step, theme: theme, design: layered,
+                                      backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
+        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders portrait, the head large, cut off straight across just below the shoulders."), d)
+        XCTAssertFalse(d.contains("whole and uncropped"), d)
+        // Painted into its frame, HP1 is told to break out of it.
+        let painted = GDDAssetPrompts.symbolBrief(job: hp1, jobs: jobs, design: SetDesign(anchorID: "HP1", look: "Glossy."), theme: theme)
+        XCTAssertTrue(painted.contains("its top and sides break out over the frame's rim"), painted)
+    }
+
+    // An older brief, written for a symbol painted into its frame, keeps what the subject does.
+    func testAnOldBriefKeepsJacksBeanAndLosesTheGreenScreen() {
+        XCTAssertEqual(GDDAssetPrompts.withoutFrame("Jack leans forward, thrusting a brilliant magic bean aloft in his raised hand so it breaks cleanly past the upper frame boundary. A rim light carves his silhouette on a flat green screen."),
+                       "Jack leans forward, thrusting a brilliant magic bean aloft in his raised hand. A rim light carves his silhouette.")
+    }
+
+    func testBustsShareTheirCropWordsWithoutClashing() {
+        let c = GDDAssetPrompts.silhouetteClashes([pay("HP3", .highPay, cast: "Jack", silhouette: "bust to the upper chest"),
+                                                   pay("HP4", .highPay, cast: "Hen", silhouette: "bust to the chest"),
+                                                   pay("MP1", .mediumPay, silhouette: "treasure chest")])
+        XCTAssertTrue(c.isEmpty, "\(c)")
+    }
+
+    func testAPanelTakesItsPlannedColoursLightness() {
+        XCTAssertLessThan(FrameStack.tone(named: "brown").lightness, 1)
+        XCTAssertGreaterThan(FrameStack.tone(named: "gold").lightness, 1)
+        // White and black are set off by lightness: a white symbol's panel darker, a black one's paler.
+        XCTAssertLessThan(FrameStack.tone(named: "white").lightness, 1)
+        XCTAssertGreaterThan(FrameStack.tone(named: "black").lightness, 1)
+        XCTAssertEqual(FrameStack.tone(named: "teal").saturation, 0.6)
     }
 }
