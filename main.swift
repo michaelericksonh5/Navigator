@@ -21500,6 +21500,26 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
     app.run()
 }
 
+// PAID (~$0.10 a frame drawn thicker than planned):  Navigator --finish-frames <set folder> <frame_HP,…>
+// Those frames' inside edges finished at their planned size; their symbols built again.
+if let flag = CommandLine.arguments.firstIndex(of: "--finish-frames"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    let ids = args[flag + 2].split(separator: ",").map(String.init)
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        print(String(format: "FINISHING: %@ — up to $%.2f", ids.joined(separator: ","), Double(ids.count) * nbEstimatedCost(size: "2K", modelFlag: run.modelFlag)))
+        run.finishFrameEdges(ids, folder: folder) {
+            run.stackFramed(folder, only: ids.flatMap { run.frameMembers($0, folder: folder) }) {
+                MainActor.assumeIsolated { print("DONE: \(run.status)"); print(String(format: "SPENT: $%.4f", run.spent)) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { exit(0) }
+            }
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --restack <set folder> [id,id,…]
 // Builds a layered set's framed symbols from their pieces again, as a frame or panel change does.
 if let flag = CommandLine.arguments.firstIndex(of: "--restack"), flag + 1 < CommandLine.arguments.count {
@@ -25397,19 +25417,14 @@ final class GDDToAssetsRun: ObservableObject {
         }
         var r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
         var into = reach(r.png) ?? 0
-        if templated, r.png != nil, into > 0.015 {
-            navLog(String(format: "gdd frame: %@ came back %.1f%% inside its lip — drawing it once more", step.id, into * 100))
-            let again = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
-            r.cost += again.cost
-            if let p2 = again.png, let e2 = reach(p2), e2 < into { r.png = p2; into = e2 }
+        // Thicker than planned on its inside: the overshoot is taken off, and Gemini finishes the new
+        // inside edge as the frame's own narrow lip (finishFrameEdge).
+        if templated, let drawn = r.png, into > 0.015 {
+            let f = finishFrameEdge(drawn, step: step, job: job, model: model, log: log, into: into)
+            r.cost += f.cost; r.png = f.png
         }
-        if templated, r.png != nil {
-            if into <= 0.015 { r.png = cleaned(r.png) }
-            else {
-                navLog(String(format: "gdd frame: %@ is %.1f%% thicker than planned on its inside — kept whole, as drawn; redraw it in review to try again", step.id, into * 100))
-                log.event(["step": "frame-thick", "id": step.id, "inside": into])
-            }
-        }
+        // Whatever reaches past the lip now is a sliver of the new edge: cleaned, so the size is the plan's.
+        if templated, r.png != nil { r.png = cleaned(r.png) }
         if let png = r.png {
             navLog(String(format: "gdd frame: %@ rim %.0f%% of its width", step.id, (sideRim(png) ?? 0) * 100))
             if (try? png.write(to: dst)) != nil { DispatchQueue.main.async { self.framesMade.append(dst) } }
@@ -25419,6 +25434,60 @@ final class GDDToAssetsRun: ObservableObject {
                    "error": r.png == nil ? (r.error ?? "no image returned") : ""])
         navLog(String(format: "gdd frame: %@ → %@ $%.3f %.1fs", step.id, r.png == nil ? "FAILED" : "saved", r.cost, secs))
         DispatchQueue.main.async { self.spent += r.cost }
+    }
+
+    /// A frame drawn thicker than planned on its inside, taken back to its planned opening and its new
+    /// inside edge finished by Gemini as the frame's own narrow lip: the planned size and a designed
+    /// edge (2026-10-02 — asked again, Gemini drew the same thick picture frame; cut alone, it looked
+    /// chopped). Any sliver of the new lip past the plan is cleaned. One edit, ~$0.10.
+    fileprivate func finishFrameEdge(_ drawn: Data, step: RenderStep, job: AssetJob, model: String, log: GDDRunLog, into: Double) -> (png: Data, cost: Double) {
+        let (b, geo, finish) = DispatchQueue.main.sync { () -> (RGB8, FrameGeometry, String) in
+            (self.backing.rgb, FrameGeometry(self.styledDesign),
+             self.theme.map { GDDAssetPrompts.finishInnerEdge(step: step, theme: $0, design: self.styledDesign, backing: (self.backing.name, self.backing.rgb)) } ?? "")
+        }
+        func cleaned(_ png: Data) -> Data {
+            guard let cg = loadCGImage(data: png), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { return png }
+            FrameStack.clearOpening(&px, width: cg.width, height: cg.height, backing: b, geometry: geo)
+            return ChromaKeyOutputRules.image(straightRGBA8: px, width: cg.width, height: cg.height, space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG) ?? png
+        }
+        func reach(_ png: Data) -> Double {
+            guard let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return 0 }
+            return FrameStack.encroachment(px, width: cg.width, height: cg.height, backing: b, geometry: geo) ?? 0
+        }
+        let cutBack = cleaned(drawn)
+        navLog(String(format: "gdd frame: %@ came back %.1f%% inside its lip — taken back to the plan and its inner edge finished", step.id, into * 100))
+        log.write("prompts/\(step.id)-finish.txt", "MODE: frame inner edge\nATTACHED: \(step.id), cut back to its planned opening\n\n\(finish)")
+        let fin = sizedRequest(job, prompt: finish, inputs: [downsamplePNG(cutBack, longEdge: 1536) ?? cutBack], model: model)
+        guard let p2 = fin.png else { return (cutBack, fin.cost) }
+        let e2 = reach(p2)
+        log.event(["step": "frame-finish", "id": step.id, "before": into, "after": e2, "cost": fin.cost])
+        navLog(String(format: "gdd frame: %@ inner edge finished — %.1f%% inside its lip after, cleaned to the plan", step.id, e2 * 100))
+        return (cleaned(p2), fin.cost)
+    }
+
+    private func fm_copy(_ a: URL, to b: URL) throws { try? FileManager.default.removeItem(at: b); try FileManager.default.copyItem(at: a, to: b) }
+
+    /// Paid: the inside edges of frames already drawn, finished at their planned size (finishFrameEdge).
+    func finishFrameEdges(_ ids: [String], folder: URL, done: @escaping () -> Void) {
+        let model = NanoBananaModel.byFlag(modelFlag).id
+        let steps = renderSteps().filter { ids.contains($0.id) && $0.mode == .frame }
+        let size = jobs.first { $0.kind == .symbol }?.size ?? "2K"
+        let log = session(), b = backing.rgb, geo = FrameGeometry(styledDesign)
+        DispatchQueue.global(qos: .userInitiated).async {
+            for st in steps {
+                let u = folder.appendingPathComponent("\(st.id).png")
+                guard let d = try? Data(contentsOf: u), let cg = loadCGImage(data: d), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+                let into = FrameStack.encroachment(px, width: cg.width, height: cg.height, backing: b, geometry: geo) ?? 0
+                guard into > 0.015 else { navLog(String(format: "gdd frame: %@ keeps its lip (%.1f%%) — nothing to finish", st.id, into * 100)); continue }
+                let job = AssetJob(id: st.id, kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: size)
+                let f = self.finishFrameEdge(d, step: st, job: job, model: model, log: log, into: into)
+                try? self.fm_copy(u, to: folder.appendingPathComponent("\(st.id).prev.png"))
+                try? f.png.write(to: u)
+                try? FileManager.default.removeItem(at: folder.appendingPathComponent("\(st.id)_rmbg.png"))
+                DispatchQueue.main.async { self.spent += f.cost }
+            }
+            DispatchQueue.main.async { done() }
+        }
     }
 
     /// The image a framed sheet edits: each member's frame, in the sheet's layout on the flat

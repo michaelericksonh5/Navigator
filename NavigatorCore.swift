@@ -13340,6 +13340,20 @@ extension GDDAssetPrompts {
         ]).joined(separator: "\n\n")
     }
 
+    /// The edit that finishes a frame cut back to its planned opening: Gemini drew the frame's band
+    /// wider than planned, inward, so the overshoot is taken off and the new inside edge is finished
+    /// as the frame's own narrow lip — a slim frame that reads as designed, not one that looks chopped
+    /// (the art director, 2026-10-02), at exactly the planned size.
+    static func finishInnerEdge(step: RenderStep, theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
+        let role = FrameRules.parse(step.id)?.role ?? .highPay
+        return [
+            "Edit the attached image: it is the empty frame of the \(role == .highPay ? "high-pay" : "medium-pay") symbols of a video slot game themed “\(theme.name)”, cut straight along its opening — its inside edge is cut off. Finish that inside edge as part of the frame: a clean, narrow bevelled lip in the frame's own material, colour and light, running all the way round the opening, so the frame reads as a finished, slim frame.",
+            "Change nothing else. The opening stays exactly as large and completely empty — the flat background right up to the new lip, nothing drawn in it. The frame's carving, ornament, outline and size stay exactly as they are.",
+            backdropLine(backing),
+            "No text, lettering or numbers, no watermark, no user interface.",
+        ].joined(separator: "\n\n")
+    }
+
     /// What a symbol painted into a shared frame is told about the frame: it stays, panel
     /// treatment and all, and only the panel's colour changes, as every shipped set recolours its
     /// pay frames by rank.

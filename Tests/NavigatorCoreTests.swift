@@ -13020,6 +13020,14 @@ final class PayLadderTests: XCTestCase {
         XCTAssertFalse(b.contains("The game prints the word WILD"), b)
     }
 
+    // A frame drawn thick inside is taken back to its plan and its new inside edge finished, not left chopped.
+    func testAThickFramesInsideEdgeIsFinishedNotChopped() {
+        let b = GDDAssetPrompts.finishInnerEdge(step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme,
+                                                design: SetDesign(), backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)))
+        XCTAssertTrue(b.contains("cut straight along its opening") && b.contains("a clean, narrow bevelled lip in the frame's own material"), b)
+        XCTAssertTrue(b.contains("The opening stays exactly as large and completely empty"), b)
+    }
+
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.
     func testThePlannerIsToldTheTiersOfThisGame() {
         let chevy = [pay("HP1", .highPay)] + (1...4).map { pay("MP\($0)", .mediumPay) } + [pay("LP1", .lowPay)]
