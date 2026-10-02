@@ -5417,6 +5417,29 @@ public enum LayerizeAssembly {
 public enum FrameStack {
     /// The grey panel every layered pay is set on, drawn once per set.
     public static let panelID = "panel"
+    /// The ring a tier's frame is drawn on (opaque RGBA, `size` square): flat grey on the backing, its
+    /// outer edge `outer` of the image and its rim `rim` of its own width — the studio's frames are
+    /// slim (Tiki Titans' file: rim 8%, window 84%), and told so in words Gemini drew 17–25% rims
+    /// (2026-10-02). Drawn on a guide, as the gems are, the proportions are the code's.
+    static func frameTemplate(size n: Int, backing b: RGB8, outer: Double = 0.85, rim: Double = 0.085) -> [UInt8] {
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        let o0 = Double(n) * (1 - outer) / 2, o1 = Double(n) - o0, t = (o1 - o0) * rim
+        let edge = max(2, Double(n) / 300)
+        for y in 0..<n { for x in 0..<n {
+            let fx = Double(x), fy = Double(y), i = (y * n + x) * 4
+            let inOuter = fx >= o0 && fx < o1 && fy >= o0 && fy < o1
+            let inWindow = fx >= o0 + t && fx < o1 - t && fy >= o0 + t && fy < o1 - t
+            var v: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
+            if inOuter && !inWindow {
+                let nearEdge = min(fx - o0, o1 - fx, fy - o0, o1 - fy) < edge
+                    || min(abs(fx - (o0 + t)), abs(fx - (o1 - t)), abs(fy - (o0 + t)), abs(fy - (o1 - t))) < edge
+                v = nearEdge ? (70, 70, 70) : (140, 140, 140)
+            }
+            px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2
+        } }
+        return px
+    }
+
     /// A gem pass: `gems_<symbol>.png` is the symbol's frame with its rank's gems set in by a guided
     /// edit, `gems_<symbol>.json` where they are (GemPass). One per symbol, in its own colour.
     public static func gemsID(_ symbol: String) -> String { "gems_\(symbol)" }
@@ -5513,6 +5536,21 @@ public enum FrameStack {
         return out
     }
 
+    /// CIE L*a*b* of an sRGB pixel (D65).
+    static func lab(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> (Double, Double, Double) {
+        func lin(_ v: UInt8) -> Double { let c = Double(v) / 255; return c > 0.04045 ? pow((c + 0.055) / 1.055, 2.4) : c / 12.92 }
+        let R = lin(r), G = lin(g), B = lin(b)
+        let x = (0.4124 * R + 0.3576 * G + 0.1805 * B) / 0.9505, y = 0.2126 * R + 0.7152 * G + 0.0722 * B, z = (0.0193 * R + 0.1192 * G + 0.9505 * B) / 1.089
+        func f(_ t: Double) -> Double { t > 0.008856 ? cbrt(t) : 7.787 * t + 16 / 116 }
+        return (116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z)))
+    }
+    static func medianLab(_ px: [UInt8], _ idx: [Int]) -> (Double, Double, Double) {
+        guard !idx.isEmpty else { return (0, 0, 0) }
+        let l = idx.map { lab(px[$0], px[$0 + 1], px[$0 + 2]) }
+        func med(_ v: [Double]) -> Double { v.sorted()[v.count / 2] }
+        return (med(l.map(\.0)), med(l.map(\.1)), med(l.map(\.2)))
+    }
+
     /// WCAG 2.x relative luminance of an sRGB pixel.
     static func luminance(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Double {
         func c(_ v: UInt8) -> Double { let s = Double(v) / 255; return s <= 0.03928 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4) }
@@ -5531,11 +5569,13 @@ public enum FrameStack {
         guard base.count == w * h * 4, edit.count == base.count else { c.problems = ["the edit came back the wrong size"]; return c }
         func lum(_ px: [UInt8], _ i: Int) -> Double { luminance(px[i], px[i + 1], px[i + 2]) }
         // The rim between a corner and the centre, as drawn.
-        var rim: [Double] = []
+        var rim: [Double] = [], rimIdx: [Int] = []
         for y in max(0, Int(Double(o.y) - down * 0.7))..<max(0, Int(Double(o.y) - down * 0.3)) {
-            for x in (o.x + o.w * 3 / 10)..<(o.x + o.w * 4 / 10) where x < w { rim.append(lum(base, (y * w + x) * 4)) }
+            for x in (o.x + o.w * 3 / 10)..<(o.x + o.w * 4 / 10) where x < w { rim.append(lum(base, (y * w + x) * 4)); rimIdx.append((y * w + x) * 4) }
         }
         let lf = rim.isEmpty ? 0 : rim.sorted()[rim.count / 2]
+        let rimLab = medianLab(base, rimIdx)
+        c.colour = []
         var away = [Bool](repeating: true, count: w * h)
         for (n, g) in gems.enumerated() {
             let r = g.size / 2
@@ -5543,16 +5583,23 @@ public enum FrameStack {
             for (x, y, _) in spot(g, radius: r * 1.6, w, h) { away[y * w + x] = false }
             let changed = near.filter { (x, y, _) in let i = (y * w + x) * 4
                 return abs(Int(edit[i]) - Int(base[i])) + abs(Int(edit[i + 1]) - Int(base[i + 1])) + abs(Int(edit[i + 2]) - Int(base[i + 2])) > 60 }.count
-            let core = spot(g, radius: r * 0.55, w, h).map { (x, y, _) in lum(edit, (y * w + x) * 4) }.sorted()
+            let coreIdx = spot(g, radius: r * 0.55, w, h).map { (x, y, _) in (y * w + x) * 4 }
+            let gl = medianLab(edit, coreIdx)
+            c.colour?.append(((gl.0 - rimLab.0) * (gl.0 - rimLab.0) + (gl.1 - rimLab.1) * (gl.1 - rimLab.1) + (gl.2 - rimLab.2) * (gl.2 - rimLab.2)).squareRoot())
+            let core = coreIdx.map { lum(edit, $0) }.sorted()
             let lg = core.isEmpty ? 0 : core[core.count * 3 / 4]
             // A disc left as it was is flat; a gem, even a clear one, is all facets.
             let inner = spot(g, radius: r * 0.8, w, h).map { (x, y, _) -> Double in let i = (y * w + x) * 4
                 return 0.299 * Double(edit[i]) + 0.587 * Double(edit[i + 1]) + 0.114 * Double(edit[i + 2]) }
             let mean = inner.reduce(0, +) / Double(max(1, inner.count))
             let spread = (inner.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(max(1, inner.count))).squareRoot()
-            // Where the gem's light is: its pixels at 2:1 or more against the rim.
+            // Where the gem is: its pixels at 2:1 or more against the rim, or plainly another colour.
             var sx = 0.0, sy = 0.0, k = 0.0
-            for (x, y, _) in near where lum(edit, (y * w + x) * 4) + 0.05 >= 2 * (lf + 0.05) { sx += Double(x); sy += Double(y); k += 1 }
+            for (x, y, _) in near {
+                let i = (y * w + x) * 4, l = lab(edit[i], edit[i + 1], edit[i + 2])
+                let d = ((l.0 - rimLab.0) * (l.0 - rimLab.0) + (l.1 - rimLab.1) * (l.1 - rimLab.1) + (l.2 - rimLab.2) * (l.2 - rimLab.2)).squareRoot()
+                if lum(edit, i) + 0.05 >= 2 * (lf + 0.05) || d >= 50 { sx += Double(x); sy += Double(y); k += 1 }
+            }
             let off = k > 0 ? ((sx / k - g.x) * (sx / k - g.x) + (sy / k - g.y) * (sy / k - g.y)).squareRoot() / g.size : 1
             c.changed.append(Double(changed) / Double(max(1, near.count)))
             c.spread.append(spread)
@@ -5561,7 +5608,11 @@ public enum FrameStack {
             let name = "the \(g.place) gem"
             if c.changed[n] < 0.3 { c.problems.append("\(name) is missing") }
             else if spread < 8 { c.problems.append("\(name) is still a flat disc") }
-            else if c.contrast[n] < 3 { c.problems.append(String(format: "%@ blends into the frame (%.1f:1, needs 3:1)", name, c.contrast[n])) }
+            // Read by lightness (WCAG 2.1's 3:1 for graphics) or by colour: a blue gem on bright gold
+            // is 2.5:1 and plain to see (ΔE 93); gems that blended were ΔE 15–42 (test 1), accepted 78–94.
+            else if c.contrast[n] < 3 && (c.colour?[n] ?? 0) < 60 {
+                c.problems.append(String(format: "%@ blends into the frame (%.1f:1, needs 3:1 or a clear colour difference)", name, c.contrast[n]))
+            }
             else if off > 0.15 { c.problems.append(String(format: "%@ sits off its place (by %.0f%% of its size)", name, off * 100)) }
         }
         var moved = 0, total = 0
@@ -11146,6 +11197,8 @@ public struct Gem: Codable, Equatable, Sendable {
 /// A gem pass checked, gem by gem (FrameStack.check).
 public struct GemCheck: Codable, Equatable, Sendable {
     public var changed: [Double] = [], spread: [Double] = [], offset: [Double] = [], contrast: [Double] = []
+    /// Each gem's colour against the rim's, CIE76 ΔE; nil in passes checked before it was measured.
+    public var colour: [Double]? = nil
     public var drift = 0.0
     public var problems: [String] = []
     public var passed: Bool { problems.isEmpty }
@@ -11898,6 +11951,8 @@ public struct RenderStep: Equatable, Sendable {
 /// set consistent; this is that, arranged so each image sees what it has to agree with.
 public enum RenderPlan {
     public static let themeArt = "theme-art"
+    /// The flat ring a tier's frame is drawn on, made when its step runs (FrameStack.frameTemplate).
+    public static let frameTemplate = "frame-template"
 
     /// `hasThemeArt`: whether the theme's approved artwork is available AND governs the look.
     /// The composite of every symbol already finished — built when the step runs, so a
@@ -11936,7 +11991,7 @@ public enum RenderPlan {
             guard let shared = ids.first else { continue }
             let sibling = r == .mediumPay ? frameSteps.first.map { [$0.id] } ?? [] : []
             // A lone high pay's frame is HP1's, drawn rich: named in `members` (frameBrief).
-            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling, after: sibling,
+            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling + [frameTemplate], after: sibling,
                                          members: r == .highPay && framed.count == 1 ? framed.map(\.id) : []))
             for p in ids.dropFirst() { frameSteps.append(RenderStep(id: p, mode: .frame, refs: art + [shared], after: [shared])) }
         }
@@ -12915,6 +12970,7 @@ extension GDDAssetPrompts {
             ?? (role == .highPay ? "a sturdy square frame in this set's own premium material, a bevelled rim with matching ornaments at the corners"
                                  : "a plainer square frame in this set's own material, with a simple bevelled rim")
         let art = step.refs.contains(RenderPlan.themeArt)
+        let template = step.refs.last == RenderPlan.frameTemplate
         var parts: [String] = []
         for (i, r) in step.refs.enumerated() {
             let img = "Image \(i + 1)"
@@ -12963,11 +13019,14 @@ extension GDDAssetPrompts {
             : (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
             + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."
                 : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
+        let ring = "Edit the last attached image: its flat grey square ring marks exactly where the frame goes. Turn the ring into the frame described below — its outer edge, its opening and its narrow rim exactly where the ring's are\(single ? ", except for a crest it may rise into at the top centre" : "") — and keep everything outside it the flat background."
         return ([
-            single
+            template && single ? "\(ring) It is the empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
+            : template ? "\(ring) It is the empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of it, so it holds each in turn and carries nothing of any of them."
+            : single
                 ? "Create one empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
                 : "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of this frame, so it holds each in turn and carries nothing of any of them.",
-            "THE FRAME: \(spec).\(rung) A square frame seen straight on, upright and level, centred and filling about 85% of the image with an even margin. \(slim) \(panel)",
+            "THE FRAME: \(spec).\(rung) A square frame seen straight on, upright and level\(template ? "" : ", centred and filling about 85% of the image with an even margin"). \(slim) \(panel)",
         ] + parts + [
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
             backdropLine(backing),

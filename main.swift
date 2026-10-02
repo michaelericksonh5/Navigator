@@ -24717,6 +24717,11 @@ final class GDDToAssetsRun: ObservableObject {
             let d: Data?
             if r == RenderPlan.themeArt { d = themeArt }
             else if r == RenderPlan.setSoFar { d = setSoFarPNG(excluding: id, folder: folder) }
+            else if r == RenderPlan.frameTemplate {
+                let b = Thread.isMainThread ? backing.rgb : DispatchQueue.main.sync { self.backing.rgb }
+                d = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: 1536, backing: b), width: 1536, height: 1536,
+                                               space: CGColorSpace(name: CGColorSpace.sRGB)!).flatMap(encodePNG)
+            }
             else {
                 let u = r.hasPrefix("cast-") ? Self.referenceURL(r, in: folder) : folder.appendingPathComponent("\(r).png")
                 d = (try? Data(contentsOf: u)).map { downsamplePNG($0, longEdge: 1536) ?? $0 }
@@ -25315,9 +25320,26 @@ final class GDDToAssetsRun: ObservableObject {
         let size = DispatchQueue.main.sync { self.jobs.first { $0.kind == .symbol }?.size ?? "2K" }
         let job = AssetJob(id: step.id, kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: size)
         let started = Date()
-        let r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
-        if let png = r.png, (try? png.write(to: dst)) != nil {
-            DispatchQueue.main.async { self.framesMade.append(dst) }
+        // Drawn on the slim ring, its rim is measured: one drawn thick is drawn once more (ponytail:
+        // the thinner of the two is kept either way).
+        let b = DispatchQueue.main.sync { self.backing.rgb }
+        func sideRim(_ png: Data) -> Double? {
+            guard let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            let k = FrameStack.keyed(px, backing: b)
+            guard let win = LayerizeAssembly.opening(k, width: cg.width, height: cg.height),
+                  let e = LayerizeAssembly.extent(k, width: cg.width, height: cg.height), e.w > 0 else { return nil }
+            return Double(win.x - e.x) / Double(e.w)
+        }
+        var r = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
+        if refs.last == RenderPlan.frameTemplate, let png = r.png, let rim = sideRim(png), rim > 0.14 {
+            navLog(String(format: "gdd frame: %@ came back with a %.0f%% rim — drawing it once more", step.id, rim * 100))
+            let again = sizedRequest(job, prompt: prompt, inputs: inputs, model: model)
+            r.cost += again.cost
+            if let p2 = again.png, let rim2 = sideRim(p2), rim2 < rim { r.png = p2 }
+        }
+        if let png = r.png {
+            navLog(String(format: "gdd frame: %@ rim %.0f%% of its width", step.id, (sideRim(png) ?? 0) * 100))
+            if (try? png.write(to: dst)) != nil { DispatchQueue.main.async { self.framesMade.append(dst) } }
         }
         let secs = Date().timeIntervalSince(started)
         log.event(["step": "frame", "id": step.id, "refs": refs, "model": model, "cost": r.cost, "seconds": secs,

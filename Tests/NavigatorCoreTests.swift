@@ -11473,7 +11473,7 @@ final class SetDesignTests: XCTestCase {
                              subject: "a bank vault hall", aspect: "3:4", size: "4K"))
         let steps = RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true)
         // The high pays' frame comes first, empty, then HP1's richer version of it as an edit.
-        XCTAssertEqual(steps[0], RenderStep(id: "frame_HP", mode: .frame, refs: ["theme-art"], after: []))
+        XCTAssertEqual(steps[0], RenderStep(id: "frame_HP", mode: .frame, refs: ["theme-art", "frame-template"], after: []))   // drawn on the slim ring
         XCTAssertEqual(steps[1], RenderStep(id: "frame_HP1", mode: .frame, refs: ["theme-art", "frame_HP"], after: ["frame_HP"]))
         // The anchor is a high pay, so all four high pays are drawn next, together, painted into
         // their frames tiled on the sheet: the ranking is seen on one image, and one frame is shared.
@@ -11495,7 +11495,7 @@ final class SetDesignTests: XCTestCase {
         XCTAssertEqual(byID["bg_base"], RenderStep(id: "bg_base", mode: .background, refs: ["theme-art"], after: []))
         // Without concept art the anchor carries the look, background included.
         let bare = RenderPlan.steps(jobs, SetDesign(), hasThemeArt: false)
-        XCTAssertEqual(bare.first?.refs, [])
+        XCTAssertEqual(bare.first?.refs, ["frame-template"])
         XCTAssertEqual(bare.first { $0.id == "bg_base" }?.refs, ["HP1"])
         // A partial redo of the sheet paints its members alone into their own frame, matched to
         // one that stays; the frame is kept (reused from disk when it is there), HP1's is not needed.
@@ -12058,7 +12058,7 @@ final class SetDesignTests: XCTestCase {
                     j("MP2", .mediumPay, "axe", hue: "blue", shape: "shield", tier: 2),
                     j("MP3", .mediumPay, "hen", hue: "green", shape: "shield", tier: 3, frame: false)]
         let steps = Dictionary(uniqueKeysWithValues: RenderPlan.steps(jobs, SetDesign(anchorID: "HP1"), hasThemeArt: true).map { ($0.id, $0) })
-        XCTAssertEqual(steps["frame_MP"], RenderStep(id: "frame_MP", mode: .frame, refs: ["theme-art"], after: []))
+        XCTAssertEqual(steps["frame_MP"], RenderStep(id: "frame_MP", mode: .frame, refs: ["theme-art", "frame-template"], after: []))
         XCTAssertNil(steps["frame_HP"])                                    // no framed high pay, no frame for them
         XCTAssertEqual(steps["MP1"]?.refs, ["HP1", RenderPlan.setSoFar, "frame_MP"])
         XCTAssertEqual(steps["MP2"], RenderStep(id: "MP2", mode: .intoFrame, refs: ["HP1", RenderPlan.setSoFar, "frame_MP"],
@@ -12580,6 +12580,12 @@ final class FrameRanksTests: XCTestCase {
         for g in gems.dropFirst() { paint(&bad, g) }
         XCTAssertEqual(FrameStack.check(base: base, edit: bad, width: w, height: w, window: win, down: 30, gems: gems).problems,
                        ["the top-left gem is still a flat disc"])
+        // A deep blue gem is darker than the bronze — no 3:1 by lightness — and plain to see by colour.
+        var blue = base
+        for g in gems { paint(&blue, g, colour: (40, 90, 230)) }
+        let b = FrameStack.check(base: base, edit: blue, width: w, height: w, window: win, down: 30, gems: gems)
+        XCTAssertLessThan(b.contrast.max()!, 3); XCTAssertGreaterThan(b.colour!.min()!, 60)
+        XCTAssertTrue(b.passed, b.problems.joined(separator: "; "))
         var dull = good
         paint(&dull, gems[1], colour: (170, 115, 75))
         XCTAssertTrue(FrameStack.check(base: base, edit: dull, width: w, height: w, window: win, down: 30, gems: gems).problems.first?
@@ -12862,7 +12868,9 @@ final class PayLadderTests: XCTestCase {
         let f = try! XCTUnwrap(steps.first { $0.id == "frame_HP" })
         XCTAssertEqual(f.members, ["HP1"])
         let b = GDDAssetPrompts.brief(job: jobs[0], step: f, theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
-        XCTAssertTrue(b.hasPrefix("Create one empty frame for the top symbol"), b)
+        XCTAssertTrue(b.hasPrefix("Edit the last attached image: its flat grey square ring"), b)
+        XCTAssertTrue(b.contains("It is the empty frame for the top symbol"), b)
+        XCTAssertTrue(b.contains("except for a crest it may rise into at the top centre"), b)
         XCTAssertTrue(b.contains("the richest frame of the set: doubled vines with a crown crest"), b)
         XCTAssertTrue(b.contains("rise into a crest at the top centre"), b)
         XCTAssertTrue(b.contains("one gem at the centre of its crest and four"), b)     // painted: HP1's gems
@@ -12909,6 +12917,17 @@ final class PayLadderTests: XCTestCase {
         let f = GDDAssetPrompts.brief(job: hps[0], step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme, design: d,
                                       backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: hps)
         XCTAssertTrue(f.contains("Its rim is slim — about a twelfth of the frame's width"), f)
+    }
+
+    // The ring a frame is drawn on has the studio's slim proportions; gems that read by colour pass.
+    func testTheFrameRingIsSlimAndAColourfulGemReads() {
+        let n = 400, px = FrameStack.frameTemplate(size: n, backing: RGB8(255, 0, 255))
+        let keyed = FrameStack.keyed(px, backing: RGB8(255, 0, 255))
+        let win = try! XCTUnwrap(LayerizeAssembly.opening(keyed, width: n, height: n))
+        let e = try! XCTUnwrap(LayerizeAssembly.extent(keyed, width: n, height: n))
+        XCTAssertEqual(Double(e.w) / Double(n), 0.85, accuracy: 0.01)
+        XCTAssertEqual(Double(win.x - e.x) / Double(e.w), 0.085, accuracy: 0.01)
+        XCTAssertEqual(Double(win.w) / Double(e.w), 0.83, accuracy: 0.01)
     }
 
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.
