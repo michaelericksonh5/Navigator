@@ -5470,6 +5470,59 @@ public enum FrameStack {
             px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255
         } }
     }
+    /// The inner lip a frame is finished with: the innermost `lip` of the image across its band, next to
+    /// the planned opening. `u` 0 at the opening, 1 at the lip's outer side; nil outside it.
+    static func lipDepth(_ g: FrameGeometry, _ x: Double, _ y: Double, lip: Double) -> Double? {
+        let d = g.dist(x, y)
+        guard d > -g.t, d <= -g.t + lip else { return nil }
+        return (d + g.t) / lip
+    }
+    /// The lip guide (the art director, 2026-10-02: a cut-back inside "looks really bad"): the frame cut
+    /// back to its planned opening plus a narrow lip, and the lip drawn in as a plain grey bevelled
+    /// moulding lit from the upper left — the small, marked area Gemini repaints, as it turns the gem
+    /// pass's discs into gems, so the frame's inside edge is designed, at exactly the planned size.
+    static func lipGuide(_ px: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry, lip: Double) {
+        let hh = 1.5 / Double(w), lx = -0.7071, ly = -0.7071
+        for y in 0..<h { for x in 0..<w {
+            let fx = (Double(x) + 0.5) / Double(w) - 0.5, fy = (Double(y) + 0.5) / Double(h) - 0.5
+            let d = g.dist(fx, fy), i = (y * w + x) * 4
+            if d <= -g.t { px[i] = b.r; px[i + 1] = b.g; px[i + 2] = b.b; px[i + 3] = 255; continue }
+            guard let u = lipDepth(g, fx, fy, lip: lip) else { continue }
+            var gx = g.dist(fx + hh, fy) - g.dist(fx - hh, fy), gy = g.dist(fx, fy + hh) - g.dist(fx, fy - hh)
+            let n = max(1e-9, (gx * gx + gy * gy).squareRoot()); gx /= n; gy /= n
+            let facing = gx * lx + gy * ly
+            let shade = u < 0.12 ? 50 : u > 0.85 ? 185 + 30 * facing : 135 - 65 * facing
+            let c = UInt8(max(0, min(255, shade)))
+            px[i] = c; px[i + 1] = c; px[i + 2] = c; px[i + 3] = 255
+        } }
+    }
+    /// The lip pass's result laid onto the frame it was given: Gemini's pixels in the lip, feathered half
+    /// a lip out into the frame where it joined its carving to it, and the frame as it was everywhere
+    /// else — whatever the edit moved elsewhere is left out — with the opening the plan's, empty.
+    static func lipComposite(base: [UInt8], edit: [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry, lip: Double) -> [UInt8] {
+        var out = base
+        for y in 0..<h { for x in 0..<w {
+            let fx = (Double(x) + 0.5) / Double(w) - 0.5, fy = (Double(y) + 0.5) / Double(h) - 0.5
+            let d = g.dist(fx, fy), i = (y * w + x) * 4
+            if d <= -g.t { out[i] = b.r; out[i + 1] = b.g; out[i + 2] = b.b; out[i + 3] = 255; continue }
+            let edge = -g.t + lip
+            let k = d <= edge ? 1 : d <= edge + lip / 2 ? 1 - (d - edge) / (lip / 2) : 0
+            guard k > 0 else { continue }
+            for c in 0..<3 { out[i + c] = UInt8((Double(edit[i + c]) * k + Double(base[i + c]) * (1 - k)).rounded()) }
+        } }
+        return out
+    }
+    /// How much the lip pass changed the lip, mean RGB difference: near 0, it was left grey.
+    static func lipChanged(guide: [UInt8], edit: [UInt8], width w: Int, height h: Int, geometry g: FrameGeometry, lip: Double) -> Double {
+        var sum = 0.0, n = 0.0
+        for y in stride(from: 0, to: h, by: 2) { for x in stride(from: 0, to: w, by: 2) {
+            guard lipDepth(g, (Double(x) + 0.5) / Double(w) - 0.5, (Double(y) + 0.5) / Double(h) - 0.5, lip: lip) != nil else { continue }
+            let i = (y * w + x) * 4
+            sum += Double(abs(Int(edit[i]) - Int(guide[i])) + abs(Int(edit[i + 1]) - Int(guide[i + 1])) + abs(Int(edit[i + 2]) - Int(guide[i + 2]))) / 3; n += 1
+        } }
+        return n > 0 ? sum / n : 0
+    }
+
     /// How far a frame drawn on the moulding reaches into its opening past the inner lip, the most of
     /// any side, as a share of the image: 0 when it keeps to the lip.
     static func encroachment(_ px: [UInt8], width w: Int, height h: Int, backing b: RGB8, geometry g: FrameGeometry) -> Double? {
@@ -13338,6 +13391,18 @@ extension GDDAssetPrompts {
             backdropLine(backing),
             "No text, lettering or numbers, no watermark, no user interface.",
         ]).joined(separator: "\n\n")
+    }
+
+    /// The lip pass: Gemini repaints only the plain grey lip Navigator drew round the opening
+    /// (FrameStack.lipGuide), in the frame's own material — a local edit, as the gem pass is.
+    static func lipBrief(step: RenderStep, theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
+        let role = FrameRules.parse(step.id)?.role ?? .highPay
+        return [
+            "Edit the attached image: it is the empty frame of the \(role == .highPay ? "high-pay" : "medium-pay") symbols of a video slot game themed “\(theme.name)”, with a plain grey lip — a narrow bevelled moulding — running all the way round its opening. Repaint only that grey lip, as part of this frame: in the frame's own material, colour and finish, a clean narrow moulding lit from the upper left like the rest of it, joined neatly to the carving and ornament just outside it so that they end against it as a finished frame does.",
+            "Change nothing else. The frame's carving, ornament, outline and size stay exactly as they are, and the opening inside the lip stays completely empty: the flat background right up to the lip, nothing drawn in it.",
+            backdropLine(backing),
+            "No text, lettering or numbers, no watermark, no user interface.",
+        ].joined(separator: "\n\n")
     }
 
     /// The edit that finishes a frame cut back to its planned opening: Gemini drew the frame's band

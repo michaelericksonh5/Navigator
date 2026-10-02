@@ -13028,6 +13028,34 @@ final class PayLadderTests: XCTestCase {
         XCTAssertTrue(b.contains("The opening stays exactly as large and completely empty"), b)
     }
 
+    // The lip: the frame cut back to its opening plus a narrow lip, the lip drawn grey for Gemini to
+    // repaint, and only the lip taken back from the edit.
+    func testTheLipGuideAndCompositeTouchOnlyTheLip() {
+        let n = 400, back = RGB8(255, 0, 255), g = FrameGeometry(), lip = 0.014
+        var frame = [UInt8](repeating: 200, count: n * n * 4)
+        for i in stride(from: 0, to: frame.count, by: 4) { frame[i] = 180; frame[i + 1] = 140; frame[i + 2] = 40 }     // gold everywhere
+        var guide = frame
+        FrameStack.lipGuide(&guide, width: n, height: n, backing: back, geometry: g, lip: lip)
+        let o = g.opening(width: n, height: n), at = { (x: Int, y: Int) in (y * n + x) * 4 }
+        XCTAssertEqual(Array(guide[at(200, 200)..<at(200, 200) + 3]), [255, 0, 255])                 // the opening, empty
+        let inLip = at(o.x - 2, 200)
+        XCTAssertEqual(guide[inLip], guide[inLip + 1]); XCTAssertEqual(guide[inLip + 1], guide[inLip + 2])   // the lip, grey
+        XCTAssertEqual(Array(guide[at(o.x - 15, 200)..<at(o.x - 15, 200) + 3]), [180, 140, 40])      // the band beyond, as it was
+        // An edit that repainted the lip red and moved everything else: only the lip (and its feather) is kept.
+        var edit = [UInt8](repeating: 0, count: frame.count)
+        for i in stride(from: 0, to: edit.count, by: 4) { edit[i] = 220; edit[i + 1] = 30; edit[i + 2] = 30; edit[i + 3] = 255 }
+        XCTAssertGreaterThan(FrameStack.lipChanged(guide: guide, edit: edit, width: n, height: n, geometry: g, lip: lip), 12)
+        XCTAssertEqual(FrameStack.lipChanged(guide: guide, edit: guide, width: n, height: n, geometry: g, lip: lip), 0)
+        let out = FrameStack.lipComposite(base: guide, edit: edit, width: n, height: n, backing: back, geometry: g, lip: lip)
+        XCTAssertEqual(out[inLip], 220)
+        XCTAssertEqual(Array(out[at(o.x - 15, 200)..<at(o.x - 15, 200) + 3]), [180, 140, 40])
+        XCTAssertEqual(Array(out[at(200, 200)..<at(200, 200) + 3]), [255, 0, 255])
+        XCTAssertEqual(FrameStack.encroachment(out, width: n, height: n, backing: back, geometry: g)!, 0, accuracy: 0.004)
+        let b = GDDAssetPrompts.lipBrief(step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme, design: SetDesign(),
+                                         backing: (name: "chroma magenta", rgb: back))
+        XCTAssertTrue(b.contains("Repaint only that grey lip"), b)
+    }
+
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.
     func testThePlannerIsToldTheTiersOfThisGame() {
         let chevy = [pay("HP1", .highPay)] + (1...4).map { pay("MP\($0)", .mediumPay) } + [pay("LP1", .lowPay)]
