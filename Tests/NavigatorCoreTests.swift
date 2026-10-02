@@ -12820,7 +12820,7 @@ final class PayLadderTests: XCTestCase {
                    pay("HP3", .highPay, cast: "The Harp", silhouette: "singing harp"),
                    pay("HP4", .highPay, cast: "The Hen", silhouette: "bust to the chest")]
         XCTAssertEqual(hps.map { PayLadder.rank($0, in: hps) }, [1, 2, 3, 4])
-        XCTAssertTrue(PayLadder.crop(hps[0], in: hps)!.contains("head-and-shoulders"))
+        XCTAssertTrue(PayLadder.crop(hps[0], in: hps)!.contains("head-and-shoulders bust, mostly face"))
         XCTAssertTrue(PayLadder.crop(hps[1], in: hps)!.contains("top of the chest"))
         XCTAssertNil(PayLadder.crop(hps[2], in: hps))                          // a harp is shown whole
         XCTAssertTrue(PayLadder.crop(hps[3], in: hps)!.contains("down to the chest"))
@@ -12854,6 +12854,63 @@ final class PayLadderTests: XCTestCase {
         XCTAssertEqual(PayLadder.problems([pay("HP1", .highPay, cast: "Jack"), pay("HP2", .highPay)]), [])
     }
 
+    // With one high pay, its frame is HP1's: the richest, crested, never the plain rung.
+    func testALoneHighPaysFrameIsHP1sRichOne() {
+        let jobs = [pay("HP1", .highPay, cast: "Jack")] + (1...2).map { pay("MP\($0)", .mediumPay) }
+        let d = SetDesign(anchorID: "HP1", look: "Glossy.", families: ["highPayFrame": "golden vines", "hp1Frame": "doubled vines with a crown crest"])
+        let steps = RenderPlan.steps(jobs, d, hasThemeArt: false)
+        let f = try! XCTUnwrap(steps.first { $0.id == "frame_HP" })
+        XCTAssertEqual(f.members, ["HP1"])
+        let b = GDDAssetPrompts.brief(job: jobs[0], step: f, theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
+        XCTAssertTrue(b.hasPrefix("Create one empty frame for the top symbol"), b)
+        XCTAssertTrue(b.contains("the richest frame of the set: doubled vines with a crown crest"), b)
+        XCTAssertTrue(b.contains("rise into a crest at the top centre"), b)
+        XCTAssertTrue(b.contains("one gem at the centre of its crest and four"), b)     // painted: HP1's gems
+        // The medium pays' frame still steps down from it.
+        let mp = GDDAssetPrompts.brief(job: jobs[1], step: steps.first { $0.id == "frame_MP" }!, theme: theme, design: d,
+                                       backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
+        XCTAssertTrue(mp.contains("The medium pays' frame is its plainer sibling"), mp)
+        // Several high pays share the plain rung as before.
+        let four = RenderPlan.steps((1...4).map { pay("HP\($0)", .highPay) }, d, hasThemeArt: false)
+        XCTAssertEqual(four.first { $0.id == "frame_HP" }?.members, [])
+    }
+
+    // Measured on the studio's shipped character pays: HP1 mostly face, then a step down by rank;
+    // a character HP1 breaks out over its frame's top, so its frame keeps only the corner gems.
+    func testABustIsSetByItsFaceAsCloseAsItsRank() {
+        let hps = [pay("HP1", .highPay, cast: "Jack", silhouette: "head-and-shoulders bust"),
+                   pay("HP2", .highPay, cast: "The Giant", silhouette: "bust with full shoulders"),
+                   pay("HP3", .highPay, cast: "The Hen", silhouette: "bust to the upper chest"),
+                   pay("HP4", .highPay, cast: "The Wife", silhouette: "bust to the chest"),
+                   pay("HP5", .highPay, silhouette: "golden harp")]
+        let shares = hps.prefix(4).map { PayLadder.face($0, in: hps)!.share }
+        XCTAssertEqual(shares[0], 0.58)
+        for k in 1..<4 { XCTAssertLessThan(shares[k], shares[k - 1]) }
+        XCTAssertNil(PayLadder.face(hps[4], in: hps))                      // an item is placed by its outline
+        // A 400px-tall drawing whose face is 100px tall, at x 150–250: in a 1000px window it is set
+        // so the face is 580px tall, centred across, the head 10% over the window's top.
+        let at = FrameStack.facePlacement(subject: (x: 50, y: 0, w: 300, h: 400), face: (150, 60, 100, 100),
+                                          window: (x: 200, y: 200, w: 1000, h: 1000), faceShare: 0.58, lift: 0.1)
+        XCTAssertEqual(at.h / 400 * 100, 580, accuracy: 0.5)
+        XCTAssertEqual(at.x + (200 - 50) / 300 * at.w, 700, accuracy: 0.5)   // the face's centre on the window's
+        XCTAssertEqual(at.y, 100, accuracy: 0.5)
+        XCTAssertGreaterThan(at.y + at.h, 1200)                              // its cut edge behind the floor
+        // A short bust is never left with its cut edge showing: scaled until it reaches the floor.
+        let short = FrameStack.facePlacement(subject: (x: 0, y: 0, w: 300, h: 300), face: (100, 20, 100, 200),
+                                             window: (x: 200, y: 200, w: 1000, h: 1000), faceShare: 0.2, lift: 0)
+        XCTAssertGreaterThanOrEqual(short.y + short.h, 1240 - 0.5)
+        // Its frame: corners only for a character HP1, the crest jewel for an object one.
+        let d = SetDesign(anchorID: "HP1", look: "", families: ["framing": Framing.layered.rawValue])
+        XCTAssertEqual(Set(FrameRules.gemSlots(for: hps[0], in: hps, design: d)), [.corners])
+        XCTAssertEqual(Set(FrameRules.gemSlots(for: pay("HP1", .highPay, silhouette: "golden harp"), in: [pay("HP1", .highPay, silhouette: "golden harp")], design: d)), [.corners, .crest])
+        let g = GDDAssetPrompts.gemsBrief(job: hps[0], theme: theme, design: d, backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), jobs: hps)
+        XCTAssertTrue(g.contains("change only the four flat white discs at the corners"), g)
+        // And the frames are slim, as the studio's are.
+        let f = GDDAssetPrompts.brief(job: hps[0], step: RenderStep(id: "frame_HP", mode: .frame, refs: [], after: []), theme: theme, design: d,
+                                      backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: hps)
+        XCTAssertTrue(f.contains("Its rim is slim — about a twelfth of the frame's width"), f)
+    }
+
     // One theme, two games: Chevy-Hot has one high pay and four medium pays, Tiki Titans four high pays and none.
     func testThePlannerIsToldTheTiersOfThisGame() {
         let chevy = [pay("HP1", .highPay)] + (1...4).map { pay("MP\($0)", .mediumPay) } + [pay("LP1", .lowPay)]
@@ -12880,11 +12937,11 @@ final class PayLadderTests: XCTestCase {
         let w = GDDAssetPrompts.symbolBrief(job: hp1, jobs: jobs, design: layered, theme: theme)
         XCTAssertFalse(w.contains("green screen"), w)
         XCTAssertTrue(w.contains("never mention a frame"), w)
-        XCTAssertTrue(w.contains("It is shown as a close head-and-shoulders portrait"), w)
+        XCTAssertTrue(w.contains("It is shown as a close head-and-shoulders bust, mostly face"), w)
         let step = RenderStep(id: "HP1", mode: .anchor, refs: [], after: [])
         let d = GDDAssetPrompts.brief(job: hp1, step: step, theme: theme, design: layered,
                                       backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
-        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders portrait, the head large, cut off straight across just below the shoulders."), d)
+        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, cut off straight across just below the shoulders."), d)
         XCTAssertFalse(d.contains("whole and uncropped"), d)
         // Painted into its frame, HP1 is told to break out of it.
         let painted = GDDAssetPrompts.symbolBrief(job: hp1, jobs: jobs, design: SetDesign(anchorID: "HP1", look: "Glossy."), theme: theme)

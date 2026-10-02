@@ -25226,7 +25226,7 @@ final class GDDToAssetsRun: ObservableObject {
                   let frame = FrameRules.assignments(symbols, design: design)[symbol] else { return nil }
             var p = self.prompt(for: job, step: RenderStep(id: id, mode: .gem, refs: [frame], after: []))
             if let change { p += "\n\nIn review this change was asked for: \(change.trimmingCharacters(in: .whitespacesAndNewlines))" }
-            return (job, frame, FrameRules.gemSlots(rank: FrameRules.rank(of: symbol, in: symbols), role: job.role, design: design), p, self.backing.rgb, self.session())
+            return (job, frame, FrameRules.gemSlots(for: job, in: symbols, design: design), p, self.backing.rgb, self.session())
         }
         guard let ctx, !ctx.slots.isEmpty else { return nil }
         if change == nil, Self.currentGemPass(symbol, folder: folder) != nil { return nil }
@@ -25308,7 +25308,7 @@ final class GDDToAssetsRun: ObservableObject {
             return
         }
         DispatchQueue.main.async { self.status = "Drawing \(step.id) once, for its tier to be painted into…" }
-        let st = RenderStep(id: step.id, mode: .frame, refs: refs, after: [])
+        let st = RenderStep(id: step.id, mode: .frame, refs: refs, after: [], members: step.members)
         let prompt = DispatchQueue.main.sync { self.prompt(for: Self.placeholder, step: st) }
         let log = DispatchQueue.main.sync { self.session() }
         log.write("prompts/\(step.id).txt", "MODE: frame\nATTACHED: \(refs.isEmpty ? "nothing" : refs.joined(separator: ", "))\n\n\(prompt)")
@@ -26008,11 +26008,12 @@ extension GDDToAssetsRun {
         let symbolJobs = jobs.filter { $0.kind == .symbol }
         let fits = Dictionary(uniqueKeysWithValues: members.compactMap { id in symbolJobs.first { $0.id == id }.map { j in
             (id, { (rim: (across: Double, down: Double)?) in PayLadder.fit(j, in: symbolJobs, rim: rim) }) } })
+        let faces = Dictionary(uniqueKeysWithValues: members.compactMap { id in symbolJobs.first { $0.id == id }.flatMap { j in PayLadder.face(j, in: symbolJobs).map { (id, $0) } } })
         keying = true
         status = "Building \(targets.count) framed symbol\(targets.count == 1 ? "" : "s") from their layers…"
         let build = {
             DispatchQueue.global(qos: .userInitiated).async {
-                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, gemmed: gemmed, fits: fits, folder: folder, colour: colour, backing: backing)
+                let failed = Self.stack(targets, tiers: tiers, frameOf: frameOf, planned: planned, gemmed: gemmed, fits: fits, faces: faces, folder: folder, colour: colour, backing: backing)
                 // Gems that are missing, out of date or failed their checks: said, for review.
                 let gemNotes = targets.filter(gemmed.contains).compactMap { id -> String? in
                     guard let pass = Self.currentGemPass(id, folder: folder) else { return "\(id) (\(Self.gemsMissing(id, folder: folder)))" }
@@ -26043,6 +26044,7 @@ extension GDDToAssetsRun {
     /// after treat it like a split symbol. Returns what could not be built, and why.
     nonisolated static func stack(_ ids: [String], tiers: [[String]], frameOf: [String: String], planned: [String: String] = [:],
                                   gemmed: Set<String> = [], fits: [String: ((across: Double, down: Double)?) -> (width: Double, height: Double)] = [:],
+                                  faces: [String: (share: Double, lift: Double, over: Double, sides: Double)] = [:],
                                   folder: URL, colour: PanelColour, backing: RGB8) -> [String: String] {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
         func pixels(_ name: String) -> (px: [UInt8], w: Int, h: Int)? {
@@ -26110,17 +26112,28 @@ extension GDDToAssetsRun {
             let fit = fits[id]?(rim) ?? (width: 0.96, height: 1.12)
             // Under its crest jewel, tucked behind no more than its lowest quarter.
             let crest = gemmed.contains(id) ? currentGemPass(id, folder: folder)?.gems.first { $0.place == "crest" } : nil
-            let at = FrameStack.placement(subject: e, window: f.window, cut: cut, width: fit.width, height: fit.height,
+            var at = FrameStack.placement(subject: e, window: f.window, cut: cut, width: fit.width, height: fit.height,
                                           ceiling: crest.map { $0.y + $0.size / 4 })
+            var clipBox = cut.any ? FrameStack.clip(cut, window: f.window) : nil
+            // A bust is set by its face when one is found: as close as its rank's, centred on the face,
+            // its head over the rim and its cut edge behind the window's floor (PayLadder.face).
+            if let rule = faces[id], let fb = largestFace(img) {
+                let o = f.window, oh = Double(o.h)
+                var lift = rule.lift * (rim?.down ?? 0.22) + rule.over
+                if let c = crest { lift = min(lift, (Double(o.y) - (c.y + c.size / 4)) / oh) }
+                at = FrameStack.facePlacement(subject: e, face: (fb.minX, fb.minY, fb.width, fb.height), window: o, faceShare: rule.share, lift: lift)
+                let side = rule.sides * (rim?.across ?? 0.22) * Double(o.w)
+                clipBox = (Double(o.x) - side, -.infinity, Double(o.x + o.w) + side, Double(o.y + o.h))
+                navLog(String(format: "gdd stack: %@ set by its face — %.0f%% of the window tall, head %.0f%% over its top", id, rule.share * 100, lift * 100))
+            }
             guard var body = canvas(crop, CGRect(x: at.x, y: at.y, width: at.w, height: at.h), W, H) else { continue }
-            if cut.any {
-                let c = FrameStack.clip(cut, window: f.window)
+            if let c = clipBox {
                 body.withUnsafeMutableBufferPointer { p in
                     for y in 0..<H { for x in 0..<W where Double(x) < c.x0 || Double(x) >= c.x1 || Double(y) < c.y0 || Double(y) >= c.y1 {
                         p[(y * W + x) * 4 + 3] = 0
                     } }
                 }
-                navLog("gdd stack: \(id) is cut off along its \([cut.left ? "left" : nil, cut.right ? "right" : nil, cut.top ? "top" : nil, cut.bottom ? "bottom" : nil].compactMap { $0 }.joined(separator: " and ")) — set behind the frame's rim there")
+                if cut.any { navLog("gdd stack: \(id) is cut off along its \([cut.left ? "left" : nil, cut.right ? "right" : nil, cut.top ? "top" : nil, cut.bottom ? "bottom" : nil].compactMap { $0 }.joined(separator: " and ")) — set behind the frame's rim there") }
             }
             // A tight shadow away from the light, and a wide glow behind: the light behind the
             // subject is what made the painted ones read as one object. The glow is its own layer.
@@ -26180,6 +26193,16 @@ extension GDDToAssetsRun {
             navLog(String(format: "gdd stack: %@ in %@, panel %.0f°", id, fid, h))
         }
         return failed
+    }
+
+    /// The biggest face Vision finds in a symbol, top-left based, or nil: what a bust is set by.
+    nonisolated static func largestFace(_ img: CGImage) -> CGRect? {
+        let req = VNDetectFaceRectanglesRequest()
+        try? VNImageRequestHandler(cgImage: img).perform([req])
+        guard let f = (req.results ?? []).filter({ $0.confidence > 0.5 }).max(by: { $0.boundingBox.height < $1.boundingBox.height })
+        else { return nil }
+        let b = f.boundingBox, w = Double(img.width), h = Double(img.height)
+        return CGRect(x: b.minX * w, y: (1 - b.maxY) * h, width: b.width * w, height: b.height * h)
     }
 
     /// Moves what was made from the current image — its cut-out, every split — beside the version it
@@ -27624,7 +27647,8 @@ struct GDDToAssetsSheet: View {
         // Only the tiers this set has.
         let hps = run.jobs.filter { $0.role == .highPay && $0.hasFrame }.count
         let mps = run.jobs.contains { $0.role == .mediumPay && $0.hasFrame }
-        let parts = [("HP1", hps >= 1 ? words(FrameRules.gemSlots(rank: 1, role: .highPay, design: d)) : nil),
+        let hp1 = run.jobs.first { $0.role == .highPay && $0.hasFrame && FrameRules.rank(of: $0.id, in: run.jobs.filter { $0.kind == .symbol }) == 1 }
+        let parts = [("HP1", hps >= 1 ? words(hp1.map { FrameRules.gemSlots(for: $0, in: run.jobs, design: d) } ?? FrameRules.gemSlots(rank: 1, role: .highPay, design: d)) : nil),
                      ("HP2", hps >= 2 ? words(FrameRules.gemSlots(rank: 2, role: .highPay, design: d)) : nil),
                      ("the other high pays", hps >= 3 ? words(FrameRules.gemSlots(rank: 0, role: .highPay, design: d)) : nil),
                      ("the medium pays", mps ? words(FrameRules.gemSlots(rank: 0, role: .mediumPay, design: d)) : nil)]

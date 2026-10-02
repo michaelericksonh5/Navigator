@@ -5854,6 +5854,22 @@ public enum FrameStack {
          cut.right ? Double(o.x + o.w) : .infinity, cut.bottom ? Double(o.y + o.h) : .infinity)
     }
 
+    /// Where a bust goes when its face is known (`face`, in the same pixels as `subject`): scaled so
+    /// the face is `faceShare` of the window's height, centred across on the face, its head's top
+    /// `lift` of the window above the window's top — and never so small that its cut-off edge
+    /// shows: it reaches `tuck` past the window's floor, to be clipped there. Gemini frames a bust
+    /// as it likes; this sets the closeness by rank (PayLadder.face), as the shipped sets do.
+    public static func facePlacement(subject e: (x: Int, y: Int, w: Int, h: Int), face f: (x: Double, y: Double, w: Double, h: Double),
+                                     window o: (x: Int, y: Int, w: Int, h: Int), faceShare: Double, lift: Double,
+                                     tuck: Double = 0.04) -> (x: Double, y: Double, w: Double, h: Double) {
+        let ox = Double(o.x), oy = Double(o.y), ow = Double(o.w), oh = Double(o.h)
+        let top = oy - lift * oh
+        var scale = faceShare * oh / max(1, f.h)
+        scale = max(scale, (oy + oh * (1 + tuck) - top) / Double(max(1, e.h)))
+        let faceX = f.x + f.w / 2 - Double(e.x)
+        return (ox + ow / 2 - faceX * scale, top, Double(e.w) * scale, Double(e.h) * scale)
+    }
+
     /// Where the symbol goes, x, y, w, h, top-left based: as large as `width` of the window across
     /// and `height` of it up, keeping its proportions, centred across and standing a little above the
     /// window's floor — so a tall symbol breaks out over the top of the frame, as the painted ones
@@ -11043,6 +11059,16 @@ public enum FrameRules {
         // The medium pays never: they are set apart from the high pays (the art director, 2026-10-02).
         return jewelled && role == .highPay && ladder != .gems ? [.corners] : []
     }
+    /// A pay's gem slots, knowing what it shows: a character HP1 whose head breaks out over the top
+    /// of its frame keeps the corners and gives up the crest jewel there — the studio's character
+    /// HP1s (Platinum Goddess, Egyptian Queen) are set with corner gems only (2026-10-02).
+    public static func gemSlots(for job: AssetJob, in jobs: [AssetJob], design: SetDesign) -> [GemSlot] {
+        let symbols = jobs.filter { $0.kind == .symbol }
+        let rank = FrameRules.rank(of: job.id, in: symbols)
+        let slots = gemSlots(rank: rank, role: job.role, design: design)
+        return rank == 1 && PayLadder.face(job, in: symbols) != nil ? slots.filter { $0 != .crest } : slots
+    }
+
     /// Whether a frame is drawn with gems in it — a painted set's; a layered set's frames have none.
     public static func hasGems(_ ref: Ref, _ design: SetDesign) -> Bool {
         Framing(design) != .layered && !gemSlots(rank: ref.rank, role: ref.role, design: design).isEmpty
@@ -11170,8 +11196,10 @@ public enum PayLadder {
         guard bust(job), FrameRules.sharedTiers.contains(job.role) else { return nil }
         if job.role == .mediumPay { return "from the waist up, cut off straight across at the waist" }
         switch rank(job, in: jobs) {
-        case 1: return "a close head-and-shoulders portrait, the head large, cut off straight across just below the shoulders"
-        case 2: return "head and full shoulders, cut off straight across at the top of the chest"
+        // "Mostly his face" (the art director); "portrait" was dropped after a draw came back with a
+        // painted scene behind it.
+        case 1: return "a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, cut off straight across just below the shoulders"
+        case 2: return "head and full shoulders, the whole head in view, cut off straight across at the top of the chest"
         case 3: return "head, shoulders and the top of the chest, cut off straight across there"
         case 4: return "head down to the chest, cut off straight across below it"
         default: return "from the waist up, cut off straight across at the waist"
@@ -11208,6 +11236,28 @@ public enum PayLadder {
         case 2: return (1.0, 1.04 + 0.3 * r.down)
         case 3: return (0.94, 0.98)
         default: return (0.9, 0.92)
+        }
+    }
+
+    /// How close a bust is set, by rank, once its face is found (FrameStack.facePlacement): the face's
+    /// height as a share of the window's; how far its head rises over the window's top, in rims
+    /// (FrameStack.rim) plus `over`, a share of the window past the frame's own top edge; and how far
+    /// its shoulders may run past the window's sides, in rims. Nil for anything not a living bust.
+    /// Measured on the studio's shipped character pays (B2B asset packs and artSource, 2026-10-02): the
+    /// face is 0.40 of the whole symbol's height at HP1 (median of 28 games; 0.44–0.61 in the closer
+    /// ones — Da Vinci, Timeless Rose, Platinum Goddess), then about 0.33, 0.32 and 0.30 down the ranks
+    /// (Bring 'Em In 0.41/0.33/0.33/0.27). In a window that is 84% of its frame (Tiki Titans' own
+    /// file), HP1 at the close end is about 0.58 of the window: "mostly his face" (the art director).
+    /// Its head breaks just past the frame's top edge, as Mona Lisa's and Dodge's do; the rest reach
+    /// into the rim, and its shoulders run to the frame's outer edge.
+    public static func face(_ job: AssetJob, in jobs: [AssetJob]) -> (share: Double, lift: Double, over: Double, sides: Double)? {
+        guard crop(job, in: jobs) != nil else { return nil }
+        if job.role != .highPay { return (0.25, -0.1, 0, 0) }
+        switch rank(job, in: jobs) {
+        case 1: return (0.58, 1, 0.06, 1)
+        case 2: return (0.42, 0.6, 0, 0.5)
+        case 3: return (0.38, 0.2, 0, 0.3)
+        default: return (0.33, 0, 0, 0)
         }
     }
 
@@ -11881,10 +11931,13 @@ public enum RenderPlan {
         // version is an edit of the shared one; the medium pays' frame is shown the high pays'.
         var frameSteps: [RenderStep] = []
         for r in FrameRules.sharedTiers {
-            let ids = FrameRules.frameIDs(r, count: symbols.filter { $0.role == r && $0.hasFrame }.count, design: design)
+            let framed = symbols.filter { $0.role == r && $0.hasFrame }
+            let ids = FrameRules.frameIDs(r, count: framed.count, design: design)
             guard let shared = ids.first else { continue }
             let sibling = r == .mediumPay ? frameSteps.first.map { [$0.id] } ?? [] : []
-            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling, after: sibling))
+            // A lone high pay's frame is HP1's, drawn rich: named in `members` (frameBrief).
+            frameSteps.append(RenderStep(id: shared, mode: .frame, refs: art + sibling, after: sibling,
+                                         members: r == .highPay && framed.count == 1 ? framed.map(\.id) : []))
             for p in ids.dropFirst() { frameSteps.append(RenderStep(id: p, mode: .frame, refs: art + [shared], after: [shared])) }
         }
         let frameOf = FrameRules.assignments(symbols, design: design)
@@ -12850,8 +12903,12 @@ extension GDDAssetPrompts {
     /// painted into a copy of it, so it suits all of them and carries nothing of any one.
     static func frameBrief(step: RenderStep, theme: GameTheme, design: SetDesign,
                            backing: (name: String, rgb: RGB8)) -> String {
-        guard let ref = FrameRules.parse(step.id) else { return "" }
-        let role = ref.role
+        guard let parsed = FrameRules.parse(step.id) else { return "" }
+        let role = parsed.role
+        // The only high pay's frame is HP1's: the richest, crested, set with HP1's gems — not the
+        // plain rung a tier of several shares (Chevy-Hot, one HP and four MPs, 2026-10-02).
+        let single = parsed.isShared && role == .highPay && step.members.count == 1
+        let ref = single ? FrameRules.Ref(role: role, rank: 1) : parsed
         let plural = role == .highPay ? "high-pay symbols" : "medium-pay symbols"
         let trim: (String) -> String = { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
         let spec = FrameStyle.spec(design, highPay: role == .highPay).map(trim)
@@ -12863,10 +12920,13 @@ extension GDDAssetPrompts {
             let img = "Image \(i + 1)"
             if r == RenderPlan.themeArt {
                 parts.append("\(img) is the approved concept art for this theme. Take only how it is painted — the technique, light, materials and finish. Nothing of its scene, characters, objects or text appears.")
-            } else if ref.isShared, FrameRules.parse(r)?.role == .highPay {
+            } else if parsed.isShared, role == .mediumPay, FrameRules.parse(r)?.role == .highPay {
                 parts.append("\(img) is this game's high-pay frame. The medium pays' frame is its plainer sibling: the same square outline and window, a simpler material and less ornament, so a player ranks them at a glance.")
             }
         }
+        // The studio's frames are slim: Tiki Titans' rim is 8% of the frame's width and its window 84%
+        // of it; ours came back at 17–20%, which shrank every symbol inside (2026-10-02).
+        let slim = "Its rim is slim — about a twelfth of the frame's width on each side, its ornaments included — so the window inside takes most of the frame."
         let panel = Framing(design) == .layered
             ? "Inside the rim the window is open and EMPTY: it shows the same flat background as around the frame, right up to the rim — no panel, glass, shadow or glow inside it, whatever an attached image shows."
             : "Inside the rim, the backing panel fills the whole window: \(PanelStyle.brief(design)), in a calm mid-tone. Nothing stands on it — no subject, emblem, text or symbol: the symbols are painted into it later."
@@ -12877,8 +12937,8 @@ extension GDDAssetPrompts {
         let places = FrameRules.gemPlaces(FrameRules.gemSlots(rank: ref.rank, role: role, design: design))
         let gems = layered ? "" : FrameRules.hasGems(ref, design) && !places.isEmpty ? ", set with \(gem): \(places), \(clear)" : ""
         let noGems = layered ? " No gems or jewels on it: they are set into it afterwards." : ""
-        if !ref.isShared {
-            let rich = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with a crest at the top centre"
+        let rich = FrameStyle.richer(design).map(trim) ?? "heavier, brighter metal with a crest at the top centre"
+        if !ref.isShared && !single {
             let change: String
             switch (ladder, ref.rank) {
             case (.gems, 2): change = "the same frame\(gems)"
@@ -12898,12 +12958,16 @@ extension GDDAssetPrompts {
                 "No text, lettering or numbers, no watermark, no user interface.",
             ]).joined(separator: "\n\n")
         }
-        let rung = (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
+        let rung = single ? " The only high pay, so the richest frame of the set: \(rich)\(gems). Its outline may rise into a crest at the top centre."
+            + (layered ? noGems : "")
+            : (role == .highPay && ladder == .metal ? " Its metal parts are bronze: the top symbols' frames are silver and gold." : "")
             + (layered ? noGems : !gems.isEmpty ? " It is set with \(gem): \(places), \(clear)."
                 : role == .highPay && ladder == .gems ? " No gems on it: the top symbols' frames are the jewelled ones." : "")
         return ([
-            "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of this frame, so it holds each in turn and carries nothing of any of them.",
-            "THE FRAME: \(spec).\(rung) A square frame seen straight on, upright and level, centred and filling about 85% of the image with an even margin. \(panel)",
+            single
+                ? "Create one empty frame for the top symbol of a video slot game themed “\(theme.name)”: it is \(Framing(design) == .layered ? "set into" : "painted into") this frame, which carries nothing of it."
+                : "Create one empty frame for the \(plural) of a video slot game themed “\(theme.name)”. Every one of them is \(Framing(design) == .layered ? "set into" : "painted into") a copy of this frame, so it holds each in turn and carries nothing of any of them.",
+            "THE FRAME: \(spec).\(rung) A square frame seen straight on, upright and level, centred and filling about 85% of the image with an even margin. \(slim) \(panel)",
         ] + parts + [
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
             backdropLine(backing),
@@ -13439,7 +13503,7 @@ extension GDDAssetPrompts {
     /// style, lighting, and composition"), in the wording test 2 passed with (2026-10-02).
     static func gemsBrief(job: AssetJob, theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), jobs: [AssetJob]) -> String {
         let rank = FrameRules.rank(of: job.id, in: jobs)
-        let slots = Set(FrameRules.gemSlots(rank: rank, role: job.role, design: design))
+        let slots = Set(FrameRules.gemSlots(for: job, in: jobs, design: design))
         let whose = job.role != .highPay ? "a medium-pay symbol" : rank == 1 ? "the top high-pay symbol" : rank == 2 ? "the second high-pay symbol" : "a high-pay symbol"
         let discs: String, alike: String
         switch (slots.contains(.corners), slots.contains(.crest)) {
