@@ -12105,7 +12105,9 @@ public enum PayLadder {
             out.append("- HIGH PAYS, rankable at a glance, are this theme's LIVING CAST, in story order: the hero at HP1, then the villain or second lead, then its creatures — "
                      + "and anything in the story that speaks, sings or moves of its own accord counts as living (a harp that sings, a talking mirror). "
                      + "Each names its character in \"cast\". Never an item ranked above a living one; only when the story has fewer living beings than "
-                     + "high pays do the last ones become its most precious treasures. A theme made of objects (fruit, gems, cars) ranks its most prized objects instead.")
+                     + "high pays do the last ones become its most precious treasures. A theme made of objects (fruit, gems, cars) ranks its most prized objects instead. "
+                     + "HP1 and HP2 are shown as close busts, HP1 mostly face: their subjects are their faces and heads — expression, hair, crown or hat — "
+                     + "never something held in a hand, which falls below the cut and pulls the picture down to the chest. A prop goes to a lower rank, whose chest shows.")
         }
         if has(.mediumPay) {
             out.append("- MEDIUM PAYS are set apart from the high pays: this theme's LORE ITEMS — the objects its story turns on (in a fairy tale, the magic "
@@ -12125,6 +12127,15 @@ public enum PayLadder {
         let hps = jobs.filter { $0.kind == .symbol && $0.role == .highPay && !$0.subject.isEmpty }.sorted { rank($0, in: jobs) < rank($1, in: jobs) }
         if let item = hps.firstIndex(where: { !living($0) }), let after = hps[item...].first(where: living) {
             out.append("\(hps[item].id) is an item ranked above \(after.id), who shows \(after.cast): the living cast takes the top high pays, in story order.")
+        }
+        // A close bust holding something: the hand and what it holds fall below the cut, and drawn anyway
+        // they pull HP1 back to its chest — Jack's raised bean, twice (2026-10-02, 2026-10-03).
+        let held = ["holding", "holds", "hand", "palm", "presenting", "clutching", "grasping", "cradles", "cradling", "raised fist"]
+        for j in hps where living(j) && rank(j, in: jobs) <= 2 && bust(j) {
+            let words = (j.subject + " " + (j.currentBrief ?? "")).lowercased()
+            if let w = held.first(where: { words.contains($0) }) {
+                out.append("\(j.id) is a close bust — its face and head — but its subject has it \(w == "hand" || w == "palm" ? "holding something in a hand" : "\(w) something"): drop the prop, it falls below the cut; give it to a lower rank.")
+            }
         }
         for m in jobs where m.kind == .symbol && m.role == .mediumPay && living(m) {
             out.append("\(m.id) shows \(m.cast), but the medium pays are this theme's lore items, set apart from the high pays: give it an object from the story.")
@@ -13866,14 +13877,14 @@ extension GDDAssetPrompts {
         ]
         if !parsed.isShared {
             return ([
-                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make HP1's version of it, for the top symbol: the same construction, proportions and size, and exactly the same window and inner lip, so they read as one set — but the richest of the set: \(rich).\(crest) No gems or jewels on it: they are set into it afterwards. The opening stays the flat background, with nothing drawn in it.",
+                "Edit the last attached image: it is the empty frame of the \(plural) of a video slot game themed “\(theme.name)”. Make HP1's version of it, for the top symbol: the same construction, proportions and size, and exactly the same window and inner lip, so they read as one set — but the richest of the set: \(rich).\(crest) Every addition goes on its outer edge and its corners, never inward: its inner lip and window stay exactly where they are. No gems or jewels on it: they are set into it afterwards. The opening stays the flat background, with nothing drawn in it.",
             ] + refs + tail).joined(separator: "\n\n")
         }
         let geo = FrameGeometry(design)
         let rung = single ? " It is the only high pay's, so the richest frame of the set: \(rich).\(crest)" : ""
         return ([
             "Edit the last attached image: it is a plain grey moulding — \(geo.shape.words) — with exactly this frame's outline, narrow width and inner lip. Repaint it as the frame described below: its surface becomes this theme's material, carving and ornament, keeping the same narrow band, the same inner lip and the same opening. Its ornament — corner pieces, flourishes\(single && crestOK ? ", and a crest at the top centre" : "") — may spread a little past its outer edge onto the background, never inward: the opening inside the inner lip stays the flat background, with nothing drawn in it — no liner, second border or step. It is the empty frame for the \(single ? "top symbol" : plural) of a video slot game themed “\(theme.name)”. \(single ? "It is" : "Every one of them is") set into \(single ? "this frame" : "a copy of it"), so it carries nothing of \(single ? "it" : "any of them").",
-            "THE FRAME: \(spec).\(rung) No gems or jewels on it: they are set into it afterwards. Seen straight on, upright and level.",
+            "THE FRAME: \(spec).\(rung)\(role == .mediumPay ? " It is plainer than the high pays' frame, in a different, humbler material, so a player ranks them at a glance." : "") No gems or jewels on it: they are set into it afterwards. Seen straight on, upright and level.",
         ] + refs + tail).joined(separator: "\n\n")
     }
 

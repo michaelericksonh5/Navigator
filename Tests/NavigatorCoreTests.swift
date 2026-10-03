@@ -13166,6 +13166,17 @@ final class SetLookTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(f.over, 0.14); XCTAssertGreaterThan(f.sides, 1)              // over the top, past the sides
     }
 
+    // A close-cropped HP1 or HP2 holding something is sent back: the prop falls below the cut.
+    func testACloseBustHoldingAPropIsSentBack() {
+        var jack = pay("HP1", .highPay); jack.cast = "Jack"; jack.silhouette = "head-and-shoulders bust"
+        jack.subject = "Jack smiling while holding a glowing magic bean in his hand."
+        var giant = pay("HP2", .highPay); giant.cast = "Giant"; giant.silhouette = "bust with full shoulders"; giant.subject = "The Giant scowling under a spiked crown."
+        let p = PayLadder.problems([jack, giant])
+        XCTAssertEqual(p.count, 1); XCTAssertTrue(p[0].hasPrefix("HP1 is a close bust"), p[0])
+        jack.subject = "Jack's grinning face under tousled hair."
+        XCTAssertEqual(PayLadder.problems([jack, giant]), [])
+    }
+
     // The planner chooses a themed backing, from the backings there are.
     func testThePlannerChoosesAThemedBacking() {
         let plan = GDDAssetPrompts.planning(theme: GameTheme(name: "Galactic Goddess"), gameName: "G", jobs: [pay("HP1", .highPay)])

@@ -25617,7 +25617,10 @@ final class GDDToAssetsRun: ObservableObject {
             navLog("gdd frame: \(step.id) → built from \(FrameKit.sharedID(step.id))\(build.metal.map { " in \($0)" } ?? "") $0")
             return ok
         }
-        let resolved = resolveRefs(step.refs, for: step.id, themeArt: themeArt, folder: folder)
+        // The medium pays' frame is drawn from its own words, not shown the high pays': shown it, GPT drew
+        // the same gold vines where the plan asked for timber and brass (Chevy-Hot, 2026-10-03).
+        let shown = ref.role == .mediumPay ? step.refs.filter { FrameRules.parse($0)?.role != .highPay } : step.refs
+        let resolved = resolveRefs(shown, for: step.id, themeArt: themeArt, folder: folder)
         var inputs = resolved.inputs, refs = resolved.refs
         if ref.isShared {
             guard let t = ChromaKeyOutputRules.image(straightRGBA8: FrameStack.frameTemplate(size: size, backing: b, geometry: geo), width: size, height: size, space: space).flatMap(encodePNG) else { return false }
@@ -25644,6 +25647,14 @@ final class GDDToAssetsRun: ObservableObject {
                    "covered": best?.covered ?? 1, "error": kept ? "" : (error ?? "drifted off its planned window: built from parts instead")])
         DispatchQueue.main.async { self.spent += cost }
         guard kept, let best else {
+            // HP1's own that drifted keeps the shared frame GPT drew: built from a parts sheet it came back
+            // plainer than the frame it was to outrank, in another hand (Tiki, 2026-10-03). It still
+            // stands apart by its gems, its backing's colour and its break-out.
+            if !ref.isShared, let d = try? Data(contentsOf: folder.appendingPathComponent("\(FrameKit.sharedID(step.id)).png")), let px = pixels(d) {
+                navLog(String(format: "gdd frame: %@ → GPT Image 2.5 drifted (%.1f%% of its window covered) $%.3f — kept %@", step.id,
+                              (best?.covered ?? 1) * 100, cost, FrameKit.sharedID(step.id)))
+                return write(px)
+            }
             navLog(String(format: "gdd frame: %@ → GPT Image 2.5 %@ $%.3f — built from its parts sheet instead", step.id,
                           error ?? String(format: "drifted (%.1f%% of its window covered)", (best?.covered ?? 1) * 100), cost))
             return false
