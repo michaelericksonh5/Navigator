@@ -13156,6 +13156,16 @@ final class SetLookTests: XCTestCase {
         let again = ReelSizing.fit(out, width: n, height: n, share: 0.64)
         XCTAssertEqual(again.count, out.count)
     }
+    // New plans' frames take the studio's share of the canvas, leaving HP1 room to break out; older sets keep theirs.
+    func testFramesLeaveHP1RoomToBreakOut() {
+        XCTAssertEqual(FrameGeometry(SetDesign()).outer, 0.85)                                  // planned before
+        XCTAssertEqual(FrameGeometry(SetDesign(families: [FrameGeometry.outerKey: "0.78"])).outer, 0.78)
+        XCTAssertEqual(ReelSizing.share(.lowPay, outer: 0.78), 0.78 * 0.75, accuracy: 1e-9)
+        var hp1 = pay("HP1", .highPay); hp1.cast = "Jack"; hp1.silhouette = "head-and-shoulders bust"; hp1.hasFrame = true
+        let f = PayLadder.face(hp1, in: [hp1])!
+        XCTAssertGreaterThanOrEqual(f.over, 0.14); XCTAssertGreaterThan(f.sides, 1)              // over the top, past the sides
+    }
+
     // The planner chooses a themed backing, from the backings there are.
     func testThePlannerChoosesAThemedBacking() {
         let plan = GDDAssetPrompts.planning(theme: GameTheme(name: "Galactic Goddess"), gameName: "G", jobs: [pay("HP1", .highPay)])

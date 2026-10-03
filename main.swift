@@ -26066,7 +26066,7 @@ final class GDDToAssetsRun: ObservableObject {
                 let id = u.lastPathComponent.replacingOccurrences(of: "_rmbg.png", with: "")
                 guard let role = roles[id], let job = jobs.first(where: { $0.id == id }), !Framing.stacks(job, design),
                       let cg = loadCGImage(u), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
-                let out = ReelSizing.fit(px, width: cg.width, height: cg.height, share: ReelSizing.share(role))
+                let out = ReelSizing.fit(px, width: cg.width, height: cg.height, share: ReelSizing.share(role, outer: FrameGeometry(design).outer))
                 if let img = ChromaKeyOutputRules.image(straightRGBA8: out, width: cg.width, height: cg.height, space: space), let png = encodePNG(img) {
                     try? png.write(to: u)
                 }
@@ -26480,6 +26480,8 @@ extension GDDToAssetsRun {
                 let o = f.window, oh = Double(o.h)
                 var lift = rule.lift * (rim?.down ?? 0.22) + rule.over
                 if let c = crest { lift = min(lift, (Double(o.y) - (c.y + c.size / 4)) / oh) }
+                // Never past the canvas: its head stays whole, a hair inside the top.
+                lift = min(lift, (Double(o.y) - 0.012 * Double(H)) / oh)
                 at = FrameStack.facePlacement(subject: e, face: (fb.minX, fb.minY, fb.width, fb.height), window: o, faceShare: rule.share, lift: lift)
                 let side = rule.sides * (rim?.across ?? 0.22) * Double(o.w)
                 clipBox = (Double(o.x) - side, -.infinity, Double(o.x + o.w) + side, Double(o.y + o.h))

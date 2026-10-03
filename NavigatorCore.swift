@@ -10965,6 +10965,8 @@ public enum GDDAssetPrompts {
             let t = cap(clean(v), SetDesignRules.maxFamily)
             if !t.isEmpty { design.families[k] = t }
         }
+        // A new plan's frames take the studio's share of the canvas; sets planned before keep theirs.
+        design.families[FrameGeometry.outerKey] = String(FrameGeometry.studioOuter)
         var out: [AssetJob] = [], missing: [String] = []
         for var j in jobs {
             let subj = (bySubject[j.id]?.0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -11443,7 +11445,16 @@ public enum GemCut: String, CaseIterable, Sendable {
 public struct FrameGeometry: Sendable {
     public var shape: FrameShape, rim: Double, outer: Double = 0.85
     public init(shape: FrameShape = .square, rim: Double = FrameWeight.slim.rim, outer: Double = 0.85) { self.shape = shape; self.rim = rim; self.outer = outer }
-    public init(_ design: SetDesign) { self.init(shape: FrameShape(design), rim: FrameWeight(design).rim) }
+    /// A set's frames at the size its plan was made with: 0.78 of the canvas since 2026-10-02, 0.85 before.
+    public init(_ design: SetDesign) {
+        self.init(shape: FrameShape(design), rim: FrameWeight(design).rim, outer: Double(design.families[Self.outerKey] ?? "") ?? 0.85)
+    }
+    /// How much of its canvas a pay's frame takes, kept in the plan's families.
+    public static let outerKey = "frameOuter"
+    /// The studio's: Tiki Titans' frame is 246x255 in its 320 cell (0.77-0.80), so its HP1 rises well
+    /// over the frame inside the canvas — its crown starts 17% of the frame's height above it. At 0.85
+    /// there was room for 7.5% of the canvas above the frame, and HP1 barely broke out (2026-10-02).
+    public static let studioOuter = 0.78
     var a: Double { outer / 2 }
     /// The band's width in the image's units.
     var t: Double { rim * outer }
@@ -11915,8 +11926,8 @@ public enum FrameKit {
 /// scatters, jackpots and value coins 1.00–1.02, bonus symbols 1.03. A framed high pay's frame is 0.85 of
 /// its cell (FrameGeometry.outer), so that is 1.0. Framed pays are sized by their stack, backgrounds never.
 public enum ReelSizing {
-    static let highPay = 0.85
-    public static func share(_ role: SlotSymbolRole) -> Double {
+    /// `outer`: the set's frame share of the canvas (FrameGeometry), what a framed high pay fills.
+    public static func share(_ role: SlotSymbolRole, outer highPay: Double = 0.85) -> Double {
         switch role {
         case .lowPay: return highPay * 0.75
         case .mediumPay: return highPay * 0.98
@@ -12076,7 +12087,10 @@ public enum PayLadder {
         guard crop(job, in: jobs) != nil else { return nil }
         if job.role != .highPay { return (0.25, -0.1, 0, 0) }
         switch rank(job, in: jobs) {
-        case 1: return (0.58, 1, 0.06, 1)
+        // HP1's head rises 14% of the window past the frame's top edge and its shoulders run past the
+        // frame's sides (0.8 of a rim beyond them): "pops out of the sides and top" (the art director);
+        // Tiki Titans' HP1 crown starts 17% of the frame above it. Capped at the canvas in the stack.
+        case 1: return (0.58, 1, 0.14, 1.8)
         case 2: return (0.42, 0.6, 0, 0.5)
         case 3: return (0.38, 0.2, 0, 0.3)
         default: return (0.33, 0, 0, 0)
