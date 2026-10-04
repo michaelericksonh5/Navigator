@@ -13311,6 +13311,44 @@ final class ReelLayoutTests: XCTestCase {
     }
 }
 
+final class GameSheetTests: XCTestCase {
+    let symbols = GDDSymbolSetRules.parseManual("WD, HP1-4, MP1-4, LP1-5, SC, BO1-3, JP1-4").symbols
+
+    func shape(_ l: ReelLayout) -> [String] {
+        l.grids.map { "\($0.mode) \($0.startRows.map { "\($0)→" } ?? "")\($0.rows)x\($0.reels)\($0.independent ? " ind" : "")" }
+            + l.extras.map { "\($0.what) \($0.count.map(String.init) ?? "") \($0.place)" }.sorted()
+            + (l.wheels ?? []).map { "\($0.name): \($0.wedges.joined(separator: "/"))" }
+            + (l.potFeatures ?? []) + (l.awards ?? [])
+    }
+    // What a sheet writes, the GDD reader reads back as the same game: one pipeline, typed or read.
+    func testASheetsDocumentReadsBackAsTheSameGame() {
+        var a = GameSheet()
+        a.pots = 3; a.potFeatures = "Expand, Multi, Jackpots or Wilds"; a.bonus = .ownGrid; a.bonusRows = 3; a.bonusReels = 5; a.bonusGrowsTo = 5
+        var b = GameSheet()
+        b.rows = 4; b.reels = 5; b.wheel = .jackpot; b.bonusWheel = true; b.oneMoreChance = true; b.jackpotTable = false; b.holdAndSpin = "Loot Link"
+        var c = GameSheet()
+        c.rows = 3; c.reels = 3; c.hotReel = true; c.bonusIndependent = true; c.wheel = .credits; c.jackpotNames = "Mega, Major, Minor"
+        for sheet in [a, b, c, GameSheet()] {
+            let doc = sheet.document(game: "Example", symbols: symbols)
+            XCTAssertEqual(shape(ReelLayoutRules.read(doc)), shape(sheet.layout(symbols)), doc)
+            XCTAssertFalse(doc.lowercased().contains("free"))
+            // Only the scenes the game has: base, bonus games when it has them, a jackpot wheel's own screen.
+            let scenes = AssetPlanRules.backgroundJobs(gddText: doc).map(\.id)
+            XCTAssertEqual(scenes.filter { $0 == "bg_bonus" }, [], doc)
+            XCTAssertEqual(scenes.contains("bg_bonusgames"), sheet.bonus != .none)
+        }
+    }
+    // A sheet from a GDD's reading, to correct it, keeps what the reading had.
+    func testASheetFromAReadingKeepsIt() {
+        let read = ReelLayoutRules.read(ReelLayoutTests.toyota)
+        let sheet = GameSheet(layout: read)
+        XCTAssertEqual(sheet.rows, 3); XCTAssertEqual(sheet.reels, 5); XCTAssertEqual(sheet.pots, 3); XCTAssertTrue(sheet.jackpotTable)
+        XCTAssertEqual(sheet.bonus, .ownGrid); XCTAssertEqual(sheet.bonusGrowsTo, 5)
+        XCTAssertEqual(GameSheet.ladder(4), ["Grand", "Major", "Minor", "Mini"])
+        XCTAssertEqual(GameSheet().jackpots(symbols), ["Grand", "Major", "Minor", "Mini"])
+    }
+}
+
 final class WheelAndPopUpTests: XCTestCase {
     // A jackpot wheel whose bonus wedge opens a second wheel that picks the bonus (the Tiki Titans pattern),
     // in sentences written for this test.

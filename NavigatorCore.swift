@@ -8221,7 +8221,9 @@ public struct ReelLayout: Equatable, Codable, Sendable {
         let parts = modes.map { m in "\(m) " + grids.filter { $0.mode == m }.map {
             "\($0.startRows.map { "\($0)→" } ?? "")\($0.rows)×\($0.reels)\($0.independent ? " independent" : "")" }.joined(separator: ", ") }
         let places = Dictionary(grouping: extras, by: { $0.place.isEmpty ? "around" : $0.place }).sorted { $0.key < $1.key }
-            .map { "\($0.key): " + $0.value.map { e in (e.count.map { "\($0) " } ?? "") + e.what + (e.rows.map { " \($0)×\(e.reels ?? 0)" } ?? "") }.joined(separator: ", ") }
+            .map { "\($0.key): " + $0.value.map { e in
+                (e.count.map { "\($0) " } ?? "") + e.what + ((e.count ?? 1) > 1 && !e.what.hasSuffix("s") ? "s" : "") + (e.rows.map { " \($0)×\(e.reels ?? 0)" } ?? "")
+            }.joined(separator: ", ") }
         return (parts + places).joined(separator: " · ")
     }
 }
@@ -8775,7 +8777,9 @@ public enum PotStates {
                 if i.contains("collect") { return "COLLECT" }
                 if i.range(of: #"matrix|expand|grow|extra (row|reel)"#, options: .regularExpression) != nil { return "EXPAND" }
                 if i.range(of: #"bonus game|free (games|spins)"#, options: .regularExpression) != nil { return "BONUS GAMES" }
-                return ""
+                // Already a plaque's word or two ("multi"): as written.
+                let words = i.replacingOccurrences(of: #"^(and|or)\s+"#, with: "", options: .regularExpression)
+                return words.split(separator: " ").count <= 3 ? words.uppercased() : ""
             }
         }
         return nil
@@ -8814,6 +8818,131 @@ public enum PotStates {
         var out = [UInt8](repeating: 0, count: w * h * 4)
         FrameKit.over(&out, width: w, scaled, at: Int((e.cx - f.cx * k).rounded()), Int((Double(e.bottom) - Double(f.bottom) * k).rounded()))
         return out
+    }
+}
+
+/// A game's structure entered by hand — for a game with no GDD yet, or a GDD that does not say (15 of the
+/// studio's 54 give no reel size) or was read wrong. It becomes the same ReelLayout a GDD is read into, and a
+/// short document written the way the studio's GDDs are, so everything after — the plan, the symbols, the
+/// backgrounds, the reel area, the jackpot table, the pots and their plaques, the wheels, the pop-ups — runs
+/// exactly as it does for a GDD. One tool, whichever way the game arrives.
+public struct GameSheet: Equatable, Codable, Sendable {
+    public enum Bonus: String, Codable, CaseIterable, Sendable { case none = "None", sameReels = "On the base reels", ownGrid = "On a grid of its own" }
+    public enum Wheel: String, Codable, CaseIterable, Sendable { case none = "None", jackpot = "Jackpot wheel", credits = "Credit wheel" }
+    public var rows = 3, reels = 5
+    public var hotReel = false
+    /// The bonus games: on the base grid, or a grid of their own, each cell its own reel or not, growing taller or not.
+    public var bonus = Bonus.sameReels
+    public var bonusRows = 3, bonusReels = 5
+    public var bonusIndependent = false
+    public var bonusGrowsTo = 0          // rows it can grow to; 0 does not grow
+    /// A hold-and-spin mode of its own ("Loot Link"): the base grid, each cell its own reel.
+    public var holdAndSpin = ""
+    /// The jackpots' names, top first; empty takes the studio's ladder for the set's JP symbols.
+    public var jackpotNames = ""
+    public var jackpotTable = true
+    public var pots = 0
+    /// What each pot unlocks, as its plaque reads ("Expand, Multi, Jackpots or Wilds"); empty leaves plaques plain.
+    public var potFeatures = ""
+    public var wheel = Wheel.none
+    /// A wedge on the wheel that opens a second wheel picking the bonus (Tiki Titans).
+    public var bonusWheel = false
+    public var oneMoreChance = false
+
+    public init() {}
+
+    /// The studio's ladder for `n` jackpots, top first (Micro below Mini as Billionaire's Gamma has it).
+    public static func ladder(_ n: Int) -> [String] { Array(["Grand", "Major", "Minor", "Mini", "Micro", "Mega"].prefix(max(0, n))) }
+    /// The jackpots' names: as typed, or the ladder for the set's JP symbols.
+    public func jackpots(_ symbols: [SlotSymbol]) -> [String] {
+        let typed = jackpotNames.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        return typed.isEmpty ? Self.ladder(symbols.filter { $0.role == .jackpot }.count) : typed
+    }
+
+    public func layout(_ symbols: [SlotSymbol]) -> ReelLayout {
+        var out = ReelLayout()
+        let base = ReelLayout.Grid(mode: "base", rows: rows, reels: reels, note: "typed")
+        out.grids = [base]
+        switch bonus {
+        case .none: break
+        case .sameReels, .ownGrid:
+            let r = bonus == .ownGrid ? bonusRows : rows, k = bonus == .ownGrid ? bonusReels : reels
+            out.grids.append(ReelLayout.Grid(mode: "bonus", rows: max(r, bonusGrowsTo), reels: k, independent: bonusIndependent,
+                                             note: "typed", startRows: bonusGrowsTo > r ? r : nil))
+        }
+        let hold = holdAndSpin.trimmingCharacters(in: .whitespaces)
+        if !hold.isEmpty { out.grids.append(ReelLayout.Grid(mode: hold.lowercased(), rows: rows, reels: reels, independent: true, note: "typed")) }
+        if hotReel { out.extras.append(ReelLayout.Extra(what: "hot reel", rows: 1, reels: reels, place: "above")) }
+        let names = jackpots(symbols)
+        if jackpotTable && !names.isEmpty { out.extras.append(ReelLayout.Extra(what: "jackpot table", rows: nil, reels: nil, place: "above")) }
+        if pots > 0 {
+            out.extras.append(ReelLayout.Extra(what: "pots", rows: nil, reels: nil, place: "above", count: pots))
+            let words = potFeatures.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+            if pots > 1 { out.potFeatures = (0..<pots).map { $0 < words.count ? words[$0] : "" } }
+        }
+        if wheel != .none {
+            let bonusWedge = bonusWheel ? ["BONUS GAMES"] : []
+            var wheels = [wheel == .jackpot
+                          ? ReelLayout.Wheel(name: "Jackpot Wheel", wedges: (names.isEmpty ? Self.ladder(4) : names).map { $0.uppercased() } + bonusWedge)
+                          : ReelLayout.Wheel(name: "Wheel", wedges: ["CREDITS"] + bonusWedge)]
+            if bonusWheel { wheels.append(ReelLayout.Wheel(name: "Bonus Wheel", wedges: ["WILD BONUS", "MULTIPLIER BONUS", "BONUS GAMES"])) }
+            out.wheels = wheels
+            out.extras.append(ReelLayout.Extra(what: "wheel", rows: nil, reels: nil, place: "", count: wheels.count))
+        }
+        if oneMoreChance { out.awards = ["one more chance"] }
+        return out
+    }
+
+    /// The structure as the studio's GDDs write it — for the planner's context and the backgrounds' scenes,
+    /// and read back by ReelLayoutRules to the same layout. "Bonus games", never "free".
+    public func document(game: String, symbols: [SlotSymbol]) -> String {
+        let name = game.isEmpty ? "This game" : game, names = jackpots(symbols)
+        func list(_ a: [String]) -> String { a.count < 2 ? a.joined() : a.dropLast().joined(separator: ", ") + " and " + a.last! }
+        var d = ["# \(name)", "\(name) is a \(rows)x\(reels) lines game."]
+        d += ["Base Game Mode", "The base game is played on a \(rows)x\(reels) matrix" + (hotReel ? ", with an additional 1x\(reels) Hot Reel positioned above the matrix." : ".")]
+        if bonus != .none {
+            let r = bonus == .ownGrid ? bonusRows : rows, k = bonus == .ownGrid ? bonusReels : reels
+            // "Bonus games" only: "bonus game" alone names another scene (GDDScenes), a second paid background.
+            d += ["Bonus Games", "The bonus games are played on a \(r)x\(k) matrix" + (bonusIndependent ? " of independent reels" : "")
+                  + (bonusGrowsTo > r ? ", and the matrix can grow from a \(r)x\(k) to a \(bonusGrowsTo)x\(k) matrix." : ".")]
+        }
+        let hold = holdAndSpin.trimmingCharacters(in: .whitespaces)
+        if !hold.isEmpty { d += [hold, "\(hold) is played on a \(rows)x\(reels) matrix of independent reels."] }
+        if !names.isEmpty { d += ["Jackpots", "The jackpots are the \(list(names)) jackpots" + (jackpotTable ? ", shown on the jackpot table above the matrix." : ".")] }
+        if pots > 0 {
+            d += ["Pots", "There \(pots == 1 ? "is 1 pot" : "are \(pots) pots") that sit above the matrix and fill as the game is played."]
+            let f = potFeatures.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+            if pots > 1 && f.count == pots { d.append("The pots are tied to \(pots) features: \(f.joined(separator: ", ")).") }
+        }
+        if wheel != .none {
+            d.append("Wheel")
+            d.append(wheel == .jackpot
+                     ? "Landing the trigger symbols starts the Jackpot Wheel. The wheel has wedges for the \(list(names.isEmpty ? Self.ladder(4) : names)) jackpots" + (bonusWheel ? " and a special Bonus wedge." : ".")
+                     : "Landing the trigger symbols starts the Wheel, whose wedges award credit values" + (bonusWheel ? " and a special Bonus wedge." : "."))
+            if bonusWheel { d.append("When the Bonus wedge is selected, the Bonus Wheel appears. Each wedge on the Bonus Wheel represents a mode for entering the bonus: the standard bonus, random wilds, or a multiplier bonus.") }
+        }
+        if oneMoreChance { d.append("One More Chance can trigger on a losing spin.") }
+        return d.joined(separator: "\n")
+    }
+
+    /// A sheet from a layout read off a GDD, to correct it: its base and first bonus grid, its hold-and-spin
+    /// mode, extras, wheels and awards. Modes beyond those are not editable here.
+    public init(layout l: ReelLayout) {
+        if let b = l.base { rows = b.rows; reels = b.reels }
+        hotReel = l.extras.contains { $0.what == "hot reel" || $0.what == "extra reel" }
+        if let g = l.grids.first(where: { $0.mode.hasPrefix("bonus") }) {
+            bonus = g.rows == rows && g.reels == reels && g.startRows == nil ? .sameReels : .ownGrid
+            bonusRows = g.startRows ?? g.rows; bonusReels = g.reels; bonusIndependent = g.independent
+            bonusGrowsTo = g.startRows == nil ? 0 : g.rows
+            if bonus == .sameReels && g.startRows != nil { bonus = .ownGrid }
+        } else { bonus = .none }
+        if let h = l.grids.first(where: { ReelLayoutRules.holdModes.contains($0.mode) }) { holdAndSpin = h.mode.capitalized }
+        jackpotTable = l.extras.contains { $0.what == "jackpot table" }
+        pots = l.extras.first { $0.what == "pots" }?.count ?? (l.extras.contains { $0.what == "pots" } ? 1 : 0)
+        potFeatures = (l.potFeatures ?? []).map { $0.capitalized }.joined(separator: ", ")
+        if let w = l.wheels?.first { wheel = w.wedges.contains("CREDITS") && !w.wedges.contains(where: WheelRules.tiers.map { $0.uppercased() }.contains) ? .credits : .jackpot }
+        bonusWheel = l.wheels?.contains { $0.name.hasPrefix("Bonus") } ?? false
+        oneMoreChance = l.awards?.contains("one more chance") ?? false
     }
 }
 
@@ -10199,7 +10328,7 @@ public struct AssetJob: Equatable, Sendable {
     public let kind: Kind
     public let role: SlotSymbolRole  // .unknown for backgrounds
     public let tier: Int?
-    public let title: String         // what it is, for the plan table
+    public var title: String         // what it is, for the plan table (a typed set's jackpots are renamed in place)
     public var subject: String       // the art subject — filled in by the planning pass
     public var silhouette: String    // one or two words, used to enforce distinctness
     /// Whether this symbol is drawn inside a frame, plaque or backing shape.
@@ -14514,7 +14643,7 @@ extension GDDAssetPrompts {
 
     static func jackpotTierName(_ job: AssetJob) -> String {
         let t = (job.title + " " + job.subject).lowercased()
-        for n in ["grand", "mega", "major", "minor", "mini"] where t.contains(n) { return n.uppercased() }
+        for n in ["grand", "mega", "major", "minor", "mini", "micro"] where t.contains(n) { return n.uppercased() }
         return "tier \(job.tier ?? 1)"
     }
 

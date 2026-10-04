@@ -21356,7 +21356,7 @@ if CommandLine.arguments.contains("--timing") {
 // launched the process, so a shell-started run reports the shell's grants, not Navigator's.
 // Probes that would raise a macOS dialog are skipped unless the window already asked.
 // PAID test of the design pipeline, headless — the same steps as the window, logged in full:
-//   Navigator --design-test "<GDD document name>" "<theme name>" [--anchor <out-dir>]
+//   Navigator --design-test "<GDD document name, or the game's name with --typed>" "<theme name>" [--anchor <out-dir>] [--typed "<symbols>" [--sheet <GameSheet.json>]]
 // Reads the document, loads the theme and its art, reads the art style (free when it was read
 // before), designs the set (plus one revision when the checks find something), and with
 // --anchor draws ONLY the anchor. Every call is metered, so this never runs on its own.
@@ -21379,8 +21379,12 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
         // --gdd-file <path>: the document's text from a file, for a GDD the library cannot read now.
         // --new-theme: a theme not on the hub yet, planned from its name alone (no hub sign-in needed).
         let gddFile = value("--gdd-file"), newTheme = args.contains("--new-theme")
+        // --typed "<symbols>" [--sheet <GameSheet .json>]: a set with no GDD, as the window's "type the set" makes it.
+        let typedSpec = value("--typed")
+        let sheet: GameSheet = value("--sheet").flatMap { try? JSONDecoder().decode(GameSheet.self, from: Data(contentsOf: URL(fileURLWithPath: $0))) } ?? GameSheet()
+        if value("--sheet") != nil && typedSpec == nil { fail("--sheet goes with --typed") }
         let entry: GDDLibrary.Entry?
-        if gddFile == nil {
+        if gddFile == nil && typedSpec == nil {
             guard let folder = GDDLibrary.folder else { fail("no GDD folder is set") }
             guard let e = GDDLibrary.entries(in: folder).first(where: { $0.name == gddName }) else { fail("no document named “\(gddName)”") }
             entry = e
@@ -21392,7 +21396,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
             run.lowPays = k
         } else { fail("--low-pays is one of \(LowPayKind.allCases.map(\.rawValue).joined(separator: ", ")), or custom:<what>") }
         @MainActor func readText(_ body: @escaping (String?, String?) -> Void) {
-            if let f = gddFile { body(try? String(contentsOfFile: f, encoding: .utf8), "couldn’t read \(f)") }
+            if typedSpec != nil { body("", nil) }
+            else if let f = gddFile { body(try? String(contentsOfFile: f, encoding: .utf8), "couldn’t read \(f)") }
             else if let entry { GDDLibrary.text(of: entry, completion: body) }
         }
         @MainActor func themes(_ body: @escaping ([GameTheme]?, String?) -> Void) {
@@ -21400,8 +21405,14 @@ if let flag = CommandLine.arguments.firstIndex(of: "--design-test"), flag + 2 < 
         }
         readText { text, err in MainActor.assumeIsolated {
             guard let text else { fail(err ?? "the document could not be read") }
-            run.load(gddText: text, gameName: gddName, size: "2K", symbolAspect: "1:1",
-                     backgroundAspect: "3:4", backgroundSize: "4K")
+            if let typedSpec {
+                run.loadManual(typedSpec, gameName: gddName, sheet: sheet, size: "2K", symbolAspect: "1:1",
+                               backgroundAspect: "3:4", backgroundSize: "4K")
+                print("TYPED: \(run.reelLayout?.summary ?? "no reels")")
+            } else {
+                run.load(gddText: text, gameName: gddName, size: "2K", symbolAspect: "1:1",
+                         backgroundAspect: "3:4", backgroundSize: "4K")
+            }
             print("GDD: \(run.symbols.count) symbols, \(run.jobs.count) images to plan")
             guard !run.jobs.isEmpty else { fail("the document declares no symbol set Navigator can read") }
             themes { list, err in MainActor.assumeIsolated {
@@ -21815,6 +21826,38 @@ if let flag = CommandLine.arguments.firstIndex(of: "--finish"), flag + 2 < Comma
 // without opening anything on the display.
 // Free, and only with NAVIGATOR_NO_PAID_CALLS=1:  Navigator --gdd-snapshot <set folder> <out.png>
 // The GDD window around a reopened set, off screen — its plan's frames and picks as the window shows them.
+// Free:  NAVIGATOR_NO_PAID_CALLS=1 Navigator --typed-snapshot <out.png>
+// The window in "No GDD yet — type the set", a typical set built with pots, plaques and a wheel, drawn off screen.
+if let flag = CommandLine.arguments.firstIndex(of: "--typed-snapshot"), flag + 1 < CommandLine.arguments.count {
+    guard PaidCalls.disabled else { print("Refusing: set NAVIGATOR_NO_PAID_CALLS=1"); exit(2) }
+    let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        let run = GDDToAssetsRun()
+        var sheet = GameSheet()
+        sheet.pots = 3; sheet.potFeatures = "Expand, Multi, Jackpots or Wilds"; sheet.wheel = .jackpot; sheet.bonusWheel = true
+        run.loadManual(GDDSymbolSetRules.typicalSet, gameName: "Example", sheet: sheet, size: "2K", symbolAspect: "1:1",
+                       backgroundAspect: "3:4", backgroundSize: "4K")
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 980, height: 1500), styleMask: [.borderless], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.contentView = NSHostingView(rootView: GDDToAssetsSheet(run: run, initialDocument: nil, startTyped: true, onClose: {}))
+        w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            w.contentView?.layoutSubtreeIfNeeded(); w.contentView?.display()
+            if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(w.windowNumber), [.boundsIgnoreFraming, .bestResolution]),
+               let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
+                try? png.write(to: out)
+            }
+            print("REELS: \(run.reelLayout?.summary ?? "none")")
+            print("JOBS: \(run.jobs.map(\.id).joined(separator: " "))")
+            print("WROTE: \(out.path)"); exit(0)
+        }
+    } }
+    app.run()
+}
+
 if let flag = CommandLine.arguments.firstIndex(of: "--gdd-snapshot"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
     // The window can start a paid style read on its own; it is only ever shown here with every paid call blocked.
@@ -24305,6 +24348,8 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var gddText = ""
     /// The reels the GDD lays out, read with its symbols (ReelLayoutRules), kept with the set.
     @Published var reelLayout: ReelLayout?
+    /// A set typed by hand (no GDD): its document is written from its GameSheet, not read from a file.
+    @Published var typed = false
     @Published var symbols: [SlotSymbol] = []
     /// Symbol-set lines the parser could not read. A dropped symbol is invisible
     /// otherwise — it only shows up when someone counts the folder.
@@ -24506,7 +24551,7 @@ final class GDDToAssetsRun: ObservableObject {
     func load(gddText text: String, gameName name: String, size: String,
               symbolAspect: String, backgroundAspect: String, backgroundSize: String) {
         revision += 1
-        gddText = text; gameName = name
+        gddText = text; gameName = name; typed = false
         let reels = ReelLayoutRules.read(text)
         reelLayout = reels.grids.isEmpty ? nil : reels
         let read = GDDSymbolSetRules.parseWithProblems(text)
@@ -24661,26 +24706,58 @@ final class GDDToAssetsRun: ObservableObject {
         }
     }
 
-    /// Build a plan from a symbol set typed by hand, for a game with no GDD yet.
-    func loadManual(_ spec: String, gameName name: String, size: String,
+    /// Build a plan from a symbol set typed by hand, for a game with no GDD yet, and the game's structure
+    /// (GameSheet): it becomes the reel layout and a document written the way GDDs are, so the plan, the
+    /// backgrounds and every interface piece come out as they do from a GDD.
+    func loadManual(_ spec: String, gameName name: String, sheet: GameSheet, size: String,
                     symbolAspect: String, backgroundAspect: String, backgroundSize: String) {
         revision += 1
         let r = GDDSymbolSetRules.parseManual(spec)
-        gddText = ""                       // there is no document; say so rather than fake one
         gameName = name.isEmpty ? "Untitled game" : name
-        symbols = r.symbols
+        typed = true
+        symbols = Self.namingJackpots(r.symbols, sheet: sheet)
+        gddText = sheet.document(game: gameName, symbols: symbols)
+        reelLayout = sheet.layout(symbols)
         parseProblems = r.problems
-        symbolsInferred = false; fromShippedArt = false
+        symbolsInferred = false; fromShippedArt = false; undeclared = []
         plausibilityWarning = GDDSymbolPlausibility.warning(r.symbols, inferred: false)
-        jobs = AssetPlanRules.symbolJobs(r.symbols, size: size, aspect: symbolAspect)
-            + AssetPlanRules.backgroundJobs(gddText: "base game and bonus games",
-                                            size: backgroundSize, aspect: backgroundAspect)
+        jobs = AssetPlanRules.symbolJobs(symbols, size: size, aspect: symbolAspect)
+            + AssetPlanRules.backgroundJobs(gddText: gddText, size: backgroundSize, aspect: backgroundAspect)
         missing = []; palette = []
         resetDesign(); lastFolder = nil
         status = r.symbols.isEmpty
             ? "Type the symbols this game needs, e.g. \(GDDSymbolSetRules.typicalSet)"
             : "\(r.symbols.count) symbols · \(jobs.count) images to make."
               + (r.problems.isEmpty ? "" : "  Couldn’t read: \(r.problems.joined(separator: ", "))")
+    }
+
+    /// The JP symbols carry the sheet's jackpot names, top tier first, as a GDD's notes would ("JP1 // Grand").
+    static func namingJackpots(_ symbols: [SlotSymbol], sheet: GameSheet) -> [SlotSymbol] {
+        let names = sheet.jackpots(symbols)
+        let order = symbols.filter { $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }.map(\.code)
+        return symbols.map { s in
+            guard let i = order.firstIndex(of: s.code), i < names.count else { return s }
+            return SlotSymbol(code: s.code, index: s.index, role: s.role, tier: s.tier, note: "\(names[i]) jackpot")
+        }
+    }
+
+    /// A game's structure set or corrected by hand, without starting the plan over: the reel layout, and for a
+    /// typed set its document and the jackpots' names; backgrounds the structure adds or drops follow it.
+    func applySheet(_ sheet: GameSheet, backgroundSize: String, backgroundAspect: String) {
+        guard !symbols.isEmpty else { return }
+        reelLayout = sheet.layout(symbols)
+        guard typed else { return }
+        symbols = Self.namingJackpots(symbols, sheet: sheet)
+        gddText = sheet.document(game: gameName, symbols: symbols)
+        let names = Dictionary(uniqueKeysWithValues: symbols.map { ($0.code, $0.note) })
+        let scenes = AssetPlanRules.backgroundJobs(gddText: gddText, size: backgroundSize, aspect: backgroundAspect)
+        let kept: [AssetJob] = jobs.compactMap { (j: AssetJob) -> AssetJob? in
+            var j = j
+            if j.kind == .background { return scenes.contains { $0.id == j.id } ? j : nil }
+            if j.role == .jackpot, let n = names[j.id], !n.isEmpty { j.title = n }
+            return j
+        }
+        jobs = kept + scenes.filter { s in !kept.contains { $0.id == s.id } }
     }
 
     /// Read the symbol set out of a document the parsers could not.
@@ -27770,12 +27847,84 @@ enum SpineExport {
 
 // ===== GDD to Assets: the window =====
 
+/// A game's structure, set by hand (GameSheet): for a game with no GDD yet, or to correct or complete a GDD's
+/// reading. The same layout a GDD is read into comes out of it, so the rest of GDD to Assets runs unchanged.
+struct GameSheetEditor: View {
+    @Binding var sheet: GameSheet
+    /// How many JP symbols the set has, for the jackpot names' placeholder.
+    var jackpots: Int
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
+            GridRow {
+                Text("Reels").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Stepper("\(sheet.rows) rows", value: $sheet.rows, in: 1...12).fixedSize()
+                    Text("×")
+                    Stepper("\(sheet.reels) reels", value: $sheet.reels, in: 1...12).fixedSize()
+                    Toggle("Hot reel above", isOn: $sheet.hotReel)
+                }
+            }
+            GridRow {
+                Text("Bonus games").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Picker("", selection: $sheet.bonus) { ForEach(GameSheet.Bonus.allCases, id: \.self) { Text($0.rawValue) } }.labelsHidden().fixedSize()
+                    if sheet.bonus == .ownGrid {
+                        Stepper("\(sheet.bonusRows) rows", value: $sheet.bonusRows, in: 1...12).fixedSize()
+                        Text("×")
+                        Stepper("\(sheet.bonusReels) reels", value: $sheet.bonusReels, in: 1...12).fixedSize()
+                    }
+                    if sheet.bonus != .none {
+                        Toggle("Each cell its own reel", isOn: $sheet.bonusIndependent)
+                        Stepper(sheet.bonusGrowsTo == 0 ? "Doesn’t grow" : "Grows to \(sheet.bonusGrowsTo) rows", value: $sheet.bonusGrowsTo, in: 0...12).fixedSize()
+                    }
+                }
+            }
+            GridRow {
+                Text("Hold-and-spin").foregroundColor(.secondary)
+                TextField("A mode of its own on the base reels, e.g. Loot Link — empty for none", text: $sheet.holdAndSpin).frame(maxWidth: 360)
+            }
+            GridRow {
+                Text("Jackpots").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    TextField(jackpots == 0 ? "No JP symbols in the set" : GameSheet.ladder(jackpots).joined(separator: ", "), text: $sheet.jackpotNames).frame(maxWidth: 260)
+                    Toggle("Jackpot table above the reels", isOn: $sheet.jackpotTable)
+                }
+            }
+            GridRow {
+                Text("Pots").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Stepper(sheet.pots == 0 ? "None" : "\(sheet.pots) pot\(sheet.pots == 1 ? "" : "s") above the reels", value: $sheet.pots, in: 0...6).fixedSize()
+                    if sheet.pots > 1 {
+                        TextField("What each unlocks, for its plaque: Expand, Multi, …", text: $sheet.potFeatures).frame(maxWidth: 300)
+                    }
+                }
+            }
+            GridRow {
+                Text("Wheel").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Picker("", selection: $sheet.wheel) { ForEach(GameSheet.Wheel.allCases, id: \.self) { Text($0.rawValue) } }.labelsHidden().fixedSize()
+                    if sheet.wheel != .none { Toggle("A bonus wedge opens a Bonus Wheel", isOn: $sheet.bonusWheel) }
+                }
+            }
+            GridRow {
+                Text("Awards").foregroundColor(.secondary)
+                Toggle("One More Chance", isOn: $sheet.oneMoreChance)
+            }
+        }
+        .font(.callout)
+        .help("The game's structure: what its reel area, jackpot table, pots, wheels and pop-ups are made from.")
+    }
+}
+
 struct GDDToAssetsSheet: View {
     // Owned by the window, not the view, so the window's own close button can ask the
     // same question the Close button asks. A paid batch must not be able to slip
     // behind a closed window where nobody can see it, stop it, or learn what it spent.
     @ObservedObject var run: GDDToAssetsRun
     var initialDocument: URL? = nil
+    /// Open on "No GDD yet — type the set" (the typed-set snapshot).
+    var startTyped = false
     let onClose: () -> Void
 
     @State private var gddFolder: URL? = GDDLibrary.folder
@@ -27866,6 +28015,9 @@ struct GDDToAssetsSheet: View {
     /// Working from a document, or from a set typed by hand.
     @State private var fromDocument = true
     @State private var manualSpec = GDDSymbolSetRules.typicalSet
+    /// The game's structure: typed for a set with no GDD, or a GDD's reading to correct.
+    @State private var sheet = GameSheet()
+    @State private var correctingStructure = false
     @State private var manualName = ""
 
     enum PickTarget: Identifiable, Hashable { case gdds, output, manifests
@@ -27940,6 +28092,7 @@ struct GDDToAssetsSheet: View {
                             }
                             .pickerStyle(.segmented).frame(width: 340)
                             .disabled(run.busy || run.running)
+                            .onAppear { if startTyped { fromDocument = false } }
                             if fromDocument { gddStep } else { manualStep }
                             // Shown before a document is picked too: it is the artist's choice,
                             // not the document's, and loading a document keeps it.
@@ -28190,12 +28343,15 @@ struct GDDToAssetsSheet: View {
                       systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundColor(.orange)
             }
+            Text("The game").bold().padding(.top, 4)
+            GameSheetEditor(sheet: $sheet, jackpots: run.symbols.filter { $0.role == .jackpot }.count)
+                .onChange(of: sheet) { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect) }
         }
         .disabled(run.busy || run.running)
     }
 
     private func applyManual() {
-        run.loadManual(manualSpec, gameName: manualName, size: size,
+        run.loadManual(manualSpec, gameName: manualName, sheet: sheet, size: size,
                        symbolAspect: symbolAspect, backgroundAspect: backgroundAspect,
                        backgroundSize: backgroundSize)
     }
@@ -28596,13 +28752,13 @@ struct GDDToAssetsSheet: View {
             Text(backgroundNote)
                 .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
                 .fixedSize(horizontal: false, vertical: true)
-            if let reels = run.reelLayout {
+            if !run.symbols.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
                         Text("Reels").bold()
-                        Text(reels.summary).foregroundColor(.secondary)
+                        Text(run.reelLayout?.summary ?? "not set — the document gives no reel size").foregroundColor(run.reelLayout == nil ? .orange : .secondary)
                         Button("Make game interface…") { run.makeReelArea() }
-                            .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
+                            .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying || run.reelLayout == nil)
                             .help("Everything round the symbols, from the GDD: for every grid, the bezel, dividers, reel texture and reel fade as layers; the jackpot table and pots when it has them; its wheels as the studio builds them (rim, hub, pointer, one wedge per prize); and the award pop-ups (panel, value bar, CONTINUE button, a title per award — bonus games, total win, each jackpot, the win ladder). Previews of each. Only what isn't made yet is drawn. GPT Image 2.5, about $0.07–0.15 a piece.")
                         Menu("Make Again") {
                             ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
@@ -28619,7 +28775,19 @@ struct GDDToAssetsSheet: View {
                         .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
                         .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots or their filling and full states, the wheels, or the pop-ups. The current files are kept in the set's versions folder. About $0.07–0.15 a piece; the bezel can take two tries.")
                     }
-                    ForEach(reels.notes, id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
+                    ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
+                    if fromDocument {
+                        // The reading of a GDD, set right by hand — or the structure it never gives.
+                        DisclosureGroup(run.reelLayout == nil ? "Set the game's structure" : "Correct the game's structure", isExpanded: $correctingStructure) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                GameSheetEditor(sheet: $sheet, jackpots: run.symbols.filter { $0.role == .jackpot }.count)
+                                Button("Use This Structure") { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect) }
+                                    .help("Replaces what was read from the document: the reels, bonus grid, extras, jackpot table, pots, wheels and awards the game interface is made from.")
+                            }
+                        }
+                        .font(.callout)
+                        .onChange(of: correctingStructure) { if correctingStructure { sheet = run.reelLayout.map { GameSheet(layout: $0) } ?? GameSheet() } }
+                    }
                 }
             }
             VStack(alignment: .leading, spacing: 6) {
@@ -29105,7 +29273,8 @@ struct GDDToAssetsSheet: View {
     }
 
     private func reflow() {
-        guard !run.gddText.isEmpty else { return }
+        // A typed set's document is written from its sheet, not a GDD to read again.
+        guard !run.gddText.isEmpty, !run.typed else { return }
         let keep = Dictionary(uniqueKeysWithValues: run.jobs.map { ($0.id, $0) })
         let design = run.design, fixed = run.fixedProblems
         run.load(gddText: run.gddText, gameName: run.gameName, size: size,
