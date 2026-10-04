@@ -21711,7 +21711,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         // The reels saved with the set, or read from --gdd-file for a set made before they were.
         let text = args.firstIndex(of: "--gdd-file").flatMap { $0 + 1 < args.count ? try? String(contentsOfFile: args[$0 + 1], encoding: .utf8) : nil }
         guard let layout = text.map(ReelLayoutRules.read) ?? run.reelLayout else { print("FAILED: this set has no reels saved: add --gdd-file <the GDD's text>"); exit(1) }
-        if text != nil { run.reelLayout = layout; run.writeManifest(to: folder) }
+        if let text { run.reelLayout = layout; run.gddText = text; run.writeManifest(to: folder) }
         guard let base = layout.base else { print("FAILED: the document gives no reel size"); exit(1) }
         let area = ReelArea(layout)
         print("REELS: base \(base.rows)x\(base.reels)" + layout.extras.map { " + \($0.what) \($0.place)" }.joined()
@@ -25978,7 +25978,9 @@ final class GDDToAssetsRun: ObservableObject {
         ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
-        ("Pieces from the GDD", { n in n.hasPrefix("shared_concepts") || (GDDToAssetsRun.conceptNames.contains { n.hasPrefix($0 + ".") || n.hasPrefix($0 + "_rmbg") || n.hasPrefix($0 + "-") }) }),
+        ("Number font", { $0.hasPrefix("transition_font_totalWin") }),
+        ("Lobby and loading", { n in Composites.all.contains { n.hasPrefix($0.name + ".png") } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
+        ("Studio and GDD pieces", { n in n.hasPrefix("shared_concepts") || (GDDToAssetsRun.conceptNames.contains { n.hasPrefix($0 + ".") || n.hasPrefix($0 + "_rmbg") || n.hasPrefix($0 + "-") }) }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
         ("Pop-ups", { $0.contains("_popUp_") || $0.hasPrefix("shared_popUps") || $0.hasPrefix("transition_outro_") || $0.hasPrefix("shared_celebration_message")
             || $0.hasPrefix("base_banner_event-") || $0.hasPrefix("wheelSpin_banner") }),
@@ -26004,7 +26006,9 @@ final class GDDToAssetsRun: ObservableObject {
     /// Every static asset this game needs (AssetChecklist), with what is made already.
     func checklist() -> [(item: AssetChecklist.Item, made: Bool)] {
         let hasBonus = jobs.contains { $0.role == .bonus } || (reelLayout?.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") } ?? false)
-        let items = AssetChecklist.items(jobs: jobs, layout: reelLayout, jackpots: jackpotNames, hasBonus: hasBonus)
+        let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
+        let standard = reelLayout.map { StandardPieces.pieces(game: gameName, gdd: gddText, layout: $0, hero: hero) }
+        let items = AssetChecklist.items(jobs: jobs, layout: reelLayout, jackpots: jackpotNames, hasBonus: hasBonus, standard: standard)
         let fm = FileManager.default
         return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) } } ?? false) }
     }
@@ -26188,6 +26192,18 @@ final class GDDToAssetsRun: ObservableObject {
                 write(FrameKit.keyed(px, backing: b), table.width, table.height, "shared_interface_jackpotTable_rmbg.png")
             }
         }
+        // The jackpot meters as the studio ships them, a plaque per tier (shared_meter_<tier>), cut from the table. Free.
+        if layout.extras.contains(where: { $0.what == "jackpot table" }), !jackpots.isEmpty, let t = load("shared_interface_jackpotTable_rmbg.png") {
+            let table = JackpotTable(count: jackpots.count, width: base.grid.w + 2 * base.band)
+            let tierNames = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
+            if t.w == table.width, t.h == table.height {
+                for (i, p) in table.plaques.enumerated() where i < tierNames.count && !has("shared_meter_\(PopUps.key(tierNames[i])).png") {
+                    let m = p.w / 20, x = max(0, p.x - m), y = max(0, p.y - m), w = min(t.w - x, p.w + 2 * m), h = min(t.h - y, p.h + 2 * m)
+                    let piece = FrameKit.crop(t.px, width: t.w, x, y, w, h)
+                    write(piece.px, piece.w, piece.h, "shared_meter_\(PopUps.key(tierNames[i])).png")
+                }
+            }
+        }
         // 4. The pots, one per bonus symbol they are tied to, each drawn from its symbol.
         // As many pots as the GDD says ("3 pots"; without a number, one per bonus symbol), each drawn from the
         // bonus symbol it is tied to, in order; one with no symbol of its own matches the pots before it.
@@ -26322,6 +26338,12 @@ final class GDDToAssetsRun: ObservableObject {
         }
         // 6. The award pop-ups (PopUps): a blank panel, an empty value bar and a CONTINUE button in the reel
         // frame's material, and a lettered title per award this game has, each matched to the first.
+        // The pop-up panel and bar under the studio's names (celebration backing 2 and 1), moved from Navigator's first ones.
+        for (old, new) in [("shared_popUp_background", "shared_celebration_backing-2"), ("shared_popUp_valueBar", "shared_celebration_backing-1")] {
+            for sfx in [".png", "_rmbg.png"] where fm.fileExists(atPath: url(old + sfx).path) && !fm.fileExists(atPath: url(new + sfx).path) {
+                try? fm.moveItem(at: url(old + sfx), to: url(new + sfx))
+            }
+        }
         let hasBonus = !bonus.isEmpty || layout.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") }
         let plan = PopUps.plan(layout, jackpots: names, bonus: hasBonus)
         var firstTitle = plan.first { $0.kind == .title && fm.fileExists(atPath: url("\($0.name).png").path) }.flatMap { try? Data(contentsOf: url("\($0.name).png")) }
@@ -26342,11 +26364,18 @@ final class GDDToAssetsRun: ObservableObject {
         popUpSheet(plan, folder: folder)
         // 7. The pieces Gemini planned from the GDD (ConceptPiece): each on its shape's grey template, or a plain
         // canvas, in the reel frame's material; each state an edit of the first.
-        for piece in layout.concepts ?? [] {
+        let (gameName, gddText) = DispatchQueue.main.sync { (self.gameName, self.gddText) }
+        let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
+        let standard = StandardPieces.pieces(game: gameName, gdd: gddText, layout: layout, hero: hero)
+        Self.conceptNames = (standard + (layout.concepts ?? [])).map(\.name)
+        for piece in standard + (layout.concepts ?? []) {
             if !has("\(piece.name).png"), let ref = bezelRef, let canvas = blank(piece.width, piece.height) {
                 let tpl = ConceptPiece.template(piece, backing: b).flatMap { png($0, piece.width, piece.height) }
-                let prompt = GDDAssetPrompts.conceptBrief(theme: theme, design: design, backing: (backing.name, b), piece: piece, templated: tpl != nil)
-                if let px = paint(piece.name, prompt: prompt, inputs: [ref, tpl ?? canvas], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.name) }
+                // Set images it is drawn from: a symbol's own art, its cut-out subject when it has one.
+                let refs = (piece.refs ?? []).compactMap { id in (try? Data(contentsOf: url("\(id)_alone.png"))) ?? (try? Data(contentsOf: url("\(id).png"))) }
+                    .map { downsamplePNG($0, longEdge: 1536) ?? $0 }
+                let prompt = GDDAssetPrompts.conceptBrief(theme: theme, design: design, backing: (backing.name, b), piece: piece, templated: tpl != nil, refs: refs.count)
+                if let px = paint(piece.name, prompt: prompt, inputs: [ref] + refs + [tpl ?? canvas], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.name) }
             }
             guard let first = try? Data(contentsOf: url("\(piece.name).png")) else { continue }
             for state in piece.states where !has("\(piece.stateName(state)).png") {
@@ -26354,7 +26383,18 @@ final class GDDToAssetsRun: ObservableObject {
                                   inputs: [first], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.stateName(state)) }
             }
         }
-        conceptSheet(layout.concepts ?? [], folder: folder)
+        conceptSheet(standard + (layout.concepts ?? []), folder: folder)
+        // 8. The total-win number font: its glyphs drawn in a grid in the TOTAL WIN title's lettering, cut cell by
+        // cell and laid out as the studio's strip (NumberFont).
+        if !has("transition_font_totalWin.png"), let title = try? Data(contentsOf: url("transition_outro_totalWin.png")),
+           let canvas = blank(NumberFont.size.w, NumberFont.size.h),
+           let px = paint("transition_font_totalWin_sheet", prompt: GDDAssetPrompts.fontBrief(theme: theme, backing: (backing.name, b)),
+                          inputs: [downsamplePNG(title, longEdge: 1024) ?? title, canvas], w: NumberFont.size.w, h: NumberFont.size.h, covered: nil) {
+            both(px, NumberFont.size.w, NumberFont.size.h, "transition_font_totalWin_sheet")
+            if let strip = numberFontStrip(FrameKit.keyed(px, backing: b), folder: folder) { problems += strip }
+        }
+        // 9. The loading screen and lobby icons, put together from the logo, the key art and the base background. Free.
+        composites(folder: folder)
         // 7. A preview per mode: background, texture, this set's symbols, dividers, bezel; the table and pots above.
         for (name, grid) in modes { reelPreview(name: name, area: ReelArea(layout, grid: grid), jobs: jobs, folder: folder) }
         log.event(["step": "reel area", "cost": cost, "problems": problems, "modes": modes.map { "\($0.name) \($0.grid.rows)x\($0.grid.reels)" }])
@@ -26406,14 +26446,14 @@ final class GDDToAssetsRun: ObservableObject {
         func img(_ n: String) -> CGImage? { loadCGImage(folder.appendingPathComponent("\(n)_rmbg.png")) }
         // The assembled example, top: panel, title, bar, button, as a game stacks them.
         let pw = 1100, ph = pw * 3 / 4, px0 = (W - pw) / 2, top = H - 40 - ph
-        if let p = img("shared_popUp_background") { ctx.draw(p, in: CGRect(x: px0, y: top, width: pw, height: ph)) }
+        if let p = img("shared_celebration_backing-2") { ctx.draw(p, in: CGRect(x: px0, y: top, width: pw, height: ph)) }
         if let t = plan.first(where: { $0.kind == .title && img($0.name) != nil }), let i = img(t.name) {
             // Inside the panel's face, above the bar: no wider than 70% of the panel, no taller than a third.
             let s = min(Double(pw) * 0.7 / Double(t.w), Double(ph) * 0.34 / Double(t.h))
             let tw = Int(Double(t.w) * s), th = Int(Double(t.h) * s)
             ctx.draw(i, in: CGRect(x: (W - tw) / 2, y: top + ph * 47 / 100, width: tw, height: th))
         }
-        if let i = img("shared_popUp_valueBar") { let bw = pw * 8 / 10, bh = bw / 3; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 19 / 100, width: bw, height: bh)) }
+        if let i = img("shared_celebration_backing-1") { let bw = pw * 8 / 10, bh = bw / 3; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 19 / 100, width: bw, height: bh)) }
         if let i = img("base_popUp_bonusBtn") { let bw = pw * 4 / 10, bh = bw * 3 / 8; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 4 / 100, width: bw, height: bh)) }
         for (k, t) in titles.enumerated() {
             guard let i = img(t.name) else { continue }
@@ -26425,6 +26465,82 @@ final class GDDToAssetsRun: ObservableObject {
         if let out = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_popUps-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
             CGImageDestinationAddImage(dest, out, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
             CGImageDestinationFinalize(dest)
+        }
+    }
+
+    /// The number font's grid (NumberFont, straight RGBA) cut a glyph a cell into `transition_font_totalWin.png`:
+    /// every glyph scaled to one height, centred in cells of one width, with the order and cell width beside it in
+    /// `transition_font_totalWin.json`. Returns problems — an empty cell, a glyph that spills into its neighbour's.
+    func numberFontStrip(_ px: [UInt8], folder: URL) -> [String]? {
+        let (W, _) = NumberFont.size, height = 128, glyphH = 108
+        var glyphs: [FrameKit.Piece] = [], problems: [String] = []
+        for (i, g) in NumberFont.glyphs.enumerated() {
+            let c = NumberFont.cell(i)
+            let cell = FrameKit.crop(px, width: W, c.x, c.y, c.w, c.h)
+            var x0 = c.w, y0 = c.h, x1 = -1, y1 = -1
+            for y in 0..<c.h { for x in 0..<c.w where cell.px[(y * c.w + x) * 4 + 3] > 96 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
+            guard x1 > x0, y1 > y0 else { problems.append("number font: no “\(g)” in its cell"); glyphs.append(FrameKit.Piece(px: [], w: 0, h: 0)); continue }
+            if x0 == 0 || y0 == 0 || x1 == c.w - 1 || y1 == c.h - 1 { problems.append("number font: “\(g)” runs out of its cell") }
+            glyphs.append(FrameKit.crop(cell.px, width: c.w, x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+        }
+        // One scale for all, from the tallest digit, so the small marks stay small.
+        let tallest = glyphs.prefix(10).map(\.h).max() ?? 1
+        let k = Double(glyphH) / Double(max(1, tallest))
+        let scaled = glyphs.map { g -> FrameKit.Piece in g.w == 0 ? g : FrameKit.resized(g, max(1, Int(Double(g.w) * k)), max(1, Int(Double(g.h) * k))) }
+        let cellW = (scaled.map(\.w).max() ?? 64) + 8, stripW = cellW * scaled.count
+        var strip = [UInt8](repeating: 0, count: stripW * height * 4)
+        for (i, g) in scaled.enumerated() where g.w > 0 {
+            // The comma and full stop sit low, on the baseline, as drawn.
+            let low = NumberFont.glyphs[i] == "," || NumberFont.glyphs[i] == "."
+            FrameKit.over(&strip, width: stripW, g, at: i * cellW + (cellW - g.w) / 2, max(0, low ? height - 10 - g.h : (height - g.h) / 2))
+        }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        try? ChromaKeyOutputRules.image(straightRGBA8: strip, width: stripW, height: height, space: space).flatMap(encodePNG)?
+            .write(to: folder.appendingPathComponent("transition_font_totalWin.png"))
+        let meta: [String: Any] = ["glyphs": NumberFont.glyphs, "cellWidth": cellW, "height": height]
+        try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]).write(to: folder.appendingPathComponent("transition_font_totalWin.json"))
+        return problems
+    }
+
+    /// The loading screen and lobby icons (Composites): the base background filling each, the key art standing in
+    /// it and the logo over it, laid out by the shape of each. Made when the logo is. Free.
+    func composites(folder: URL) {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
+        guard let logo = loadCGImage(folder.appendingPathComponent("shared_logo_master_rmbg.png")) else { return }
+        let art = loadCGImage(folder.appendingPathComponent("shared_character_keyArt_rmbg.png"))
+        let bg = loadCGImage(folder.appendingPathComponent("bg_base.png"))
+        func fit(_ img: CGImage, in r: CGRect) -> CGRect {
+            let s = min(r.width / CGFloat(img.width), r.height / CGFloat(img.height))
+            let w = CGFloat(img.width) * s, h = CGFloat(img.height) * s
+            return CGRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h)
+        }
+        for c in Composites.all where !fm.fileExists(atPath: folder.appendingPathComponent("\(c.name).png").path) {
+            guard let ctx = CGContext(data: nil, width: c.w, height: c.h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { continue }
+            ctx.interpolationQuality = .high
+            let W = CGFloat(c.w), H = CGFloat(c.h)
+            ctx.setFillColor(CGColor(red: 0.06, green: 0.05, blue: 0.1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+            if let bg {
+                let s = max(W / CGFloat(bg.width), H / CGFloat(bg.height))
+                let w = CGFloat(bg.width) * s, h = CGFloat(bg.height) * s
+                ctx.draw(bg, in: CGRect(x: (W - w) / 2, y: (H - h) * 0.4, width: w, height: h))
+            }
+            // Wide: the hero on the right, the logo on the left. Tall or square: the hero low and large, the logo above.
+            let wide = W > H * 1.2
+            if let art { ctx.draw(art, in: fit(art, in: wide ? CGRect(x: W * 0.5, y: 0, width: W * 0.5, height: H * 0.98) : CGRect(x: W * 0.05, y: 0, width: W * 0.9, height: H * 0.72))) }
+            let lr = wide ? (art == nil ? CGRect(x: W * 0.1, y: H * 0.2, width: W * 0.8, height: H * 0.6) : CGRect(x: W * 0.04, y: H * 0.18, width: W * 0.5, height: H * 0.64))
+                          : CGRect(x: W * 0.06, y: H * (art == nil ? 0.3 : 0.66), width: W * 0.88, height: H * (art == nil ? 0.4 : 0.3))
+            ctx.draw(logo, in: fit(logo, in: lr))
+            if let img = ctx.makeImage(), let png = encodePNG(img) { try? png.write(to: folder.appendingPathComponent("\(c.name).png")) }
+        }
+        // The sell screen's avatar, when the game has one: the key art's head and shoulders.
+        if let art, fm.fileExists(atPath: folder.appendingPathComponent("shared_sellScreen_background.png").path),
+           !fm.fileExists(atPath: folder.appendingPathComponent("shared_sellScreen_tutorialAvatar.png").path),
+           let crop = art.cropping(to: CGRect(x: 0, y: 0, width: art.width, height: min(art.height, art.width * 307 / 247))),
+           let ctx = CGContext(data: nil, width: 247, height: 307, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+            ctx.interpolationQuality = .high
+            ctx.draw(crop, in: CGRect(x: 0, y: 0, width: 247, height: 307))
+            if let img = ctx.makeImage(), let png = encodePNG(img) { try? png.write(to: folder.appendingPathComponent("shared_sellScreen_tutorialAvatar.png")) }
         }
     }
 

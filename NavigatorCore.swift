@@ -8840,6 +8840,8 @@ public struct ConceptPiece: Codable, Equatable, Sendable {
     public var states: [String]      // its states after the first, as the GDD has them ("lit", "full"); [] for one image
     public var source: String        // the GDD's own words it comes from
     public var standard = false      // the studio's own convention (a logo, a sell screen), not read off the GDD
+    /// Set images it is drawn from, by id ("HP1": the hero for the key art), attached after the reel frame.
+    public var refs: [String]? = nil
 
     public static let shapes = ["panel", "bar", "button", "plaque", "ring", "disc", "lettering", "free"]
 
@@ -8912,7 +8914,7 @@ public enum AssetChecklist {
     /// square root of the size — $0.12 at 2048², $0.17 for a 3168×2304 bezel asked at 8 MP.
     public static func gpt(_ w: Int, _ h: Int) -> Double { 0.06 * max(1, Double(w * h) / 1_048_576).squareRoot() }
 
-    public static func items(jobs: [AssetJob], layout: ReelLayout?, jackpots names: [String], hasBonus: Bool) -> [Item] {
+    public static func items(jobs: [AssetJob], layout: ReelLayout?, jackpots names: [String], hasBonus: Bool, standard: [ConceptPiece]? = nil) -> [Item] {
         var out: [Item] = []
         for j in jobs where j.kind == .symbol {
             out.append(Item(group: "Symbols", name: j.id, what: j.title, files: ["\(j.id).png"], maker: "Symbols", cost: 0.10))
@@ -8962,9 +8964,19 @@ public enum AssetChecklist {
             out.append(Item(group: "Pop-ups", name: p.name, what: p.text.isEmpty ? p.kind.rawValue : p.text.replacingOccurrences(of: "\n", with: " "),
                             files: ["\(p.name).png"], maker: "Pop-ups", cost: gpt(p.w, p.h)))
         }
-        for c in l.concepts ?? [] {
+        if l.extras.contains(where: { $0.what == "jackpot table" }), !names.isEmpty {
+            out.append(Item(group: "Jackpots", name: "shared_meter", what: "a meter plaque per tier, cut from the table: " + names.joined(separator: ", "),
+                            files: names.map { "shared_meter_\(PopUps.key($0)).png" }, maker: "Jackpot table", cost: 0))
+        }
+        out.append(Item(group: "Fonts", name: "transition_font_totalWin", what: "the total-win number font: " + NumberFont.glyphs.joined(separator: " "),
+                        files: ["transition_font_totalWin.png"], maker: "Number font", cost: gpt(NumberFont.size.w, NumberFont.size.h)))
+        for c in (standard ?? []) + (l.concepts ?? []) {
             out.append(Item(group: c.standard ? "Studio pieces" : "From the GDD", name: c.name, what: c.what + (c.states.isEmpty ? "" : " (states: \(c.states.joined(separator: ", ")))"),
                             files: ["\(c.name).png"] + c.states.map { "\(c.stateName($0)).png" }, maker: "Gemini concept", cost: Double(1 + c.states.count) * gpt(c.width, c.height)))
+        }
+        if (standard ?? []).contains(where: { $0.name == "shared_logo_master" }) {
+            out.append(Item(group: "Lobby and loading", name: "shared_preloader", what: "the loading screen and lobby icons, put together from the logo, the key art and the base background",
+                            files: Composites.all.map { "\($0.name).png" }, maker: "Composites", cost: 0))
         }
         // What the GDD has that nothing makes yet: said, not dropped.
         if l.concepts == nil {
@@ -8975,6 +8987,70 @@ public enum AssetChecklist {
         }
         return out
     }
+}
+
+/// The pieces every game gets, and those a GDD's signals call for, that GDDs almost never list (asset inventory
+/// of 10 shipped games, 2026-10-04: a logo in 9 of 10 and 2 of 56 GDDs; Power Bet UI in 8 of 10, signalled by
+/// "Power Bet" in 31 GDDs; tutorials required by 35 GDDs). Drawn by the generic generator like Gemini's pieces.
+public enum StandardPieces {
+    /// The game's title for its logo: the document's name without its number and file words ("9001 Example
+    /// Pots GDD (Google Doc)" → "Example Pots"), or the typed game's name.
+    public static func title(_ game: String) -> String {
+        var t = game.replacingOccurrences(of: #"\.(txt|docx?|md)$"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"\((Google Doc|DOCX)\)"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"(?i)\b(GDD|game design document)\b"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"^\s*\d+\s+"#, with: "", options: .regularExpression)
+        return t.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "-–")))
+    }
+
+    public static func pieces(game: String, gdd: String, layout: ReelLayout, hero: String?) -> [ConceptPiece] {
+        let name = title(game), l = gdd.lowercased()
+        func piece(_ n: String, _ what: String, _ look: String, _ shape: String, _ w: Int, _ h: Int, _ letters: String = "", refs: [String]? = nil) -> ConceptPiece {
+            ConceptPiece(name: n, what: what, look: look, shape: shape, width: w, height: h, lettering: letters, states: [], source: "", standard: true, refs: refs).normalised()
+        }
+        var out: [ConceptPiece] = []
+        if !name.isEmpty {
+            out.append(piece("shared_logo_master", "the game's title logo, “\(name)”.", "Bold, dimensional display lettering of the title in the theme's richest colours and metal, an emblem of the theme worked into it, as a slot game's logo is.", "lettering", 2048, 1024, name))
+        }
+        if let hero {
+            out.append(piece("shared_character_keyArt", "the full figure of the game's hero — the character or object in the attached symbol — for the logo, lobby icons and loading screen.",
+                             "The same face, hair, crown and costume as the symbol, the whole figure from head to feet in a heroic three-quarter pose, lit dramatically.", "free", 1536, 2048, refs: [hero]))
+        }
+        if l.contains("power bet") || layout.grids.contains(where: { $0.mode.hasPrefix("power bet") }) {
+            out += [piece("shared_sellScreen_background", "the blank panel of the Power Bet sell screen, where the player picks a boost.", "A grand plaque, its face plain and empty.", "panel", 720, 768),
+                    piece("shared_sellScreen_playNowBtn", "the sell screen's play button.", "A raised, glowing button.", "button", 1024, 384, "PLAY NOW!"),
+                    piece("shared_powerBet_drawer", "the Power Bet drawer that slides out beside the reels, holding the boost buttons.", "A tall panel, its header lettered.", "panel", 368, 608, "POWER BET"),
+                    piece("shared_powerBet_toggleOff", "the Power Bet switch, off.", "A small toggle switch, dark.", "button", 512, 224, "OFF"),
+                    piece("shared_powerBet_toggleOn", "the Power Bet switch, on.", "A small toggle switch, lit.", "button", 512, 224, "ON")]
+        }
+        if l.contains("tutorial") {
+            out += [piece("shared_tutorial_background", "the blank panel the game's first-time tutorial cards appear on.", "A plain panel with a fine frame, its face empty.", "panel", 1024, 640),
+                    piece("shared_tutorial_button", "the tutorial's button.", "A small raised button.", "button", 448, 208, "GOT IT!")]
+        }
+        return out
+    }
+}
+
+/// The loading screen and lobby icons, put together in code from the logo, the key art and the base background,
+/// at the sizes shipped games use (asset inventory, 2026-10-04). Free.
+public enum Composites {
+    public static let all: [(name: String, w: Int, h: Int)] = [
+        ("shared_preloader", 1024, 512), ("shared_preloader_2048", 2048, 1024),
+        ("shared_interface-gameIcon1x2", 317, 586), ("shared_interface-gameArt.600x600", 600, 600), ("shared_interface-gameArt.176x176", 176, 176),
+        ("shared_interface-sharedIcon", 1200, 630), ("shared_interface-icon", 309, 230),
+    ]
+}
+
+/// A bitmap number font as the studio ships them: a strip of glyphs the engine prints amounts with
+/// (`transition_font_totalWin`, 6 of 10 games; every game prints its total win). Drawn as a grid of one glyph
+/// a cell — a strip of twenty is far past GPT Image's 3:1 — then cut cell by cell and laid out in code.
+public enum NumberFont {
+    public static let glyphs = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "$", "¢", ",", ".", "x", "K", "M", "B", "T"]
+    public static let columns = 5, cell = 320
+    public static var rows: Int { (glyphs.count + columns - 1) / columns }
+    public static var size: (w: Int, h: Int) { (columns * cell, rows * cell) }
+    /// The cell a glyph is drawn in, top-left based.
+    public static func cell(_ i: Int) -> ReelArea.Rect { ReelArea.Rect(x: (i % columns) * cell, y: (i / columns) * cell, w: cell, h: cell) }
 }
 
 /// Gemini's reading of what else a game needs on screen (ConceptPiece), given what Navigator already makes.
@@ -9407,8 +9483,9 @@ public enum PopUps {
 
     public static func plan(_ layout: ReelLayout, jackpots: [String], bonus: Bool) -> [Piece] {
         func title(_ name: String, _ text: String, _ w: Int = 1536, _ h: Int = 512) -> Piece { Piece(name: name, kind: .title, text: text, w: w, h: h) }
-        var out = [Piece(name: "shared_popUp_background", kind: .panel, text: "", w: 1536, h: 1152),
-                   Piece(name: "shared_popUp_valueBar", kind: .bar, text: "", w: 1536, h: 512),
+        // The studio's own names (asset inventory, 2026-10-04): the panel is celebration backing 2, the value bar 1.
+        var out = [Piece(name: "shared_celebration_backing-2", kind: .panel, text: "", w: 1536, h: 1152),
+                   Piece(name: "shared_celebration_backing-1", kind: .bar, text: "", w: 1536, h: 512),
                    Piece(name: "base_popUp_bonusBtn", kind: .button, text: "CONTINUE", w: 1024, h: 384)]
         if bonus {
             out += [title("base_popUp_bonusGamesAwarded", "BONUS GAMES AWARDED!"),
@@ -15356,10 +15433,11 @@ extension GDDAssetPrompts {
     }
     /// A planned piece (ConceptPiece) on its grey template (the last image) or a plain canvas, the reel frame
     /// attached first for the game's material.
-    static func conceptBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, templated: Bool) -> String {
+    static func conceptBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, templated: Bool, refs: Int = 0) -> String {
+        let shown = refs == 0 ? "" : refs == 1 ? " Image 2 is the game's own symbol it is drawn from: keep its likeness exactly." : " Images 2 to \(refs + 1) are the game's own symbols it is drawn from: keep their likeness exactly."
         let letters = p.lettering.isEmpty ? "No text, lettering or numbers." : "Letter “\(p.lettering)” on it in bold, clear display letters, spelled exactly so. No other words, and no numbers or amounts."
         return [
-            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. "
+            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”.\(shown) "
             + (templated ? "Edit the last attached image: its plain grey shape is \(p.what.lowercased().hasPrefix("the ") ? "" : "this game's ")\(p.what) Repaint it in the reel frame's own material and craft: \(p.look) It keeps exactly its size and outline; its ornament may spread a little past its edge."
                          : "Edit the last attached image, a plain canvas: draw on it \(p.what) \(p.look) In the reel frame's own material and craft, seen straight on, centred, filling most of the picture with a small even margin."),
             letters + " Static art only: no burst, rays or flying sparkles — the game animates those.",
@@ -15376,7 +15454,18 @@ extension GDDAssetPrompts {
         ].joined(separator: "\n\n")
     }
 
-    /// Pot state `k` of PotStates.levels    /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
+    /// The number font's glyphs (NumberFont) in a grid on a plain canvas (the last image), lettered as the game's
+    /// TOTAL WIN title (attached first) is.
+    static func fontBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+        let rows = stride(from: 0, to: NumberFont.glyphs.count, by: NumberFont.columns).map { NumberFont.glyphs[$0..<min($0 + NumberFont.columns, NumberFont.glyphs.count)].joined(separator: "  ") }
+        return [
+            "Image 1 is the TOTAL WIN title of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter these characters on it in exactly that title's lettering — the same letterforms, colours, outline, bevel and finish — as the font the game prints its amounts in.",
+            "Lay them out in a grid of \(NumberFont.columns) columns and \(NumberFont.rows) rows, one character centred in each cell, the cells evenly spaced across and down the whole picture, in this order: " + rows.enumerated().map { "row \($0.offset + 1): \($0.element)" }.joined(separator: "; ") + ". The digits and letters all the same height; the comma and full stop small, at the baseline; every character well apart from its neighbours. Nothing else: no frame, lines, boxes or other words.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+
+    /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
         let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]

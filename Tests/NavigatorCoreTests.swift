@@ -13356,6 +13356,29 @@ final class ConceptAndChecklistTests: XCTestCase {
     }
 }
 
+final class StandardPiecesTests: XCTestCase {
+    // Every game's logo and key art; Power Bet's sell screen and drawer, and a tutorial, only when the GDD has them.
+    func testTheStudioPiecesFollowTheGame() {
+        XCTAssertEqual(StandardPieces.title("4471 Tiki Titans Volcano Gold GDD (Google Doc)"), "Tiki Titans Volcano Gold")
+        XCTAssertEqual(StandardPieces.title("Galactic Goddess"), "Galactic Goddess")
+        let plain = StandardPieces.pieces(game: "9001 Example Pots GDD", gdd: "Example Pots is a 3x5 lines game.", layout: ReelLayout(), hero: "HP1")
+        XCTAssertEqual(plain.map(\.name), ["shared_logo_master", "shared_character_keyArt"])
+        XCTAssertEqual(plain.first?.lettering, "EXAMPLE POTS"); XCTAssertEqual(plain.last?.refs, ["HP1"])
+        let full = StandardPieces.pieces(game: "Example", gdd: "This game features two power bets. This project should use an interactive tutorial system.", layout: ReelLayout(), hero: nil)
+        XCTAssertTrue(full.contains { $0.name == "shared_sellScreen_playNowBtn" && $0.lettering == "PLAY NOW!" })
+        XCTAssertTrue(full.contains { $0.name == "shared_tutorial_background" })
+        XCTAssertFalse(full.contains { $0.name == "shared_character_keyArt" })
+        XCTAssertTrue(full.allSatisfy { $0.standard && $0.width % 16 == 0 && $0.height % 16 == 0 })
+    }
+    // The number font is drawn as a grid within GPT's limits, a glyph a cell.
+    func testTheNumberFontGrid() {
+        XCTAssertEqual(NumberFont.glyphs.count, 19); XCTAssertEqual(NumberFont.rows, 4)
+        let (w, h) = NumberFont.size
+        XCTAssertLessThanOrEqual(Double(max(w, h)) / Double(min(w, h)), 3); XCTAssertEqual(w % 16, 0); XCTAssertEqual(h % 16, 0)
+        XCTAssertEqual(NumberFont.cell(7).x, 2 * NumberFont.cell); XCTAssertEqual(NumberFont.cell(7).y, NumberFont.cell)
+    }
+}
+
 final class GameSheetTests: XCTestCase {
     let symbols = GDDSymbolSetRules.parseManual("WD, HP1-4, MP1-4, LP1-5, SC, BO1-3, JP1-4").symbols
 
