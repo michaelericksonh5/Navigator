@@ -25852,8 +25852,8 @@ final class GDDToAssetsRun: ObservableObject {
         ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
         ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") }),
-        ("Pots", { $0.hasPrefix("shared_interface_pot") }),
-        ("Pot states", { $0.hasPrefix("shared_interface_pot") && ($0.contains("_filling") || $0.contains("_full")) }),
+        ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
+        ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
         ("Pop-ups", { $0.contains("_popUp_") || $0.hasPrefix("shared_popUps") || $0.hasPrefix("transition_outro_") || $0.hasPrefix("shared_celebration_message")
             || $0.hasPrefix("base_banner_event-") || $0.hasPrefix("wheelSpin_banner") }),
@@ -26025,52 +26025,64 @@ final class GDDToAssetsRun: ObservableObject {
             let total = pots.count ?? bonus.count
             if total == 0 { problems.append("the GDD has pots above the reels but says neither how many nor ties them to bonus symbols") }
             let potH = PotStates.height(1024)
-            for i in 0..<total where !has("shared_interface_pot\(i + 1).png") {
+            func jar(_ i: Int, _ k: Int) -> String { PotStates.name(pot: i, of: total, state: k) }
+            // Pots made before the rig's names: the empty pot is State0; its old filling/full drawings are kept
+            // in versions/, as the rig has five fill states, not two.
+            for i in 0..<total where fm.fileExists(atPath: url("shared_interface_pot\(i + 1).png").path) && !fm.fileExists(atPath: url("\(jar(i, 0)).png").path) {
+                try? fm.moveItem(at: url("shared_interface_pot\(i + 1).png"), to: url("\(jar(i, 0)).png"))
+                try? fm.moveItem(at: url("shared_interface_pot\(i + 1)_rmbg.png"), to: url("\(jar(i, 0))_rmbg.png"))
+                let kept = folder.appendingPathComponent("versions/pots-before-rig")
+                try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+                for n in ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []) where n.hasPrefix("shared_interface_pot\(i + 1)_") {
+                    try? fm.moveItem(at: url(n), to: kept.appendingPathComponent(n))
+                }
+            }
+            for i in 0..<total where !has("\(jar(i, 0)).png") {
                 let bo = i < bonus.count ? bonus[i] : nil
                 let symbol = bo.flatMap { try? Data(contentsOf: url("\($0.id).png")) }
                 if bo != nil && symbol == nil { problems.append("pot \(i + 1): \(bo!.id) is not drawn"); continue }
-                let earlier = (0..<i).compactMap { try? Data(contentsOf: url("shared_interface_pot\($0 + 1).png")) }.prefix(2)
+                let earlier = (0..<i).compactMap { try? Data(contentsOf: url("\(jar($0, 0)).png")) }.prefix(2)
                 let prompt = GDDAssetPrompts.potBrief(theme: theme, design: design, backing: (backing.name, b),
                                                       symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total)
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
                 // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
-                if let px = paint("shared_interface_pot\(i + 1)", prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil) {
+                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil) {
                     let tall = PotStates.padded(FrameKit.keyed(px, backing: b), size: 1024)
-                    write(FrameKit.onBacking(tall, b), 1024, potH, "shared_interface_pot\(i + 1).png")
-                    write(tall, 1024, potH, "shared_interface_pot\(i + 1)_rmbg.png")
+                    write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
+                    write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
                 }
             }
             // A pot drawn before pots had their room is given it, free.
             for i in 0..<total {
-                guard let p = load("shared_interface_pot\(i + 1)_rmbg.png"), p.w == 1024, p.h == 1024 else { continue }
+                guard let p = load("\(jar(i, 0))_rmbg.png"), p.w == 1024, p.h == 1024 else { continue }
                 let tall = PotStates.padded(p.px, size: 1024)
-                write(FrameKit.onBacking(tall, b), 1024, potH, "shared_interface_pot\(i + 1).png")
-                write(tall, 1024, potH, "shared_interface_pot\(i + 1)_rmbg.png")
+                write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
+                write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
             }
-            // Its states as it fills, each an edit of its empty drawing so they swap in place.
+            // Its fill states, State1…State5, each an edit of State0 so they swap in place.
             for i in 0..<total {
-                guard let empty = try? Data(contentsOf: url("shared_interface_pot\(i + 1).png")) else { continue }
-                for state in GDDAssetPrompts.potStates where !has("shared_interface_pot\(i + 1)_\(state).png") {
-                    let prompt = GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), state: state)
-                    if let px = paint("shared_interface_pot\(i + 1)_\(state)", prompt: prompt, inputs: [empty], w: 1024, h: potH, covered: nil) {
-                        write(px, 1024, potH, "shared_interface_pot\(i + 1)_\(state).png")
-                        write(FrameKit.keyed(px, backing: b), 1024, potH, "shared_interface_pot\(i + 1)_\(state)_rmbg.png")
+                guard let empty = try? Data(contentsOf: url("\(jar(i, 0)).png")) else { continue }
+                for k in 1...PotStates.levels where !has("\(jar(i, k)).png") {
+                    let prompt = GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k)
+                    if let px = paint(jar(i, k), prompt: prompt, inputs: [empty], w: 1024, h: potH, covered: nil) {
+                        write(px, 1024, potH, "\(jar(i, k)).png")
+                        write(FrameKit.keyed(px, backing: b), 1024, potH, "\(jar(i, k))_rmbg.png")
                     }
                 }
-                // Each state laid on the empty pot, so a swap in game does not jump (PotStates): free, and a
-                // state already in place is left as it is.
-                for state in GDDAssetPrompts.potStates {
-                    let n = "shared_interface_pot\(i + 1)_\(state)"
-                    guard let s = load("\(n)_rmbg.png"), let e = load("shared_interface_pot\(i + 1)_rmbg.png") else { continue }
+                // Each state laid on State0, so a swap in game does not jump (PotStates): free, and a state
+                // already in place is left as it is.
+                for k in 1...PotStates.levels {
+                    let n = jar(i, k)
+                    guard let s = load("\(n)_rmbg.png"), let e = load("\(jar(i, 0))_rmbg.png") else { continue }
                     guard e.w == s.w, e.h == s.h else {
-                        problems.append("pot \(i + 1)'s \(state) state was drawn before pots had room above them: Make Again ▸ Pot States")
+                        problems.append("pot \(i + 1)'s State\(k) was drawn before pots had room above them: Make Again ▸ Pot States")
                         continue
                     }
                     let laid = PotStates.registered(s.px, to: e.px, width: s.w, height: s.h)
                     guard laid != s.px else { continue }
                     write(FrameKit.onBacking(laid, b), s.w, s.h, "\(n).png")
                     write(laid, s.w, s.h, "\(n)_rmbg.png")
-                    navLog("gdd reel: \(n) laid on its empty pot")
+                    navLog("gdd reel: \(n) laid on State0")
                 }
             }
             potSheet(count: total, folder: folder)
@@ -26220,20 +26232,21 @@ final class GDDToAssetsRun: ObservableObject {
         }
     }
 
-    /// `shared_interface_pots-states.jpg`: each pot's states side by side — empty, filling, full — to review.
+    /// `shared_avatar_jars-preview.jpg`: each pot's states side by side, State0 to State5 — to review.
     func potSheet(count: Int, folder: URL) {
-        let cell = 360, states = [""] + GDDAssetPrompts.potStates.map { "_\($0)" }
+        let cell = 300, states = 0...PotStates.levels
         let W = states.count * cell, H = count * cell
         guard count > 0, let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
         ctx.setFillColor(CGColor(red: 0.08, green: 0.07, blue: 0.13, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
         ctx.interpolationQuality = .high
-        for i in 0..<count { for (j, st) in states.enumerated() {
-            guard let img = loadCGImage(folder.appendingPathComponent("shared_interface_pot\(i + 1)\(st)_rmbg.png")) else { continue }
+        for i in 0..<count { for k in states {
+            guard let img = loadCGImage(folder.appendingPathComponent("\(PotStates.name(pot: i, of: count, state: k))_rmbg.png")) else { continue }
             let w = cell * img.width / max(1, img.height)
-            ctx.draw(img, in: CGRect(x: j * cell + (cell - w) / 2, y: H - (i + 1) * cell, width: w, height: cell))
+            ctx.draw(img, in: CGRect(x: k * cell + (cell - w) / 2, y: H - (i + 1) * cell, width: w, height: cell))
         } }
-        if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_interface_pots-states.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
+        try? FileManager.default.removeItem(at: folder.appendingPathComponent("shared_interface_pots-states.jpg"))     // the two-state sheet it replaces
+        if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_avatar_jars-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
             CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
             CGImageDestinationFinalize(dest)
         }
@@ -26247,7 +26260,7 @@ final class GDDToAssetsRun: ObservableObject {
             guard let cg = loadCGImage(folder.appendingPathComponent(n)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
             return FrameKit.Piece(px: px, w: cg.width, h: cg.height)
         }
-        let table = piece("shared_interface_jackpotTable_rmbg.png"), pots = (1...6).compactMap { piece("shared_interface_pot\($0)_rmbg.png") }
+        let table = piece("shared_interface_jackpotTable_rmbg.png"), pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { piece("\($0)_rmbg.png") }
         let potW = area.cell * 13 / 10, potH = pots.map { potW * $0.h / max(1, $0.w) }.max() ?? 0
         let tableH = table.map { $0.h * area.width / max(1, $0.w) } ?? 0
         let W = area.width, top = tableH + potH, H = area.height + top
@@ -28577,7 +28590,7 @@ struct GDDToAssetsSheet: View {
                             Button("Show the Previews") {
                                 guard let folder = run.lastFolder else { return }
                                 let previews = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-                                    .filter { $0.hasSuffix("-preview.jpg") || $0 == "shared_interface_pots-states.jpg" }
+                                    .filter { $0.hasSuffix("-preview.jpg") }
                                     .map { folder.appendingPathComponent($0) }
                                 NSWorkspace.shared.activateFileViewerSelecting(previews.isEmpty ? [folder] : previews)
                             }

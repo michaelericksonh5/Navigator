@@ -8747,6 +8747,14 @@ extension ReelArea {
 /// room for what rises from it when full (square, GPT filled the canvas and the treasure was cut flat).
 public enum PotStates {
     public static let headroom = 0.25
+    /// The studio's pot rig (`shared_avatar_jar`, 18 rigs in about 17 shipped games, 2026-10-04): State0 empty
+    /// and unlit, then five fill states — a lid opening further each time, the game's treasure rising until it
+    /// overflows at State5, the glow growing. The pot itself never moves. A burst and reset are the rig's own.
+    public static let levels = 5
+    /// A pot state's file name, the rig's: `shared_avatar_jar-State3Idle`, numbered when a game has several pots.
+    public static func name(pot i: Int, of total: Int, state k: Int) -> String {
+        "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-State\(k)Idle"
+    }
     /// The canvas height of a pot `n` wide: 1280 for 1024, a multiple of 16 as GPT Image takes sizes.
     public static func height(_ n: Int) -> Int { n + Int(headroom * Double(n)) / 16 * 16 }
     /// A pot drawn square (straight RGBA, `n` a side) stood at the bottom of its taller canvas.
@@ -14836,8 +14844,8 @@ extension GDDAssetPrompts {
     /// match the game's other pots (attached when there are any).
     static func potBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), symbol: String?, number: Int, of total: Int) -> String {
         [
-            symbol.map { "Image 1 is a bonus symbol of a video slot game themed “\(theme.name)”: \($0). Draw the pot that stands above the reels for it, which fills up as the game is played: the same vessel — its shape, material, colour and ornament — larger and grander, standing upright, seen straight on, its mouth open and empty, the whole vessel in view with a small even margin." }
-            ?? "Draw pot \(number) of the \(total) pots that stand above the reels of a video slot game themed “\(theme.name)”, which fill up as the game is played: a grand vessel of this theme, \(number > 1 ? "matching the attached pots in construction and size, a colour of its own, " : "")standing upright, seen straight on, its mouth open and empty, the whole vessel in view with a small even margin.",
+            symbol.map { "Image 1 is a bonus symbol of a video slot game themed “\(theme.name)”: \($0). Draw the pot that stands above the reels for it, which fills up as the game is played: the same vessel — its shape, material, colour and ornament — larger and grander, standing upright, seen straight on, empty and unlit — its lid closed if it has one, its mouth open and empty if not — the whole vessel in view with a small even margin." }
+            ?? "Draw pot \(number) of the \(total) pots that stand above the reels of a video slot game themed “\(theme.name)”, which fill up as the game is played: a grand vessel of this theme, \(number > 1 ? "matching the attached pots in construction and size, a colour of its own, " : "")standing upright, seen straight on, empty and unlit — its lid closed if it has one, its mouth open and empty if not — the whole vessel in view with a small even margin.",
             "No text, lettering, numbers or symbols on it.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
@@ -14945,15 +14953,16 @@ extension GDDAssetPrompts {
         ].joined(separator: "\n\n")
     }
 
-    static let potStates = ["filling", "full"]
-    static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), state: String) -> String {
-        let contents = "what it collects in this game — glowing energy and gems in the pot's own colour, as this theme would have them"
-        let show = state == "full"
-            ? "filled to the brim and overflowing with \(contents): they rise above its mouth and spill a little over the rim, glowing brightly, with sparkles"
-            : "beginning to fill with \(contents): a soft glow rises from its mouth and lights it from within, its contents just showing at the rim"
+    /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
+    /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
+    static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
+        let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]
+        let heap = ["", "a few pieces just showing at its mouth", "a small heap at its mouth", "a heap rising above its mouth", "a tall heap well above its mouth",
+                    "heaped high and overflowing, a few pieces spilling over the rim"][k]
+        let glow = ["", "a faint", "a soft", "a warm", "a bright", "a radiant"][k]
         return [
-            "Edit the attached image: it is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”, empty. Show the same pot \(show).",
-            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents and their light change. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty and unlit. Show the same pot at stage \(k) of 5 as it fills: inside it, \(heap) of what it collects in this game — the theme's own treasure (coins, gems or gold as this theme would have them) in the pot's own colours; \(glow) glow from within. Only if the attached pot is shown with a closed lid or door: that lid or door \(lid), still attached to it.",
+            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents, their light and any lid it already has change. Never add a lid, cover, cap or door it does not have in the attached image: an open mouth stays an open mouth, the treasure rising out of it. A calm, still pose: no burst, rays, explosion or flying pieces. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }

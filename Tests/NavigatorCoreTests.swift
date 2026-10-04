@@ -13388,6 +13388,10 @@ final class ReelAreaTests: XCTestCase {
         let l = PotStates.foot(laid, width: n, height: n)!
         XCTAssertEqual(l.width, e.width, accuracy: 2); XCTAssertEqual(l.cx, e.cx, accuracy: 1.5); XCTAssertEqual(l.bottom, e.bottom, accuracy: 1)
         XCTAssertEqual(PotStates.registered(laid, to: empty, width: n, height: n), laid)
+        // The studio rig's names: State0 empty, five fill states, numbered when a game has several pots.
+        XCTAssertEqual(PotStates.name(pot: 0, of: 1, state: 0), "shared_avatar_jar-State0Idle")
+        XCTAssertEqual(PotStates.name(pot: 2, of: 3, state: 5), "shared_avatar_jar3-State5Idle")
+        XCTAssertEqual(PotStates.levels, 5)
         // Pots stand at the bottom of a canvas with room above them.
         XCTAssertEqual(PotStates.height(1024), 1280)
         let tall = PotStates.padded(empty, size: n)
