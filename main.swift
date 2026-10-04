@@ -25693,6 +25693,35 @@ final class GDDToAssetsRun: ObservableObject {
     /// (FrameStack.windowCovered) and drawn once more when it drifted. A ladder's rungs are the shared
     /// frame, their metal tinted in code. False when it could not be drawn to plan: the frame is then
     /// built from its parts sheet instead (generateFrame).
+    /// A drawn frame revised in review by GPT Image 2.5, the change asked of the frame as it is, and kept
+    /// only if it still leaves its planned window open (up to two attempts); else the frame stays as it was.
+    fileprivate func reviseFrameWithGPT(_ id: String, prompt: String, png: Data, folder: URL) -> (cost: Double, error: String?) {
+        let (b, geo, size) = DispatchQueue.main.sync {
+            (self.backing.rgb, FrameGeometry(self.styledDesign), ["1K": 1024, "4K": 4096][self.jobs.first { $0.kind == .symbol }?.size ?? "2K"] ?? 2048)
+        }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        var cost = 0.0, best: (px: [UInt8], covered: Double)?
+        for attempt in 1...2 {
+            let r = OpenAIImages.edit(prompt: prompt, images: [downsamplePNG(png, longEdge: 2048) ?? png], size: size == 4096 ? 2048 : size)
+            cost += r.cost
+            guard let d = r.png, let cg = loadCGImage(data: d), let raw = ChromaKeyOutputRules.straightRGBA8(cg) else { return (cost, r.error ?? "No image came back.") }
+            let px = cg.width == size && cg.height == size ? raw : FrameKit.resized(FrameKit.Piece(px: raw, w: cg.width, h: cg.height), size, size).px
+            let covered = FrameStack.windowCovered(px, width: size, height: size, backing: b, geometry: geo)
+            navLog(String(format: "gdd review: %@ GPT revision attempt %d covers %.1f%% of its planned window $%.3f", id, attempt, covered * 100, r.cost))
+            if best == nil || covered < best!.covered { best = (px, covered) }
+            if covered <= FrameStack.windowTolerance { break }
+        }
+        guard let best, best.covered <= FrameStack.windowTolerance else {
+            return (cost, String(format: "the revision covered %.0f%% of the frame's window, so the frame was kept as it was", (best?.covered ?? 1) * 100))
+        }
+        guard let onBack = ChromaKeyOutputRules.image(straightRGBA8: best.px, width: size, height: size, space: space).flatMap(encodePNG),
+              (try? onBack.write(to: folder.appendingPathComponent("\(id).png"))) != nil else { return (cost, "Couldn’t write \(id).png.") }
+        if let cut = ChromaKeyOutputRules.image(straightRGBA8: FrameKit.keyed(best.px, backing: b), width: size, height: size, space: space).flatMap(encodePNG) {
+            try? cut.write(to: folder.appendingPathComponent("\(id)_rmbg.png"))
+        }
+        return (cost, nil)
+    }
+
     fileprivate func drawFrameWithGPT(step: RenderStep, themeArt: Data?, folder: URL) -> Bool {
         let dst = folder.appendingPathComponent("\(step.id).png")
         let (design, b, geo, build, size, log, theme, jobs, backing) = DispatchQueue.main.sync {
@@ -25776,9 +25805,28 @@ final class GDDToAssetsRun: ObservableObject {
         return ok
     }
 
+    /// The reel-area pieces the window can make again, by the files each is: every mode's bezel follows the
+    /// base's, every mode's texture the base texture, and the pot states their pot.
+    static let reelPieces: [(name: String, files: (String) -> Bool)] = [
+        ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
+        ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
+        ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") }),
+        ("Pots", { $0.hasPrefix("shared_interface_pot") }),
+        ("Pot states", { $0.hasPrefix("shared_interface_pot") && ($0.contains("_filling") || $0.contains("_full")) }),
+    ]
+
     /// The window's "Make reel area": the set's reel area made in the background, said in the status.
-    func makeReelArea() {
+    /// `redo` names a piece (reelPieces) to make again: its files are kept in versions/ first, never deleted.
+    func makeReelArea(redo: String? = nil) {
         guard let folder = lastFolder, let layout = reelLayout else { return }
+        if let redo, let piece = Self.reelPieces.first(where: { $0.name == redo }) {
+            let fm = FileManager.default, f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+            let kept = folder.appendingPathComponent("versions/reel-\(f.string(from: Date()))")
+            for n in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where piece.files(n) {
+                try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+                try? fm.moveItem(at: folder.appendingPathComponent(n), to: kept.appendingPathComponent(n))
+            }
+        }
         keying = true
         status = "Making the reel area — bezel, dividers, reel texture — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
         DispatchQueue.global(qos: .userInitiated).async {
@@ -26628,6 +26676,7 @@ extension GDDToAssetsRun {
         let backing = self.backing
         let before = spent
         let steps = renderSteps(only: [id])
+        let gptFrame = isFrame && !isPanel && frameArtist == .gpt && OpenAIImages.available
         status = "Revising \(id)…"
         DispatchQueue.global(qos: .userInitiated).async {
             let fm = FileManager.default
@@ -26644,11 +26693,20 @@ extension GDDToAssetsRun {
                     let prompt = GDDAssetPrompts.reviseBrief(job: job, change: change, theme: theme,
                                                              backing: (backing.name, backing.rgb), isFrame: isFrame, layered: layered)
                     log.write("prompts/\(id)-revision-\(archive.split(separator: ".").dropLast().last ?? "").txt", "MODE: review edit\nATTACHED: \(id) (the image being edited)\n\n\(prompt)")
-                    let r = self.sizedRequest(job, prompt: prompt, inputs: [downsamplePNG(png, longEdge: 1536) ?? png], model: model)
-                    DispatchQueue.main.async { self.spent += r.cost }
-                    if let out = r.png { do { try out.write(to: src) } catch { err = error.localizedDescription } }
-                    else { err = r.error ?? "No image came back." }
-                    log.event(["step": "review-edit", "id": id, "change": change, "cost": r.cost, "error": err ?? ""])
+                    var cost = 0.0
+                    if gptFrame {
+                        // A GPT frame is revised by GPT and checked like a new one: Gemini repainted frames
+                        // thick inward, the reason they went to GPT.
+                        let r = self.reviseFrameWithGPT(id, prompt: prompt, png: png, folder: folder)
+                        cost = r.cost; err = r.error
+                    } else {
+                        let r = self.sizedRequest(job, prompt: prompt, inputs: [downsamplePNG(png, longEdge: 1536) ?? png], model: model)
+                        cost = r.cost
+                        if let out = r.png { do { try out.write(to: src) } catch { err = error.localizedDescription } }
+                        else { err = r.error ?? "No image came back." }
+                    }
+                    DispatchQueue.main.async { self.spent += cost }
+                    log.event(["step": "review-edit", "id": id, "change": change, "cost": cost, "error": err ?? ""])
                 } else { err = "Couldn’t read \(id).png." }
             } else {
                 var j = job
@@ -27909,6 +27967,7 @@ struct GDDToAssetsSheet: View {
                         if GoogleWebSession.themeHubURL != nil { Button("Retry") { loadThemes() } }
                         Button("Hub address…") { askForHubURL() }
                         Button("View hub") { viewHub() }
+                        newThemeButton
                     }
                 }
                 .padding(8)
@@ -27921,7 +27980,12 @@ struct GDDToAssetsSheet: View {
                     if loadingThemes { ProgressView().controlSize(.small) }
                     Button("View hub") { viewHub() }
                         .help("Open the team theme hub to browse the themes and their artwork")
+                    newThemeButton
                 }
+            }
+            if let t = pickedTheme, !themes.contains(where: { $0.name == t.name }) {
+                Label("\(t.name) — a new theme, planned from its name and the GDD", systemImage: "sparkles")
+                    .font(.caption).foregroundColor(.secondary)
             }
             if !themes.isEmpty {
                 // NOT a Picker.
@@ -28274,7 +28338,21 @@ struct GDDToAssetsSheet: View {
                         Text(reels.summary).foregroundColor(.secondary)
                         Button("Make reel area…") { run.makeReelArea() }
                             .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
-                            .help("For every grid the GDD gives: the bezel, dividers, reel texture and reel fade as layers, the jackpot table and pots above the reels when it has them, and a reel preview per mode, with this set's own symbols and background. GPT Image 2.5, about $0.15 a piece.")
+                            .help("For every grid the GDD gives: the bezel, dividers, reel texture and reel fade as layers, the jackpot table and pots above the reels when it has them, and a reel preview per mode, with this set's own symbols and background. Only what isn't made yet is drawn. GPT Image 2.5, about $0.15 a piece.")
+                        Menu("Make Again") {
+                            ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
+                            Divider()
+                            Button("Show the Reel Previews") {
+                                guard let folder = run.lastFolder else { return }
+                                let previews = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+                                    .filter { $0.hasSuffix("_reel-preview.jpg") || $0 == "shared_interface_pots-states.jpg" }
+                                    .map { folder.appendingPathComponent($0) }
+                                NSWorkspace.shared.activateFileViewerSelecting(previews.isEmpty ? [folder] : previews)
+                            }
+                        }
+                        .fixedSize()
+                        .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
+                        .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots or their filling and full states. The current files are kept in the set's versions folder. About $0.15 a piece; the bezel can take two tries.")
                     }
                     ForEach(reels.notes, id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
                 }
@@ -28887,6 +28965,26 @@ struct GDDToAssetsSheet: View {
             askForHubURL(); return
         }
         GoogleWebSession.shared.presentWeb(url: u, title: "Team Theme Hub") { loadThemes() }
+    }
+
+    /// A theme not on the hub yet, as `--new-theme` makes one: its name alone, the written look and the
+    /// GDD to plan from, no hub artwork (so no style read is paid for).
+    private var newThemeButton: some View {
+        Button("New theme…") {
+            let a = NSAlert()
+            a.messageText = "A theme not on the hub"
+            a.informativeText = "Its name is all the set is planned from, with the GDD. Pick an art style below if you want one."
+            let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+            f.placeholderString = "Galactic Goddess"
+            a.accessoryView = f
+            a.addButton(withTitle: "Use It"); a.addButton(withTitle: "Cancel")
+            a.window.initialFirstResponder = f
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+            let n = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !n.isEmpty else { return }
+            pickedTheme = themes.first { $0.name.caseInsensitiveCompare(n) == .orderedSame } ?? GameTheme(name: n)
+        }
+        .help("Make a set for a theme that isn’t on the team hub yet")
     }
 
     private func askForHubURL() {
