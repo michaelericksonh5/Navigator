@@ -787,7 +787,9 @@ enum OpenAIImages {
 
     /// With no images, a new image from the prompt (images/generations); with some, an edit of the last,
     /// the others its references (images/edits).
-    static func edit(prompt: String, images: [Data], size: Int = 2048, quality: String = "high") -> (png: Data?, cost: Double, error: String?) {
+    /// `size` wide, `height` tall (square when nil): each a multiple of 16, as GPT Image takes them.
+    static func edit(prompt: String, images: [Data], size: Int = 2048, height: Int? = nil, quality: String = "high") -> (png: Data?, cost: Double, error: String?) {
+        let dims = "\(size)x\(height ?? size)"
         guard let key = APIKeys.openAI else { return (nil, 0, "No OpenAI API key: set one in AI → API Keys…") }
         guard !PaidCalls.disabled else { return (nil, 0, PaidCalls.refusal) }
         var req = URLRequest(url: URL(string: "https://api.openai.com/v1/images/\(images.isEmpty ? "generations" : "edits")")!, timeoutInterval: 360)
@@ -795,9 +797,9 @@ enum OpenAIImages {
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         if images.isEmpty {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model, "prompt": prompt, "size": "\(size)x\(size)", "quality": quality,
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model, "prompt": prompt, "size": dims, "quality": quality,
                                                                          "background": "opaque", "output_format": "png", "n": 1])
-            return send(req, size: size, quality: quality)
+            return send(req, dims: dims, quality: quality)
         }
         let boundary = "navigator-\(UUID().uuidString)"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -805,7 +807,7 @@ enum OpenAIImages {
         func field(_ name: String, _ value: String) {
             body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
         }
-        for (k, v) in [("model", model), ("prompt", prompt), ("size", "\(size)x\(size)"), ("quality", quality),
+        for (k, v) in [("model", model), ("prompt", prompt), ("size", dims), ("quality", quality),
                        ("background", "opaque"), ("output_format", "png"), ("n", "1")] { field(k, v) }
         for (i, img) in images.enumerated() {
             body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"image\(i).png\"\r\nContent-Type: image/png\r\n\r\n".data(using: .utf8)!)
@@ -813,10 +815,10 @@ enum OpenAIImages {
         }
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         req.httpBody = body
-        return send(req, size: size, quality: quality)
+        return send(req, dims: dims, quality: quality)
     }
 
-    private static func send(_ req: URLRequest, size: Int, quality: String) -> (png: Data?, cost: Double, error: String?) {
+    private static func send(_ req: URLRequest, dims: String, quality: String) -> (png: Data?, cost: Double, error: String?) {
         let done = DispatchSemaphore(value: 0)
         var data: Data?, status = 0, failure: String?
         URLSession.shared.dataTask(with: req) { d, r, e in
@@ -833,7 +835,7 @@ enum OpenAIImages {
         }
         guard let first = (j["data"] as? [[String: Any]])?.first, let b64 = first["b64_json"] as? String,
               let png = Data(base64Encoded: b64) else { return (nil, cost, "OpenAI returned no image (\(status))") }
-        navLog(String(format: "openai image: %@ %dx%d %@ $%.4f", model, size, size, quality, cost))
+        navLog(String(format: "openai image: %@ %@ %@ $%.4f", model, dims, quality, cost))
         return (png, cost, nil)
     }
 
@@ -21686,6 +21688,32 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
     app.run()
 }
 
+// PAID (~$0.30, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>]
+// The reel area the GDD's base grid needs — bezel, dividers, reel texture, reel fade — and a reel preview.
+if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        // The reels saved with the set, or read from --gdd-file for a set made before they were.
+        let text = args.firstIndex(of: "--gdd-file").flatMap { $0 + 1 < args.count ? try? String(contentsOfFile: args[$0 + 1], encoding: .utf8) : nil }
+        guard let layout = text.map(ReelLayoutRules.read) ?? run.reelLayout else { print("FAILED: this set has no reels saved: add --gdd-file <the GDD's text>"); exit(1) }
+        if text != nil { run.reelLayout = layout; run.writeManifest(to: folder) }
+        guard let base = layout.base else { print("FAILED: the document gives no reel size"); exit(1) }
+        let area = ReelArea(layout)
+        print("REELS: base \(base.rows)x\(base.reels)" + layout.extras.map { " + \($0.what) \($0.place)" }.joined()
+              + "; \(area.width)x\(area.height) px, cell \(area.cell)")
+        for n in layout.notes { print("NOTE: \(n)") }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = run.generateReelArea(layout, folder: folder)
+            print(String(format: "DONE: %@\nSPENT: $%.4f", r.problems.isEmpty ? "reel area made" : r.problems.joined(separator: "; "), r.cost))
+            exit(0)
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --restack <set folder> [id,id,…]
 // Builds a layered set's framed symbols from their pieces again, as a frame or panel change does.
 if let flag = CommandLine.arguments.firstIndex(of: "--restack"), flag + 1 < CommandLine.arguments.count {
@@ -24233,6 +24261,8 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var theme: GameTheme?
     @Published var gameName = ""
     @Published var gddText = ""
+    /// The reels the GDD lays out, read with its symbols (ReelLayoutRules), kept with the set.
+    @Published var reelLayout: ReelLayout?
     @Published var symbols: [SlotSymbol] = []
     /// Symbol-set lines the parser could not read. A dropped symbol is invisible
     /// otherwise — it only shows up when someone counts the folder.
@@ -24435,6 +24465,8 @@ final class GDDToAssetsRun: ObservableObject {
               symbolAspect: String, backgroundAspect: String, backgroundSize: String) {
         revision += 1
         gddText = text; gameName = name
+        let reels = ReelLayoutRules.read(text)
+        reelLayout = reels.grids.isEmpty ? nil : reels
         let read = GDDSymbolSetRules.parseWithProblems(text)
         symbols = read.symbols
         parseProblems = read.problems
@@ -25743,6 +25775,114 @@ final class GDDToAssetsRun: ObservableObject {
         return ok
     }
 
+    /// The window's "Make reel area": the set's reel area made in the background, said in the status.
+    func makeReelArea() {
+        guard let folder = lastFolder, let layout = reelLayout else { return }
+        keying = true
+        status = "Making the reel area — bezel, dividers, reel texture — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = self.generateReelArea(layout, folder: folder)
+            DispatchQueue.main.async {
+                self.keying = false
+                self.status = (r.problems.isEmpty ? "Reel area made" : "Reel area made — " + r.problems.joined(separator: "; "))
+                    + String(format: " · $%.2f. See reel-preview.jpg in the set's folder.", r.cost)
+            }
+        }
+    }
+
+    /// The reel area for `layout` (ReelArea): GPT Image 2.5 paints the bezel on its grey template, checked
+    /// against its openings and drawn once more when it covers them; GPT draws the reel texture; code splits
+    /// the bezel from its dividers, masks the texture to the grid, adds the reel fade, and composes a reel
+    /// preview from this set's own background and cut-outs. Writes reel_bezel.png (as drawn), and as layers
+    /// reel_bezel_rmbg.png, reel_dividers_rmbg.png, reel_texture_rmbg.png, reel_fade_rmbg.png; and
+    /// reel-preview.jpg. Blocks: call off the main thread.
+    func generateReelArea(_ layout: ReelLayout, folder: URL) -> (cost: Double, problems: [String]) {
+        let area = ReelArea(layout)
+        let (theme, design, backing, jobs) = DispatchQueue.main.sync { (self.theme, self.styledDesign, self.backing, self.jobs) }
+        guard let theme else { return (0, ["no theme"]) }
+        let b = backing.rgb, space = CGColorSpace(name: CGColorSpace.sRGB)!, W = area.width, H = area.height
+        var cost = 0.0, problems: [String] = []
+        func png(_ px: [UInt8], _ w: Int, _ h: Int) -> Data? { ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG) }
+        func pixels(_ d: Data, _ w: Int, _ h: Int) -> [UInt8]? {
+            guard let cg = loadCGImage(data: d), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            return cg.width == w && cg.height == h ? px : FrameKit.resized(FrameKit.Piece(px: px, w: cg.width, h: cg.height), w, h).px
+        }
+        // The bezel, on its template.
+        guard let tpl = png(area.template(backing: b), W, H) else { return (0, ["the template could not be drawn"]) }
+        let hot = layout.extras.contains { $0.what == "hot reel" }
+        let prompt = GDDAssetPrompts.bezelBrief(theme: theme, design: design, backing: (backing.name, b), hotReel: hot)
+        let log = DispatchQueue.main.sync { self.session() }
+        log.write("prompts/reel_bezel.txt", "MODE: reel bezel (GPT Image 2.5), \(W)x\(H)\n\n\(prompt)")
+        if let cg = ChromaKeyOutputRules.image(straightRGBA8: area.template(backing: b), width: W, height: H, space: space) { log.writeJPEG("prompts/reel_bezel-template.jpg", cg) }
+        var best: (px: [UInt8], covered: Double)?
+        for attempt in 1...2 {
+            let r = OpenAIImages.edit(prompt: prompt, images: [tpl], size: W, height: H)
+            cost += r.cost
+            guard let d = r.png, let px = pixels(d, W, H) else { problems.append("bezel: \(r.error ?? "no image")"); break }
+            let c = area.covered(px, backing: b)
+            navLog(String(format: "gdd reel: bezel attempt %d covers %.1f%% of its openings $%.3f", attempt, c * 100, r.cost))
+            if best == nil || c < best!.covered { best = (px, c) }
+            if c <= FrameStack.windowTolerance { break }
+        }
+        if let best {
+            if best.covered > FrameStack.windowTolerance { problems.append(String(format: "the bezel covers %.1f%% of its openings", best.covered * 100)) }
+            let (bezel, div) = area.layers(FrameKit.keyed(best.px, backing: b))
+            try? png(best.px, W, H)?.write(to: folder.appendingPathComponent("reel_bezel.png"))
+            try? png(bezel, W, H)?.write(to: folder.appendingPathComponent("reel_bezel_rmbg.png"))
+            try? png(div, W, H)?.write(to: folder.appendingPathComponent("reel_dividers_rmbg.png"))
+        }
+        // The reel texture, drawn at the grid's own shape and laid in under the band.
+        let g = area.grid, long = 2048.0, k = long / Double(max(g.w, g.h))
+        let tw = Int((Double(g.w) * k / 16).rounded()) * 16, th = Int((Double(g.h) * k / 16).rounded()) * 16
+        let tprompt = GDDAssetPrompts.reelTextureBrief(theme: theme, design: design)
+        log.write("prompts/reel_texture.txt", "MODE: reel texture (GPT Image 2.5), \(tw)x\(th)\n\n\(tprompt)")
+        let tr = OpenAIImages.edit(prompt: tprompt, images: [], size: tw, height: th)
+        cost += tr.cost
+        if let d = tr.png, let tex = pixels(d, tw, th) {
+            try? d.write(to: folder.appendingPathComponent("reel_texture.png"))
+            try? png(area.textureLayer(tex, width: tw, height: th), W, H)?.write(to: folder.appendingPathComponent("reel_texture_rmbg.png"))
+        } else { problems.append("texture: \(tr.error ?? "no image")") }
+        try? png(area.fadeLayer(), W, H)?.write(to: folder.appendingPathComponent("reel_fade_rmbg.png"))
+        // The preview: the base background, the texture, this set's symbols in the openings, dividers, bezel.
+        var canvas = [UInt8](repeating: 0, count: W * H * 4)
+        for i in stride(from: 3, to: canvas.count, by: 4) { canvas[i] = 255 }
+        func layer(_ name: String) -> [UInt8]? {
+            guard let cg = loadCGImage(folder.appendingPathComponent(name)), cg.width == W, cg.height == H else { return nil }
+            return ChromaKeyOutputRules.straightRGBA8(cg)
+        }
+        if let bg = loadCGImage(folder.appendingPathComponent("bg_base.png")), let bpx = ChromaKeyOutputRules.straightRGBA8(bg) {
+            let s = max(Double(W) / Double(bg.width), Double(H) / Double(bg.height))
+            let piece = FrameKit.resized(FrameKit.Piece(px: bpx, w: bg.width, h: bg.height), Int(Double(bg.width) * s) + 1, Int(Double(bg.height) * s) + 1)
+            FrameKit.over(&canvas, width: W, piece, at: (W - piece.w) / 2, (H - piece.h) / 2)
+        }
+        for name in ["reel_texture_rmbg.png"] { if let l = layer(name) { FrameKit.over(&canvas, width: W, FrameKit.Piece(px: l, w: W, h: H), at: 0, 0) } }
+        let pool = jobs.filter { $0.kind == .symbol && ![.replacement, .blank].contains($0.role) && FileManager.default.fileExists(atPath: folder.appendingPathComponent("\($0.id)_rmbg.png").path) }
+        var seed: UInt64 = 7
+        func next() -> Int { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Int(seed >> 33) }
+        let weighted = pool.flatMap { j in Array(repeating: j, count: j.role == .lowPay ? 5 : [.highPay, .mediumPay].contains(j.role) ? 3 : 1) }
+        var cache: [String: FrameKit.Piece] = [:]
+        for w in area.windows where !weighted.isEmpty {
+            let rows = max(1, Int((Double(w.h) / Double(area.cell)).rounded())), ch = w.h / rows
+            for r in 0..<rows {
+                let j = weighted[next() % weighted.count], size = min(area.cell, ch)
+                let key = "\(j.id)-\(size)"
+                if cache[key] == nil, let cg = loadCGImage(folder.appendingPathComponent("\(j.id)_rmbg.png")), let px = ChromaKeyOutputRules.straightRGBA8(cg) {
+                    cache[key] = FrameKit.resized(FrameKit.Piece(px: px, w: cg.width, h: cg.height), size, size)
+                }
+                if let p = cache[key] { FrameKit.over(&canvas, width: W, p, at: w.x + (w.w - size) / 2, w.y + r * ch + (ch - size) / 2) }
+            }
+        }
+        for name in ["reel_dividers_rmbg.png", "reel_bezel_rmbg.png"] { if let l = layer(name) { FrameKit.over(&canvas, width: W, FrameKit.Piece(px: l, w: W, h: H), at: 0, 0) } }
+        if let img = ChromaKeyOutputRules.image(straightRGBA8: canvas, width: W, height: H, space: space),
+           let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("reel-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+        log.event(["step": "reel area", "cost": cost, "problems": problems, "grid": "\(layout.base.map { "\($0.rows)x\($0.reels)" } ?? "?")"])
+        DispatchQueue.main.async { self.spent += cost }
+        return (cost, problems)
+    }
+
     /// The image a framed sheet edits: each member's frame, in the sheet's layout on the flat
     /// backing, so every symbol starts from the one frame instead of drawing its own. HP1 falls
     /// back to the shared frame when its own is missing; nil when the shared one is.
@@ -26236,7 +26376,7 @@ extension GDDToAssetsRun {
     func writeManifest(to folder: URL) {
         guard let theme else { return }
         let m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
-                            backing: (backing.name, backing.rgb), model: modelFlag)
+                            backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
         if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
     }
 
@@ -26262,6 +26402,7 @@ extension GDDToAssetsRun {
         run.panelColour = PanelColour(picked)
         run.backing = (name: m.backingName, rgb: m.backingRGB)
         run.modelFlag = m.model
+        run.reelLayout = m.reels
         run.lastFolder = folder
         run.loadReview(folder)
         ThemeHubClient.themes { list, _ in
@@ -28003,6 +28144,18 @@ struct GDDToAssetsSheet: View {
             Text(backgroundNote)
                 .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
                 .fixedSize(horizontal: false, vertical: true)
+            if let reels = run.reelLayout {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text("Reels").bold()
+                        Text(reels.summary).foregroundColor(.secondary)
+                        Button("Make reel area…") { run.makeReelArea() }
+                            .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
+                            .help("The bezel, dividers, reel texture and reel fade for the base grid, as layers, and a reel preview with this set's own symbols and background. GPT Image 2.5, about $0.30.")
+                    }
+                    ForEach(reels.notes, id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
+                }
+            }
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Text("Frames built")

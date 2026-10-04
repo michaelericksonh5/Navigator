@@ -13228,15 +13228,46 @@ final class ReelLayoutTests: XCTestCase {
         XCTAssertEqual(r.base?.rows, 3); XCTAssertEqual(r.base?.reels, 3)
         let bonus = r.grids.filter { $0.mode == "bonus" }
         XCTAssertEqual(bonus.map { "\($0.rows)x\($0.reels)" }, ["3x4"]); XCTAssertTrue(bonus[0].independent)
+        XCTAssertEqual(r.grids.count, 2)
         XCTAssertEqual(r.extras.first { $0.what == "hot reel" }.map { "\($0.rows ?? 0)x\($0.reels ?? 0) \($0.place)" }, "1x3 above")
         XCTAssertTrue(r.notes.contains { $0.contains("written both ways") }, "\(r.notes)")
     }
     func testToyotasReelsPotsAndJackpotTableAreRead() {
         let r = ReelLayoutRules.read(Self.toyota)
         XCTAssertEqual(r.base.map { "\($0.rows)x\($0.reels)" }, "3x5")
-        XCTAssertEqual(Set(r.grids.filter { $0.mode == "bonus" }.map { "\($0.rows)x\($0.reels)" }), ["3x5", "5x5"])
+        XCTAssertEqual(r.grids.map { "\($0.mode) \($0.rows)x\($0.reels)\($0.independent ? " independent" : "")" }, ["base 3x5", "bonus 5x5", "bonus 3x5"])
         XCTAssertTrue(r.extras.contains { $0.what == "pots" && $0.place == "above" })
         XCTAssertTrue(r.extras.contains { $0.what == "jackpot table" })
         XCTAssertFalse(r.extras.contains { $0.what == "hot reel" })
+    }
+}
+
+final class ReelAreaTests: XCTestCase {
+    // A 3x5 grid: five openings, four dividers, the band and gaps in the studio's cell ratios, sizes GPT takes.
+    func testTheReelAreaIsLaidOutExactlyFromTheGrid() {
+        let a = ReelArea(rows: 3, reels: 5, cell: 200)
+        XCTAssertEqual(a.windows.count, 5); XCTAssertEqual(a.dividers.count, 4)
+        XCTAssertEqual(a.width % 16, 0); XCTAssertEqual(a.height % 16, 0)
+        XCTAssertEqual(a.band, 40); XCTAssertEqual(a.gap, 9)
+        XCTAssertEqual(a.grid.w, 5 * 200 + 4 * 9); XCTAssertEqual(a.grid.h, 600)
+        let b = RGB8(255, 0, 255), px = a.template(backing: b)
+        XCTAssertEqual(a.covered(px, backing: b), 0, accuracy: 1e-9)                 // the template keeps every opening
+        let mid = a.windows[2]
+        XCTAssertEqual(Array(px[((mid.y + 10) * a.width + mid.x + 10) * 4..<((mid.y + 10) * a.width + mid.x + 10) * 4 + 3]), [255, 0, 255])
+        // Split: the dividers on their own layer, the bezel without them, both empty in the openings.
+        let (bezel, div) = a.layers(px)
+        let d = a.dividers[0], di = ((d.y + 5) * a.width + d.x + 1) * 4
+        XCTAssertEqual(div[di + 3], 255); XCTAssertEqual(bezel[di + 3], 0)
+        XCTAssertEqual(bezel[((mid.y + 10) * a.width + mid.x + 10) * 4 + 3], 0)
+    }
+    // Chevy-Hot: a 1x3 hot reel above a 3x3 grid, in a housing sharing the top band, read from its GDD.
+    func testAHotReelSitsInAHousingAboveTheGrid() {
+        let a = ReelArea(ReelLayoutRules.read(ReelLayoutTests.chevy), cell: 200)
+        XCTAssertEqual(a.windows.count, 6); XCTAssertEqual(a.dividers.count, 4)
+        XCTAssertLessThan(a.windows[0].y + a.windows[0].h, a.windows[3].y)              // the hot reel above
+        XCTAssertEqual(a.windows[0].h, 170)                                              // 0.85 of a cell
+        let px = a.template(backing: RGB8(255, 0, 255))
+        let barY = a.windows[3].y - a.band / 2, bi = (barY * a.width + a.grid.x + 50) * 4
+        XCTAssertGreaterThan(px[bi], 100)                                                // the bar under it is shaded, not black
     }
 }

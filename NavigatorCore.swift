@@ -8162,14 +8162,14 @@ public struct SlotSymbol: Equatable, Sendable {
 /// layout, Independent Reels". Documents write rows x reels ("3x5 lines game", 3 rows of 5 reels) but
 /// not always: Chevy-Hot calls one bonus grid both "3x4" and "4x3". A size given both ways is read as
 /// rows x reels with the rows the smaller (slot grids are wider than tall), and said in `notes`.
-public struct ReelLayout: Equatable, Sendable {
-    public struct Grid: Equatable, Sendable {
+public struct ReelLayout: Equatable, Codable, Sendable {
+    public struct Grid: Equatable, Codable, Sendable {
         public var mode: String          // "base", "bonus", "power bet", …
         public var rows: Int, reels: Int
         public var independent = false   // each cell its own reel (hold-and-spin style)
         public var note = ""             // the words it was read from
     }
-    public struct Extra: Equatable, Sendable {
+    public struct Extra: Equatable, Codable, Sendable {
         public var what: String          // "hot reel", "jackpot table", "pots"
         public var rows: Int?, reels: Int?
         public var place: String         // "above", "below", "beside"
@@ -8179,6 +8179,15 @@ public struct ReelLayout: Equatable, Sendable {
     public var notes: [String] = []
     /// The base game's grid, the one the bezel is built round.
     public var base: Grid? { grids.first { $0.mode == "base" } ?? grids.first }
+    /// For people: "base 3×5 · bonus 3×5, 5×5 · above: pots, jackpot table".
+    public var summary: String {
+        var modes: [String] = []
+        for m in grids.map(\.mode) where !modes.contains(m) { modes.append(m) }
+        let parts = modes.map { m in "\(m) " + grids.filter { $0.mode == m }.map { "\($0.rows)×\($0.reels)\($0.independent ? " independent" : "")" }.joined(separator: ", ") }
+        let places = Dictionary(grouping: extras, by: \.place).sorted { $0.key < $1.key }
+            .map { "\($0.key): " + $0.value.map { e in e.rows.map { "\(e.what) \($0)×\(e.reels ?? 0)" } ?? e.what }.joined(separator: ", ") }
+        return (parts + places).joined(separator: " · ")
+    }
 }
 
 public enum ReelLayoutRules {
@@ -8195,7 +8204,12 @@ public enum ReelLayoutRules {
             return bonus ? "bonus" : nil
         }
         if let m = pick(before), !(before.lowercased().contains("base") && before.lowercased().contains("bonus")) { return m }
-        return pick(line) ?? pick(section) ?? "base"
+        // A line naming one mode is that mode's; one naming both defers to its section ("Bonus Game Mode"),
+        // and only then is the whole game's.
+        let l = line.lowercased(), base = l.contains("base"), bonus = ["bonus", "free game", "free spin"].contains(where: l.contains)
+        if l.contains("power bet") { return "power bet" }
+        if base != bonus { return base ? "base" : "bonus" }
+        return pick(section) ?? "base"
     }
 
     public static func read(_ gdd: String) -> ReelLayout {
@@ -8231,8 +8245,10 @@ public enum ReelLayoutRules {
                 guard !out.grids.contains(where: { $0.mode == mode && Set([$0.rows, $0.reels]) == Set([a, b]) }) else { continue }
                 // "matrix ... depending on" — a grid it can grow to: kept, after the first of its mode.
                 let rows = min(a, b), reels = max(a, b)
+                // Independent reels are said of this grid itself ("a 3x4 matrix of independent reels"), not of
+                // something else in the sentence ("an independent jackpot reel").
                 out.grids.append(ReelLayout.Grid(mode: mode, rows: rows, reels: reels,
-                                                 independent: lower.contains("independent"), note: String(line.prefix(140))))
+                                                 independent: after.prefix(40).contains("independent"), note: String(line.prefix(140))))
             }
             for (what, words) in [("jackpot table", ["jackpot table above", "jackpot table"]), ("pots", ["pots that sit above", "pots above"])]
                 where words.contains(where: lower.contains) && !out.extras.contains(where: { $0.what == what }) {
@@ -8246,6 +8262,148 @@ public enum ReelLayoutRules {
                 out.notes.append("The \(mode) grid is written both ways (\(pairs.sorted().joined(separator: " and "))): read as rows x reels with the fewer rows — check it.")
             }
         }
+        return out
+    }
+}
+
+/// The reel area a GDD's grid needs — its bezel (the frame round the reels), the dividers between reels
+/// and the reel texture behind them — laid out in code, exactly, before any art: the model paints the
+/// material, never the geometry (what the symbol frames taught). Ratios measured on the studio's shipped
+/// games (about 25: B2B packs, artSource PSDs, screenshots; 2026-10-04), in cells: side band 0.20 (middle
+/// half 0.14–0.30), divider 0.045, backing 0.05 under the band, corner radius 0.1, a crest above the top
+/// band 0.3–0.6. A hot reel above sits in a housing sharing the top band (DeluxeWays' notched box).
+public struct ReelArea: Equatable, Sendable {
+    public struct Rect: Equatable, Sendable { public var x, y, w, h: Int
+        public func contains(_ px: Int, _ py: Int) -> Bool { px >= x && px < x + w && py >= y && py < y + h }
+    }
+    public var width: Int, height: Int, cell: Int
+    /// The openings symbols show through: one per reel (and one per hot-reel cell row).
+    public var windows: [Rect] = []
+    /// The divider bars between them, a layer of their own.
+    public var dividers: [Rect] = []
+    /// The whole grid, main and hot reel together, that the reel texture fills.
+    public var grid: Rect
+    public var band: Int, gap: Int, radius: Int
+
+    public static let bandShare = 0.20, gapShare = 0.045, bleedShare = 0.05, radiusShare = 0.1, crestRoom = 0.5, margin = 0.3
+
+    /// The base grid (rows x reels) and a hot reel of `hot` rows above it when there is one, at `cell`
+    /// pixels a cell; the canvas rounded up to multiples of 16, as GPT Image takes sizes.
+    public init(rows: Int, reels: Int, hotRows: Int = 0, cell: Int = 512) {
+        self.cell = cell
+        let band = Int((Self.bandShare * Double(cell)).rounded()), gap = Int((Self.gapShare * Double(cell)).rounded())
+        self.band = band; self.gap = gap; self.radius = Int((Self.radiusShare * Double(cell)).rounded())
+        let gridW = reels * cell + (reels - 1) * gap
+        let hotH = hotRows > 0 ? Int(Double(hotRows) * 0.85 * Double(cell)) : 0
+        let gridH = rows * cell + (hotRows > 0 ? hotH + band : 0)
+        let side = Int(Self.margin * Double(cell)), top = Int((Self.margin + Self.crestRoom) * Double(cell))
+        func up16(_ v: Int) -> Int { (v + 15) / 16 * 16 }
+        width = up16(gridW + 2 * band + 2 * side); height = up16(gridH + 2 * band + top + side)
+        let gx = (width - gridW) / 2, gy = top + band + (height - (gridH + 2 * band + top + side)) / 2
+        grid = Rect(x: gx, y: gy, w: gridW, h: gridH)
+        var y = gy
+        if hotRows > 0 {
+            // The hot reel: one window per reel, the bar under it as wide as the band.
+            for r in 0..<reels { windows.append(Rect(x: gx + r * (cell + gap), y: y, w: cell, h: hotH)) }
+            for r in 1..<reels { dividers.append(Rect(x: gx + r * (cell + gap) - gap, y: y, w: gap, h: hotH)) }
+            y += hotH + band
+        }
+        for r in 0..<reels { windows.append(Rect(x: gx + r * (cell + gap), y: y, w: cell, h: rows * cell)) }
+        for r in 1..<reels { dividers.append(Rect(x: gx + r * (cell + gap) - gap, y: y, w: gap, h: rows * cell)) }
+    }
+    public init(_ layout: ReelLayout, cell: Int = 512) {
+        let g = layout.base ?? ReelLayout.Grid(mode: "base", rows: 3, reels: 5)
+        let hot = layout.extras.first { $0.what == "hot reel" && $0.place == "above" }
+        self.init(rows: g.rows, reels: g.reels, hotRows: hot?.rows ?? 0, cell: cell)
+    }
+    /// Where a pixel is: 0 outside the frame, 1 in the band (or the hot bar), 2 a divider, 3 an opening.
+    func zone(_ x: Int, _ y: Int) -> Int {
+        if windows.contains(where: { $0.contains(x, y) }) { return 3 }
+        if dividers.contains(where: { $0.contains(x, y) }) { return 2 }
+        let outer = Rect(x: grid.x - band, y: grid.y - band, w: grid.w + 2 * band, h: grid.h + 2 * band)
+        guard outer.contains(x, y) else { return 0 }
+        // rounded outer corners
+        let r = Double(radius + band)
+        let cx = Double(min(max(x, outer.x + Int(r)), outer.x + outer.w - Int(r))), cy = Double(min(max(y, outer.y + Int(r)), outer.y + outer.h - Int(r)))
+        return (Double(x) - cx) * (Double(x) - cx) + (Double(y) - cy) * (Double(y) - cy) <= r * r ? 1 : 0
+    }
+
+    /// The grey moulding GPT Image repaints (opaque RGBA on the backing): the band shaded as a bevel lit
+    /// from the top, the dividers as narrow bars, the openings the flat backing.
+    func template(backing b: RGB8) -> [UInt8] {
+        var px = [UInt8](repeating: 255, count: width * height * 4)
+        let outer = Rect(x: grid.x - band, y: grid.y - band, w: grid.w + 2 * band, h: grid.h + 2 * band)
+        for y in 0..<height { for x in 0..<width {
+            let i = (y * width + x) * 4
+            var v: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
+            switch zone(x, y) {
+            case 1:
+                // depth into the band from the outer edge, 0…1, and which way it faces
+                let dl = x - outer.x, dr = outer.x + outer.w - 1 - x, dt = y - outer.y, db = outer.y + outer.h - 1 - y
+                let d = min(dl, dr, dt, db), u = Double(d) / Double(max(1, band))
+                let facingUp = d == dt ? 1.0 : d == db ? -1.0 : 0.3
+                // Past the outer band — the bar under a hot reel — a flat face.
+                let shade = u > 1.06 ? 150.0 : u < 0.06 || u > 0.94 ? 60.0 : u < 0.25 ? 150 + 70 * facingUp : u > 0.75 ? 125 - 60 * facingUp : 160 - 20 * abs(u - 0.5)
+                let c = UInt8(max(0, min(255, shade))); v = (c, c, c)
+            case 2:
+                // A narrow bevelled bar: dark edges, lit across its middle.
+                let u = Double(x - (dividers.first { $0.contains(x, y) }?.x ?? x)) / Double(max(1, gap - 1))
+                let c = UInt8(max(0, min(255, u < 0.12 || u > 0.88 ? 85 : 170 - 60 * abs(u - 0.5)))); v = (c, c, c)
+            default: break
+            }
+            px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2; px[i + 3] = 255
+        } }
+        return px
+    }
+
+    /// The share of the openings a drawn bezel covers (opaque RGBA on its backing): the bezel's window
+    /// check, as FrameStack.windowCovered is the symbol frames'.
+    func covered(_ px: [UInt8], backing b: RGB8) -> Double {
+        var open = 0, hit = 0
+        for w in windows { for y in w.y..<(w.y + w.h) { for x in w.x..<(w.x + w.w) {
+            let i = (y * width + x) * 4
+            open += 1
+            if abs(Int(px[i]) - Int(b.r)) + abs(Int(px[i + 1]) - Int(b.g)) + abs(Int(px[i + 2]) - Int(b.b)) > 90 { hit += 1 }
+        } } }
+        return open > 0 ? Double(hit) / Double(open) : 1
+    }
+
+    /// The bezel and dividers as layers of their own (straight RGBA), from the drawn bezel keyed off its
+    /// backing: the dividers are their regions, the bezel everything else; both empty in the openings.
+    func layers(_ keyed: [UInt8]) -> (bezel: [UInt8], dividers: [UInt8]) {
+        var bezel = keyed, div = [UInt8](repeating: 0, count: keyed.count)
+        for y in 0..<height { for x in 0..<width {
+            let i = (y * width + x) * 4
+            switch zone(x, y) {
+            case 3: bezel[i + 3] = 0
+            case 2: for c in 0..<4 { div[i + c] = keyed[i + c] }; bezel[i + 3] = 0
+            default: break
+            }
+        } }
+        return (bezel, div)
+    }
+
+    /// The reel texture laid in its place: the drawn texture fitted over the grid, running `bleedShare`
+    /// under the band, its corners rounded; transparent elsewhere.
+    func textureLayer(_ texture: [UInt8], width tw: Int, height th: Int) -> [UInt8] {
+        let bleed = Int(Self.bleedShare * Double(cell))
+        let r = Rect(x: grid.x - bleed, y: grid.y - bleed, w: grid.w + 2 * bleed, h: grid.h + 2 * bleed)
+        var out = [UInt8](repeating: 0, count: width * height * 4)
+        let rad = Double(radius)
+        for y in r.y..<(r.y + r.h) { for x in r.x..<(r.x + r.w) {
+            let cx = Double(min(max(x, r.x + radius), r.x + r.w - 1 - radius)), cy = Double(min(max(y, r.y + radius), r.y + r.h - 1 - radius))
+            guard (Double(x) - cx) * (Double(x) - cx) + (Double(y) - cy) * (Double(y) - cy) <= rad * rad else { continue }
+            let sx = min(tw - 1, (x - r.x) * tw / r.w), sy = min(th - 1, (y - r.y) * th / r.h)
+            let s = (sy * tw + sx) * 4, d = (y * width + x) * 4
+            out[d] = texture[s]; out[d + 1] = texture[s + 1]; out[d + 2] = texture[s + 2]; out[d + 3] = 255
+        } }
+        return out
+    }
+
+    /// The reel fade: flat black over the grid at `alpha`, the studio's reelFade.
+    func fadeLayer(alpha: Double = 0.6) -> [UInt8] {
+        var out = [UInt8](repeating: 0, count: width * height * 4)
+        for y in grid.y..<(grid.y + grid.h) { for x in grid.x..<(grid.x + grid.w) { out[(y * width + x) * 4 + 3] = UInt8(alpha * 255) } }
         return out
     }
 }
@@ -11862,9 +12020,10 @@ public enum FrameKit {
     }
     /// `p` laid over `dst` (straight alpha) with its top-left at (x, y).
     static func over(_ dst: inout [UInt8], width n: Int, _ p: Piece, at x: Int, _ y: Int) {
+        let rows = dst.count / max(1, n * 4)                // any canvas, not only a square one
         for yy in 0..<p.h { for xx in 0..<p.w {
             let X = x + xx, Y = y + yy
-            guard X >= 0, Y >= 0, X < n, Y < n else { continue }
+            guard X >= 0, Y >= 0, X < n, Y < rows else { continue }
             let s = (yy * p.w + xx) * 4, d = (Y * n + X) * 4
             let sa = Double(p.px[s + 3]) / 255; guard sa > 0 else { continue }
             let da = Double(dst[d + 3]) / 255, oa = sa + da * (1 - sa)
@@ -13982,6 +14141,29 @@ extension GDDAssetPrompts {
         ] + refs + tail).joined(separator: "\n\n")
     }
 
+    /// The reel frame (bezel) GPT Image 2.5 paints on Navigator's grey moulding of the grid (ReelArea): the
+    /// game's main frame, of a piece with its symbol frames but heavier, a crest at the top centre — no
+    /// logo, which ships as its own piece. Its openings and bands are the template's, exactly.
+    static func bezelBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), hotReel: Bool) -> String {
+        let trim: (String) -> String = { $0.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) }
+        let frame = FrameStyle.spec(design, highPay: true).map(trim) ?? "this set's own premium material, bevelled, with matching ornaments"
+        return [
+            "Edit the attached image: it is the plain grey reel frame of a video slot game themed “\(theme.name)” — a band round the reels\(hotReel ? ", a housing above them for one more row of reels with a bar between," : "") and narrow divider bars between the reels. Repaint it as the game's reel frame, its bezel: the same craft as its symbol frames — \(frame) — but heavier and grander, the frame of the whole game, with corner pieces and a crest at the top centre. Keep exactly the same band widths, the same divider bars and the same openings: its ornament may spread past its outer edge onto the background, never inward. Every opening stays the flat background, with nothing drawn in it.",
+            "Lit from above, with bevel highlights along its top edges. No logo, title, text, lettering, numbers or symbols on it: the logo is a piece of its own.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// The reel texture behind the symbols: opaque, dark, in the theme's own deep colour with a subtle
+    /// pattern and a vignette — the studio's reelTexture (luminance 20–45 of 255).
+    static func reelTextureBrief(theme: GameTheme, design: SetDesign) -> String {
+        [
+            "The reel backing texture of a video slot game themed “\(theme.name)”: the dark panel the spinning symbols sit on. Fill the whole image edge to edge, seen straight on and flat — an opaque, very dark surface in this theme's own deep colour, with a subtle tone-on-tone pattern of its motifs and a soft vignette, darker at the edges. It sits behind bright symbols, so it stays dark, calm and low in contrast.",
+            "No objects, frames, borders, symbols, characters, text or lettering.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+        ].joined(separator: "\n\n")
+    }
+
     /// Frame words without their crest or crown: the clauses (split at commas and "and") that name one.
     static func withoutCrest(_ text: String) -> String {
         let parts = text.components(separatedBy: ", ").flatMap { $0.components(separatedBy: " and ") }
@@ -14369,10 +14551,12 @@ public struct SetManifest: Codable, Equatable {
     public var families: [String: String]
     public var cast: [Cast]
     public var symbols: [Symbol]
+    /// The reels the GDD lays out (ReelLayoutRules), read when it was loaded; nil in sets made before.
+    public var reels: ReelLayout?
 
     init(game: String, gdd: String, theme: GameTheme, design: SetDesign, jobs: [AssetJob],
-                backing: (name: String, rgb: RGB8), model: String) {
-        self.game = game; self.gdd = gdd
+                backing: (name: String, rgb: RGB8), model: String, reels: ReelLayout? = nil) {
+        self.game = game; self.gdd = gdd; self.reels = reels
         themeName = theme.name; themeCategory = theme.category; themeLook = theme.look; themeStyle = theme.styleFromArt
         backingName = backing.name; self.backing = [Int(backing.rgb.r), Int(backing.rgb.g), Int(backing.rgb.b)]
         self.model = model
