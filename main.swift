@@ -21688,7 +21688,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
     app.run()
 }
 
-// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again]
+// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>]
 // The reel area for every grid the GDD gives — bezel, dividers, reel texture, reel fade — the jackpot table and
 // pots above the reels when it has them, and a preview per mode. What is there already is kept, unless --again.
 if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < CommandLine.arguments.count {
@@ -21706,6 +21706,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         print("REELS: base \(base.rows)x\(base.reels)" + layout.extras.map { " + \($0.what) \($0.place)" }.joined()
               + "; \(area.width)x\(area.height) px, cell \(area.cell)")
         for n in layout.notes { print("NOTE: \(n)") }
+        // --redo "Pot States": one piece drawn again, its files kept in versions/ — the window's Make Again.
+        if let i = args.firstIndex(of: "--redo"), i + 1 < args.count, !GDDToAssetsRun.keepForRedo(args[i + 1], folder: folder) {
+            print("FAILED: no piece \(args[i + 1]): " + GDDToAssetsRun.reelPieces.map(\.name).joined(separator: ", ")); exit(1)
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let r = run.generateReelArea(layout, folder: folder, again: args.contains("--again"))
             print(String(format: "DONE: %@\nSPENT: $%.4f", r.problems.isEmpty ? "reel area made" : r.problems.joined(separator: "; "), r.cost))
@@ -25815,18 +25819,23 @@ final class GDDToAssetsRun: ObservableObject {
         ("Pot states", { $0.hasPrefix("shared_interface_pot") && ($0.contains("_filling") || $0.contains("_full")) }),
     ]
 
+    /// A reel piece's files moved into versions/ so the next reel-area run draws it again. False: no such piece.
+    @discardableResult static func keepForRedo(_ piece: String, folder: URL) -> Bool {
+        guard let p = reelPieces.first(where: { $0.name.caseInsensitiveCompare(piece) == .orderedSame }) else { return false }
+        let fm = FileManager.default, f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+        let kept = folder.appendingPathComponent("versions/reel-\(f.string(from: Date()))")
+        for n in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where p.files(n) {
+            try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+            try? fm.moveItem(at: folder.appendingPathComponent(n), to: kept.appendingPathComponent(n))
+        }
+        return true
+    }
+
     /// The window's "Make reel area": the set's reel area made in the background, said in the status.
     /// `redo` names a piece (reelPieces) to make again: its files are kept in versions/ first, never deleted.
     func makeReelArea(redo: String? = nil) {
         guard let folder = lastFolder, let layout = reelLayout else { return }
-        if let redo, let piece = Self.reelPieces.first(where: { $0.name == redo }) {
-            let fm = FileManager.default, f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
-            let kept = folder.appendingPathComponent("versions/reel-\(f.string(from: Date()))")
-            for n in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] where piece.files(n) {
-                try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
-                try? fm.moveItem(at: folder.appendingPathComponent(n), to: kept.appendingPathComponent(n))
-            }
-        }
+        if let redo { Self.keepForRedo(redo, folder: folder) }
         keying = true
         status = "Making the reel area — bezel, dividers, reel texture — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
         DispatchQueue.global(qos: .userInitiated).async {
@@ -25957,6 +25966,7 @@ final class GDDToAssetsRun: ObservableObject {
         if let pots = layout.extras.first(where: { $0.what == "pots" }) {
             let total = pots.count ?? bonus.count
             if total == 0 { problems.append("the GDD has pots above the reels but says neither how many nor ties them to bonus symbols") }
+            let potH = PotStates.height(1024)
             for i in 0..<total where !has("shared_interface_pot\(i + 1).png") {
                 let bo = i < bonus.count ? bonus[i] : nil
                 let symbol = bo.flatMap { try? Data(contentsOf: url("\($0.id).png")) }
@@ -25965,20 +25975,44 @@ final class GDDToAssetsRun: ObservableObject {
                 let prompt = GDDAssetPrompts.potBrief(theme: theme, design: design, backing: (backing.name, b),
                                                       symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total)
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
+                // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
                 if let px = paint("shared_interface_pot\(i + 1)", prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil) {
-                    write(px, 1024, 1024, "shared_interface_pot\(i + 1).png")
-                    write(FrameKit.keyed(px, backing: b), 1024, 1024, "shared_interface_pot\(i + 1)_rmbg.png")
+                    let tall = PotStates.padded(FrameKit.keyed(px, backing: b), size: 1024)
+                    write(FrameKit.onBacking(tall, b), 1024, potH, "shared_interface_pot\(i + 1).png")
+                    write(tall, 1024, potH, "shared_interface_pot\(i + 1)_rmbg.png")
                 }
+            }
+            // A pot drawn before pots had their room is given it, free.
+            for i in 0..<total {
+                guard let p = load("shared_interface_pot\(i + 1)_rmbg.png"), p.w == 1024, p.h == 1024 else { continue }
+                let tall = PotStates.padded(p.px, size: 1024)
+                write(FrameKit.onBacking(tall, b), 1024, potH, "shared_interface_pot\(i + 1).png")
+                write(tall, 1024, potH, "shared_interface_pot\(i + 1)_rmbg.png")
             }
             // Its states as it fills, each an edit of its empty drawing so they swap in place.
             for i in 0..<total {
                 guard let empty = try? Data(contentsOf: url("shared_interface_pot\(i + 1).png")) else { continue }
                 for state in GDDAssetPrompts.potStates where !has("shared_interface_pot\(i + 1)_\(state).png") {
                     let prompt = GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), state: state)
-                    if let px = paint("shared_interface_pot\(i + 1)_\(state)", prompt: prompt, inputs: [empty], w: 1024, h: 1024, covered: nil) {
-                        write(px, 1024, 1024, "shared_interface_pot\(i + 1)_\(state).png")
-                        write(FrameKit.keyed(px, backing: b), 1024, 1024, "shared_interface_pot\(i + 1)_\(state)_rmbg.png")
+                    if let px = paint("shared_interface_pot\(i + 1)_\(state)", prompt: prompt, inputs: [empty], w: 1024, h: potH, covered: nil) {
+                        write(px, 1024, potH, "shared_interface_pot\(i + 1)_\(state).png")
+                        write(FrameKit.keyed(px, backing: b), 1024, potH, "shared_interface_pot\(i + 1)_\(state)_rmbg.png")
                     }
+                }
+                // Each state laid on the empty pot, so a swap in game does not jump (PotStates): free, and a
+                // state already in place is left as it is.
+                for state in GDDAssetPrompts.potStates {
+                    let n = "shared_interface_pot\(i + 1)_\(state)"
+                    guard let s = load("\(n)_rmbg.png"), let e = load("shared_interface_pot\(i + 1)_rmbg.png") else { continue }
+                    guard e.w == s.w, e.h == s.h else {
+                        problems.append("pot \(i + 1)'s \(state) state was drawn before pots had room above them: Make Again ▸ Pot States")
+                        continue
+                    }
+                    let laid = PotStates.registered(s.px, to: e.px, width: s.w, height: s.h)
+                    guard laid != s.px else { continue }
+                    write(FrameKit.onBacking(laid, b), s.w, s.h, "\(n).png")
+                    write(laid, s.w, s.h, "\(n)_rmbg.png")
+                    navLog("gdd reel: \(n) laid on its empty pot")
                 }
             }
             potSheet(count: total, folder: folder)
@@ -26000,7 +26034,8 @@ final class GDDToAssetsRun: ObservableObject {
         ctx.interpolationQuality = .high
         for i in 0..<count { for (j, st) in states.enumerated() {
             guard let img = loadCGImage(folder.appendingPathComponent("shared_interface_pot\(i + 1)\(st)_rmbg.png")) else { continue }
-            ctx.draw(img, in: CGRect(x: j * cell, y: H - (i + 1) * cell, width: cell, height: cell))
+            let w = cell * img.width / max(1, img.height)
+            ctx.draw(img, in: CGRect(x: j * cell + (cell - w) / 2, y: H - (i + 1) * cell, width: w, height: cell))
         } }
         if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_interface_pots-states.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
             CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
@@ -26017,7 +26052,8 @@ final class GDDToAssetsRun: ObservableObject {
             return FrameKit.Piece(px: px, w: cg.width, h: cg.height)
         }
         let table = piece("shared_interface_jackpotTable_rmbg.png"), pots = (1...6).compactMap { piece("shared_interface_pot\($0)_rmbg.png") }
-        let tableH = table.map { $0.h * area.width / max(1, $0.w) } ?? 0, potH = pots.isEmpty ? 0 : area.cell * 13 / 10
+        let potW = area.cell * 13 / 10, potH = pots.map { potW * $0.h / max(1, $0.w) }.max() ?? 0
+        let tableH = table.map { $0.h * area.width / max(1, $0.w) } ?? 0
         let W = area.width, top = tableH + potH, H = area.height + top
         var canvas = [UInt8](repeating: 0, count: W * H * 4)
         for i in stride(from: 3, to: canvas.count, by: 4) { canvas[i] = 255 }
@@ -26044,8 +26080,8 @@ final class GDDToAssetsRun: ObservableObject {
         let tableY = top + area.grid.y - area.band - tableH + tableH / 6
         if let t = table { FrameKit.over(&canvas, width: W, FrameKit.resized(t, W, tableH), at: 0, max(0, tableY)) }
         for (i, p) in pots.enumerated() {
-            let q = FrameKit.resized(p, potH, potH), cx = area.grid.x + area.grid.w * (2 * i + 1) / (2 * pots.count)
-            FrameKit.over(&canvas, width: W, q, at: cx - potH / 2, max(0, tableY - potH + potH / 8))
+            let ph = potW * p.h / max(1, p.w), q = FrameKit.resized(p, potW, ph), cx = area.grid.x + area.grid.w * (2 * i + 1) / (2 * pots.count)
+            FrameKit.over(&canvas, width: W, q, at: cx - potW / 2, max(0, tableY - ph + potW / 8))
         }
         if let img = ChromaKeyOutputRules.image(straightRGBA8: canvas, width: W, height: H, space: space),
            let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("\(name)_reel-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {

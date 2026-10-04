@@ -8500,6 +8500,44 @@ extension ReelArea {
 /// The jackpot table that sits above the reels: a plate as wide as the bezel with one plaque per jackpot,
 /// each its name lettered over an empty value field the game prints the amount in. Laid out in code, like
 /// the bezel, for GPT Image to paint.
+/// A pot's filling and full states laid on its empty pot. GPT Image redraws the whole pot for a state, a few
+/// percent bigger or smaller and shifted (Toyota, 2026-10-04: full pots 8–12% narrower at the foot), so a
+/// state swap in game would jump. The foot is what filling leaves alone: each state is scaled to the empty
+/// pot's foot width and set on its foot's bottom centre. Every pot file has `headroom` clear above the pot,
+/// room for what rises from it when full (square, GPT filled the canvas and the treasure was cut flat).
+public enum PotStates {
+    public static let headroom = 0.25
+    /// The canvas height of a pot `n` wide: 1280 for 1024, a multiple of 16 as GPT Image takes sizes.
+    public static func height(_ n: Int) -> Int { n + Int(headroom * Double(n)) / 16 * 16 }
+    /// A pot drawn square (straight RGBA, `n` a side) stood at the bottom of its taller canvas.
+    public static func padded(_ px: [UInt8], size n: Int) -> [UInt8] {
+        [UInt8](repeating: 0, count: (height(n) - n) * n * 4) + px
+    }
+
+    /// The foot of a cut-out pot (straight RGBA, `w` by `h`): its bottom row, and the centre and width of the
+    /// band just above it. Rows with only a few opaque pixels (strays at the edge) are not the bottom.
+    static func foot(_ keyed: [UInt8], width w: Int, height h: Int) -> (cx: Double, bottom: Int, width: Double)? {
+        func opaque(_ x: Int, _ y: Int) -> Bool { keyed[(y * w + x) * 4 + 3] > 128 }
+        guard let bottom = (0..<h).reversed().first(where: { y in (0..<w).filter { opaque($0, y) }.count >= w / 50 }) else { return nil }
+        let top = max(0, bottom - Int(0.08 * Double(w))), low = max(top + 1, bottom - Int(0.03 * Double(w)))
+        let cols = (0..<w).filter { x in (top..<low).contains { opaque(x, $0) } }
+        guard let a = cols.first, let b = cols.last else { return nil }
+        return (Double(a + b) / 2, bottom, Double(b - a))
+    }
+
+    /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas.
+    public static func registered(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        guard let f = foot(state, width: w, height: h), let e = foot(empty, width: w, height: h), f.width > 0 else { return state }
+        let k = e.width / f.width
+        // Already in place (to a pixel or two of resampling): left alone, so laying again never blurs it.
+        guard abs(k - 1) > 0.01 || abs(f.cx - e.cx) >= 2 || abs(f.bottom - e.bottom) >= 2 else { return state }
+        let scaled = FrameKit.resized(FrameKit.Piece(px: state, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        FrameKit.over(&out, width: w, scaled, at: Int((e.cx - f.cx * k).rounded()), Int((Double(e.bottom) - Double(f.bottom) * k).rounded()))
+        return out
+    }
+}
+
 public struct JackpotTable: Equatable, Sendable {
     public var width: Int, height: Int, plaques: [ReelArea.Rect], fields: [ReelArea.Rect], plate: ReelArea.Rect
     public init(count n: Int, width outer: Int, cell: Int = 512) {
@@ -14314,7 +14352,7 @@ extension GDDAssetPrompts {
             : "beginning to fill with \(contents): a soft glow rises from its mouth and lights it from within, its contents just showing at the rim"
         return [
             "Edit the attached image: it is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”, empty. Show the same pot \(show).",
-            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents and their light change. No text, lettering or numbers.",
+            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents and their light change. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }

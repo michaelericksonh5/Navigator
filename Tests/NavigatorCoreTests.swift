@@ -13243,6 +13243,34 @@ final class ReelLayoutTests: XCTestCase {
 }
 
 final class ReelAreaTests: XCTestCase {
+    /// A pot state GPT drew smaller and shifted is laid back on its empty pot's foot, and laying it again
+    /// changes nothing.
+    func testPotStateIsLaidOnTheEmptyPot() {
+        let n = 200
+        func pot(_ k: Double, _ dx: Int, _ dy: Int) -> [UInt8] {
+            var px = [UInt8](repeating: 0, count: n * n * 4)
+            for y in 0..<n { for x in 0..<n {
+                let u = Double(x - dx - 100) / k + 100, v = Double(y - dy - 195) / k + 195
+                if (80..<120).contains(u) && (180..<195).contains(v) || (60..<140).contains(u) && (100..<180).contains(v) {
+                    px[(y * n + x) * 4 + 3] = 255
+                }
+            } }
+            return px
+        }
+        let empty = pot(1, 0, 0), drawn = pot(0.88, 9, -14)
+        let e = PotStates.foot(empty, width: n, height: n)!, d = PotStates.foot(drawn, width: n, height: n)!
+        XCTAssertGreaterThan(abs(d.width - e.width), 3)
+        let laid = PotStates.registered(drawn, to: empty, width: n, height: n)
+        let l = PotStates.foot(laid, width: n, height: n)!
+        XCTAssertEqual(l.width, e.width, accuracy: 2); XCTAssertEqual(l.cx, e.cx, accuracy: 1.5); XCTAssertEqual(l.bottom, e.bottom, accuracy: 1)
+        XCTAssertEqual(PotStates.registered(laid, to: empty, width: n, height: n), laid)
+        // Pots stand at the bottom of a canvas with room above them.
+        XCTAssertEqual(PotStates.height(1024), 1280)
+        let tall = PotStates.padded(empty, size: n)
+        XCTAssertEqual(tall.count, n * PotStates.height(n) * 4)
+        XCTAssertEqual(PotStates.foot(tall, width: n, height: PotStates.height(n))!.bottom, e.bottom + PotStates.height(n) - n)
+    }
+
     // A 3x5 grid: five openings, four dividers, the band and gaps in the studio's cell ratios, sizes GPT takes.
     func testTheReelAreaIsLaidOutExactlyFromTheGrid() {
         let a = ReelArea(rows: 3, reels: 5, cell: 200)
