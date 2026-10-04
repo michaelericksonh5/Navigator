@@ -8312,7 +8312,7 @@ public enum ReelLayoutRules {
         }
 
         var titled = false, wheels = Set<String>()     // the wheels' own names: "Jackpot Wheel", "Bonus Wheel"
-        var wheelText: [String: String] = [:], lastWheel = "Wheel"   // what is said of each wheel
+        var wheelText: [String: String] = [:], lastWheel = "Wheel", carryWheel: String? = nil   // what is said of each wheel
         // Capitalised: a name, not "the wheel"; "Bonus Game Wheel" is the Bonus Wheel.
         let wheelName = try! NSRegularExpression(pattern: #"\b([A-Z][a-z]+)(?: Game)? Wheel\b"#)
         for raw in gdd.components(separatedBy: .newlines) {
@@ -8320,7 +8320,7 @@ public enum ReelLayoutRules {
             let hashes = trimmed.prefix(while: { $0 == "#" }).count
             let text = String(trimmed.dropFirst(hashes)).trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "*-•")))
             guard !text.isEmpty else { continue }
-            let listItem = trimmed.hasPrefix("-") || trimmed.hasPrefix("*") || trimmed.hasPrefix("•")
+            let listItem = trimmed.hasPrefix("-") || trimmed.hasPrefix("*") || trimmed.hasPrefix("•") || trimmed.hasPrefix("//")
             let heading = hashes > 0 || (!listItem && text.count < 50 && !text.hasSuffix(".") && text.range(of: #"\d\s*[x×]\s*\d"#, options: .regularExpression) == nil)
             if heading {
                 let level = hashes > 0 ? hashes : 9, l = text.lowercased()
@@ -8343,6 +8343,9 @@ public enum ReelLayoutRules {
             }
             titled = true
             guard skipping == nil else { continue }
+            // A wheel's description continued in comment lines under it ("//11=WY1 (standard bonus), 16=WY2
+            // (random wilds)"): still about that wheel.
+            if let w = carryWheel, trimmed.hasPrefix("//") { wheelText[w, default: ""] += " " + text.lowercased() } else { carryWheel = nil }
             // Growing reels said across sentences: "six variable-size reels … Reels 1 and 6 can be anywhere from 3 to 10 tall".
             for w in groups(wordRange, text) {
                 guard let k = number(w.g[1]), let lo = Int(w.g[2]), let hi = Int(w.g[3]), (1...12).contains(k), lo < hi, hi <= 12 else { continue }
@@ -8469,12 +8472,15 @@ public enum ReelLayoutRules {
                 }
                 if lower.range(of: #"\bwheels?\b"#, options: .regularExpression) != nil,
                    lower.range(of: #"super boost wheel spin|remaining_spins"#, options: .regularExpression) == nil {
-                    let named = groups(wheelName, sentence).map(\.g[1]).filter { !["The", "A", "This", "Each", "That", "Second", "First"].contains($0) }
+                    var named = groups(wheelName, sentence).map(\.g[1]).filter { !["The", "A", "This", "Each", "That", "Second", "First"].contains($0) }
+                    // A wheel already named, said in lower case ("the winning bonus wheel wedge").
+                    named += wheels.filter { w in !named.contains(w) && lower.range(of: "\\b\(w.lowercased())( game)? wheel\\b", options: .regularExpression) != nil }.sorted()
                     wheels.formUnion(named)
                     addExtra(ReelLayout.Extra(what: "wheel", rows: nil, reels: nil, place: "", count: max(1, wheels.count)))
                     // A sentence is about the wheels it names, or the last one named.
                     for w in named.isEmpty ? [lastWheel] : named.map({ "\($0) Wheel" }) { wheelText[w, default: ""] += " " + lower }
                     if let l = named.last { lastWheel = "\(l) Wheel" }
+                    carryWheel = named.isEmpty ? lastWheel : "\(named.last!) Wheel"
                 }
             }
         }
@@ -14860,6 +14866,14 @@ extension GDDAssetPrompts {
         return (options[label] ?? [("deep crimson", "red")]).first { !reserved.contains($0.1) }?.0 ?? "rich gold"
     }
 
+    /// A wedge's lettering as the studio sets it: one word stacked down the middle, a longer label's first
+    /// words across the wide outer end above the last word stacked (Founding Fortunes' FREE / GAMES wedge).
+    static func wedgeLettering(_ label: String) -> String {
+        let words = label.split(separator: " ").map(String.init)
+        let stacked = "in bold, dimensional display letters set one above another down the middle of the wedge, reading from the wide outer end toward the point, as large as the wedge allows"
+        guard words.count > 1 else { return "Letter “\(label)” on it \(stacked), spelled exactly so. No other words or numbers." }
+        return "Letter “\(words.dropLast().joined(separator: " "))” in smaller bold letters straight across the wide outer end of the wedge, and below it “\(words.last!)” \(stacked) — together reading “\(label)”, spelled exactly so. No other words or numbers."
+    }
     /// One wedge of a prize wheel, on its grey template (the last image); `matching` when another wedge of the
     /// same wheel is attached first, to match.
     static func wedgeBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), label: String, matching: Bool) -> String {
@@ -14868,7 +14882,7 @@ extension GDDAssetPrompts {
             + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a rich \(wedgeColour(label, backing: backing.name)) face in the theme's own material and craft, a fine trim along its two long sides and its curved outer end.",
             label == "CREDITS"
                 ? "Its face stays plain and unlettered: the game prints the prize amount on it."
-                : "Letter “\(label)” on it in bold, dimensional display letters set one above another down the middle of the wedge, reading from the wide outer end toward the point, as large as the wedge allows and spelled exactly so. No other words or numbers.",
+                : wedgeLettering(label),
             "Keep exactly the wedge's shape: paint nothing outside its outline, and the point stays sharp at the bottom.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),

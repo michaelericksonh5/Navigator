@@ -25923,7 +25923,10 @@ final class GDDToAssetsRun: ObservableObject {
             // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up.
             // Small pieces (a wheel's wedge) asked at a megapixel at least, and scaled back down.
             let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
-            let rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
+            var rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
+            // Rounding to 16 can tip a 3:1 piece past GPT Image's 3:1 limit (1536x512 asked as 1760x576).
+            if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
+            if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
             for attempt in 1...(covered == nil ? 1 : 2) {
                 let r = OpenAIImages.edit(prompt: prompt, images: inputs, size: rw, height: rh)
                 cost += r.cost
@@ -26161,15 +26164,20 @@ final class GDDToAssetsRun: ObservableObject {
         var wedges: [String: [UInt8]] = [:]
         for l in Set(order) { if let p = piece("\(prefix)_interface_wedge-\(PopUps.key(l))_rmbg.png"), p.w == art.wedgeSize.w, p.h == art.wedgeSize.h { wedges[l] = p.px } }
         guard !wedges.isEmpty else { return }
-        let n = WheelArt.frameSize
-        var canvas = [UInt8](repeating: 0, count: n * n * 4)
-        for i in 0..<(n * n) { canvas[i * 4] = 20; canvas[i * 4 + 1] = 18; canvas[i * 4 + 2] = 34; canvas[i * 4 + 3] = 255 }
-        FrameKit.over(&canvas, width: n, FrameKit.Piece(px: art.face(wedges, order: order, size: n), w: n, h: n), at: 0, 0)
-        if let f = piece("wheelSpin_interface_wheelFrame_rmbg.png") { FrameKit.over(&canvas, width: n, FrameKit.resized(f, n, n), at: 0, 0) }
-        if let h = piece("wheelSpin_interface_wheelHub_rmbg.png") { let s = n * 23 / 100; FrameKit.over(&canvas, width: n, FrameKit.resized(h, s, s), at: (n - s) / 2, (n - s) / 2) }
-        if let p = piece("wheelSpin_interface_winIndicator_rmbg.png") { let s = n * 14 / 100; FrameKit.over(&canvas, width: n, FrameKit.resized(p, s, s), at: (n - s) / 2, n * 7 / 100 - s / 3) }
+        // The wheel at frame size, with room above it for the pointer, whose tip reaches just inside the rim.
+        let n = WheelArt.frameSize, top = n / 6, H = n + top
+        var canvas = [UInt8](repeating: 0, count: n * H * 4)
+        for i in 0..<(n * H) { canvas[i * 4] = 20; canvas[i * 4 + 1] = 18; canvas[i * 4 + 2] = 34; canvas[i * 4 + 3] = 255 }
+        FrameKit.over(&canvas, width: n, FrameKit.Piece(px: art.face(wedges, order: order, size: n), w: n, h: n), at: 0, top)
+        if let f = piece("wheelSpin_interface_wheelFrame_rmbg.png") { FrameKit.over(&canvas, width: n, FrameKit.resized(f, n, n), at: 0, top) }
+        if let h = piece("wheelSpin_interface_wheelHub_rmbg.png") { let s = n * 23 / 100; FrameKit.over(&canvas, width: n, FrameKit.resized(h, s, s), at: (n - s) / 2, top + (n - s) / 2) }
+        if let p = piece("wheelSpin_interface_winIndicator_rmbg.png") {
+            // Drawn pointing down with its tip at the picture's bottom centre (wheelPointerBrief).
+            let s = n * 30 / 100, tipY = top + n * 10 / 100
+            FrameKit.over(&canvas, width: n, FrameKit.resized(p, s, s), at: (n - s) / 2, tipY - s * 95 / 100)
+        }
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        if let img = ChromaKeyOutputRules.image(straightRGBA8: canvas, width: n, height: n, space: space),
+        if let img = ChromaKeyOutputRules.image(straightRGBA8: canvas, width: n, height: H, space: space),
            let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("\(prefix)_wheel-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
             CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
             CGImageDestinationFinalize(dest)
@@ -26191,11 +26199,13 @@ final class GDDToAssetsRun: ObservableObject {
         // The assembled example, top: panel, title, bar, button, as a game stacks them.
         let pw = 1100, ph = pw * 3 / 4, px0 = (W - pw) / 2, top = H - 40 - ph
         if let p = img("shared_popUp_background") { ctx.draw(p, in: CGRect(x: px0, y: top, width: pw, height: ph)) }
-        if let t = plan.first(where: { $0.kind == .title }), let i = img(t.name) {
-            let tw = pw * 8 / 10, th = tw * t.h / t.w
-            ctx.draw(i, in: CGRect(x: (W - tw) / 2, y: top + ph * 55 / 100, width: tw, height: th))
+        if let t = plan.first(where: { $0.kind == .title && img($0.name) != nil }), let i = img(t.name) {
+            // Inside the panel's face, above the bar: no wider than 70% of the panel, no taller than a third.
+            let s = min(Double(pw) * 0.7 / Double(t.w), Double(ph) * 0.34 / Double(t.h))
+            let tw = Int(Double(t.w) * s), th = Int(Double(t.h) * s)
+            ctx.draw(i, in: CGRect(x: (W - tw) / 2, y: top + ph * 47 / 100, width: tw, height: th))
         }
-        if let i = img("shared_popUp_valueBar") { let bw = pw * 8 / 10, bh = bw / 3; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 26 / 100, width: bw, height: bh)) }
+        if let i = img("shared_popUp_valueBar") { let bw = pw * 8 / 10, bh = bw / 3; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 19 / 100, width: bw, height: bh)) }
         if let i = img("base_popUp_bonusBtn") { let bw = pw * 4 / 10, bh = bw * 3 / 8; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 4 / 100, width: bw, height: bh)) }
         for (k, t) in titles.enumerated() {
             guard let i = img(t.name) else { continue }
