@@ -25922,12 +25922,42 @@ final class GDDToAssetsRun: ObservableObject {
                     write(FrameKit.keyed(px, backing: b), 1024, 1024, "shared_interface_pot\(i + 1)_rmbg.png")
                 }
             }
+            // Its states as it fills, each an edit of its empty drawing so they swap in place.
+            for i in 0..<total {
+                guard let empty = try? Data(contentsOf: url("shared_interface_pot\(i + 1).png")) else { continue }
+                for state in GDDAssetPrompts.potStates where !has("shared_interface_pot\(i + 1)_\(state).png") {
+                    let prompt = GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), state: state)
+                    if let px = paint("shared_interface_pot\(i + 1)_\(state)", prompt: prompt, inputs: [empty], w: 1024, h: 1024, covered: nil) {
+                        write(px, 1024, 1024, "shared_interface_pot\(i + 1)_\(state).png")
+                        write(FrameKit.keyed(px, backing: b), 1024, 1024, "shared_interface_pot\(i + 1)_\(state)_rmbg.png")
+                    }
+                }
+            }
+            potSheet(count: total, folder: folder)
         }
         // 5. A preview per mode: background, texture, this set's symbols, dividers, bezel; the table and pots above.
         for (name, grid) in modes { reelPreview(name: name, area: ReelArea(layout, grid: grid), jobs: jobs, folder: folder) }
         log.event(["step": "reel area", "cost": cost, "problems": problems, "modes": modes.map { "\($0.name) \($0.grid.rows)x\($0.grid.reels)" }])
         DispatchQueue.main.async { self.spent += cost }
         return (cost, problems)
+    }
+
+    /// `shared_interface_pots-states.jpg`: each pot's states side by side — empty, filling, full — to review.
+    func potSheet(count: Int, folder: URL) {
+        let cell = 360, states = [""] + GDDAssetPrompts.potStates.map { "_\($0)" }
+        let W = states.count * cell, H = count * cell
+        guard count > 0, let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        ctx.setFillColor(CGColor(red: 0.08, green: 0.07, blue: 0.13, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.interpolationQuality = .high
+        for i in 0..<count { for (j, st) in states.enumerated() {
+            guard let img = loadCGImage(folder.appendingPathComponent("shared_interface_pot\(i + 1)\(st)_rmbg.png")) else { continue }
+            ctx.draw(img, in: CGRect(x: j * cell, y: H - (i + 1) * cell, width: cell, height: cell))
+        } }
+        if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_interface_pots-states.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
     }
 
     /// `<mode>_reel-preview.jpg`: the mode's layers composed over the base background with this set's own

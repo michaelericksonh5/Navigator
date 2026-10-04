@@ -13285,6 +13285,19 @@ final class ReelAreaTests: XCTestCase {
             XCTAssertGreaterThan(alpha(rb, x, y), 200, "band at \(x),\(y)")
         }
         for d in bonus.dividers { XCTAssertGreaterThan(alpha(rd, d.x + d.w / 2, d.y + d.h / 2), 200) }
+        // No step where a stretch meets the crest: a bezel whose band rises toward its middle (as the art's
+        // sweeps up to the crest) re-laid wider keeps the band's top edge continuous across that join.
+        var rising = bz
+        for x in 0..<base.width { for y in 0..<base.height {
+            let o = base.outer, i = (y * base.width + x) * 4
+            let lift = max(0, 30 - abs(x - (o.x + o.w / 2)) / 8)                      // up to 30px higher at the middle
+            if y < o.y + base.band && y >= o.y - lift && x > o.x + 60 && x < o.x + o.w - 60 { rising[i + 3] = 255; rising[i] = 200 }
+        } }
+        let wide = ReelArea(rows: 3, reels: 6, cell: 200)
+        let (rw, _) = ReelArea.relay(bezel: rising, dividers: dv, from: base, to: wide)
+        func topEdge(_ x: Int) -> Int { (0..<wide.height).first { rw[($0 * wide.width + x) * 4 + 3] > 128 } ?? -1 }
+        let cw = min(Int(1.3 * 200.0), base.outer.w / 3), join = wide.outer.x + (wide.outer.w - cw) / 2
+        XCTAssertLessThanOrEqual(abs(topEdge(join - 2) - topEdge(join + 2)), 3, "a step at the crest's join")
     }
 
     // The jackpot table: one plaque per jackpot, each with an empty value field, inside the plate.

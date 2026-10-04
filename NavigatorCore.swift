@@ -8425,63 +8425,70 @@ extension ReelArea {
     var outer: Rect { Rect(x: grid.x - band, y: grid.y - band, w: grid.w + 2 * band, h: grid.h + 2 * band) }
 
     /// The base game's bezel and dividers re-laid round another grid of the same game, in code, as the
-    /// studio re-lays one bezel's material for a new grid (Golden Knight's: corners, one edge tile per reel,
-    /// side posts, a centred crest). Each corner, the centre piece of each edge (the crest on top) and a
-    /// plain run of each edge are cut from the base; the runs are repeated, mirrored, to the new lengths;
-    /// the dividers are a run of a base divider. Exact by construction, and free: GPT's own re-lay of a
-    /// 3x4 grid shifted its rows into 16% of the openings (Chevy-Hot, 2026-10-04). Straight RGBA in and out.
+    /// studio re-lays one bezel's material for a new grid (Golden Knight's: corners, edge runs, side posts,
+    /// a centred crest). Each edge is cut into its corners, its centre piece (the crest on top) and the two
+    /// stretches between; a stretch is lengthened by repeating it mirrored an odd number of times and fitting
+    /// that to the new length, so each end still meets the piece it met in the base — the band sweeps up to
+    /// the crest, and a run cut from near the corners met it a step lower (Chevy-Hot, 2026-10-04). Dividers
+    /// are a run of a base divider. Exact by construction, and free: GPT's own re-lay of a 3x4 grid shifted its
+    /// rows into 16% of the openings. Straight RGBA in and out.
     static func relay(bezel: [UInt8], dividers: [UInt8], from a: ReelArea, to b: ReelArea) -> (bezel: [UInt8], dividers: [UInt8]) {
         let W = b.width, H = b.height, ao = a.outer, bo = b.outer
         var out = [UInt8](repeating: 0, count: W * H * 4), div = out
         let k = a.band + Int(0.35 * Double(a.cell))                       // a corner reaches this far along each edge
         let mx = ao.x, my = ao.y, mr = a.width - (ao.x + ao.w), mb = a.height - (ao.y + ao.h)
-        func crop(_ x: Int, _ y: Int, _ w: Int, _ h: Int) -> FrameKit.Piece { FrameKit.crop(bezel, width: a.width, max(0, x), max(0, y), max(1, w), max(1, h)) }
+        let topH = my + k, botH = mb + k, leftW = mx + k, rightW = mr + k
+        func crop(_ src: [UInt8], _ x: Int, _ y: Int, _ w: Int, _ h: Int) -> FrameKit.Piece { FrameKit.crop(src, width: a.width, max(0, x), max(0, y), max(1, w), max(1, h)) }
         func paste(_ p: FrameKit.Piece, _ x: Int, _ y: Int, into dst: inout [UInt8]) { FrameKit.over(&dst, width: W, p, at: x, y) }
-        /// A run along an edge: the plain piece repeated, every other copy mirrored, cut to `length`.
-        func run(_ p: FrameKit.Piece, length: Int, horizontal: Bool) -> FrameKit.Piece {
-            var parts: [FrameKit.Piece] = [], n = 0, i = 0
-            let step = horizontal ? p.w : p.h
-            while n < length { parts.append(i % 2 == 0 ? p : FrameKit.flipped(p, x: horizontal, y: !horizontal)); n += step; i += 1 }
-            let w = horizontal ? length : p.w, h = horizontal ? p.h : length
-            var px = [UInt8](repeating: 0, count: max(1, w * h) * 4)
-            for (j, q) in parts.enumerated() {
+        /// `p` lengthened (or shortened) to `length` along its edge: repeated mirrored an odd number of times,
+        /// so it starts and ends as it did, then fitted to the length.
+        func span(_ p: FrameKit.Piece, _ length: Int, horizontal: Bool) -> FrameKit.Piece {
+            guard length > 0 else { return FrameKit.Piece(px: [0, 0, 0, 0], w: 1, h: 1) }
+            let unit = horizontal ? p.w : p.h
+            var n = max(1, Int((Double(length) / Double(max(1, unit))).rounded())); if n % 2 == 0 { n += 1 }
+            let w = horizontal ? unit * n : p.w, h = horizontal ? p.h : unit * n
+            var px = [UInt8](repeating: 0, count: w * h * 4)
+            for j in 0..<n {
+                let q = j % 2 == 0 ? p : FrameKit.flipped(p, x: horizontal, y: !horizontal)
                 for yy in 0..<q.h { for xx in 0..<q.w {
-                    let X = horizontal ? j * step + xx : xx, Y = horizontal ? yy : j * step + yy
-                    guard X < w, Y < h else { continue }
+                    let X = horizontal ? j * unit + xx : xx, Y = horizontal ? yy : j * unit + yy
                     for c in 0..<4 { px[(Y * w + X) * 4 + c] = q.px[(yy * q.w + xx) * 4 + c] }
                 } }
             }
-            return FrameKit.Piece(px: px, w: w, h: h)
+            return FrameKit.resized(FrameKit.Piece(px: px, w: w, h: h), horizontal ? length : w, horizontal ? h : length)
         }
-        // Edges: top and bottom across, left and right down, each a plain run with its centre piece on top.
-        let topH = my + k, botH = mb + k, leftW = mx + k, rightW = mr + k
-        let centreW = min(Int(1.3 * Double(a.cell)), ao.w / 3), centreH = min(Int(0.9 * Double(a.cell)), ao.h / 3)
-        let plainW = max(16, (ao.w - 2 * k - centreW) / 2 - 8), plainH = max(16, min(a.cell / 2, (ao.h - 2 * k - centreH) / 2 - 8))
-        let runs: [(FrameKit.Piece, Int, Int, Int, Bool)] = [
-            (crop(ao.x + k, 0, plainW, topH), bo.x + k, bo.y - my, bo.w - 2 * k, true),
-            (crop(ao.x + k, ao.y + ao.h - k, plainW, botH), bo.x + k, bo.y + bo.h - k, bo.w - 2 * k, true),
-            (crop(0, ao.y + ao.h - k - plainH, leftW, plainH), bo.x - mx, bo.y + k, bo.h - 2 * k, false),
-            (crop(ao.x + ao.w - k, ao.y + ao.h - k - plainH, rightW, plainH), bo.x + bo.w - k, bo.y + k, bo.h - 2 * k, false),
-        ]
-        for (p, x, y, len, h) in runs where len > 0 { paste(run(p, length: len, horizontal: h), x, y, into: &out) }
-        // Centre pieces: the crest over the top, the bottom's, and each side's middle.
-        paste(crop(ao.x + (ao.w - centreW) / 2, 0, centreW, topH), bo.x + (bo.w - centreW) / 2, bo.y - my, into: &out)
-        paste(crop(ao.x + (ao.w - centreW) / 2, ao.y + ao.h - k, centreW, botH), bo.x + (bo.w - centreW) / 2, bo.y + bo.h - k, into: &out)
+        // Top and bottom: corner | stretch | centre piece | stretch | corner, the centre at the middle of the edge.
+        let cw = min(Int(1.3 * Double(a.cell)), ao.w / 3)
+        let aL = ao.x + k, aC = ao.x + (ao.w - cw) / 2, aR = ao.x + ao.w - k
+        let bL = bo.x + k, bC = bo.x + (bo.w - cw) / 2, bR = bo.x + bo.w - k
+        for (y0, h, ny) in [(0, topH, bo.y - my), (ao.y + ao.h - k, botH, bo.y + bo.h - k)] {
+            paste(span(crop(bezel, aL, y0, aC - aL, h), bC - bL, horizontal: true), bL, ny, into: &out)
+            paste(span(crop(bezel, aC + cw, y0, aR - aC - cw, h), bR - bC - cw, horizontal: true), bC + cw, ny, into: &out)
+            paste(crop(bezel, aC, y0, cw, h), bC, ny, into: &out)
+        }
+        // Sides: corner | stretch | post | stretch | corner. Both stretches come from below the post: above it a
+        // base with a hot reel has the bar joining its side, which a grid without one must not carry.
+        let ch = min(Int(0.9 * Double(a.cell)), ao.h / 3)
         let sideY = a.windows.last.map { $0.y + $0.h / 2 } ?? (ao.y + ao.h / 2)
-        paste(crop(0, sideY - centreH / 2, leftW, centreH), bo.x - mx, bo.y + bo.h / 2 - centreH / 2, into: &out)
-        paste(crop(ao.x + ao.w - k, sideY - centreH / 2, rightW, centreH), bo.x + bo.w - k, bo.y + bo.h / 2 - centreH / 2, into: &out)
-        // Corners last, over the runs.
-        paste(crop(0, 0, leftW, topH), bo.x - mx, bo.y - my, into: &out)
-        paste(crop(ao.x + ao.w - k, 0, rightW, topH), bo.x + bo.w - k, bo.y - my, into: &out)
-        paste(crop(0, ao.y + ao.h - k, leftW, botH), bo.x - mx, bo.y + bo.h - k, into: &out)
-        paste(crop(ao.x + ao.w - k, ao.y + ao.h - k, rightW, botH), bo.x + bo.w - k, bo.y + bo.h - k, into: &out)
-        // Dividers: a run of the base's last divider, the length of each new one; across, the same turned.
+        let aP = sideY - ch / 2, aB = ao.y + ao.h - k
+        let bT = bo.y + k, bP = bo.y + (bo.h - ch) / 2, bB = bo.y + bo.h - k
+        for (x0, w, nx) in [(0, leftW, bo.x - mx), (ao.x + ao.w - k, rightW, bo.x + bo.w - k)] {
+            let lower = crop(bezel, x0, aP + ch, w, aB - aP - ch)
+            paste(span(FrameKit.flipped(lower, x: false, y: true), bP - bT, horizontal: false), nx, bT, into: &out)
+            paste(span(lower, bB - bP - ch, horizontal: false), nx, bP + ch, into: &out)
+            paste(crop(bezel, x0, aP, w, ch), nx, bP, into: &out)
+        }
+        // Corners.
+        paste(crop(bezel, 0, 0, leftW, topH), bo.x - mx, bo.y - my, into: &out)
+        paste(crop(bezel, ao.x + ao.w - k, 0, rightW, topH), bo.x + bo.w - k, bo.y - my, into: &out)
+        paste(crop(bezel, 0, ao.y + ao.h - k, leftW, botH), bo.x - mx, bo.y + bo.h - k, into: &out)
+        paste(crop(bezel, ao.x + ao.w - k, ao.y + ao.h - k, rightW, botH), bo.x + bo.w - k, bo.y + bo.h - k, into: &out)
+        // Dividers: a stretch of the base's last divider, the length of each new one; across, the same turned.
         if let d = a.dividers.last(where: { $0.h > $0.w }) {
-            let seg = FrameKit.crop(dividers, width: a.width, d.x, d.y + d.h / 4, d.w, max(16, d.h / 2))
+            let seg = crop(dividers, d.x, d.y + d.h / 4, d.w, max(16, d.h / 2))
             for nd in b.dividers {
                 let across = nd.w > nd.h
-                let r = run(across ? FrameKit.turned(seg, degrees: 90) : seg, length: across ? nd.w : nd.h, horizontal: across)
-                paste(r, nd.x, nd.y, into: &div)
+                paste(span(across ? FrameKit.turned(seg, degrees: 90) : seg, across ? nd.w : nd.h, horizontal: across), nd.x, nd.y, into: &div)
             }
         }
         // Nothing of either in the openings.
@@ -14296,6 +14303,22 @@ extension GDDAssetPrompts {
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
+    /// A pot's states as it fills with the bonus symbols that fly up to it: an edit of its empty drawing, so the
+    /// vessel stays the same and the states swap in place. "filling": its contents glow up from its mouth;
+    /// "full": they overflow its rim.
+    static let potStates = ["filling", "full"]
+    static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), state: String) -> String {
+        let contents = "what it collects in this game — glowing energy and gems in the pot's own colour, as this theme would have them"
+        let show = state == "full"
+            ? "filled to the brim and overflowing with \(contents): they rise above its mouth and spill a little over the rim, glowing brightly, with sparkles"
+            : "beginning to fill with \(contents): a soft glow rises from its mouth and lights it from within, its contents just showing at the rim"
+        return [
+            "Edit the attached image: it is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”, empty. Show the same pot \(show).",
+            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents and their light change. No text, lettering or numbers.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+
     /// The reel texture behind the symbols: opaque, dark, in the theme's own deep colour with a subtle
     /// pattern and a vignette — the studio's reelTexture (luminance 20–45 of 255).
     static func reelTextureBrief(theme: GameTheme, design: SetDesign) -> String {
