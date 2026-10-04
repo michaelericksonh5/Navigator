@@ -8193,6 +8193,10 @@ public struct ReelLayout: Equatable, Codable, Sendable {
     public var wheels: [Wheel]? = nil
     /// Award events the document has beyond the usual ones: "one more chance".
     public var awards: [String]? = nil
+    /// What each pot unlocks, in order, as its plaque words ("EXPAND", "MULTI", "JACKPOTS OR WILDS"), when
+    /// the document lists them ("the pots each unlock a feature …: a bigger matrix, …"); "" for one it
+    /// names in words no plaque word fits.
+    public var potFeatures: [String]? = nil
     /// The base game's grid, the one the bezel is built round.
     public var base: Grid? { grids.first { $0.mode == "base" } ?? grids.first }
     /// Every grid with the name its files take, as the studio names them: base first (the grid the bezel is
@@ -8504,6 +8508,7 @@ public enum ReelLayoutRules {
                 .map { WheelRules.wheel(named: $0, text: wheelText[$0]!) }
         }
         if gdd.lowercased().contains("one more chance") { out.awards = ["one more chance"] }
+        if let pots = out.extras.first(where: { $0.what == "pots" }), (pots.count ?? 0) > 1 { out.potFeatures = PotStates.features(gdd, count: pots.count!) }
         return out
     }
 }
@@ -8751,6 +8756,32 @@ public enum PotStates {
     /// and unlit, then five fill states — a lid opening further each time, the game's treasure rising until it
     /// overflows at State5, the glow growing. The pot itself never moves. A burst and reset are the rig's own.
     public static let levels = 5
+    /// What each of `count` pots unlocks, from a sentence that lists them after a colon, as plaque words —
+    /// the short words the studio letters on them (Toyota's mock-up: EXPAND / MULTI / JACKPOTS OR WILDS).
+    public static func features(_ gdd: String, count: Int) -> [String]? {
+        for line in gdd.components(separatedBy: .newlines) {
+            let l = line.lowercased()
+            guard l.range(of: #"\bpots?\b"#, options: .regularExpression) != nil, let colon = l.firstIndex(of: ":") else { continue }
+            let list = l[l.index(after: colon)...].components(separatedBy: ".").first ?? ""
+            let items = list.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            guard items.count == count else { continue }
+            return items.map { i in
+                let wild = i.range(of: #"\bwild|\bwdwy|\bwd\d"#, options: .regularExpression) != nil, jackpot = i.contains("jackpot")
+                if wild && jackpot { return "JACKPOTS OR WILDS" }
+                if jackpot { return "JACKPOTS" }
+                if wild { return "WILDS" }
+                if i.contains("multiplier") { return "MULTI" }
+                if i.contains("respin") { return "RESPINS" }
+                if i.contains("collect") { return "COLLECT" }
+                if i.range(of: #"matrix|expand|grow|extra (row|reel)"#, options: .regularExpression) != nil { return "EXPAND" }
+                if i.range(of: #"bonus game|free (games|spins)"#, options: .regularExpression) != nil { return "BONUS GAMES" }
+                return ""
+            }
+        }
+        return nil
+    }
+    /// A pot's plaque, beneath it, when a game has several: `shared_avatar_jar2-plaque`.
+    public static func plaqueName(pot i: Int) -> String { "shared_avatar_jar\(i + 1)-plaque" }
     /// A pot state's file name, the rig's: `shared_avatar_jar-State3Idle`, numbered when a game has several pots.
     public static func name(pot i: Int, of total: Int, state k: Int) -> String {
         "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-State\(k)Idle"
@@ -14953,6 +14984,17 @@ extension GDDAssetPrompts {
         ].joined(separator: "\n\n")
     }
 
+    /// The plaque beneath a pot (on its grey template, the last image; the pot attached first), lettered with
+    /// what the pot unlocks, or plain when the game does not say.
+    static func potPlaqueBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), word: String) -> String {
+        [
+            "Image 1 is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is the small plaque that sits beneath that pot. Paint it in the pot's own colour and material, a raised plate with fine trim.",
+            word.isEmpty ? "Its face stays plain and empty. No text or numbers." : "Letter “\(word)” across it in bold, clear display letters, spelled exactly so, as large as the plaque allows. No other text.",
+            "It keeps exactly its size and outline.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
@@ -14961,7 +15003,7 @@ extension GDDAssetPrompts {
                     "heaped high and overflowing, a few pieces spilling over the rim"][k]
         let glow = ["", "a faint", "a soft", "a warm", "a bright", "a radiant"][k]
         return [
-            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty and unlit. Show the same pot at stage \(k) of 5 as it fills: inside it, \(heap) of what it collects in this game — the theme's own treasure (coins, gems or gold as this theme would have them) in the pot's own colours; \(glow) glow from within. Only if the attached pot is shown with a closed lid or door: that lid or door \(lid), still attached to it.",
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty and unlit. Show the same pot at stage \(k) of 5 as it fills: inside it, \(heap) of what it collects in this game — the theme's own treasure (coins, gems or gold as this theme would have them) in the pot's own colours; \(glow) glow from within, in the pot's own colour — never the background's. Only if the attached pot is shown with a closed lid or door: that lid or door \(lid), still attached to it.",
             "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents, their light and any lid it already has change. Never add a lid, cover, cap or door it does not have in the attached image: an open mouth stays an open mouth, the treasure rising out of it. A calm, still pose: no burst, rays, explosion or flying pieces. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
             backdropLine(backing),
         ].joined(separator: "\n\n")

@@ -13257,6 +13257,10 @@ final class ReelLayoutTests: XCTestCase {
     // A headline is the base game's; a grid that grows is one grid; "independent jackpot reel" is not independent reels.
     func testAGrowingBonusIsOneGridAndPotsAreCounted() {
         let r = ReelLayoutRules.read(Self.toyota)
+        // Each pot's plaque word, from the list of what the pots unlock.
+        XCTAssertEqual(PotStates.features("The pots each unlock a feature in the bonus game: a bigger matrix, a multiplier on every win, and new wilds or a jackpot reel.", count: 3),
+                       ["EXPAND", "MULTI", "JACKPOTS OR WILDS"])
+        XCTAssertNil(PotStates.features("The pots fill up.", count: 3))
         XCTAssertEqual(grids(Self.toyota), ["base 3x5", "bonus 3→5x5"])
         XCTAssertEqual(r.extras.first { $0.what == "pots" }.map { "\($0.count ?? 0) \($0.place)" }, "3 above")
         XCTAssertEqual(r.extras.first { $0.what == "jackpot table" }?.place, "above")

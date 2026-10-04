@@ -25854,6 +25854,7 @@ final class GDDToAssetsRun: ObservableObject {
         ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") }),
         ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
+        ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
         ("Pop-ups", { $0.contains("_popUp_") || $0.hasPrefix("shared_popUps") || $0.hasPrefix("transition_outro_") || $0.hasPrefix("shared_celebration_message")
             || $0.hasPrefix("base_banner_event-") || $0.hasPrefix("wheelSpin_banner") }),
@@ -26085,6 +26086,19 @@ final class GDDToAssetsRun: ObservableObject {
                     navLog("gdd reel: \(n) laid on State0")
                 }
             }
+            // Several pots: a plaque under each, lettered with what it unlocks when the GDD lists it (PotStates.features).
+            if total > 1 {
+                let plaque = PopUps.Piece(name: "", kind: .button, text: "", w: 1024, h: 384)
+                for i in 0..<total where !has("\(PotStates.plaqueName(pot: i)).png") {
+                    let word = (layout.potFeatures ?? []).indices.contains(i) ? layout.potFeatures![i] : ""
+                    guard let pot = try? Data(contentsOf: url("\(jar(i, 0)).png")), let tpl = png(PopUps.template(plaque, backing: b), plaque.w, plaque.h) else { continue }
+                    if let px = paint(PotStates.plaqueName(pot: i), prompt: GDDAssetPrompts.potPlaqueBrief(theme: theme, design: design, backing: (backing.name, b), word: word),
+                                      inputs: [downsamplePNG(pot, longEdge: 1024) ?? pot, tpl], w: plaque.w, h: plaque.h, covered: nil) {
+                        write(px, plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i)).png")
+                        write(FrameKit.keyed(px, backing: b), plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i))_rmbg.png")
+                    }
+                }
+            }
             potSheet(count: total, folder: folder)
         }
         let names = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
@@ -26235,7 +26249,7 @@ final class GDDToAssetsRun: ObservableObject {
     /// `shared_avatar_jars-preview.jpg`: each pot's states side by side, State0 to State5 — to review.
     func potSheet(count: Int, folder: URL) {
         let cell = 300, states = 0...PotStates.levels
-        let W = states.count * cell, H = count * cell
+        let W = (states.count + (count > 1 ? 1 : 0)) * cell, H = count * cell
         guard count > 0, let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
         ctx.setFillColor(CGColor(red: 0.08, green: 0.07, blue: 0.13, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
@@ -26245,6 +26259,12 @@ final class GDDToAssetsRun: ObservableObject {
             let w = cell * img.width / max(1, img.height)
             ctx.draw(img, in: CGRect(x: k * cell + (cell - w) / 2, y: H - (i + 1) * cell, width: w, height: cell))
         } }
+        // The plaques, last, each beside its pot.
+        for i in 0..<count {
+            guard count > 1, let img = loadCGImage(folder.appendingPathComponent("\(PotStates.plaqueName(pot: i))_rmbg.png")) else { continue }
+            let h = (cell - 20) * img.height / max(1, img.width)
+            ctx.draw(img, in: CGRect(x: states.count * cell + 10, y: H - (i + 1) * cell + (cell - h) / 2, width: cell - 20, height: h))
+        }
         try? FileManager.default.removeItem(at: folder.appendingPathComponent("shared_interface_pots-states.jpg"))     // the two-state sheet it replaces
         if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_avatar_jars-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
             CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
