@@ -13312,6 +13312,50 @@ final class ReelLayoutTests: XCTestCase {
     }
 }
 
+final class ConceptAndChecklistTests: XCTestCase {
+    // A planned piece is made drawable: a studio name, a known shape, a size GPT takes, never "free".
+    func testAConceptPieceIsNormalised() {
+        let p = ConceptPiece(name: "freeSpinsCounter", what: "Counts the free spins left", look: "A gold frame", shape: "Meter",
+                             width: 3000, height: 300, lettering: "free spins", states: ["lit", "", "a", "b", "c", "d", "e"], source: "").normalised()
+        XCTAssertEqual(p.name, "base_interface_bonusGamesCounter")
+        XCTAssertEqual(p.shape, "free"); XCTAssertEqual(p.lettering, "BONUS GAMES"); XCTAssertEqual(p.what, "Counts the bonus games left")
+        XCTAssertLessThanOrEqual(p.width, 2048); XCTAssertLessThanOrEqual(Double(p.width) / Double(p.height), 3)
+        XCTAssertEqual(p.width % 16, 0); XCTAssertEqual(p.height % 16, 0)
+        XCTAssertEqual(p.states.count, 5); XCTAssertEqual(p.stateName("lit"), "base_interface_bonusGamesCounter-lit")
+    }
+    // Gemini's reply: pieces kept once, none the tool already makes.
+    func testTheConceptPlanIsParsed() {
+        let reply = """
+        {"pieces": [
+          {"name": "base_interface_multiplierMeter", "what": "Three multiplier meters above the reels.", "look": "Brass tubes.", "shape": "bar", "width": 1536, "height": 512, "lettering": "", "states": ["lit"], "source": "3 meters above it"},
+          {"name": "base_interface_multiplierMeter", "what": "again", "look": "", "shape": "bar", "width": 10, "height": 10, "lettering": "", "states": [], "source": ""},
+          {"name": "shared_interface_jackpotTable", "what": "covered", "look": "", "shape": "panel", "width": 1024, "height": 512, "lettering": "", "states": [], "source": ""}
+        ]}
+        """
+        let p = ConceptPlan.parse(reply, covered: ["shared_interface_jackpotTable"])
+        XCTAssertEqual(p.map(\.name), ["base_interface_multiplierMeter"])
+        XCTAssertEqual(p.first?.states, ["lit"])
+        XCTAssertTrue(ConceptPlan.prompt(gdd: "x", game: "G", covered: ["a"]).contains("Never the word \"free\""))
+    }
+    // The checklist: everything the game needs, made by what, and what nothing makes yet said.
+    func testTheChecklistCoversTheGame() {
+        let symbols = GDDSymbolSetRules.parseManual("WD, HP1-4, LP1-5, BO1-3, JP1-4").symbols
+        let jobs = AssetPlanRules.symbolJobs(symbols) + AssetPlanRules.backgroundJobs(gddText: "base game and bonus games")
+        var layout = ReelLayoutRules.read(ReelLayoutTests.toyota)
+        layout.extras.append(ReelLayout.Extra(what: "meters", rows: nil, reels: nil, place: "above", count: 3))
+        let items = AssetChecklist.items(jobs: jobs, layout: layout, jackpots: ["GRAND", "MAJOR", "MINOR", "MINI"], hasBonus: true)
+        let groups = Set(items.map(\.group))
+        XCTAssertTrue(groups.isSuperset(of: ["Symbols", "Backgrounds", "Reel area", "Jackpots", "Pots", "Pop-ups"]))
+        XCTAssertEqual(items.filter { $0.group == "Pots" }.count, 3 + 3)                 // three pots and their plaques
+        XCTAssertTrue(items.contains { $0.name == "meters" && !$0.supported })            // read, nothing makes it yet: said
+        layout.concepts = [ConceptPiece(name: "base_interface_meter", what: "a meter", look: "", shape: "bar", width: 1536, height: 512, lettering: "", states: ["lit"], source: "")]
+        let with = AssetChecklist.items(jobs: jobs, layout: layout, jackpots: [], hasBonus: true)
+        XCTAssertFalse(with.contains { !$0.supported })
+        XCTAssertEqual(with.first { $0.name == "base_interface_meter" }?.files, ["base_interface_meter.png", "base_interface_meter-lit.png"])
+        XCTAssertEqual(AssetChecklist.gpt(1024, 1024), 0.06, accuracy: 1e-9)
+    }
+}
+
 final class GameSheetTests: XCTestCase {
     let symbols = GDDSymbolSetRules.parseManual("WD, HP1-4, MP1-4, LP1-5, SC, BO1-3, JP1-4").symbols
 

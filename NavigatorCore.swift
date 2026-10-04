@@ -8193,6 +8193,9 @@ public struct ReelLayout: Equatable, Codable, Sendable {
     public var wheels: [Wheel]? = nil
     /// Award events the document has beyond the usual ones: "one more chance".
     public var awards: [String]? = nil
+    /// The pieces Gemini found the game needs that no dedicated generator makes (ConceptPlan): meters,
+    /// collection areas, glass covers, counters, …, drawn by the generic generator.
+    public var concepts: [ConceptPiece]? = nil
     /// What each pot unlocks, in order, as its plaque words ("EXPAND", "MULTI", "JACKPOTS OR WILDS"), when
     /// the document lists them ("the pots each unlock a feature …: a bigger matrix, …"); "" for one it
     /// names in words no plaque word fits.
@@ -8821,6 +8824,223 @@ public enum PotStates {
     }
 }
 
+/// A piece of a game's static art that no dedicated generator makes, as Gemini plans it from the GDD
+/// (ConceptPlan): what it is and looks like, its shape, size, lettering and states. Drawn by the generic
+/// generator the way the dedicated ones are — a grey template by shape, painted in the set's material by
+/// GPT Image, each state an edit of the first. Code keeps what must be exact (the bezel, a wheel's wedges);
+/// this covers the rest — meters, collection areas, glass covers, counters, sell screens — and whatever a
+/// new GDD invents.
+public struct ConceptPiece: Codable, Equatable, Sendable {
+    public var name: String          // the studio's file name: "base_interface_multiplierMeter"
+    public var what: String          // what it is in the game, from the GDD
+    public var look: String          // how it should look
+    public var shape: String         // panel | bar | button | plaque | ring | disc | lettering | free
+    public var width: Int, height: Int
+    public var lettering: String     // words lettered into it ("" for none) — never an amount the engine prints
+    public var states: [String]      // its states after the first, as the GDD has them ("lit", "full"); [] for one image
+    public var source: String        // the GDD's own words it comes from
+    public var standard = false      // the studio's own convention (a logo, a sell screen), not read off the GDD
+
+    public static let shapes = ["panel", "bar", "button", "plaque", "ring", "disc", "lettering", "free"]
+
+    /// A piece as code will draw it: a studio name, a known shape, a size GPT Image takes (multiples of 16,
+    /// no longer than 3:1, at most 2048 a side), at most five states, and never "free" in a name or a word.
+    public func normalised() -> ConceptPiece {
+        var p = self
+        func noFree(_ t: String) -> String {
+            t.replacingOccurrences(of: #"(?i)\bfree (games|spins)\b"#, with: "bonus games", options: .regularExpression)
+             .replacingOccurrences(of: #"(?i)\bfree\b"#, with: "bonus", options: .regularExpression)
+        }
+        let words = name.replacingOccurrences(of: #"(?i)free(games|spins)?"#, with: "bonusGames", options: .regularExpression)
+            .split { !$0.isLetter && !$0.isNumber && $0 != "_" && $0 != "-" }.joined()
+        p.name = words.isEmpty ? "base_interface_piece" : String(words.prefix(80))
+        if !p.name.contains("_") { p.name = "base_interface_" + p.name }
+        p.what = noFree(what); p.look = noFree(look); p.lettering = noFree(lettering).uppercased(); p.source = source
+        p.shape = Self.shapes.contains(shape.lowercased()) ? shape.lowercased() : "free"
+        var w = max(64, min(2048, width)), h = max(64, min(2048, height))
+        if w > 3 * h { h = (w + 2) / 3 } else if h > 3 * w { w = (h + 2) / 3 }
+        p.width = (w + 15) / 16 * 16; p.height = (h + 15) / 16 * 16
+        if p.width > 3 * p.height { p.height = (p.width / 3 + 15) / 16 * 16 }
+        if p.height > 3 * p.width { p.width = (p.height / 3 + 15) / 16 * 16 }
+        p.states = Array(states.map { noFree($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.prefix(5))
+        return p
+    }
+    /// A state's file name: `<name>-<state>` in camel case ("base_interface_glass-shattered").
+    public func stateName(_ state: String) -> String { "\(name)-\(PopUps.key(state))" }
+
+    /// Its grey template on the backing, by shape; nil for lettering and free shapes, drawn on a plain canvas.
+    static func template(_ p: ConceptPiece, backing b: RGB8) -> [UInt8]? {
+        switch p.shape {
+        case "panel": return PopUps.template(PopUps.Piece(name: "", kind: .panel, text: "", w: p.width, h: p.height), backing: b)
+        case "bar": return PopUps.template(PopUps.Piece(name: "", kind: .bar, text: "", w: p.width, h: p.height), backing: b)
+        case "button", "plaque": return PopUps.template(PopUps.Piece(name: "", kind: .button, text: "", w: p.width, h: p.height), backing: b)
+        case "ring", "disc":
+            // A ring or disc as wide as the piece's shorter side, centred.
+            let n = min(p.width, p.height)
+            let sq = p.shape == "disc" ? WheelArt.discTemplate(size: n, share: 0.9, backing: b) : ring(n, backing: b)
+            var out = [UInt8](repeating: 255, count: p.width * p.height * 4)
+            for i in 0..<(p.width * p.height) { out[i * 4] = b.r; out[i * 4 + 1] = b.g; out[i * 4 + 2] = b.b }
+            let ox = (p.width - n) / 2, oy = (p.height - n) / 2
+            for y in 0..<n { for x in 0..<n { for c in 0..<4 { out[((y + oy) * p.width + x + ox) * 4 + c] = sq[(y * n + x) * 4 + c] } } }
+            return out
+        default: return nil
+        }
+    }
+    static func ring(_ n: Int, backing b: RGB8) -> [UInt8] {
+        let c = Double(n) / 2, inner = 0.62 * c, outer = 0.95 * c
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let i = (y * n + x) * 4, r = ((Double(x) + 0.5 - c) * (Double(x) + 0.5 - c) + (Double(y) + 0.5 - c) * (Double(y) + 0.5 - c)).squareRoot()
+            let g: UInt8? = r >= inner && r <= outer ? UInt8(130 + 60 * (c - Double(y)) / c) : nil
+            px[i] = g ?? b.r; px[i + 1] = g ?? b.g; px[i + 2] = g ?? b.b
+        } }
+        return px
+    }
+}
+
+/// Every static asset a game needs, as GDD to Assets will make it — and what it needs that nothing makes yet —
+/// with the files each is, who makes it and about what it costs, so the whole set is seen before a cent is spent.
+public enum AssetChecklist {
+    public struct Item: Equatable, Sendable {
+        public var group: String, name: String, what: String
+        public var files: [String]           // what it is on disk once made (a piece's states too)
+        public var maker: String             // "Symbols", "Reel area", "Gemini concept", …; "" when nothing makes it yet
+        public var cost: Double              // about, for what is not made yet
+        public var supported: Bool { !maker.isEmpty }
+    }
+    /// GPT Image's cost for a piece, measured (2026-10-04): $0.06 a megapixel's worth at least, rising with the
+    /// square root of the size — $0.12 at 2048², $0.17 for a 3168×2304 bezel asked at 8 MP.
+    public static func gpt(_ w: Int, _ h: Int) -> Double { 0.06 * max(1, Double(w * h) / 1_048_576).squareRoot() }
+
+    public static func items(jobs: [AssetJob], layout: ReelLayout?, jackpots names: [String], hasBonus: Bool) -> [Item] {
+        var out: [Item] = []
+        for j in jobs where j.kind == .symbol {
+            out.append(Item(group: "Symbols", name: j.id, what: j.title, files: ["\(j.id).png"], maker: "Symbols", cost: 0.10))
+        }
+        for j in jobs where j.kind == .background {
+            out.append(Item(group: "Backgrounds", name: j.id, what: j.title, files: ["\(j.id).png"], maker: "Backgrounds", cost: 0.15))
+        }
+        guard let l = layout, l.base != nil else {
+            out.append(Item(group: "Reel area", name: "reels", what: "the reels' size — the document gives none: set the game's structure", files: [], maker: "", cost: 0))
+            return out
+        }
+        for (i, m) in l.fileModes.enumerated() {
+            let a = ReelArea(l, grid: m.grid)
+            out.append(Item(group: "Reel area", name: "\(m.name)_interface_bezel", what: "\(m.grid.rows)×\(m.grid.reels) bezel and dividers\(m.grid.independent ? ", each cell its own" : "")",
+                            files: ["\(m.name)_interface_bezel.png", "\(m.name)_interface_dividers_rmbg.png"], maker: "Reel area", cost: i == 0 ? gpt(a.width, a.height) * 1.3 : 0))
+            out.append(Item(group: "Reel area", name: "\(m.name)_interface_reelTexture", what: "reel texture and reel fade",
+                            files: ["\(m.name)_interface_reelTexture_rmbg.png", "\(m.name)_interface_reelFade_rmbg.png"], maker: "Reel area", cost: i == 0 ? gpt(2048, 1365) : 0))
+        }
+        if l.extras.contains(where: { $0.what == "jackpot table" }), !names.isEmpty {
+            out.append(Item(group: "Jackpots", name: "shared_interface_jackpotTable", what: "jackpot table: " + names.joined(separator: ", "),
+                            files: ["shared_interface_jackpotTable.png"], maker: "Jackpot table", cost: gpt(3008, 1008)))
+        }
+        if let pots = l.extras.first(where: { $0.what == "pots" }) {
+            let n = pots.count ?? 1
+            for i in 0..<n {
+                let words = (l.potFeatures ?? []).indices.contains(i) ? l.potFeatures![i] : ""
+                out.append(Item(group: "Pots", name: PotStates.name(pot: i, of: n, state: 0).replacingOccurrences(of: "-State0Idle", with: ""),
+                                what: "pot \(i + 1), State0 to State\(PotStates.levels)" + (words.isEmpty ? "" : " — \(words)"),
+                                files: (0...PotStates.levels).map { "\(PotStates.name(pot: i, of: n, state: $0)).png" }, maker: "Pots", cost: Double(PotStates.levels + 1) * gpt(1024, 1280)))
+                if n > 1 { out.append(Item(group: "Pots", name: PotStates.plaqueName(pot: i), what: words.isEmpty ? "plaque, plain" : "plaque: \(words)",
+                                           files: ["\(PotStates.plaqueName(pot: i)).png"], maker: "Pots", cost: gpt(1024, 384))) }
+            }
+        }
+        for (wi, w) in (l.wheels ?? []).enumerated() {
+            let prefix = wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)"
+            if wi == 0 {
+                out.append(Item(group: "Wheels", name: "wheelSpin_interface_wheelFrame", what: "rim, hub and pointer, shared by the game's wheels",
+                                files: ["wheelSpin_interface_wheelFrame.png", "wheelSpin_interface_wheelHub.png", "wheelSpin_interface_winIndicator.png"],
+                                maker: "Wheels", cost: gpt(2048, 2048) * 1.3 + 2 * gpt(512, 512)))
+            }
+            let labels = WheelRules.labels(w, jackpots: names)
+            let distinct = labels.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
+            out.append(Item(group: "Wheels", name: "\(prefix)_interface_wedge", what: "\(w.name): " + distinct.joined(separator: ", "),
+                            files: distinct.map { "\(prefix)_interface_wedge-\(PopUps.key($0)).png" }, maker: "Wheels", cost: Double(distinct.count) * 0.04))
+        }
+        for p in PopUps.plan(l, jackpots: names, bonus: hasBonus) {
+            out.append(Item(group: "Pop-ups", name: p.name, what: p.text.isEmpty ? p.kind.rawValue : p.text.replacingOccurrences(of: "\n", with: " "),
+                            files: ["\(p.name).png"], maker: "Pop-ups", cost: gpt(p.w, p.h)))
+        }
+        for c in l.concepts ?? [] {
+            out.append(Item(group: c.standard ? "Studio pieces" : "From the GDD", name: c.name, what: c.what + (c.states.isEmpty ? "" : " (states: \(c.states.joined(separator: ", ")))"),
+                            files: ["\(c.name).png"] + c.states.map { "\(c.stateName($0)).png" }, maker: "Gemini concept", cost: Double(1 + c.states.count) * gpt(c.width, c.height)))
+        }
+        // What the GDD has that nothing makes yet: said, not dropped.
+        if l.concepts == nil {
+            for e in l.extras where ["meters", "collection area", "extra reel"].contains(e.what) && !(e.what == "extra reel" && e.place == "above") {
+                out.append(Item(group: "From the GDD", name: e.what, what: "\(e.count.map { "\($0) " } ?? "")\(e.what) \(e.place) — read from the GDD; Find What Else It Needs plans them",
+                                files: [], maker: "", cost: 0))
+            }
+        }
+        return out
+    }
+}
+
+/// Gemini's reading of what else a game needs on screen (ConceptPiece), given what Navigator already makes.
+public enum ConceptPlan {
+    public static let model = ProcessInfo.processInfo.environment["NAVIGATOR_CONCEPT_MODEL"] ?? "gemini-3.8-flash"
+
+    public static func prompt(gdd: String, game: String, covered: [String]) -> String {
+        """
+        You are the art lead of a video slot studio, listing the STATIC art pieces a game needs that are not on the list of what is already made. Read the game design document below.
+
+        ALREADY MADE (do not list any of these, or anything they cover): \(covered.joined(separator: "; ")).
+        Already covered as kinds: every symbol; every background; the reel frame (bezel), reel dividers, reel texture and reel fade for each mode; a hot reel housing; the jackpot table; pots and their fill states and plaques; prize wheels; award pop-ups (panel, value bar, CONTINUE button, award titles, the win ladder).
+
+        List every OTHER piece of static art this game shows on screen that the document describes or clearly needs: meters and their fill or lit states, collection areas or rows, counters' frames ("spins remaining"), glass or lock covers over reels or cells, cell backings and lock frames for hold-and-spin cells, multiplier badges, tubes, posters, avatars or mascots standing by the reels, Power Bet sell screens and their buttons, mode intro titles, a feature's logo or title lettering. Static art only: animation, particles, glows and bursts are made in Spine, not here.
+
+        For each piece:
+        - name: the studio's file name, <mode>_<category>_<name> in camelCase, e.g. base_interface_multiplierMeter, bonusGames_interface_spinsCounter, shared_sellScreen_background. Modes: base, bonusGames, shared, transition, or the game's own mode names (lootLink, …). Categories: interface, popUp, banner, sellScreen, intro, outro, avatar. Never the word "free": production says "bonus games".
+        - what: what it is and does in this game, one sentence.
+        - look: how it should look, one sentence, in this game's theme.
+        - shape: panel, bar, button, plaque, ring, disc, lettering (words alone) or free (anything else).
+        - width, height: pixels, at most 2048 a side, no longer than 3:1.
+        - lettering: the words lettered into it as the art, or "" — never a number or amount the game prints (the engine draws those in its own font).
+        - states: the names of its states after the first, if the document has them (["lit"], ["filling", "full"]); [] for one image.
+        - source: the document's own words it comes from (a short quote), or "" for a piece every game of this kind has.
+        Only pieces this game really has. If it needs nothing more, return an empty list.
+
+        GAME: \(game)
+        DOCUMENT:
+        \(gdd.prefix(60_000))
+        """
+    }
+
+    public static let schema: [String: Any] = [
+        "type": "OBJECT",
+        "properties": [
+            "pieces": ["type": "ARRAY", "items": [
+                "type": "OBJECT",
+                "properties": [
+                    "name": ["type": "STRING"], "what": ["type": "STRING"], "look": ["type": "STRING"],
+                    "shape": ["type": "STRING", "enum": ConceptPiece.shapes],
+                    "width": ["type": "INTEGER"], "height": ["type": "INTEGER"],
+                    "lettering": ["type": "STRING"], "states": ["type": "ARRAY", "items": ["type": "STRING"]],
+                    "source": ["type": "STRING"],
+                ],
+                "required": ["name", "what", "look", "shape", "width", "height", "lettering", "states", "source"],
+            ]],
+        ],
+        "required": ["pieces"],
+    ]
+
+    /// The reply's pieces, normalised, none twice and none already made.
+    public static func parse(_ reply: String, covered: Set<String>) -> [ConceptPiece] {
+        guard let j = GDDAssetPrompts.json(fromModelReply: reply), let list = j["pieces"] as? [[String: Any]] else { return [] }
+        var out: [ConceptPiece] = []
+        for d in list {
+            let p = ConceptPiece(name: d["name"] as? String ?? "", what: d["what"] as? String ?? "", look: d["look"] as? String ?? "",
+                                 shape: d["shape"] as? String ?? "free", width: d["width"] as? Int ?? 1024, height: d["height"] as? Int ?? 1024,
+                                 lettering: d["lettering"] as? String ?? "", states: d["states"] as? [String] ?? [],
+                                 source: d["source"] as? String ?? "").normalised()
+            guard !p.what.isEmpty, !covered.contains(p.name), !out.contains(where: { $0.name == p.name }) else { continue }
+            out.append(p)
+        }
+        return out
+    }
+}
+
 /// A game's structure entered by hand — for a game with no GDD yet, or a GDD that does not say (15 of the
 /// studio's 54 give no reel size) or was read wrong. It becomes the same ReelLayout a GDD is read into, and a
 /// short document written the way the studio's GDDs are, so everything after — the plan, the symbols, the
@@ -8970,6 +9190,14 @@ public enum WheelRules {
         }
         let n = ReelLayoutRules.groups(ReelLayoutRules.re(#"\b(\d{1,2}) (?:segments|wedges|slices)\b"#), t).compactMap { Int($0.g[1]) }.first
         return ReelLayout.Wheel(name: name, wedges: wedges, segments: n)
+    }
+
+    /// A wheel's wedge labels with this game's own jackpot names (its symbols') in place of the GDD's tier words.
+    public static func labels(_ wheel: ReelLayout.Wheel, jackpots names: [String]) -> [String] {
+        let tierWords = Set(tiers.map { $0.uppercased() } + ["JACKPOTS"])
+        let found = wheel.wedges.filter(tierWords.contains)
+        return (found.isEmpty ? [] : names.isEmpty ? (found == ["JACKPOTS"] ? ["GRAND", "MAJOR", "MINOR", "MINI"] : found) : names)
+            + wheel.wedges.filter { !tierWords.contains($0) }
     }
 
     /// The wedges round the wheel, clockwise from the top: each label as often as its worth allows — the top
@@ -15126,7 +15354,29 @@ extension GDDAssetPrompts {
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
-    /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
+    /// A planned piece (ConceptPiece) on its grey template (the last image) or a plain canvas, the reel frame
+    /// attached first for the game's material.
+    static func conceptBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, templated: Bool) -> String {
+        let letters = p.lettering.isEmpty ? "No text, lettering or numbers." : "Letter “\(p.lettering)” on it in bold, clear display letters, spelled exactly so. No other words, and no numbers or amounts."
+        return [
+            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. "
+            + (templated ? "Edit the last attached image: its plain grey shape is \(p.what.lowercased().hasPrefix("the ") ? "" : "this game's ")\(p.what) Repaint it in the reel frame's own material and craft: \(p.look) It keeps exactly its size and outline; its ornament may spread a little past its edge."
+                         : "Edit the last attached image, a plain canvas: draw on it \(p.what) \(p.look) In the reel frame's own material and craft, seen straight on, centred, filling most of the picture with a small even margin."),
+            letters + " Static art only: no burst, rays or flying sparkles — the game animates those.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// A planned piece's state, an edit of its first image (attached): the same piece, only what that state changes.
+    static func conceptStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, state: String) -> String {
+        [
+            "Edit the attached image: it is \(p.what) in a video slot game themed “\(theme.name)”. Show the same piece in its “\(state)” state, as the game shows it then — lit, filled, opened or changed only as that state means.",
+            "Everything else stays exactly as it is: its shape, size, position, material and lettering. Static art: no burst, rays or flying pieces. No new text or numbers.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+
+    /// Pot state `k` of PotStates.levels    /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
         let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]
@@ -15134,8 +15384,8 @@ extension GDDAssetPrompts {
                     "heaped high and overflowing, a few pieces spilling over the rim"][k]
         let glow = ["", "a faint", "a soft", "a warm", "a bright", "a radiant"][k]
         return [
-            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty and unlit. Show the same pot at stage \(k) of 5 as it fills: inside it, \(heap) of what it collects in this game — the theme's own treasure (coins, gems or gold as this theme would have them) in the pot's own colours; \(glow) glow from within, in the pot's own colour — never the background's. Only if the attached pot is shown with a closed lid or door: that lid or door \(lid), still attached to it.",
-            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents, their light and any lid it already has change. Never add a lid, cover, cap or door it does not have in the attached image: an open mouth stays an open mouth, the treasure rising out of it. A calm, still pose: no burst, rays, explosion or flying pieces. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty and unlit. Show the same pot at stage \(k) of 5 as it fills: inside it, \(heap) of what it collects in this game — the theme's own treasure (coins, gems or gold as this theme would have them) in the pot's own colours; \(glow) glow from within, in the pot's own colour — never the background's. If the attached pot has a lid, cover or door, it is still there in this picture, on its hinge or resting tilted on the rim, \(lid) — never taken away; if it has none, add none.",
+            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents, their light and how far any lid it already has is open change. A lid it has stays with it in every state, opened further as it fills, as the studio's pots open theirs; a pot with no lid never gains one — an open mouth stays an open mouth, the treasure rising out of it. A calm, still pose: no burst, rays, explosion or flying pieces. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }

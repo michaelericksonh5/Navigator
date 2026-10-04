@@ -21730,6 +21730,44 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --checklist <set folder>
+// Every static asset the set's game needs, grouped, made or not, who makes it and about what the rest costs.
+if let flag = CommandLine.arguments.firstIndex(of: "--checklist"), flag + 1 < CommandLine.arguments.count {
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        let list = run.checklist()
+        var group = ""
+        for (i, made) in list {
+            if i.group != group { group = i.group; print("\n\(group)") }
+            print("  \(made ? "✓" : i.supported ? "○" : "⚠︎") \(i.name) — \(i.what)" + (made || !i.supported ? "" : String(format: " · ~$%.2f", i.cost)) + (i.supported ? "" : " · NOTHING MAKES THIS YET"))
+        }
+        let todo = list.filter { !$0.made && $0.item.supported }
+        print(String(format: "\n%d of %d made · %d to make, about $%.2f · %d not supported yet", list.filter(\.made).count, list.count, todo.count, todo.reduce(0) { $0 + $1.item.cost }, list.filter { !$0.item.supported }.count))
+        exit(0)
+    } }
+    app.run()
+}
+
+// PAID (~$0.02, Gemini):  Navigator --find-concepts <set folder> --gdd-file <gdd.txt>
+// Gemini reads the GDD for every other static piece the game needs; saved with the set, made by --reel-area.
+if let flag = CommandLine.arguments.firstIndex(of: "--find-concepts"), flag + 1 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        if let i = args.firstIndex(of: "--gdd-file"), i + 1 < args.count, let t = try? String(contentsOfFile: args[i + 1], encoding: .utf8) { run.gddText = t }
+        run.findConcepts { err in
+            MainActor.assumeIsolated {
+                for c in run.reelLayout?.concepts ?? [] { print("PIECE: \(c.name) [\(c.shape) \(c.width)x\(c.height)\(c.lettering.isEmpty ? "" : " “\(c.lettering)”")\(c.states.isEmpty ? "" : " states: " + c.states.joined(separator: ", "))] \(c.what) — from: \(c.source)") }
+                print("DONE: \(err ?? run.status)"); print(String(format: "SPENT: $%.4f", run.spent)); exit(0)
+            }
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --interface-templates <out folder> [segments]
 // The grey templates GPT Image paints the wheel and pop-ups on, on chroma magenta, to look at before paying.
 if let flag = CommandLine.arguments.firstIndex(of: "--interface-templates"), flag + 1 < CommandLine.arguments.count {
@@ -24749,7 +24787,9 @@ final class GDDToAssetsRun: ObservableObject {
             symbols = jobs.filter { $0.kind == .symbol }.enumerated().map { SlotSymbol(code: $0.element.id, index: $0.offset, role: $0.element.role, tier: $0.element.tier, note: $0.element.title) }
         }
         guard !symbols.isEmpty else { return }
+        let concepts = reelLayout?.concepts
         reelLayout = sheet.layout(symbols)
+        reelLayout?.concepts = concepts
         guard typed else { return }
         symbols = Self.namingJackpots(symbols, sheet: sheet)
         gddText = sheet.document(game: gameName, symbols: symbols)
@@ -25929,6 +25969,8 @@ final class GDDToAssetsRun: ObservableObject {
 
     /// The reel-area pieces the window can make again, by the files each is: every mode's bezel follows the
     /// base's, every mode's texture the base texture, and the pot states their pot.
+    /// The planned pieces' names, for Make Again (set as a set is made or reopened).
+    nonisolated(unsafe) static var conceptNames: [String] = []
     static let reelPieces: [(name: String, files: (String) -> Bool)] = [
         ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
@@ -25936,6 +25978,7 @@ final class GDDToAssetsRun: ObservableObject {
         ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
+        ("Pieces from the GDD", { n in n.hasPrefix("shared_concepts") || (GDDToAssetsRun.conceptNames.contains { n.hasPrefix($0 + ".") || n.hasPrefix($0 + "_rmbg") || n.hasPrefix($0 + "-") }) }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
         ("Pop-ups", { $0.contains("_popUp_") || $0.hasPrefix("shared_popUps") || $0.hasPrefix("transition_outro_") || $0.hasPrefix("shared_celebration_message")
             || $0.hasPrefix("base_banner_event-") || $0.hasPrefix("wheelSpin_banner") }),
@@ -25953,6 +25996,43 @@ final class GDDToAssetsRun: ObservableObject {
         return true
     }
 
+    /// The game's jackpot names, as lettered (its JP symbols').
+    var jackpotNames: [String] {
+        jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
+            .map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
+    }
+    /// Every static asset this game needs (AssetChecklist), with what is made already.
+    func checklist() -> [(item: AssetChecklist.Item, made: Bool)] {
+        let hasBonus = jobs.contains { $0.role == .bonus } || (reelLayout?.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") } ?? false)
+        let items = AssetChecklist.items(jobs: jobs, layout: reelLayout, jackpots: jackpotNames, hasBonus: hasBonus)
+        let fm = FileManager.default
+        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) } } ?? false) }
+    }
+
+    /// Gemini reads the GDD for every other static piece the game needs (ConceptPlan) — meters, collection
+    /// areas, glass covers, counters, sell screens — added to the structure for the generic generator.
+    func findConcepts(completion: ((String?) -> Void)? = nil) {
+        guard reelLayout != nil, !gddText.isEmpty else { completion?("No document to read: open the GDD, or type the set."); return }
+        let covered = checklist().flatMap { [$0.item.name] + $0.item.files.map { String($0.dropLast(4)) } }
+        let prompt = ConceptPlan.prompt(gdd: gddText, game: gameName, covered: covered)
+        busy = true
+        status = "Gemini is reading the GDD for anything else the game needs…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = H5GService.describe(prompt: prompt, systemPrompt: nil, imagePNG: nil, model: ConceptPlan.model, schema: ConceptPlan.schema)
+            DispatchQueue.main.async {
+                self.busy = false
+                self.spent += r.cost ?? 0
+                guard let text = r.text else { self.status = "Couldn’t plan the other pieces: \(r.error ?? "no reply")"; completion?(r.error); return }
+                let found = ConceptPlan.parse(text, covered: Set(covered))
+                self.reelLayout?.concepts = (self.reelLayout?.concepts ?? []).filter(\.standard) + found
+                if let f = self.lastFolder { self.writeManifest(to: f) }
+                self.status = found.isEmpty ? "Gemini found nothing else this game needs." : "Gemini found \(found.count) more piece\(found.count == 1 ? "" : "s"): "
+                    + found.map { $0.name }.joined(separator: ", ") + String(format: " · $%.3f", r.cost ?? 0)
+                completion?(nil)
+            }
+        }
+    }
+
     /// The interface previews in Finder (reel, wheel, pop-up and pot sheets), or the set's folder when none.
     func showPreviews() {
         guard let folder = lastFolder else { return }
@@ -25965,6 +26045,7 @@ final class GDDToAssetsRun: ObservableObject {
     /// `redo` names a piece (reelPieces) to make again: its files are kept in versions/ first, never deleted.
     func makeReelArea(redo: String? = nil) {
         guard let folder = lastFolder, let layout = reelLayout else { return }
+        Self.conceptNames = (layout.concepts ?? []).map(\.name)
         if let redo { Self.keepForRedo(redo, folder: folder) }
         keying = true
         status = "Making the game interface — reel area, \(layout.wheels.map { "\($0.count) wheel\($0.count == 1 ? "" : "s"), " } ?? "")pop-ups — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
@@ -26203,10 +26284,7 @@ final class GDDToAssetsRun: ObservableObject {
         for (wi, wheel) in (layout.wheels ?? []).enumerated() {
             let prefix = wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)"
             // Its jackpot wedges carry this game's own jackpot names (its symbols'), whatever words the GDD used.
-            let tierWords = Set(WheelRules.tiers.map { $0.uppercased() } + ["JACKPOTS"])
-            let tiers = wheel.wedges.filter(tierWords.contains)
-            let labels = (tiers.isEmpty ? [] : names.isEmpty ? (tiers == ["JACKPOTS"] ? ["GRAND", "MAJOR", "MINOR", "MINI"] : tiers) : names)
-                + wheel.wedges.filter { !tierWords.contains($0) }
+            let labels = WheelRules.labels(wheel, jackpots: names)
             let order = WheelRules.order(labels, segments: wheel.segments), art = WheelArt(segments: order.count)
             if wi == 0 {
                 let n = WheelArt.frameSize
@@ -26262,6 +26340,21 @@ final class GDDToAssetsRun: ObservableObject {
             }
         }
         popUpSheet(plan, folder: folder)
+        // 7. The pieces Gemini planned from the GDD (ConceptPiece): each on its shape's grey template, or a plain
+        // canvas, in the reel frame's material; each state an edit of the first.
+        for piece in layout.concepts ?? [] {
+            if !has("\(piece.name).png"), let ref = bezelRef, let canvas = blank(piece.width, piece.height) {
+                let tpl = ConceptPiece.template(piece, backing: b).flatMap { png($0, piece.width, piece.height) }
+                let prompt = GDDAssetPrompts.conceptBrief(theme: theme, design: design, backing: (backing.name, b), piece: piece, templated: tpl != nil)
+                if let px = paint(piece.name, prompt: prompt, inputs: [ref, tpl ?? canvas], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.name) }
+            }
+            guard let first = try? Data(contentsOf: url("\(piece.name).png")) else { continue }
+            for state in piece.states where !has("\(piece.stateName(state)).png") {
+                if let px = paint(piece.stateName(state), prompt: GDDAssetPrompts.conceptStateBrief(theme: theme, backing: (backing.name, b), piece: piece, state: state),
+                                  inputs: [first], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.stateName(state)) }
+            }
+        }
+        conceptSheet(layout.concepts ?? [], folder: folder)
         // 7. A preview per mode: background, texture, this set's symbols, dividers, bezel; the table and pots above.
         for (name, grid) in modes { reelPreview(name: name, area: ReelArea(layout, grid: grid), jobs: jobs, folder: folder) }
         log.event(["step": "reel area", "cost": cost, "problems": problems, "modes": modes.map { "\($0.name) \($0.grid.rows)x\($0.grid.reels)" }])
@@ -26331,6 +26424,29 @@ final class GDDToAssetsRun: ObservableObject {
         }
         if let out = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_popUps-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
             CGImageDestinationAddImage(dest, out, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+    }
+
+    /// `shared_concepts-preview.jpg`: every piece planned from the GDD with its states, a row each — to review.
+    func conceptSheet(_ pieces: [ConceptPiece], folder: URL) {
+        guard !pieces.isEmpty else { return }
+        let cell = 300, cols = (pieces.map { 1 + $0.states.count }.max() ?? 1)
+        let W = cols * cell, H = pieces.count * cell
+        guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        ctx.setFillColor(CGColor(red: 0.08, green: 0.07, blue: 0.13, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.interpolationQuality = .high
+        for (r, p) in pieces.enumerated() {
+            for (k, n) in ([p.name] + p.states.map { p.stateName($0) }).enumerated() {
+                guard let img = loadCGImage(folder.appendingPathComponent("\(n)_rmbg.png")) else { continue }
+                let s = min(Double(cell - 16) / Double(img.width), Double(cell - 16) / Double(img.height))
+                let w = Int(Double(img.width) * s), h = Int(Double(img.height) * s)
+                ctx.draw(img, in: CGRect(x: k * cell + (cell - w) / 2, y: H - (r + 1) * cell + (cell - h) / 2, width: w, height: h))
+            }
+        }
+        if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_concepts-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
             CGImageDestinationFinalize(dest)
         }
     }
@@ -28060,6 +28176,7 @@ struct GDDToAssetsSheet: View {
     /// The game's structure: typed for a set with no GDD, or a GDD's reading to correct.
     @State private var sheet = GameSheet()
     @State private var correctingStructure = false
+    @State private var checklistOpen = false
     @State private var manualName = ""
 
     enum PickTarget: Identifiable, Hashable { case gdds, output, manifests
@@ -28405,6 +28522,40 @@ struct GDDToAssetsSheet: View {
             return "\(n) \(r.label.lowercased())"
         }
         return "\(run.symbols.count) symbols — " + parts.joined(separator: ", ")
+    }
+
+    /// Every static asset the game needs (AssetChecklist): made, to make (with its cost) or not made by
+    /// anything yet — and Gemini's reading of the GDD for anything else it needs.
+    @ViewBuilder private var assetChecklist: some View {
+        let list = run.checklist()
+        let todo = list.filter { !$0.made && $0.item.supported }, missing = list.filter { !$0.item.supported }
+        DisclosureGroup(isExpanded: $checklistOpen) {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(Dictionary(grouping: list, by: \.item.group).keys.sorted { a, b in
+                    (list.firstIndex { $0.item.group == a } ?? 0) < (list.firstIndex { $0.item.group == b } ?? 0) }), id: \.self) { g in
+                    Text(g).font(.caption.bold()).padding(.top, 4)
+                    ForEach(list.filter { $0.item.group == g }, id: \.item.name) { e in
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: e.made ? "checkmark.circle.fill" : e.item.supported ? "circle" : "exclamationmark.triangle.fill")
+                                .foregroundColor(e.made ? .green : e.item.supported ? .secondary : .orange)
+                            Text(e.item.name).font(.caption.monospaced())
+                            Text(e.item.what).font(.caption).foregroundColor(.secondary).lineLimit(2)
+                            Spacer()
+                            if !e.made && e.item.supported { Text(String(format: "~$%.2f", e.item.cost)).font(.caption).foregroundColor(.secondary) }
+                        }
+                    }
+                }
+                HStack {
+                    Button("Find What Else It Needs…") { run.findConcepts() }
+                        .disabled(run.gddText.isEmpty || run.busy || run.reelLayout == nil)
+                        .help("Gemini reads the GDD for every other static piece the game shows — meters, collection areas, glass covers, counters, sell screens, a feature's lettering — and adds them here, made with the game interface. About $0.02.")
+                }.padding(.top, 6)
+            }
+        } label: {
+            Text("Asset checklist — \(list.filter(\.made).count) of \(list.count) made" + (todo.isEmpty ? "" : String(format: ", %d to make (~$%.2f)", todo.count, todo.reduce(0) { $0 + $1.item.cost }))
+                 + (missing.isEmpty ? "" : ", \(missing.count) not made by anything yet"))
+                .font(.callout).foregroundColor(missing.isEmpty ? .primary : .orange)
+        }
     }
 
     // MARK: Step 2 — the theme
@@ -28812,6 +28963,7 @@ struct GDDToAssetsSheet: View {
                         .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots or their filling and full states, the wheels, or the pop-ups. The current files are kept in the set's versions folder. About $0.07–0.15 a piece; the bezel can take two tries.")
                     }
                     ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
+                    assetChecklist
                     if fromDocument {
                         // The reading of a GDD, set right by hand — or the structure it never gives.
                         DisclosureGroup(run.reelLayout == nil ? "Set the game's structure" : "Correct the game's structure", isExpanded: $correctingStructure) {
