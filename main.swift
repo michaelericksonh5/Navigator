@@ -21719,6 +21719,21 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --read-gdd <gdd.txt> […]
+// What GDD to Assets reads from each document, without a window: its symbols, reels, extras and notes.
+// For checking the readers against the real corpus (Navigator --export-gdds), not against fixtures.
+if let flag = CommandLine.arguments.firstIndex(of: "--read-gdd") {
+    for path in CommandLine.arguments[(flag + 1)...] {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { print("\(path): unreadable"); continue }
+        let symbols = GDDSymbolSetRules.parse(text), reels = ReelLayoutRules.read(text)
+        print("== \((path as NSString).lastPathComponent)")
+        print("symbols (\(symbols.count)): " + symbols.map(\.code).joined(separator: " "))
+        print("reels: " + (reels.grids.isEmpty && reels.extras.isEmpty ? "none read" : reels.summary))
+        for n in reels.notes { print("note: \(n)") }
+    }
+    exit(0)
+}
+
 // Free:  Navigator --restack <set folder> [id,id,…]
 // Builds a layered set's framed symbols from their pieces again, as a frame or panel change does.
 if let flag = CommandLine.arguments.firstIndex(of: "--restack"), flag + 1 < CommandLine.arguments.count {
