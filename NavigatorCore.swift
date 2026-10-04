@@ -8164,107 +8164,312 @@ public struct SlotSymbol: Equatable, Sendable {
 /// rows x reels with the rows the smaller (slot grids are wider than tall), and said in `notes`.
 public struct ReelLayout: Equatable, Codable, Sendable {
     public struct Grid: Equatable, Codable, Sendable {
-        public var mode: String          // "base", "bonus", "power bet", …
+        public var mode: String          // "base", "bonus", "power bet", "loot link", "bonus 2", …
         public var rows: Int, reels: Int
         public var independent = false   // each cell its own reel (hold-and-spin style)
         public var note = ""             // the words it was read from
+        /// A grid that grows ("from a 3x5 to a 5x5", "reels grow to 7 tall"): the rows it starts with. `rows`
+        /// is the most it reaches, the size its bezel is built for.
+        public var startRows: Int? = nil
     }
     public struct Extra: Equatable, Codable, Sendable {
-        public var what: String          // "hot reel", "jackpot table", "pots"
+        public var what: String          // "hot reel", "extra reel", "jackpot table", "pots", "meters", "wheel", "collection area"
         public var rows: Int?, reels: Int?
-        public var place: String         // "above", "below", "beside"
-        public var count: Int? = nil     // "3 pots"
+        public var place: String         // "above", "below", "beside"; "" when the document doesn't say
+        public var count: Int? = nil     // "3 pots", two wheels
+        public var mode: String? = nil   // when it belongs to one mode only
     }
     public var grids: [Grid] = []
     public var extras: [Extra] = []
     public var notes: [String] = []
     /// The base game's grid, the one the bezel is built round.
     public var base: Grid? { grids.first { $0.mode == "base" } ?? grids.first }
-    /// For people: "base 3×5 · bonus 3×5, 5×5 · above: pots, jackpot table".
+    /// Every grid with the name its files take, as the studio names them: base first (the grid the bezel is
+    /// built round), then bonusGames, bonusGames2, powerBet, lootLink, … — "bonus games" as production says
+    /// it, never "free" (the reader has already read "free games" as the bonus).
+    public var fileModes: [(name: String, grid: Grid)] {
+        guard let base else { return [] }
+        var out: [(name: String, grid: Grid)] = [("base", base)]
+        for g in grids where g != base {
+            let words = g.mode.replacingOccurrences(of: #"\bbonus\b"#, with: "bonus games", options: .regularExpression).split(separator: " ")
+            let n = words.enumerated().map { $0.offset == 0 ? $0.element.lowercased() : $0.element.prefix(1).uppercased() + $0.element.dropFirst().lowercased() }.joined()
+            var name = n, i = 2
+            while out.contains(where: { $0.name == name }) { name = n + "\(i)"; i += 1 }
+            out.append((name, g))
+        }
+        return out
+    }
+    /// For people: "base 3×5 · bonus 3→5×5 · above: 3 pots, jackpot table".
     public var summary: String {
         var modes: [String] = []
         for m in grids.map(\.mode) where !modes.contains(m) { modes.append(m) }
-        let parts = modes.map { m in "\(m) " + grids.filter { $0.mode == m }.map { "\($0.rows)×\($0.reels)\($0.independent ? " independent" : "")" }.joined(separator: ", ") }
-        let places = Dictionary(grouping: extras, by: \.place).sorted { $0.key < $1.key }
-            .map { "\($0.key): " + $0.value.map { e in e.rows.map { "\(e.what) \($0)×\(e.reels ?? 0)" } ?? e.what }.joined(separator: ", ") }
+        let parts = modes.map { m in "\(m) " + grids.filter { $0.mode == m }.map {
+            "\($0.startRows.map { "\($0)→" } ?? "")\($0.rows)×\($0.reels)\($0.independent ? " independent" : "")" }.joined(separator: ", ") }
+        let places = Dictionary(grouping: extras, by: { $0.place.isEmpty ? "around" : $0.place }).sorted { $0.key < $1.key }
+            .map { "\($0.key): " + $0.value.map { e in (e.count.map { "\($0) " } ?? "") + e.what + (e.rows.map { " \($0)×\(e.reels ?? 0)" } ?? "") }.joined(separator: ", ") }
         return (parts + places).joined(separator: " · ")
     }
 }
 
+/// Reads a GDD's reels, per game mode, and what is drawn round them. Tuned on the studio's 54 real documents
+/// (Navigator --export-gdds / --read-gdd, 2026-10-04), not fixtures: the first reader, built on two documents,
+/// was wrong in 48 of them. What the corpus showed:
+/// - A size's mode is said before it in its own sentence ("The bonus game … is played on a 3x4 matrix"), or
+///   just after it ("an 8x5 matrix during the bonus"); a feature list after it ("a 3x5 lines game with a
+///   jackpot, bonus, and …") and the next sentence are about something else. "<Game> is a 3x5 … game" is base.
+/// - Sizes are written rows x reels ("8x5" loot links are 8 tall) unless the sentence says otherwise ("(5
+///   reels, 4 rows)") or a bonus grid is written reels first (Chevy-Hot's "3x4" bonus of the 3-reel game).
+/// - Grids that grow ("from a 3x5 to a 5x5", "grow to 7 tall") are one grid, built at its largest.
+/// - Hold-and-spin modes (Loot Link, Lock and Respin, …) are modes of their own, their reels independent.
+/// - "N reels that are M tall", "15x1 independent reels" (15 one-cell reels: a 3x5), and phantoms: symbol
+///   counts ("wy1 x5"), blast areas ("3x3 mine"), pick screens, symbol sizes.
+/// - Round the reels: hot and extra reels, the jackpot table (paytable, area, meters), pots (a pot, the safe),
+///   meters, wheels — never the promotions' "super boost wheel spins" copied into most documents.
+/// "Free games/spins" is read as the bonus: production says "bonus games", never "free".
 public enum ReelLayoutRules {
-    /// The mode a line belongs to: from its own words first, then the section it sits under.
-    /// The words before a size decide first — a sentence's subject comes first ("The bonus game … is played on
-    /// a 3x4 matrix … from the base game"); a line naming both modes otherwise ("in both the Base and Bonus
-    /// games") speaks of the whole game: base.
-    static func mode(of line: String, before: String = "", section: String) -> String {
-        func pick(_ t: String) -> String? {
-            let l = t.lowercased()
-            if l.contains("power bet") { return "power bet" }
-            let bonus = ["bonus", "free game", "free spin"].contains(where: l.contains)
-            if l.contains("base") { return "base" }
-            return bonus ? "bonus" : nil
+    static let numbers = ["one": 1, "single": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+                          "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12]
+    static let num = #"(\d{1,2}|one|single|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)"#
+    static func number(_ s: String) -> Int? { Int(s) ?? numbers[s.lowercased()] }
+    static func re(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p, options: [.caseInsensitive]) }
+    /// Each match's groups ("" for a group that took no part).
+    static func groups(_ r: NSRegularExpression, _ s: String) -> [(range: NSRange, g: [String])] {
+        let ns = s as NSString
+        return r.matches(in: s, range: NSRange(location: 0, length: ns.length)).map { m in
+            (m.range, (0..<m.numberOfRanges).map { m.range(at: $0).location == NSNotFound ? "" : ns.substring(with: m.range(at: $0)) })
         }
-        if let m = pick(before), !(before.lowercased().contains("base") && before.lowercased().contains("bonus")) { return m }
-        // A line naming one mode is that mode's; one naming both defers to its section ("Bonus Game Mode"),
-        // and only then is the whole game's.
-        let l = line.lowercased(), base = l.contains("base"), bonus = ["bonus", "free game", "free spin"].contains(where: l.contains)
-        if l.contains("power bet") { return "power bet" }
-        if base != bonus { return base ? "base" : "bonus" }
-        return pick(section) ?? "base"
+    }
+
+    static let modeWords = re(#"\b(super loot link|loot link|lock (?:and|&) respin|hold (?:and|&) spin|jackpot mode|drum mode|wysiwyg mode|bonus collect mode|collect mode|super boost|feature boost|super bonus|power bets?|bonus game ?(\d)\b|bonus (\d)\b|free (?:games?|spins?)|bonus(?:es)?|base)\b"#)
+    /// Modes whose reels are each cell's own.
+    static let holdModes: Set<String> = ["super loot link", "loot link", "lock and respin", "drum mode", "wysiwyg mode", "bonus collect mode", "collect mode"]
+
+    /// The mode a stretch of words names, the one nearest its end winning; nil when it names none. Power bet
+    /// colours what follows it: its base game is the power bet's, its bonus the power bet bonus. "Both the base
+    /// and bonus" is the whole game: base.
+    static func mode(named t: String) -> String? {
+        let found = groups(modeWords, t).map { m -> String in
+            let w = m.g[1].lowercased()
+            if !m.g[2].isEmpty { return "bonus \(m.g[2])" }
+            if !m.g[3].isEmpty { return "bonus \(m.g[3])" }
+            if w.hasPrefix("power bet") || w == "feature boost" { return "power bet" }
+            if w.hasPrefix("free") || w.hasPrefix("bonus") { return "bonus" }
+            if w == "hold and spin" || w == "hold & spin" || w == "lock & respin" { return "lock and respin" }
+            return w
+        }
+        guard let last = found.last else { return nil }
+        if t.lowercased().range(of: #"\bboth (the )?base (game )?and (the )?bonus"#, options: .regularExpression) != nil { return "base" }
+        if found.contains("power bet") && last != "power bet" {
+            return last == "bonus" ? "power bet bonus" : last == "base" ? "power bet" : last
+        }
+        return last
     }
 
     public static func read(_ gdd: String) -> ReelLayout {
         var out = ReelLayout()
-        var section = ""
-        let size = try! NSRegularExpression(pattern: #"(\d{1,2})\s*[x×X]\s*(\d{1,2})"#)
-        var seen: [String: [(Int, Int)]] = [:]
+        var section = "", sectionLevel = 0, skipping: Int? = nil
+        var knownReels: Int? = nil
+        // The document's own word on its reels and shape, wherever it is said.
+        let docReels = groups(re(#"\b(\d{1,2}) reels? (?:that are|of \d|each)|\((\d{1,2}) reels,"#), gdd).compactMap { Int($0.g[1].isEmpty ? $0.g[2] : $0.g[1]) }.first
+        // A "tall" portrait game (Tall Raspberry's 8x5); "portrait only" alone is the device, not the grid (Bring 'Em In's 3x5).
+        let portrait = gdd.lowercased().range(of: #"tall"? portrait"#, options: .regularExpression) != nil
+        let size = re(#"(?<![A-Za-z0-9._/])(\d{1,2})\s*[x×]\s*(\d{1,2})(?![0-9_/])"#)
+        let stated = re(#"\b(\d{1,2}) reels\b"#), statedRows = re(#"\b(\d{1,2}) (?:rows?|tall|high)\b"#)
+        let wordGrid = re(#"\b\#(num) reels? (?:that are|of|each containing|containing|with) \#(num) (?:symbols? )?(?:tall|symbols|high|rows|positions)"#)
+        let wordRange = re(#"\b\#(num) (?:variable[- ]size )?reels\b.{0,120}?\b(\d{1,2}) to (\d{1,2}) (?:tall|rows|high)"#)
+        let growTall = re(#"(?:grows?|expand(?:s|ing)?|up|increases?|reach(?:es)?|growing)(?: [a-z]+){0,2} to (?:be )?(\d{1,2}) (?:tall|rows|high)|\((\d{1,2}) tall\)"#)
+        let place = { (t: String) -> String in
+            let l = t.lowercased()
+            if l.range(of: #"\b(above|on top|top of the (screen|matrix|reels))\b"#, options: .regularExpression) != nil { return "above" }
+            if l.range(of: #"\b(below|beneath|under the|bottom)\b"#, options: .regularExpression) != nil { return "below" }
+            if l.range(of: #"\b(beside|to the (left|right)|either side|left of|right of|side of)\b"#, options: .regularExpression) != nil { return "beside" }
+            return ""
+        }
+        func addExtra(_ e: ReelLayout.Extra) {
+            if let i = out.extras.firstIndex(where: { $0.what == e.what && $0.mode == e.mode }) {
+                if out.extras[i].place.isEmpty { out.extras[i].place = e.place }
+                if let c = e.count, c > (out.extras[i].count ?? 0) { out.extras[i].count = c }
+            } else { out.extras.append(e) }
+        }
+        func addGrid(_ g: ReelLayout.Grid) {
+            if let i = out.grids.firstIndex(where: { $0.mode == g.mode && $0.rows == g.rows && $0.reels == g.reels && $0.startRows == g.startRows }) {
+                out.grids[i].independent = out.grids[i].independent || g.independent    // said again, with more
+                return
+            }
+            out.grids.append(g)
+            if g.mode == "base", knownReels == nil { knownReels = g.reels }
+        }
+
+        var titled = false, wheels = Set<String>()     // the wheels' own names: "Jackpot Wheel", "Bonus Wheel"
         for raw in gdd.components(separatedBy: .newlines) {
-            let line = raw.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "*-•")))
-            let lower = line.lowercased()
-            // A heading that names a mode starts its section; "Spinning & Winning" under "Bonus Game Mode" does not.
-            let heading = raw.trimmingCharacters(in: .whitespaces).hasPrefix("#") || (line.count < 40 && !line.isEmpty && line.range(of: #"\d"#, options: .regularExpression) == nil)
-            if heading, ["base", "bonus", "free", "power bet"].contains(where: lower.contains) { section = line }
-            let ns = line as NSString
-            for m in size.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
-                guard let a = Int(ns.substring(with: m.range(at: 1))), let b = Int(ns.substring(with: m.range(at: 2))),
-                      (1...8).contains(a), (1...8).contains(b) else { continue }
-                let after = ns.substring(from: m.range.location + m.range.length).lowercased().prefix(60)
-                let before = ns.substring(to: m.range.location).lowercased().suffix(60)
-                let near = before + " " + after
-                // An extra beside the grid: "an additional 1x3 Hot Reel positioned above the main matrix".
-                let soon = after.prefix(16)
-                if soon.contains("hot reel") || (before.hasSuffix("additional ") && soon.contains("reel")) {
-                    let place = lower.contains("above") ? "above" : lower.contains("below") ? "below" : "beside"
-                    if !out.extras.contains(where: { $0.what == "hot reel" }) {
-                        out.extras.append(ReelLayout.Extra(what: "hot reel", rows: min(a, b), reels: max(a, b), place: place))
-                    }
-                    continue
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            let hashes = trimmed.prefix(while: { $0 == "#" }).count
+            let text = String(trimmed.dropFirst(hashes)).trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "*-•")))
+            guard !text.isEmpty else { continue }
+            let listItem = trimmed.hasPrefix("-") || trimmed.hasPrefix("*") || trimmed.hasPrefix("•")
+            let heading = hashes > 0 || (!listItem && text.count < 50 && !text.hasSuffix(".") && text.range(of: #"\d\s*[x×]\s*\d"#, options: .regularExpression) == nil)
+            if heading {
+                let level = hashes > 0 ? hashes : 9, l = text.lowercased()
+                // Promotions, messaging and audio are about other things — the "super boost wheel spins"
+                // promotion is copied into most documents. They end at a heading of their rank or above,
+                // not at a short line inside them.
+                if let s = skipping, hashes > 0 ? level <= s : mode(named: text) != nil { skipping = nil }
+                // Section names only: "Sound Designer" in a document's credits is not its audio section.
+                if l.range(of: #"^(audio|sounds?|sound (design|behaviou?rs?|effects|list)|(journey[- ]based )?promotions?|messaging)( ?[/&-] ?\w+)?\s*:?$"#, options: .regularExpression) != nil {
+                    skipping = min(skipping ?? level, level); continue
                 }
-                guard ["matrix", "reel", "grid", "layout", "lines", "ways"].contains(where: { near.contains($0) }) else { continue }
-                let mode = Self.mode(of: line, before: String(before), section: section)
-                seen[mode, default: []].append((a, b))
-                guard !out.grids.contains(where: { $0.mode == mode && Set([$0.rows, $0.reels]) == Set([a, b]) }) else { continue }
-                // "matrix ... depending on" — a grid it can grow to: kept, after the first of its mode.
-                let rows = min(a, b), reels = max(a, b)
-                // Independent reels are said of this grid itself ("a 3x4 matrix of independent reels"), not of
-                // something else in the sentence ("an independent jackpot reel").
-                out.grids.append(ReelLayout.Grid(mode: mode, rows: rows, reels: reels,
-                                                 independent: after.prefix(40).contains("independent"), note: String(line.prefix(140))))
+                guard skipping == nil else { continue }
+                // The document's title ("Green Machine Deluxe Power Bet") names the game, not a section.
+                guard titled else { titled = true; continue }
+                if let m = mode(named: text) { section = m; sectionLevel = level }
+                // A sub-heading ("Spinning & Winning" under "Bonus Game Mode") keeps its mode's section.
+                else if hashes > 0 && level <= sectionLevel || hashes == 1
+                            || ["presentation", "layout", "tech", "symbol", "overview", "tutorial", "math", "paytable"].contains(where: l.contains) { section = ""; sectionLevel = 0 }
+                continue
             }
-            for (what, words) in [("jackpot table", ["jackpot table above", "jackpot table"]), ("pots", ["pots that sit above", "pots above"])]
-                where words.contains(where: lower.contains) && !out.extras.contains(where: { $0.what == what }) {
-                let n = (try? NSRegularExpression(pattern: #"(\d+)\s+\#(what)"#)).flatMap { re in
-                    re.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)).flatMap { Range($0.range(at: 1), in: lower).flatMap { Int(lower[$0]) } } }
-                out.extras.append(ReelLayout.Extra(what: what, rows: nil, reels: nil, place: lower.contains("above") ? "above" : "beside", count: n))
+            titled = true
+            guard skipping == nil else { continue }
+            // Growing reels said across sentences: "six variable-size reels … Reels 1 and 6 can be anywhere from 3 to 10 tall".
+            for w in groups(wordRange, text) {
+                guard let k = number(w.g[1]), let lo = Int(w.g[2]), let hi = Int(w.g[3]), (1...12).contains(k), lo < hi, hi <= 12 else { continue }
+                let m = mode(named: (text as NSString).substring(to: w.range.location)) ?? (section.isEmpty ? "base" : section)
+                addGrid(ReelLayout.Grid(mode: m, rows: hi, reels: k, note: String(text.prefix(140)), startRows: lo))
+            }
+            // Sentences: exports run paragraphs together ("…Bonus games.The pots are …").
+            let sentences = text.replacingOccurrences(of: #"(?<=[a-z0-9)”"'][.!?])\s*(?=[A-Z{])"#, with: "\u{1}", options: .regularExpression)
+                .components(separatedBy: "\u{1}")
+            for sentence in sentences where !sentence.isEmpty {
+                let lower = sentence.lowercased(), ns = sentence as NSString
+                // Independent reels, not reels that grow "independently" or an "independent jackpot reel".
+                let indie = lower.range(of: #"\bindependent\b(?! (jackpot|one))"#, options: .regularExpression) != nil
+                var previous: ReelLayout.Grid? = nil, previousEnd = 0
+                // The mode of whatever starts at `loc`: said before it, said just after it, the headline's base, its section.
+                func modeAt(_ loc: Int, after: String) -> String {
+                    let before = ns.substring(to: loc)
+                    // Said just after it ("a 5×6 matrix during the bonus round") beats an earlier clause's mode.
+                    if let q = groups(re(#"^\s*(?:[a-z]+\s){0,3}?(?:during|in|for|of|within) the ([a-z0-9 &]{3,30})"#), after).first, let m = mode(named: q.g[1]) { return m }
+                    // The game itself: "Example is a 3x5 lines game", "The game starts off as a 3x5" — its base,
+                    // even when its name has a mode in it ("Green Machine … with Power Bet is a 5x5 version").
+                    if let subject = groups(re(#"^\s*([^,]{1,70}?)\s+(?:is an?|starts?(?: off)? as an?|begins? (?:as|at) an?)\s+(?:[a-z'’-]+\s+){0,6}$"#), before).first?.g[1] {
+                        let l = subject.lowercased()
+                        if l == "the game" || l == "this game" || !(l.hasPrefix("the ") || l.hasPrefix("this ") || l.hasPrefix("each ") || l.hasPrefix("it")) { return "base" }
+                    }
+                    var m = mode(named: before)
+                    if m == "base", section.hasPrefix("power bet") { m = section }
+                    return m ?? (section.isEmpty ? "base" : section)
+                }
+                for match in groups(size, sentence) {
+                    guard let a = Int(match.g[1]), let b = Int(match.g[2]) else { continue }
+                    let end = match.range.location + match.range.length
+                    let after = ns.substring(from: end).lowercased(), before = ns.substring(to: match.range.location).lowercased()
+                    let soon = String(after.prefix(30))
+                    // Phantoms: symbol counts ("wy1 x5" is kept out by the pattern), blast areas, masks, pick
+                    // screens, a symbol's own size.
+                    if soon.prefix(24).range(of: #"\b(mines?|explosion|explodes|surrounding|piece|chests?|win animation|super stack|dim|mask|pick|blast)\b"#, options: .regularExpression) != nil
+                        || soon.range(of: #"^\s*(\w+\s)?(symbols?|mega|giant|colossal)\b"#, options: .regularExpression) != nil
+                        || before.suffix(50).range(of: #"\b(dim|blackout|mask|blast|explosion)\b"#, options: .regularExpression) != nil { continue }
+                    // Cells counted ("15x1 independent reels"): one-cell reels laid over the game's reels.
+                    if b == 1, a > 4, indie {
+                        let reels = knownReels ?? (a % 5 == 0 ? 5 : a % 6 == 0 ? 6 : 5)
+                        guard a % reels == 0 else { continue }
+                        let m = modeAt(match.range.location, after: after)
+                        addGrid(ReelLayout.Grid(mode: m, rows: a / reels, reels: reels, independent: true, note: String(sentence.prefix(140))))
+                        continue
+                    }
+                    guard (1...12).contains(a), (1...12).contains(b) else { continue }
+                    let m = modeAt(match.range.location, after: after)
+                    // A reel beside the grid: "an additional 1x3 Hot Reel positioned above", "a 1x5 reel to the right".
+                    if soon.contains("hot reel") || soon.range(of: #"^\s*(?:\w+\s){0,2}reel\b"#, options: .regularExpression) != nil
+                        && (before.range(of: #"(additional|added|addition of|extra|an? (?:sideways|horizontal))\s*(\w+\s)?$"#, options: .regularExpression) != nil
+                            || soon.range(of: #"reel (to the (right|left)|on top|above|below)"#, options: .regularExpression) != nil) {
+                        let at = place(soon + " " + String(after.prefix(80)))
+                        let hot = soon.contains("hot reel") || lower.contains("hot reel")
+                        let r = at == "beside" ? max(a, b) : min(a, b), k = at == "beside" ? min(a, b) : max(a, b)
+                        addExtra(ReelLayout.Extra(what: hot ? "hot reel" : "extra reel", rows: r, reels: k, place: at.isEmpty ? "above" : at,
+                                                  mode: m == "base" ? nil : m))
+                        continue
+                    }
+                    if soon.range(of: #"^\s*(?:\w+\s){0,1}collection (area|row|bar)"#, options: .regularExpression) != nil {
+                        addExtra(ReelLayout.Extra(what: "collection area", rows: min(a, b), reels: max(a, b), place: place(after), mode: m == "base" ? nil : m))
+                        continue
+                    }
+                    let near = String(before.suffix(60)) + " " + String(after.prefix(60))
+                    guard ["matrix", "matrices", "reel", "grid", "layout", "lines", "ways", "game", "stepper", "spinner", "played on", "starts", "begins", "tall"]
+                            .contains(where: near.contains) else { continue }
+                    // Which number is the reels: the sentence says ("(5 reels, 4 rows)"); else the game's reel
+                    // count, from its base grid or the document's own words ("5 reels that are 3 tall"); else a
+                    // portrait game is taller than wide, any other wider. Sizes are written both ways ("a 5x3
+                    // ways game", "a 3x5 lines game"), so the order they are written in decides nothing.
+                    var rows = min(a, b), reels = max(a, b)
+                    if let r = groups(stated, sentence).compactMap({ Int($0.g[1]) }).first(where: { $0 == a || $0 == b }) {
+                        reels = r; rows = r == b ? a : b
+                    } else if let r = groups(statedRows, sentence).compactMap({ Int($0.g[1]) }).first(where: { $0 == a || $0 == b }) {
+                        rows = r; reels = r == a ? b : a
+                    } else if let k = knownReels ?? docReels, (a == k) != (b == k) {
+                        reels = k; rows = a == k ? b : a
+                    } else if portrait {
+                        rows = max(a, b); reels = min(a, b)
+                    }
+                    var g = ReelLayout.Grid(mode: m, rows: rows, reels: reels, independent: indie || holdModes.contains(m), note: String(sentence.prefix(140)))
+                    // A size this one grows from, earlier in the sentence: one grid, built at its largest.
+                    if let p = previous, p.mode == g.mode, p.reels == g.reels, p.rows != g.rows,
+                       ns.substring(with: NSRange(location: previousEnd, length: match.range.location - previousEnd)).lowercased()
+                        .range(of: #"\b(to|grows?|expands?|upgrades?|unlocks?|transitions?|increases?|becomes?)\b"#, options: .regularExpression) != nil {
+                        g.startRows = min(p.rows, g.rows); g.rows = max(p.rows, g.rows)
+                    }
+                    addGrid(g)
+                    previous = g; previousEnd = end
+                }
+                // Grids written in words: "5 reels that are 3 tall", "six variable-size reels … 3 to 10 tall".
+                for w in groups(wordGrid, sentence) {
+                    guard let k = number(w.g[1]), let r = number(w.g[2]), (1...12).contains(k), (1...12).contains(r) else { continue }
+                    addGrid(ReelLayout.Grid(mode: modeAt(w.range.location, after: ""), rows: r, reels: k, independent: indie, note: String(sentence.prefix(140))))
+                }
+                // A reel added above: "a seventh fixed-size reel above the matrix that tumbles sideways".
+                if lower.range(of: #"\b(sixth|seventh|eighth|extra|additional|sideways|horizontal)( [a-z-]+)? reel (?:that sits |positioned |placed )?(above|on top)"#, options: .regularExpression) != nil {
+                    let m = modeAt(0, after: "")
+                    addExtra(ReelLayout.Extra(what: lower.contains("hot reel") ? "hot reel" : "extra reel", rows: 1, reels: nil, place: "above", mode: m == "base" ? nil : m))
+                }
+                // Reels that grow taller: the grid of its mode, built at the height it reaches.
+                for w in groups(growTall, sentence) {
+                    guard let t = Int(w.g[1].isEmpty ? w.g[2] : w.g[1]), t <= 12 else { continue }
+                    let m = modeAt(w.range.location, after: "")
+                    if let i = out.grids.firstIndex(where: { $0.mode == m }) ?? out.grids.firstIndex(where: { $0.mode == "base" }), t > out.grids[i].rows {
+                        out.grids[i].startRows = out.grids[i].startRows ?? out.grids[i].rows; out.grids[i].rows = t
+                    }
+                }
+                // Round the reels.
+                let m = section.isEmpty ? nil : section
+                if lower.range(of: #"\bjackpot (table|paytable|pay table|area|display|meters?|plaques?|banner)s?\b|\bpaytables? above"#, options: .regularExpression) != nil {
+                    addExtra(ReelLayout.Extra(what: "jackpot table", rows: nil, reels: nil, place: place(lower)))
+                }
+                if lower.range(of: #"\b(pots?|pot avatar|collection pot)\b|\bsafe (above|fills|at the top)|\bthe safe\b|\b(hoard|basket) (above|fills)"#, options: .regularExpression) != nil {
+                    let n = groups(re(#"\b\#(num) (?:\w+ ){0,2}pots\b"#), lower).compactMap { number($0.g[1]) }.first
+                    let singular = lower.range(of: #"\bpots\b|\bpot \d"#, options: .regularExpression) == nil
+                    addExtra(ReelLayout.Extra(what: "pots", rows: nil, reels: nil, place: place(lower), count: n ?? (singular ? 1 : nil)))
+                }
+                if lower.range(of: #"\bmeters?\b"#, options: .regularExpression) != nil,
+                   lower.range(of: #"\b(win|bet|jackpot|credit) meters?\b"#, options: .regularExpression) == nil {
+                    let n = groups(re(#"\b\#(num) (?:\w+ ){0,2}meters\b"#), lower).compactMap { number($0.g[1]) }.first
+                    if n != nil || !place(lower).isEmpty { addExtra(ReelLayout.Extra(what: "meters", rows: nil, reels: nil, place: place(lower), count: n, mode: m == "base" ? nil : m)) }
+                }
+                if lower.range(of: #"\bwheels?\b"#, options: .regularExpression) != nil,
+                   lower.range(of: #"super boost wheel spin|remaining_spins"#, options: .regularExpression) == nil {
+                    wheels.formUnion(groups(re(#"\b([A-Z][a-z]+) Wheel\b"#), sentence).map(\.g[1]).filter { !["The", "A", "This", "Each", "That", "Second", "First"].contains($0) })
+                    addExtra(ReelLayout.Extra(what: "wheel", rows: nil, reels: nil, place: "", count: max(1, wheels.count)))
+                }
             }
         }
-        // A size written both ways in one mode is said, once.
-        for (mode, sizes) in seen {
-            let pairs = Set(sizes.map { "\($0.0)x\($0.1)" })
-            if sizes.contains(where: { s in sizes.contains { $0 == (s.1, s.0) && s.0 != s.1 } }) {
-                out.notes.append("The \(mode) grid is written both ways (\(pairs.sorted().joined(separator: " and "))): read as rows x reels with the fewer rows — check it.")
-            }
+        // One grid per mode and width, built at its largest: "a 3x5 or a 5x5 matrix depending on …".
+        var merged: [ReelLayout.Grid] = []
+        for g in out.grids {
+            if let i = merged.firstIndex(where: { $0.mode == g.mode && $0.reels == g.reels && $0.independent == g.independent }) {
+                let lo = min(merged[i].startRows ?? merged[i].rows, g.startRows ?? g.rows), hi = max(merged[i].rows, g.rows)
+                merged[i].rows = hi; merged[i].startRows = lo < hi ? lo : nil
+            } else { merged.append(g) }
         }
+        out.grids = merged
+        if out.grids.isEmpty { out.notes.append("The document gives no reel size.") }
         return out
     }
 }
@@ -8324,8 +8529,9 @@ public struct ReelArea: Equatable, Sendable {
     /// `grid`'s reel area, the base grid's by default; a hot reel above belongs to the base grid only.
     public init(_ layout: ReelLayout, grid: ReelLayout.Grid? = nil, cell: Int = 512) {
         let g = grid ?? layout.base ?? ReelLayout.Grid(mode: "base", rows: 3, reels: 5)
-        let hot = g == layout.base ? layout.extras.first { $0.what == "hot reel" && $0.place == "above" } : nil
-        self.init(rows: g.rows, reels: g.reels, hotRows: hot?.rows ?? 0, independent: g.independent, cell: cell)
+        // A hot reel, or any reel added above the base grid, sits in its housing on the top band.
+        let hot = g == layout.base ? layout.extras.first { ($0.what == "hot reel" || $0.what == "extra reel") && $0.place == "above" && $0.mode == nil } : nil
+        self.init(rows: g.rows, reels: g.reels, hotRows: hot.map { $0.rows ?? 1 } ?? 0, independent: g.independent, cell: cell)
     }
     /// Where a pixel is: 0 outside the frame, 1 in the band (or the hot bar), 2 a divider, 3 an opening.
     func zone(_ x: Int, _ y: Int) -> Int {

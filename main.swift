@@ -21723,13 +21723,14 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
 // What GDD to Assets reads from each document, without a window: its symbols, reels, extras and notes.
 // For checking the readers against the real corpus (Navigator --export-gdds), not against fixtures.
 if let flag = CommandLine.arguments.firstIndex(of: "--read-gdd") {
-    for path in CommandLine.arguments[(flag + 1)...] {
+    for path in CommandLine.arguments[(flag + 1)...] where path != "--json" {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { print("\(path): unreadable"); continue }
         let symbols = GDDSymbolSetRules.parse(text), reels = ReelLayoutRules.read(text)
         print("== \((path as NSString).lastPathComponent)")
         print("symbols (\(symbols.count)): " + symbols.map(\.code).joined(separator: " "))
         print("reels: " + (reels.grids.isEmpty && reels.extras.isEmpty ? "none read" : reels.summary))
         for n in reels.notes { print("note: \(n)") }
+        if CommandLine.arguments.contains("--json"), let d = try? JSONEncoder().encode(reels), let j = String(data: d, encoding: .utf8) { print("json: \(j)") }
     }
     exit(0)
 }
@@ -22029,7 +22030,7 @@ if CommandLine.arguments.contains("--art-audit") {
 // Each document's rows as the window lists them — order, role, label and the GDD's own note —
 // and how much of the document each symbol's prompt writer would be given.
 if let flag = CommandLine.arguments.firstIndex(of: "--gdd-rows") {
-    for path in CommandLine.arguments[(flag + 1)...] {
+    for path in CommandLine.arguments[(flag + 1)...] where path != "--json" {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { print("unreadable: \(path)"); continue }
         let read = GDDSymbolSetRules.parseWithProblems(text)
         let jobs = AssetPlanRules.symbolJobs(read.symbols)
@@ -25911,10 +25912,8 @@ final class GDDToAssetsRun: ObservableObject {
             return best?.px
         }
         // Modes: the base grid, then each bonus grid in turn, named as the studio's are.
-        let bonusGrids = layout.grids.filter { $0.mode != "base" }
-        let modes: [(name: String, grid: ReelLayout.Grid)] = [("base", baseGrid)]
-            // "Bonus games", as production says it — never "free", in a file name or anywhere a player could see.
-            + bonusGrids.enumerated().map { ($0.offset == 0 ? "bonusGames" : "bonusGames\($0.offset + 1)", $0.element) }
+        // Named after their modes (ReelLayout.fileModes): bonusGames, powerBet, lootLink — never "free".
+        let modes = layout.fileModes
         // 1. The base bezel and texture.
         let base = ReelArea(layout)
         if !has("base_interface_bezel.png"), let tpl = png(base.template(backing: b), base.width, base.height) {
@@ -25939,9 +25938,25 @@ final class GDDToAssetsRun: ObservableObject {
         // 2. Each mode's layers: a bonus grid re-laid by GPT round the base bezel, or the base bezel itself.
         // The bonus games' backing a new hue, as the studio's are: the base texture's own turned well round.
         let bonusHue = texture.flatMap { FrameStack.dominantHue($0.px, width: $0.w, height: $0.h) }.map { ($0 + 150).truncatingRemainder(dividingBy: 360) }
+        // A bezel laid for another grid (the document read again, a grid corrected) is not this one's: a
+        // mode's is kept in versions/ and laid again, free; the base's is said, as drawing it again is paid.
+        func laidFor(_ area: ReelArea, _ n: String) -> Bool {
+            guard let e = load(n) else { return true }
+            return e.w == area.width && e.h == area.height && area.covered(FrameKit.onBacking(e.px, b), backing: b) <= FrameStack.windowTolerance
+        }
+        if !laidFor(base, "base_interface_bezel_rmbg.png") {
+            problems.append("the base bezel was drawn for another grid than \(baseGrid.rows)×\(baseGrid.reels): Make Again ▸ Bezel")
+        }
         for (name, grid) in modes {
             let area = ReelArea(layout, grid: grid)
             let sameAsBase = name != "base" && grid.rows == baseGrid.rows && grid.reels == baseGrid.reels && grid.independent == baseGrid.independent
+            if name != "base", fm.fileExists(atPath: url("\(name)_interface_bezel_rmbg.png").path), !laidFor(area, "\(name)_interface_bezel_rmbg.png") {
+                let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+                let kept = folder.appendingPathComponent("versions/reel-\(f.string(from: Date()))")
+                try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+                for part in ["bezel", "bezel_rmbg", "dividers_rmbg"] { try? fm.moveItem(at: url("\(name)_interface_\(part).png"), to: kept.appendingPathComponent("\(name)_interface_\(part).png")) }
+                navLog("gdd reel: \(name)'s bezel was laid for another grid — kept in \(kept.lastPathComponent), laid again")
+            }
             if name != "base" && !has("\(name)_interface_bezel_rmbg.png") {
                 if sameAsBase {
                     for part in ["bezel", "bezel_rmbg", "dividers_rmbg"] { try? fm.removeItem(at: url("\(name)_interface_\(part).png")); try? fm.copyItem(at: url("base_interface_\(part).png"), to: url("\(name)_interface_\(part).png")) }

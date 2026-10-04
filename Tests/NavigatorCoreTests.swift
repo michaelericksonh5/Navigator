@@ -13219,26 +13219,91 @@ final class MarkdownGDDTests: XCTestCase {
 }
 
 final class ReelLayoutTests: XCTestCase {
-    // Two real documents, as Drive exports them (Markdown).
-    static let chevy = "# 4400 Chevy-Hot\n\n## Game Design Document\n\n# Game Overview\n\nChevy-Hot is the third entry in the Chevy game set, and features a Hot-Reel above the base game matrix that is unlocked upon powering up 2 out of the 3 base matrix reels. Base reels are powered up when a Scatter or Activator lands on the reel. Additionally, when a scatter lands on a base reel it will shoot a fireball up to the glass panel in front of the Hot Reel. When 2 of the 3 base reels are powered up and have shot fireballs at the glass, the glass in front of the Hot Reel shatters and the symbols that land on the Hot Reel are active for that spin. Any Scatters and Activators on the Hot Reel will also power up the base reel that is below that segment.\n\nIf the Hot Reel is not unlocked, symbols on the Hot Reel are not active and do not contribute to any wins.\n\nIf an SF1 lands, all Scatters present on the matrix that are active are collected and paid out. If all three Base Reels are unlocked and there is an SF1 present on the reels, the Bonus Game is unlocked. Animations for triggering the Bonus Game play out after SF1s collects all present scatters.\n\n## Symbol Set\n\n  - 0 // WD1 (Wild Symbol)\n  - 1 // HP1  (Standard HP symbols)\n  - 2-5 // MPs  (Standard MP symbols)\n  - 6-9 // LPs  (Standard LP symbols)\n  - 10 //WY1  (Standard WYSIWYG)\n  - 11        //SF1  (Special Collector Symbol)\n  - 12 //R1 (Replacement 1)\n  - 13 //BL (Blank)\n  - 14 //WY2  (Hotspot WYSIWYG)\n  - 15 //JP1  (Grand)\n  - 16 //JP2  (Major)\n  - 17 //JP3  (Minor)\n  - 18 //JP4  (Mini)\n\n## Special Symbols + Upgrades\n\n  - SF1 - Unlike the previous Chevy games, in Chevy-Hot the SF1 can appear on any of the reels. In order for the Bonus Game to be triggered, an SF1 must be present on or count towards a Base Reel's activation, and the SF1s must collect Scatters from the other two reels. SF1s that land in the base game shoot fireballs up to the Hot Reel's glass panel. The second reel that fires fireballs at the glass panel causes the glass to shatter.\n\n  - WY1 - WY1s can appear on any reels on the Base Game. The value of the WY1 will be paid out instantly if it is collected by an SF1. WY1s that land in the base game shoot a fireball up to the Hot Reel's glass panel. The second reel that fires fireballs at the glass panel causes the glass to shatter.\n\n  - WY2 - WY2s function the same as WY1s, except that they will typically have a higher value and will only appear in hotspots in the bonus game.\n\n### Upgraded Symbols:\n\nIn the base game, it is possible for SF1s or WY1s that land on the matrix to upgrade into a \"Giga\"/\"Ultra\" Scatter. When a symbol upgrades to a Giga, it launches an empowered fireball at the glass that breaks it on impact, unlocking the Hot Reel. Currently, a symbol will only upgrade to a Giga if it is the only WYSIWYG/Activator that lands on the base reels in that spin.\n\n# Game Modes & Features\n\n## Base Game Mode\n\nThe base game for Chevy-Hot is played on a 3x3 matrix, with an extra horizontal reel Hot Reel above the matrix. SF1s and WY1s are able to land on the base reels along with standard symbols, and the Hot Reel can land Scatters, Jackpots, and Activators. If any two Scatters or Activators land on two separate base reels, or if one upgrades to a Giga, the Hot Reel is unlocked and the symbols that land on it are activated.\n\n## Bonus Game Mode\n\nThe bonus game for Chevy-Hot is played on a 3x4 matrix of independent reels, and any SF1s from the base game are transferred to the bonus. The reels on that bonus game are able to land SF1s. Jackpots, and WY1s. Additionally, some spots can turn into Hotspots that also feature SF1s, Jackpots, and WY2s in place of WY1s.\n\n# Power Bet Features\n\nThis game features two power bets.\n\n## Hot-Hot Reels -\n\nMore Frequent Hot Reel Unlocks! In the first Power Bet for Chevy-Hot, the Hot Reel is triggered more frequently via scatters and Giga upgrades.\n\n## Scatter Blitz! -\n\nStandard symbols removed, no line pays. Only Scatters and Blanks! In the second Power Bet for Chevy-Hot, the reels in the base game no longer land standard symbols, and instead only land scatters and blanks.\n\n# PRESENTATION\n\n## BASE GAME\n\n  - 3x3 matrix layout with an additional 1x3 Hot Reel positioned above the main matrix\n  - Hot Reel should be visually distinct and stand out compared to the main 3x3 matrix\n  - Three open areas at the bottom align with the main matrix columns below\n  - Hot Reel is initially covered by a glass layer with subtle transparency.\n  - When a Scatter or Activator lands, a smart animation and reel highlight will play simultaneously on the reel it lands on\n  - If two or more Scatters or Activators land, the second fly-up will break the glass, revealing the Hot Reel.\n  - In Hot Reels, Scatters and Activators will highlight any unhighlighted reels they land above\n  - Scatters and Activators may also transform into a Giga Symbol that breaks the glass with a single fly-up\n  - When the Giga Symbol appears, it will be highlighted with a yellow ring around it\n  - The Activators collect Scatters to trigger a payout. Visually, this is represented by the Scatters flying into the Activator, causing its count to increase\n  - Anytime all three reels are highlighted and an Activator is present, it will trigger an animation that lights up all three highlights, indicating that the bonus has been unlocked\n  - Anticipation FX plays only on Reel 3 and the Hot Reel, featuring a blue energy glow within the reel\n\n## BONUS GAME\n\n  - 4x3 matrix layout, Independent Reels\n  - The Activator collects Scatters, shown by them flying into it and increasing its count\n  - There are special Red Scatters inside the Hot Reels that can be won along with the jackpots\n"
-    static let toyota = "# 9001 Example Pots\n\n## Game Design Document\n\n# Game Overview\n\nExample Pots is a 3x5 lines game with 3 pots that sit above the matrix in both the base and bonus games. Each pot is tied to a feature that can be won in either mode.\n\nThe base game has a collector symbol, SF1, that gathers WY1 values; the bonus game adds a second special symbol, SF2.\n\nThree BO symbols each send a flyup to their pot above the matrix, and each one can start the bonus games at random. The pots unlock these features in the bonus game: a bigger 5x5 matrix, a multiplier on the collector, and an SF2 that adds wilds or becomes an independent jackpot reel.\n\nEvery bonus starts with at least one feature, and more can be added by landing further BO symbols.\n\n## Symbol Set\n\n  - 0 WD1 // Wild\n  - 1 HP1 // High-pay 1\n  - 2 HP2 // High-pay 2\n  - 3 HP3 // High-pay 3\n  - 4 HP4 // High-pay 4\n  - 5 LP1 // Low-pay 1\n  - 6 LP2 // Low-pay 2\n  - 7 LP3 // Low-pay 3\n  - 8 LP4 // Low-pay 4\n  - 9 LP5 // Low-pay 5\n  - 10 BO1 // Bonus 1\n  - 11 BO2 // Bonus 2\n  - 12 BO3 // Bonus 3\n  - 13 WY1 // Scatter\n  - 14 WDWY1 // Wild+Way\n  - 15 SF1 // Special Feature 1\n  - 16 SF2 // Special Feature 2\n  - 17 JP1 // JP Grand\n  - 18 JP2 // JP Major\n  - 19 JP3 // JP Minor\n  - 20 JP4 // JP Mini\n  - 21 R1 // Replacement Symbol\n  - 22 BL // Blank\n\n## Special Symbols + Upgrades\n\n  - SF1 - A collector symbol for WY1 and WDWY1 values; in the bonus it can carry a multiplier.\n\n  - SF2 - Only in the bonus once its pot is unlocked: it adds WDWY1 symbols for that spin, or becomes an independent one-slot jackpot reel where it landed.\n\n# Game Modes & Features\n\n## Base Game Mode\n\nThe base game is played on a 3x5 matrix. SF1, WY1 and BO1-BO3 land with the standard symbols; BO symbols fly up to their pots above the matrix.\n\n## Bonus Game Mode\n\nThe bonus game is played on a 3x5 or a 5x5 matrix, and can grow from a 3x5 to a 5x5 matrix when the first pot's feature is unlocked part way through. It never shrinks back to a 3x5.\n\nLine wins pay as in the base game; the pot features play before them. When the SF2 becomes a jackpot reel it spins once before the next spin, and a short pop-up shows the jackpot won. A BO symbol for a feature already unlocked awards extra spins.\n\n# Power Bet Features\n\nThis game does not currently feature power bets.\n\n# PRESENTATION\n\n## BASE GAME\n\n  - 3x5 matrix layout with the jackpot table above\n  - An SF1 collects any WY1 that lands with it\n\n## BONUS GAME\n\n  - The bonus plays on a 3x5 and/or a 5x5 matrix depending on the features unlocked\n  - The SF2 either adds WDWY1 symbols or becomes an independent jackpot reel\n"
-
-    func testChevyHotsReelsAndItsHotReelAreRead() {
-        let r = ReelLayoutRules.read(Self.chevy)
-        XCTAssertEqual(r.base?.rows, 3); XCTAssertEqual(r.base?.reels, 3)
-        let bonus = r.grids.filter { $0.mode == "bonus" }
-        XCTAssertEqual(bonus.map { "\($0.rows)x\($0.reels)" }, ["3x4"]); XCTAssertTrue(bonus[0].independent)
-        XCTAssertEqual(r.grids.count, 2)
-        XCTAssertEqual(r.extras.first { $0.what == "hot reel" }.map { "\($0.rows ?? 0)x\($0.reels ?? 0) \($0.place)" }, "1x3 above")
-        XCTAssertTrue(r.notes.contains { $0.contains("written both ways") }, "\(r.notes)")
+    // The wording patterns of the studio's GDDs, in sentences written for these tests (the documents
+    // themselves stay out of this public repository). The reader is checked against the real corpus with
+    // Navigator --read-gdd.
+    static let chevy = """
+    # 9000 Example Hot
+    # Game Modes & Features
+    ## Base Game Mode
+    The base game is played on a 3x3 matrix, with an extra horizontal reel Hot Reel above the matrix.
+    ## Bonus Game Mode
+    The bonus game is played on a 3x4 matrix of independent reels, and any SF1s from the base game are transferred to the bonus.
+    # PRESENTATION
+    ## BASE GAME
+      - 3x3 matrix layout with an additional 1x3 Hot Reel positioned above the main matrix
+    ## BONUS GAME
+      - 4x3 matrix layout, Independent Reels
+    """
+    static let toyota = """
+    # 9001 Example Pots
+    Example Pots is a 3x5 lines game with 3 pots that sit above the matrix in both the Base and Bonus games.The pots are tied to features unlocked during the bonus game: an upgrade to a 5x5 matrix, and an independent jackpot reel.
+    Bonus Game Mode
+    Spinning & Winning
+    The bonus game is played out on either a 3x5 or a 5x5 matrix depending on if the Pot 1 mechanic is active, and can transition from a 3x5 to a 5x5 matrix. It is not possible for the matrix to downgrade from a 5x5 to a 3x5.
+    PRESENTATION
+      - 3x5 matrix layout with the jackpot table above
+    """
+    func grids(_ t: String) -> [String] {
+        ReelLayoutRules.read(t).grids.map { "\($0.mode) \($0.startRows.map { "\($0)→" } ?? "")\($0.rows)x\($0.reels)\($0.independent ? " independent" : "")" }
     }
-    func testToyotasReelsPotsAndJackpotTableAreRead() {
+
+    // A bonus grid written reels first ("3x4" of a 3-reel game) is 4 rows of 3; the hot reel sits above.
+    func testABonusGridIsOrientedByTheGamesReels() {
+        let r = ReelLayoutRules.read(Self.chevy)
+        XCTAssertEqual(grids(Self.chevy), ["base 3x3", "bonus 4x3 independent"])
+        XCTAssertEqual(r.extras.first { $0.what == "hot reel" }.map { "\($0.rows ?? 0)x\($0.reels ?? 0) \($0.place)" }, "1x3 above")
+    }
+    // A headline is the base game's; a grid that grows is one grid; "independent jackpot reel" is not independent reels.
+    func testAGrowingBonusIsOneGridAndPotsAreCounted() {
         let r = ReelLayoutRules.read(Self.toyota)
-        XCTAssertEqual(r.base.map { "\($0.rows)x\($0.reels)" }, "3x5")
-        XCTAssertEqual(r.grids.map { "\($0.mode) \($0.rows)x\($0.reels)\($0.independent ? " independent" : "")" }, ["base 3x5", "bonus 5x5", "bonus 3x5"])
-        XCTAssertTrue(r.extras.contains { $0.what == "pots" && $0.place == "above" })
-        XCTAssertTrue(r.extras.contains { $0.what == "jackpot table" })
-        XCTAssertFalse(r.extras.contains { $0.what == "hot reel" })
+        XCTAssertEqual(grids(Self.toyota), ["base 3x5", "bonus 3→5x5"])
+        XCTAssertEqual(r.extras.first { $0.what == "pots" }.map { "\($0.count ?? 0) \($0.place)" }, "3 above")
+        XCTAssertEqual(r.extras.first { $0.what == "jackpot table" }?.place, "above")
+    }
+    // Sizes are written both ways; the sentence, then the document, says which number is the reels.
+    func testSizesAreOrientedByWhatTheDocumentSays() {
+        XCTAssertEqual(grids("Example is a 5x3 ways game with two special modes."), ["base 3x5"])
+        XCTAssertEqual(grids("Example is a tumbling game played on a 5×4 matrix (5 reels, 4 rows) in the base game, expanding to a 5×6 matrix during the bonus round."),
+                       ["base 4x5", "bonus 6x5"])
+        XCTAssertEqual(grids("The initial matrix has 3 reels that are 4 tall. The matrix begins at 3x4 before expanding."), ["base 4x3"])
+        XCTAssertEqual(grids("Shadow of the jungle with an 8x5 reel set.\nThe game is a \"tall\" portrait mode only setting."), ["base 8x5"])
+    }
+    // Hold-and-spin modes are their own, cells counted ("15x1 independent reels") laid over the game's reels.
+    func testHoldAndSpinModesAndCountedCells() {
+        XCTAssertEqual(grids("Example is a 3x5 lines game.\nLoot Link\nThe matrix changes to a 15x1 independent reels matrix."), ["base 3x5", "loot link 3x5 independent"])
+        XCTAssertEqual(grids("Example is a 4x5 ways game.\nThe matrix changes to a 40x1 independent reels matrix during the bonus game."), ["base 4x5", "bonus 8x5 independent"])
+    }
+    // Grids in words, and reels that grow.
+    func testGridsWrittenInWords() {
+        XCTAssertEqual(grids("The matrix has 5 reels that are 3 tall."), ["base 3x5"])
+        let mercury = "It features six variable-size reels and a seventh fixed-size reel above the matrix that tumbles sideways. Reels 1 and 6 can be anywhere from 3 to 10 tall."
+        XCTAssertEqual(grids(mercury), ["base 3→10x6"])
+        XCTAssertTrue(ReelLayoutRules.read(mercury).extras.contains { $0.what == "extra reel" && $0.place == "above" })
+        XCTAssertEqual(grids("It starts out with a 6x6 matrix, but each reel can expand independently to be 12 tall."), ["base 6→12x6"])
+    }
+    // Each grid's files are named after its mode, base first, never "free".
+    func testGridsAreNamedAfterTheirModes() {
+        let t = "Example is a 4x5 ways game.\nThe free games are played on a 4x5 matrix of independent reels.\nPower Bet\nThe power bet is played on a 4x6 matrix.\nLoot Link\nThe matrix changes to a 40x1 independent reels matrix."
+        XCTAssertEqual(ReelLayoutRules.read(t).fileModes.map(\.name), ["base", "bonusGames", "powerBet", "lootLink"])
+    }
+    // Not grids: symbol counts, blast areas, masks, a symbol's size, build paths.
+    func testPhantomSizesAreNotGrids() {
+        for t in ["Landing wy1 x5 pays the line.", "A 3x3 mine explodes around it.", "When a 2x2 symbol lands on the reels it pays double.",
+                  "For the dim, a blackout covers the screen, then a 5x1 piece covers the reels.", "Builds: //builds/Example_7x7/"] {
+            XCTAssertEqual(grids(t), [], t)
+        }
+    }
+    // The document's title names the game, not a mode; credits are not sections; the promotions' copied
+    // "super boost wheel spins" is not a wheel. A real wheel is counted by its names.
+    func testTitlesCreditsPromotionsAndWheels() {
+        XCTAssertEqual(grids("# Example Deluxe Power Bet\nExample Deluxe with Power Bet is a 5x5 version of the game."), ["base 5x5"])
+        XCTAssertEqual(grids("Sound Designer\nA. Person\nGeneral Structure\nExample is a 3x5 lines game."), ["base 3x5"])
+        let promo = "Example is a 3x5 lines game.\nJourney-based Promotions\nNode table\nMessaging\n  * {REMAINING_SPINS} super boost wheel spins have been awarded.\nEach spin of the wheel increases a meter."
+        XCTAssertFalse(ReelLayoutRules.read(promo).extras.contains { $0.what == "wheel" })
+        let wheel = "Example is a 4x5 game. Landing 3 coins triggers the Jackpot Wheel. Landing the Bonus wedge shows the Bonus Wheel."
+        XCTAssertEqual(ReelLayoutRules.read(wheel).extras.first { $0.what == "wheel" }?.count, 2)
+        XCTAssertEqual(ReelLayoutRules.read("Nothing about reels here.").notes, ["The document gives no reel size."])
     }
 }
 
@@ -13288,13 +13353,13 @@ final class ReelAreaTests: XCTestCase {
         XCTAssertEqual(div[di + 3], 255); XCTAssertEqual(bezel[di + 3], 0)
         XCTAssertEqual(bezel[((mid.y + 10) * a.width + mid.x + 10) * 4 + 3], 0)
     }
-    // An independent grid (Chevy-Hot's 3x4 bonus): a window per cell, dividers between rows as well as reels.
+    // An independent grid (a 4-row, 3-reel bonus): a window per cell, dividers between rows as well as reels.
     func testAnIndependentGridHasAWindowPerCell() {
         let layout = ReelLayoutRules.read(ReelLayoutTests.chevy)
         let bonus = layout.grids.first { $0.mode == "bonus" }!
         let a = ReelArea(layout, grid: bonus, cell: 200)
-        XCTAssertEqual(a.windows.count, 12); XCTAssertEqual(a.dividers.count, 2 + 3)       // 2 between rows, 3 between reels
-        XCTAssertEqual(a.grid.h, 3 * 200 + 2 * a.gap)
+        XCTAssertEqual(a.windows.count, 12); XCTAssertEqual(a.dividers.count, 3 + 2)       // 3 between rows, 2 between reels
+        XCTAssertEqual(a.grid.h, 4 * 200 + 3 * a.gap)
         let px = a.template(backing: RGB8(255, 0, 255))
         XCTAssertEqual(a.covered(px, backing: RGB8(255, 0, 255)), 0, accuracy: 1e-9)
         XCTAssertFalse(a.windows.contains { $0.h < 200 })                                  // no hot reel in the bonus grid
