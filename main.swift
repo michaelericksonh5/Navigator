@@ -780,17 +780,26 @@ enum APIKeys {
 /// call's cost is worked out from the usage it returns. Blocks; call off the main thread.
 enum OpenAIImages {
     static let model = "gpt-image-2.5-sunburst"
-    /// A 2048 high-quality edit, before its usage is known: the fal reference table's 1024 high is $0.22.
-    static let estimate = 0.30
+    /// A 2048 high-quality edit before its usage is known: measured $0.121–0.134 a call over 14 calls,
+    /// one in four drawn twice (2026-10-03).
+    static let estimate = 0.16
     static var available: Bool { APIKeys.lookup("OpenAI").key != nil }
 
+    /// With no images, a new image from the prompt (images/generations); with some, an edit of the last,
+    /// the others its references (images/edits).
     static func edit(prompt: String, images: [Data], size: Int = 2048, quality: String = "high") -> (png: Data?, cost: Double, error: String?) {
         guard let key = APIKeys.openAI else { return (nil, 0, "No OpenAI API key: set one in AI → API Keys…") }
         guard !PaidCalls.disabled else { return (nil, 0, PaidCalls.refusal) }
-        var req = URLRequest(url: URL(string: "https://api.openai.com/v1/images/edits")!, timeoutInterval: 360)
+        var req = URLRequest(url: URL(string: "https://api.openai.com/v1/images/\(images.isEmpty ? "generations" : "edits")")!, timeoutInterval: 360)
         req.httpMethod = "POST"
-        let boundary = "navigator-\(UUID().uuidString)"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if images.isEmpty {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model, "prompt": prompt, "size": "\(size)x\(size)", "quality": quality,
+                                                                         "background": "opaque", "output_format": "png", "n": 1])
+            return send(req, size: size, quality: quality)
+        }
+        let boundary = "navigator-\(UUID().uuidString)"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         var body = Data()
         func field(_ name: String, _ value: String) {
@@ -804,6 +813,10 @@ enum OpenAIImages {
         }
         body.append("--\(boundary)--\r\n".data(using: .utf8)!)
         req.httpBody = body
+        return send(req, size: size, quality: quality)
+    }
+
+    private static func send(_ req: URLRequest, size: Int, quality: String) -> (png: Data?, cost: Double, error: String?) {
         let done = DispatchSemaphore(value: 0)
         var data: Data?, status = 0, failure: String?
         URLSession.shared.dataTask(with: req) { d, r, e in
@@ -25545,8 +25558,12 @@ final class GDDToAssetsRun: ObservableObject {
             log.write("prompts/\(step.id).txt", "MODE: frame parts\nATTACHED: \(refs.isEmpty ? "nothing" : refs.joined(separator: ", "))\n\n\(prompt)")
             let job = AssetJob(id: step.id, kind: .symbol, role: .unknown, tier: nil, title: "", aspect: "1:1", size: "2K")
             // A sheet with no length of moulding on it is drawn once more.
+            // Drawn by the set's frame artist, so a fallback frame is in the same hand as the rest.
+            let gptSheet = DispatchQueue.main.sync { FrameArtist(self.styledDesign) == .gpt } && OpenAIImages.available
             for _ in 1...2 {
-                let r = sizedRequest(job, prompt: prompt, inputs: resolved.inputs, model: model)
+                let r: (png: Data?, cost: Double, error: String?) = gptSheet
+                    ? OpenAIImages.edit(prompt: prompt, images: resolved.inputs.map { downsamplePNG($0, longEdge: 2048) ?? $0 })
+                    : { let x = sizedRequest(job, prompt: prompt, inputs: resolved.inputs, model: model); return (x.png, x.cost, x.error) }()
                 cost += r.cost
                 guard let png = r.png else { error = r.error ?? "no image returned"; break }
                 if parts(png) != nil {

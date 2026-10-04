@@ -6504,7 +6504,9 @@ final class FileOperationDiskTests: XCTestCase {
     private let directory = FileManager.default.temporaryDirectory.appendingPathComponent("NavigatorDiskTests-\(UUID().uuidString)")
     private var trashed: [URL] = []
     private var oldDefaults: UserDefaults?
-    private let suite = "NavigatorDiskTests-\(UUID().uuidString)"
+    // One fixed domain, emptied after each test: a new name per run left an empty plist behind in
+    // ~/Library/Preferences every time (2,724 of them by 2026-10-04).
+    private let suite = "NavigatorDiskTests"
 
     override func setUpWithError() throws {
         try fm.createDirectory(at: directory, withIntermediateDirectories: false)
