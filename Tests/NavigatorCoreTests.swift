@@ -13093,7 +13093,8 @@ final class PayLadderTests: XCTestCase {
         let step = RenderStep(id: "HP1", mode: .anchor, refs: [], after: [])
         let d = GDDAssetPrompts.brief(job: hp1, step: step, theme: theme, design: layered,
                                       backing: (name: "chroma magenta", rgb: RGB8(255, 0, 255)), gameName: "", jobs: jobs)
-        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, cut off straight across just below the shoulders. Whatever the description says, nothing below that cut is in the picture"), d)
+        XCTAssertTrue(d.contains("It is shown as a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, the hair kept close around the head"), d)
+        XCTAssertTrue(d.contains("cut off straight across just below the shoulders. Whatever the description says, nothing below that cut is in the picture"), d)
         XCTAssertFalse(d.contains("whole and uncropped"), d)
         // Painted into its frame, HP1 is told to break out of it.
         let painted = GDDAssetPrompts.symbolBrief(job: hp1, jobs: jobs, design: SetDesign(anchorID: "HP1", look: "Glossy."), theme: theme)

@@ -13116,8 +13116,10 @@ public enum PayLadder {
         switch rank(job, in: jobs) {
         // "Mostly his face" (the art director); "portrait" was dropped after a draw came back with a
         // painted scene behind it.
-        case 1: return "a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, cut off straight across just below the shoulders"
-        case 2: return "head and full shoulders, the whole head in view, cut off straight across at the top of the chest"
+        // Hair kept to the head: a goddess's hair spread to every edge of her picture, hid her frame and
+        // left no backing to see (2026-10-04).
+        case 1: return "a close head-and-shoulders bust, mostly face: the face large, the whole head and hair in view, the hair kept close around the head and falling behind the shoulders — never spread across the picture — with plain background on both sides of the head, cut off straight across just below the shoulders"
+        case 2: return "head and full shoulders, the whole head in view, the hair kept close around the head with plain background on both sides of it, cut off straight across at the top of the chest"
         case 3: return "head, shoulders and the top of the chest, cut off straight across there"
         case 4: return "head down to the chest, cut off straight across below it"
         default: return "from the waist up, cut off straight across at the waist"

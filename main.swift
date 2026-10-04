@@ -24744,6 +24744,10 @@ final class GDDToAssetsRun: ObservableObject {
     /// A game's structure set or corrected by hand, without starting the plan over: the reel layout, and for a
     /// typed set its document and the jackpots' names; backgrounds the structure adds or drops follow it.
     func applySheet(_ sheet: GameSheet, backgroundSize: String, backgroundAspect: String) {
+        // A reopened set has its jobs, not the symbol list it was planned from.
+        if symbols.isEmpty {
+            symbols = jobs.filter { $0.kind == .symbol }.enumerated().map { SlotSymbol(code: $0.element.id, index: $0.offset, role: $0.element.role, tier: $0.element.tier, note: $0.element.title) }
+        }
         guard !symbols.isEmpty else { return }
         reelLayout = sheet.layout(symbols)
         guard typed else { return }
@@ -25947,6 +25951,14 @@ final class GDDToAssetsRun: ObservableObject {
             try? fm.moveItem(at: folder.appendingPathComponent(n), to: kept.appendingPathComponent(n))
         }
         return true
+    }
+
+    /// The interface previews in Finder (reel, wheel, pop-up and pot sheets), or the set's folder when none.
+    func showPreviews() {
+        guard let folder = lastFolder else { return }
+        let previews = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
+            .filter { $0.hasSuffix("-preview.jpg") }.map { folder.appendingPathComponent($0) }
+        NSWorkspace.shared.activateFileViewerSelecting(previews.isEmpty ? [folder] : previews)
     }
 
     /// The window's "Make reel area": the set's reel area made in the background, said in the status.
@@ -27225,6 +27237,10 @@ extension GDDToAssetsRun {
             var at = FrameStack.placement(subject: e, window: f.window, cut: cut, width: fit.width, height: fit.height,
                                           ceiling: crest.map { $0.y + $0.size / 4 })
             var clipBox = cut.any ? FrameStack.clip(cut, window: f.window) : nil
+            // A bust set by its face breaks out where the studio's do: its head over the frame's top, its
+            // shoulders over the sides — not its hair over everything. The goddess's hair, as wide as her
+            // canvas, buried HP1's frame to its bottom bar (2026-10-04).
+            var head: (cx: Double, half: Double, shoulders: Double)? = nil
             // Below, a bust ends behind the window's own floor — a round, arched, shield or diamond
             // window's included, not only a straight one.
             let followsFloor = cut.bottom || faces[id] != nil
@@ -27239,6 +27255,10 @@ extension GDDToAssetsRun {
                 at = FrameStack.facePlacement(subject: e, face: (fb.minX, fb.minY, fb.width, fb.height), window: o, faceShare: rule.share, lift: lift)
                 let side = rule.sides * (rim?.across ?? 0.22) * Double(o.w)
                 clipBox = (Double(o.x) - side, -.infinity, Double(o.x + o.w) + side, Double(o.y + o.h))
+                let k = at.w / Double(max(1, e.w))
+                let fx = at.x + (Double(fb.minX) - Double(e.x)) * k, fw = Double(fb.width) * k
+                // Shoulders start a little below the chin; hair hanging beside the chin stays inside.
+                head = (fx + fw / 2, fw, at.y + (Double(fb.maxY) - Double(e.y)) * k + 0.4 * Double(fb.height) * k)
                 navLog(String(format: "gdd stack: %@ set by its face — %.0f%% of the window tall, head %.0f%% over its top", id, rule.share * 100, lift * 100))
             }
             guard var body = canvas(crop, CGRect(x: at.x, y: at.y, width: at.w, height: at.h), W, H) else { continue }
@@ -27247,7 +27267,18 @@ extension GDDToAssetsRun {
                     let o = f.window
                     for y in 0..<H { for x in 0..<W {
                         let under = followsFloor && y > f.floor[min(o.x + o.w - 1, max(o.x, x))]
-                        if under || Double(x) < c.x0 || Double(x) >= c.x1 || Double(y) < c.y0 || Double(y) >= c.y1 { p[(y * W + x) * 4 + 3] = 0 }
+                        var out = under || Double(x) < c.x0 || Double(x) >= c.x1 || Double(y) < c.y0 || Double(y) >= c.y1
+                        // Above its shoulders it keeps to its window, but for its head's own column rising over the top,
+                        // that column's sides softened so hair is not cut off straight.
+                        if let hd = head, !out, Double(y) < hd.shoulders {
+                            if x < o.x || x >= o.x + o.w { out = true }
+                            else if Double(y) < Double(o.y) {
+                                let past = abs(Double(x) - hd.cx) - hd.half, soft = 0.3 * hd.half
+                                if past >= soft { out = true }
+                                else if past > 0 { let i = (y * W + x) * 4 + 3; p[i] = UInt8(Double(p[i]) * (1 - past / soft)) }
+                            }
+                        }
+                        if out { p[(y * W + x) * 4 + 3] = 0 }
                     } }
                 }
                 if cut.any { navLog("gdd stack: \(id) is cut off along its \([cut.left ? "left" : nil, cut.right ? "right" : nil, cut.top ? "top" : nil, cut.bottom ? "bottom" : nil].compactMap { $0 }.joined(separator: " and ")) — set behind the frame's rim there") }
@@ -27630,6 +27661,17 @@ struct GDDReviewView: View {
             Button("Export for Spine…") { exportForSpine() }
                 .disabled(ready.isEmpty)
                 .help("A layer kit per approved symbol, in the format the Spine generator reads")
+            // The game interface of a reopened set, from the structure saved with it.
+            Menu("Game Interface") {
+                Button("Make What’s Missing") { run.makeReelArea() }
+                Menu("Make Again") { ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } } }
+                Divider()
+                Button("Show the Previews") { run.showPreviews() }
+            }
+            .fixedSize()
+            .disabled(run.reelLayout == nil || !OpenAIImages.available || run.keying)
+            .help(run.reelLayout == nil ? "This set was made before its structure was saved with it: make its interface from the GDD to Assets window."
+                  : "The reel area, jackpot table, pots, wheels and pop-ups of this set's structure (\(run.reelLayout!.summary)). Only what isn't made yet is drawn, about $0.07–0.15 a piece; Make Again keeps the current files in versions/.")
         }
         .padding(12)
     }
@@ -28763,13 +28805,7 @@ struct GDDToAssetsSheet: View {
                         Menu("Make Again") {
                             ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
                             Divider()
-                            Button("Show the Previews") {
-                                guard let folder = run.lastFolder else { return }
-                                let previews = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-                                    .filter { $0.hasSuffix("-preview.jpg") }
-                                    .map { folder.appendingPathComponent($0) }
-                                NSWorkspace.shared.activateFileViewerSelecting(previews.isEmpty ? [folder] : previews)
-                            }
+                            Button("Show the Previews") { run.showPreviews() }
                         }
                         .fixedSize()
                         .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
