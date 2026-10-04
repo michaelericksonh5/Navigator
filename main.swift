@@ -3706,7 +3706,7 @@ enum VertexSetup {
             address once. Ask Michael for the Vertex service address and paste it below.
 
             You do NOT need Node.js, Claude, or any plugin — and no API key. After this, \
-            AI → Sign in to Vertex opens a normal Google sign-in in your browser.
+            AI → Sign in to Google opens a normal Google sign-in, which connects Vertex, Docs and the theme hub at once.
             """
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         field.placeholderString = "https://…"
@@ -3731,6 +3731,54 @@ enum VertexSetup {
         return v
     }
 
+    /// One Google sign-in for everything Navigator does with Google: Vertex (the token the service hands
+    /// back), and Docs and the theme hub (the web session's cookies). The Vertex sign-in runs in Navigator's
+    /// own web window, so the Google login made there is the web session too; once the token is back, the
+    /// same window opens the theme hub to confirm it, then closes. With no Vertex service set up, just the
+    /// web sign-in. Calls back on the main thread with the account (when Vertex confirmed one) or an error.
+    @MainActor static func signInEverywhere(completion: @escaping (String?, String?) -> Void) {
+        let hub = GoogleWebSession.themeHubURL.flatMap(URL.init(string:))
+        guard let base = H5GService.baseURL else {
+            guard let hub else { completion(nil, "Neither the Vertex service nor the theme hub is set up on this Mac."); return }
+            GoogleWebSession.shared.presentSignIn(startAt: hub) { completion(nil, nil) }
+            return
+        }
+        var stateBytes = [UInt8](repeating: 0, count: 8)
+        _ = SecRandomCopyBytes(kSecRandomDefault, stateBytes.count, &stateBytes)
+        let state = stateBytes.map { String(format: "%02x", $0) }.joined()
+        let server = LoopbackCallback()
+        guard let port = server.start(state: state) else { completion(nil, "Couldn’t open a local port for the sign-in callback."); return }
+        var comps = URLComponents(string: base + "/auth/start")
+        comps?.queryItems = [URLQueryItem(name: "redirect_uri", value: "http://127.0.0.1:\(port)/cb"), URLQueryItem(name: "state", value: state)]
+        guard let authURL = comps?.url else { server.stop(); completion(nil, "Couldn’t build the sign-in URL from \(base)."); return }
+        navLog("google sign-in: one window for Vertex, Docs and the hub, callback on 127.0.0.1:\(port)")
+        var finished = false
+        func finish(_ email: String?, _ err: String?) {
+            guard !finished else { return }
+            finished = true; server.stop(); completion(email, err)
+        }
+        GoogleWebSession.shared.presentSignIn(startAt: authURL) {
+            // Closed before the token came back: the web session may still be signed in, Vertex is not.
+            MainActor.assumeIsolated { finish(nil, "The sign-in window was closed before Vertex finished.") }
+        }
+        server.await(timeout: 300) { token, err in
+            guard let token else { DispatchQueue.main.async { MainActor.assumeIsolated { finish(nil, err ?? "The sign-in didn’t complete.") } }; return }
+            if let writeErr = writeToken(token) { DispatchQueue.main.async { MainActor.assumeIsolated { finish(nil, writeErr) } }; return }
+            let who = H5GService.me()
+            DispatchQueue.main.async { MainActor.assumeIsolated {
+                guard let email = who.email else { finish(nil, who.error ?? "Signed in, but the service didn’t confirm who you are."); return }
+                guard let hub, GoogleWebSession.shared.signInOpen else { GoogleWebSession.shared.closeSignIn(); finish(email, nil); return }
+                // The same Google session, on to the hub: loaded, it serves Docs and the themes too.
+                GoogleWebSession.shared.navigateSignIn(to: hub) { ok in
+                    navLog("google sign-in: \(email); theme hub \(ok ? "reached" : "not reached")")
+                    finish(email, ok ? nil : "Signed in to Vertex as \(email), but the theme hub didn’t open — sign in to Google in the window if it asks.")
+                    if ok { GoogleWebSession.shared.closeSignIn() }
+                }
+            } }
+        }
+    }
+
+    /// The browser-only Vertex sign-in, kept for a Mac whose web view Google turns away.
     /// Run the loopback sign-in. Calls back on the main thread with the signed-in email, or an error.
     static func signIn(completion: @escaping (String?, String?) -> Void) {
         guard let base = H5GService.baseURL else {
@@ -4029,7 +4077,7 @@ func promptVertexSetup() {
 func promptVertexSignin() {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = "Sign in to Vertex first"
-    a.informativeText = "Navigator's Vertex features run through your High 5 Games account. Sign in from the menu bar: AI → Sign in to Vertex…"
+    a.informativeText = "Navigator's Vertex features run through your High 5 Games account. Sign in from the menu bar: AI → Sign in to Google…"
     a.addButton(withTitle: "OK"); a.runModal()
 }
 
@@ -19047,7 +19095,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let qaItem = aiMenu.addItem(withTitle: "Install Finder Quick Actions", action: #selector(installFinderQuickActions(_:)), keyEquivalent: "")
         qaItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
-        let vSignIn = aiMenu.addItem(withTitle: "Sign in to Vertex…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
+        let vSignIn = aiMenu.addItem(withTitle: "Sign in to Google (Vertex, Docs, theme hub)…", action: #selector(vertexSignInAction(_:)), keyEquivalent: "")
         aiMenu.addItem(withTitle: "Copy Team Setup Link…", action: #selector(copyVertexSetupLinkAction(_:)), keyEquivalent: "")
         vSignIn.target = self
         let vStatus = aiMenu.addItem(withTitle: "Vertex Status…", action: #selector(vertexStatusAction(_:)), keyEquivalent: "")
@@ -19173,30 +19221,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // A modal "go and do it in your browser" note, dismissed BY the result rather than left for
         // the person to close. The first version left both on screen at once, which a live run of
         // the whole flow showed and reading the code did not.
-        let note = NSAlert()
-        note.messageText = "Finish the sign-in in your browser"
-        note.informativeText = "Pick your @high5games.com account. Navigator will confirm here "
-                             + "when it's done, or you can cancel and try later."
-        note.addButton(withTitle: "Cancel")
-        var cancelled = false
-        VertexSetup.signIn { email, err in
-            // The person gave up and closed the note; do not ambush them with a result later.
-            guard !cancelled else { return }
-            NSApp.abortModal()
-            note.window.orderOut(nil)
+        // One sign-in, in Navigator's own window: Vertex, Google Docs and the theme hub together.
+        MainActor.assumeIsolated { VertexSetup.signInEverywhere { email, err in
             let a = NSAlert()
-            if let email {
-                a.messageText = "Signed in to Vertex"
-                a.informativeText = "Account: \(email)\nThe session lasts about 30 days."
+            if let email, err == nil {
+                a.messageText = "Signed in to Google"
+                a.informativeText = "Account: \(email)\nVertex, Google Docs and the theme hub are all connected. The Vertex session lasts about 30 days."
             } else {
                 a.alertStyle = .warning
-                a.messageText = "Vertex sign-in didn’t finish"
+                a.messageText = email == nil ? "Sign-in didn’t finish" : "Signed in to Vertex"
                 a.informativeText = err ?? "Unknown error."
             }
             a.addButton(withTitle: "OK")
             a.runModal()
-        }
-        if note.runModal() == .alertFirstButtonReturn { cancelled = true }
+        } }
     }
 
     // Nudge, once per version, if Navigator's Finder menu is switched off.
@@ -19257,7 +19295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                     a.alertStyle = .warning
                     a.messageText = "Not signed in to Vertex"
                     a.informativeText = (who.error.map { $0 + "\n\n" } ?? "")
-                        + "Use AI → Sign in to Vertex (Imagen)… to sign in with your High 5 Games Google account."
+                        + "Use AI → Sign in to Google… to sign in with your High 5 Games Google account."
                 }
                 a.addButton(withTitle: "OK"); a.runModal()
             }
@@ -19903,7 +19941,7 @@ enum H5GService {
         if PaidCalls.disabled { return (nil, nil, PaidCalls.refusal) }
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
         guard let token else {
-            return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
+            return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Google first.")
         }
         guard let url = URL(string: base + "/v1/images") else { return (nil, nil, "bad service URL") }
         var body: [String: Any] = ["prompt": prompt, "model": modelID]
@@ -20085,7 +20123,7 @@ enum H5GService {
         if PaidCalls.disabled { return (nil, nil, PaidCalls.refusal) }
         guard let base = baseURL else { return (nil, nil, "Couldn’t find the AI service URL.") }
         guard let token else {
-            return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Vertex first.")
+            return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Google first.")
         }
         guard let url = URL(string: base + "/v1/vision") else { return (nil, nil, "bad service URL") }
         var body: [String: Any] = ["prompt": prompt]
@@ -22946,6 +22984,27 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     // MARK: - Sign in
 
     private var signInWindow: NSWindow?
+    private var signInWeb: WKWebView?
+    static let safariAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15"
+    var signInOpen: Bool { signInWindow != nil }
+    /// The sign-in window on to `url`, answering true once a page that is not Google's sign-in has loaded
+    /// there (30 seconds at most), false otherwise. For checking the hub once the Google session is set.
+    func navigateSignIn(to url: URL, _ done: @escaping (Bool) -> Void) {
+        guard let web = signInWeb else { done(false); return }
+        web.load(URLRequest(url: url))
+        func poll(_ n: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak web] in
+                MainActor.assumeIsolated {
+                    guard let web else { done(false); return }
+                    if !web.isLoading, let u = web.url, u.host == url.host, !Self.isSignInPage(u) { done(true); return }
+                    if n > 60 { done(false); return }
+                    poll(n + 1)
+                }
+            }
+        }
+        poll(0)
+    }
+    func closeSignIn() { signInWindow?.close() }
 
     /// Show a real browser window on `url` so the user can sign in to Google normally.
     ///
@@ -22965,6 +23024,10 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()
         let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 980, height: 760), configuration: cfg)
+        // Safari's own: Google turns away a sign-in from an app's web view it does not recognise as a
+        // browser, and the Vertex sign-in runs here too, so one Google sign-in serves every use.
+        web.customUserAgent = Self.safariAgent
+        signInWeb = web
         web.load(URLRequest(url: url))
         let w = NSWindow(contentRect: web.frame,
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -22979,7 +23042,7 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
                                                        object: w, queue: .main) { [weak self] _ in
             if let t = token { NotificationCenter.default.removeObserver(t) }
             Task { @MainActor in
-                self?.signInWindow = nil
+                self?.signInWindow = nil; self?.signInWeb = nil
                 // The worker holds the OLD session's state; drop it so the next request
                 // starts from the cookies that were just established.
                 self?.worker = nil; self?.host?.close(); self?.host = nil
@@ -23231,9 +23294,8 @@ enum ThemeHubClient {
     @MainActor static func check(_ done: @escaping (String) -> Void) {
         themes { list, err in
             if let list { done("Connected — \(list.count) themes."); return }
-            if err == GoogleWebSession.signInNeeded, let base = GoogleWebSession.themeHubURL,
-               let u = URL(string: base) {
-                GoogleWebSession.shared.presentSignIn(startAt: u) {
+            if err == GoogleWebSession.signInNeeded, GoogleWebSession.themeHubURL != nil {
+                VertexSetup.signInEverywhere { _, _ in
                     themes { l, e in done(l.map { "Connected — \($0.count) themes." } ?? "Couldn’t load themes: \(e ?? "unknown error")") }
                 }
                 return
@@ -28540,8 +28602,7 @@ struct GDDToAssetsSheet: View {
     }
 
     private func offerSignIn(then retry: @escaping () -> Void) {
-        guard let base = GoogleWebSession.themeHubURL, let u = URL(string: base) else { return }
-        GoogleWebSession.shared.presentSignIn(startAt: u) { retry() }
+        VertexSetup.signInEverywhere { _, _ in retry() }
     }
 
     /// Open the hub itself, so the themes and their reference art can be browsed.

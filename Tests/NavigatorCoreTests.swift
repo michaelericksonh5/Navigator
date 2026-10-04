@@ -7509,7 +7509,7 @@ final class TransferExecutionTests: XCTestCase {
 
     func testUndoPartialTransferUsesOnlySuccessfulOutcomes() throws {
         let oldDefaults = TrashOrigins.defaults
-        let suite = "NavigatorTransferUndo-\(UUID().uuidString)"
+        let suite = "NavigatorTransferUndo"   // one fixed domain: a new name per run left an empty plist each time
         TrashOrigins.defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { TrashOrigins.defaults.removePersistentDomain(forName: suite); TrashOrigins.defaults = oldDefaults }
 
