@@ -13307,6 +13307,65 @@ final class ReelLayoutTests: XCTestCase {
     }
 }
 
+final class WheelAndPopUpTests: XCTestCase {
+    // A jackpot wheel whose bonus wedge opens a second wheel that picks the bonus (the Tiki Titans pattern),
+    // in sentences written for this test.
+    static let wheels = """
+    Example is a 4x5 tumbling game.
+    Jackpot Trigger
+    Accumulating 3 or more Jackpot Coins triggers the Jackpot Wheel event. The wheel has wedges for the Mini, Minor, Major and Grand jackpots and a special Bonus Game wedge.
+    If the wheel lands on the Bonus Game wedge, the Bonus Wheel appears after a moment. Each wedge on the Bonus Wheel represents a mode for entering the bonus: the standard bonus, random wilds, or a special collector, with the number of free spins awarded.
+    One More Chance can trigger on a losing spin.
+    """
+    func testWheelsAreReadWithTheirWedges() {
+        let r = ReelLayoutRules.read(Self.wheels)
+        XCTAssertEqual(r.wheels?.map(\.name), ["Jackpot Wheel", "Bonus Wheel"])
+        XCTAssertEqual(r.wheels?.first?.wedges, ["GRAND", "MAJOR", "MINOR", "MINI", "BONUS GAMES"])
+        XCTAssertEqual(r.wheels?.last?.wedges, ["WILD BONUS", "COLLECTOR BONUS", "BONUS GAMES"])
+        XCTAssertEqual(r.awards, ["one more chance"])
+        XCTAssertFalse(r.wheels!.flatMap(\.wedges).contains { $0.lowercased().contains("free") })
+    }
+    // Tiers by worth (the top once, each lower once more), features twice, credits fill; no two alike side by side.
+    func testWedgesAreLaidRoundTheWheel() {
+        let o = WheelRules.order(["GRAND", "MAJOR", "MINOR", "MINI", "BONUS GAMES"], segments: nil)
+        XCTAssertEqual(o.count, 12)
+        XCTAssertEqual(o.filter { $0 == "GRAND" }.count, 1); XCTAssertEqual(o.filter { $0 == "MINI" }.count, 4)
+        XCTAssertEqual(o.filter { $0 == "BONUS GAMES" }.count, 2)
+        XCTAssertFalse(zip(o, o.dropFirst() + [o[0]]).contains { $0 == $1 })
+        XCTAssertEqual(WheelRules.order(["CREDITS"], segments: 20).count, 20)
+    }
+    // Wedges cut to their exact sector tile the face with no gap: every point inside the rim is covered.
+    func testWedgesTileTheFace() {
+        let art = WheelArt(segments: 12, radius: 120)
+        let (w, h) = art.wedgeSize
+        XCTAssertEqual(w % 16, 0); XCTAssertEqual(h % 16, 0); XCTAssertLessThanOrEqual(Double(h) / Double(w), 3)
+        let solid = art.cut([UInt8](repeating: 255, count: w * h * 4))
+        let face = art.face(["A": solid], order: ["A"], size: 280)
+        var holes = 0
+        let c = 140.0, rim = 0.86 * c * 0.97
+        for y in 0..<280 { for x in 0..<280 where (Double(x) + 0.5 - c) * (Double(x) + 0.5 - c) + (Double(y) + 0.5 - c) * (Double(y) + 0.5 - c) < rim * rim {
+            if face[(y * 280 + x) * 4 + 3] < 250 { holes += 1 }
+        } }
+        XCTAssertLessThan(holes, 30, "seams between wedges")
+        XCTAssertEqual(WheelArt.frameCovered(WheelArt.frameTemplate(backing: RGB8(255, 0, 255)), backing: RGB8(255, 0, 255)), 0, accuracy: 1e-9)
+    }
+    // The pop-ups a game needs, from what it has; nothing says "free".
+    func testPopUpsFollowTheGame() {
+        let layout = ReelLayoutRules.read(Self.wheels + "\nLoot Link\nThe matrix changes to a 20x1 independent reels matrix.")
+        let p = PopUps.plan(layout, jackpots: ["Grand", "Major", "Minor", "Mini"], bonus: true)
+        let titles = p.filter { $0.kind == .title }.map(\.text)
+        XCTAssertTrue(titles.contains("BONUS GAMES AWARDED!")); XCTAssertTrue(titles.contains("TOTAL WIN"))
+        XCTAssertTrue(titles.contains("YOU'VE WON THE\nGRAND\nJACKPOT")); XCTAssertTrue(titles.contains("LOOT LINK AWARDED!"))
+        XCTAssertTrue(titles.contains("JACKPOT WHEEL AWARDED!")); XCTAssertTrue(titles.contains("ONE MORE CHANCE"))
+        XCTAssertEqual(Array(titles.suffix(4)), PopUps.winTiers)
+        XCTAssertFalse(p.contains { $0.name.lowercased().contains("free") || $0.text.lowercased().contains("free") })
+        XCTAssertEqual(Set(p.map(\.name)).count, p.count)
+        XCTAssertFalse(p.contains { Double(max($0.w, $0.h)) / Double(min($0.w, $0.h)) > 3 || $0.w % 16 != 0 || $0.h % 16 != 0 })
+        // A game without a bonus or jackpots still has its panel, bar, button and win ladder.
+        XCTAssertEqual(PopUps.plan(ReelLayoutRules.read("Example is a 3x5 lines game."), jackpots: [], bonus: false).count, 3 + 4)
+    }
+}
+
 final class ReelAreaTests: XCTestCase {
     /// A pot state GPT drew smaller and shifted is laid back on its empty pot's foot, and laying it again
     /// changes nothing.

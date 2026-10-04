@@ -21719,6 +21719,27 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --interface-templates <out folder> [segments]
+// The grey templates GPT Image paints the wheel and pop-ups on, on chroma magenta, to look at before paying.
+if let flag = CommandLine.arguments.firstIndex(of: "--interface-templates"), flag + 1 < CommandLine.arguments.count {
+    let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1]), b = RGB8(255, 0, 255), space = CGColorSpace(name: CGColorSpace.sRGB)!
+    let n = flag + 2 < CommandLine.arguments.count ? Int(CommandLine.arguments[flag + 2]) ?? 12 : 12
+    try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+    func save(_ px: [UInt8], _ w: Int, _ h: Int, _ name: String) {
+        try? ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG)?.write(to: out.appendingPathComponent("\(name).png"))
+    }
+    let art = WheelArt(segments: n)
+    save(art.wedgeTemplate(backing: b), art.wedgeSize.w, art.wedgeSize.h, "wedge")
+    save(WheelArt.frameTemplate(backing: b), WheelArt.frameSize, WheelArt.frameSize, "wheelFrame")
+    save(WheelArt.discTemplate(size: 512, share: 0.7, backing: b), 512, 512, "wheelHub")
+    for p in PopUps.plan(ReelLayout(), jackpots: [], bonus: false) { save(PopUps.template(p, backing: b), p.w, p.h, p.name) }
+    // The face from flat wedges in two greys, to see the tiling.
+    let light = art.cut([UInt8]((0..<(art.wedgeSize.w * art.wedgeSize.h)).flatMap { _ in [200, 200, 200, 255] as [UInt8] }))
+    let dark = art.cut([UInt8]((0..<(art.wedgeSize.w * art.wedgeSize.h)).flatMap { _ in [90, 90, 90, 255] as [UInt8] }))
+    save(art.face(["A": light, "B": dark], order: (0..<n).map { $0 % 2 == 0 ? "A" : "B" }, size: 1024), 1024, 1024, "face")
+    print("WROTE: \(out.path)"); exit(0)
+}
+
 // Free:  Navigator --read-gdd <gdd.txt> […]
 // What GDD to Assets reads from each document, without a window: its symbols, reels, extras and notes.
 // For checking the readers against the real corpus (Navigator --export-gdds), not against fixtures.
@@ -25833,6 +25854,9 @@ final class GDDToAssetsRun: ObservableObject {
         ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") }),
         ("Pots", { $0.hasPrefix("shared_interface_pot") }),
         ("Pot states", { $0.hasPrefix("shared_interface_pot") && ($0.contains("_filling") || $0.contains("_full")) }),
+        ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
+        ("Pop-ups", { $0.contains("_popUp_") || $0.hasPrefix("shared_popUps") || $0.hasPrefix("transition_outro_") || $0.hasPrefix("shared_celebration_message")
+            || $0.hasPrefix("base_banner_event-") || $0.hasPrefix("wheelSpin_banner") }),
     ]
 
     /// A reel piece's files moved into versions/ so the next reel-area run draws it again. False: no such piece.
@@ -25853,13 +25877,13 @@ final class GDDToAssetsRun: ObservableObject {
         guard let folder = lastFolder, let layout = reelLayout else { return }
         if let redo { Self.keepForRedo(redo, folder: folder) }
         keying = true
-        status = "Making the reel area — bezel, dividers, reel texture — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
+        status = "Making the game interface — reel area, \(layout.wheels.map { "\($0.count) wheel\($0.count == 1 ? "" : "s"), " } ?? "")pop-ups — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
         DispatchQueue.global(qos: .userInitiated).async {
             let r = self.generateReelArea(layout, folder: folder)
             DispatchQueue.main.async {
                 self.keying = false
-                self.status = (r.problems.isEmpty ? "Reel area made" : "Reel area made — " + r.problems.joined(separator: "; "))
-                    + String(format: " · $%.2f. See the *_reel-preview.jpg files in the set's folder.", r.cost)
+                self.status = (r.problems.isEmpty ? "Game interface made" : "Game interface made — " + r.problems.joined(separator: "; "))
+                    + String(format: " · $%.2f. Make Again ▸ Show the Previews to look.", r.cost)
             }
         }
     }
@@ -25897,7 +25921,8 @@ final class GDDToAssetsRun: ObservableObject {
             log.write("prompts/\(what).txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h)\n\n\(prompt)")
             var best: (px: [UInt8], c: Double)?
             // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up.
-            let f = min(1, (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
+            // Small pieces (a wheel's wedge) asked at a megapixel at least, and scaled back down.
+            let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
             let rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
             for attempt in 1...(covered == nil ? 1 : 2) {
                 let r = OpenAIImages.edit(prompt: prompt, images: inputs, size: rw, height: rh)
@@ -26047,11 +26072,142 @@ final class GDDToAssetsRun: ObservableObject {
             }
             potSheet(count: total, folder: folder)
         }
-        // 5. A preview per mode: background, texture, this set's symbols, dividers, bezel; the table and pots above.
+        let names = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
+        let bezelRef = (try? Data(contentsOf: url("base_interface_bezel.png"))).map { downsamplePNG($0, longEdge: 2048) ?? $0 }
+        func blank(_ w: Int, _ h: Int) -> Data? {
+            png([UInt8]((0..<(w * h)).flatMap { _ in [b.r, b.g, b.b, 255] }), w, h)
+        }
+        func both(_ px: [UInt8], _ w: Int, _ h: Int, _ n: String) {
+            write(px, w, h, "\(n).png"); write(FrameKit.keyed(px, backing: b), w, h, "\(n)_rmbg.png")
+        }
+        // 5. The wheels, built as the studio's wheelSpin mode is: a rim, a hub and a pointer shared by the game's
+        // wheels, and one upright wedge per prize that the engine turns round the hub (WheelArt).
+        for (wi, wheel) in (layout.wheels ?? []).enumerated() {
+            let prefix = wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)"
+            // Its jackpot wedges carry this game's own jackpot names (its symbols'), whatever words the GDD used.
+            let tierWords = Set(WheelRules.tiers.map { $0.uppercased() } + ["JACKPOTS"])
+            let tiers = wheel.wedges.filter(tierWords.contains)
+            let labels = (tiers.isEmpty ? [] : names.isEmpty ? (tiers == ["JACKPOTS"] ? ["GRAND", "MAJOR", "MINOR", "MINI"] : tiers) : names)
+                + wheel.wedges.filter { !tierWords.contains($0) }
+            let order = WheelRules.order(labels, segments: wheel.segments), art = WheelArt(segments: order.count)
+            if wi == 0 {
+                let n = WheelArt.frameSize
+                if !has("wheelSpin_interface_wheelFrame.png"), let tpl = png(WheelArt.frameTemplate(backing: b), n, n),
+                   let px = paint("wheelSpin_interface_wheelFrame", prompt: GDDAssetPrompts.wheelFrameBrief(theme: theme, design: design, backing: (backing.name, b)),
+                                  inputs: [tpl], w: n, h: n, covered: { WheelArt.frameCovered($0, backing: b) }) {
+                    both(px, n, n, "wheelSpin_interface_wheelFrame")
+                }
+                let rim = (try? Data(contentsOf: url("wheelSpin_interface_wheelFrame.png"))).map { downsamplePNG($0, longEdge: 1024) ?? $0 }
+                if let rim, !has("wheelSpin_interface_wheelHub.png"), let tpl = png(WheelArt.discTemplate(size: 512, share: 0.7, backing: b), 512, 512),
+                   let px = paint("wheelSpin_interface_wheelHub", prompt: GDDAssetPrompts.wheelHubBrief(theme: theme, design: design, backing: (backing.name, b)),
+                                  inputs: [rim, tpl], w: 512, h: 512, covered: nil) {
+                    both(px, 512, 512, "wheelSpin_interface_wheelHub")
+                }
+                if let rim, !has("wheelSpin_interface_winIndicator.png"), let canvas = blank(1024, 1024),
+                   let px = paint("wheelSpin_interface_winIndicator", prompt: GDDAssetPrompts.wheelPointerBrief(theme: theme, design: design, backing: (backing.name, b)),
+                                  inputs: [rim, canvas], w: 1024, h: 1024, covered: nil) {
+                    both(px, 1024, 1024, "wheelSpin_interface_winIndicator")
+                }
+            }
+            // One wedge per prize, each matched to the wheel's first.
+            let (ww, wh) = art.wedgeSize
+            var firstWedge: Data? = nil
+            for label in order.reduce(into: [String](), { if !$0.contains($1) { $0.append($1) } }) {
+                let n = "\(prefix)_interface_wedge-\(PopUps.key(label))"
+                if !has("\(n).png"), let tpl = png(art.wedgeTemplate(backing: b), ww, wh),
+                   let px = paint(n, prompt: GDDAssetPrompts.wedgeBrief(theme: theme, design: design, backing: (backing.name, b), label: label, matching: firstWedge != nil),
+                                  inputs: (firstWedge.map { [$0] } ?? []) + [tpl], w: ww, h: wh, covered: nil) {
+                    let cut = art.cut(FrameKit.keyed(px, backing: b))
+                    write(FrameKit.onBacking(cut, b), ww, wh, "\(n).png"); write(cut, ww, wh, "\(n)_rmbg.png")
+                }
+                if firstWedge == nil { firstWedge = try? Data(contentsOf: url("\(n).png")) }
+            }
+            wheelPreview(prefix: prefix, art: art, order: order, folder: folder)
+        }
+        // 6. The award pop-ups (PopUps): a blank panel, an empty value bar and a CONTINUE button in the reel
+        // frame's material, and a lettered title per award this game has, each matched to the first.
+        let hasBonus = !bonus.isEmpty || layout.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") }
+        let plan = PopUps.plan(layout, jackpots: names, bonus: hasBonus)
+        var firstTitle = plan.first { $0.kind == .title && fm.fileExists(atPath: url("\($0.name).png").path) }.flatMap { try? Data(contentsOf: url("\($0.name).png")) }
+        for piece in plan where !has("\(piece.name).png") {
+            if piece.kind == .title {
+                guard let canvas = blank(piece.w, piece.h) else { continue }
+                let prompt = GDDAssetPrompts.popUpTitleBrief(theme: theme, design: design, backing: (backing.name, b), text: piece.text, matching: firstTitle != nil)
+                if let px = paint(piece.name, prompt: prompt, inputs: (firstTitle.map { [downsamplePNG($0, longEdge: 1024) ?? $0] } ?? []) + [canvas], w: piece.w, h: piece.h, covered: nil) {
+                    both(px, piece.w, piece.h, piece.name)
+                    if firstTitle == nil { firstTitle = try? Data(contentsOf: url("\(piece.name).png")) }
+                }
+            } else if let ref = bezelRef, let tpl = png(PopUps.template(piece, backing: b), piece.w, piece.h),
+                      let px = paint(piece.name, prompt: GDDAssetPrompts.popUpPieceBrief(theme: theme, design: design, backing: (backing.name, b), kind: piece.kind, text: piece.text),
+                                     inputs: [ref, tpl], w: piece.w, h: piece.h, covered: nil) {
+                both(px, piece.w, piece.h, piece.name)
+            }
+        }
+        popUpSheet(plan, folder: folder)
+        // 7. A preview per mode: background, texture, this set's symbols, dividers, bezel; the table and pots above.
         for (name, grid) in modes { reelPreview(name: name, area: ReelArea(layout, grid: grid), jobs: jobs, folder: folder) }
         log.event(["step": "reel area", "cost": cost, "problems": problems, "modes": modes.map { "\($0.name) \($0.grid.rows)x\($0.grid.reels)" }])
         DispatchQueue.main.async { self.spent += cost }
         return (cost, problems)
+    }
+
+    /// `<prefix>_wheel-preview.jpg`: the wheel put together — its wedges turned into place round the hub, the
+    /// rim, the hub and the pointer at the top — to see it, not to ship (the engine builds it from the parts).
+    func wheelPreview(prefix: String, art: WheelArt, order: [String], folder: URL) {
+        func piece(_ n: String) -> FrameKit.Piece? {
+            guard let cg = loadCGImage(folder.appendingPathComponent(n)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            return FrameKit.Piece(px: px, w: cg.width, h: cg.height)
+        }
+        var wedges: [String: [UInt8]] = [:]
+        for l in Set(order) { if let p = piece("\(prefix)_interface_wedge-\(PopUps.key(l))_rmbg.png"), p.w == art.wedgeSize.w, p.h == art.wedgeSize.h { wedges[l] = p.px } }
+        guard !wedges.isEmpty else { return }
+        let n = WheelArt.frameSize
+        var canvas = [UInt8](repeating: 0, count: n * n * 4)
+        for i in 0..<(n * n) { canvas[i * 4] = 20; canvas[i * 4 + 1] = 18; canvas[i * 4 + 2] = 34; canvas[i * 4 + 3] = 255 }
+        FrameKit.over(&canvas, width: n, FrameKit.Piece(px: art.face(wedges, order: order, size: n), w: n, h: n), at: 0, 0)
+        if let f = piece("wheelSpin_interface_wheelFrame_rmbg.png") { FrameKit.over(&canvas, width: n, FrameKit.resized(f, n, n), at: 0, 0) }
+        if let h = piece("wheelSpin_interface_wheelHub_rmbg.png") { let s = n * 23 / 100; FrameKit.over(&canvas, width: n, FrameKit.resized(h, s, s), at: (n - s) / 2, (n - s) / 2) }
+        if let p = piece("wheelSpin_interface_winIndicator_rmbg.png") { let s = n * 14 / 100; FrameKit.over(&canvas, width: n, FrameKit.resized(p, s, s), at: (n - s) / 2, n * 7 / 100 - s / 3) }
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        if let img = ChromaKeyOutputRules.image(straightRGBA8: canvas, width: n, height: n, space: space),
+           let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("\(prefix)_wheel-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, img, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+    }
+
+    /// `shared_popUps-preview.jpg`: one pop-up put together (panel, its first title, value bar, button) beside
+    /// every title, button and bar the game has — to review, not to ship.
+    func popUpSheet(_ plan: [PopUps.Piece], folder: URL) {
+        let cell = 420, cols = 4
+        let titles = plan.filter { $0.kind != .panel }
+        let rows = (titles.count + cols - 1) / cols
+        let W = cols * cell, H = 900 + rows * (cell / 2)
+        guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        ctx.setFillColor(CGColor(red: 0.08, green: 0.07, blue: 0.13, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.interpolationQuality = .high
+        func img(_ n: String) -> CGImage? { loadCGImage(folder.appendingPathComponent("\(n)_rmbg.png")) }
+        // The assembled example, top: panel, title, bar, button, as a game stacks them.
+        let pw = 1100, ph = pw * 3 / 4, px0 = (W - pw) / 2, top = H - 40 - ph
+        if let p = img("shared_popUp_background") { ctx.draw(p, in: CGRect(x: px0, y: top, width: pw, height: ph)) }
+        if let t = plan.first(where: { $0.kind == .title }), let i = img(t.name) {
+            let tw = pw * 8 / 10, th = tw * t.h / t.w
+            ctx.draw(i, in: CGRect(x: (W - tw) / 2, y: top + ph * 55 / 100, width: tw, height: th))
+        }
+        if let i = img("shared_popUp_valueBar") { let bw = pw * 8 / 10, bh = bw / 3; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 26 / 100, width: bw, height: bh)) }
+        if let i = img("base_popUp_bonusBtn") { let bw = pw * 4 / 10, bh = bw * 3 / 8; ctx.draw(i, in: CGRect(x: (W - bw) / 2, y: top + ph * 4 / 100, width: bw, height: bh)) }
+        for (k, t) in titles.enumerated() {
+            guard let i = img(t.name) else { continue }
+            let x = (k % cols) * cell, y = H - 900 - (k / cols + 1) * (cell / 2)
+            let s = min(Double(cell - 20) / Double(t.w), Double(cell / 2 - 20) / Double(t.h))
+            let w = Int(Double(t.w) * s), h = Int(Double(t.h) * s)
+            ctx.draw(i, in: CGRect(x: x + (cell - w) / 2, y: y + (cell / 2 - h) / 2, width: w, height: h))
+        }
+        if let out = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_popUps-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, out, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
     }
 
     /// `shared_interface_pots-states.jpg`: each pot's states side by side — empty, filling, full — to review.
@@ -28402,23 +28558,23 @@ struct GDDToAssetsSheet: View {
                     HStack(spacing: 6) {
                         Text("Reels").bold()
                         Text(reels.summary).foregroundColor(.secondary)
-                        Button("Make reel area…") { run.makeReelArea() }
+                        Button("Make game interface…") { run.makeReelArea() }
                             .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
-                            .help("For every grid the GDD gives: the bezel, dividers, reel texture and reel fade as layers, the jackpot table and pots above the reels when it has them, and a reel preview per mode, with this set's own symbols and background. Only what isn't made yet is drawn. GPT Image 2.5, about $0.15 a piece.")
+                            .help("Everything round the symbols, from the GDD: for every grid, the bezel, dividers, reel texture and reel fade as layers; the jackpot table and pots when it has them; its wheels as the studio builds them (rim, hub, pointer, one wedge per prize); and the award pop-ups (panel, value bar, CONTINUE button, a title per award — bonus games, total win, each jackpot, the win ladder). Previews of each. Only what isn't made yet is drawn. GPT Image 2.5, about $0.07–0.15 a piece.")
                         Menu("Make Again") {
                             ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
                             Divider()
-                            Button("Show the Reel Previews") {
+                            Button("Show the Previews") {
                                 guard let folder = run.lastFolder else { return }
                                 let previews = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? [])
-                                    .filter { $0.hasSuffix("_reel-preview.jpg") || $0 == "shared_interface_pots-states.jpg" }
+                                    .filter { $0.hasSuffix("-preview.jpg") || $0 == "shared_interface_pots-states.jpg" }
                                     .map { folder.appendingPathComponent($0) }
                                 NSWorkspace.shared.activateFileViewerSelecting(previews.isEmpty ? [folder] : previews)
                             }
                         }
                         .fixedSize()
                         .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
-                        .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots or their filling and full states. The current files are kept in the set's versions folder. About $0.15 a piece; the bezel can take two tries.")
+                        .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots or their filling and full states, the wheels, or the pop-ups. The current files are kept in the set's versions folder. About $0.07–0.15 a piece; the bezel can take two tries.")
                     }
                     ForEach(reels.notes, id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
                 }

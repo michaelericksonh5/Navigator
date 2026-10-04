@@ -8182,6 +8182,17 @@ public struct ReelLayout: Equatable, Codable, Sendable {
     public var grids: [Grid] = []
     public var extras: [Extra] = []
     public var notes: [String] = []
+    /// A prize wheel the game has ("Jackpot Wheel", "Bonus Wheel"): the labels its wedges carry, lettered as the
+    /// studio letters them (GRAND, MAJOR, BONUS GAMES; "CREDITS" is a wedge left plain for the engine's
+    /// number), and its wedge count when the document gives one.
+    public struct Wheel: Equatable, Codable, Sendable {
+        public var name: String
+        public var wedges: [String]
+        public var segments: Int? = nil
+    }
+    public var wheels: [Wheel]? = nil
+    /// Award events the document has beyond the usual ones: "one more chance".
+    public var awards: [String]? = nil
     /// The base game's grid, the one the bezel is built round.
     public var base: Grid? { grids.first { $0.mode == "base" } ?? grids.first }
     /// Every grid with the name its files take, as the studio names them: base first (the grid the bezel is
@@ -8301,6 +8312,9 @@ public enum ReelLayoutRules {
         }
 
         var titled = false, wheels = Set<String>()     // the wheels' own names: "Jackpot Wheel", "Bonus Wheel"
+        var wheelText: [String: String] = [:], lastWheel = "Wheel"   // what is said of each wheel
+        // Capitalised: a name, not "the wheel"; "Bonus Game Wheel" is the Bonus Wheel.
+        let wheelName = try! NSRegularExpression(pattern: #"\b([A-Z][a-z]+)(?: Game)? Wheel\b"#)
         for raw in gdd.components(separatedBy: .newlines) {
             let trimmed = raw.trimmingCharacters(in: .whitespaces)
             let hashes = trimmed.prefix(while: { $0 == "#" }).count
@@ -8455,8 +8469,12 @@ public enum ReelLayoutRules {
                 }
                 if lower.range(of: #"\bwheels?\b"#, options: .regularExpression) != nil,
                    lower.range(of: #"super boost wheel spin|remaining_spins"#, options: .regularExpression) == nil {
-                    wheels.formUnion(groups(re(#"\b([A-Z][a-z]+) Wheel\b"#), sentence).map(\.g[1]).filter { !["The", "A", "This", "Each", "That", "Second", "First"].contains($0) })
+                    let named = groups(wheelName, sentence).map(\.g[1]).filter { !["The", "A", "This", "Each", "That", "Second", "First"].contains($0) }
+                    wheels.formUnion(named)
                     addExtra(ReelLayout.Extra(what: "wheel", rows: nil, reels: nil, place: "", count: max(1, wheels.count)))
+                    // A sentence is about the wheels it names, or the last one named.
+                    for w in named.isEmpty ? [lastWheel] : named.map({ "\($0) Wheel" }) { wheelText[w, default: ""] += " " + lower }
+                    if let l = named.last { lastWheel = "\(l) Wheel" }
                 }
             }
         }
@@ -8470,6 +8488,16 @@ public enum ReelLayoutRules {
         }
         out.grids = merged
         if out.grids.isEmpty { out.notes.append("The document gives no reel size.") }
+        // Each wheel's wedges, from what is said of it ("Wheel" alone folds into the first named one).
+        if !wheelText.isEmpty {
+            if let unnamed = wheelText.removeValue(forKey: "Wheel") {
+                let first = wheelText.keys.sorted().first ?? "Wheel"
+                wheelText[first, default: ""] += unnamed
+            }
+            out.wheels = wheelText.keys.sorted { a, b in a.hasPrefix("Bonus") == b.hasPrefix("Bonus") ? a < b : !a.hasPrefix("Bonus") }
+                .map { WheelRules.wheel(named: $0, text: wheelText[$0]!) }
+        }
+        if gdd.lowercased().contains("one more chance") { out.awards = ["one more chance"] }
         return out
     }
 }
@@ -8740,6 +8768,268 @@ public enum PotStates {
         let scaled = FrameKit.resized(FrameKit.Piece(px: state, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
         var out = [UInt8](repeating: 0, count: w * h * 4)
         FrameKit.over(&out, width: w, scaled, at: Int((e.cx - f.cx * k).rounded()), Int((Double(e.bottom) - Double(f.bottom) * k).rounded()))
+        return out
+    }
+}
+
+/// What a wheel's wedges carry, from what the document says of it. The studio letters tier words and feature
+/// names into its wedges (GRAND, MAJOR, FREE GAMES on Founding Fortunes; MEGA, MINI on Tiki Titans) and leaves
+/// credit amounts to a number font. "Free" is never lettered: production says bonus games.
+public enum WheelRules {
+    static let tiers = ["grand", "mega", "major", "minor", "mini", "micro"]
+
+    public static func wheel(named name: String, text t: String) -> ReelLayout.Wheel {
+        var wedges: [String] = []
+        if name.hasPrefix("Bonus") {
+            // A wheel that picks the bonus: its wedges are the ways in.
+            for (words, label) in [("random wild", "WILD BONUS"), ("collector", "COLLECTOR BONUS"), ("multiplier", "MULTIPLIER BONUS"), ("standard", "BONUS GAMES")]
+                where t.contains(words) { wedges.append(label) }
+            if wedges.isEmpty { wedges = ["BONUS GAMES"] }
+        } else {
+            wedges = tiers.filter { t.range(of: "\\b\($0)\\b", options: .regularExpression) != nil }.map { $0.uppercased() }
+            // The game's own tiers, from its symbols — not "non-jackpot wysiwyg symbols" (credit values).
+            if wedges.isEmpty, t.range(of: #"(?<!non-)\bjackpots?\b"#, options: .regularExpression) != nil { wedges = ["JACKPOTS"] }
+            // A wedge into the bonus, said as a wedge — not the bonus mode the wheel sits beside.
+            if t.range(of: #"bonus (game )?wedge|wedge[^.]{0,40}\bbonus\b|bonus wheel appears"#, options: .regularExpression) != nil { wedges.append("BONUS GAMES") }
+            if t.contains("multiplier") { wedges.append("MULTIPLIER") }
+            if t.range(of: #"credit|\bvalues?\b"#, options: .regularExpression) != nil || wedges.isEmpty { wedges.append("CREDITS") }
+        }
+        let n = ReelLayoutRules.groups(ReelLayoutRules.re(#"\b(\d{1,2}) (?:segments|wedges|slices)\b"#), t).compactMap { Int($0.g[1]) }.first
+        return ReelLayout.Wheel(name: name, wedges: wedges, segments: n)
+    }
+
+    /// The wedges round the wheel, clockwise from the top: each label as often as its worth allows — the top
+    /// tier once, each tier below once more (Tiki Titans: MEGA 1, MAJOR 2, MINOR 3, MINI 4, bonus 2), features
+    /// twice, credits filling the rest — spread so no two alike sit side by side where it can be helped.
+    public static func order(_ labels: [String], segments: Int?) -> [String] {
+        var counts: [(String, Int)] = []
+        var tier = 0
+        for l in labels {
+            if tiers.contains(l.lowercased()) { tier += 1; counts.append((l, tier)) }
+            else if l != "CREDITS" { counts.append((l, 2)) }
+        }
+        let used = counts.reduce(0) { $0 + $1.1 }
+        let n = max(segments ?? 12, used + (labels.contains("CREDITS") ? 2 : 0), 4)
+        if labels.contains("CREDITS") { counts.append(("CREDITS", n - used)) }
+        else if used < n, let last = counts.indices.last { counts[last].1 += n - used }   // the commonest prize fills up
+        // Largest remaining first, never the one just placed.
+        var out: [String] = []
+        while out.count < n {
+            let pick = counts.indices.filter { counts[$0].1 > 0 }
+                .max { a, b in (counts[a].0 == out.last ? -1 : counts[a].1) < (counts[b].0 == out.last ? -1 : counts[b].1) }!
+            out.append(counts[pick].0); counts[pick].1 -= 1
+        }
+        return out
+    }
+}
+
+/// A prize wheel laid out in code, the way the studio's wheelSpin mode is built (Founding Fortunes): one
+/// upright wedge per prize, tip down at the hub, that the engine turns round the wheel; a frame ring; a hub;
+/// a pointer at the top. GPT Image paints each part on its grey template; the wedges are cut to their exact
+/// sector so they tile without a gap or overlap, and composed here into a face for the preview.
+public struct WheelArt: Equatable, Sendable {
+    public var segments: Int
+    /// The wedge's length, hub to rim, in pixels.
+    public var radius: Int
+    public static let frameSize = 2048
+
+    public init(segments: Int, radius: Int = 900) { self.segments = max(3, segments); self.radius = radius }
+
+    var half: Double { Double.pi / Double(segments) }
+    static func up16(_ v: Int) -> Int { (v + 15) / 16 * 16 }
+    /// The wedge's canvas: its tip 12 px above the bottom, centred; no thinner than a third of its height,
+    /// as GPT Image takes sizes.
+    public var wedgeSize: (w: Int, h: Int) {
+        let h = Self.up16(radius + 24)
+        return (max(Self.up16(Int(2 * Double(radius) * sin(half)) + 24), Self.up16(h / 3)), h)
+    }
+    var tip: (x: Double, y: Double) { (Double(wedgeSize.w) / 2, Double(wedgeSize.h - 12)) }
+
+    /// How far inside the wedge a pixel is: 0 outside, 1 well inside, between across its one-pixel edge.
+    /// `bleed` pixels past the sides: neighbouring wedges overlap that much, so turned copies close up with no seam.
+    func inWedge(_ x: Double, _ y: Double, bleed: Double = 0) -> Double {
+        let dx = x - tip.x, dy = tip.y - y, r = (dx * dx + dy * dy).squareRoot()
+        guard dy > -bleed else { return 0 }
+        let side = r * sin(max(-Double.pi / 2, min(Double.pi / 2, half - abs(atan2(dx, dy))))) + bleed   // from the nearer side
+        return min(max(min(side, Double(radius) - r) + 0.5, 0), 1)
+    }
+
+    /// The grey wedge GPT repaints (opaque RGBA on the backing): lit from the outer end, darker at the tip.
+    func wedgeTemplate(backing b: RGB8) -> [UInt8] {
+        let (w, h) = wedgeSize
+        var px = [UInt8](repeating: 255, count: w * h * 4)
+        for y in 0..<h { for x in 0..<w {
+            let i = (y * w + x) * 4, a = inWedge(Double(x) + 0.5, Double(y) + 0.5)
+            let r = ((Double(x) - tip.x) * (Double(x) - tip.x) + (tip.y - Double(y)) * (tip.y - Double(y))).squareRoot() / Double(radius)
+            let g = 110 + 70 * min(1, r)
+            px[i] = UInt8(Double(b.r) * (1 - a) + g * a); px[i + 1] = UInt8(Double(b.g) * (1 - a) + g * a); px[i + 2] = UInt8(Double(b.b) * (1 - a) + g * a)
+        } }
+        return px
+    }
+
+    /// A drawn wedge (straight RGBA, keyed) cut to its sector, a pixel and a half over at the sides.
+    public func cut(_ px: [UInt8]) -> [UInt8] {
+        let (w, h) = wedgeSize
+        var out = px
+        for y in 0..<h { for x in 0..<w {
+            let i = (y * w + x) * 4
+            out[i + 3] = UInt8(Double(px[i + 3]) * inWedge(Double(x) + 0.5, Double(y) + 0.5, bleed: 1.5))
+        } }
+        return out
+    }
+
+    /// The wheel's face, `size` square: each segment's wedge (by `order`, clockwise from the top) turned into
+    /// its place, sampled bilinearly. Transparent past the wedges' length.
+    public func face(_ wedges: [String: [UInt8]], order: [String], size: Int) -> [UInt8] {
+        let (w, h) = wedgeSize, c = Double(size) / 2, scale = Double(radius) / (c * 0.86)
+        var out = [UInt8](repeating: 0, count: size * size * 4)
+        // Bilinear on premultiplied colour, so a wedge's keyed-out edge brings none of the backing with it.
+        func sample(_ p: [UInt8], _ x: Double, _ y: Double) -> (Double, Double, Double, Double) {
+            let x0 = Int(x.rounded(.down)), y0 = Int(y.rounded(.down)), fx = x - Double(x0), fy = y - Double(y0)
+            var acc = (0.0, 0.0, 0.0, 0.0)
+            for (xx, yy, wt) in [(x0, y0, (1 - fx) * (1 - fy)), (x0 + 1, y0, fx * (1 - fy)), (x0, y0 + 1, (1 - fx) * fy), (x0 + 1, y0 + 1, fx * fy)] {
+                guard xx >= 0, yy >= 0, xx < w, yy < h, wt > 0 else { continue }
+                let i = (yy * w + xx) * 4, a = Double(p[i + 3]) / 255 * wt
+                acc.0 += Double(p[i]) * a; acc.1 += Double(p[i + 1]) * a; acc.2 += Double(p[i + 2]) * a; acc.3 += a
+            }
+            return acc
+        }
+        for y in 0..<size { for x in 0..<size {
+            let dx = (Double(x) + 0.5 - c) * scale, dy = (c - Double(y) - 0.5) * scale
+            let r = (dx * dx + dy * dy).squareRoot()
+            guard r <= Double(radius) else { continue }
+            var t = atan2(dx, dy) + half
+            if t < 0 { t += 2 * Double.pi }
+            let k = min(segments - 1, Int(t / (2 * half))), phi = t - Double(k) * 2 * half - half
+            guard let p = wedges[order[k % order.count]] else { continue }
+            let (r0, g0, b0, a) = sample(p, tip.x + r * sin(phi) - 0.5, tip.y - r * cos(phi) - 0.5)
+            guard a > 0.001 else { continue }
+            let i = (y * size + x) * 4
+            out[i] = UInt8(min(255, r0 / a + 0.5)); out[i + 1] = UInt8(min(255, g0 / a + 0.5)); out[i + 2] = UInt8(min(255, b0 / a + 0.5))
+            out[i + 3] = UInt8(min(255, a * 255 + 0.5))
+        } }
+        return out
+    }
+
+    /// The frame ring's grey template, `frameSize` square: a bevelled ring from 0.86 to 0.99 of the half-width,
+    /// the face inside it left as the backing — the window its check keeps open.
+    static func frameTemplate(backing b: RGB8) -> [UInt8] {
+        let n = frameSize, c = Double(n) / 2, inner = 0.86 * c, outer = 0.99 * c
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let i = (y * n + x) * 4, r = ((Double(x) + 0.5 - c) * (Double(x) + 0.5 - c) + (Double(y) + 0.5 - c) * (Double(y) + 0.5 - c)).squareRoot()
+            var v = (Double(b.r), Double(b.g), Double(b.b))
+            if r >= inner && r <= outer {
+                let u = (r - inner) / (outer - inner), lit = (c - Double(y)) / c       // lit from the top
+                let g = u < 0.08 || u > 0.92 ? 70 : 140 + 50 * lit * (u < 0.5 ? 1 : -1) - 20 * abs(u - 0.5)
+                v = (g, g, g)
+            }
+            px[i] = UInt8(max(0, min(255, v.0))); px[i + 1] = UInt8(max(0, min(255, v.1))); px[i + 2] = UInt8(max(0, min(255, v.2)))
+        } }
+        return px
+    }
+    /// The share of the face a drawn frame covers (opaque RGBA on its backing): the frame's window check.
+    static func frameCovered(_ px: [UInt8], backing b: RGB8) -> Double {
+        let n = frameSize, c = Double(n) / 2, inner = 0.83 * c
+        var open = 0, hit = 0
+        for y in stride(from: 0, to: n, by: 2) { for x in stride(from: 0, to: n, by: 2) {
+            let dx = Double(x) - c, dy = Double(y) - c
+            guard dx * dx + dy * dy < inner * inner else { continue }
+            let i = (y * n + x) * 4
+            open += 1
+            if abs(Int(px[i]) - Int(b.r)) + abs(Int(px[i + 1]) - Int(b.g)) + abs(Int(px[i + 2]) - Int(b.b)) > 90 { hit += 1 }
+        } }
+        return open > 0 ? Double(hit) / Double(open) : 1
+    }
+    /// A plain grey disc on the backing, `n` square, radius `share` of the half-width: the hub's template.
+    static func discTemplate(size n: Int, share: Double, backing b: RGB8) -> [UInt8] {
+        let c = Double(n) / 2, r0 = share * c
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let i = (y * n + x) * 4, r = ((Double(x) + 0.5 - c) * (Double(x) + 0.5 - c) + (Double(y) + 0.5 - c) * (Double(y) + 0.5 - c)).squareRoot()
+            let g = r <= r0 ? 150 + 50 * (c - Double(y)) / c : nil
+            px[i] = g.map { UInt8($0) } ?? b.r; px[i + 1] = g.map { UInt8($0) } ?? b.g; px[i + 2] = g.map { UInt8($0) } ?? b.b
+        } }
+        return px
+    }
+}
+
+/// The award pop-ups a game needs, as the studio builds them: a blank panel, an empty value bar and a lettered
+/// CONTINUE button shared by all, and one lettered title per award event, transparent, that the engine lays
+/// on them — amounts and game counts are never lettered, the engine prints them. Names follow the studio's
+/// `<mode>_<category>_<name>`; production says "bonus games", so nothing here says "free", in a name or a word.
+public enum PopUps {
+    public enum Kind: String, Sendable { case panel, bar, button, title }
+    public struct Piece: Equatable, Sendable {
+        public var name: String, kind: Kind, text: String, w: Int, h: Int
+    }
+    /// A piece's grey template on the backing: the panel a rounded plate with a sunken inner face, the bar a
+    /// long rounded field, the button a raised pill. Titles have none — they are lettering alone.
+    static func template(_ p: Piece, backing b: RGB8) -> [UInt8] {
+        let (w, h) = (p.w, p.h)
+        var px = [UInt8](repeating: 255, count: w * h * 4)
+        let box: (x: Double, y: Double, w: Double, h: Double, r: Double) = {
+            switch p.kind {
+            case .panel: return (0.06, 0.08, 0.88, 0.84, 0.08)
+            case .bar: return (0.04, 0.33, 0.92, 0.34, 0.5)
+            default: return (0.06, 0.15, 0.88, 0.70, 0.5)
+            }
+        }()
+        let x0 = box.x * Double(w), y0 = box.y * Double(h), bw = box.w * Double(w), bh = box.h * Double(h), r = box.r * min(bw, bh)
+        func inside(_ x: Double, _ y: Double, inset d: Double) -> Bool {
+            let l = x0 + d, t = y0 + d, rt = x0 + bw - d, bt = y0 + bh - d, rr = max(0, r - d)
+            guard x >= l, x <= rt, y >= t, y <= bt else { return false }
+            let cx = min(max(x, l + rr), rt - rr), cy = min(max(y, t + rr), bt - rr)
+            return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rr * rr
+        }
+        let rim = min(bw, bh) * (p.kind == .panel ? 0.09 : 0.18)
+        for y in 0..<h { for x in 0..<w {
+            let i = (y * w + x) * 4, fx = Double(x) + 0.5, fy = Double(y) + 0.5
+            var v = (b.r, b.g, b.b)
+            if inside(fx, fy, inset: 0) {
+                let lit = 1 - (fy - y0) / bh
+                let g = inside(fx, fy, inset: rim) ? UInt8(p.kind == .button ? 150 + 40 * lit : 70 + 20 * lit) : UInt8(120 + 80 * lit)
+                v = (g, g, g)
+            }
+            px[i] = v.0; px[i + 1] = v.1; px[i + 2] = v.2
+        } }
+        return px
+    }
+    /// A label as a file name's part: "BONUS GAMES" → bonusGames, "GRAND" → grand.
+    public static func key(_ label: String) -> String {
+        let words = label.lowercased().split { !$0.isLetter && !$0.isNumber }
+        return words.enumerated().map { $0.offset == 0 ? String($0.element) : $0.element.prefix(1).uppercased() + $0.element.dropFirst() }.joined()
+    }
+    /// The studio's celebration ladder (shared_celebration_message-1…4 in 59–67 shipped games).
+    public static let winTiers = ["BIG WIN!", "SUPER WIN!", "MEGA WIN!", "ULTRA WIN!"]
+
+    public static func plan(_ layout: ReelLayout, jackpots: [String], bonus: Bool) -> [Piece] {
+        func title(_ name: String, _ text: String, _ w: Int = 1536, _ h: Int = 512) -> Piece { Piece(name: name, kind: .title, text: text, w: w, h: h) }
+        var out = [Piece(name: "shared_popUp_background", kind: .panel, text: "", w: 1536, h: 1152),
+                   Piece(name: "shared_popUp_valueBar", kind: .bar, text: "", w: 1536, h: 512),
+                   Piece(name: "base_popUp_bonusBtn", kind: .button, text: "CONTINUE", w: 1024, h: 384)]
+        if bonus {
+            out += [title("base_popUp_bonusGamesAwarded", "BONUS GAMES AWARDED!"),
+                    title("transition_outro_totalWin", "TOTAL WIN"),
+                    title("transition_outro_bonusGamesComplete", "BONUS GAMES COMPLETE")]
+        }
+        for j in jackpots where !j.isEmpty {
+            let tier = j.uppercased().replacingOccurrences(of: " JACKPOT", with: "")
+            let key = tier.lowercased().replacingOccurrences(of: " ", with: "")
+            out.append(title("base_popUp_\(key)Awarded", "YOU'VE WON THE\n\(tier)\nJACKPOT", 1024, 768))
+        }
+        // Modes of their own (Loot Link, Lock and Respin, …), awarded by name.
+        for (name, g) in layout.fileModes.dropFirst() where !g.mode.hasPrefix("bonus") && !g.mode.hasPrefix("power bet") && !g.mode.hasSuffix("bonus") {
+            let words = g.mode.replacingOccurrences(of: " mode", with: "").uppercased()
+            guard !out.contains(where: { $0.text == "\(words) AWARDED!" }) else { continue }
+            out.append(title("base_popUp_\(name)Awarded", "\(words) AWARDED!"))
+        }
+        for (i, w) in (layout.wheels ?? []).enumerated() {
+            out.append(title("base_banner_event-\(i == 0 ? "wheel" : "wheel\(i + 1)")Awarded", "\(w.name.uppercased()) AWARDED!"))
+        }
+        if !(layout.wheels ?? []).isEmpty { out.append(title("wheelSpin_banner_spin", "PRESS TO SPIN", 1536, 512)) }
+        if layout.awards?.contains("one more chance") == true { out.append(title("shared_popUp_oneMoreChance", "ONE MORE CHANCE")) }
+        for (i, t) in winTiers.enumerated() { out.append(title("shared_celebration_message-\(i + 1)", t)) }
         return out
     }
 }
@@ -14550,6 +14840,97 @@ extension GDDAssetPrompts {
     /// A pot's states as it fills with the bonus symbols that fly up to it: an edit of its empty drawing, so the
     /// vessel stays the same and the states swap in place. "filling": its contents glow up from its mouth;
     /// "full": they overflow its rim.
+    // MARK: Wheels and pop-ups
+
+    /// A wedge's colour: its tier's or feature's, never one the backing claims (SlotBackingRules.reserved).
+    static func wedgeColour(_ label: String, backing: String) -> String {
+        let options: [String: [(String, String)]] = [
+            "GRAND": [("crimson red", "red")], "MEGA": [("crimson red", "red")],
+            "MAJOR": [("royal purple", "purple"), ("deep orange", "orange")],
+            "MINOR": [("sapphire blue", "blue"), ("deep orange", "orange")],
+            "MINI": [("emerald green", "green"), ("amber", "orange")],
+            "MICRO": [("teal", "teal"), ("silver", "grey")],
+            "BONUS GAMES": [("rich gold", "gold")], "WILD BONUS": [("bright orange", "orange")],
+            "COLLECTOR BONUS": [("teal", "teal"), ("sapphire blue", "blue"), ("emerald green", "green")],
+            "MULTIPLIER BONUS": [("violet", "purple"), ("deep orange", "orange")],
+            "MULTIPLIER": [("violet", "purple"), ("deep orange", "orange")],
+            "CREDITS": [("deep midnight blue", "blue"), ("deep crimson", "red")],
+        ]
+        let reserved = SlotBackingRules.reserved(backing)
+        return (options[label] ?? [("deep crimson", "red")]).first { !reserved.contains($0.1) }?.0 ?? "rich gold"
+    }
+
+    /// One wedge of a prize wheel, on its grey template (the last image); `matching` when another wedge of the
+    /// same wheel is attached first, to match.
+    static func wedgeBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), label: String, matching: Bool) -> String {
+        [
+            (matching ? "Image 1 is another wedge of the same wheel: match its material, trim and lettering exactly — only the colour differs. " : "")
+            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a rich \(wedgeColour(label, backing: backing.name)) face in the theme's own material and craft, a fine trim along its two long sides and its curved outer end.",
+            label == "CREDITS"
+                ? "Its face stays plain and unlettered: the game prints the prize amount on it."
+                : "Letter “\(label)” on it in bold, dimensional display letters set one above another down the middle of the wedge, reading from the wide outer end toward the point, as large as the wedge allows and spelled exactly so. No other words or numbers.",
+            "Keep exactly the wedge's shape: paint nothing outside its outline, and the point stays sharp at the bottom.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// The rim round the wheel, on its grey ring (the last image).
+    static func wheelFrameBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
+        [
+            "Edit the attached image: the plain grey ring is the frame round the prize wheel of a video slot game themed “\(theme.name)”. Repaint it as the wheel's rim in the theme's own material and craft, richly ornamented, with small lamps or gems set evenly all the way round it.",
+            "It keeps exactly its size and shape. Inside the ring stays the flat background, with nothing drawn in it: the wheel's wedges turn there. No text, numbers or pointer.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// The hub at the wheel's centre, on its grey disc (the last image); the rim attached first.
+    static func wheelHubBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
+        [
+            "Image 1 is the rim of a prize wheel in a video slot game themed “\(theme.name)”. Edit the last attached image: the plain grey disc is the hub at that wheel's centre. Paint it as a polished cap in the rim's own material, the theme's emblem in relief at its middle. It stays round and its size.",
+            "No text or numbers.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// The pointer at the top of the wheel; the rim attached.
+    static func wheelPointerBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
+        [
+            "The attached image is the rim of a prize wheel in a video slot game themed “\(theme.name)”. Draw the pointer that sits at the top of that wheel and marks the winning wedge: one ornate pointer in the rim's own material, pointing straight down, its sharp tip at the bottom centre of the picture, filling about two thirds of the picture's height.",
+            "Nothing else: no wheel, rim, text or numbers.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+
+    /// A pop-up's blank panel, empty value bar or lettered button, on its grey template (the last image); the
+    /// reel frame attached first for the game's material.
+    static func popUpPieceBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), kind: PopUps.Kind, text: String) -> String {
+        let what: String
+        switch kind {
+        case .panel: what = "the blank panel the game's award pop-ups appear on — a grand plaque. Repaint it with an ornate frame in the reel frame's own material and craft; its inner face a rich deep colour of the theme, plain and empty: the game lays its titles and amounts on it. No text, numbers or icons."
+        case .bar: what = "the long bar a pop-up's amount is printed in. Repaint it as a recessed dark field framed in the reel frame's trim, plain and empty: the game prints the number there. No text or numbers."
+        case .button: what = "a button on the game's pop-ups. Repaint it in the reel frame's own material, a raised pill, lettered “\(text)” across its middle in bold, clear display letters, spelled exactly so. No other text."
+        case .title: what = ""
+        }
+        return [
+            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is \(what)",
+            "It keeps exactly its size and outline; its ornament may spread a little past its edge onto the background.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// A pop-up's title lettering, alone; `matching` when another title of the game is attached to match.
+    static func popUpTitleBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), text: String, matching: Bool) -> String {
+        let lines = text.components(separatedBy: "\n")
+        return [
+            (matching ? "The attached image is another title of this game: match its lettering exactly — letterforms, colours, outline, bevel and finish. " : "")
+            + "Letter \(lines.count == 1 ? "the words" : "these \(lines.count) lines, one under another, the middle line largest,") \(lines.map { "“\($0)”" }.joined(separator: " / ")) as the title of an award pop-up in a video slot game themed “\(theme.name)”: bold, dimensional display lettering with a thick outline and a bevel, in the theme's richest colours and metal, a little sparkle. Spelled exactly so, nothing added.",
+            "Only the lettering: no panel, plaque, banner, icons, characters or numbers behind or around it. It fills the picture's width with a small even margin.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+
     static let potStates = ["filling", "full"]
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), state: String) -> String {
         let contents = "what it collects in this game — glowing energy and gems in the pot's own colour, as this theme would have them"
