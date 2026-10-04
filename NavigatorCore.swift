@@ -8173,6 +8173,7 @@ public struct ReelLayout: Equatable, Codable, Sendable {
         public var what: String          // "hot reel", "jackpot table", "pots"
         public var rows: Int?, reels: Int?
         public var place: String         // "above", "below", "beside"
+        public var count: Int? = nil     // "3 pots"
     }
     public var grids: [Grid] = []
     public var extras: [Extra] = []
@@ -8252,7 +8253,9 @@ public enum ReelLayoutRules {
             }
             for (what, words) in [("jackpot table", ["jackpot table above", "jackpot table"]), ("pots", ["pots that sit above", "pots above"])]
                 where words.contains(where: lower.contains) && !out.extras.contains(where: { $0.what == what }) {
-                out.extras.append(ReelLayout.Extra(what: what, rows: nil, reels: nil, place: lower.contains("above") ? "above" : "beside"))
+                let n = (try? NSRegularExpression(pattern: #"(\d+)\s+\#(what)"#)).flatMap { re in
+                    re.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)).flatMap { Range($0.range(at: 1), in: lower).flatMap { Int(lower[$0]) } } }
+                out.extras.append(ReelLayout.Extra(what: what, rows: nil, reels: nil, place: lower.contains("above") ? "above" : "beside", count: n))
             }
         }
         // A size written both ways in one mode is said, once.
@@ -8289,13 +8292,15 @@ public struct ReelArea: Equatable, Sendable {
 
     /// The base grid (rows x reels) and a hot reel of `hot` rows above it when there is one, at `cell`
     /// pixels a cell; the canvas rounded up to multiples of 16, as GPT Image takes sizes.
-    public init(rows: Int, reels: Int, hotRows: Int = 0, cell: Int = 512) {
+    /// `independent`: every cell its own window, with dividers between rows too (hold-and-spin grids).
+    public init(rows: Int, reels: Int, hotRows: Int = 0, independent: Bool = false, cell: Int = 512) {
         self.cell = cell
         let band = Int((Self.bandShare * Double(cell)).rounded()), gap = Int((Self.gapShare * Double(cell)).rounded())
         self.band = band; self.gap = gap; self.radius = Int((Self.radiusShare * Double(cell)).rounded())
         let gridW = reels * cell + (reels - 1) * gap
         let hotH = hotRows > 0 ? Int(Double(hotRows) * 0.85 * Double(cell)) : 0
-        let gridH = rows * cell + (hotRows > 0 ? hotH + band : 0)
+        let mainH = rows * cell + (independent ? (rows - 1) * gap : 0)
+        let gridH = mainH + (hotRows > 0 ? hotH + band : 0)
         let side = Int(Self.margin * Double(cell)), top = Int((Self.margin + Self.crestRoom) * Double(cell))
         func up16(_ v: Int) -> Int { (v + 15) / 16 * 16 }
         width = up16(gridW + 2 * band + 2 * side); height = up16(gridH + 2 * band + top + side)
@@ -8308,13 +8313,19 @@ public struct ReelArea: Equatable, Sendable {
             for r in 1..<reels { dividers.append(Rect(x: gx + r * (cell + gap) - gap, y: y, w: gap, h: hotH)) }
             y += hotH + band
         }
-        for r in 0..<reels { windows.append(Rect(x: gx + r * (cell + gap), y: y, w: cell, h: rows * cell)) }
-        for r in 1..<reels { dividers.append(Rect(x: gx + r * (cell + gap) - gap, y: y, w: gap, h: rows * cell)) }
+        if independent {
+            for row in 0..<rows { for r in 0..<reels { windows.append(Rect(x: gx + r * (cell + gap), y: y + row * (cell + gap), w: cell, h: cell)) } }
+            for row in 1..<rows { dividers.append(Rect(x: gx, y: y + row * (cell + gap) - gap, w: gridW, h: gap)) }
+        } else {
+            for r in 0..<reels { windows.append(Rect(x: gx + r * (cell + gap), y: y, w: cell, h: mainH)) }
+        }
+        for r in 1..<reels { dividers.append(Rect(x: gx + r * (cell + gap) - gap, y: y, w: gap, h: mainH)) }
     }
-    public init(_ layout: ReelLayout, cell: Int = 512) {
-        let g = layout.base ?? ReelLayout.Grid(mode: "base", rows: 3, reels: 5)
-        let hot = layout.extras.first { $0.what == "hot reel" && $0.place == "above" }
-        self.init(rows: g.rows, reels: g.reels, hotRows: hot?.rows ?? 0, cell: cell)
+    /// `grid`'s reel area, the base grid's by default; a hot reel above belongs to the base grid only.
+    public init(_ layout: ReelLayout, grid: ReelLayout.Grid? = nil, cell: Int = 512) {
+        let g = grid ?? layout.base ?? ReelLayout.Grid(mode: "base", rows: 3, reels: 5)
+        let hot = g == layout.base ? layout.extras.first { $0.what == "hot reel" && $0.place == "above" } : nil
+        self.init(rows: g.rows, reels: g.reels, hotRows: hot?.rows ?? 0, independent: g.independent, cell: cell)
     }
     /// Where a pixel is: 0 outside the frame, 1 in the band (or the hot bar), 2 a divider, 3 an opening.
     func zone(_ x: Int, _ y: Int) -> Int {
@@ -8346,8 +8357,9 @@ public struct ReelArea: Equatable, Sendable {
                 let shade = u > 1.06 ? 150.0 : u < 0.06 || u > 0.94 ? 60.0 : u < 0.25 ? 150 + 70 * facingUp : u > 0.75 ? 125 - 60 * facingUp : 160 - 20 * abs(u - 0.5)
                 let c = UInt8(max(0, min(255, shade))); v = (c, c, c)
             case 2:
-                // A narrow bevelled bar: dark edges, lit across its middle.
-                let u = Double(x - (dividers.first { $0.contains(x, y) }?.x ?? x)) / Double(max(1, gap - 1))
+                // A narrow bevelled bar: dark edges, lit across its middle — across its width or its height.
+                let d = dividers.first { $0.contains(x, y) }
+                let u = d.map { $0.w <= $0.h ? Double(x - $0.x) : Double(y - $0.y) }.map { $0 / Double(max(1, gap - 1)) } ?? 0.5
                 let c = UInt8(max(0, min(255, u < 0.12 || u > 0.88 ? 85 : 170 - 60 * abs(u - 0.5)))); v = (c, c, c)
             default: break
             }
@@ -8405,6 +8417,114 @@ public struct ReelArea: Equatable, Sendable {
         var out = [UInt8](repeating: 0, count: width * height * 4)
         for y in grid.y..<(grid.y + grid.h) { for x in grid.x..<(grid.x + grid.w) { out[(y * width + x) * 4 + 3] = UInt8(alpha * 255) } }
         return out
+    }
+}
+
+extension ReelArea {
+    /// The outer edge of the band.
+    var outer: Rect { Rect(x: grid.x - band, y: grid.y - band, w: grid.w + 2 * band, h: grid.h + 2 * band) }
+
+    /// The base game's bezel and dividers re-laid round another grid of the same game, in code, as the
+    /// studio re-lays one bezel's material for a new grid (Golden Knight's: corners, one edge tile per reel,
+    /// side posts, a centred crest). Each corner, the centre piece of each edge (the crest on top) and a
+    /// plain run of each edge are cut from the base; the runs are repeated, mirrored, to the new lengths;
+    /// the dividers are a run of a base divider. Exact by construction, and free: GPT's own re-lay of a
+    /// 3x4 grid shifted its rows into 16% of the openings (Chevy-Hot, 2026-10-04). Straight RGBA in and out.
+    static func relay(bezel: [UInt8], dividers: [UInt8], from a: ReelArea, to b: ReelArea) -> (bezel: [UInt8], dividers: [UInt8]) {
+        let W = b.width, H = b.height, ao = a.outer, bo = b.outer
+        var out = [UInt8](repeating: 0, count: W * H * 4), div = out
+        let k = a.band + Int(0.35 * Double(a.cell))                       // a corner reaches this far along each edge
+        let mx = ao.x, my = ao.y, mr = a.width - (ao.x + ao.w), mb = a.height - (ao.y + ao.h)
+        func crop(_ x: Int, _ y: Int, _ w: Int, _ h: Int) -> FrameKit.Piece { FrameKit.crop(bezel, width: a.width, max(0, x), max(0, y), max(1, w), max(1, h)) }
+        func paste(_ p: FrameKit.Piece, _ x: Int, _ y: Int, into dst: inout [UInt8]) { FrameKit.over(&dst, width: W, p, at: x, y) }
+        /// A run along an edge: the plain piece repeated, every other copy mirrored, cut to `length`.
+        func run(_ p: FrameKit.Piece, length: Int, horizontal: Bool) -> FrameKit.Piece {
+            var parts: [FrameKit.Piece] = [], n = 0, i = 0
+            let step = horizontal ? p.w : p.h
+            while n < length { parts.append(i % 2 == 0 ? p : FrameKit.flipped(p, x: horizontal, y: !horizontal)); n += step; i += 1 }
+            let w = horizontal ? length : p.w, h = horizontal ? p.h : length
+            var px = [UInt8](repeating: 0, count: max(1, w * h) * 4)
+            for (j, q) in parts.enumerated() {
+                for yy in 0..<q.h { for xx in 0..<q.w {
+                    let X = horizontal ? j * step + xx : xx, Y = horizontal ? yy : j * step + yy
+                    guard X < w, Y < h else { continue }
+                    for c in 0..<4 { px[(Y * w + X) * 4 + c] = q.px[(yy * q.w + xx) * 4 + c] }
+                } }
+            }
+            return FrameKit.Piece(px: px, w: w, h: h)
+        }
+        // Edges: top and bottom across, left and right down, each a plain run with its centre piece on top.
+        let topH = my + k, botH = mb + k, leftW = mx + k, rightW = mr + k
+        let centreW = min(Int(1.3 * Double(a.cell)), ao.w / 3), centreH = min(Int(0.9 * Double(a.cell)), ao.h / 3)
+        let plainW = max(16, (ao.w - 2 * k - centreW) / 2 - 8), plainH = max(16, min(a.cell / 2, (ao.h - 2 * k - centreH) / 2 - 8))
+        let runs: [(FrameKit.Piece, Int, Int, Int, Bool)] = [
+            (crop(ao.x + k, 0, plainW, topH), bo.x + k, bo.y - my, bo.w - 2 * k, true),
+            (crop(ao.x + k, ao.y + ao.h - k, plainW, botH), bo.x + k, bo.y + bo.h - k, bo.w - 2 * k, true),
+            (crop(0, ao.y + ao.h - k - plainH, leftW, plainH), bo.x - mx, bo.y + k, bo.h - 2 * k, false),
+            (crop(ao.x + ao.w - k, ao.y + ao.h - k - plainH, rightW, plainH), bo.x + bo.w - k, bo.y + k, bo.h - 2 * k, false),
+        ]
+        for (p, x, y, len, h) in runs where len > 0 { paste(run(p, length: len, horizontal: h), x, y, into: &out) }
+        // Centre pieces: the crest over the top, the bottom's, and each side's middle.
+        paste(crop(ao.x + (ao.w - centreW) / 2, 0, centreW, topH), bo.x + (bo.w - centreW) / 2, bo.y - my, into: &out)
+        paste(crop(ao.x + (ao.w - centreW) / 2, ao.y + ao.h - k, centreW, botH), bo.x + (bo.w - centreW) / 2, bo.y + bo.h - k, into: &out)
+        let sideY = a.windows.last.map { $0.y + $0.h / 2 } ?? (ao.y + ao.h / 2)
+        paste(crop(0, sideY - centreH / 2, leftW, centreH), bo.x - mx, bo.y + bo.h / 2 - centreH / 2, into: &out)
+        paste(crop(ao.x + ao.w - k, sideY - centreH / 2, rightW, centreH), bo.x + bo.w - k, bo.y + bo.h / 2 - centreH / 2, into: &out)
+        // Corners last, over the runs.
+        paste(crop(0, 0, leftW, topH), bo.x - mx, bo.y - my, into: &out)
+        paste(crop(ao.x + ao.w - k, 0, rightW, topH), bo.x + bo.w - k, bo.y - my, into: &out)
+        paste(crop(0, ao.y + ao.h - k, leftW, botH), bo.x - mx, bo.y + bo.h - k, into: &out)
+        paste(crop(ao.x + ao.w - k, ao.y + ao.h - k, rightW, botH), bo.x + bo.w - k, bo.y + bo.h - k, into: &out)
+        // Dividers: a run of the base's last divider, the length of each new one; across, the same turned.
+        if let d = a.dividers.last(where: { $0.h > $0.w }) {
+            let seg = FrameKit.crop(dividers, width: a.width, d.x, d.y + d.h / 4, d.w, max(16, d.h / 2))
+            for nd in b.dividers {
+                let across = nd.w > nd.h
+                let r = run(across ? FrameKit.turned(seg, degrees: 90) : seg, length: across ? nd.w : nd.h, horizontal: across)
+                paste(r, nd.x, nd.y, into: &div)
+            }
+        }
+        // Nothing of either in the openings.
+        for w in b.windows { for y in w.y..<(w.y + w.h) { for x in w.x..<(w.x + w.w) { out[(y * W + x) * 4 + 3] = 0; div[(y * W + x) * 4 + 3] = 0 } } }
+        return (out, div)
+    }
+}
+
+/// The jackpot table that sits above the reels: a plate as wide as the bezel with one plaque per jackpot,
+/// each its name lettered over an empty value field the game prints the amount in. Laid out in code, like
+/// the bezel, for GPT Image to paint.
+public struct JackpotTable: Equatable, Sendable {
+    public var width: Int, height: Int, plaques: [ReelArea.Rect], fields: [ReelArea.Rect], plate: ReelArea.Rect
+    public init(count n: Int, width outer: Int, cell: Int = 512) {
+        func up16(_ v: Int) -> Int { (v + 15) / 16 * 16 }
+        let plateH = Int(0.9 * Double(cell)), pad = Int(0.12 * Double(cell)), margin = Int(0.15 * Double(cell))
+        // No longer than 3:1, GPT Image's limit: a wide plate is given room above and below.
+        width = up16(outer + 2 * margin); height = up16(max(plateH + 2 * margin, (width + 2) / 3))
+        let pl = ReelArea.Rect(x: (width - outer) / 2, y: (height - plateH) / 2, w: outer, h: plateH)
+        let pw = (outer - pad * (n + 1)) / max(1, n), ph = plateH - 2 * pad
+        let ps = (0..<n).map { ReelArea.Rect(x: pl.x + pad + $0 * (pw + pad), y: pl.y + pad, w: pw, h: ph) }
+        plate = pl; plaques = ps
+        fields = ps.map { ReelArea.Rect(x: $0.x + $0.w / 10, y: $0.y + $0.h * 45 / 100, w: $0.w * 8 / 10, h: $0.h * 45 / 100) }
+    }
+    /// The grey plate, its plaques raised and their value fields recessed, on the backing.
+    func template(backing b: RGB8) -> [UInt8] {
+        var px = [UInt8](repeating: 255, count: width * height * 4)
+        for y in 0..<height { for x in 0..<width {
+            let i = (y * width + x) * 4
+            var c: (UInt8, UInt8, UInt8) = (b.r, b.g, b.b)
+            if plate.contains(x, y) {
+                let edge = min(x - plate.x, plate.x + plate.w - 1 - x, y - plate.y, plate.y + plate.h - 1 - y)
+                var v = edge < 6 ? 70 : 140
+                if let p = plaques.first(where: { $0.contains(x, y) }) {
+                    let e = min(x - p.x, p.x + p.w - 1 - x, y - p.y, p.y + p.h - 1 - y)
+                    v = e < 5 ? 200 : 170
+                    if fields.contains(where: { $0.contains(x, y) }) { v = 60 }
+                }
+                c = (UInt8(v), UInt8(v), UInt8(v))
+            }
+            px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = 255
+        } }
+        return px
     }
 }
 
@@ -14150,6 +14270,28 @@ extension GDDAssetPrompts {
         return [
             "Edit the attached image: it is the plain grey reel frame of a video slot game themed “\(theme.name)” — a band round the reels\(hotReel ? ", a housing above them for one more row of reels with a bar between," : "") and narrow divider bars between the reels. Repaint it as the game's reel frame, its bezel: the same craft as its symbol frames — \(frame) — but heavier and grander, the frame of the whole game, with corner pieces and a crest at the top centre. Keep exactly the same band widths, the same divider bars and the same openings: its ornament may spread past its outer edge onto the background, never inward. Every opening stays the flat background, with nothing drawn in it.",
             "Lit from above, with bevel highlights along its top edges. No logo, title, text, lettering, numbers or symbols on it: the logo is a piece of its own.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// The jackpot table above the reels (JackpotTable): its plaques lettered with the jackpots' names, in the
+    /// bezel's material (attached first), each value field left empty for the game's amount.
+    static func jackpotTableBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), names: [String]) -> String {
+        [
+            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: it is the plain grey jackpot table that sits above those reels — a plate with \(names.count) plaques in a row. Repaint it in the reel frame's own material and craft. Each plaque has its jackpot's name lettered across its top, in this order from left to right: \(names.map { "“\($0)”" }.joined(separator: ", ")) — bold, dimensional lettering, spelled exactly so, the grandest plaque the richest. Below each name its dark recessed field stays plain and empty: the game prints the amount there.",
+            "The only lettering is those names. No numbers, prices, logo or symbols. The plate keeps exactly its size and outline; its ornament may spread a little past its outer edge onto the background.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// A pot above the reels, tied to a bonus symbol (attached): the same vessel, larger and grander, empty.
+    /// `symbol` nil: a pot with no bonus symbol of its own (the GDD names more pots than it has), drawn to
+    /// match the game's other pots (attached when there are any).
+    static func potBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), symbol: String?, number: Int, of total: Int) -> String {
+        [
+            symbol.map { "Image 1 is a bonus symbol of a video slot game themed “\(theme.name)”: \($0). Draw the pot that stands above the reels for it, which fills up as the game is played: the same vessel — its shape, material, colour and ornament — larger and grander, standing upright, seen straight on, its mouth open and empty, the whole vessel in view with a small even margin." }
+            ?? "Draw pot \(number) of the \(total) pots that stand above the reels of a video slot game themed “\(theme.name)”, which fill up as the game is played: a grand vessel of this theme, \(number > 1 ? "matching the attached pots in construction and size, a colour of its own, " : "")standing upright, seen straight on, its mouth open and empty, the whole vessel in view with a small even margin.",
+            "No text, lettering, numbers or symbols on it.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
         ].joined(separator: "\n\n")

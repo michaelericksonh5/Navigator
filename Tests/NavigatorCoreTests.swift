@@ -13260,6 +13260,41 @@ final class ReelAreaTests: XCTestCase {
         XCTAssertEqual(div[di + 3], 255); XCTAssertEqual(bezel[di + 3], 0)
         XCTAssertEqual(bezel[((mid.y + 10) * a.width + mid.x + 10) * 4 + 3], 0)
     }
+    // An independent grid (Chevy-Hot's 3x4 bonus): a window per cell, dividers between rows as well as reels.
+    func testAnIndependentGridHasAWindowPerCell() {
+        let layout = ReelLayoutRules.read(ReelLayoutTests.chevy)
+        let bonus = layout.grids.first { $0.mode == "bonus" }!
+        let a = ReelArea(layout, grid: bonus, cell: 200)
+        XCTAssertEqual(a.windows.count, 12); XCTAssertEqual(a.dividers.count, 2 + 3)       // 2 between rows, 3 between reels
+        XCTAssertEqual(a.grid.h, 3 * 200 + 2 * a.gap)
+        let px = a.template(backing: RGB8(255, 0, 255))
+        XCTAssertEqual(a.covered(px, backing: RGB8(255, 0, 255)), 0, accuracy: 1e-9)
+        XCTAssertFalse(a.windows.contains { $0.h < 200 })                                  // no hot reel in the bonus grid
+    }
+    // A bonus grid's bezel is the base bezel re-laid in code: every opening empty, the band all the way
+    // round, dividers between reels and rows — and no "free" in any mode's name.
+    func testABonusBezelIsTheBaseBezelReLaid() {
+        let b = RGB8(255, 0, 255)
+        let base = ReelArea(rows: 3, reels: 5, cell: 200), bonus = ReelArea(rows: 5, reels: 5, independent: true, cell: 200)
+        let (bz, dv) = base.layers(FrameKit.keyed(base.template(backing: b), backing: b))
+        let (rb, rd) = ReelArea.relay(bezel: bz, dividers: dv, from: base, to: bonus)
+        let W = bonus.width, alpha = { (px: [UInt8], x: Int, y: Int) in px[(y * W + x) * 4 + 3] }
+        for w in bonus.windows { XCTAssertEqual(alpha(rb, w.x + w.w / 2, w.y + w.h / 2), 0); XCTAssertEqual(alpha(rd, w.x + 3, w.y + 3), 0) }
+        let o = bonus.outer
+        for (x, y) in [(o.x + o.w / 2, o.y + 5), (o.x + o.w / 2, o.y + o.h - 5), (o.x + 5, o.y + o.h / 2), (o.x + o.w - 5, o.y + o.h / 3)] {
+            XCTAssertGreaterThan(alpha(rb, x, y), 200, "band at \(x),\(y)")
+        }
+        for d in bonus.dividers { XCTAssertGreaterThan(alpha(rd, d.x + d.w / 2, d.y + d.h / 2), 200) }
+    }
+
+    // The jackpot table: one plaque per jackpot, each with an empty value field, inside the plate.
+    func testTheJackpotTableHasAPlaquePerJackpot() {
+        let t = JackpotTable(count: 4, width: 2800, cell: 512)
+        XCTAssertEqual(t.plaques.count, 4); XCTAssertEqual(t.width % 16, 0)
+        for (p, f) in zip(t.plaques, t.fields) { XCTAssertTrue(t.plate.contains(p.x, p.y) && p.contains(f.x, f.y) && p.contains(f.x + f.w - 1, f.y + f.h - 1)) }
+        XCTAssertEqual(ReelLayoutRules.read(ReelLayoutTests.toyota).extras.first { $0.what == "pots" }?.count, 3)
+    }
+
     // Chevy-Hot: a 1x3 hot reel above a 3x3 grid, in a housing sharing the top band, read from its GDD.
     func testAHotReelSitsInAHousingAboveTheGrid() {
         let a = ReelArea(ReelLayoutRules.read(ReelLayoutTests.chevy), cell: 200)
