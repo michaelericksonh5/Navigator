@@ -21699,7 +21699,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
     app.run()
 }
 
-// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>] [--only "<piece>,<piece>"] [--localize]
+// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>] [--only "<piece>,<piece>"] [--localize] [--budget <dollars>]
 // The reel area for every grid the GDD gives — bezel, dividers, reel texture, reel fade — the jackpot table and
 // pots above the reels when it has them, and a preview per mode. What is there already is kept, unless --again,
 // which keeps it in versions/ and draws it all again (or only the --only pieces). Run --checklist first for the cost.
@@ -21740,7 +21740,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         }
         if args.contains("--localize") { run.localizeIntro = true }
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = run.generateReelArea(full, folder: folder, only: only)
+            let budget = args.firstIndex(of: "--budget").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil }
+            let r = run.generateReelArea(full, folder: folder, only: only, budget: budget)
             print(String(format: "DONE: %@\nSPENT: $%.4f", r.problems.isEmpty ? "reel area made" : r.problems.joined(separator: "; "), r.cost))
             exit(0)
         }
@@ -26189,7 +26190,8 @@ final class GDDToAssetsRun: ObservableObject {
     /// - Pots: one per bonus symbol they are tied to, drawn from it.
     /// What is already there is kept unless `again`. Blocks: call off the main thread.
     /// `only`: Make Again's pieces (reelPieces names) to draw; nothing else is drawn, though free steps still run.
-    func generateReelArea(_ layout: ReelLayout, folder: URL, only: Set<String>? = nil) -> (cost: Double, problems: [String]) {
+    /// `budget`: dollars the run may spend; a drawing that would pass it is not asked for, and the run says so.
+    func generateReelArea(_ layout: ReelLayout, folder: URL, only: Set<String>? = nil, budget: Double? = nil) -> (cost: Double, problems: [String]) {
         let (theme0, design, backing, jobs) = DispatchQueue.main.sync { (self.theme, self.styledDesign, self.backing, self.jobs) }
         guard let theme = theme0, let baseGrid = layout.base else { return (0, ["no theme or no grid"]) }
         let b = backing.rgb, space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
@@ -26234,6 +26236,10 @@ final class GDDToAssetsRun: ObservableObject {
             if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
             if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
             for attempt in 1...(covered == nil && judge == nil ? 1 : 2) {
+                if let budget, cost + AssetChecklist.gpt(rw, rh) > budget {
+                    if !problems.contains(where: { $0.hasPrefix("stopped at the budget") }) { problems.append(String(format: "stopped at the budget of $%.2f: what is not drawn yet is drawn by the next run", budget)) }
+                    return best?.px
+                }
                 let r = OpenAIImages.edit(prompt: ask, images: inputs, size: rw, height: rh)
                 cost += r.cost
                 guard let d = r.png, let px = pixels(d, w, h) else { problems.append("\(what): \(r.error ?? "no image")"); return best?.px }
@@ -26379,12 +26385,17 @@ final class GDDToAssetsRun: ObservableObject {
                     write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
                 }
             }
-            // A pot drawn before pots had their room is given it, free.
+            // A pot drawn before pots had their present room is given it, free; its states, drawn on the old canvas, are
+            // kept in versions/ and grown again (each grows from the one before).
             for i in 0..<total {
-                guard let p = load("\(jar(i, 0))_rmbg.png"), p.w == 1024, p.h == 1024 else { continue }
-                let tall = PotStates.padded(p.px, size: 1024)
+                guard let p = load("\(jar(i, 0))_rmbg.png"), p.w == 1024, p.h < potH else { continue }
+                let tall = [UInt8](repeating: 0, count: 1024 * (potH - p.h) * 4) + p.px
                 write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
                 write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
+                let kept = folder.appendingPathComponent("versions/pots-before-room")
+                try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+                for k in 1...PotStates.levels { for sfx in [".png", "_rmbg.png"] { try? fm.moveItem(at: url(jar(i, k) + sfx), to: kept.appendingPathComponent(jar(i, k) + sfx)) } }
+                navLog("gdd reel: \(jar(i, 0)) given room to \(potH) px; its states kept in \(kept.lastPathComponent) to grow again")
             }
             // Its fill states, State1…State5, each grown from the one before on a grey heap laid in code to its height
             // (PotStates.rise, the shipped rigs' back-loaded schedule): the treasure only ever rises, the last states

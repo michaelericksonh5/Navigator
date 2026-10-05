@@ -13550,7 +13550,7 @@ final class ReelAreaTests: XCTestCase {
         XCTAssertEqual(PotStates.name(pot: 2, of: 3, state: 5), "shared_avatar_jar3-State5Idle")
         XCTAssertEqual(PotStates.levels, 5)
         // Pots stand at the bottom of a canvas with room above them.
-        XCTAssertEqual(PotStates.height(1024), 1280)
+        XCTAssertEqual(PotStates.height(1024), 1536)
         let tall = PotStates.padded(empty, size: n)
         XCTAssertEqual(tall.count, n * PotStates.height(n) * 4)
         XCTAssertEqual(PotStates.foot(tall, width: n, height: PotStates.height(n))!.bottom, e.bottom + PotStates.height(n) - n)
@@ -13716,7 +13716,10 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertGreaterThan(PotStates.rise[5] - PotStates.rise[3], PotStates.rise[5] * 0.35)    // shipped: about half the rise after State3
         let t3 = PotStates.template(previous: pot, empty: pot, width: w, height: h, state: 3, backing: RGB8(255, 0, 255))!
         let crown = (0..<h).first { y in (0..<w).contains { t3[(y * w + $0) * 4] != 255 || t3[(y * w + $0) * 4 + 2] != 255 } }!
-        XCTAssertEqual(Double(45 - crown) / 79, PotStates.rise[3], accuracy: 0.03)
+        XCTAssertEqual(Double(45 - crown) / 79, PotStates.crown(3, after: 0, room: 1), accuracy: 0.03)
+        // A state drawn higher than planned: the next still rises a step the eye sees, within the room left.
+        XCTAssertGreaterThanOrEqual(PotStates.crown(2, after: 0.16, room: 0.5) - 0.16, 0.04)
+        XCTAssertLessThanOrEqual(PotStates.crown(5, after: 0.45, room: 0.5), 0.5)
         XCTAssertFalse(PotStates.growthProblems(pot, previous: pot, empty: pot, width: w, height: h, state: 3).isEmpty)  // no rise: caught
     }
     // The phone-size check: a speckled piece fails where a smooth one passes; reading is scored by letters.

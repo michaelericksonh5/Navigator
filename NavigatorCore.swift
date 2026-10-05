@@ -8767,7 +8767,9 @@ extension ReelArea {
 /// pot's foot width and set on its foot's bottom centre. Every pot file has `headroom` clear above the pot,
 /// room for what rises from it when full (square, GPT filled the canvas and the treasure was cut flat).
 public enum PotStates {
-    public static let headroom = 0.25
+    /// Room above the pot, in its width: half — a lid thrown open early (GPT, 2026-10-04: 16% of the pot's height at
+    /// State1) still leaves the later states room to keep rising; 1024x1536 is a size GPT Image draws natively.
+    public static let headroom = 0.5
     /// The studio's pot rig (`shared_avatar_jar`, 18 rigs in about 17 shipped games, 2026-10-04): State0 empty
     /// and unlit, then five fill states — a lid opening further each time, the game's treasure rising until it
     /// overflows at State5, the glow growing. The pot itself never moves. A burst and reset are the rig's own.
@@ -8817,9 +8819,23 @@ public enum PotStates {
     /// State `k`'s template: state k−1 (straight RGBA on its tall canvas) on the backing, with flat grey treasure
     /// heaped on the pot's mouth — a dome over most of the pot's top whose crown stands `rise[k]` of State0's height
     /// above State0's top — for GPT to paint as more of the same treasure. The code sets how high it fills.
+    /// State `k`'s crown, in State0's heights above its top, from where state k−1 stands (`after`): at least a step the eye
+    /// sees at phone size (4%), and the room left shared out as the shipped rigs share it — back-loaded — so a state
+    /// drawn higher than planned leaves the rest still growing, all within the canvas (`room`).
+    public static func crown(_ k: Int, after rp: Double, room: Double) -> Double {
+        let final = min(room, max(rise[levels], rp + Double(levels - k + 1) * 0.05))
+        let share = (rise[k] - rise[k - 1]) / (rise[levels] - rise[k - 1])
+        return min(room, rp + max(0.04, (final - rp) * share))
+    }
+    /// Where a state stands, and how far it can rise, in State0's heights above State0's top.
+    static func standing(_ px: [UInt8], empty: [UInt8], width w: Int, height h: Int) -> (rise: Double, room: Double, s0: (top: Int, bottom: Int))? {
+        guard let s0 = span(empty, width: w, height: h), let sp = span(px, width: w, height: h) else { return nil }
+        let H0 = Double(max(1, s0.bottom - s0.top))
+        return (Double(s0.top - sp.top) / H0, (Double(s0.top) - 0.03 * Double(h)) / H0, s0)
+    }
     static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8) -> [UInt8]? {
-        guard k > 0, k < rise.count, let s0 = span(empty, width: w, height: h) else { return nil }
-        let H0 = Double(s0.bottom - s0.top)
+        guard k > 0, k < rise.count, let st = standing(previous, empty: empty, width: w, height: h) else { return nil }
+        let s0 = st.s0, H0 = Double(s0.bottom - s0.top)
         // The pot's top: its widest row in its top third.
         var x0 = 0, x1 = -1
         for y in s0.top..<min(h, s0.top + Int(H0 * 0.35)) {
@@ -8828,7 +8844,7 @@ public enum PotStates {
         }
         guard x1 > x0 else { return nil }
         let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.42
-        let crown = max(0, Double(s0.top) - rise[k] * H0), foot = Double(s0.top) + 0.12 * H0
+        let crown = max(0, Double(s0.top) - crown(k, after: st.rise, room: st.room) * H0), foot = Double(s0.top) + 0.12 * H0
         var out = FrameKit.onBacking(previous, b)
         for y in Int(crown)..<min(h, Int(foot)) { for x in max(0, Int(cx - hw))..<min(w, Int(cx + hw) + 1) where previous[(y * w + x) * 4 + 3] < 128 {
             let dx = (Double(x) - cx) / hw, dy = (foot - Double(y)) / max(1, foot - crown)
@@ -8838,14 +8854,16 @@ public enum PotStates {
         } }
         return out
     }
-    /// What keeps a drawn state (laid on State0) from growing as the rig must: from State2 on its top at least 3% of
-    /// State0's height above the state before (shipped: every late step 5–9%), and within 5% of its height in `rise`.
+    /// What keeps a drawn state (laid on State0) from growing as the rig must: its top at least 3% of State0's height above
+    /// the state before (shipped: every late step 5–9%), and near its crown — not far short, nor far past it (a lid thrown
+    /// open early leaves the later states no room).
     public static func growthProblems(_ px: [UInt8], previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int) -> [String] {
-        guard k < rise.count, let s0 = span(empty, width: w, height: h), let sp = span(previous, width: w, height: h), let sk = span(px, width: w, height: h) else { return [] }
-        let H0 = Double(s0.bottom - s0.top), r = Double(s0.top - sk.top) / H0, rp = Double(s0.top - sp.top) / H0
+        guard k > 0, k < rise.count, let p = standing(previous, empty: empty, width: w, height: h), let n = standing(px, empty: empty, width: w, height: h) else { return [] }
+        let c = crown(k, after: p.rise, room: p.room), r = n.rise
         var out: [String] = []
-        if k >= 2 && r < rp + 0.03 { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, rp * 100)) }
-        if abs(r - rise[k]) > 0.05 { out.append(String(format: "its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%%: the treasure reaches exactly the grey heap's top", r * 100, rise[k] * 100)) }
+        if r < p.rise + (k == 1 ? 0.01 : 0.03) { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, p.rise * 100)) }
+        else if r < c - 0.06 { out.append(String(format: "too low: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure reaches the grey heap's top", r * 100, c * 100)) }
+        if r > c + 0.08 { out.append(String(format: "too high too soon: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure stops at the grey heap's top and any lid opens only as far as this stage says", r * 100, c * 100)) }
         return out
     }
     /// A pot's Power Bet look, beside its states.
@@ -9040,12 +9058,12 @@ public enum AssetChecklist {
                 let words = (l.potFeatures ?? []).indices.contains(i) ? l.potFeatures![i] : ""
                 out.append(Item(group: "Pots", name: PotStates.name(pot: i, of: n, state: 0).replacingOccurrences(of: "-State0Idle", with: ""),
                                 what: "pot \(i + 1), State0 to State\(PotStates.levels)" + (words.isEmpty ? "" : " — \(words)"),
-                                files: (0...PotStates.levels).map { "\(PotStates.name(pot: i, of: n, state: $0)).png" }, maker: "Pots", cost: Double(PotStates.levels + 1) * gpt(1024, 1280)))
+                                files: (0...PotStates.levels).map { "\(PotStates.name(pot: i, of: n, state: $0)).png" }, maker: "Pots", cost: Double(PotStates.levels + 1) * gpt(1024, PotStates.height(1024))))
                 if n > 1 { out.append(Item(group: "Pots", name: PotStates.plaqueName(pot: i), what: words.isEmpty ? "plaque, plain" : "plaque: \(words)",
                                            files: ["\(PotStates.plaqueName(pot: i)).png"], maker: "Pots", cost: gpt(1024, 384))) }
                 if let boost = l.potBoost {
                     out.append(Item(group: "Pots", name: PotStates.boostedName(pot: i, of: n), what: "pot \(i + 1) with the Power Bet on: \(boost)",
-                                    files: ["\(PotStates.boostedName(pot: i, of: n)).png"], maker: "Pots", cost: gpt(1024, 1280)))
+                                    files: ["\(PotStates.boostedName(pot: i, of: n)).png"], maker: "Pots", cost: gpt(1024, PotStates.height(1024))))
                 }
             }
         }
@@ -15869,7 +15887,8 @@ extension GDDAssetPrompts {
     /// A pot's fill state `k`, grown from state k−1 (attached, with the new treasure laid on it as a flat grey heap
     /// to the height PotStates.rise sets): the heap painted as more of the same treasure, nothing else changed.
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
-        let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]
+        let lid = ["", "still resting on its rim, lifted only a finger's width at the front so the treasure glints in the gap", "lifted a little, tilted back a quarter of the way",
+                   "tilted halfway open", "opened most of the way", "thrown fully open"][k]
         return [
             "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, \(k == 1 ? "empty" : "at fill stage \(k - 1) of 5"). The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). At a glance this stage must look clearly fuller and livelier than the one before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.",
             "If the pot has a lid, cover or door, the rising treasure lifts it: \(lid) on its hinge or resting tilted on the heap — never taken away; a pot with no lid never gains one. Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
