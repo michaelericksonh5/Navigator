@@ -9227,6 +9227,36 @@ public enum Localized {
 /// (10 of 10 older games ship one; GameForge's landscape is 4608x2532, drawn here at its shape within GPT's limits).
 public enum Derived {
     public static let landscape = (w: 2912, h: 1600)
+    /// A cut-out with any glow round it taken off: everything outside its solid body (opaque over 200, what it encloses
+    /// kept), grown `grow` pixels, cleared. The studio's jackpot coins carry none (2026-10-05); free, whatever was drawn.
+    public static func withoutGlow(_ px: [UInt8], width w: Int, height h: Int, grow: Int = 2) -> [UInt8] {
+        // Outside: not solid and reached from the picture's border.
+        var outside = [Bool](repeating: false, count: w * h), stack: [Int] = []
+        func solid(_ i: Int) -> Bool { px[i * 4 + 3] > 200 }
+        for x in 0..<w { for y in [0, h - 1] where !solid(y * w + x) { stack.append(y * w + x) } }
+        for y in 0..<h { for x in [0, w - 1] where !solid(y * w + x) { stack.append(y * w + x) } }
+        while let i = stack.popLast() {
+            guard !outside[i] else { continue }
+            outside[i] = true
+            let x = i % w, y = i / w
+            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] where nx >= 0 && nx < w && ny >= 0 && ny < h {
+                let j = ny * w + nx
+                if !outside[j] && !solid(j) { stack.append(j) }
+            }
+        }
+        var keep = outside.map { !$0 }
+        guard keep.contains(true) else { return px }
+        for _ in 0..<grow {
+            var next = keep
+            for y in 0..<h { for x in 0..<w where !keep[y * w + x] {
+                if (x > 0 && keep[y * w + x - 1]) || (x < w - 1 && keep[y * w + x + 1]) || (y > 0 && keep[(y - 1) * w + x]) || (y < h - 1 && keep[(y + 1) * w + x]) { next[y * w + x] = true }
+            } }
+            keep = next
+        }
+        var out = px
+        for i in 0..<(w * h) where !keep[i] { out[i * 4 + 3] = 0 }
+        return out
+    }
     public static func winName(_ id: String) -> String { "\(id)_win" }
 
     /// The solid body of a cut-out (alpha over 200, so a glow doesn't count): its box, or nil when empty.
@@ -9867,8 +9897,25 @@ public enum PopUps {
         return nil
     }
 
+    /// A title's lines, set in code, not left to the model (which squeezed BONUS GAMES AWARDED! onto one line and pushed
+    /// its “!” to the edge, 2026-10-05): a title of three or more words and over twelve letters goes on two lines, centred —
+    /// the event's name above, AWARDED! or COMPLETE below it, as the studio sets them; any other the split nearest even.
+    public static func lines(_ text: String) -> [String] {
+        guard !text.contains("\n") else { return text.components(separatedBy: "\n") }
+        let words = text.split(separator: " ").map(String.init)
+        guard words.count >= 3, text.filter(\.isLetter).count > 12 else { return [text] }
+        if let last = words.last, ["AWARDED!", "AWARDED", "COMPLETE", "COMPLETE!"].contains(last) { return [words.dropLast().joined(separator: " "), last] }
+        let cut = (1..<words.count).min { a, b in
+            abs(words[..<a].joined(separator: " ").count - words[a...].joined(separator: " ").count) < abs(words[..<b].joined(separator: " ").count - words[b...].joined(separator: " ").count)
+        }!
+        return [words[..<cut].joined(separator: " "), words[cut...].joined(separator: " ")]
+    }
     public static func plan(_ layout: ReelLayout, jackpots: [String], bonus: Bool) -> [Piece] {
-        func title(_ name: String, _ text: String, _ w: Int = 1536, _ h: Int = 512) -> Piece { Piece(name: name, kind: .title, text: text, w: w, h: h) }
+        // Two lines take a taller canvas (2:1), so each line is as large as a one-line title's.
+        func title(_ name: String, _ text: String, _ w: Int = 1536, _ h: Int = 512) -> Piece {
+            let l = lines(text)
+            return Piece(name: name, kind: .title, text: l.joined(separator: "\n"), w: w, h: l.count == 2 && h == 512 ? 768 : h)
+        }
         // The studio's own names (asset inventory, 2026-10-04): the panel is celebration backing 2, the value bar 1.
         var out = [Piece(name: "shared_celebration_backing-2", kind: .panel, text: "", w: 1536, h: 1152),
                    Piece(name: "shared_celebration_backing-1", kind: .bar, text: "", w: 1536, h: 512),
@@ -15595,7 +15642,9 @@ extension GDDAssetPrompts {
             return "Exactly one character, the “\(r)”, whole and unmistakable — no second letter, no other lettering, no numbers, no watermark, no user interface."
         }
         if let w = letteredWord(job) {
+            // The studio's jackpot coins carry no glow: one painted round them keys to a halo (2026-10-05).
             return "The only lettering is “\(w)”, spelled exactly so — no other text, letters or numbers, no watermark, no user interface."
+                + (job.role == .jackpot ? " No glow, halo or light around it: its own edge meets the background directly." : "")
         }
         return "No text, lettering or numbers, no watermark, no user interface."
     }
@@ -15845,10 +15894,11 @@ extension GDDAssetPrompts {
     /// A pop-up's title lettering, alone; `matching` when another title of the game is attached to match.
     static func popUpTitleBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), text: String, matching: Bool) -> String {
         let lines = text.components(separatedBy: "\n")
+        let layout = lines.count == 1 ? "the words" : lines.count == 2 ? "these 2 lines, the second centred under the first, the two about equally wide," : "these \(lines.count) lines, one centred under another, the middle line largest,"
         return [
-            (matching ? "The attached image is another title of this game: match its lettering exactly — letterforms, colours, outline, bevel and finish — but never any texture or sparkle inside its letters. " : "")
-            + "Letter \(lines.count == 1 ? "the words" : "these \(lines.count) lines, one under another, the middle line largest,") \(lines.map { "“\($0)”" }.joined(separator: " / ")) as the title of an award pop-up in a video slot game themed “\(theme.name)”, in the theme's richest colours. Spelled exactly so, nothing added. " + letteringRules,
-            "Only the lettering: no panel, plaque, banner, icons, characters or numbers behind or around it. It fills the picture's width with a small even margin.",
+            (matching ? "The attached image is another title of this game: match its lettering exactly — letterforms, colours, outline, bevel and finish — but never any texture or sparkle inside its letters, and set these words in their own lines as given. " : "")
+            + "Letter \(layout) \(lines.map { "“\($0)”" }.joined(separator: " / ")) as the title of an award pop-up in a video slot game themed “\(theme.name)”, in the theme's richest colours. Spelled exactly so — every letter and mark as given, \(text.contains("!") ? "the “!” included, " : "")nothing added. " + letteringRules,
+            "Only the lettering: no panel, plaque, banner, icons, characters or numbers behind or around it. It fills most of the picture's width with a clear even margin all round: no letter or mark touches the picture's edge.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
         ].joined(separator: "\n\n")
@@ -16717,6 +16767,8 @@ public enum Legibility {
     public struct Measure: Equatable, Sendable {
         public var glints: Double, hf: Double, edges: Double
         public var read: Double?        // the words read at SE size, 0…1; nil when it carries none
+        public var bang: Bool? = nil     // an “!” it should carry, read; nil when it carries none
+        public var edge: Bool = false    // its lettering runs to the picture's edge
     }
 
     /// The piece (straight RGBA) cropped to its silhouette and scaled to its display size, measured.
@@ -16727,10 +16779,15 @@ public enum Legibility {
         let s = Double(display ?? displaySize(kind)) / Double(kind == .wedge ? crop.h : crop.w)
         let d = FrameKit.resized(crop, max(1, Int(Double(crop.w) * s)), max(1, Int(Double(crop.h) * s)))
         var m = clutter(d.px, width: d.w, height: d.h)
+        // Lettering alone on its canvas that reaches the edge may be cut off there (Tiki's BONUS GAMES AWARDED!, 2026-10-05).
+        if kind == .title || kind == .message { m.edge = box.x <= 1 || box.y <= 1 || box.x + box.w >= w - 1 || box.y + box.h >= h - 1 }
         if let text, !text.isEmpty {
             let se = 750.0 / 1170.0
             let small = FrameKit.resized(d, max(1, Int(Double(d.w) * se)), max(1, Int(Double(d.h) * se)))
-            m.read = readScore(read(small.px, width: small.w, height: small.h, languages: languages), text)
+            let got = read(small.px, width: small.w, height: small.h, languages: languages)
+            m.read = readScore(got, text)
+            // Apple's recognizer reads a display “!” reliably (every one in the galactic and Tiki titles, 2026-10-05).
+            if text.contains("!") { m.bang = got.contains("!") }
         }
         return m
     }
@@ -16742,6 +16799,8 @@ public enum Legibility {
         if let h = l.hf, m.hf > h { out.append(String(format: "too much fine detail and texture (%.2f of its light and shade is finer than the phone shows clearly; shipped at most %.2f)", m.hf, h) + advice(kind, glints: false)) }
         if let e = l.edges, m.edges > e { out.append(String(format: "too busy (%.0f%% of it is edges at phone size; shipped at most %.0f%%)", m.edges * 100, e * 100)) }
         if let r = m.read, r < (kind == .title || kind == .piece ? 0.8 : 1) { out.append(String(format: "its words do not read at a small phone's size (%.0f%% read)", r * 100)) }
+        if m.bang == false { out.append("its “!” is missing or does not read — set it clearly after the last letter, inside the margin") }
+        if m.edge { out.append("its lettering runs to the picture's edge and may be cut off — a clear margin all round") }
         return out
     }
     /// What to change, for the redraw, by what the piece is.
@@ -16762,6 +16821,8 @@ public enum Legibility {
         if let h = l.hf { e += max(0, m.hf / h - 1) }
         if let x = l.edges { e += max(0, m.edges / x - 1) }
         if let r = m.read { e += max(0, (kind == .title || kind == .piece ? 0.8 : 1) - r) * 3 }
+        if m.bang == false { e += 1 }
+        if m.edge { e += 1 }
         return e
     }
 

@@ -27408,6 +27408,19 @@ final class GDDToAssetsRun: ObservableObject {
         }
     }
 
+    /// The jackpot coins' cut-outs without any glow drawn round them (Derived.withoutGlow): free, before they are sized.
+    func trimGlows(_ cuts: [URL]) {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        for url in cuts {
+            let id = url.lastPathComponent.replacingOccurrences(of: "_rmbg.png", with: "")
+            guard jobs.first(where: { $0.id == id })?.role == .jackpot, let cg = loadCGImage(url), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+            let trimmed = Derived.withoutGlow(px, width: cg.width, height: cg.height)
+            guard trimmed != px else { continue }
+            try? ChromaKeyOutputRules.image(straightRGBA8: trimmed, width: cg.width, height: cg.height, space: space).flatMap(encodePNG)?.write(to: url)
+            navLog("gdd cut: \(id)'s glow trimmed off its cut-out")
+        }
+    }
+
     func cutAndSplit(_ symbolPNGs: [URL], removeBackground: Bool, separateFrames: Bool) {
         if removeBackground && !symbolPNGs.isEmpty {
             self.keying = true
@@ -27420,6 +27433,7 @@ final class GDDToAssetsRun: ObservableObject {
                 self.status = done.isEmpty
                     ? "Background removal didn’t produce anything — check Photoshop."
                     : "Backgrounds removed from \(done.count) of \(symbolPNGs.count) symbols."
+                self.trimGlows(done)
                 self.sizeForReels(done)
                 // Frames were drawn WITH their symbols so the two would match. Splitting
                 // them afterwards is what makes the frame reusable and the symbol

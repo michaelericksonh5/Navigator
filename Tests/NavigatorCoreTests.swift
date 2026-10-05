@@ -13511,9 +13511,12 @@ final class WheelAndPopUpTests: XCTestCase {
         let layout = ReelLayoutRules.read(Self.wheels + "\nLoot Link\nThe matrix changes to a 20x1 independent reels matrix.")
         let p = PopUps.plan(layout, jackpots: ["Grand", "Major", "Minor", "Mini"], bonus: true)
         let titles = p.filter { $0.kind == .title }.map(\.text)
-        XCTAssertTrue(titles.contains("BONUS GAMES AWARDED!")); XCTAssertTrue(titles.contains("TOTAL WIN"))
-        XCTAssertTrue(titles.contains("YOU'VE WON THE\nGRAND\nJACKPOT")); XCTAssertTrue(titles.contains("LOOT LINK AWARDED!"))
-        XCTAssertTrue(titles.contains("JACKPOT WHEEL AWARDED!")); XCTAssertTrue(titles.contains("ONE MORE CHANCE"))
+        // Long titles set on two centred lines in code, the event's name above AWARDED!; short ones on one.
+        XCTAssertTrue(titles.contains("BONUS GAMES\nAWARDED!")); XCTAssertTrue(titles.contains("TOTAL WIN"))
+        XCTAssertTrue(titles.contains("YOU'VE WON THE\nGRAND\nJACKPOT")); XCTAssertTrue(titles.contains("LOOT LINK\nAWARDED!"))
+        XCTAssertTrue(titles.contains("JACKPOT WHEEL\nAWARDED!")); XCTAssertTrue(titles.contains("ONE MORE\nCHANCE"))
+        XCTAssertTrue(titles.contains("PRESS TO SPIN")); XCTAssertTrue(titles.contains("BIG WIN!"))
+        XCTAssertEqual(p.first { $0.name == "base_popUp_bonusGamesAwarded" }?.h, 768)      // two lines, a taller canvas
         XCTAssertEqual(Array(titles.suffix(PopUps.winTiers.count)), PopUps.winTiers)
         XCTAssertFalse(p.contains { $0.name.lowercased().contains("free") || $0.text.lowercased().contains("free") })
         XCTAssertEqual(Set(p.map(\.name)).count, p.count)
@@ -13782,5 +13785,34 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertGreaterThan(b.glints, a.glints)
         XCTAssertEqual(Legibility.readScore("BONUS GAMES", "Bonus Games!"), 1)
         XCTAssertEqual(Legibility.readScore("BONVS GAMES", "BONUS GAMES"), 0.9, accuracy: 0.001)
+    }
+}
+
+
+final class TitleAndCoinTests: XCTestCase {
+    // A coin's painted glow comes off its cut-out; the coin itself, and anything it encloses, stays.
+    func testACoinsGlowIsTrimmed() {
+        let n = 60
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let d = (Double((x - 30) * (x - 30) + (y - 30) * (y - 30))).squareRoot(), i = (y * n + x) * 4
+            px[i] = 200; px[i + 3] = d < 18 ? 255 : d < 26 ? 90 : 0                      // a coin, a soft glow round it
+            if d < 4 { px[i + 3] = 120 }                                                     // a glassy middle it encloses
+        } }
+        let t = Derived.withoutGlow(px, width: n, height: n)
+        XCTAssertEqual(t[(30 * n + 52) * 4 + 3], 0)                                        // the glow: gone
+        XCTAssertEqual(t[(30 * n + 40) * 4 + 3], 255)                                      // the coin: kept
+        XCTAssertEqual(t[(30 * n + 30) * 4 + 3], 120)                                      // what it encloses: kept
+        XCTAssertTrue(GDDAssetPrompts.bans(AssetPlanRules.symbolJobs(GDDSymbolSetRules.parseManual("JP1").symbols)[0]).contains("No glow"))
+    }
+    // Lettering that runs to its canvas's edge is caught.
+    func testLetteringAtTheEdgeIsCaught() {
+        let w = 200, h = 80
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 20..<60 { for x in 0..<w { px[(y * w + x) * 4] = 250; px[(y * w + x) * 4 + 3] = 255 } }
+        let m = Legibility.measure(px, width: w, height: h, kind: .title)!
+        XCTAssertTrue(m.edge)
+        XCTAssertTrue(Legibility.problems(m, kind: .title).contains { $0.contains("edge") })
+        XCTAssertEqual(PopUps.lines("COLLECTOR BONUS WHEEL"), ["COLLECTOR", "BONUS WHEEL"])
     }
 }
