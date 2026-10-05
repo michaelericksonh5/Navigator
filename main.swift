@@ -26491,6 +26491,13 @@ final class GDDToAssetsRun: ObservableObject {
         /// When asked (softenPots), a pot drawing eased to the shipped sparkle and fine-detail limits as it arrives, only as far
         /// as it needs (Legibility.softened); off, drawings are kept as drawn.
         let soften = DispatchQueue.main.sync { self.softenPots }
+        /// A pot measured at phone size once it is drawn: said as a warning, never drawn again for it — a redraw seldom
+        /// brought dozens of small pieces of treasure under the sparkle limit, and it doubled what each drawing cost (2026-10-05).
+        func readNote(_ name: String, _ keyed: [UInt8], _ w: Int, _ h: Int) {
+            guard let m = Legibility.measure(keyed, width: w, height: h, kind: .pot) else { return }
+            let p = Legibility.problems(m, kind: .pot)
+            if !p.isEmpty { problems.append("\(name) at phone size (a warning; pots are not drawn again for it): " + p.map { $0.components(separatedBy: " — ").first ?? $0 }.joined(separator: "; ")) }
+        }
         func softly(_ w: Int, _ h: Int) -> (([UInt8]) -> [UInt8])? {
             guard soften else { return nil }
             return { px in FrameKit.onBacking(Legibility.softened(FrameKit.keyed(px, backing: b, width: w, height: h), width: w, height: h, kind: .pot), b) }
@@ -26522,7 +26529,8 @@ final class GDDToAssetsRun: ObservableObject {
                                                       symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total, kind: kind)
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
                 // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
-                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil, judge: legible(.pot, 1024, 1024), finish: softly(1024, 1024)) {
+                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil, finish: softly(1024, 1024)) {
+                    readNote(jar(i, 0), FrameKit.keyed(px, backing: b, width: 1024, height: 1024), 1024, 1024)
                     let tall = PotStates.padded(FrameKit.keyed(px, backing: b, width: 1024, height: 1024), size: 1024)
                     write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
                     write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
@@ -26609,7 +26617,7 @@ final class GDDToAssetsRun: ObservableObject {
                             if Double(covered) > 0.4 * Double(max(1, body)) { out.append("the spill hides too much of the \(kind.noun) — it spills over the front of its rim and down its sides, the \(kind.noun) itself still clearly seen"); x += 1 }
                             if PotStates.holeShare(full, width: 1024, height: potH, besides: e0.px) > 0.005 { out.append("the background shows through inside the treasure — every piece solid"); x += 1 }
                             if PotStates.cutOff(full, width: 1024, height: potH) { out.append("it runs off the edge of the picture — all the treasure inside it"); x += 1 }
-                            if let m = Legibility.measure(full, width: 1024, height: potH, kind: .pot) { out += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
+
                             return (out, x)
                         }
                         if let px = paint(fullN, prompt: GDDAssetPrompts.potFullBrief(theme: theme, backing: (backing.name, b), kind: kind, lidless: lid == nil),
@@ -26617,6 +26625,7 @@ final class GDDToAssetsRun: ObservableObject {
                             let keyed = FrameKit.keyed(px, backing: b, width: 1024, height: potH)
                             write(FrameKit.onBacking(keyed, b), 1024, potH, "\(fullN).png"); write(keyed, 1024, potH, "\(fullN)_rmbg.png")
                             parts = cut(keyed)
+                            if let parts { readNote(jar(i, PotStates.levels), PotStates.state(PotStates.levels, of: parts), 1024, potH) }
                         }
                     }
                     if let parts {
@@ -26668,7 +26677,7 @@ final class GDDToAssetsRun: ObservableObject {
                         }
                         if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure solid"); x += 1 }
                         if PotStates.cutOff(laid, width: 1024, height: potH) { p.append("it runs off the edge of the picture — the \(kind.noun) and all its treasure inside it, on the floor it stands on"); x += 1 }
-                        if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
+
                         return (p, x)
                     }
                     guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
@@ -26678,6 +26687,7 @@ final class GDDToAssetsRun: ObservableObject {
                     // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
                     FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
                     write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
+                    readNote(jar(i, k), laid, 1024, potH)
                 }
                 // With the Power Bet on, the look the GDD gives the pot, an edit of its full state (PotStates.boost).
                 if let look = layout.potBoost, !has("\(PotStates.boostedName(pot: i, of: total)).png"), let full = try? Data(contentsOf: url("\(jar(i, PotStates.levels)).png")) {
