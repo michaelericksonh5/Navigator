@@ -9601,8 +9601,6 @@ public enum Composites {
     ]
 }
 
-/// The intro button's word in each language the studio's intro splashes ship with (`continue-asset-txt-<lang>`,
-/// about twenty in 9 of 10 games). Off unless asked: a studio localization tool may make these already.
 /// The words Navigator letters into game art, in the studio's shipped languages, as the localization team's dictionaries
 /// give them — written here by Tools/ArtWords/art_words.py. Only these words ship with Navigator; the dictionaries
 /// themselves stay private (this repository and its releases are public). A word not here for a language has no approved
@@ -10310,17 +10308,15 @@ public enum ArtWords {
     }
 }
 
+/// A set's lettered pieces in other languages (phase 3, 2026-10-05): each piece's words from the art-words table (ArtWords),
+/// lettered on a copy of its English picture as `<stem>-<lang>` — the studio's own convention for the intro's word
+/// (`shared_intro_continue-asset-txt-<lang>`, about twenty languages in 9 of 10 games). A word the table lacks is listed
+/// for the localization team, never drawn or guessed; a piece whose words are the English ones (MINI, 500) is its
+/// English picture, copied.
 public enum Localized {
-    /// The languages of the studio's CONTINUE strips (`continue-asset-txt-<lang>`: these 24 in about 250 shipped games,
-    /// 2026-10-05), each with its word as the localization team's dictionary had it that day.
-    static let shipped: [(lang: String, word: String)] = [
-        ("en", "CONTINUE"), ("fr", "CONTINUER"), ("es", "CONTINUAR"), ("pt-br", "CONTINUAR"), ("pt", "CONTINUAR"), ("de", "FORTFAHREN"),
-        ("it", "CONTINUA"), ("tr", "DEVAM ET"), ("ru", "ПРОДОЛЖИТЬ"), ("zh-cn", "继续"), ("zh-hk", "繼續"), ("da", "FORTSÆT"),
-        ("sv", "FORTSÄTT"), ("sk", "POKRAČOVAŤ"), ("ro", "CONTINUARE"), ("pl", "KONTYNUUJ"), ("no", "FORTSETT"), ("fi", "JATKA"),
-        ("el", "ΣΥΝΕΧΕΙΑ"), ("cs", "POKRAČOVAT"), ("bg", "ПРОДЪЛЖЕТЕ"), ("nl", "DOORGAAN"), ("ko", "계속하기"), ("ja", "続ける"),
-    ]
-    /// CONTINUE in each language, as the art-words table has it (ArtWords); a language it lacks keeps the word above.
-    public static var continueWord: [(lang: String, word: String)] { shipped.map { ($0.lang, ArtWords.word("CONTINUE", lang: $0.lang) ?? $0.word) } }
+    /// The studio's languages (the intro's CONTINUE strips in about 250 shipped games, 2026-10-05); no Hungarian.
+    public static let codes = ["en", "fr", "es", "pt-br", "pt", "de", "it", "tr", "ru", "zh-cn", "zh-hk", "da", "sv", "sk", "ro", "pl", "no", "fi",
+                               "el", "cs", "bg", "nl", "ko", "ja"]
     /// A language's name, for choosing which to localize into.
     public static func languageName(_ lang: String) -> String {
         ["en": "English", "fr": "French (Canada)", "es": "Spanish", "pt-br": "Portuguese (Brazil)", "pt": "Portuguese (Portugal)", "de": "German",
@@ -10328,7 +10324,71 @@ public enum Localized {
          "sv": "Swedish", "sk": "Slovak", "ro": "Romanian", "pl": "Polish", "no": "Norwegian", "fi": "Finnish", "el": "Greek", "cs": "Czech",
          "bg": "Bulgarian", "nl": "Dutch", "ko": "Korean", "ja": "Japanese"][lang] ?? lang
     }
-    public static func name(_ lang: String) -> String { "shared_intro_continue-asset-txt-\(lang)" }
+    /// The intro's word alone, lettered as the CONTINUE button is; English is one of its languages too.
+    public static let introWord = "shared_intro_continue-asset-txt"
+    public static func name(_ stem: String, lang: String) -> String { "\(stem)-\(lang)" }
+    /// The language of a localized picture's file or stem; nil for an English one.
+    public static func lang(of file: String) -> String? {
+        var stem = file
+        for x in ["_rmbg.png", ".png", ".jpg"] where stem.hasSuffix(x) { stem = String(stem.dropLast(x.count)); break }
+        return codes.first { stem.hasSuffix("-" + $0) && stem.count > $0.count + 1 }
+    }
+
+    /// A lettered piece: its English picture's stem, its words (the jackpot table's several, left to right), its size, how
+    /// a phone shows it, and how it is lettered again — `alone` (a title, the intro's word) on a plain canvas in its
+    /// lettering, `edit` the same picture with only its words changed, `wedge` lettered on its blank wedge in code.
+    public struct Piece: Equatable, Sendable {
+        public enum How: Sendable { case alone, edit, wedge }
+        public var stem: String, words: [String], w: Int, h: Int, kind: Legibility.Kind, how: How
+        /// The picture it is lettered after, when not its own (the intro's word: the CONTINUE button).
+        public var from: String?
+        public var display: Int?
+        public init(stem: String, words: [String], w: Int, h: Int, kind: Legibility.Kind, how: How, from: String? = nil, display: Int? = nil) {
+            self.stem = stem; self.words = words; self.w = w; self.h = h; self.kind = kind; self.how = how; self.from = from; self.display = display
+        }
+    }
+    /// What a piece becomes in a language: its words to letter; its English picture as it is (the same words); or the
+    /// words with no approved translation — flagged, not drawn.
+    public enum Plan: Equatable {
+        case draw([String]), same, missing([String])
+        public var flagged: Bool { if case .missing = self { true } else { false } }
+    }
+    public static func plan(_ p: Piece, lang: String) -> Plan {
+        if lang == "en" { return .draw(p.words) }
+        // An amount is an amount in every language: 500, 2X, X3, 10K, $5.
+        let found = p.words.map { w in ArtWords.word(w, lang: lang) ?? (w.range(of: #"^[X×]?[$€£]?[\d.,]+ ?[KMBX×]?$"#, options: [.regularExpression, .caseInsensitive]) != nil ? w : nil) }
+        let missing = zip(p.words, found).filter { $0.1 == nil }.map(\.0)
+        guard missing.isEmpty else { return .missing(missing) }
+        let words = found.compactMap { $0 }
+        return zip(words, p.words).allSatisfy { ArtWords.key($0) == ArtWords.key($1) } ? .same : .draw(words)
+    }
+    /// A translation set on as many lines as its English: split round the word the English gives a line of its own (the
+    /// jackpot's tier) when the translation has it, else at the spaces nearest even; one line when it has no spaces.
+    public static func lines(_ word: String, english: String, lang: String) -> [String] {
+        let en = english.components(separatedBy: "\n")
+        guard en.count > 1 else { return [word] }
+        if en.count == 3, let tier = ArtWords.word(en[1], lang: lang), let r = word.range(of: tier, options: .caseInsensitive) {
+            return [word[..<r.lowerBound], word[r], word[r.upperBound...]].map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        }
+        func best(_ ws: ArraySlice<String>, _ k: Int) -> [String] {
+            guard k > 1, ws.count > 1 else { return [ws.joined(separator: " ")] }
+            return (ws.startIndex + 1 ..< ws.endIndex).map { [ws[..<$0].joined(separator: " ")] + best(ws[$0...], k - 1) }
+                .min { $0.map(\.count).max()! < $1.map(\.count).max()! }!
+        }
+        return best(ArraySlice(word.split(separator: " ").map(String.init)), en.count)
+    }
+    /// The words a set needs that have no approved translation, each with its languages and pieces: for the localization team.
+    public static func missingReport(_ pieces: [Piece], languages: [String]) -> String {
+        var by: [String: (langs: [String], stems: Set<String>)] = [:], order: [String] = []
+        for p in pieces { for l in languages { if case .missing(let ws) = plan(p, lang: l) { for w in ws.map({ $0.replacingOccurrences(of: "\n", with: " ") }) {
+            if by[w] == nil { order.append(w) }
+            if !(by[w]?.langs.contains(l) ?? false) { by[w, default: ([], [])].langs.append(l) }
+            by[w]?.stems.insert(p.stem)
+        } } } }
+        guard !order.isEmpty else { return "" }
+        return "Words with no approved translation in the localization dictionaries. Navigator did not letter these pieces in these languages; add the words to the dictionaries (then Tools/ArtWords/art_words.py) or letter them by hand.\n\n"
+            + order.map { w in "\(w)\n  languages: \(by[w]!.langs.count == languages.count ? "all chosen" : by[w]!.langs.joined(separator: ", "))\n  pieces: \(by[w]!.stems.sorted().joined(separator: ", "))" }.joined(separator: "\n\n") + "\n"
+    }
     /// The text recognizer to read a language's word with (Apple Vision's, accurate, macOS 14): its own, or one for the
     /// same letters (Bulgarian read as Russian, Slovak as Czech, Finnish as Latin); nil for one it cannot read (Greek).
     public static func readers(_ lang: String) -> [String]? {
@@ -17101,11 +17161,17 @@ extension GDDAssetPrompts {
     static func landscapeBrief(theme: GameTheme) -> String {
         "Edit the attached image: it is the portrait background of a video slot game themed “\(theme.name)”. Make the same scene as a wide landscape picture: keep its centre — its main features, light and colours — as it is, and extend the scene naturally to the left and right to fill the wider frame, the reels' place in the middle kept as clear as it is. No text, reels, frames or characters added."
     }
-    /// A language's word for the intro button (Localized), lettered as the game's CONTINUE button (attached first) is.
-    static func localizedBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), word: String, lang: String) -> String {
-        [
-            "Image 1 is the CONTINUE button of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter the word “\(word)” on it (the button's word in the language coded \(lang)) in exactly that button's lettering — letterforms, colours, outline and finish — spelled exactly so, every accent and character exactly as given.",
-            "Only the lettering: no button or plate behind it. It fills the picture's width with a small even margin. " + letteringRules,
+    /// A lettered piece in another language (Localized), from its English picture (attached first): `alone`, its words
+    /// lettered again on a plain canvas (the last image) in exactly that lettering; otherwise the same picture with only its
+    /// words replaced. `words`: each English lettering's translation, as the lines it is set on.
+    static func reletteredBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), english: [String], words: [[String]], language: String, alone: Bool) -> String {
+        func set(_ l: [String]) -> String { l.count == 1 ? "“\(l[0])”" : l.map { "“\($0)”" }.joined(separator: " / ") + " on \(l.count) lines, each centred under the one before" }
+        let pairs = zip(english, words).map { "“\($0.0.replacingOccurrences(of: "\n", with: " "))” becomes \(set($0.1))" }.joined(separator: "; ")
+        return [
+            alone ? "Image 1 is lettering from a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter on it \(set(words[0])) — the same words in \(language) — in exactly image 1's lettering: its letterforms, weight, colours, outline, bevel and finish."
+                  : "Edit the attached image: it is a piece of a video slot game themed “\(theme.name)”. Replace its lettering with the same words in \(language): \(pairs). Everything else stays exactly as it is — its shape, size, position, material, colours and ornament — and the new words are lettered in exactly the old lettering's letterforms, colours, outline and finish, as large as the old words' space allows.",
+            "Spelled exactly as given — every letter, accent and mark, nothing added, changed or translated again. " + letteringRules,
+            alone ? "Only the lettering: no plate, banner or anything behind it. It fills most of the picture's width with a clear even margin all round: no letter or mark touches the picture's edge." : "No other text.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -17540,8 +17606,10 @@ public struct SetManifest: Codable, Equatable {
     /// The game's document beside it, as read (or written from a typed sheet).
     public static let documentName = "navigator-gdd.txt"
     public var format = 1
-    /// A set typed by hand (GameSheet), not read from a GDD; the intro's CONTINUE localized. Nil in older sets.
+    /// A set typed by hand (GameSheet), not read from a GDD; the intro's CONTINUE localized (sets before 2.18). Nil in older sets.
     public var typed: Bool?, localize: Bool?
+    /// The languages its lettered pieces are localized into (Localized.codes, English left out).
+    public var languages: [String]?
     public var game: String
     public var gdd: String
     public var themeName: String, themeCategory: String, themeLook: String, themeStyle: String

@@ -21742,7 +21742,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
     app.run()
 }
 
-// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>] [--only "<piece>,<piece>"] [--localize] [--budget <dollars>]
+// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>] [--only "<piece>,<piece>"] [--languages fr,de | --localize] [--budget <dollars>]
 // The reel area for every grid the GDD gives — bezel, dividers, reel texture, reel fade — the jackpot table and
 // pots above the reels when it has them, and a preview per mode. What is there already is kept, unless --again,
 // which keeps it in versions/ and draws it all again (or only the --only pieces). Run --checklist first for the cost.
@@ -21781,7 +21781,9 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         if args.contains("--again") {
             for p in GDDToAssetsRun.reelPieces where only?.contains(p.name) ?? true { GDDToAssetsRun.keepForRedo(p.name, folder: folder) }
         }
-        if args.contains("--localize") { run.localizeIntro = true }
+        // --languages fr,de,ja (or --localize: every language): the lettered pieces in those languages too.
+        if let i = args.firstIndex(of: "--languages"), i + 1 < args.count { run.languages = args[i + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { Localized.codes.dropFirst().contains($0) } }
+        else if args.contains("--localize") { run.languages = Array(Localized.codes.dropFirst()) }
         DispatchQueue.global(qos: .userInitiated).async {
             let budget = args.firstIndex(of: "--budget").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil }
             let r = run.generateReelArea(full, folder: folder, only: only, budget: budget)
@@ -21813,12 +21815,14 @@ if let flag = CommandLine.arguments.firstIndex(of: "--legibility"), flag + 1 < C
     app.run()
 }
 
-// Free:  Navigator --checklist <set folder>
+// Free:  Navigator --checklist <set folder> [--languages fr,de,ja]
 // Every static asset the set's game needs, grouped, made or not, who makes it and about what the rest costs.
 if let flag = CommandLine.arguments.firstIndex(of: "--checklist"), flag + 1 < CommandLine.arguments.count {
     let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
     DispatchQueue.main.async { MainActor.assumeIsolated {
         guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--languages"), i + 1 < args.count { run.languages = args[i + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { Localized.codes.dropFirst().contains($0) } }
         let list = run.checklist()
         var group = ""
         for (i, made) in list {
@@ -21827,6 +21831,12 @@ if let flag = CommandLine.arguments.firstIndex(of: "--checklist"), flag + 1 < Co
         }
         let todo = list.filter { !$0.made && $0.item.supported }
         print(String(format: "\n%d of %d made · %d to make, about $%.2f · %d not supported yet", list.filter(\.made).count, list.count, todo.count, todo.reduce(0) { $0 + $1.item.cost }, list.filter { !$0.item.supported }.count))
+        if !run.languages.isEmpty {
+            let lettered = run.letteredPieces(folder)
+            if !lettered.notMade.isEmpty { print("\nNOT DRAWN IN ENGLISH YET: " + lettered.notMade.joined(separator: ", ")) }
+            let report = Localized.missingReport(lettered.pieces, languages: run.languages)
+            if !report.isEmpty { print("\n" + report) }
+        }
         exit(0)
     } }
     app.run()
@@ -24567,7 +24577,8 @@ final class GDDToAssetsRun: ObservableObject {
     /// A set typed by hand (no GDD): its document is written from its GameSheet, not read from a file.
     @Published var typed = false
     /// Letter the intro's CONTINUE in each of the studio's languages (Localized) — off: a localization tool may.
-    @Published var localizeIntro = false
+    /// The languages the lettered pieces are localized into (phase 3; Localized.codes, English left out).
+    @Published var languages: [String] = []
     /// Pot drawings eased to the phone-size sparkle limits in code as they arrive (Legibility.softened). Off: the art director
     /// found it soft and cheap-looking close up (2026-10-05) — an option, not the default.
     @Published var softenPots = false
@@ -26181,7 +26192,10 @@ final class GDDToAssetsRun: ObservableObject {
         let standard = StandardPieces.pieces(game: game, gdd: gdd, layout: layout, hero: hero, bonusGames: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout))
         return (standard, StandardPieces.without(layout.concepts ?? [], standard))
     }
-    static let reelPieces: [(name: String, files: (String) -> Bool)] = [
+    /// A localized picture (`<stem>-<lang>`) is in Localized, never in its English piece's group.
+    static let reelPieces: [(name: String, files: (String) -> Bool)] = [("Localized", { Localized.lang(of: $0) != nil })]
+        + englishPieces.map { p in (p.name, { Localized.lang(of: $0) == nil && p.files($0) }) }
+    static let englishPieces: [(name: String, files: (String) -> Bool)] = [
         ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
         ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") || $0.hasPrefix("shared_meter_") }),
@@ -26191,7 +26205,6 @@ final class GDDToAssetsRun: ObservableObject {
         ("Number fonts", { $0.hasPrefix("transition_font_totalWin") || $0.hasPrefix("shared_font_") }),
         ("Symbol win states", { $0.contains("_win.png") || $0.contains("_win_rmbg") }),
         ("Landscape backgrounds", { $0.contains("-landscape") }),
-        ("Localized CONTINUE", { $0.hasPrefix("shared_intro_continue-asset-txt") }),
         ("Lobby and loading", { n in Composites.all.contains { n.hasPrefix($0.name + ".png") } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
         // The lobby and loading pictures and the sell screen's avatar are made from the logo and key art: redone with them.
         ("Studio and GDD pieces", { n in n.hasPrefix("shared_concepts") || isConcept(n) || Composites.all.contains { n == $0.name + ".png" } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
@@ -26209,7 +26222,7 @@ final class GDDToAssetsRun: ObservableObject {
             switch self {
             case .core: ["Bezel", "Reel texture", "Pots"]
             case .rest: ["Jackpot table", "Pot plaques", "Number fonts", "Symbol win states", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
-            case .localize: ["Localized CONTINUE"]
+            case .localize: ["Localized"]
             }
         }
         var title: String { switch self { case .core: "the core pieces"; case .rest: "everything else"; case .localize: "the localized pieces" } }
@@ -26273,6 +26286,49 @@ final class GDDToAssetsRun: ObservableObject {
         return out
     }
 
+    /// Every lettered piece of the set (phase 3), each the size of its English picture; the ones not drawn in English yet
+    /// apart, as nothing can be lettered after them. The game's title logo keeps its name, and symbols are core art.
+    func letteredPieces(_ folder: URL) -> (pieces: [Localized.Piece], notMade: [String]) {
+        guard let layout = reelLayout else { return ([], []) }
+        var out: [Localized.Piece] = [], notMade: [String] = []
+        func size(_ stem: String) -> (w: Int, h: Int)? {
+            guard let src = CGImageSourceCreateWithURL(folder.appendingPathComponent("\(stem).png") as CFURL, nil),
+                  let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                  let w = p[kCGImagePropertyPixelWidth] as? Int, let h = p[kCGImagePropertyPixelHeight] as? Int else { return nil }
+            return (w, h)
+        }
+        func add(_ stem: String, _ words: [String], _ kind: Legibility.Kind, _ how: Localized.Piece.How, from: String? = nil, size given: (w: Int, h: Int)? = nil, display: Int? = nil) {
+            let src = how == .wedge ? "\(stem)-blank_rmbg" : from ?? stem
+            guard let s = size(src) else { notMade.append(from ?? stem); return }
+            out.append(Localized.Piece(stem: stem, words: words, w: given?.w ?? s.w, h: given?.h ?? s.h, kind: kind, how: how, from: from, display: display))
+        }
+        let (standard, planned) = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
+        if standard.contains(where: { $0.name == "shared_intro_continueBtn" }) {
+            add(Localized.introWord, ["CONTINUE"], .word, .alone, from: "base_popUp_bonusBtn", size: (1024, 352))
+        }
+        for p in PopUps.plan(layout, jackpots: jackpotNames, bonus: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout)) {
+            if p.kind == .title { add(p.name, [p.text], p.text.contains("\n") ? .title : .message, .alone) }
+            if p.kind == .button { add(p.name, [p.text], .button, .edit) }
+        }
+        for p in standard + planned where !p.lettering.isEmpty && p.name != "shared_logo_master" {
+            let shown = p.shape == "lettering" ? 520 : p.shape == "button" ? 330 : p.width >= 1536 ? 640 : 360
+            for stem in [p.name] + p.states.map(p.stateName) { add(stem, [p.lettering], .piece, p.shape == "lettering" ? .alone : .edit, display: shown) }
+        }
+        for (i, word) in (layout.potFeatures ?? []).enumerated() where !word.isEmpty && size(PotStates.plaqueName(pot: i)) != nil {
+            add(PotStates.plaqueName(pot: i), [word], .button, .edit)
+        }
+        if layout.extras.contains(where: { $0.what == "jackpot table" }), !jackpotNames.isEmpty {
+            add("shared_interface_jackpotTable", jackpotNames, .piece, .edit, display: 1100)
+        }
+        for (wi, wheel) in (layout.wheels ?? []).enumerated() {
+            let order = WheelRules.order(WheelRules.labels(wheel, jackpots: jackpotNames), segments: wheel.segments)
+            for label in Set(order).sorted() where label != "CREDITS" { add("\(wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)")_interface_wedge-\(PopUps.key(label))", [label], .wedge, .wedge) }
+        }
+        return (out, notMade)
+    }
+    /// The languages a piece is lettered in: the chosen ones, and English too for the intro's word, which has no English picture.
+    func languages(for p: Localized.Piece) -> [String] { p.stem == Localized.introWord ? ["en"] + languages : languages }
+
     /// Every static asset this game needs (AssetChecklist), with what is made already.
     func checklist() -> [(item: AssetChecklist.Item, made: Bool)] {
         let hasBonus = AssetChecklist.hasBonusGames(jobs: jobs, layout: reelLayout)
@@ -26289,9 +26345,19 @@ final class GDDToAssetsRun: ObservableObject {
             for j in jobs where j.kind == .background {
                 items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
             }
-            if localizeIntro {
-                items.append(AssetChecklist.Item(group: "Intro", name: "shared_intro_continue-asset-txt", what: "CONTINUE in \(Localized.continueWord.count) languages",
-                                                 files: Localized.continueWord.map { "\(Localized.name($0.lang)).png" }, maker: "Localized", cost: Double(Localized.continueWord.count) * AssetChecklist.gpt(1024, 352)))
+            // Phase 3: each lettered piece in the languages chosen — a word with no approved translation flagged, not drawn;
+            // the same words as the English copied, free; a wheel's wedge lettered in code, free.
+            if !languages.isEmpty, let f = lastFolder {
+                for p in letteredPieces(f).pieces {
+                    let plans = languages(for: p).map { (lang: $0, plan: Localized.plan(p, lang: $0)) }
+                    let files = plans.filter { !$0.plan.flagged }.map { "\(Localized.name(p.stem, lang: $0.lang)).png" }
+                    guard !files.isEmpty else { continue }
+                    let draws = plans.filter { if case .draw = $0.plan { !FileManager.default.fileExists(atPath: f.appendingPathComponent("\(Localized.name(p.stem, lang: $0.lang)).png").path) } else { false } }.count
+                    let flagged = plans.count - files.count
+                    items.append(AssetChecklist.Item(group: "Localized", name: p.stem, what: "“\(p.words.joined(separator: " · ").replacingOccurrences(of: "\n", with: " "))” in \(files.count) language\(files.count == 1 ? "" : "s")"
+                                                     + (flagged > 0 ? " — \(flagged) flagged, no approved word" : ""),
+                                                     files: files, maker: "Localized", cost: p.how == .wedge ? 0 : Double(draws) * AssetChecklist.gpt(p.w, p.h)))
+                }
             }
         }
         let fm = FileManager.default
@@ -26339,7 +26405,8 @@ final class GDDToAssetsRun: ObservableObject {
         guard let folder = lastFolder, let layout = reelLayout else { return }
         let pieces = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
         Self.conceptNames = (pieces.standard + pieces.planned).map(\.name)
-        if phase == .rest {
+        if phase == .localize && languages.isEmpty { status = "Choose the languages to localize into first (Languages…)."; return }
+        if phase == .rest || phase == .localize {
             let core = coreApproval(folder)
             guard core.left.isEmpty else {
                 let a = NSAlert()
@@ -26362,6 +26429,12 @@ final class GDDToAssetsRun: ObservableObject {
         let total = todo.reduce(0) { $0 + $1.item.cost }
         alert.informativeText = String(format: "%d piece%@ — about $%.2f (GPT Image 2.5). A piece that fails the phone-size check is drawn once more: at most $%.2f.%@",
                                        todo.count, todo.count == 1 ? "" : "s", total, 2 * total, redo == nil ? "" : " The current files are kept in the set's versions folder.")
+        if phase == .localize {
+            let lettered = letteredPieces(folder)
+            let flagged = lettered.pieces.reduce(0) { n, p in n + languages(for: p).filter { Localized.plan(p, lang: $0).flagged }.count }
+            alert.informativeText += (flagged == 0 ? "" : " \(flagged) picture\(flagged == 1 ? " has" : "s have") a word with no approved translation: listed in localization-missing.txt, not drawn.")
+                + (lettered.notMade.isEmpty ? "" : " Not drawn in English yet, so not localized: " + lettered.notMade.joined(separator: ", ") + ".")
+        }
         alert.addButton(withTitle: redo == nil ? "Make" : "Make Again"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         if let redo { Self.keepForRedo(redo, folder: folder) }
@@ -26544,18 +26617,20 @@ final class GDDToAssetsRun: ObservableObject {
                 write(FrameKit.keyed(px, backing: b, width: table.width, height: table.height), table.width, table.height, "shared_interface_jackpotTable_rmbg.png")
             }
         }
-        // The jackpot meters as the studio ships them, a plaque per tier (shared_meter_<tier>), cut from the table. Free.
-        if layout.extras.contains(where: { $0.what == "jackpot table" }), !jackpots.isEmpty, let t = load("shared_interface_jackpotTable_rmbg.png") {
+        // The jackpot meters as the studio ships them, a plaque per tier (shared_meter_<tier>), cut from the table — and
+        // from each localized table (`-<lang>`). Free.
+        func meters(_ suffix: String = "") {
+            guard layout.extras.contains(where: { $0.what == "jackpot table" }), !jackpots.isEmpty, let t = load("shared_interface_jackpotTable\(suffix)_rmbg.png") else { return }
             let table = JackpotTable(count: jackpots.count, width: base.grid.w + 2 * base.band)
             let tierNames = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
-            if t.w == table.width, t.h == table.height {
-                for (i, p) in table.plaques.enumerated() where i < tierNames.count && !has("shared_meter_\(PopUps.key(tierNames[i])).png") {
-                    let m = p.w / 20, x = max(0, p.x - m), y = max(0, p.y - m), w = min(t.w - x, p.w + 2 * m), h = min(t.h - y, p.h + 2 * m)
-                    let piece = FrameKit.crop(t.px, width: t.w, x, y, w, h)
-                    write(piece.px, piece.w, piece.h, "shared_meter_\(PopUps.key(tierNames[i])).png")
-                }
+            guard t.w == table.width, t.h == table.height else { return }
+            for (i, p) in table.plaques.enumerated() where i < tierNames.count && !has("shared_meter_\(PopUps.key(tierNames[i]))\(suffix).png") {
+                let m = p.w / 20, x = max(0, p.x - m), y = max(0, p.y - m), w = min(t.w - x, p.w + 2 * m), h = min(t.h - y, p.h + 2 * m)
+                let piece = FrameKit.crop(t.px, width: t.w, x, y, w, h)
+                write(piece.px, piece.w, piece.h, "shared_meter_\(PopUps.key(tierNames[i]))\(suffix).png")
             }
         }
+        meters()
         // 4. The pots, one per bonus symbol they are tied to, each drawn from its symbol.
         // As many pots as the GDD says ("3 pots"; without a number, one per bonus symbol), each drawn from the
         // bonus symbol it is tied to, in order; one with no symbol of its own matches the pots before it.
@@ -26977,26 +27052,54 @@ final class GDDToAssetsRun: ObservableObject {
             if let px = paint(Derived.landscapeName(j.id), prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
                               inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(Derived.landscapeName(j.id)).png") }
         }
-        // 12. The intro button's word in each language, when asked (Localized): lettered as the CONTINUE button.
-        let localize = DispatchQueue.main.sync(execute: { self.localizeIntro })
-        if localize && wanted("\(Localized.name("fr")).png") && !fm.fileExists(atPath: url("base_popUp_bonusBtn.png").path) {
-            problems.append("the localized CONTINUE needs the CONTINUE button: Make Again ▸ Pop-ups")
-        }
-        if localize, let btn = try? Data(contentsOf: url("base_popUp_bonusBtn.png")) {
-            for (lang, word) in Localized.continueWord where !has("\(Localized.name(lang)).png") {
-                guard let canvas = blank(1024, 352) else { continue }
-                // Read in its own language at the size it is shown on the CONTINUE button (its word about 230 px across);
-                // a language the recognizer cannot read (Greek) is said, not guessed at.
-                let readers = Localized.readers(lang)
-                if readers == nil, !problems.contains(where: { $0.hasPrefix("not read back") }) { problems.append("not read back (no text recognizer for it here): the CONTINUE word in \(lang) — check it by eye") }
-                if let px = paint(Localized.name(lang), prompt: GDDAssetPrompts.localizedBrief(theme: theme, backing: (backing.name, b), word: word, lang: lang),
-                                  inputs: [downsamplePNG(btn, longEdge: 1024) ?? btn, canvas], w: 1024, h: 352, covered: nil,
-                                  judge: { px in
-                                      let k = FrameKit.keyed(px, backing: b, width: 1024, height: 352)
-                                      guard let m = Legibility.measure(k, width: 1024, height: 352, kind: .word, text: readers == nil ? nil : word, languages: readers) else { return ([], 0) }
-                                      return (Legibility.problems(m, kind: .word), Legibility.excess(m, kind: .word))
-                                  }) { both(px, 1024, 352, Localized.name(lang)) }
+        // 12. Phase 3: the lettered pieces in the languages chosen (Localized), every word from the art-words table. A word
+        // with no approved translation is flagged and listed for the localization team, never drawn; a piece whose words are
+        // the English ones is copied; a wedge is lettered in code; anything else is lettered by GPT after its English
+        // picture and read back in its own language — by Gemini where Apple's recognizer cannot read it (Greek).
+        let (languages, lettered) = DispatchQueue.main.sync { (self.languages, self.letteredPieces(folder)) }
+        if !languages.isEmpty {
+            var flagged = 0
+            for p in lettered.pieces {
+                for lang in DispatchQueue.main.sync(execute: { self.languages(for: p) }) {
+                    let n = Localized.name(p.stem, lang: lang)
+                    guard wanted("\(n).png"), !has("\(n).png") else { continue }
+                    switch Localized.plan(p, lang: lang) {
+                    case .missing:
+                        flagged += 1
+                    case .same:
+                        for x in [".png", "_rmbg.png"] where has(p.stem + x) { try? fm.copyItem(at: url(p.stem + x), to: url(n + x)) }
+                    case .draw(let words) where p.how == .wedge:
+                        guard let blank = load("\(p.stem)-blank_rmbg.png"), let art = wheels.first(where: { p.stem.hasPrefix($0.prefix + "_") })?.art else { continue }
+                        let done = WheelLabel.lettered(blank.px, label: words[0], art: art, face: titleTones)
+                        write(FrameKit.onBacking(done, b), blank.w, blank.h, "\(n).png"); write(done, blank.w, blank.h, "\(n)_rmbg.png")
+                    case .draw(let words):
+                        guard let english = try? Data(contentsOf: url("\(p.from ?? p.stem).png")) else { continue }
+                        let readers = Localized.readers(lang), text = words.joined(separator: " ")
+                        let prompt = GDDAssetPrompts.reletteredBrief(theme: theme, backing: (backing.name, b), english: p.words,
+                                                                     words: zip(p.words, words).map { Localized.lines($0.1, english: $0.0, lang: lang) },
+                                                                     language: Localized.languageName(lang), alone: p.how == .alone)
+                        let inputs = [downsamplePNG(english, longEdge: 2048) ?? english] + (p.how == .alone ? [blank(p.w, p.h)].compactMap { $0 } : [])
+                        guard let px = paint(n, prompt: prompt, inputs: inputs, w: p.w, h: p.h, covered: nil, judge: { px in
+                            let k = FrameKit.keyed(px, backing: b, width: p.w, height: p.h)
+                            guard let m = Legibility.measure(k, width: p.w, height: p.h, kind: p.kind, text: readers == nil ? nil : text, display: p.display, languages: readers) else { return ([], 0) }
+                            return (Legibility.problems(m, kind: p.kind), Legibility.excess(m, kind: p.kind))
+                        }) else { continue }
+                        both(px, p.w, p.h, n)
+                        if p.stem == "shared_interface_jackpotTable" { meters("-\(lang)") }
+                        if readers == nil, let shot = try? Data(contentsOf: url("\(n).png")) {
+                            let r = H5GService.describe(prompt: "Write out exactly the words lettered in this picture, every letter and accent as drawn, and nothing else.",
+                                                        systemPrompt: nil, imagePNG: downsamplePNG(shot, longEdge: 1024) ?? shot)
+                            cost += r.cost ?? 0
+                            let got = r.text ?? ""
+                            if Legibility.readScore(got, text) < 1 { problems.append("\(n): Gemini reads “\(got.trimmingCharacters(in: .whitespacesAndNewlines))”, not “\(text)” — check it by eye") }
+                        }
+                    }
+                }
             }
+            if !lettered.notMade.isEmpty, only?.contains("Localized") ?? true { problems.append("not localized until drawn in English: " + lettered.notMade.joined(separator: ", ")) }
+            let report = Localized.missingReport(lettered.pieces, languages: languages), reportURL = url("localization-missing.txt")
+            if report.isEmpty { try? fm.removeItem(at: reportURL) } else { try? report.write(to: reportURL, atomically: true, encoding: .utf8) }
+            if flagged > 0 { problems.append("\(flagged) localized picture\(flagged == 1 ? "" : "s") not drawn: no approved word in the dictionaries — listed in localization-missing.txt") }
         }
         // 9. The loading screen and lobby icons, put together from the logo, the key art and the base background. Free.
         composites(folder: folder)
@@ -27822,6 +27925,35 @@ final class GDDToAssetsRun: ObservableObject {
 }
 
 
+/// The languages a set's lettered pieces are localized into (phase 3), from the studio's own.
+struct LanguagePicker: View {
+    @Binding var selection: [String]
+    @State private var open = false
+    var body: some View {
+        Button(selection.isEmpty ? "Languages…" : "Languages (\(selection.count))…") { open = true }
+            .help("The languages phase 3 letters the game's pieces in.")
+            .popover(isPresented: $open) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Localize into").bold()
+                        Spacer()
+                        Button("All") { selection = Array(Localized.codes.dropFirst()) }
+                        Button("None") { selection = [] }
+                    }
+                    LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 4) {
+                        ForEach(Localized.codes.dropFirst(), id: \.self) { l in
+                            Toggle(Localized.languageName(l), isOn: Binding(get: { selection.contains(l) },
+                                                                             set: { on in selection = Localized.codes.filter { $0 == l ? on : selection.contains($0) } }))
+                        }
+                    }
+                    Text("Every word comes from the localization team's dictionaries, bundled with Navigator. A word they have no approved translation for is flagged and listed for them, never drawn or guessed.")
+                        .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(14).frame(width: 400)
+            }
+    }
+}
+
 // MARK: - Review and revise: the second pass over a finished set
 
 extension GDDToAssetsRun {
@@ -27840,7 +27972,7 @@ extension GDDToAssetsRun {
         guard let theme else { return }
         var m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
                             backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
-        m.typed = typed; m.localize = localizeIntro
+        m.typed = typed; m.languages = languages
         if var s = editorSession { s.savedAt = Date(); m.session = s }
         if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
         // The file it opens from — one per set, named for the game — and the recent sets.
@@ -27881,7 +28013,7 @@ extension GDDToAssetsRun {
         run.backing = (name: m.backingName, rgb: m.backingRGB)
         run.modelFlag = m.model
         run.reelLayout = m.reels
-        run.typed = m.typed ?? false; run.localizeIntro = m.localize ?? false
+        run.typed = m.typed ?? false; run.languages = m.languages ?? (m.localize == true ? Array(Localized.codes.dropFirst()) : [])
         run.gddText = (try? String(contentsOf: folder.appendingPathComponent(SetManifest.documentName), encoding: .utf8)) ?? ""
         run.lastFolder = folder
         run.loadReview(folder)
@@ -28427,7 +28559,7 @@ extension GDDToAssetsRun {
             stems.insert(stem)
         }
         // Each pot: its six states in order, the boosted look, then what they are built from.
-        let pots = Dictionary(grouping: stems.filter { $0.hasPrefix("shared_avatar_jar") }) { s -> String in
+        let pots = Dictionary(grouping: stems.filter { $0.hasPrefix("shared_avatar_jar") && Localized.lang(of: $0) == nil }) { s -> String in
             String(s.prefix(while: { $0 != "-" }))
         }
         for key in pots.keys.sorted() {
@@ -28452,6 +28584,14 @@ extension GDDToAssetsRun {
             sections.append(SetSection(id: "pot-\(key)", title: n.isEmpty ? "Pot" : "Pot \(n)", assets: assets, pot: true))
         }
         stems.subtract(pots.values.flatMap { $0 })
+        // The localized pieces, a section per language in the studio's order.
+        for lang in Localized.codes {
+            let mine = stems.filter { Localized.lang(of: $0) == lang }.sorted()
+            guard !mine.isEmpty else { continue }
+            stems.subtract(mine)
+            sections.append(SetSection(id: "loc-\(lang)", title: "Localized · \(Localized.languageName(lang))",
+                                       assets: mine.map { SetAsset(id: $0, file: shown($0), kind: .interface, label: $0) }))
+        }
         // The rest of the interface, piece by piece, as Make Again names them.
         for p in Self.reelPieces where !p.name.hasPrefix("Pot") {
             let mine = stems.filter { p.files("\($0).png") || p.files("\($0)_rmbg.png") }.sorted()
@@ -28484,7 +28624,7 @@ extension GDDToAssetsRun {
 
     /// The Make Again piece an interface picture is made by.
     static func piece(of stem: String) -> String? {
-        if stem.hasPrefix("shared_avatar_jar") { return stem.contains("-plaque") ? "Pot plaques" : "Pots" }
+        if stem.hasPrefix("shared_avatar_jar") && Localized.lang(of: stem) == nil { return stem.contains("-plaque") ? "Pot plaques" : "Pots" }
         return reelPieces.first { $0.files("\(stem).png") || $0.files("\(stem)_rmbg.png") }?.name
     }
     /// A pot picture the six states are built from (PotStates.parts), for a pot made of parts (a jar, a chest).
@@ -29338,11 +29478,20 @@ struct AssetBrowserView: View {
             Menu("Game Interface") {
                 Button("1 · Core Pieces…") { run.makeReelArea(phase: .core) }
                 Button(core.left.isEmpty ? "2 · Everything Else…" : "2 · Everything Else… (\(core.left.count) core pictures to approve)") { run.makeReelArea(phase: .rest) }
+                Button(run.languages.isEmpty ? "3 · Localize… (choose languages first)" : "3 · Localize into \(run.languages.count) language\(run.languages.count == 1 ? "" : "s")…") { run.makeReelArea(phase: .localize) }
+                    .disabled(run.languages.isEmpty)
                 Divider()
                 Menu("Make Again") { ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } } }
             }
             .fixedSize()
             .disabled(run.reelLayout == nil || !OpenAIImages.available || run.keying)
+            LanguagePicker(selection: $run.languages)
+                .onChange(of: run.languages) { _, _ in run.writeManifest(to: folder) }
+            let missing = folder.appendingPathComponent("localization-missing.txt")
+            if FileManager.default.fileExists(atPath: missing.path) {
+                Button("Missing Words") { NSWorkspace.shared.open(missing) }
+                    .help("The words the dictionaries have no approved translation for, with their languages and pieces — for the localization team.")
+            }
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
     }
@@ -29939,6 +30088,7 @@ struct GDDToAssetsSheet: View {
         .onChange(of: run.planned) { _, planned in if planned { placeSet() } }
         .onChange(of: outParent) { _, _ in placeSet() }
         .onChange(of: run.jobs.map { $0.subject + "|" + $0.silhouette }) { _, _ in save(currentSession) }
+        .onChange(of: run.languages) { _, _ in save(currentSession) }
         .onDisappear { saveWork?.perform() }
         .sheet(item: $picking) { which in
             NavigatorFolderPicker(
@@ -30302,8 +30452,6 @@ struct GDDToAssetsSheet: View {
                     }
                 }
                 HStack {
-                    Toggle("CONTINUE in \(Localized.continueWord.count) languages", isOn: $run.localizeIntro)
-                        .help("The intro splash's CONTINUE lettered in each of the studio's languages, as its shipped games carry. Off when your localization tool makes these.")
                     Button("Find What Else It Needs…") { run.findConcepts() }
                         .disabled(run.gddText.isEmpty || run.busy || run.reelLayout == nil)
                         .help("Gemini reads the GDD for every other static piece the game shows — meters, collection areas, glass covers, counters, sell screens, a feature's lettering — and adds them here, made with the game interface. About $0.02.")
@@ -30717,6 +30865,9 @@ struct GDDToAssetsSheet: View {
                         Button("2 · Everything Else…") { run.makeReelArea(phase: .rest) }
                             .disabled(ready)
                             .help("Once every core picture is approved: the jackpot table, pot plaques, wheels, pop-ups and celebrations, number fonts, the specials' win states, landscape backgrounds, the logo, key art, feature cards, Power Bet and tutorial pieces, and the lobby and loading pictures — drawn to match the core.")
+                        Button("3 · Localize…") { run.makeReelArea(phase: .localize) }
+                            .disabled(ready || run.languages.isEmpty)
+                            .help(run.languages.isEmpty ? "Choose the languages first (Languages…, below)." : "Every lettered piece — pop-up titles and buttons, feature cards, Power Bet and tutorial pieces, pot plaques, the jackpot table, wheel wedges and the intro's CONTINUE — in \(run.languages.count) language\(run.languages.count == 1 ? "" : "s"), each word as the localization team's dictionaries give it. A word with no approved translation is flagged and listed, not drawn.")
                         Menu("Make Again") {
                             ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
                         }
@@ -30734,6 +30885,12 @@ struct GDDToAssetsSheet: View {
                              : "Core: \(core.total - core.left.count) of \(core.total) approved — everything else waits until all are (approve them in Assets).")
                             .font(.caption).foregroundColor(core.left.isEmpty && core.total > 0 ? .green : .secondary)
                             .id(run.review.approvedCount(in: core.left) + run.imagesVersion)
+                    }
+                    HStack(spacing: 8) {
+                        LanguagePicker(selection: $run.languages)
+                        Text(run.languages.isEmpty ? "Phase 3 letters the game's pieces in the languages chosen here."
+                             : "Localize into " + run.languages.map(Localized.languageName).joined(separator: ", ") + ".")
+                            .font(.caption).foregroundColor(.secondary).lineLimit(2)
                     }
                     ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
                     assetChecklist

@@ -13379,8 +13379,8 @@ final class StandardPiecesTests: XCTestCase {
         XCTAssertEqual(Derived.winName("SC"), "SC_win"); XCTAssertEqual(Derived.landscapeName("bg_base"), "bg_base-landscape")
         let jobs = AssetPlanRules.symbolJobs(GDDSymbolSetRules.parseManual("WD, HP1-4, LP1-5, SC, BO, JP1-4, MU1").symbols)
         XCTAssertEqual(Set(Derived.winSymbols(jobs).map(\.id)), ["WD", "SC", "BO", "JP1", "JP2", "JP3", "JP4", "MU1"])
-        XCTAssertEqual(Localized.continueWord.first?.word, "CONTINUE"); XCTAssertEqual(Localized.name("de"), "shared_intro_continue-asset-txt-de")
-        XCTAssertFalse(Localized.continueWord.contains { $0.word.lowercased().contains("free") })
+        XCTAssertEqual(Localized.name(Localized.introWord, lang: "de"), "shared_intro_continue-asset-txt-de")
+        XCTAssertFalse(Localized.codes.contains { (ArtWords.word("CONTINUE", lang: $0) ?? "").lowercased().contains("free") })
         // A value variant planned by Gemini is named after its symbol, never as it (MU1.png is the symbol), and keeps its refs.
         let v = ConceptPlan.parse(#"{"pieces": [{"name": "MU1_values", "what": "The multiplier symbol's values.", "look": "", "shape": "free", "width": 1024, "height": 1024, "lettering": "x2", "states": ["x3", "x5"], "source": "", "refs": ["MU1"]}]}"#, covered: [])
         XCTAssertEqual(v.first?.name, "MU1_values"); XCTAssertEqual(v.first?.refs, ["MU1"]); XCTAssertEqual(v.first?.stateName("x3"), "MU1_values-x3")
@@ -13786,10 +13786,10 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertEqual(Localized.readers("ru"), ["ru-RU"])
         XCTAssertNotNil(Localized.readers("fi"))
         XCTAssertNil(Localized.readers("el"))
-        XCTAssertTrue(Localized.continueWord.allSatisfy { $0.lang == "el" || Localized.readers($0.lang) != nil })
+        XCTAssertTrue(Localized.codes.allSatisfy { $0 == "el" || Localized.readers($0) != nil })
         // The shipped strips' 24 languages; the dictionary's word wins, cleaned of invisible marks and in capitals.
-        XCTAssertEqual(Localized.shipped.count, 24)
-        XCTAssertTrue(["pt-br", "zh-hk", "bg", "sk"].allSatisfy { l in Localized.shipped.contains { $0.lang == l } })
+        XCTAssertEqual(Localized.codes.count, 24)
+        XCTAssertTrue(["pt-br", "zh-hk", "bg", "sk"].allSatisfy(Localized.codes.contains))
         // The bundled art words: in capitals with each language's own rules, English as given, a missing word nil.
         XCTAssertEqual(ArtWords.word("CONTINUE", lang: "sv"), "FORTSÄTT")
         XCTAssertEqual(ArtWords.word("Continue", lang: "tr"), "DEVAM ET")
@@ -13797,7 +13797,7 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertEqual(ArtWords.word("GOT IT!", lang: "en"), "GOT IT!")
         XCTAssertNil(ArtWords.word("GOT IT!", lang: "fr"))
         XCTAssertTrue(ArtWords.table.values.allSatisfy { $0.values.allSatisfy { !$0.isEmpty && !$0.contains("\u{200F}") } })
-        XCTAssertEqual(Localized.continueWord.count, 24)
+        XCTAssertTrue(Localized.codes.allSatisfy { ArtWords.word("CONTINUE", lang: $0) != nil })
         let cellW = 40, h = 50, n = NumberFont.glyphs.count
         var strip = [UInt8](repeating: 0, count: cellW * n * h * 4)
         for i in 0..<n { for y in 5..<45 { for x in (i * cellW + 10)..<(i * cellW + 30) { strip[(y * cellW * n + x) * 4 + 3] = 255 } } }
@@ -14040,5 +14040,46 @@ final class PotSofteningTests: XCTestCase {
         XCTAssertEqual(PotKind.safe.revealCap(1), 0.22)
         XCTAssertNil(PotKind.safe.revealCap(2))
         XCTAssertNil(PotKind.jar.revealCap(1))
+    }
+}
+
+/// Phase 3: a lettered piece in each language from the bundled art words — flagged, copied or lettered again.
+final class LocalizationPlanTests: XCTestCase {
+    func testAPieceIsLetteredCopiedOrFlagged() {
+        let title = Localized.Piece(stem: "shared_popUp_oneMoreChance", words: ["ONE MORE CHANCE"], w: 1536, h: 512, kind: .message, how: .alone)
+        XCTAssertEqual(Localized.plan(title, lang: "fr"), .draw(["ENCORE UNE CHANCE"]))
+        XCTAssertTrue(Localized.plan(Localized.Piece(stem: "t", words: ["GOT IT!"], w: 1, h: 1, kind: .button, how: .edit), lang: "fr").flagged)
+        // An amount stays an amount; the same words as the English are the English picture.
+        let wedge = Localized.Piece(stem: "wheelSpin_interface_wedge-500", words: ["500"], w: 1, h: 1, kind: .wedge, how: .wedge)
+        XCTAssertEqual(Localized.plan(wedge, lang: "ja"), .same)
+        XCTAssertEqual(Localized.plan(Localized.Piece(stem: "m", words: ["X3"], w: 1, h: 1, kind: .piece, how: .edit), lang: "de"), .same)
+        // The jackpot table's names are each looked up: one missing flags the table.
+        let table = Localized.Piece(stem: "shared_interface_jackpotTable", words: ["GRAND", "MAJOR", "MICRO"], w: 1, h: 1, kind: .piece, how: .edit)
+        XCTAssertEqual(Localized.plan(table, lang: "fr"), .missing(["MICRO"]))
+        // English only for the intro's word, which has no English picture: lettered as given.
+        XCTAssertEqual(Localized.plan(Localized.Piece(stem: Localized.introWord, words: ["CONTINUE"], w: 1, h: 1, kind: .word, how: .alone), lang: "en"), .draw(["CONTINUE"]))
+    }
+    func testLocalizedFilesAreKnownByTheirLanguage() {
+        XCTAssertEqual(Localized.lang(of: "base_popUp_bonusBtn-pt-br_rmbg.png"), "pt-br")
+        XCTAssertEqual(Localized.lang(of: "shared_avatar_jar2-plaque-pt.png"), "pt")
+        XCTAssertEqual(Localized.lang(of: "shared_intro_continue-asset-txt-en"), "en")
+        XCTAssertNil(Localized.lang(of: "shared_celebration_message-1.png"))
+        XCTAssertNil(Localized.lang(of: "bg_base-landscape.png"))
+        XCTAssertNil(Localized.lang(of: "shared_avatar_jar1-State0Idle_open.png"))
+    }
+    func testATranslationKeepsItsEnglishLines() {
+        // The tier on a line of its own when the translation has it; else the split nearest even; one line stays one.
+        XCTAssertEqual(Localized.lines("VOUS AVEZ GAGNÉ LE JACKPOT GRAND", english: "YOU'VE WON THE\nGRAND\nJACKPOT", lang: "fr"), ["VOUS AVEZ GAGNÉ LE JACKPOT", "GRAND"])
+        XCTAssertEqual(Localized.lines("AAAA BB CC DDDD", english: "ONE\nTWO", lang: "xx"), ["AAAA BB", "CC DDDD"])
+        XCTAssertEqual(Localized.lines("ENCORE UNE CHANCE", english: "ONE MORE CHANCE", lang: "fr"), ["ENCORE UNE CHANCE"])
+        XCTAssertEqual(Localized.lines("賞金合計", english: "TOTAL\nWIN", lang: "ja"), ["賞金合計"])
+    }
+    func testMissingWordsAreListedForTheLocalizationTeam() {
+        let pieces = [Localized.Piece(stem: "shared_tutorial_button", words: ["GOT IT!"], w: 1, h: 1, kind: .button, how: .edit),
+                      Localized.Piece(stem: "shared_popUp_oneMoreChance", words: ["ONE MORE CHANCE"], w: 1, h: 1, kind: .message, how: .alone)]
+        let r = Localized.missingReport(pieces, languages: ["fr", "pt"])
+        XCTAssertTrue(r.contains("GOT IT!\n  languages: all chosen\n  pieces: shared_tutorial_button"))
+        XCTAssertTrue(r.contains("ONE MORE CHANCE\n  languages: pt\n"))
+        XCTAssertEqual(Localized.missingReport([pieces[1]], languages: ["fr"]), "")
     }
 }
