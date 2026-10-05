@@ -13858,7 +13858,7 @@ final class PotKindTests: XCTestCase {
             return px
         }
         let pig = boxes([(60..<140, 100..<180)]), piled = boxes([(60..<140, 100..<180), (20..<180, 170..<195)])
-        XCTAssertTrue(PotKind.piggyBank.anchoredAtTop && PotKind.safe.anchoredAtTop && !PotKind.chest.anchoredAtTop && !PotKind.jar.anchoredAtTop)
+        XCTAssertEqual(PotKind.allCases.map(\.anchor), [.foot, .foot, .top, .face])
         XCTAssertEqual(PotStates.registered(piled, to: pig, width: w, height: h, top: true), piled)
         XCTAssertNotEqual(PotStates.registered(piled, to: pig, width: w, height: h), piled)
         // Drawn too wide, it is made to its share of the canvas, centred, and raised off the bottom; standing so, left alone.
@@ -13877,6 +13877,33 @@ final class PotKindTests: XCTestCase {
         XCTAssertTrue(PotStates.cutOff(boxes([(20..<180, 150..<200)]), width: w, height: h))
         XCTAssertTrue(PotStates.cutOff(boxes([(0..<100, 50..<150)]), width: w, height: h))
         XCTAssertFalse(PotStates.cutOff(wide, width: w, height: h))
+    }
+    // A piggy bank drawn smaller and shifted, its pile in front and rising behind it past its ears, is laid back on
+    // State0 by its face; laying it again changes nothing.
+    func testAPiggyBankIsLaidByItsFace() {
+        let w = 200, h = 200
+        func pig(_ x: Int, _ y: Int) -> (UInt8, UInt8, UInt8)? {
+            guard (70..<130).contains(x), (80..<180).contains(y) else { return nil }
+            return y < 130 ? ((x / 10 + y / 10) % 2 == 0 ? (220, 40, 40) : (40, 40, 220)) : (40, 200, 40)
+        }
+        var empty = [UInt8](repeating: 0, count: w * h * 4), state = empty
+        for y in 0..<h { for x in 0..<w {
+            let i = (y * w + x) * 4
+            if let c = pig(x, y) { empty[i] = c.0; empty[i + 1] = c.1; empty[i + 2] = c.2; empty[i + 3] = 255 }
+            // Drawn at 0.8 about the face's top centre and moved (5, 7).
+            let ex = Int((Double(x - 5 - 100) / 0.8 + 100).rounded(.down)), ey = Int((Double(y - 7 - 80) / 0.8 + 80).rounded(.down))
+            let front = y >= 125 && (20..<180).contains(x), behind = (20..<180).contains(x) && (60..<125).contains(y)
+            if !front, let c = pig(ex, ey) { state[i] = c.0; state[i + 1] = c.1; state[i + 2] = c.2; state[i + 3] = 255 }
+            else if front || behind { state[i] = 230; state[i + 1] = 190; state[i + 2] = 40; state[i + 3] = 255 }
+        } }
+        let laid = PotStates.matched(state, to: empty, width: w, height: h)
+        var same = 0, total = 0
+        for y in stride(from: 85, to: 125, by: 10) { for x in stride(from: 75, to: 125, by: 10) {
+            let i = (y * w + x) * 4; total += 1
+            if abs(Int(laid[i]) - Int(empty[i])) + abs(Int(laid[i + 2]) - Int(empty[i + 2])) < 60 { same += 1 }
+        } }
+        XCTAssertGreaterThanOrEqual(same, total * 9 / 10)
+        XCTAssertEqual(PotStates.matched(empty, to: empty, width: w, height: h), empty)
     }
     // What a pot is, from the document's own word (written for the test), and kept through a typed sheet.
     func testThePotsKindIsReadAndKept() {

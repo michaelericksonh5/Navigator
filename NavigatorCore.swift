@@ -8795,16 +8795,18 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
     case piggyBank
     public var noun: String { switch self { case .jar: "pot"; case .chest: "treasure chest"; case .safe: "safe"; case .piggyBank: "piggy bank" } }
     public var nouns: String { switch self { case .jar: "pots"; case .chest: "treasure chests"; case .safe: "safes"; case .piggyBank: "piggy banks" } }
-    /// The end of it that stays put as it fills, to lay each state on State0 by: a jar's and a chest's lids rise, so their
-    /// foot; a safe's gold pours out over its sill and a piggy bank's coins pile round its feet, so their top (laid by the
-    /// foot, the piggy bank shrank to a third as its pile widened, 2026-10-05).
-    public var anchoredAtTop: Bool { self == .safe || self == .piggyBank }
+    /// The part of it that stays put and in view as it fills, to lay each state on State0 by: a jar's and a chest's lids
+    /// rise, so their foot; a safe's gold pours out over its sill, so its top; a piggy bank's coins pile round and behind
+    /// it up to its ears, so its face (laid by its foot, it shrank to a third as its pile widened; by its top, as the
+    /// pile behind it reached its ears, 2026-10-05).
+    public enum Anchor: Sendable { case foot, top, face }
+    public var anchor: Anchor { switch self { case .jar, .chest: .foot; case .safe: .top; case .piggyBank: .face } }
     /// The most of its canvas's width it stands in at State0: a piggy bank's coins pile up beside it (the Blitz
     /// medallion's pile reached 2.6 times its width), so it stands narrow; the others may fill it.
     public var bodyShare: Double { self == .piggyBank ? 0.45 : 1 }
     /// The room it leaves under its foot at State0, in its canvas's heights: a safe's gold and a piggy bank's coins pile on
     /// the floor in front of it, lower than its foot (a safe's State5 pour ran off the canvas's bottom, 2026-10-05).
-    public var footRoom: Double { anchoredAtTop ? 0.08 : 0 }
+    public var footRoom: Double { anchor == .foot ? 0 : 0.08 }
     /// Its State0: closed, empty, unlit.
     var closed: String {
         switch self {
@@ -8833,7 +8835,7 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
         case .safe: return ["a glint of gold inside the gap", "gold bars and coins stacked on its lowest shelf", "gold stacked halfway up inside",
                             "gold stacked to the top inside, a few coins spilling out over the sill", "full to overflowing: gold pouring out of the door and piling in front of it"][i]
         case .piggyBank: return ["a few coins scattered at its feet", "a small pile of coins round its feet", "coins piled round it up to its belly",
-                                 "coins piled round and behind it up to its back", "full to overflowing: a great pile of coins round and behind it, spilling wide to both sides"][i]
+                                 "coins piled round and behind it up to its back, its face and ears in full view", "full to overflowing: a great pile of coins round and behind it, spilling wide to both sides, its face and ears in full view above them"][i]
         }
     }
     /// The kind a text names: the first vessel word in it.
@@ -9177,8 +9179,54 @@ public enum PotStates {
             || (0..<h).filter { px[$0 * w * 4 + 3] > 128 || px[($0 * w + w - 1) * 4 + 3] > 128 }.count > h / 50
     }
 
-    /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas, by the end of it that stays put as it
-    /// fills (`top`: PotKind.anchoredAtTop).
+    /// `state` laid on `empty` by the part of it that stays put as it fills (PotKind.anchor).
+    public static func laid(_ state: [UInt8], on empty: [UInt8], width w: Int, height h: Int, by anchor: PotKind.Anchor) -> [UInt8] {
+        anchor == .face ? matched(state, to: empty, width: w, height: h) : registered(state, to: empty, width: w, height: h, top: anchor == .top)
+    }
+    /// `state` laid on `empty` by `empty`'s own pixels in the top `share` of its body — its face, which stays in view: the
+    /// scale and place that match them best, searched coarse to fine; left alone when it is in place already.
+    public static func matched(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int, share: Double = 0.5) -> [UInt8] {
+        guard let s0 = span(empty, width: w, height: h) else { return state }
+        let yMax = s0.top + Int(Double(s0.bottom - s0.top) * share)
+        func points(_ step: Int) -> [(x: Double, y: Double, rgb: (Int, Int, Int))] {
+            stride(from: s0.top, to: yMax, by: step).flatMap { y in stride(from: 0, to: w, by: step).compactMap { x -> (x: Double, y: Double, rgb: (Int, Int, Int))? in
+                let i = (y * w + x) * 4
+                return empty[i + 3] > 200 ? (Double(x), Double(y), (Int(empty[i]), Int(empty[i + 1]), Int(empty[i + 2]))) : nil
+            } }
+        }
+        // Where an empty pixel at p lands in the drawn state when the state is scaled by k and set at (ox, oy).
+        func cost(_ k: Double, _ ox: Double, _ oy: Double, _ pts: [(x: Double, y: Double, rgb: (Int, Int, Int))]) -> Double {
+            var sum = 0
+            for p in pts {
+                let x = Int(((p.x - ox) / k).rounded()), y = Int(((p.y - oy) / k).rounded())
+                guard x >= 0, y >= 0, x < w, y < h else { sum += 765; continue }
+                let i = (y * w + x) * 4
+                sum += state[i + 3] < 128 ? 765 : abs(Int(state[i]) - p.rgb.0) + abs(Int(state[i + 1]) - p.rgb.1) + abs(Int(state[i + 2]) - p.rgb.2)
+            }
+            return Double(sum) / Double(max(1, pts.count))
+        }
+        // Scaled about the face's top centre, so a scale alone does not move it.
+        let cx = Double(w) / 2, cy = Double(s0.top)
+        func search(_ ks: [Double], _ ds: [Double], around: (k: Double, dx: Double, dy: Double), _ pts: [(x: Double, y: Double, rgb: (Int, Int, Int))]) -> (k: Double, dx: Double, dy: Double) {
+            var best = (k: around.k, dx: around.dx, dy: around.dy), low = cost(around.k, cx * (1 - around.k) + around.dx, cy * (1 - around.k) + around.dy, pts)
+            for k in ks { for dx in ds { for dy in ds {
+                let c = cost(k, cx * (1 - k) + dx, cy * (1 - k) + dy, pts)
+                if c < low - 0.01 { low = c; best = (k, dx, dy) }
+            } } }
+            return best
+        }
+        let coarse = search((-12...15).map { 1 + 0.02 * Double($0) }, stride(from: -64.0, through: 64, by: 8).map { $0 }, around: (1, 0, 0), points(16))
+        let fine = search((-4...4).map { coarse.k + 0.005 * Double($0) }, (-8...8).map { Double($0) }, around: coarse, points(4))
+        let k = fine.k, ox = cx * (1 - k) + fine.dx, oy = cy * (1 - k) + fine.dy
+        // Already in place (to a pixel or two of resampling): left alone, so laying again never blurs it.
+        guard abs(k - 1) > 0.004 || abs(ox) >= 2 || abs(oy) >= 2 else { return state }
+        let scaled = FrameKit.resized(FrameKit.Piece(px: state, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        FrameKit.over(&out, width: w, scaled, at: Int(ox.rounded()), Int(oy.rounded()))
+        return out
+    }
+    /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas, by its foot's band — or, `top`, by its
+    /// top's.
     public static func registered(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int, top: Bool = false) -> [UInt8] {
         guard let f = foot(state, width: w, height: h, top: top), let e = foot(empty, width: w, height: h, top: top), f.width > 0 else { return state }
         let k = e.width / f.width

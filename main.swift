@@ -26465,7 +26465,7 @@ final class GDDToAssetsRun: ObservableObject {
                     guard let prev = load("\(jar(i, k - 1))_rmbg.png"), prev.w == 1024, prev.h == potH,
                           let prevPNG = png(FrameKit.onBacking(prev.px, b), 1024, potH) else { break }
                     let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
-                        let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH, top: kind.anchoredAtTop)
+                        let laid = PotStates.laid(FrameKit.keyed(px, backing: b, width: 1024, height: potH), on: e0.px, width: 1024, height: potH, by: kind.anchor)
                         var p: [String] = []
                         var pair = [UInt8](repeating: 0, count: 2048 * potH * 4)
                         FrameKit.over(&pair, width: 2048, FrameKit.Piece(px: FrameKit.onBacking(prev.px, b), w: 1024, h: potH), at: 0, 0)
@@ -26487,7 +26487,7 @@ final class GDDToAssetsRun: ObservableObject {
                     }
                     guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
                                          inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge) else { break }
-                    var laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH, top: kind.anchoredAtTop)
+                    var laid = PotStates.laid(FrameKit.keyed(px, backing: b, width: 1024, height: potH), on: e0.px, width: 1024, height: potH, by: kind.anchor)
                     // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
                     FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
                     write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
@@ -26560,7 +26560,7 @@ final class GDDToAssetsRun: ObservableObject {
                         problems.append("\(n) was drawn before pots had room above them: Make Again ▸ Pot States")
                         continue
                     }
-                    let laid = PotStates.registered(s.px, to: e.px, width: s.w, height: s.h, top: kind.anchoredAtTop)
+                    let laid = PotStates.laid(s.px, on: e.px, width: s.w, height: s.h, by: kind.anchor)
                     guard laid != s.px else { continue }
                     write(FrameKit.onBacking(laid, b), s.w, s.h, "\(n).png")
                     write(laid, s.w, s.h, "\(n)_rmbg.png")
