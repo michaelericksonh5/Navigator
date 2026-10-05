@@ -13792,18 +13792,9 @@ final class ReadabilityTests: XCTestCase {
 final class TitleAndCoinTests: XCTestCase {
     // A coin's painted glow comes off its cut-out; the coin itself, and anything it encloses, stays.
     func testACoinsGlowIsTrimmed() {
-        let n = 60
-        var px = [UInt8](repeating: 0, count: n * n * 4)
-        for y in 0..<n { for x in 0..<n {
-            let d = (Double((x - 30) * (x - 30) + (y - 30) * (y - 30))).squareRoot(), i = (y * n + x) * 4
-            px[i] = 200; px[i + 3] = d < 18 ? 255 : d < 26 ? 90 : 0                      // a coin, a soft glow round it
-            if d < 4 { px[i + 3] = 120 }                                                     // a glassy middle it encloses
-        } }
-        let t = Derived.withoutGlow(px, width: n, height: n)
-        XCTAssertEqual(t[(30 * n + 52) * 4 + 3], 0)                                        // the glow: gone
-        XCTAssertEqual(t[(30 * n + 40) * 4 + 3], 255)                                      // the coin: kept
-        XCTAssertEqual(t[(30 * n + 30) * 4 + 3], 120)                                      // what it encloses: kept
+        // The brief bans it; the cut's trim (Apple's subject mask) is checked on real coins, not synthetic ones.
         XCTAssertTrue(GDDAssetPrompts.bans(AssetPlanRules.symbolJobs(GDDSymbolSetRules.parseManual("JP1").symbols)[0]).contains("No glow"))
+        XCTAssertFalse(GDDAssetPrompts.bans(AssetPlanRules.symbolJobs(GDDSymbolSetRules.parseManual("WD").symbols)[0]).contains("No glow"))
     }
     // Lettering that runs to its canvas's edge is caught.
     func testLetteringAtTheEdgeIsCaught() {

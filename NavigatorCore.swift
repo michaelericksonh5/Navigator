@@ -9227,35 +9227,29 @@ public enum Localized {
 /// (10 of 10 older games ship one; GameForge's landscape is 4608x2532, drawn here at its shape within GPT's limits).
 public enum Derived {
     public static let landscape = (w: 2912, h: 1600)
-    /// A cut-out with any glow round it taken off: everything outside its solid body (opaque over 200, what it encloses
-    /// kept), grown `grow` pixels, cleared. The studio's jackpot coins carry none (2026-10-05); free, whatever was drawn.
-    public static func withoutGlow(_ px: [UInt8], width w: Int, height h: Int, grow: Int = 2) -> [UInt8] {
-        // Outside: not solid and reached from the picture's border.
-        var outside = [Bool](repeating: false, count: w * h), stack: [Int] = []
-        func solid(_ i: Int) -> Bool { px[i * 4 + 3] > 200 }
-        for x in 0..<w { for y in [0, h - 1] where !solid(y * w + x) { stack.append(y * w + x) } }
-        for y in 0..<h { for x in [0, w - 1] where !solid(y * w + x) { stack.append(y * w + x) } }
-        while let i = stack.popLast() {
-            guard !outside[i] else { continue }
-            outside[i] = true
-            let x = i % w, y = i / w
-            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] where nx >= 0 && nx < w && ny >= 0 && ny < h {
-                let j = ny * w + nx
-                if !outside[j] && !solid(j) { stack.append(j) }
-            }
-        }
-        var keep = outside.map { !$0 }
-        guard keep.contains(true) else { return px }
-        for _ in 0..<grow {
-            var next = keep
-            for y in 0..<h { for x in 0..<w where !keep[y * w + x] {
-                if (x > 0 && keep[y * w + x - 1]) || (x < w - 1 && keep[y * w + x + 1]) || (y > 0 && keep[(y - 1) * w + x]) || (y < h - 1 && keep[(y + 1) * w + x]) { next[y * w + x] = true }
-            } }
-            keep = next
-        }
-        var out = px
-        for i in 0..<(w * h) where !keep[i] { out[i * 4 + 3] = 0 }
-        return out
+    /// A cut-out with any glow round it taken off: the cut kept only where Apple's subject lifting (Vision's foreground
+    /// mask, run on the drawing on its backing, `source`) finds the symbol. The studio's jackpot coins carry no glow
+    /// (2026-10-05). A glow keys nearly opaque and fades into the coin's own rim, so neither alpha nor edges tell them apart;
+    /// the subject mask did, on all four galactic coins (it kept 87–92% of each cut: the rest was the glow ring).
+    /// Nil when the mask is missing or would take off more than 30% of the cut — then the cut is left as it was.
+    public static func withoutGlow(_ cut: [UInt8], source: CGImage) -> [UInt8]? {
+        let w = source.width, h = source.height
+        guard cut.count == w * h * 4 else { return nil }
+        let req = VNGenerateForegroundInstanceMaskRequest(), handler = VNImageRequestHandler(cgImage: source)
+        guard (try? handler.perform([req])) != nil, let obs = req.results?.first,
+              let buf = try? obs.generateScaledMaskForImage(forInstances: obs.allInstances, from: handler),
+              CVPixelBufferGetWidth(buf) == w, CVPixelBufferGetHeight(buf) == h else { return nil }
+        CVPixelBufferLockBaseAddress(buf, .readOnly); defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buf)?.assumingMemoryBound(to: Float32.self) else { return nil }
+        let stride = CVPixelBufferGetBytesPerRow(buf) / 4
+        var out = cut, before = 0, kept = 0
+        for y in 0..<h { for x in 0..<w {
+            let i = (y * w + x) * 4
+            if cut[i + 3] > 128 { before += 1 }
+            out[i + 3] = UInt8(Double(cut[i + 3]) * Double(max(0, min(1, base[y * stride + x]))))
+            if out[i + 3] > 128 { kept += 1 }
+        } }
+        return Double(kept) >= 0.7 * Double(max(1, before)) ? out : nil
     }
     public static func winName(_ id: String) -> String { "\(id)_win" }
 

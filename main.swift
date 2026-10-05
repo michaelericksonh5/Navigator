@@ -27413,8 +27413,10 @@ final class GDDToAssetsRun: ObservableObject {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
         for url in cuts {
             let id = url.lastPathComponent.replacingOccurrences(of: "_rmbg.png", with: "")
-            guard jobs.first(where: { $0.id == id })?.role == .jackpot, let cg = loadCGImage(url), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
-            let trimmed = Derived.withoutGlow(px, width: cg.width, height: cg.height)
+            guard jobs.first(where: { $0.id == id })?.role == .jackpot, let cg = loadCGImage(url), let px = ChromaKeyOutputRules.straightRGBA8(cg),
+                  let sg = loadCGImage(url.deletingLastPathComponent().appendingPathComponent("\(id).png")), sg.width == cg.width, sg.height == cg.height,
+                  sg.width > 0 else { continue }
+            guard let trimmed = Derived.withoutGlow(px, source: sg) else { navLog("gdd cut: \(id)'s glow not trimmed — the subject mask would take off too much; check it by eye"); continue }
             guard trimmed != px else { continue }
             try? ChromaKeyOutputRules.image(straightRGBA8: trimmed, width: cg.width, height: cg.height, space: space).flatMap(encodePNG)?.write(to: url)
             navLog("gdd cut: \(id)'s glow trimmed off its cut-out")
