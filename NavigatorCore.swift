@@ -18330,13 +18330,29 @@ public enum Legibility {
 }
 
 /// A wedge's words lettered in code, as the studio laid Tiki Titans' (its "Tags", separate smart objects over the
-/// wedges): spelled right and upright by construction, never stacked letter over letter. In Impact, the heavy
+/// wedges): spelled right and upright by construction, never stacked letter over letter (Japanese, Chinese and Korean
+/// excepted: stacked upright, as vertical writing sets them). In Impact, the heavy
 /// condensed face Gameforge ships for in-game text (Tiki Titans, Toyota, Blazing, Mines), with a light face, a thick
 /// outline in the wedge's own hue darkened nearly to black and a thin bright rim — the treatment shipped titles
 /// measure with (research/legibility-docs.md C1–C6, legibility-measure.md).
 public enum WheelLabel {
     static let fontName = "Impact"
-    public enum Layout: String, Sendable { case across, along }
+    public enum Layout: String, Sendable { case across, along, stacked }
+    /// Japanese, Chinese and Korean are stacked upright, one character under another, as their vertical writing sets them
+    /// (his call, 2026-10-05), in the heaviest face of their script on every Mac — Impact has none of them.
+    static func stackedFont(_ lang: String?) -> String? {
+        ["ja": "HiraginoSans-W9", "ko": "AppleSDGothicNeo-Heavy", "zh-cn": "PingFangSC-Semibold", "zh-hk": "PingFangHK-Semibold"][lang ?? ""]
+    }
+    /// A stacked character's height, in its font's size, and the gap under it, in those heights; a space a short gap.
+    static let stackedBody = 0.92, stackedGap = 0.1, stackedSpace = 0.35, stackedOutline = 0.06
+    /// The label's face at `size`: Impact, or its script's face with its vertical alternates (`vert`: the long-vowel bar
+    /// upright) — glyphs swapped, not turned, as the vertical-forms attribute turns them.
+    static func face(_ lang: String?, _ size: CGFloat) -> CTFont {
+        guard let name = stackedFont(lang) else { return CTFontCreateWithName(fontName as CFString, size, nil) }
+        let vert = [kCTFontOpenTypeFeatureTag: "vert", kCTFontOpenTypeFeatureValue: 1] as [CFString: Any]
+        let d = CTFontDescriptorCreateWithAttributes([kCTFontNameAttribute: name, kCTFontFeatureSettingsAttribute: [vert]] as CFDictionary)
+        return CTFontCreateWithFontDescriptor(d, size, nil)
+    }
     /// The outline and rim round each letter, in cap heights: outline about a sixth, rim a twentieth.
     static let outline = 0.17, rim = 0.05, gap = 0.3
     /// Where letters may sit, in the wedge's length: clear of the hub and of the trim at the rim.
@@ -18344,7 +18360,8 @@ public enum WheelLabel {
 
     /// The largest letters a label can have: across the wedge (upright at the pointer) or along it (reading out
     /// from the hub), on one line or two. Across is kept unless along gives letters more than a tenth bigger.
-    public static func fit(_ label: String, art: WheelArt) -> (layout: Layout, lines: [String], size: CGFloat) {
+    public static func fit(_ label: String, art: WheelArt, lang: String? = nil) -> (layout: Layout, lines: [String], size: CGFloat) {
+        if stackedFont(lang) != nil { let chars = label.map(String.init); return (.stacked, chars, size(for: chars, layout: .stacked, art: art, lang: lang)) }
         let words = label.split(separator: " ").map(String.init)
         var splits = [[label]]
         if words.count > 1 { splits += (1..<words.count).map { [words[..<$0].joined(separator: " "), words[$0...].joined(separator: " ")] } }
@@ -18355,16 +18372,17 @@ public enum WheelLabel {
         return a.size >= 0.9 * b.size ? (.across, a.lines, a.size) : (.along, b.lines, b.size)
     }
     /// The font size at which the lines just fit their place in the wedge.
-    static func size(for lines: [String], layout: Layout, art: WheelArt) -> CGFloat {
-        let font = CTFontCreateWithName(fontName as CFString, 100, nil), cap = CTFontGetCapHeight(font)
+    static func size(for lines: [String], layout: Layout, art: WheelArt, lang: String? = nil) -> CGFloat {
+        let font = face(lang, 100)
+        let cap = layout == .stacked ? CGFloat(stackedBody) * 100 : CTFontGetCapHeight(font)
         let w1 = lines.map { width($0, font) }.max() ?? 0, n = CGFloat(lines.count)
-        let pad = CGFloat(outline + rim + 0.04) * cap
-        let hw1 = w1 / 2 + pad, hh1 = (n * cap + (n - 1) * CGFloat(gap) * cap) / 2 + pad
+        let pad = CGFloat((layout == .stacked ? stackedOutline : outline) + rim + 0.04) * cap
+        let hw1 = w1 / 2 + pad, hh1 = (layout == .stacked ? stackHeight(lines, cap) : n * cap + (n - 1) * CGFloat(gap) * cap) / 2 + pad
         let R = CGFloat(art.radius), rOut = CGFloat(outer) * R, rIn = CGFloat(inner) * R, t = CGFloat(tan(art.half) * sideMargin)
         func fits(_ k: CGFloat) -> Bool {
             let hw = k * hw1, hh = k * hh1
             switch layout {
-            case .across:
+            case .across, .stacked:
                 guard hw < rOut else { return false }
                 let bottom = (rOut * rOut - hw * hw).squareRoot() - 2 * hh
                 return bottom >= rIn && hw <= bottom * t
@@ -18377,6 +18395,10 @@ public enum WheelLabel {
         var lo: CGFloat = 0, hi: CGFloat = 50
         for _ in 0..<40 { let m = (lo + hi) / 2; if fits(m) { lo = m } else { hi = m } }
         return lo * 100
+    }
+    /// A stacked label's height: each character's, a space's short gap, and the gaps between.
+    static func stackHeight(_ chars: [String], _ cap: CGFloat) -> CGFloat {
+        chars.reduce(0) { $0 + ($1 == " " ? CGFloat(stackedSpace) : 1) * cap } + CGFloat(max(0, chars.count - 1)) * CGFloat(stackedGap) * cap
     }
     static func width(_ s: String, _ font: CTFont) -> CGFloat {
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
@@ -18402,19 +18424,22 @@ public enum WheelLabel {
 
     /// The wedge (straight RGBA at its wedgeSize, cut to its sector) with its label lettered on, cut again; its face in
     /// the game's own lettering tones (`face`, light to deep: palette(fromTitle:)), or polished gold.
-    static func lettered(_ wedge: [UInt8], label: String, art: WheelArt, face tones: [RGB8]? = nil) -> [UInt8] {
+    static func lettered(_ wedge: [UInt8], label: String, art: WheelArt, face tones: [RGB8]? = nil, lang: String? = nil) -> [UInt8] {
         let (w, h) = art.wedgeSize
-        let f = fit(label, art: art)
+        let f = fit(label, art: art, lang: lang)
         guard f.size > 4, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return wedge }
-        let font = CTFontCreateWithName(fontName as CFString, f.size, nil), cap = CTFontGetCapHeight(font)
-        let n = CGFloat(f.lines.count), H = n * cap + (n - 1) * CGFloat(gap) * cap, pad = CGFloat(outline + rim + 0.04) * cap
+        let stacked = f.layout == .stacked, ring = stacked ? stackedOutline : outline
+        let font = face(lang, f.size)
+        let cap = stacked ? CGFloat(stackedBody) * f.size : CTFontGetCapHeight(font)
+        let n = CGFloat(f.lines.count), H = stacked ? stackHeight(f.lines, cap) : n * cap + (n - 1) * CGFloat(gap) * cap
+        let pad = CGFloat(ring + rim + 0.04) * cap
         let W = f.lines.map { width($0, font) }.max() ?? 0
         let R = CGFloat(art.radius), rOut = CGFloat(outer) * R
         // The block's centre on the wedge's axis, measured from the tip (12 px above the canvas's foot).
         let centre: CGFloat
         switch f.layout {
-        case .across: centre = (rOut * rOut - (W / 2 + pad) * (W / 2 + pad)).squareRoot() - (H / 2 + pad)
+        case .across, .stacked: centre = (rOut * rOut - (W / 2 + pad) * (W / 2 + pad)).squareRoot() - (H / 2 + pad)
         case .along: centre = (rOut * rOut - (H / 2 + pad) * (H / 2 + pad)).squareRoot() - (W / 2 + pad)
         }
         ctx.translateBy(x: CGFloat(w) / 2, y: 12 + centre)
@@ -18423,18 +18448,29 @@ public enum WheelLabel {
         ctx.setLineJoin(.round)
         // The outline: the wedge's own hue, darkened nearly to black.
         let ink = darkInk(wedge, width: w, height: h)
-        let lines = f.lines.enumerated().map { (i, s) -> (CTLine, CGPoint) in
+        // Each line with where it is drawn and the top and foot of its face. A stacked character is centred in its slot by
+        // its own ink.
+        var top = H / 2
+        let lines = f.lines.enumerated().compactMap { (i, s) -> (line: CTLine, at: CGPoint, top: CGFloat, foot: CGFloat)? in
+            if stacked {
+                defer { top -= (s == " " ? CGFloat(stackedSpace) : 1 + CGFloat(stackedGap)) * cap }
+                guard s != " " else { return nil }
+                let line = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
+                let ink = CTLineGetImageBounds(line, ctx), mid = top - cap / 2
+                return (line, CGPoint(x: -ink.midX, y: mid - ink.midY), mid + cap / 2, mid - cap / 2)
+            }
             let line = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
-            return (line, CGPoint(x: -width(s, font) / 2, y: H / 2 - cap - CGFloat(i) * cap * (1 + CGFloat(gap))))
+            let y = H / 2 - cap - CGFloat(i) * cap * (1 + CGFloat(gap))
+            return (line, CGPoint(x: -width(s, font) / 2, y: y), y + cap, y)
         }
-        func draw(_ mode: CGTextDrawingMode) { for (l, p) in lines { ctx.textPosition = p; ctx.setTextDrawingMode(mode); CTLineDraw(l, ctx) } }
+        func draw(_ mode: CGTextDrawingMode) { for l in lines { ctx.textPosition = l.at; ctx.setTextDrawingMode(mode); CTLineDraw(l.line, ctx) } }
         // A soft shadow under the bright rim, the rim, the dark outline, then each line's face: light, top to bottom.
         ctx.saveGState()
         ctx.setShadow(offset: CGSize(width: 0, height: -0.06 * cap), blur: 0.12 * cap, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
-        ctx.setStrokeColor(CGColor(red: 1, green: 0.88, blue: 0.55, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline + rim) * cap)
+        ctx.setStrokeColor(CGColor(red: 1, green: 0.88, blue: 0.55, alpha: 1)); ctx.setLineWidth(2 * CGFloat(ring + rim) * cap)
         draw(.stroke)
         ctx.restoreGState()
-        ctx.setStrokeColor(CGColor(red: CGFloat(ink.r) / 255, green: CGFloat(ink.g) / 255, blue: CGFloat(ink.b) / 255, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline) * cap)
+        ctx.setStrokeColor(CGColor(red: CGFloat(ink.r) / 255, green: CGFloat(ink.g) / 255, blue: CGFloat(ink.b) / 255, alpha: 1)); ctx.setLineWidth(2 * CGFloat(ring) * cap)
         draw(.stroke)
         // The face: polished gold, cream at the top through gold to amber at the foot — a smooth gradient whose darkest
         // part still stands far lighter than the outline (WCAG G18) — with a gloss band across its upper third.
@@ -18443,11 +18479,11 @@ public enum WheelLabel {
         let stops = (tones?.count == 3 ? tones! : [RGB8(255, 250, 224), RGB8(255, 214, 92), RGB8(219, 143, 33)]).map(cg)
         let face = CGGradient(colorsSpace: srgb, colors: stops as CFArray, locations: [0, 0.45, 1])!
         let gloss = CGGradient(colorsSpace: srgb, colors: [CGColor(red: 1, green: 1, blue: 1, alpha: 0.55), CGColor(red: 1, green: 1, blue: 1, alpha: 0)] as CFArray, locations: [0, 1])!
-        for (l, p) in lines {
+        for l in lines {
             ctx.saveGState()
-            ctx.textPosition = p; ctx.setTextDrawingMode(.clip); CTLineDraw(l, ctx)
-            ctx.drawLinearGradient(face, start: CGPoint(x: 0, y: p.y + cap), end: CGPoint(x: 0, y: p.y), options: [])
-            ctx.drawLinearGradient(gloss, start: CGPoint(x: 0, y: p.y + cap), end: CGPoint(x: 0, y: p.y + cap * 0.6), options: [])
+            ctx.textPosition = l.at; ctx.setTextDrawingMode(.clip); CTLineDraw(l.line, ctx)
+            ctx.drawLinearGradient(face, start: CGPoint(x: 0, y: l.top), end: CGPoint(x: 0, y: l.foot), options: [])
+            ctx.drawLinearGradient(gloss, start: CGPoint(x: 0, y: l.top), end: CGPoint(x: 0, y: l.top - (l.top - l.foot) * 0.4), options: [])
             ctx.restoreGState()
         }
         guard let img = ctx.makeImage(), let text = ChromaKeyOutputRules.straightRGBA8(img) else { return wedge }

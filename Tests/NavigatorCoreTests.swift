@@ -14074,6 +14074,17 @@ final class LocalizationPlanTests: XCTestCase {
         XCTAssertEqual(Localized.lines("ENCORE UNE CHANCE", english: "ONE MORE CHANCE", lang: "fr"), ["ENCORE UNE CHANCE"])
         XCTAssertEqual(Localized.lines("賞金合計", english: "TOTAL\nWIN", lang: "ja"), ["賞金合計"])
     }
+    // Japanese, Chinese and Korean wedges stacked upright, one character under another; a Korean space a short gap.
+    func testCJKWedgesAreStackedUpright() {
+        let art = WheelArt(segments: 12)
+        let ja = WheelLabel.fit("ボーナスゲーム", art: art, lang: "ja")
+        XCTAssertEqual(ja.layout, .stacked); XCTAssertEqual(ja.lines.count, 7); XCTAssertGreaterThan(ja.size, 20)
+        XCTAssertEqual(WheelLabel.fit("무료 게임", art: art, lang: "ko").lines, ["무", "료", " ", "게", "임"])
+        XCTAssertNotEqual(WheelLabel.fit("BONUSSPIELE", art: art, lang: "de").layout, .stacked)
+        XCTAssertNotEqual(WheelLabel.fit("BONUS GAMES", art: art).layout, .stacked)
+        // Fewer characters, bigger letters.
+        XCTAssertGreaterThan(WheelLabel.fit("超級", art: art, lang: "zh-hk").size, ja.size)
+    }
     func testMissingWordsAreListedForTheLocalizationTeam() {
         let pieces = [Localized.Piece(stem: "shared_tutorial_button", words: ["GOT IT!"], w: 1, h: 1, kind: .button, how: .edit),
                       Localized.Piece(stem: "shared_popUp_oneMoreChance", words: ["ONE MORE CHANCE"], w: 1, h: 1, kind: .message, how: .alone)]

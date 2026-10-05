@@ -667,31 +667,45 @@ enum FalKeyCheck {
 
     /// The last definite answer, kept so Setup can show it without reading the key — reading
     /// it is what raises the keychain password prompt after an update.
-    static var last: (accepted: Bool, at: Date)? {
-        get {
-            let p = (Prefs.d.string(forKey: prefKey) ?? "").split(separator: "|")
-            guard p.count == 2, let t = Double(p[1]) else { return nil }
-            return (p[0] == "1", Date(timeIntervalSince1970: t))
-        }
-        set { Prefs.d.set(newValue.map { "\($0.accepted ? 1 : 0)|\($0.at.timeIntervalSince1970)" } ?? "", forKey: prefKey) }
-    }
+    static var last: (accepted: Bool, at: Date)? { get { KeyVerdict.get(prefKey) } set { KeyVerdict.set(newValue, prefKey) } }
 }
 
 /// Does OpenAI accept a key, and can it reach GPT Image 2.5? Asked of the model lookup
 /// (GET /v1/models/<model>): it runs nothing, so it costs nothing. Blocks.
+/// A key check's last definite answer, kept so Setup can show it without reading the key — reading it is what raises the
+/// keychain password prompt after an update.
+enum KeyVerdict {
+    static func get(_ prefKey: String) -> (accepted: Bool, at: Date)? {
+        let p = (Prefs.d.string(forKey: prefKey) ?? "").split(separator: "|")
+        guard p.count == 2, let t = Double(p[1]) else { return nil }
+        return (p[0] == "1", Date(timeIntervalSince1970: t))
+    }
+    static func set(_ v: (accepted: Bool, at: Date)?, _ prefKey: String) {
+        Prefs.d.set(v.map { "\($0.accepted ? 1 : 0)|\($0.at.timeIntervalSince1970)" } ?? "", forKey: prefKey)
+    }
+}
+
+/// Whether OpenAI accepts the key and lets it use GPT Image 2.5: a model lookup, which bills nothing
+/// (measured 2026-10-05: 200 for a model the key can use, 404 for one it cannot, 401 for a bad key).
 enum OpenAIKeyCheck {
-    static func verify(_ key: String) -> String {
+    static var last: (accepted: Bool, at: Date)? { get { KeyVerdict.get("openAIKeyCheck") } set { KeyVerdict.set(newValue, "openAIKeyCheck") } }
+    /// Blocks; call off the main thread.
+    static func verify(_ key: String) -> (accepted: Bool?, message: String) {
         var req = URLRequest(url: URL(string: "https://api.openai.com/v1/models/\(OpenAIImages.model)")!, timeoutInterval: 15)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         let done = DispatchSemaphore(value: 0); var status = 0
         URLSession.shared.dataTask(with: req) { _, r, _ in status = (r as? HTTPURLResponse)?.statusCode ?? 0; done.signal() }.resume()
         done.wait()
+        let r: (Bool?, String)
         switch status {
-        case 200: return "OpenAI accepted the key, and it can use \(OpenAIImages.model)."
-        case 401: return "OpenAI rejected this key (401)."
-        case 403, 404: return "OpenAI accepted the key but it cannot use \(OpenAIImages.model) (\(status)): the organisation may need verifying."
-        default: return "Couldn’t reach OpenAI (\(status)) — the key isn’t proven wrong."
+        case 200: r = (true, "OpenAI accepted the key, and it can use \(OpenAIImages.model).")
+        case 401: r = (false, "OpenAI rejected this key (401). Paste a fresh one from platform.openai.com/api-keys.")
+        case 403, 404: r = (false, "OpenAI accepted the key but it cannot use \(OpenAIImages.model) (\(status)): the organisation may need verifying.")
+        default: r = (nil, "Couldn’t reach OpenAI (\(status)) — the key isn’t proven wrong.")
         }
+        if let ok = r.0 { last = (ok, Date()) }
+        navLog("openai key check: \(status) → \(r.1)")
+        return r
     }
 }
 
@@ -17576,6 +17590,7 @@ struct SetupItem: Identifiable {
         let openGDD = { _ = NSApp.sendAction(#selector(AppDelegate.gddToAssetsAction(_:)), to: nil, from: nil) }
         let hub = GoogleWebSession.themeHubURL
         let falStored = PermissionProbe.keyStored(account: "fal.ai") == .granted
+        let openAIStored = PermissionProbe.keyStored(account: "OpenAI") == .granted
         var rows: [SetupItem] = [
             // ── Connect ─────────────────────────────────────────────────────────────
             SetupItem(id: "vertex", section: .connect, title: "Vertex sign-in",
@@ -17620,6 +17635,35 @@ struct SetupItem: Identifiable {
                           }
                       },
                       labels: falStored ? [.notAsked: "Not checked", .denied: "Rejected"] : [:],
+                      openSettings: openKeys),
+            SetupItem(id: "openaikey", section: .connect, title: "OpenAI API key",
+                      short: !openAIStored ? "For GPT Image 2.5, which draws GDD to Assets' frames, reel area, pots, pop-ups and lettering. Add Key opens a box to paste it."
+                        : OpenAIKeyCheck.last?.accepted == false ? "OpenAI rejected the saved key, or it cannot use GPT Image 2.5. Replace it."
+                        : OpenAIKeyCheck.last == nil ? "Saved, but not checked yet. Check asks OpenAI whether it accepts the key."
+                        : "For GPT Image 2.5 in GDD to Assets, on OpenAI's own API. OpenAI accepts the key.",
+                      why: "Navigator calls OpenAI directly (api.openai.com), not through fal, and the drawings are billed to the OpenAI account the key belongs to. A key set with the H5G AI Connect hub (OPENAI_API_KEY) is used first.\n\nGreen means OpenAI accepted the key and lets it use \(OpenAIImages.model) — checked with a model lookup, which draws nothing and costs nothing."
+                         + (OpenAIKeyCheck.last.map { "\n\nLast checked " + $0.at.formatted(date: .abbreviated, time: .shortened) + "." } ?? ""),
+                      probe: { _ in
+                          guard PermissionProbe.keyStored(account: "OpenAI") == .granted else { return .off }
+                          guard let v = OpenAIKeyCheck.last else { return .notAsked }
+                          return v.accepted ? .granted : .denied
+                      },
+                      probeMayPrompt: false, canAsk: false,
+                      settingsLabel: !openAIStored ? "Add Key…" : OpenAIKeyCheck.last?.accepted == false ? "Replace Key…" : "Check",
+                      run: !openAIStored || OpenAIKeyCheck.last?.accepted == false ? nil : { report in
+                          report("Asking OpenAI…")
+                          DispatchQueue.global(qos: .userInitiated).async {
+                              let found = APIKeys.lookup("OpenAI")
+                              let msg = found.key.map { k -> String in
+                                  let r = OpenAIKeyCheck.verify(k)
+                                  return r.accepted == true ? "Checked just now." : r.message
+                              }
+                                  ?? (found.accessDenied ? "The keychain didn’t hand the key over — choose Always Allow when it asks."
+                                                         : "No key is saved.")
+                              DispatchQueue.main.async { report(msg) }
+                          }
+                      },
+                      labels: openAIStored ? [.notAsked: "Not checked", .denied: "Rejected"] : [:],
                       openSettings: openKeys),
             SetupItem(id: "themehub", section: .connect, title: "Team theme hub",
                       short: hub == nil
@@ -19193,12 +19237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             let key = fal.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let oKey = openAI.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if key != (APIKeys.fal ?? "") { APIKeys.fal = key; FalKeyCheck.last = nil }   // a new key has no verdict yet
-            if APIKeys.hubKey("OpenAI") == nil { APIKeys.openAI = oKey }
+            if APIKeys.hubKey("OpenAI") == nil && oKey != (APIKeys.openAI ?? "") { APIKeys.openAI = oKey; OpenAIKeyCheck.last = nil }
             // Checked now, while the keys are in hand — no keychain read, so no prompt.
             DispatchQueue.global(qos: .userInitiated).async {
                 var lines: [String] = []
                 if !key.isEmpty { lines.append(FalKeyCheck.verify(key).message) }
-                if !oKey.isEmpty { lines.append(OpenAIKeyCheck.verify(oKey)) }
+                if !oKey.isEmpty { lines.append(OpenAIKeyCheck.verify(oKey).message) }
                 DispatchQueue.main.async {
                     let done = NSAlert()
                     done.messageText = "Keys saved"
@@ -27070,7 +27114,7 @@ final class GDDToAssetsRun: ObservableObject {
                         for x in [".png", "_rmbg.png"] where has(p.stem + x) { try? fm.copyItem(at: url(p.stem + x), to: url(n + x)) }
                     case .draw(let words) where p.how == .wedge:
                         guard let blank = load("\(p.stem)-blank_rmbg.png"), let art = wheels.first(where: { p.stem.hasPrefix($0.prefix + "_") })?.art else { continue }
-                        let done = WheelLabel.lettered(blank.px, label: words[0], art: art, face: titleTones)
+                        let done = WheelLabel.lettered(blank.px, label: words[0], art: art, face: titleTones, lang: lang)
                         write(FrameKit.onBacking(done, b), blank.w, blank.h, "\(n).png"); write(done, blank.w, blank.h, "\(n)_rmbg.png")
                     case .draw(let words):
                         guard let english = try? Data(contentsOf: url("\(p.from ?? p.stem).png")) else { continue }
