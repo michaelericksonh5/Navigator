@@ -26387,7 +26387,7 @@ final class GDDToAssetsRun: ObservableObject {
                 }
             }
             if let best, best.c > FrameStack.windowTolerance { problems.append(String(format: "the %@ covers %.1f%% of its openings", what, best.c * 100)) }
-            if let best, !best.failed.isEmpty { problems.append("\(what) at phone size: " + best.failed.joined(separator: "; ")) }
+            if let best, !best.failed.isEmpty { problems.append("\(what): " + best.failed.joined(separator: "; ")) }
             return best?.px
         }
         // Modes: the base grid, then each bonus grid in turn, named as the studio's are.
