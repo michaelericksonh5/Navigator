@@ -8898,25 +8898,43 @@ public enum PotStates {
     }
     /// State0 with its lid taken off (GPT, laid on State0's foot), so its open mouth shows.
     public static func openName(pot i: Int, of total: Int) -> String { name(pot: i, of: total, state: 0) + "_open" }
-    /// The lid, as State0's own pixels: where State0 is opaque and the open pot is not, or differs from it strongly, above
-    /// the open pot's rim — exactly the lid, in exactly its place (asked to draw the lid alone, GPT drew it larger and
-    /// centred, 2026-10-05). Nil when that is no lid: not in the pot's top half, or under 2% or over 45% of it.
+    /// The lid, as State0's own pixels — exactly the lid, in exactly its place (asked to draw the lid alone, GPT drew it larger
+    /// and centred, 2026-10-05): State0 above the open pot's rim line (its first row 40% as wide as its widest, a little below
+    /// for the lid's brim), wherever the open pot is not there or differs from it; its largest connected piece, so a handle's
+    /// tip GPT nudged is no part of it. Nil when that is no whole lid: in pieces, or under 4% or over 45% of the pot's height.
     public static func lidFrom(empty: [UInt8], open: [UInt8], width w: Int, height h: Int) -> [UInt8]? {
         guard let e = box(empty, width: w, height: h), let o = box(open, width: w, height: h) else { return nil }
-        var lid = [UInt8](repeating: 0, count: w * h * 4), n = 0, all = 0
-        let band = o.y + Int(0.05 * Double(e.h))                 // the open pot's rim, and a little below it
-        for y in 0..<h { for x in 0..<w {
+        func width(_ px: [UInt8], _ y: Int) -> Int { let xs = (0..<w).filter { px[(y * w + $0) * 4 + 3] > 128 }; return xs.isEmpty ? 0 : xs.last! - xs.first! }
+        let widest = (o.y..<(o.y + o.h)).map { width(open, $0) }.max() ?? 0
+        guard let rim = (o.y..<(o.y + o.h)).first(where: { Double(width(open, $0)) >= 0.4 * Double(widest) }) else { return nil }
+        let band = rim + Int(0.04 * Double(e.h))
+        var mask = [Bool](repeating: false, count: w * h)
+        for y in 0..<min(h, band) { for x in 0..<w {
             let i = (y * w + x) * 4
             guard empty[i + 3] > 128 else { continue }
-            all += 1
-            let gone = open[i + 3] <= 128
-            let changed = y <= band && open[i + 3] > 128 && abs(Int(empty[i]) - Int(open[i])) + abs(Int(empty[i + 1]) - Int(open[i + 1])) + abs(Int(empty[i + 2]) - Int(open[i + 2])) > 90
-            guard y <= band && (gone || changed) else { continue }
-            for c in 0..<4 { lid[i + c] = empty[i + c] }
-            n += 1
+            let diff = abs(Int(empty[i]) - Int(open[i])) + abs(Int(empty[i + 1]) - Int(open[i + 1])) + abs(Int(empty[i + 2]) - Int(open[i + 2]))
+            if open[i + 3] <= 128 || diff > 45 { mask[y * w + x] = true }
         } }
-        guard let l = box(lid, width: w, height: h), l.y + l.h <= e.y + e.h / 2 + e.h / 10,
-              Double(n) >= 0.02 * Double(all), Double(n) <= 0.45 * Double(all) else { return nil }
+        // Its largest connected piece.
+        var label = [Int](repeating: 0, count: w * h), sizes: [Int] = [0], next = 1
+        for start in 0..<(w * h) where mask[start] && label[start] == 0 {
+            var stack = [start], n = 0
+            label[start] = next
+            while let i = stack.popLast() {
+                n += 1
+                let x = i % w, y = i / w
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] where nx >= 0 && nx < w && ny >= 0 && ny < h {
+                    let j = ny * w + nx
+                    if mask[j] && label[j] == 0 { label[j] = next; stack.append(j) }
+                }
+            }
+            sizes.append(n); next += 1
+        }
+        guard let biggest = sizes.indices.dropFirst().max(by: { sizes[$0] < sizes[$1] }) else { return nil }
+        var lid = [UInt8](repeating: 0, count: w * h * 4)
+        for i in 0..<(w * h) where label[i] == biggest { for c in 0..<4 { lid[i * 4 + c] = empty[i * 4 + c] } }
+        guard let l = box(lid, width: w, height: h), Double(l.h) >= 0.04 * Double(e.h), Double(l.h) <= 0.45 * Double(e.h),
+              Double(sizes[biggest]) >= 0.7 * Double(sizes.dropFirst().reduce(0, +)) else { return nil }
         return lid
     }
     /// State0 without its lid: its pixels where the lid is not.

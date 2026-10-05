@@ -26417,6 +26417,11 @@ final class GDDToAssetsRun: ObservableObject {
                 let lidN = PotStates.lidName(pot: i, of: total), noLid = url("\(lidN).none")
                 var lid = load("\(lidN)_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? $0.px : nil }
                 let statesToDraw = (1...PotStates.levels).contains { !has("\(jar(i, $0)).png") && wanted("\(jar(i, $0)).png") }
+                // An open pot drawn already: its lid taken from it again, free.
+                if lid == nil, statesToDraw, let open = load("\(PotStates.openName(pot: i, of: total))_rmbg.png"), open.w == 1024, open.h == potH,
+                   let l = PotStates.lidFrom(empty: e0.px, open: open.px, width: 1024, height: potH) {
+                    write(FrameKit.onBacking(l, b), 1024, potH, "\(lidN).png"); write(l, 1024, potH, "\(lidN)_rmbg.png"); lid = l
+                }
                 if lid == nil, statesToDraw, !fm.fileExists(atPath: noLid.path), let s0png = try? Data(contentsOf: url("\(jar(i, 0)).png")) {
                     let r = H5GService.describe(prompt: "This is a pot drawn for a video slot game. Does it have a lid, cover or door sitting on top of it that could open? Answer with one word: yes or no.",
                                                 systemPrompt: nil, imagePNG: downsamplePNG(s0png, longEdge: 768) ?? s0png)
