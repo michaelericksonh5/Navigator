@@ -26185,7 +26185,7 @@ final class GDDToAssetsRun: ObservableObject {
         ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
         ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") || $0.hasPrefix("shared_meter_") }),
-        ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
+        ("Pots", { $0.hasPrefix("shared_avatar_jar") && !$0.contains("-plaque") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && ($0.contains("-State") && !$0.contains("-State0") || $0.contains("-boosted")) }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
         ("Number fonts", { $0.hasPrefix("transition_font_totalWin") || $0.hasPrefix("shared_font_") }),
@@ -26199,6 +26199,29 @@ final class GDDToAssetsRun: ObservableObject {
         ("Pop-ups", { n in !isConcept(n) && (n.contains("_popUp_") || n.hasPrefix("shared_popUps") || n.hasPrefix("transition_outro_") || n.hasPrefix("shared_celebration_")
             || n.hasPrefix("base_banner_event-") || n.hasPrefix("wheelSpin_banner")) }),
     ]
+
+    /// The order a set is made in (2026-10-05): its core art first — symbols, frames, backgrounds (Generate) and the reel
+    /// area's bezel, reel texture and pots — reviewed until every picture is approved; then everything drawn to match it;
+    /// then the lettered pieces in other languages.
+    enum Phase: Int, CaseIterable {
+        case core = 1, rest, localize
+        var groups: [String] {
+            switch self {
+            case .core: ["Bezel", "Reel texture", "Pots"]
+            case .rest: ["Jackpot table", "Pot plaques", "Number fonts", "Symbol win states", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
+            case .localize: ["Localized CONTINUE"]
+            }
+        }
+        var title: String { switch self { case .core: "the core pieces"; case .rest: "everything else"; case .localize: "the localized pieces" } }
+    }
+    /// The core's pictures and which are not approved yet: every symbol, frame and background in review, the bezel and
+    /// reel texture pieces, and each pot's states. Everything else is drawn to match them, so it waits for all of them.
+    func coreApproval(_ folder: URL) -> (total: Int, left: [String]) {
+        let sections = catalog(folder, stamped: false)
+        let core = sections.filter { $0.id.hasPrefix("sym-") || $0.id == "ui-Bezel" || $0.id == "ui-Reel texture" }.flatMap(\.assets).map(\.id)
+            + sections.filter(\.pot).flatMap(\.assets).filter { $0.kind == .potState }.map(\.id)
+        return (core.count, core.filter { !review.entry($0).approved })
+    }
 
     /// A reel piece's files moved into versions/ so the next reel-area run draws it again. False: no such piece.
     @discardableResult static func keepForRedo(_ piece: String, folder: URL) -> Bool {
@@ -26312,16 +26335,30 @@ final class GDDToAssetsRun: ObservableObject {
 
     /// The window's "Make reel area": the set's reel area made in the background, said in the status.
     /// `redo` names a piece (reelPieces) to make again: its files are kept in versions/ first, never deleted.
-    func makeReelArea(redo: String? = nil) {
+    func makeReelArea(redo: String? = nil, phase: Phase? = nil) {
         guard let folder = lastFolder, let layout = reelLayout else { return }
         let pieces = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
         Self.conceptNames = (pieces.standard + pieces.planned).map(\.name)
+        if phase == .rest {
+            let core = coreApproval(folder)
+            guard core.left.isEmpty else {
+                let a = NSAlert()
+                a.messageText = "Approve the core first"
+                a.informativeText = "Everything else is drawn to match the core art, so it waits until all of it is approved: \(core.total - core.left.count) of \(core.total) are. Still to approve: "
+                    + core.left.prefix(12).joined(separator: ", ") + (core.left.count > 12 ? " and \(core.left.count - 12) more." : ".")
+                a.addButton(withTitle: "Open Assets"); a.addButton(withTitle: "OK")
+                if a.runModal() == .alertFirstButtonReturn { GDDReviewWindow.open(run: self, folder: folder) }
+                return
+            }
+        }
+        let groups = phase.map { Set($0.groups) }
+        func inPhase(_ file: String) -> Bool { groups.map { g in Self.reelPieces.contains { g.contains($0.name) && $0.files(file) } } ?? true }
         // The cost said before anything is paid for: what isn't made yet, or the piece made again.
         let list = checklist().filter { $0.item.supported && !["Symbols", "Backgrounds"].contains($0.item.maker) }
         let todo = redo.flatMap { r in Self.reelPieces.first { $0.name == r } }
-            .map { p in list.filter { $0.item.files.contains(where: p.files) } } ?? list.filter { !$0.made }
+            .map { p in list.filter { $0.item.files.contains(where: p.files) } } ?? list.filter { !$0.made && $0.item.files.contains(where: inPhase) }
         let alert = NSAlert()
-        alert.messageText = redo.map { "Make the \($0) again?" } ?? "Make the game interface?"
+        alert.messageText = redo.map { "Make the \($0) again?" } ?? phase.map { "Make \($0.title)?" } ?? "Make the game interface?"
         let total = todo.reduce(0) { $0 + $1.item.cost }
         alert.informativeText = String(format: "%d piece%@ — about $%.2f (GPT Image 2.5). A piece that fails the phone-size check is drawn once more: at most $%.2f.%@",
                                        todo.count, todo.count == 1 ? "" : "s", total, 2 * total, redo == nil ? "" : " The current files are kept in the set's versions folder.")
@@ -26331,7 +26368,7 @@ final class GDDToAssetsRun: ObservableObject {
         keying = true
         status = "Making the game interface — reel area, \(layout.wheels.map { "\($0.count) wheel\($0.count == 1 ? "" : "s"), " } ?? "")pop-ups — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = self.generateReelArea(layout, folder: folder, only: redo.map { [$0] })
+            let r = self.generateReelArea(layout, folder: folder, only: redo.map { [$0] } ?? groups)
             DispatchQueue.main.async {
                 self.keying = false
                 self.status = (r.problems.isEmpty ? "Game interface made" : "Game interface made — " + r.problems.joined(separator: "; "))
@@ -28365,7 +28402,7 @@ extension GDDToAssetsRun {
     /// Everything in the set's folder, in sections: the symbols by family (review order) and the backgrounds, then the
     /// game interface piece by piece — each pot as its six states with the drawings and parts they are built from — and
     /// the contact sheets last. Helper files (a wedge's blank, a cut-out beside its picture) are not listed on their own.
-    func catalog(_ folder: URL) -> [SetSection] {
+    func catalog(_ folder: URL, stamped: Bool = true) -> [SetSection] {
         let fm = FileManager.default
         if let layout = reelLayout {
             let pieces = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
@@ -28431,6 +28468,7 @@ extension GDDToAssetsRun {
             }))
         }
         // Each picture's write time, so the browser reloads one the moment it changes.
+        guard stamped else { return sections }
         return sections.map { s in
             var s = s
             s = SetSection(id: s.id, title: s.title, assets: s.assets.map { a in
@@ -28855,9 +28893,14 @@ struct AssetBrowserView: View {
                 Text(folder.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Spacer()
+            let core = run.coreApproval(folder)
             let done = run.review.approvedCount(in: reviewable.map(\.id))
-            ProgressView(value: Double(done), total: Double(max(1, reviewable.count))).frame(width: 110)
-            Text("\(done) of \(reviewable.count) approved").font(.callout).monospacedDigit()
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(core.left.isEmpty && core.total > 0 ? "Core approved ✓ — everything else can be made" : "Core: \(core.total - core.left.count) of \(core.total) approved")
+                    .font(.callout).monospacedDigit().foregroundStyle(core.left.isEmpty && core.total > 0 ? .green : .primary)
+                Text("\(done) of \(reviewable.count) pictures approved in all").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+            .help(core.left.isEmpty ? "Every core picture is approved." : "Still to approve in the core: " + core.left.prefix(20).joined(separator: ", ") + (core.left.count > 20 ? "…" : ""))
             Divider().frame(height: 22)
             TextField("Find a picture", text: $search).textFieldStyle(.roundedBorder).frame(width: 170).focused($editing)
             Picker("", selection: $filter) { ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
@@ -28930,6 +28973,12 @@ struct AssetBrowserView: View {
                                 Text(sec.title).font(.title3.bold())
                                 Text("\(sec.assets.count)").foregroundStyle(.secondary)
                                 Spacer()
+                                if sec.id != "previews" {
+                                    let open = sec.assets.filter { !run.review.entry($0.id).approved }
+                                    Button(open.isEmpty ? "All Approved" : "Approve All \(open.count)") { approveAll(open.map(\.id)) }
+                                        .controlSize(.small).disabled(open.isEmpty)
+                                        .help("Approve every picture in \(sec.title) shown here")
+                                }
                             }
                             .padding(.vertical, 6).background(.bar)
                         }
@@ -29285,8 +29334,11 @@ struct AssetBrowserView: View {
                 if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
             }
             .disabled(ready.isEmpty)
+            let core = run.coreApproval(folder)
             Menu("Game Interface") {
-                Button("Make What’s Missing") { run.makeReelArea() }
+                Button("1 · Core Pieces…") { run.makeReelArea(phase: .core) }
+                Button(core.left.isEmpty ? "2 · Everything Else…" : "2 · Everything Else… (\(core.left.count) core pictures to approve)") { run.makeReelArea(phase: .rest) }
+                Divider()
                 Menu("Make Again") { ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } } }
             }
             .fixedSize()
@@ -29330,6 +29382,10 @@ struct AssetBrowserView: View {
     private func step(_ d: Int) {
         guard let i = currentIndex else { selection = shown.first?.id; return }
         selection = shown[max(0, min(shown.count - 1, i + d))].id
+    }
+    private func approveAll(_ ids: [String]) {
+        for id in ids { run.review.setApproved(id, true) }
+        run.saveReview(folder)
     }
     private func toggleApproved(_ id: String) {
         run.review.setApproved(id, !run.review.entry(id).approved); run.saveReview(folder)
@@ -30654,9 +30710,13 @@ struct GDDToAssetsSheet: View {
                     HStack(spacing: 6) {
                         Text("Reels").bold()
                         Text(run.reelLayout?.summary ?? "not set — the document gives no reel size").foregroundColor(run.reelLayout == nil ? .orange : .secondary)
-                        Button("Make game interface…") { run.makeReelArea() }
-                            .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying || run.reelLayout == nil)
-                            .help("Everything round the symbols, from the GDD: for every grid, the bezel, dividers, reel texture and reel fade as layers; the jackpot table and pots when it has them; its wheels as the studio builds them (rim, hub, pointer, one wedge per prize); and the award pop-ups (panel, value bar, CONTINUE button, a title per award — bonus games, total win, each jackpot, the win ladder). Previews of each. Only what isn't made yet is drawn. GPT Image 2.5, about $0.07–0.15 a piece.")
+                        let ready = run.lastFolder == nil || !OpenAIImages.available || run.keying || run.reelLayout == nil
+                        Button("1 · Core Pieces…") { run.makeReelArea(phase: .core) }
+                            .disabled(ready)
+                            .help("The core of the reel area, with the symbols and backgrounds Generate makes: for every grid the bezel, dividers, reel texture and reel fade as layers, and the pots in their six states. Review them in Assets until every one is approved. Only what isn't made yet is drawn; GPT Image 2.5, about $0.07–0.15 a piece.")
+                        Button("2 · Everything Else…") { run.makeReelArea(phase: .rest) }
+                            .disabled(ready)
+                            .help("Once every core picture is approved: the jackpot table, pot plaques, wheels, pop-ups and celebrations, number fonts, the specials' win states, landscape backgrounds, the logo, key art, feature cards, Power Bet and tutorial pieces, and the lobby and loading pictures — drawn to match the core.")
                         Menu("Make Again") {
                             ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
                         }
@@ -30667,6 +30727,13 @@ struct GDDToAssetsSheet: View {
                             Button("View") { GDDReviewWindow.open(run: run, folder: folder) }
                                 .help("The game interface, piece by piece, in the asset browser — each pot's six states side by side")
                         }
+                    }
+                    if let folder = run.lastFolder {
+                        let core = run.coreApproval(folder)
+                        Text(core.total == 0 ? "Core: nothing made yet." : core.left.isEmpty ? "Core: all \(core.total) approved — everything else can be made."
+                             : "Core: \(core.total - core.left.count) of \(core.total) approved — everything else waits until all are (approve them in Assets).")
+                            .font(.caption).foregroundColor(core.left.isEmpty && core.total > 0 ? .green : .secondary)
+                            .id(run.review.approvedCount(in: core.left) + run.imagesVersion)
                     }
                     ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
                     assetChecklist
