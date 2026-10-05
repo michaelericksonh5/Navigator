@@ -8893,102 +8893,10 @@ public enum PotStates {
     /// research/legibility-measure.md §6). Back-loaded, so the last states still grow: generated rigs drawn each from
     /// State0 reached 91–99% of their height by State3 and barely changed after it.
     public static let rise = [0.0, 0.03, 0.07, 0.13, 0.20, 0.26]
-    /// The full pot's top stands no higher than the shipped rigs' tallest (29%; research §6): the canvas's extra room
-    /// only keeps a drawing that overshoots from being cut off.
-    public static let maxRise = 0.30
-    /// Where the treasure spills over the rim, by state: side (−1 left, +1 right) and how far down the pot, in its heights.
-    public static func spill(_ k: Int) -> [(side: Double, depth: Double)] {
-        k == 4 ? [(1, 0.12)] : k >= 5 ? [(-1, 0.22), (1, 0.26)] : []
-    }
     /// The rows a silhouette spans: those with an opaque pixel in at least 1% of the width.
     static func span(_ px: [UInt8], width w: Int, height h: Int) -> (top: Int, bottom: Int)? {
         let rows = (0..<h).filter { y in (0..<w).reduce(0) { $0 + (px[(y * w + $1) * 4 + 3] > 128 ? 1 : 0) } >= max(1, w / 100) }
         return rows.first.map { ($0, rows.last!) }
-    }
-    /// State `k`'s template: state k−1 (straight RGBA on its tall canvas) on the backing, with flat grey treasure
-    /// heaped on the pot's mouth — a dome over most of the pot's top whose crown stands `rise[k]` of State0's height
-    /// above State0's top — for GPT to paint as more of the same treasure. The code sets how high it fills.
-    /// State `k`'s crown, in State0's heights above its top, from where state k−1 stands (`after`): at least a step the eye
-    /// sees at phone size (4%), and the room left shared out as the shipped rigs share it — back-loaded — so a state
-    /// drawn higher than planned leaves the rest still growing, all within the canvas (`room`).
-    public static func crown(_ k: Int, after rp: Double, room: Double) -> Double {
-        let final = min(room, max(rise[levels], rp + Double(levels - k + 1) * 0.05))
-        let share = (rise[k] - rise[k - 1]) / (rise[levels] - rise[k - 1])
-        return min(room, rp + max(0.04, (final - rp) * share))
-    }
-    /// Where a state stands, and how far it can rise, in State0's heights above State0's top.
-    static func standing(_ px: [UInt8], empty: [UInt8], width w: Int, height h: Int, cap: Double = maxRise) -> (rise: Double, room: Double, s0: (top: Int, bottom: Int))? {
-        guard let s0 = span(empty, width: w, height: h), let sp = span(px, width: w, height: h) else { return nil }
-        let H0 = Double(max(1, s0.bottom - s0.top))
-        return (Double(s0.top - sp.top) / H0, min(cap, (Double(s0.top) - 0.03 * Double(h)) / H0), s0)
-    }
-    static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8, cap: Double = maxRise) -> [UInt8]? {
-        heaped(previous: previous, empty: empty, width: w, height: h, state: k, cap: cap).map { FrameKit.onBacking($0, b) }
-    }
-    /// State k−1 (straight RGBA) with its grey heap added, opaque — the template before it is laid on the backing.
-    /// `after`: where the state before stands by the schedule, when each state is drawn from the empty pot rather than from
-    /// the state before (GPT lifts what it is given a little each time, and drawn from each other the overshoot compounded).
-    /// `mouth`: the mouth's columns when known — a lid's own width, as it sits on the mouth (a cup whose handles join its rim
-    /// made the rim's run handle to handle).
-    static func heaped(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise, after: Double? = nil,
-                       mouth: (Int, Int)? = nil) -> [UInt8]? {
-        guard k > 0, k < rise.count, var st = standing(previous, empty: empty, width: w, height: h, cap: cap) else { return nil }
-        if let after { st.rise = after }
-        let s0 = st.s0, H0 = Double(s0.bottom - s0.top)
-        // The pot's mouth: its first row at least 40% as wide as its widest (past a lid's knob), the heap as wide as
-        // that rim and rising from it — not from the shoulders, which put grey beside the neck (2026-10-05).
-        // The run of pot continuous through its own centre, row by row: a handle that rises above the rim is a separate
-        // run, and is no part of the mouth (a cup's handle tips set the heap's width, 2026-10-05).
-        guard let fb = box(empty, width: w, height: h) else { return nil }
-        let mid = fb.x + fb.w / 2
-        func extent(_ y: Int) -> (Int, Int)? {
-            guard empty[(y * w + mid) * 4 + 3] > 128 else { return nil }
-            var a = mid, z = mid
-            while a > 0 && empty[(y * w + a - 1) * 4 + 3] > 128 { a -= 1 }
-            while z < w - 1 && empty[(y * w + z + 1) * 4 + 3] > 128 { z += 1 }
-            return (a, z)
-        }
-        let widest = (s0.top...s0.bottom).compactMap { extent($0).map { $0.1 - $0.0 } }.max() ?? 0
-        guard let rimY = (s0.top...s0.bottom).first(where: { y in extent(y).map { Double($0.1 - $0.0) >= 0.4 * Double(widest) } ?? false }) else { return nil }
-        // The mouth's width: the rim's widest row just below its top edge (its back edge, seen first, is the short arc).
-        guard let (x0, x1) = mouth ?? (rimY..<min(h, rimY + Int(0.08 * H0) + 1)).compactMap(extent).max(by: { $0.1 - $0.0 < $1.1 - $1.0 }), x1 > x0 else { return nil }
-        let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.5
-        let crown = max(0, Double(s0.top) - (after != nil ? min(st.room, rise[k]) : crown(k, after: st.rise, room: st.room)) * H0), foot = Double(rimY) + 0.03 * H0
-        var out = previous
-        // Stage 1 has no heap: a grey band over a closed lid read as treasure piled on it, and GPT threw the lid open
-        // (20% of the pot's height at State1, 2026-10-05; shipped rigs rise 1–5% there). Its treasure only glints.
-        guard k > 1 else { return out }
-        for y in Int(crown)..<min(h, Int(foot)) { for x in max(0, Int(cx - hw))..<min(w, Int(cx + hw) + 1) where previous[(y * w + x) * 4 + 3] < 128 {
-            let dx = (Double(x) - cx) / hw, dy = (foot - Double(y)) / max(1, foot - crown)
-            guard dx * dx + dy * dy <= 1 else { continue }
-            let g = UInt8(135 + 45 * (1 - dy))           // lit from above, like every grey template
-            out[(y * w + x) * 4] = g; out[(y * w + x) * 4 + 1] = g; out[(y * w + x) * 4 + 2] = g; out[(y * w + x) * 4 + 3] = 255
-        } }
-        // The spill (the shipped rigs overflow past the rim at the end): at State4 a tongue of treasure over one side of
-        // the rim, at State5 down both sides over the pot — laid in grey, over the pot itself, so the overflow is set, not hoped for.
-        for (side, depth) in spill(k) {
-            let ex = side < 0 ? Double(x0) : Double(x1), sx = ex + Double(side) * 0.02 * Double(x1 - x0)
-            let ry = depth * H0 / 2, rx = 0.13 * Double(x1 - x0), sy = Double(rimY) + ry * 0.8
-            for y in max(0, Int(sy - ry))..<min(h, Int(sy + ry)) { for x in max(0, Int(sx - rx))..<min(w, Int(sx + rx)) {
-                let dx = (Double(x) - sx) / rx, dy = (Double(y) - sy) / ry
-                guard dx * dx + dy * dy <= 1 else { continue }
-                let g = UInt8(140 + 35 * (1 - max(0, dy)))
-                out[(y * w + x) * 4] = g; out[(y * w + x) * 4 + 1] = g; out[(y * w + x) * 4 + 2] = g; out[(y * w + x) * 4 + 3] = 255
-            } }
-        }
-        return out
-    }
-    /// What keeps a drawn state (laid on State0) from growing as the rig must: its top at least 3% of State0's height above
-    /// the state before (shipped: every late step 5–9%), and near its crown — not far short, nor far past it (a lid thrown
-    /// open early leaves the later states no room).
-    public static func growthProblems(_ px: [UInt8], previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise) -> [String] {
-        guard k > 0, k < rise.count, let p = standing(previous, empty: empty, width: w, height: h, cap: cap), let n = standing(px, empty: empty, width: w, height: h, cap: cap) else { return [] }
-        let c = crown(k, after: p.rise, room: p.room), r = n.rise
-        var out: [String] = []
-        if k > 1 && r < p.rise + 0.03 { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, p.rise * 100)) }
-        else if r < c - 0.06 { out.append(String(format: "too low: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure reaches the grey heap's top", r * 100, c * 100)) }
-        if r > c + 0.06 { out.append(String(format: "too high: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure stops at the grey heap's top, and any lid rests low behind it, never raised above it", r * 100, c * 100)) }
-        return out
     }
     /// A pot's lid as its own part, as the studio's rigs carry it (Cauldron Cash's `pupmkin_lid`): drawn once from State0
     /// and laid on each state's treasure in code, tipped further open as it fills — GPT, asked to keep a lid while showing
@@ -8997,21 +8905,16 @@ public enum PotStates {
     /// How far the lid is tipped at each state, in degrees.
     /// Gentle: a lid lifted by the treasure under it stays nearly level (a flat lid spun 30° read as sliding off, 2026-10-05).
     public static let lidTilt: [Double] = [0, 2, 3, 5, 6, 8]
-    /// A lid's columns, as the mouth it sits on.
-    public static func mouth(ofLid lid: [UInt8], width w: Int, height h: Int) -> (Int, Int)? { box(lid, width: w, height: h).map { ($0.x, $0.x + $0.w - 1) } }
     static func box(_ px: [UInt8], width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int)? {
         var x0 = w, y0 = h, x1 = -1, y1 = -1
         for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 128 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
         return x1 < 0 ? nil : (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
     }
-    /// The first opaque row of `px` across the middle third of columns x0..<x0+cw — where a lid comes to rest.
-    static func restingTop(_ px: [UInt8], width w: Int, height h: Int, x0: Int, cw: Int) -> Int? {
-        let a = max(0, x0 + cw / 3), b = min(w, x0 + 2 * cw / 3)
-        for y in 0..<h { for x in a..<b where px[(y * w + x) * 4 + 3] > 128 { return y } }
-        return nil
-    }
     /// State0 with its lid taken off (GPT, laid on State0's foot), so its open mouth shows.
     public static func openName(pot i: Int, of total: Int) -> String { name(pot: i, of: total, state: 0) + "_open" }
+    /// The pot heaped full (GPT), its treasure's one drawing; and the parts cut from it for the animators.
+    public static func fullName(pot i: Int, of total: Int) -> String { name(pot: i, of: total, state: 0) + "_full" }
+    public static func partName(_ part: String, pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-\(part)" }
     /// The lid, as State0's own pixels — exactly the lid, in exactly its place (asked to draw the lid alone, GPT drew it larger
     /// and centred, 2026-10-05): State0 above the open pot's rim line (its first row 40% as wide as its widest, a little below
     /// for the lid's brim), wherever the open pot is not there or differs from it; its largest connected piece, so a handle's
@@ -9183,13 +9086,13 @@ public enum PotStates {
     public static func laid(_ state: [UInt8], on empty: [UInt8], width w: Int, height h: Int, by anchor: PotKind.Anchor) -> [UInt8] {
         anchor == .face ? matched(state, to: empty, width: w, height: h) : registered(state, to: empty, width: w, height: h, top: anchor == .top)
     }
-    /// `state` laid on `empty` by `empty`'s own pixels in the top `share` of its body — its face, which stays in view: the
+    /// `state` laid on `empty` by `empty`'s own pixels in a band of its body's `rows` (its top half: a face, which stays in view): the
     /// scale and place that match them best, searched coarse to fine; left alone when it is in place already.
-    public static func matched(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int, share: Double = 0.5) -> [UInt8] {
+    public static func matched(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int, rows: ClosedRange<Double> = 0...0.5) -> [UInt8] {
         guard let s0 = span(empty, width: w, height: h) else { return state }
-        let yMax = s0.top + Int(Double(s0.bottom - s0.top) * share)
+        let yMin = s0.top + Int(Double(s0.bottom - s0.top) * rows.lowerBound), yMax = s0.top + Int(Double(s0.bottom - s0.top) * rows.upperBound)
         func points(_ step: Int) -> [(x: Double, y: Double, rgb: (Int, Int, Int))] {
-            stride(from: s0.top, to: yMax, by: step).flatMap { y in stride(from: 0, to: w, by: step).compactMap { x -> (x: Double, y: Double, rgb: (Int, Int, Int))? in
+            stride(from: yMin, to: yMax, by: step).flatMap { y in stride(from: 0, to: w, by: step).compactMap { x -> (x: Double, y: Double, rgb: (Int, Int, Int))? in
                 let i = (y * w + x) * 4
                 return empty[i + 3] > 200 ? (Double(x), Double(y), (Int(empty[i]), Int(empty[i + 1]), Int(empty[i + 2]))) : nil
             } }
@@ -9225,6 +9128,177 @@ public enum PotStates {
         FrameKit.over(&out, width: w, scaled, at: Int(ox.rounded()), Int(oy.rounded()))
         return out
     }
+    /// A pot's parts, cut from three drawings as the studio's rigs hold them (research/pots.md: 18 rigs, body, lid and
+    /// treasure as separate pieces): its body, never redrawn; its lid; its treasure — one heap that rises out of its mouth —
+    /// and the treasure in front of it, which spills only in the last states. A pile round a base (the Blitz vault, a piggy
+    /// bank) is drawn per state instead, as that rig's pile sprites are: sunk into its floor, a pile was sliced flat.
+    public struct Parts {
+        public var body: [UInt8]           // State0 without its lid; under the lid, the open pot's mouth
+        public var lid: [UInt8]?           // State0's own lid pixels, in place
+        public var heap: [UInt8]           // behind the front lip
+        public var front: [UInt8]          // in front of the body: the spill over its lip
+        public var lip: [Int]              // per column, the row the heap goes in behind the front lip
+        public var rise: Int               // how far the drawn heap stands above where the lid rests, in px
+        public let width: Int, height: Int
+    }
+    /// How much of the drawn heap shows at each state, 0…1, by the rigs' rise (88 Drums, Jewel of Alexandria, Cauldron
+    /// Cash: hidden, a glint, peeking, mounded, high, overflowing).
+    public static func shown(_ k: Int) -> Double { rise[min(max(k, 0), 5)] / rise[levels] }
+    /// The treasure in `full`, the same pot drawn heaped (laid on `base` already): its pixels that differ from `base`,
+    /// cleared of the hairlines and specks a redraw leaves on an unchanged body — whole pieces only.
+    static func treasure(_ full: [UInt8], base: [UInt8], width w: Int, height h: Int, whole: Bool = true) -> [Bool] {
+        var m = [Bool](repeating: false, count: w * h)
+        for i in 0..<(w * h) where full[i * 4 + 3] > 128 {
+            let d = abs(Int(full[i * 4]) - Int(base[i * 4])) + abs(Int(full[i * 4 + 1]) - Int(base[i * 4 + 1])) + abs(Int(full[i * 4 + 2]) - Int(base[i * 4 + 2]))
+            m[i] = base[i * 4 + 3] <= 128 || d > 90
+        }
+        func step(_ m: [Bool], keep: Bool) -> [Bool] {      // erode (keep = all neighbours set) or dilate (any)
+            var o = m
+            for y in 1..<(h - 1) { for x in 1..<(w - 1) {
+                let i = y * w + x, n = [m[i - 1], m[i + 1], m[i - w], m[i + w]]
+                o[i] = keep ? (m[i] && !n.contains(false)) : (m[i] || n.contains(true))
+            } }
+            return o
+        }
+        // Opened twice (hairlines go), closed twice (the gaps between pieces fill), then specks under 0.05% of the canvas dropped.
+        m = step(step(step(step(m, keep: true), keep: true), keep: false), keep: false)
+        m = step(step(step(step(m, keep: false), keep: false), keep: true), keep: true)
+        var label = [Int](repeating: 0, count: w * h), sizes = [0]
+        for start in 0..<(w * h) where m[start] && label[start] == 0 {
+            var stack = [start], n = 0
+            label[start] = sizes.count
+            while let i = stack.popLast() {
+                n += 1
+                let x = i % w, y = i / w
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] where nx >= 0 && nx < w && ny >= 0 && ny < h {
+                    let j = ny * w + nx
+                    if m[j] && label[j] == 0 { label[j] = sizes.count; stack.append(j) }
+                }
+            }
+            sizes.append(n)
+        }
+        let least = w * h / 2000
+        var t = (0..<(w * h)).map { label[$0] > 0 && sizes[label[$0]] >= least }
+        guard whole else { return t }
+        // Whole pieces: grown a little and their insides filled, so a gold coin on a gold pot — which differs from the pot
+        // only at its rim and shading — is taken whole, not as an outline.
+        for _ in 0..<4 { t = step(t, keep: false) }
+        var outside = [Bool](repeating: false, count: w * h), stack: [Int] = []
+        for x in 0..<w { stack += [x, (h - 1) * w + x] }
+        for y in 0..<h { stack += [y * w, y * w + w - 1] }
+        while let i = stack.popLast() {
+            guard !outside[i], !t[i] else { continue }
+            outside[i] = true
+            let x = i % w, y = i / w
+            if x > 0 { stack.append(i - 1) }; if x < w - 1 { stack.append(i + 1) }; if y > 0 { stack.append(i - w) }; if y < h - 1 { stack.append(i + w) }
+        }
+        return (0..<(w * h)).map { !outside[$0] && full[$0 * 4 + 3] > 128 }
+    }
+    /// A state drawn whole (a safe's, a piggy bank's) with its body put back exactly: State0's own pixels wherever the
+    /// drawing has nothing new on it, so the body never drifts from state to state.
+    public static func restored(_ state: [UInt8], body: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        let t = treasure(state, base: body, width: w, height: h)
+        var out = state
+        for i in 0..<(w * h) where body[i * 4 + 3] > 128 && !t[i] { for c in 0..<4 { out[i * 4 + c] = body[i * 4 + c] } }
+        return out
+    }
+    /// The front lip a heap goes in behind, per column: where the heap's first run from the top meets the body below it,
+    /// fitted with one smooth curve (a mouth's front edge is an arc or a straight edge) and carried flat past its ends.
+    static func lip(treasure t: [Bool], base: [UInt8], width w: Int, height h: Int) -> [Int]? {
+        var pts: [(x: Double, y: Double)] = []
+        for x in 0..<w {
+            guard let top = (0..<h).first(where: { t[$0 * w + x] }) else { continue }
+            var y = top
+            while y < h && t[y * w + x] { y += 1 }
+            if y < h, base[(y * w + x) * 4 + 3] > 128 { pts.append((Double(x), Double(y))) }
+        }
+        guard pts.count >= w / 20 else { return nil }
+        // y = a + b·x + c·x², least squares, twice — the second time without the points the first fit missed by over 3%.
+        func fit(_ p: [(x: Double, y: Double)]) -> (Double, Double, Double)? {
+            var s = [Double](repeating: 0, count: 7)
+            for q in p { let u = q.x / Double(w); s[0] += 1; s[1] += u; s[2] += u * u; s[3] += u * u * u; s[4] += u * u * u * u; s[5] += q.y; s[6] += q.y * u }
+            let s7 = p.reduce(0) { $0 + $1.y * ($1.x / Double(w)) * ($1.x / Double(w)) }
+            let m = [[s[0], s[1], s[2], s[5]], [s[1], s[2], s[3], s[6]], [s[2], s[3], s[4], s7]]
+            func det(_ a: [[Double]]) -> Double { a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]) }
+            let a = m.map { Array($0.prefix(3)) }, d = det(a)
+            guard abs(d) > 1e-12 else { return nil }
+            func col(_ c: Int) -> [[Double]] { a.enumerated().map { r in r.element.enumerated().map { $0.offset == c ? m[r.offset][3] : $0.element } } }
+            return (det(col(0)) / d, det(col(1)) / d, det(col(2)) / d)
+        }
+        // Spill pouring over the lip carries a column's run on down: kept only the points near the most common row first.
+        let ys = pts.map(\.y).sorted(), mid = ys[ys.count / 2]
+        let near = pts.filter { abs($0.y - mid) < 0.06 * Double(h) }
+        guard near.count >= w / 20, var f = fit(near) else { return nil }
+        let kept = near.filter { q in let u = q.x / Double(w); return abs(f.0 + f.1 * u + f.2 * u * u - q.y) < 0.03 * Double(h) }
+        if kept.count >= w / 20, let g = fit(kept) { f = g }
+        let x0 = Int(kept.first?.x ?? pts.first!.x), x1 = Int(kept.last?.x ?? pts.last!.x)
+        return (0..<w).map { x in let u = Double(min(max(x, x0), x1)) / Double(w); return min(h, max(0, Int((f.0 + f.1 * u + f.2 * u * u).rounded()))) }
+    }
+    /// The parts, from State0 (`empty`), the open pot (`open`, nil for one without a lid) and the pot heaped full (`full`),
+    /// all on one canvas — `open` and `full` laid on `empty` here, by the body below its rim. Nil when the treasure cannot
+    /// be told from the pot.
+    public static func parts(empty: [UInt8], open: [UInt8]?, full: [UInt8], lid: [UInt8]?, width w: Int, height h: Int) -> Parts? {
+        let o = open.map { matched($0, to: empty, width: w, height: h, rows: 0.45...1) }
+        // The body: State0 wherever its lid is not; under its lid, the open pot's mouth.
+        var body = lid.map { withoutLid(empty, lid: $0) } ?? empty
+        if let lid, let o { for i in 0..<(w * h) where lid[i * 4 + 3] > 128 && body[i * 4 + 3] <= 128 { for c in 0..<4 { body[i * 4 + c] = o[i * 4 + c] } } }
+        let base = o ?? empty
+        let f = matched(full, to: base, width: w, height: h, rows: 0.45...1)
+        let t = treasure(f, base: base, width: w, height: h)
+        guard t.contains(true), let l = lip(treasure: treasure(f, base: base, width: w, height: h, whole: false), base: base, width: w, height: h) else { return nil }
+        var heap = [UInt8](repeating: 0, count: w * h * 4), front = heap
+        for i in 0..<(w * h) where t[i] { for c in 0..<4 { if i / w < l[i % w] { heap[i * 4 + c] = f[i * 4 + c] } else { front[i * 4 + c] = f[i * 4 + c] } } }
+        // How far it stands above where the lid rests (or the lip, without one).
+        guard let tb = box(heap, width: w, height: h) else { return nil }
+        let rest = lid.flatMap { box($0, width: w, height: h) }.map { $0.y + $0.h } ?? (l.min() ?? h)
+        return Parts(body: body, lid: lid, heap: heap, front: front, lip: l, rise: max(0, rest - tb.y), width: w, height: h)
+    }
+    /// State `k` of the six, put together from the parts as the rigs move them: the heap sunk behind the front lip by what
+    /// is not shown yet, the spill only at State4 (one side) and State5 (all of it),
+    /// and the lid laid on what is under it with a soft shadow beneath. State0 is State0 itself.
+    public static func state(_ k: Int, of p: Parts) -> [UInt8] {
+        let w = p.width, h = p.height
+        var out = p.body
+        if k == 0 { if let lid = p.lid { LayerizeAssembly.over(&out, lid) }; return out }
+        let sink = Int((Double(p.rise) * (1 - shown(k))).rounded())
+        // The heap sunk into the mouth, hidden below the front lip.
+        var heap = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 0..<(h - sink) { for x in 0..<w {
+            let i = (y * w + x) * 4
+            guard p.heap[i + 3] > 0, y + sink < p.lip[x] else { continue }
+            for c in 0..<4 { heap[((y + sink) * w + x) * 4 + c] = p.heap[i + c] }
+        } }
+        LayerizeAssembly.over(&out, heap)
+        if k >= levels - 1 {
+            // The spill: at State4 the side with more of it, at State5 all of it.
+            var spill = p.front
+            if k == levels - 1 {
+                var left = 0, right = 0
+                for i in 0..<(w * h) where p.front[i * 4 + 3] > 128 { if i % w < w / 2 { left += 1 } else { right += 1 } }
+                for i in 0..<(w * h) where (i % w < w / 2) != (left >= right) { spill[i * 4 + 3] = 0 }
+            }
+            LayerizeAssembly.over(&out, spill)
+        }
+        guard let lid = p.lid, let laid = placeLid(on: out, lid: lid, width: w, height: h, state: k) else { return out }
+        return shaded(laid.px, under: laid.lid, width: w, height: h)
+    }
+    /// A soft shadow cast by a lid on what is just under it: darker at its edge, gone a tenth of the lid's height below.
+    static func shaded(_ px: [UInt8], under lid: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        guard let l = box(lid, width: w, height: h) else { return px }
+        var out = px
+        let reach = max(3, l.h / 10)
+        for x in l.x..<(l.x + l.w) {
+            guard let bottom = (l.y..<(l.y + l.h)).last(where: { lid[($0 * w + x) * 4 + 3] > 128 }) else { continue }
+            for d in 1...reach where bottom + d < h {
+                let i = ((bottom + d) * w + x) * 4
+                guard lid[i + 3] <= 128, out[i + 3] > 0 else { continue }
+                let k = 0.55 + 0.45 * Double(d) / Double(reach)
+                for c in 0..<3 { out[i + c] = UInt8(Double(out[i + c]) * k) }
+            }
+        }
+        return out
+    }
+
     /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas, by its foot's band — or, `top`, by its
     /// top's.
     public static func registered(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int, top: Bool = false) -> [UInt8] {
@@ -16149,7 +16223,7 @@ extension GDDAssetPrompts {
     static func potKindStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), kind: PotKind, level k: Int) -> String {
         let opening = kind.opening(k)
         return [
-            "Edit the attached image: it is the \(kind.noun) that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. Show the same \(kind.noun) at fill stage \(k) of 5: \(opening.isEmpty ? "" : opening + ", ")\(kind.treasure(k)) — the theme's own coins, gems or gold, as large, chunky pieces with smooth faces and a handful of bright highlights, never a glittering mass of tiny pieces. At a glance it must look clearly further along than the stage before.",
+            "Edit the attached image: it is the \(kind.noun) that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. Show the same \(kind.noun) at fill stage \(k) of 5: \(opening.isEmpty ? "" : opening + ", ")\(kind.treasure(k)) — this game's own riches as its theme and style call for them (gold coins, gems, gold bars, cash or the theme's own treasures), dozens of pieces each small against it — about a tenth of its width, never a few big ones — every piece solid with a smooth face and a soft highlight, no sparkle stars or glitter. At a glance it must look clearly further along than the stage before.",
             "Everything else stays exactly as it is: its shape, size, position, material, colour and ornament\(kind == .piggyBank ? "" : ", and its \(kind == .safe ? "door" : "lid") stays attached at its hinge — never taken away"). A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
@@ -16326,10 +16400,23 @@ extension GDDAssetPrompts {
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
     /// A pot as it looks with the Power Bet on, in the GDD's own words: an edit of its full state, so it swaps in place.
     /// A pot with its lid off, from State0 (attached): the same pot in the same place, its open mouth showing, empty.
-    static func potOpenBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+    static func potOpenBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), kind: PotKind = .jar) -> String {
         [
-            "Edit the attached image: it is a pot with its lid on, from a video slot game themed “\(theme.name)”. Show the same pot with its lid taken off and gone from the picture: its open mouth and rim showing, the inside of its mouth dark and empty. Everything else stays exactly as it is — the pot's shape, size, position, material, colour and ornament.",
+            "Edit the attached image: it is a \(kind.noun) with its lid on, from a video slot game themed “\(theme.name)”. Show the same \(kind.noun) with its lid taken off and gone from the picture: its open mouth and rim showing, the inside dark and empty. Everything else stays exactly as it is — the \(kind.noun)'s shape, size, position, material, colour and ornament.",
             "No lid anywhere in the picture, no treasure, text or anything else.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// The pot heaped full, an edit of it empty (attached): the one drawing its treasure is cut from (PotStates.parts) —
+    /// the states are this heap sunk back into it, so it is drawn once, as full as the last state shows it. The pieces are
+    /// small against the pot, as the shipped rigs' are (88 Drums' coins and Cauldron Cash's about a tenth of the pot's width,
+    /// Jewel of Alexandria's gems a twentieth): a few big ones made the pot look small (art director, 2026-10-05).
+    static func potFullBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), kind: PotKind, lidless: Bool) -> String {
+        let heap = "a great rounded heap of treasure filling its mouth and standing high above its rim — about a third of the \(kind.noun)'s height — more pieces spilling over the front of its rim and down its sides, and a few on the ground at its foot"
+        return [
+            "Edit the attached image: it is the \(kind.noun) that stands above the reels of a video slot game themed “\(theme.name)”, empty. Show the very same \(kind.noun) — the same shape, size, position, material, colour and ornament, not moved or redrawn — with \(heap). It must look large, rich and overflowing.",
+            "THE TREASURE: this game's own riches as its theme and style call for them — gold coins, gems, gold bars, cash or the theme's own treasures, in the colours and finish of the set (as the \(kind.noun) itself shows). Dozens and dozens of pieces, each small against the \(kind.noun) — about a tenth of its width, never a few big ones — piled naturally, overlapping, every piece solid with a smooth face and a soft highlight: no sparkle stars, glitter, flares or rays.",
+            lidless ? "Nothing on top of it but the treasure; no text, no glow cloud or burst." : "No lid — it stays off and out of the picture; nothing on top but the treasure; no text, no glow cloud or burst.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -16337,36 +16424,6 @@ extension GDDAssetPrompts {
         [
             "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, full. Show the same pot as it looks while the game's Power Bet is on, as the game's design says: “\(look)”",
             "The pot keeps exactly its shape, size, position and ornament: only what that sentence describes changes. Anything it puts behind the pot stays behind it, inside the picture. A calm, still pose: no burst, rays, explosion or flying pieces. No text, lettering or numbers.",
-            backdropLine(backing),
-        ].joined(separator: "\n\n")
-    }
-    /// A pot's fill state `k`, grown from state k−1 (attached, with the new treasure laid on it as a flat grey heap
-    /// to the height PotStates.rise sets): the heap painted as more of the same treasure, nothing else changed.
-    /// A pot's state with its lid laid in the template by code (PotStates.placeLid): the treasure painted up under and round
-    /// it so it sits naturally — the lid itself kept exactly where it is.
-    static func potLidStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
-        [
-            (k > 1 ? "Image 2 is the same pot at the stage before, for its treasure's look only — the same coins and gems, their colours and size. " : "")
-            + "Edit the \(k > 1 ? "first" : "") attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k) of 5. Its lid is shown exactly where it rests at this stage, lifted by the treasure beneath it: keep the lid exactly as it is — its shape, size, position, angle, material and ornament.",
-            k == 1
-                ? "Paint the first of its treasure — the theme's own coins, gems or gold, in the pot's own colours — glinting in the narrow gap between the lid and the rim, filling that gap solidly, with a soft warm glow spilling from it onto the lid's rim. Nothing of the background shows through between the lid and the pot."
-                : "The flat grey mound is the treasure that has risen under and round the lid: paint it as the pot's own treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure as before — heaped up to the grey's outline and pressing up against the lid's underside, so the lid truly rests on it: a soft contact shadow where the lid sits on the treasure, the treasure's warm glow lighting the lid's underside and rim, the heap filling the pot's mouth solidly. Nothing of the background shows through anywhere inside it.\(k == 4 ? " Where the grey runs over the rim on one side, the treasure spills over it there — coins tumbling a little way down the pot's side." : k >= 5 ? " Full to overflowing: where the grey runs down over the pot on both sides, coins and gems pour over the rim and tumble down its sides." : "")",
-            "The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces. The pot itself stays exactly as it is: its shape, size, position, material, colour and ornament. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
-            detailRules,
-            backdropLine(backing),
-        ].joined(separator: "\n\n")
-    }
-    static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int, lidOff: Bool = false) -> String {
-        let lid = ["", "still closed on its rim, the treasure only glinting in the seam beneath it", "lifted a little and tipped back, resting low behind the treasure",
-                   "tipped further back, resting behind the heap", "swung open, resting behind the heap", "thrown open, resting behind the heap"][k]
-        return [
-            (k == 1
-             ? "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty. Show it at fill stage 1 of 5: the first of its treasure — the theme's own coins, gems or gold in the pot's own colours — just showing at its mouth, no higher than its rim, and a soft glow beginning within in the pot's own colour — never the background's."
-             : "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == 4 ? ", the treasure beginning to spill: where the grey runs over the rim on one side, coins tumble a little way down the pot's side" : k >= 5 ? ", full to overflowing: where the grey runs down over the pot on both sides, coins and gems pour over the rim and tumble down its sides" : ""). At a glance it must look clearly fuller and livelier than the stage before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.")
-            + " The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces.",
-            (lidOff ? "Its lid is off — it is laid back on afterwards: draw no lid, cover or door, and none of one. "
-                    : "If the pot has a lid, cover or door, it is \(lid) — never raised up above the treasure, never taken away; a pot with no lid never gains one. ") + "Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
-            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -17194,8 +17251,8 @@ public enum Legibility {
     /// What to change, for the redraw, by what the piece is.
     static func advice(_ k: Kind, glints: Bool) -> String {
         switch k {
-        case .pot: glints ? " — the treasure in fewer, bigger coins and gems with smooth faces and only a handful of highlights; no sparkle stars"
-                          : " — the treasure in fewer, bigger pieces and the pot's ornament in a few bold raised shapes with smooth metal between them"
+        case .pot: glints ? " — every coin and gem with a smooth face and one soft highlight, not glittering; no sparkle stars — still dozens of small pieces"
+                          : " — the treasure's pieces smooth-faced and softly lit, the pot's ornament in bold raised shapes with smooth metal between them — still dozens of small pieces"
         case .button, .panel: " — a plain, bold frame with smooth surfaces: no sparkle stars, flares, lens glints or rows of tiny lights on it or at its ends"
         case .title, .message, .coin: " — letters with clean solid faces and no sparkle in or around them"
         default: " — fewer, bolder details and smooth surfaces, no sparkle stars or glitter"

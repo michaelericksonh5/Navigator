@@ -26422,46 +26422,92 @@ final class GDDToAssetsRun: ObservableObject {
                 try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
                 for k in 1...PotStates.levels { for sfx in [".png", "_rmbg.png"] { try? fm.moveItem(at: url(jar(i, k) + sfx), to: kept.appendingPathComponent(jar(i, k) + sfx)) } }
             }
-            // Its fill states, State1…State5, each grown from the one before on a grey heap laid in code to its height
-            // (PotStates.rise, the shipped rigs' back-loaded schedule): the treasure only ever rises, the last states
-            // still grow, and each is laid on State0's foot so the states swap in place. Judged for both, and at phone size.
+            // Its fill states, built as the studio's rigs are (research/pots.md, all 18): one body never redrawn, its lid one
+            // piece laid on the treasure, and the treasure one drawing — the pot heaped full — sunk back into its mouth (or its
+            // floor) by what each state does not show yet (PotStates.shown). Drawn whole each state, the body drifted, the
+            // treasure showed from State1 and the states had to be lined up after (2026-10-05). A safe's door is drawn per state.
             for i in 0..<total {
                 guard let e0 = load("\(jar(i, 0))_rmbg.png"), e0.w == 1024, e0.h == potH else { continue }
-                // Its lid, when it has one, as its own part (PotStates.lidName): Gemini says whether it has one, once; it is
-                // drawn alone once and laid on every state's treasure in code, so it is never lost and opens in steps.
-                let lidN = PotStates.lidName(pot: i, of: total), noLid = url("\(lidN).none")
+                // Its lid, when it has one, as its own part (PotStates.lidName): State0's own pixels the open pot no longer covers.
+                // A chest always has one; for a pot Gemini says, once.
+                let lidN = PotStates.lidName(pot: i, of: total), noLid = url("\(lidN).none"), openN = PotStates.openName(pot: i, of: total)
                 var lid = load("\(lidN)_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? $0.px : nil }
                 let statesToDraw = (1...PotStates.levels).contains { !has("\(jar(i, $0)).png") && wanted("\(jar(i, $0)).png") }
-                // An open pot drawn already: its lid taken from it again, free.
-                if kind == .jar, lid == nil, statesToDraw, let open = load("\(PotStates.openName(pot: i, of: total))_rmbg.png"), open.w == 1024, open.h == potH,
+                let lidded = kind == .jar || kind == .chest
+                if lidded, lid == nil, statesToDraw, let open = load("\(openN)_rmbg.png"), open.w == 1024, open.h == potH,
                    let l = PotStates.lidFrom(empty: e0.px, open: open.px, width: 1024, height: potH) {
                     write(FrameKit.onBacking(l, b), 1024, potH, "\(lidN).png"); write(l, 1024, potH, "\(lidN)_rmbg.png"); lid = l
                 }
-                if kind == .jar, lid == nil, statesToDraw, !fm.fileExists(atPath: noLid.path), let s0png = try? Data(contentsOf: url("\(jar(i, 0)).png")) {
-                    let r = H5GService.describe(prompt: "This is a pot drawn for a video slot game. Does it have a lid, cover or door sitting on top of it that could open? Answer with one word: yes or no.",
-                                                systemPrompt: nil, imagePNG: downsamplePNG(s0png, longEdge: 768) ?? s0png)
-                    cost += r.cost ?? 0
-                    if r.text?.lowercased().contains("yes") == true {
-                        // The pot drawn with its lid off; the lid is then State0's own pixels the open pot no longer covers.
-                        let openN = PotStates.openName(pot: i, of: total)
-                        if let px = paint(openN, prompt: GDDAssetPrompts.potOpenBrief(theme: theme, backing: (backing.name, b)), inputs: [s0png], w: 1024, h: potH, covered: nil) {
-                            let open = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
-                            if let l = PotStates.lidFrom(empty: e0.px, open: open, width: 1024, height: potH) {
-                                write(FrameKit.onBacking(open, b), 1024, potH, "\(openN).png"); write(open, 1024, potH, "\(openN)_rmbg.png")
-                                write(FrameKit.onBacking(l, b), 1024, potH, "\(lidN).png"); write(l, 1024, potH, "\(lidN)_rmbg.png"); lid = l
-                            } else { problems.append("pot \(i + 1)'s lid could not be told from the pot: its states are drawn with the lid as the model draws it") }
-                        }
-                    } else if r.text != nil { try? "no lid".write(to: noLid, atomically: true, encoding: .utf8) }
+                if lidded, lid == nil, statesToDraw, !fm.fileExists(atPath: noLid.path), let s0png = try? Data(contentsOf: url("\(jar(i, 0)).png")) {
+                    var hasLid = kind == .chest
+                    if !hasLid {
+                        let r = H5GService.describe(prompt: "This is a pot drawn for a video slot game. Does it have a lid, cover or door sitting on top of it that could open? Answer with one word: yes or no.",
+                                                    systemPrompt: nil, imagePNG: downsamplePNG(s0png, longEdge: 768) ?? s0png)
+                        cost += r.cost ?? 0
+                        hasLid = r.text?.lowercased().contains("yes") == true
+                        if r.text != nil && !hasLid { try? "no lid".write(to: noLid, atomically: true, encoding: .utf8) }
+                    }
+                    if hasLid, let px = paint(openN, prompt: GDDAssetPrompts.potOpenBrief(theme: theme, backing: (backing.name, b), kind: kind), inputs: [s0png], w: 1024, h: potH, covered: nil) {
+                        let open = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                        if let l = PotStates.lidFrom(empty: e0.px, open: open, width: 1024, height: potH) {
+                            write(FrameKit.onBacking(open, b), 1024, potH, "\(openN).png"); write(open, 1024, potH, "\(openN)_rmbg.png")
+                            write(FrameKit.onBacking(l, b), 1024, potH, "\(lidN).png"); write(l, 1024, potH, "\(lidN)_rmbg.png"); lid = l
+                        } else { problems.append("pot \(i + 1)'s lid could not be told from the \(kind.noun): Make Again ▸ Pot states") }
+                    }
                 }
-                // What the states grow from: the open pot when the lid is its own part (its mouth drawn, not a hole), else State0.
-                let body0 = lid == nil ? e0.px : (load("\(PotStates.openName(pot: i, of: total))_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? $0.px : nil } ?? PotStates.withoutLid(e0.px, lid: lid!))
-                // A lid resting on the treasure stands as far above it as it stood above the rim at State0, so the whole rises
-                // just as far as the treasure: the shipped rise holds for the treasure itself.
-                let cap = PotStates.maxRise
-                for k in 1...PotStates.levels where kind != .jar && !has("\(jar(i, k)).png") {
-                    // A chest, safe or piggy bank: a hinged lid or a door cannot be laid in code, so each state is an edit of
-                    // the one before, opened a step further by the shipped rigs' schedule (PotKind), and judged by Gemini
-                    // against it side by side: clearly further along, lid or door still on.
+                if lidded, statesToDraw {
+                    let open = lid == nil ? nil : load("\(openN)_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? $0.px : nil }
+                    let fullN = PotStates.fullName(pot: i, of: total)
+                    func cut(_ full: [UInt8]) -> PotStates.Parts? { PotStates.parts(empty: e0.px, open: open, full: full, lid: lid, width: 1024, height: potH) }
+                    var parts = load("\(fullN)_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? cut($0.px) : nil }
+                    if parts == nil, let from = png(FrameKit.onBacking(open ?? e0.px, b), 1024, potH), let s0 = PotStates.span(e0.px, width: 1024, height: potH) {
+                        let H0 = Double(s0.bottom - s0.top)
+                        // Judged as the states it makes: the treasure told from the pot, standing as high as the rigs' last state,
+                        // not hiding the pot, solid, inside the picture, and read at phone size as State5.
+                        let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
+                            guard let p = cut(FrameKit.keyed(px, backing: b, width: 1024, height: potH)) else {
+                                return (["the treasure could not be told from the \(kind.noun) — keep the \(kind.noun) exactly as it is, unmoved, the treasure heaped on it"], 3)
+                            }
+                            var out: [String] = [], x = 0.0
+                            let r = Double(p.rise) / H0
+                            if r < 0.18 { out.append("the heap is too low — it stands about a third of the \(kind.noun)'s height above its rim"); x += 1 }
+                            if r > 0.5 { out.append("the heap is too high — about a third of the \(kind.noun)'s height above its rim, no more"); x += 1 }
+                            let full = PotStates.state(PotStates.levels, of: p)
+                            var covered = 0, body = 0
+                            for j in 0..<(1024 * potH) where p.body[j * 4 + 3] > 128 { body += 1; if p.front[j * 4 + 3] > 128 { covered += 1 } }
+                            if Double(covered) > 0.4 * Double(max(1, body)) { out.append("the spill hides too much of the \(kind.noun) — it spills over the front of its rim and down its sides, the \(kind.noun) itself still clearly seen"); x += 1 }
+                            if PotStates.holeShare(full, width: 1024, height: potH, besides: e0.px) > 0.005 { out.append("the background shows through inside the treasure — every piece solid"); x += 1 }
+                            if PotStates.cutOff(full, width: 1024, height: potH) { out.append("it runs off the edge of the picture — all the treasure inside it"); x += 1 }
+                            if let m = Legibility.measure(full, width: 1024, height: potH, kind: .pot) { out += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
+                            return (out, x)
+                        }
+                        if let px = paint(fullN, prompt: GDDAssetPrompts.potFullBrief(theme: theme, backing: (backing.name, b), kind: kind, lidless: lid == nil),
+                                          inputs: [from], w: 1024, h: potH, covered: nil, judge: judge) {
+                            let keyed = FrameKit.keyed(px, backing: b, width: 1024, height: potH)
+                            write(FrameKit.onBacking(keyed, b), 1024, potH, "\(fullN).png"); write(keyed, 1024, potH, "\(fullN)_rmbg.png")
+                            parts = cut(keyed)
+                        }
+                    }
+                    if let parts {
+                        // The parts as the animators' rig holds them, and the six states from them (free).
+                        for (name, px) in [("body", parts.body), ("treasure", parts.heap), ("spill", parts.front)] {
+                            let n = PotStates.partName(name, pot: i, of: total)
+                            write(FrameKit.onBacking(px, b), 1024, potH, "\(n).png"); write(px, 1024, potH, "\(n)_rmbg.png")
+                        }
+                        for k in 1...PotStates.levels where !has("\(jar(i, k)).png") && wanted("\(jar(i, k)).png") {
+                            var px = PotStates.state(k, of: parts)
+                            FrameKit.despill(&px, width: 1024, height: potH, backing: b)
+                            write(FrameKit.onBacking(px, b), 1024, potH, "\(jar(i, k)).png"); write(px, 1024, potH, "\(jar(i, k))_rmbg.png")
+                        }
+                    } else if load("\(fullN)_rmbg.png") != nil {
+                        problems.append("pot \(i + 1): its treasure could not be told from the \(kind.noun) — Make Again ▸ Pot states")
+                    }
+                }
+                for k in 1...PotStates.levels where (kind == .safe || kind == .piggyBank) && !has("\(jar(i, k)).png") {
+                    // A safe or a piggy bank: a swinging door, or a pile round a base, cannot be built from flat parts, so each
+                    // state is an edit of the one before, as the studio's per-state safe and the Blitz vault's pile sprites were
+                    // drawn — opened or piled a step further by PotKind's schedule, judged by Gemini against it side by side, and
+                    // its body put back from State0 exactly (PotStates.restored), so it never drifts.
                     guard let prev = load("\(jar(i, k - 1))_rmbg.png"), prev.w == 1024, prev.h == potH,
                           let prevPNG = png(FrameKit.onBacking(prev.px, b), 1024, potH) else { break }
                     let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
@@ -26487,59 +26533,8 @@ final class GDDToAssetsRun: ObservableObject {
                     }
                     guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
                                          inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge) else { break }
-                    var laid = PotStates.laid(FrameKit.keyed(px, backing: b, width: 1024, height: potH), on: e0.px, width: 1024, height: potH, by: kind.anchor)
-                    // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
-                    FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
-                    write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
-                }
-                for k in 1...PotStates.levels where kind == .jar && !has("\(jar(i, k)).png") {
-                    // A pot whose lid is its own part: each state from the open pot, the heap to the schedule's height and the
-                    // lid laid on it — GPT lifts what it is given a little, and grown from each other the overshoot compounded
-                    // (37% by State5, 2026-10-05); the state before attached only for the treasure's look. Without a lid part:
-                    // grown from the state before, as the heap alone holds its height.
-                    let prevDrawn = k == 1 ? nil : load("\(jar(i, k - 1))_rmbg.png")
-                    if k > 1 && prevDrawn == nil { break }
-                    let prevBody = lid != nil || k == 1 ? body0 : prevDrawn!.px
-                    guard var tplPx = PotStates.heaped(previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap,
-                                                       after: lid != nil ? PotStates.rise[k - 1] : nil,
-                                                       mouth: lid.flatMap { PotStates.mouth(ofLid: $0, width: 1024, height: potH) }) else { break }
-                    if let lid {
-                        guard let placed = PotStates.placeLid(on: tplPx, lid: lid, width: 1024, height: potH, state: k) else { break }
-                        tplPx = placed.px
-                    }
-                    guard let tpl = png(FrameKit.onBacking(tplPx, b), 1024, potH) else { break }
-                    let reference = lid != nil && k > 1 ? (try? Data(contentsOf: url("\(jar(i, k - 1)).png"))).map { downsamplePNG($0, longEdge: 1024) ?? $0 } : nil
-                    let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
-                        let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
-                        var p: [String] = []
-                        if lid != nil {
-                            // The lid still on (asked of Gemini: GPT redraws it a little each time, so its pixels do not match),
-                            // and the whole risen past the state before, no further than the shipped rigs.
-                            if let shown = png(FrameKit.onBacking(laid, b), 1024, potH) {
-                                let r = H5GService.describe(prompt: "Is there a lid sitting on top of this pot (resting on it or on the treasure in it)? Answer with one word: yes or no.",
-                                                            systemPrompt: nil, imagePNG: downsamplePNG(shown, longEdge: 512) ?? shown)
-                                cost += r.cost ?? 0
-                                if r.text?.lowercased().contains("no") == true { p.append("the lid was taken away — the lid stays on, resting on the treasure, exactly as shown") }
-                            }
-                            if let s0 = PotStates.span(e0.px, width: 1024, height: potH), let sk = PotStates.span(laid, width: 1024, height: potH),
-                               let sp = PotStates.span(prevDrawn?.px ?? e0.px, width: 1024, height: potH) {
-                                let H0 = Double(s0.bottom - s0.top), r = Double(s0.top - sk.top) / H0, rp = Double(s0.top - sp.top) / H0
-                                if r > PotStates.maxRise + 0.04 { p.append(String(format: "too high: its top stands %.0f%% of the pot's height above the empty pot's — at most %.0f%%: the treasure only as high as the grey, the lid resting on it", r * 100, PotStates.maxRise * 100)) }
-                                if k > 1 && r < rp + 0.02 { p.append(String(format: "it did not rise: its top stands %.0f%% above the empty pot's, the stage before %.0f%%", r * 100, rp * 100)) }
-                            }
-                        } else {
-                            p += PotStates.growthProblems(laid, previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap)
-                        }
-                        var x = Double(p.count)
-                        if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure and the gap under the lid solid"); x += 1 }
-                        if PotStates.cutOff(laid, width: 1024, height: potH) { p.append("it runs off the edge of the picture — the pot and all its treasure inside it"); x += 1 }
-                        if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
-                        return (p, x)
-                    }
-                    let prompt = lid != nil ? GDDAssetPrompts.potLidStateBrief(theme: theme, backing: (backing.name, b), level: k)
-                                            : GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k)
-                    guard let px = paint(jar(i, k), prompt: prompt, inputs: [tpl] + (reference.map { [$0] } ?? []), w: 1024, h: potH, covered: nil, judge: judge) else { break }
-                    var laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    var laid = PotStates.restored(PotStates.laid(FrameKit.keyed(px, backing: b, width: 1024, height: potH), on: e0.px, width: 1024, height: potH, by: kind.anchor),
+                                                  body: e0.px, width: 1024, height: potH)
                     // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
                     FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
                     write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
@@ -26552,15 +26547,16 @@ final class GDDToAssetsRun: ObservableObject {
                         write(FrameKit.keyed(px, backing: b, width: 1024, height: potH), 1024, potH, "\(n)_rmbg.png")
                     }
                 }
-                // Each state laid on State0, so a swap in game does not jump (PotStates): free, and a state
-                // already in place is left as it is.
-                for n in (1...PotStates.levels).map({ jar(i, $0) }) + [PotStates.boostedName(pot: i, of: total)] {
+                // What is drawn whole — a safe's or a piggy bank's states, the boosted look — laid on State0, so a swap in game does not jump
+                // (PotStates): free, and one already in place is left as it is. Built states are in place by construction.
+                for n in (lidded ? [] : (1...PotStates.levels).map({ jar(i, $0) })) + [PotStates.boostedName(pot: i, of: total)] {
                     guard let s = load("\(n)_rmbg.png"), let e = load("\(jar(i, 0))_rmbg.png") else { continue }
                     guard e.w == s.w, e.h == s.h else {
                         problems.append("\(n) was drawn before pots had room above them: Make Again ▸ Pot States")
                         continue
                     }
-                    let laid = PotStates.laid(s.px, on: e.px, width: s.w, height: s.h, by: kind.anchor)
+                    var laid = PotStates.laid(s.px, on: e.px, width: s.w, height: s.h, by: kind.anchor)
+                    if n != PotStates.boostedName(pot: i, of: total) { laid = PotStates.restored(laid, body: e.px, width: s.w, height: s.h) }
                     guard laid != s.px else { continue }
                     write(FrameKit.onBacking(laid, b), s.w, s.h, "\(n).png")
                     write(laid, s.w, s.h, "\(n)_rmbg.png")

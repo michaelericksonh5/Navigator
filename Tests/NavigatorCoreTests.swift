@@ -13725,34 +13725,60 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertEqual(tones?.count, 3)
         XCTAssertNil(WheelLabel.palette(fromTitle: title(face: RGB8(60, 30, 90)), width: w, height: h))
     }
-    // The pot's states: heaped to the shipped rigs' back-loaded heights, and a state that does not rise is caught.
-    func testPotsGrowOnTheShippedSchedule() {
-        let w = 100, h = 125
-        var pot = [UInt8](repeating: 0, count: w * h * 4)
-        for y in 45..<125 { for x in 20..<80 { pot[(y * w + x) * 4 + 3] = 255 } }         // State0: rows 45…124
-        XCTAssertEqual(PotStates.rise.count, PotStates.levels + 1)
-        XCTAssertEqual(PotStates.rise, PotStates.rise.sorted())
-        XCTAssertGreaterThan(PotStates.rise[5] - PotStates.rise[3], PotStates.rise[5] * 0.35)    // shipped: about half the rise after State3
-        let t3 = PotStates.template(previous: pot, empty: pot, width: w, height: h, state: 3, backing: RGB8(255, 0, 255))!
-        let crown = (0..<h).first { y in (0..<w).contains { t3[(y * w + $0) * 4] != 255 || t3[(y * w + $0) * 4 + 2] != 255 } }!
-        XCTAssertEqual(Double(45 - crown) / 79, PotStates.crown(3, after: 0, room: 1), accuracy: 0.03)
-        // A state drawn higher than planned: the next still rises a step the eye sees, within the room left.
-        XCTAssertGreaterThanOrEqual(PotStates.crown(2, after: 0.16, room: 0.5) - 0.16, 0.04)
-        XCTAssertLessThanOrEqual(PotStates.crown(5, after: 0.45, room: 0.5), 0.5)
-        XCTAssertFalse(PotStates.growthProblems(pot, previous: pot, empty: pot, width: w, height: h, state: 3).isEmpty)  // no rise: caught
+    // The six states built as the rigs build them: one body never redrawn, the lid laid on the treasure, the heap sunk into
+    // the mouth by what each state does not show yet, the spill only at State4 (one side) and State5 (both).
+    func testPotStatesAreBuiltFromParts() {
+        let w = 120, h = 160
+        func fill(_ px: inout [UInt8], _ xs: Range<Int>, _ ys: Range<Int>, _ c: (UInt8, UInt8, UInt8)) {
+            for y in ys { for x in xs { let i = (y * w + x) * 4; px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = 255 } }
+        }
+        var open = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 80..<150 { for x in 30..<90 { fill(&open, x..<(x + 1), y..<(y + 1), (x / 5 + y / 5) % 2 == 0 ? (200, 160, 40) : (150, 110, 30)) } }  // the body, ornamented
+        fill(&open, 35..<85, 80..<90, (30, 20, 10))              // its mouth, dark inside
+        var lid = [UInt8](repeating: 0, count: w * h * 4)
+        fill(&lid, 32..<88, 70..<88, (190, 30, 40))
+        var empty = open
+        LayerizeAssembly.over(&empty, lid)
+        var full = open
+        fill(&full, 35..<85, 50..<90, (250, 230, 60))            // the heap above the lip
+        fill(&full, 85..<95, 90..<120, (250, 230, 60))           // spill down the right
+        fill(&full, 25..<35, 100..<112, (250, 230, 60))          // a little down the left
+        let parts = PotStates.parts(empty: empty, open: open, full: full, lid: lid, width: w, height: h)!
+        XCTAssertEqual(Double(parts.lip[60]), 90, accuracy: 1)
+        let states = (0...5).map { PotStates.state($0, of: parts) }
+        XCTAssertEqual(states[0], empty)
+        func gold(_ px: [UInt8], _ x: Int, _ y: Int) -> Bool { let i = (y * w + x) * 4; return px[i + 3] > 128 && px[i] > 240 && px[i + 1] > 220 }
+        // The body never changes where nothing lies on it.
+        for s in states { XCTAssertEqual(Array(s[((140 * w + 60) * 4)..<((140 * w + 60) * 4 + 4)]), Array(open[((140 * w + 60) * 4)..<((140 * w + 60) * 4 + 4)])) }
+        // The heap rises state by state, hidden at State0 and highest at State5, as drawn.
+        let tops = states.map { s in (0..<h).first { y in (36..<84).contains { gold(s, $0, y) } } ?? h }
+        XCTAssertEqual(tops[0], h)
+        XCTAssertEqual(tops.dropFirst().map { $0 }, tops.dropFirst().sorted(by: >))
+        XCTAssertLessThan(tops[5], tops[1])
+        // Spill: none before State4, one side at State4, both at State5.
+        XCTAssertTrue((1...3).allSatisfy { !gold(states[$0], 90, 110) && !gold(states[$0], 28, 105) })
+        XCTAssertTrue(gold(states[4], 90, 110) && !gold(states[4], 28, 105))
+        XCTAssertTrue(gold(states[5], 90, 110) && gold(states[5], 28, 105))
+        let shown = (0...5).map { PotStates.shown($0) }
+        XCTAssertEqual(shown, shown.sorted())
     }
-    // The full pot is held to the shipped rigs' height; stage 1 lays no heap over a closed lid and need not rise yet.
-    func testPotsStayWithinTheShippedHeight() {
-        XCTAssertLessThanOrEqual(PotStates.crown(5, after: 0.25, room: PotStates.maxRise), PotStates.maxRise)
-        let w = 100, h = 150
-        var pot = [UInt8](repeating: 0, count: w * h * 4)
-        for y in 70..<150 { for x in 20..<80 { pot[(y * w + x) * 4 + 3] = 255 } }
-        let t1 = PotStates.template(previous: pot, empty: pot, width: w, height: h, state: 1, backing: RGB8(255, 0, 255))!
-        XCTAssertEqual(t1, FrameKit.onBacking(pot, RGB8(255, 0, 255)))                   // no grey at stage 1
-        XCTAssertTrue(PotStates.growthProblems(pot, previous: pot, empty: pot, width: w, height: h, state: 1).isEmpty)
-        var tall = pot
-        for y in 30..<70 { for x in 30..<70 { tall[(y * w + x) * 4 + 3] = 255 } }          // 50% above at stage 2: too high
-        XCTAssertTrue(PotStates.growthProblems(tall, previous: pot, empty: pot, width: w, height: h, state: 2).contains { $0.hasPrefix("too high") })
+    // A state drawn whole gets its body back exactly where nothing new lies on it — even gold coins on a gold body.
+    func testADrawnStateGetsItsBodyBack() {
+        let w = 120, h = 160
+        func fill(_ px: inout [UInt8], _ xs: Range<Int>, _ ys: Range<Int>, _ c: (UInt8, UInt8, UInt8)) {
+            for y in ys { for x in xs { let i = (y * w + x) * 4; px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = 255 } }
+        }
+        var body = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 60..<150 { for x in 40..<80 { fill(&body, x..<(x + 1), y..<(y + 1), (x / 5 + y / 5) % 2 == 0 ? (220, 170, 50) : (170, 120, 40)) } }
+        var drawn = body
+        for i in stride(from: 0, to: drawn.count, by: 4) where drawn[i + 3] > 0 { drawn[i] = drawn[i] &- 12 }   // a redraw's drift
+        // A gold coin over the body: its rim dark, its face nearly the body's own gold.
+        fill(&drawn, 50..<74, 120..<144, (60, 40, 10)); fill(&drawn, 53..<71, 123..<141, (222, 172, 52))
+        let out = PotStates.restored(drawn, body: body, width: w, height: h)
+        let i = (80 * w + 60) * 4
+        XCTAssertEqual(Array(out[i..<(i + 4)]), Array(body[i..<(i + 4)]))                    // drift undone
+        let j = (132 * w + 62) * 4
+        XCTAssertEqual(Array(out[j..<(j + 4)]), [222, 172, 52, 255])                         // the coin kept whole
     }
     // Words read in their own language where the recognizer reads it; amounts set in a cut number font.
     func testWordsAndAmountsAreReadBack() {
