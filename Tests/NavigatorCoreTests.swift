@@ -13761,6 +13761,19 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertNotNil(Localized.readers("fi"))
         XCTAssertNil(Localized.readers("el"))
         XCTAssertTrue(Localized.continueWord.allSatisfy { $0.lang == "el" || Localized.readers($0.lang) != nil })
+        // The shipped strips' 24 languages; the dictionary's word wins, cleaned of invisible marks and in capitals.
+        XCTAssertEqual(Localized.shipped.count, 24)
+        XCTAssertTrue(["pt-br", "zh-hk", "bg", "sk"].allSatisfy { l in Localized.shipped.contains { $0.lang == l } })
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("loc-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? #"{"dictionary": {"continue": "‏vidare", "spin": "snurra"}}"#.write(to: dir.appendingPathComponent("en_to_sv_dictionary.json"), atomically: true, encoding: .utf8)
+        try? #"{"dictionary": {"continue": "devam et"}}"#.write(to: dir.appendingPathComponent("en_to_tr_dictionary.json"), atomically: true, encoding: .utf8)
+        try? #"{"dictionary": {"continue": "seguir"}}"#.write(to: dir.appendingPathComponent("en_to_pt-BR_dictionary.json"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(Localized.word("continue", lang: "sv", in: dir), "VIDARE")
+        XCTAssertEqual(Localized.word("Continue", lang: "tr", in: dir), "DEVAM ET")
+        XCTAssertEqual(Localized.word("continue", lang: "pt-br", in: dir), "SEGUIR")
+        XCTAssertNil(Localized.word("continue", lang: "fi", in: dir))
+        XCTAssertNil(Localized.word("bet", lang: "sv", in: dir))
         let cellW = 40, h = 50, n = NumberFont.glyphs.count
         var strip = [UInt8](repeating: 0, count: cellW * n * h * 4)
         for i in 0..<n { for y in 5..<45 { for x in (i * cellW + 10)..<(i * cellW + 30) { strip[(y * cellW * n + x) * 4 + 3] = 255 } } }

@@ -9436,21 +9436,38 @@ public enum Composites {
 /// The intro button's word in each language the studio's intro splashes ship with (`continue-asset-txt-<lang>`,
 /// about twenty in 9 of 10 games). Off unless asked: a studio localization tool may make these already.
 public enum Localized {
-    public static let continueWord: [(lang: String, word: String)] = [
-        ("en", "CONTINUE"), ("de", "WEITER"), ("es", "CONTINUAR"), ("fr", "CONTINUER"), ("it", "CONTINUA"), ("pt", "CONTINUAR"),
-        ("nl", "DOORGAAN"), ("sv", "FORTSÄTT"), ("da", "FORTSÆT"), ("no", "FORTSETT"), ("fi", "JATKA"), ("pl", "DALEJ"),
-        ("cs", "POKRAČOVAT"), ("ro", "CONTINUĂ"), ("hu", "TOVÁBB"), ("el", "ΣΥΝΕΧΕΙΑ"), ("tr", "DEVAM"), ("ru", "ПРОДОЛЖИТЬ"),
-        ("ja", "続ける"), ("ko", "계속"), ("zh", "继续"),
+    /// The languages of the studio's CONTINUE strips (`continue-asset-txt-<lang>`: these 24 in about 250 shipped games,
+    /// 2026-10-05), each with its word as the localization team's dictionary had it that day.
+    static let shipped: [(lang: String, word: String)] = [
+        ("en", "CONTINUE"), ("fr", "CONTINUER"), ("es", "CONTINUAR"), ("pt-br", "CONTINUAR"), ("pt", "CONTINUAR"), ("de", "FORTFAHREN"),
+        ("it", "CONTINUA"), ("tr", "DEVAM ET"), ("ru", "ПРОДОЛЖИТЬ"), ("zh-cn", "继续"), ("zh-hk", "繼續"), ("da", "FORTSÆT"),
+        ("sv", "FORTSÄTT"), ("sk", "POKRAČOVAŤ"), ("ro", "CONTINUARE"), ("pl", "KONTYNUUJ"), ("no", "FORTSETT"), ("fi", "JATKA"),
+        ("el", "ΣΥΝΕΧΕΙΑ"), ("cs", "POKRAČOVAT"), ("bg", "ПРОДЪЛЖЕТЕ"), ("nl", "DOORGAAN"), ("ko", "계속하기"), ("ja", "続ける"),
     ]
+    /// The localization team's dictionaries on this Mac (`en_to_<code>_dictionary.json`, copied from their depot): what
+    /// they say wins, so a word they correct is lettered as corrected; a language without one keeps its word above.
+    public static var dictionaries = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Navigator/Localization")
+    public static var continueWord: [(lang: String, word: String)] { shipped.map { ($0.lang, word("continue", lang: $0.lang) ?? $0.word) } }
+    /// An English term as the dictionary for `lang` gives it, in capitals as it is lettered; nil without one.
+    public static func word(_ english: String, lang: String, in folder: URL = dictionaries) -> String? {
+        let parts = lang.split(separator: "-")
+        let code = ([parts.first?.lowercased() ?? ""] + parts.dropFirst().map { $0.uppercased() }).joined(separator: "-")
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent("en_to_\(code)_dictionary.json")),
+              let terms = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["dictionary"] as? [String: Any],
+              let t = terms[english.lowercased()] as? String else { return nil }
+        // Invisible marks dropped: the Swedish dictionary has a right-to-left mark before FORTSÄTT (2026-10-05).
+        let clean = String(String.UnicodeScalarView(t.unicodeScalars.filter { $0.properties.generalCategory != .format })).trimmingCharacters(in: .whitespaces)
+        return clean.isEmpty ? nil : clean.uppercased(with: Locale(identifier: code))
+    }
     public static func name(_ lang: String) -> String { "shared_intro_continue-asset-txt-\(lang)" }
-    /// The text recognizer to read a language's word with (Apple Vision's, accurate, macOS 14: 18 of the 21); a Latin
-    /// script it has no recognizer for (Finnish, Hungarian) read as Latin; nil for one it cannot read at all (Greek).
+    /// The text recognizer to read a language's word with (Apple Vision's, accurate, macOS 14): its own, or one for the
+    /// same letters (Bulgarian read as Russian, Slovak as Czech, Finnish as Latin); nil for one it cannot read (Greek).
     public static func readers(_ lang: String) -> [String]? {
-        let own = ["en": "en-US", "de": "de-DE", "es": "es-ES", "fr": "fr-FR", "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "sv": "sv-SE",
-                   "da": "da-DK", "no": "nb-NO", "pl": "pl-PL", "cs": "cs-CZ", "ro": "ro-RO", "tr": "tr-TR", "ru": "ru-RU",
-                   "ja": "ja-JP", "ko": "ko-KR", "zh": "zh-Hans"]
+        let own = ["en": "en-US", "de": "de-DE", "es": "es-ES", "fr": "fr-FR", "it": "it-IT", "pt": "pt-BR", "pt-br": "pt-BR", "nl": "nl-NL",
+                   "sv": "sv-SE", "da": "da-DK", "no": "nb-NO", "pl": "pl-PL", "cs": "cs-CZ", "sk": "cs-CZ", "ro": "ro-RO", "tr": "tr-TR",
+                   "ru": "ru-RU", "bg": "ru-RU", "ja": "ja-JP", "ko": "ko-KR", "zh-cn": "zh-Hans", "zh-hk": "zh-Hant"]
         if let v = own[lang] { return [v] }
-        return ["fi", "hu"].contains(lang) ? ["en-US", "de-DE"] : nil
+        return lang == "fi" ? ["en-US", "de-DE"] : nil
     }
 }
 
