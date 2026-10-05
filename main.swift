@@ -21979,6 +21979,37 @@ if let flag = CommandLine.arguments.firstIndex(of: "--typed-snapshot"), flag + 1
     app.run()
 }
 
+// Free, and only with NAVIGATOR_NO_PAID_CALLS=1:  Navigator --plan-folder-test <parent folder>
+// A typed set planned in the editor (subjects filled in, as a plan fills them): its set folder is made in <parent> at once,
+// with its plan and .navset saved, before anything is drawn.
+if let flag = CommandLine.arguments.firstIndex(of: "--plan-folder-test"), flag + 1 < CommandLine.arguments.count {
+    guard PaidCalls.disabled else { print("Refusing: set NAVIGATOR_NO_PAID_CALLS=1"); exit(2) }
+    let parent = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        GDDLibrary.outputParent = parent          // this test binary's own preferences, not the app's
+        let run = GDDToAssetsRun()
+        run.loadManual(GDDSymbolSetRules.typicalSet, gameName: "Plan Folder Test", sheet: GameSheet(), size: "2K", symbolAspect: "1:1",
+                       backgroundAspect: "3:4", backgroundSize: "4K")
+        run.theme = GameTheme(name: "Test Theme", category: "test", look: "a test look")
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 980, height: 900), styleMask: [.borderless], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: GDDToAssetsSheet(run: run, initialDocument: nil, startTyped: true, onClose: {}))
+        w.orderFrontRegardless()
+        print("BEFORE PLAN: folder \(run.lastFolder?.lastPathComponent ?? "none")")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            run.jobs = run.jobs.map { var j = $0; j.subject = "a subject written for this test"; return j }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                let f = run.lastFolder
+                print("AFTER PLAN: folder \(f?.lastPathComponent ?? "none")")
+                print("FILES: \((f.flatMap { try? FileManager.default.contentsOfDirectory(atPath: $0.path) } ?? []).sorted().joined(separator: ", "))")
+                print("STATUS: \(run.status)"); exit(0)
+            }
+        }
+    } }
+    app.run()
+}
+
 if let flag = CommandLine.arguments.firstIndex(of: "--gdd-snapshot"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
     // The window can start a paid style read on its own; it is only ever shown here with every paid call blocked.
@@ -25239,8 +25270,9 @@ final class GDDToAssetsRun: ObservableObject {
         fixedProblems = fixed
         // The backing was chosen BEFORE the design, and the design kept its colours off the
         // symbols — so it stays; re-choosing it now could land on a colour the set uses.
-        // A new design is a new run: its anchor has to be drawn again before the rest.
-        lastFolder = nil
+        // A new design is a new run: its anchor has to be drawn again before the rest — in a new folder, unless nothing has
+        // been drawn into this one yet (a plan's own folder, made when it was planned): then the new plan takes it over.
+        if let f = lastFolder, Self.hasPictures(f) { lastFolder = nil }
         let remaining = designProblems
         log.write("plan.tsv", GDDRunLog.planTable(applied.jobs))
         log.write("ideas-and-prompts.md", ideasAndPrompts())
@@ -27757,6 +27789,16 @@ final class GDDToAssetsRun: ObservableObject {
 
 extension GDDToAssetsRun {
     /// navigator-set.json in `folder`: what the set needs to be reopened, revised and handed on.
+    /// A folder with any of the set's pictures in it yet.
+    static func hasPictures(_ folder: URL) -> Bool {
+        ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []).contains { $0.hasSuffix(".png") || $0.hasSuffix(".jpg") }
+    }
+    /// The set's folder, from planning on: everything after is drawn into it, and its plan is saved there now.
+    func adoptFolder(_ folder: URL) {
+        lastFolder = folder
+        writeManifest(to: folder)
+    }
+
     func writeManifest(to folder: URL) {
         guard let theme else { return }
         var m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
@@ -29836,6 +29878,10 @@ struct GDDToAssetsSheet: View {
         }
         // Saved as it goes, a moment after each change, once the set has its folder: the editor and the plan.
         .onChange(of: currentSession) { _, s in save(s) }
+        // The set's folder made as soon as there is a plan — so the plan, paid for, is saved and opens again — or as soon as
+        // a place for it is chosen; one with nothing drawn into it yet follows a new choice of place.
+        .onChange(of: run.planned) { _, planned in if planned { placeSet() } }
+        .onChange(of: outParent) { _, _ in placeSet() }
         .onChange(of: run.jobs.map { $0.subject + "|" + $0.silhouette }) { _, _ in save(currentSession) }
         .onDisappear { saveWork?.perform() }
         .sheet(item: $picking) { which in
@@ -29876,6 +29922,24 @@ struct GDDToAssetsSheet: View {
             content().padding(.leading, 26)
         }
         .id("step\(n)")
+    }
+
+    /// The set's folder for a plan that has none, in the chosen place; an empty one moved when the place changes.
+    private func placeSet() {
+        guard !restoring, run.planned, let parent = outParent else { return }
+        if let f = run.lastFolder {
+            guard f.deletingLastPathComponent().standardizedFileURL != parent.standardizedFileURL, !GDDToAssetsRun.hasPictures(f) else { return }
+            let existing = Set((try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? [])
+            let dst = parent.appendingPathComponent(GDDOutputRules.uniqueName(f.lastPathComponent, existing: existing))
+            guard (try? FileManager.default.moveItem(at: f, to: dst)) != nil else { return }
+            run.adoptFolder(dst)
+            run.status = "The set’s folder moved to \(parent.lastPathComponent)."
+            return
+        }
+        guard let f = makeRunFolder() else { return }
+        run.editorSession = currentSession
+        run.adoptFolder(f)
+        run.status = "The plan is saved in “\(f.lastPathComponent)” — open it again any time from its .navset file."
     }
 
     /// The editor as it stands, as a set saves it (SetSession).
@@ -31457,12 +31521,12 @@ struct GDDToAssetsSheet: View {
             let a = NSAlert()
             a.messageText = "Generate \(n) image\(n == 1 ? "" : "s")?"
             a.informativeText = String(
-                format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into a new folder “%@” as they arrive.",
-                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, runFolderName)
+                format: "Each one is a paid %@ generation.\n\nEstimated cost: ~$%.2f, on top of what this window has already spent.\n\nThey are saved into %@ as they arrive.",
+                NanoBananaModel.byFlag(run.modelFlag).name, run.estimate, run.lastFolder.map { "the set’s folder “\($0.lastPathComponent)”" } ?? "a new folder “\(runFolderName)”")
             a.addButton(withTitle: "Generate"); a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
-        guard let out = makeRunFolder() else { return }
+        guard let out = run.lastFolder ?? makeRunFolder() else { return }
         run.generate(into: out, removeBackground: removeBG, separateFrames: separateFrames) { urls in
             // The set opens in the asset browser to look at, approve and change — not in Finder.
             if !urls.isEmpty { GDDReviewWindow.open(run: run, folder: out) }
@@ -31483,7 +31547,7 @@ struct GDDToAssetsSheet: View {
             run.generate(into: folder, removeBackground: removeBG, only: run.anchorGroupIDs) { _ in }
             return
         }
-        guard let out = makeRunFolder() else { return }
+        guard let out = run.lastFolder ?? makeRunFolder() else { return }
         run.generate(into: out, removeBackground: removeBG, only: run.anchorGroupIDs) { _ in }
     }
 }
