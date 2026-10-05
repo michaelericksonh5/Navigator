@@ -9603,6 +9603,713 @@ public enum Composites {
 
 /// The intro button's word in each language the studio's intro splashes ship with (`continue-asset-txt-<lang>`,
 /// about twenty in 9 of 10 games). Off unless asked: a studio localization tool may make these already.
+/// The words Navigator letters into game art, in the studio's shipped languages, as the localization team's dictionaries
+/// give them — written here by Tools/ArtWords/art_words.py. Only these words ship with Navigator; the dictionaries
+/// themselves stay private (this repository and its releases are public). A word not here for a language has no approved
+/// translation: it is flagged, never guessed (2026-10-05).
+public enum ArtWords {
+    // ART WORDS BEGIN — generated, do not edit by hand
+    static let tsv = """
+    continue	fr	continuer
+    play now!	fr	jouez maintenant !
+    power bet	fr	Power Bet
+    on	fr	on
+    off	fr	off
+    total win	fr	gain total
+    one more chance	fr	encore une chance
+    jackpots	fr	jackpots
+    bonus games	fr	parties bonus
+    multiplier	fr	multiplicateur
+    credits	fr	crédits
+    wilds	fr	wilds
+    respins	fr	relances
+    collect	fr	amasser
+    wild	fr	wild
+    scatter	fr	scatter
+    bonus	fr	bonus
+    super bonus	fr	super bonifié
+    jackpot	fr	jackpot
+    awarded!	fr	accordées !
+    grand	fr	Grand
+    mega	fr	Méga
+    major	fr	Majeur
+    minor	fr	Mineur
+    mini	fr	Mini
+    you've won the grand jackpot	fr	vous avez gagné le jackpot grand
+    you've won the major jackpot	fr	vous avez gagné le jackpot majeur
+    you've won the minor jackpot	fr	vous avez gagné le jackpot mineur
+    you've won the mini jackpot	fr	vous avez gagné le jackpot mini
+    big win!	fr	gros gain !
+    super win!	fr	super gain !
+    mega win!	fr	méga gain !
+    huge win!	fr	énorme gain !
+    ultra win!	fr	ultra gain !
+    loot link	fr	Loot Link
+    super boost	fr	super bonification
+    jackpot	fr	jackpot
+    continue	es	continuar
+    play now!	es	¡juega ahora!
+    power bet	es	Power Bet
+    on	es	activado
+    off	es	desactivado
+    total win	es	ganancia total
+    one more chance	es	¡una oportunidad más
+    bonus games	es	partidas bonus
+    multiplier	es	multiplicador
+    credits	es	créditos
+    wilds	es	comodines
+    respins	es	re-spins
+    collect	es	cobrar
+    wild	es	comodín
+    scatter	es	Scatter
+    bonus	es	bonus
+    jackpot	es	bote
+    awarded!	es	¡otorgadas!
+    grand	es	máximo
+    major	es	mayor
+    minor	es	menor
+    mini	es	mini
+    you've won the grand jackpot	es	has ganado el bote máximo
+    you've won the major jackpot	es	has ganado el bote mayor
+    you've won the minor jackpot	es	has ganado el bote menor
+    you've won the mini jackpot	es	has ganado el minibote
+    big win!	es	¡gran premio!
+    super win!	es	¡superpremio!
+    mega win!	es	¡megapremio!
+    huge win!	es	¡premio enorme!
+    ultra win!	es	¡ultrapremio!
+    loot link	es	Loot Link
+    super boost	es	superpotenciador
+    jackpot	es	bote
+    continue	pt-br	continuar
+    play now!	pt-br	jogue agora!
+    power bet	pt-br	Power Bet
+    on	pt-br	ativado
+    off	pt-br	desativado
+    total win	pt-br	ganho total
+    one more chance	pt-br	mais uma chance
+    jackpots	pt-br	jackpots
+    bonus games	pt-br	jogos bônus
+    multiplier	pt-br	multiplicador
+    credits	pt-br	créditos
+    wilds	pt-br	Wilds
+    respins	pt-br	novas rodadas
+    wild	pt-br	Wild
+    scatter	pt-br	Scatter
+    bonus	pt-br	bônus
+    jackpot	pt-br	jackpot
+    awarded!	pt-br	concedidos!
+    grand	pt-br	Supremo
+    mega	pt-br	Mega
+    major	pt-br	Maior
+    minor	pt-br	Menor
+    mini	pt-br	Mini
+    you've won the grand jackpot	pt-br	você ganhou o jackpot supremo
+    you've won the mega jackpot	pt-br	você ganhou o mega jackpot
+    you've won the major jackpot	pt-br	você ganhou o jackpot maior
+    you've won the minor jackpot	pt-br	você ganhou o jackpot menor
+    you've won the mini jackpot	pt-br	você ganhou o jackpot mini
+    big win!	pt-br	grande ganho!
+    super win!	pt-br	super ganho!
+    mega win!	pt-br	mega ganho!
+    huge win!	pt-br	ganho enorme!
+    ultra win!	pt-br	ultra ganho!
+    loot link	pt-br	Loot Link
+    super boost	pt-br	super-reforço
+    jackpot	pt-br	jackpot
+    continue	pt	continuar
+    power bet	pt	Power Bet
+    multiplier	pt	multiplicador
+    wild	pt	wild
+    scatter	pt	scatter
+    bonus	pt	bónus
+    jackpot	pt	jackpot
+    loot link	pt	Loot Link
+    jackpot	pt	jackpot
+    continue	de	FORTFAHREN
+    play now!	de	JETZT SPIELEN!
+    power bet	de	Power Bet
+    on	de	EIN
+    off	de	AUS
+    total win	de	GESAMTGEWINN
+    one more chance	de	NOCH EINE CHANCE
+    bonus games	de	BONUSSPIELE
+    multiplier	de	MULTIPLIKATOR
+    wild	de	WILD
+    scatter	de	SCATTER
+    bonus	de	Bonus
+    jackpot	de	CASHPOT
+    awarded!	de	ERHALTEN!
+    grand	de	GROSSER
+    mega	de	MEGA
+    major	de	GRÖSSERER
+    minor	de	KLEINER
+    mini	de	MINI
+    you've won the grand jackpot	de	Sie haben den GROSSEN CASHPOT gewonnen
+    you've won the mega jackpot	de	Sie haben den MEGA-CASHPOT gewonnen
+    you've won the major jackpot	de	Sie haben den GRÖSSEREN CASHPOT gewonnen
+    you've won the minor jackpot	de	Sie haben den KLEINEN CASHPOT gewonnen
+    you've won the mini jackpot	de	Sie haben den MINI-CASHPOT gewonnen
+    big win!	de	GROSSER GEWINN!
+    super win!	de	SUPERGEWINN!
+    ultra win!	de	ULTRAGEWINN!
+    loot link	de	Loot Link
+    jackpot	de	CASHPOT
+    continue	it	continua
+    play now!	it	gioca ora!
+    power bet	it	Power Bet
+    on	it	attivo
+    off	it	disattivato
+    total win	it	vincita totale
+    one more chance	it	un'altra chance
+    jackpots	it	jackpot
+    bonus games	it	giochi bonus
+    multiplier	it	moltiplicatore
+    credits	it	crediti
+    wilds	it	wild
+    respins	it	giri extra
+    collect	it	incassa
+    wild	it	wild
+    scatter	it	scatter
+    bonus	it	bonus
+    jackpot	it	jackpot
+    awarded!	it	assegnati!
+    grand	it	grande
+    mega	it	mega
+    major	it	maggiore
+    minor	it	minore
+    mini	it	mini
+    you've won the grand jackpot	it	hai vinto il jackpot grande
+    you've won the mega jackpot	it	hai vinto il mega jackpot
+    you've won the major jackpot	it	hai vinto il jackpot maggiore
+    you've won the minor jackpot	it	hai vinto il jackpot minore
+    you've won the mini jackpot	it	hai vinto il mini jackpot
+    big win!	it	grande vincita!
+    super win!	it	super vincita!
+    mega win!	it	mega vincita!
+    huge win!	it	vincita enorme!
+    ultra win!	it	ultra vincita!
+    loot link	it	Loot Link
+    super boost	it	super potenziamento
+    jackpot	it	jackpot
+    continue	tr	DEVAM ET
+    play now!	tr	HEMEN OYNA!
+    power bet	tr	Power Bet
+    on	tr	AÇIK
+    off	tr	KAPALI
+    total win	tr	TOPLAM KAZANÇ
+    one more chance	tr	BİR ŞANS DAHA
+    bonus games	tr	ÜCRETSİZ OYUNLAR
+    multiplier	tr	ÇARPAN
+    wild	tr	WILD
+    scatter	tr	SCATTER
+    bonus	tr	Bonus
+    jackpot	tr	Jackpot
+    awarded!	tr	VERİLDİ!
+    grand	tr	DEV
+    mega	tr	MEGA
+    major	tr	BÜYÜK
+    minor	tr	KÜÇÜK
+    mini	tr	MİNİ
+    you've won the grand jackpot	tr	DEV JACKPOT kazandın
+    you've won the mega jackpot	tr	MEGA JACKPOT kazandın
+    you've won the major jackpot	tr	BÜYÜK JACKPOT kazandın
+    you've won the minor jackpot	tr	KÜÇÜK JACKPOT kazandın
+    you've won the mini jackpot	tr	MİNİ JACKPOT kazandın
+    big win!	tr	BÜYÜK KAZANÇ!
+    super win!	tr	SÜPER KAZANÇ!
+    ultra win!	tr	ULTRA KAZANÇ!
+    loot link	tr	Loot Link
+    jackpot	tr	Jackpot
+    continue	ru	ПРОДОЛЖИТЬ
+    play now!	ru	ИГРАТЬ СЕЙЧАС!
+    power bet	ru	Power Bet
+    on	ru	ВКЛ.
+    off	ru	ВЫКЛ.
+    total win	ru	ОБЩИЙ ВЫИГРЫШ
+    one more chance	ru	ЕЩЕ ОДИН ШАНС
+    bonus games	ru	БОНУСНЫЕ ИГРЫ
+    multiplier	ru	Множитель
+    wild	ru	WILD
+    scatter	ru	SCATTER
+    bonus	ru	Бонус
+    jackpot	ru	JACKPOT
+    awarded!	ru	ПОЛУЧЕНЫ!
+    grand	ru	ОГРОМНЫЙ
+    mega	ru	МЕГА
+    major	ru	БОЛЬШОЙ
+    minor	ru	МАЛЫЙ
+    mini	ru	МИНИ
+    you've won the grand jackpot	ru	Вы выиграли ОГРОМНЫЙ JACKPOT
+    you've won the mega jackpot	ru	Вы выиграли МЕГА JACKPOT
+    you've won the major jackpot	ru	Вы выиграли БОЛЬШОЙ JACKPOT
+    you've won the minor jackpot	ru	Вы выиграли МАЛЫЙ JACKPOT
+    you've won the mini jackpot	ru	Вы выиграли МИНИ JACKPOT
+    big win!	ru	БОЛЬШОЙ ВЫИГРЫШ!
+    super win!	ru	СУПЕРВЫИГРЫШ!
+    ultra win!	ru	УЛЬТРАВЫИГРЫШ!
+    loot link	ru	Loot Link
+    jackpot	ru	JACKPOT
+    continue	zh-cn	继续
+    play now!	zh-cn	开始游戏！
+    power bet	zh-cn	Power Bet
+    on	zh-cn	开
+    off	zh-cn	关
+    total win	zh-cn	派彩总数
+    one more chance	zh-cn	还有一次机会
+    bonus games	zh-cn	奖励游戏
+    multiplier	zh-cn	倍数
+    wild	zh-cn	百搭
+    scatter	zh-cn	分散
+    bonus	zh-cn	奖赏
+    jackpot	zh-cn	Jackpot
+    awarded!	zh-cn	已奖励！
+    grand	zh-cn	豪华
+    mega	zh-cn	无敌
+    major	zh-cn	大
+    minor	zh-cn	小
+    mini	zh-cn	迷你
+    you've won the grand jackpot	zh-cn	您赢得了豪华头奖
+    you've won the mega jackpot	zh-cn	您赢得了无敌头奖
+    you've won the major jackpot	zh-cn	您赢得了大头奖
+    you've won the minor jackpot	zh-cn	您赢得了小头奖
+    you've won the mini jackpot	zh-cn	您赢得了迷你头奖
+    big win!	zh-cn	幸运大奖！
+    super win!	zh-cn	超级大奖！
+    ultra win!	zh-cn	终极大奖！
+    loot link	zh-cn	Loot Link
+    jackpot	zh-cn	Jackpot
+    continue	zh-hk	繼續
+    play now!	zh-hk	現在就玩!
+    power bet	zh-hk	Power Bet
+    on	zh-hk	開
+    off	zh-hk	關
+    total win	zh-hk	總派彩
+    one more chance	zh-hk	還有一次機會
+    bonus games	zh-hk	獎勵遊戲
+    multiplier	zh-hk	倍數
+    wild	zh-hk	百搭
+    scatter	zh-hk	分散
+    bonus	zh-hk	獎勵
+    jackpot	zh-hk	彩金
+    awarded!	zh-hk	獎勵！
+    grand	zh-hk	超級
+    mega	zh-hk	重量級
+    major	zh-hk	特大
+    minor	zh-hk	小型
+    mini	zh-hk	迷你
+    you've won the grand jackpot	zh-hk	您已贏得超級頭獎
+    you've won the mega jackpot	zh-hk	您已贏得重量級頭獎
+    you've won the major jackpot	zh-hk	您已贏得特大頭獎
+    you've won the minor jackpot	zh-hk	您已贏得小型頭獎
+    you've won the mini jackpot	zh-hk	您已贏得迷你頭獎
+    big win!	zh-hk	大贏家！
+    super win!	zh-hk	超級贏家！
+    ultra win!	zh-hk	終極贏家！
+    loot link	zh-hk	Loot Link
+    jackpot	zh-hk	彩金
+    continue	da	FORTSÆT
+    play now!	da	SPIL NU!
+    power bet	da	Power Bet
+    on	da	AKTIVERET
+    off	da	FRA
+    total win	da	SAMLET GEVINST
+    one more chance	da	EN CHANCE TIL
+    bonus games	da	BONUSSPIL
+    multiplier	da	Multiplikator
+    wild	da	WILD
+    scatter	da	SCATTER
+    bonus	da	bonus
+    jackpot	da	Jackpot
+    awarded!	da	TILDELT!
+    grand	da	STØRST
+    mega	da	MEGA
+    major	da	STOR
+    minor	da	LILLE
+    mini	da	MINI
+    you've won the grand jackpot	da	Du har vundet den STØRSTE JACKPOT
+    you've won the mega jackpot	da	Du har vundet MEGAJACKPOTTEN
+    you've won the major jackpot	da	Du har vundet den STORE JACKPOT
+    you've won the minor jackpot	da	Du har vundet den LILLE JACKPOT
+    you've won the mini jackpot	da	Du har vundet MINIJACKPOTTEN
+    big win!	da	STOR GEVINST!
+    super win!	da	SUPERGEVINST!
+    ultra win!	da	ULTRA GEVINST!
+    loot link	da	Loot Link
+    jackpot	da	Jackpot
+    continue	sv	FORTSÄTT
+    play now!	sv	SPELA NU!
+    power bet	sv	Power Bet
+    on	sv	PÅ
+    off	sv	AV
+    total win	sv	TOTAL VINST
+    one more chance	sv	EN CHANS TILL
+    bonus games	sv	BONUSSPEL
+    multiplier	sv	multiplikator
+    wild	sv	WILD
+    scatter	sv	SCATTER
+    bonus	sv	bonus
+    jackpot	sv	jackpott
+    awarded!	sv	TILLDELATS!
+    grand	sv	STÖRSTA
+    mega	sv	MEGA
+    major	sv	STORA
+    minor	sv	LILLA
+    mini	sv	MINI
+    you've won the grand jackpot	sv	DU HAR VUNNIT DEN STÖRSTA JACKPOTTEN
+    you've won the mega jackpot	sv	DU HAR VUNNIT MEGA-JACKPOTTEN
+    you've won the major jackpot	sv	DU HAR VUNNIT DEN STORA JACKPOTTEN
+    you've won the minor jackpot	sv	DU HAR VUNNIT DEN LILLA JACKPOTTEN
+    you've won the mini jackpot	sv	DU HAR VUNNIT MINI-JACKPOTTEN
+    big win!	sv	STORVINST!
+    super win!	sv	SUPERVINST!
+    ultra win!	sv	ULTRAVINST!
+    loot link	sv	Loot Link
+    jackpot	sv	jackpott
+    continue	sk	POKRAČOVAŤ
+    play now!	sk	HRAŤ TERAZ!
+    power bet	sk	Power Bet
+    on	sk	ZAP
+    off	sk	VYP
+    total win	sk	CELKOVÁ VÝHRA
+    one more chance	sk	POSLEDNÁ ŠANCA
+    bonus games	sk	BONUSOVÉ HRY
+    multiplier	sk	Násobiteľ
+    wild	sk	WILD
+    scatter	sk	SCATTER
+    bonus	sk	Bonus
+    jackpot	sk	JACKPOT
+    awarded!	sk	SÚ UDELENÉ!
+    grand	sk	VEĽKOLEPÝ
+    mega	sk	MEGA
+    major	sk	VEĽKÝ
+    minor	sk	MALÝ
+    mini	sk	MINI
+    you've won the grand jackpot	sk	Vyhrali ste VEĽKOLEPÝ JACKPOT
+    you've won the mega jackpot	sk	Vyhrali ste MEGA JACKPOT
+    you've won the major jackpot	sk	Vyhrali ste VEĽKÝ JACKPOT
+    you've won the minor jackpot	sk	Vyhrali ste MALÝ JACKPOT
+    you've won the mini jackpot	sk	Vyhrali ste MINI JACKPOT
+    big win!	sk	VEĽKÁ VÝHRA!
+    super win!	sk	SUPER VÝHRA!
+    ultra win!	sk	ULTRA VÝHRA!
+    loot link	sk	Loot Link
+    jackpot	sk	JACKPOT
+    continue	ro	CONTINUARE
+    play now!	ro	JUCAȚI ACUM!
+    power bet	ro	Power Bet
+    on	ro	ACTIVAT
+    off	ro	OPRIT
+    total win	ro	CÂȘTIG TOTAL
+    one more chance	ro	ÎNCĂ O ȘANSĂ
+    bonus games	ro	JOCURI BONUS
+    multiplier	ro	Multiplicator
+    wild	ro	WILD
+    scatter	ro	SCATTER
+    bonus	ro	Bonus
+    jackpot	ro	Jackpot
+    awarded!	ro	ACORDATE!
+    grand	ro	GRANDIOS
+    mega	ro	MEGA
+    major	ro	MARE
+    minor	ro	MIC
+    mini	ro	MINI
+    you've won the grand jackpot	ro	Ați câștigat JACKPOTUL GRANDIOS
+    you've won the mega jackpot	ro	Ați câștigat JACKPOTUL MEGA
+    you've won the major jackpot	ro	Ați câștigat JACKPOTUL MARE
+    you've won the minor jackpot	ro	Ați câștigat JACKPOTUL MIC
+    you've won the mini jackpot	ro	Ați câștigat JACKPOTUL MINI
+    big win!	ro	CÂȘTIG MARE!
+    super win!	ro	SUPER CÂȘTIG!
+    ultra win!	ro	ULTRA CÂȘTIG!
+    loot link	ro	Loot Link
+    jackpot	ro	Jackpot
+    continue	pl	KONTYNUUJ
+    play now!	pl	ZAGRAJ TERAZ!
+    power bet	pl	Power Bet
+    on	pl	WŁĄCZ
+    off	pl	WYŁĄCZ
+    total win	pl	CAŁKOWITA WYGRANA
+    one more chance	pl	DODATKOWA SZANSA
+    bonus games	pl	DARMOWE GRY
+    multiplier	pl	Mnożnik
+    wild	pl	WILD
+    scatter	pl	SCATTER
+    bonus	pl	Bonus
+    jackpot	pl	JACKPOT
+    awarded!	pl	PRZYZNANO!
+    grand	pl	GRAND
+    mega	pl	MEGA
+    major	pl	MAJOR
+    minor	pl	MINOR
+    mini	pl	MINI
+    you've won the grand jackpot	pl	Wygrywasz GRAND JACKPOT
+    you've won the mega jackpot	pl	Wygrywasz MEGA JACKPOT
+    you've won the major jackpot	pl	Wygrywasz MAJOR JACKPOT
+    you've won the minor jackpot	pl	Wygrywasz MINOR JACKPOT
+    you've won the mini jackpot	pl	Wygrywasz MINI JACKPOT
+    big win!	pl	WIELKA WYGRANA!
+    super win!	pl	SUPERWYGRANA!
+    ultra win!	pl	ULTRAWYGRANA!
+    loot link	pl	Loot Link
+    jackpot	pl	JACKPOT
+    continue	no	FORTSETT
+    play now!	no	SPILL NÅ!
+    power bet	no	Power Bet
+    on	no	PÅ
+    off	no	AV
+    total win	no	TOTAL GEVINST
+    one more chance	no	ÉN SJANSE TIL
+    bonus games	no	BONUSSPILL
+    multiplier	no	Multiplikator
+    wild	no	WILD
+    scatter	no	SCATTER
+    bonus	no	Bonus
+    jackpot	no	Jackpot
+    awarded!	no	TILDELT!
+    grand	no	GRAND
+    mega	no	MEGA
+    major	no	MAJOR
+    minor	no	MINOR
+    mini	no	MINI
+    you've won the grand jackpot	no	Du har vunnet GRAND-JACKPOTEN
+    you've won the mega jackpot	no	Du har vunnet MEGA-JACKPOTEN
+    you've won the major jackpot	no	Du har vunnet MAJOR-JACKPOTEN
+    you've won the minor jackpot	no	Du har vunnet MINOR-JACKPOTEN
+    you've won the mini jackpot	no	Du har vunnet MINI-JACKPOTEN
+    big win!	no	STORGEVINST!
+    super win!	no	SUPERGEVINST!
+    ultra win!	no	ULTRAGEVINST!
+    loot link	no	Loot Link
+    jackpot	no	Jackpot
+    continue	fi	JATKA
+    play now!	fi	PELAA NYT!
+    power bet	fi	Power Bet
+    off	fi	POIS PÄÄLTÄ
+    total win	fi	KOKONAISVOITTO
+    one more chance	fi	VIELÄ YKSI MAHDOLLISUUS
+    bonus games	fi	BONUSPELEJÄ
+    multiplier	fi	kerroin
+    wild	fi	WILD
+    scatter	fi	SCATTER
+    bonus	fi	bonus
+    jackpot	fi	jättipotti
+    awarded!	fi	ANNETTU!
+    grand	fi	VALTAVA
+    mega	fi	MEGA
+    major	fi	SUURI
+    minor	fi	PIENI
+    mini	fi	MINI
+    you've won the grand jackpot	fi	Voitit VALTAVAN JACKPOTIN
+    you've won the mega jackpot	fi	Voitit MEGA-JACKPOTIN
+    you've won the major jackpot	fi	Voitit SUUREN JACKPOTIN
+    you've won the minor jackpot	fi	Voitit PIENEN JACKPOTIN
+    you've won the mini jackpot	fi	Voitit MINI-JACKPOTIN
+    big win!	fi	ISO VOITTO!
+    super win!	fi	SUPERVOITTO!
+    ultra win!	fi	ULTRAVOITTO!
+    loot link	fi	Loot Link
+    jackpot	fi	jättipotti
+    continue	el	ΣΥΝΕΧΕΙΑ
+    play now!	el	ΠΑΙΞΤΕ ΤΩΡΑ!
+    power bet	el	Power Bet
+    on	el	ΕΝΕΡΓΟ
+    off	el	ΑΝΕΝΕΡΓΟ
+    total win	el	ΣΥΝΟΛΙΚΟ ΚΕΡΔΟΣ
+    one more chance	el	ΑΛΛΗ ΜΙΑ ΕΥΚΑΙΡΙΑ
+    bonus games	el	ΠΑΙΧΝΙΔΙΑ ΜΠΟΝΟΥΣ
+    multiplier	el	Πολλαπλασιαστής
+    wild	el	WILD
+    scatter	el	SCATTER
+    bonus	el	μπόνους
+    jackpot	el	ΤΖΑΚΠΟΤ
+    awarded!	el	ΑΠΟΝΕΜΗΘΗΚΑΝ!
+    grand	el	ΜΕΓΑΛΕΙΩΔΕΣ
+    mega	el	ΜΕΓΑ
+    major	el	ΜΕΓΑΛΟ
+    minor	el	ΜΙΚΡΟ
+    mini	el	ΜΙΝΙ
+    you've won the grand jackpot	el	Κερδίσατε το ΜΕΓΑΛΕΙΩΔΕΣ ΤΖΑΚΠΟΤ
+    you've won the mega jackpot	el	Κερδίσατε το ΜΕΓΑ ΤΖΑΚΠΟΤ
+    you've won the major jackpot	el	Κερδίσατε το ΜΕΓΑΛΟ ΤΖΑΚΠΟΤ
+    you've won the minor jackpot	el	Κερδίσατε το ΜΙΚΡΟ ΤΖΑΚΠΟΤ
+    you've won the mini jackpot	el	Κερδίσατε το ΜΙΝΙ ΤΖΑΚΠΟΤ
+    big win!	el	ΜΕΓΑΛΟ ΚΕΡΔΟΣ!
+    super win!	el	ΣΟΥΠΕΡ ΚΕΡΔΟΣ!
+    ultra win!	el	ΥΠΕΡ-ΚΕΡΔΟΣ!
+    loot link	el	Loot Link
+    jackpot	el	ΤΖΑΚΠΟΤ
+    continue	cs	POKRAČOVAT
+    play now!	cs	ZAHRAJTE SI TEĎ!
+    power bet	cs	Power Bet
+    on	cs	ZAPNUTO
+    off	cs	VYPNUTO
+    total win	cs	CELKOVÁ VÝHRA
+    one more chance	cs	JEŠTĚ JEDNA ŠANCE
+    bonus games	cs	BONUSOVÉ HRY
+    multiplier	cs	Násobitel
+    wild	cs	WILD
+    scatter	cs	SCATTER
+    bonus	cs	Bonus
+    jackpot	cs	JACKPOT
+    awarded!	cs	ZÍSKALI JSTE!
+    grand	cs	OBROVSKÝ
+    mega	cs	MEGA
+    major	cs	VELKÝ
+    minor	cs	MALÝ
+    mini	cs	MINI
+    you've won the grand jackpot	cs	VYHRÁLI JSTE OBROVSKÝ JACKPOT
+    you've won the mega jackpot	cs	Vyhráli jste MEGA JACKPOT
+    you've won the major jackpot	cs	VYHRÁLI JSTE VELKÝ JACKPOT
+    you've won the minor jackpot	cs	Vyhráli jste MALÝ JACKPOT
+    you've won the mini jackpot	cs	Vyhráli jste MINI JACKPOT
+    big win!	cs	VELKÁ VÝHRA!
+    super win!	cs	SUPER VÝHRA!
+    ultra win!	cs	ULTRA VÝHRA!
+    loot link	cs	Loot Link
+    jackpot	cs	JACKPOT
+    continue	bg	ПРОДЪЛЖЕТЕ
+    play now!	bg	ИГРАЙТЕ СЕГА!
+    power bet	bg	Power Bet
+    on	bg	ВКЛ
+    off	bg	ИЗКЛ
+    total win	bg	ОБЩА ПЕЧАЛБА
+    one more chance	bg	ОЩЕ ЕДИН ШАНС
+    bonus games	bg	БОНУС ИГРИ
+    multiplier	bg	Множител
+    wild	bg	WILD
+    scatter	bg	SCATTER
+    bonus	bg	бонус
+    jackpot	bg	ДЖАКПОТ
+    awarded!	bg	НАГРАДЕНО!
+    grand	bg	ГЛАВЕН
+    mega	bg	МЕГА
+    major	bg	ГОЛЯМ
+    minor	bg	МАЛЪК
+    mini	bg	МИНИ
+    you've won the grand jackpot	bg	Спечелихте главния джакпот
+    you've won the mega jackpot	bg	Спечелихте мега джакпота
+    you've won the major jackpot	bg	Спечелихте големия джакпот
+    you've won the minor jackpot	bg	Спечелихте малкия джакпот
+    you've won the mini jackpot	bg	Спечелихте мини джакпота
+    big win!	bg	ГОЛЯМА ПЕЧАЛБА!
+    super win!	bg	СУПЕР ПЕЧАЛБА!
+    ultra win!	bg	СВРЪХ ПЕЧАЛБА!
+    loot link	bg	Loot Link
+    jackpot	bg	ДЖАКПОТ
+    continue	nl	DOORGAAN
+    play now!	nl	SPEEL NU!
+    power bet	nl	Power Bet
+    on	nl	AAN
+    off	nl	UIT
+    total win	nl	TOTALE WINST
+    one more chance	nl	NOG ÉÉN KANS
+    bonus games	nl	BONUSSPELLEN
+    multiplier	nl	Vermenigvuldiger
+    wild	nl	WILD
+    scatter	nl	SCATTER
+    bonus	nl	Bonus
+    jackpot	nl	JACKPOT
+    awarded!	nl	TOEGEKEND!
+    grand	nl	ENORM
+    mega	nl	MEGA
+    major	nl	GROOT
+    minor	nl	KLEIN
+    mini	nl	MINI
+    you've won the grand jackpot	nl	Je hebt de ENORME JACKPOT gewonnen
+    you've won the mega jackpot	nl	Je hebt de MEGA JACKPOT gewonnen
+    you've won the major jackpot	nl	Je hebt de GROTE JACKPOT gewonnen
+    you've won the minor jackpot	nl	Je hebt de KLEINE JACKPOT gewonnen
+    you've won the mini jackpot	nl	Je hebt de MINI JACKPOT gewonnen
+    big win!	nl	GROTE WINST!
+    super win!	nl	SUPERWINST!
+    ultra win!	nl	ULTRAWINST!
+    loot link	nl	Loot Link
+    jackpot	nl	JACKPOT
+    continue	ko	계속하기
+    play now!	ko	지금 플레이하세요!
+    power bet	ko	Power Bet
+    on	ko	켜짐
+    off	ko	꺼짐
+    total win	ko	총 당첨
+    one more chance	ko	한 번 더
+    bonus games	ko	무료 게임
+    multiplier	ko	멀티플라이어
+    wild	ko	와일드
+    scatter	ko	스캐터
+    bonus	ko	보너스
+    jackpot	ko	잭팟
+    awarded!	ko	지급되었습니다!
+    grand	ko	그랜드
+    mega	ko	메가
+    major	ko	메이저
+    minor	ko	마이너
+    mini	ko	미니
+    you've won the grand jackpot	ko	그랜드 잭팟에 당첨되었습니다
+    you've won the mega jackpot	ko	메가 잭팟에 당첨되었습니다
+    you've won the major jackpot	ko	메이저 잭팟에 당첨되었습니다
+    you've won the minor jackpot	ko	마이너 잭팟에 당첨되었습니다
+    you've won the mini jackpot	ko	미니 잭팟에 당첨되었습니다
+    big win!	ko	큰 승리!
+    super win!	ko	엄청난 승리!
+    ultra win!	ko	초대박 승리!
+    loot link	ko	Loot Link
+    jackpot	ko	잭팟
+    continue	ja	続ける
+    play now!	ja	今すぐプレイ！
+    power bet	ja	Power Bet
+    on	ja	オン
+    off	ja	オフ
+    total win	ja	賞金合計
+    one more chance	ja	もう一回チャンス
+    bonus games	ja	ボーナスゲーム
+    multiplier	ja	マルチプライヤー
+    wild	ja	ワイルド
+    scatter	ja	スキャッター
+    bonus	ja	ボーナス
+    jackpot	ja	ジャックポット
+    awarded!	ja	獲得！
+    grand	ja	グランド
+    mega	ja	メガ
+    major	ja	メジャー
+    minor	ja	マイナー
+    mini	ja	ミニ
+    you've won the grand jackpot	ja	グランドジャックポット獲得
+    you've won the mega jackpot	ja	メガジャックポット獲得
+    you've won the major jackpot	ja	メジャージャックポット獲得
+    you've won the minor jackpot	ja	マイナージャックポット獲得
+    you've won the mini jackpot	ja	ミニジャックポット獲得
+    big win!	ja	大当たり！
+    super win!	ja	スーパー大当たり！
+    ultra win!	ja	ウルトラ大当たり！
+    loot link	ja	Loot Link
+    jackpot	ja	ジャックポット
+    """
+    // ART WORDS END
+    static let table: [String: [String: String]] = {
+        var t: [String: [String: String]] = [:]
+        for line in tsv.split(separator: "\n") {
+            let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 3 else { continue }
+            t[f[0], default: [:]][f[1]] = f[2]
+        }
+        return t
+    }()
+    /// How an English art word is looked up: lower case, its lines and spaces run together.
+    static func key(_ english: String) -> String {
+        english.lowercased().components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+    }
+    /// An English art word in `lang` (a shipped code: fr, pt-br, zh-hk…), in capitals as it is lettered; English itself as
+    /// given; nil when the dictionaries have no approved word for it.
+    public static func word(_ english: String, lang: String) -> String? {
+        if lang == "en" { return english }
+        guard let w = table[key(english)]?[lang] else { return nil }
+        let parts = lang.split(separator: "-")
+        let code = ([parts.first?.lowercased() ?? ""] + parts.dropFirst().map { $0.uppercased() }).joined(separator: "-")
+        return w.uppercased(with: Locale(identifier: code))
+    }
+}
+
 public enum Localized {
     /// The languages of the studio's CONTINUE strips (`continue-asset-txt-<lang>`: these 24 in about 250 shipped games,
     /// 2026-10-05), each with its word as the localization team's dictionary had it that day.
@@ -9612,20 +10319,14 @@ public enum Localized {
         ("sv", "FORTSÄTT"), ("sk", "POKRAČOVAŤ"), ("ro", "CONTINUARE"), ("pl", "KONTYNUUJ"), ("no", "FORTSETT"), ("fi", "JATKA"),
         ("el", "ΣΥΝΕΧΕΙΑ"), ("cs", "POKRAČOVAT"), ("bg", "ПРОДЪЛЖЕТЕ"), ("nl", "DOORGAAN"), ("ko", "계속하기"), ("ja", "続ける"),
     ]
-    /// The localization team's dictionaries on this Mac (`en_to_<code>_dictionary.json`, copied from their depot): what
-    /// they say wins, so a word they correct is lettered as corrected; a language without one keeps its word above.
-    public static var dictionaries = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Navigator/Localization")
-    public static var continueWord: [(lang: String, word: String)] { shipped.map { ($0.lang, word("continue", lang: $0.lang) ?? $0.word) } }
-    /// An English term as the dictionary for `lang` gives it, in capitals as it is lettered; nil without one.
-    public static func word(_ english: String, lang: String, in folder: URL = dictionaries) -> String? {
-        let parts = lang.split(separator: "-")
-        let code = ([parts.first?.lowercased() ?? ""] + parts.dropFirst().map { $0.uppercased() }).joined(separator: "-")
-        guard let data = try? Data(contentsOf: folder.appendingPathComponent("en_to_\(code)_dictionary.json")),
-              let terms = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["dictionary"] as? [String: Any],
-              let t = terms[english.lowercased()] as? String else { return nil }
-        // Invisible marks dropped: the Swedish dictionary has a right-to-left mark before FORTSÄTT (2026-10-05).
-        let clean = String(String.UnicodeScalarView(t.unicodeScalars.filter { $0.properties.generalCategory != .format })).trimmingCharacters(in: .whitespaces)
-        return clean.isEmpty ? nil : clean.uppercased(with: Locale(identifier: code))
+    /// CONTINUE in each language, as the art-words table has it (ArtWords); a language it lacks keeps the word above.
+    public static var continueWord: [(lang: String, word: String)] { shipped.map { ($0.lang, ArtWords.word("CONTINUE", lang: $0.lang) ?? $0.word) } }
+    /// A language's name, for choosing which to localize into.
+    public static func languageName(_ lang: String) -> String {
+        ["en": "English", "fr": "French (Canada)", "es": "Spanish", "pt-br": "Portuguese (Brazil)", "pt": "Portuguese (Portugal)", "de": "German",
+         "it": "Italian", "tr": "Turkish", "ru": "Russian", "zh-cn": "Chinese (Simplified)", "zh-hk": "Chinese (Hong Kong)", "da": "Danish",
+         "sv": "Swedish", "sk": "Slovak", "ro": "Romanian", "pl": "Polish", "no": "Norwegian", "fi": "Finnish", "el": "Greek", "cs": "Czech",
+         "bg": "Bulgarian", "nl": "Dutch", "ko": "Korean", "ja": "Japanese"][lang] ?? lang
     }
     public static func name(_ lang: String) -> String { "shared_intro_continue-asset-txt-\(lang)" }
     /// The text recognizer to read a language's word with (Apple Vision's, accurate, macOS 14): its own, or one for the
