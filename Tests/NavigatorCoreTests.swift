@@ -13816,18 +13816,21 @@ final class PotLidTests: XCTestCase {
         var empty = [UInt8](repeating: 0, count: w * h * 4), lid = empty, body = empty
         rect(&empty, 20, 80, 100, 180); rect(&empty, 30, 60, 90, 80)              // a pot, its lid on top
         rect(&lid, 30, 60, 90, 80)
-        XCTAssertTrue(PotStates.isLid(lid, empty: empty, width: w, height: h))
+        // The lid is State0's own pixels the open pot (lid off, its rim showing) no longer covers.
+        var open = [UInt8](repeating: 0, count: w * h * 4); rect(&open, 20, 80, 100, 180)
+        let found = PotStates.lidFrom(empty: empty, open: open, width: w, height: h)!
+        XCTAssertEqual(found[(70 * w + 60) * 4 + 3], 255); XCTAssertEqual(found[(120 * w + 60) * 4 + 3], 0)
         rect(&body, 20, 80, 100, 180); rect(&body, 35, 50, 85, 80)               // treasure heaped above the rim
         let placed = PotStates.placeLid(on: body, lid: lid, width: w, height: h, state: 3)!
         let whole = placed.px
         let lidRows = (0..<h).filter { y in (0..<w).contains { x in whole[(y * w + x) * 4 + 3] > 128 && body[(y * w + x) * 4 + 3] <= 128 } }
-        XCTAssertEqual(PotStates.lidKept(whole, laid: placed.lid), 1)
-        XCTAssertEqual(PotStates.withoutLaidLid(whole, laid: placed.lid)[(45 * w + 60) * 4 + 3], 0)
+        XCTAssertGreaterThan(placed.lid.filter { $0 > 128 }.count, 0)
         XCTAssertLessThan(lidRows.last ?? h, 56)                                   // above the heap's top (50), touching it
         XCTAssertGreaterThan(lidRows.last ?? 0, 40)
         XCTAssertGreaterThan(PotStates.holeShare(body, width: w, height: h), -1)
         var holed = body; for y in 100..<120 { for x in 50..<70 { holed[(y * w + x) * 4 + 3] = 0 } }
         XCTAssertGreaterThan(PotStates.holeShare(holed, width: w, height: h), 0.03)
+        XCTAssertEqual(PotStates.holeShare(holed, width: w, height: h, besides: holed), 0)      // a hole the empty pot has too (a handle's loop)
         XCTAssertEqual(PotStates.lidTilt, PotStates.lidTilt.sorted())
     }
 }

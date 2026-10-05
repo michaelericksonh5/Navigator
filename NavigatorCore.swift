@@ -8840,8 +8840,11 @@ public enum PotStates {
         heaped(previous: previous, empty: empty, width: w, height: h, state: k, cap: cap).map { FrameKit.onBacking($0, b) }
     }
     /// State k−1 (straight RGBA) with its grey heap added, opaque — the template before it is laid on the backing.
-    static func heaped(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise) -> [UInt8]? {
-        guard k > 0, k < rise.count, let st = standing(previous, empty: empty, width: w, height: h, cap: cap) else { return nil }
+    /// `after`: where the state before stands by the schedule, when each state is drawn from the empty pot rather than from
+    /// the state before (GPT lifts what it is given a little each time, and drawn from each other the overshoot compounded).
+    static func heaped(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise, after: Double? = nil) -> [UInt8]? {
+        guard k > 0, k < rise.count, var st = standing(previous, empty: empty, width: w, height: h, cap: cap) else { return nil }
+        if let after { st.rise = after }
         let s0 = st.s0, H0 = Double(s0.bottom - s0.top)
         // The pot's mouth: its first row at least 40% as wide as its widest (past a lid's knob), the heap as wide as
         // that rim and rising from it — not from the shoulders, which put grey beside the neck (2026-10-05).
@@ -8850,7 +8853,7 @@ public enum PotStates {
         guard let rimY = (s0.top...s0.bottom).first(where: { y in extent(y).map { Double($0.1 - $0.0) >= 0.4 * Double(widest) } ?? false }),
               let (x0, x1) = extent(rimY), x1 > x0 else { return nil }
         let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.5
-        let crown = max(0, Double(s0.top) - crown(k, after: st.rise, room: st.room) * H0), foot = Double(rimY) + 0.03 * H0
+        let crown = max(0, Double(s0.top) - (after != nil ? min(st.room, rise[k]) : crown(k, after: st.rise, room: st.room)) * H0), foot = Double(rimY) + 0.03 * H0
         var out = previous
         // Stage 1 has no heap: a grey band over a closed lid read as treasure piled on it, and GPT threw the lid open
         // (20% of the pot's height at State1, 2026-10-05; shipped rigs rise 1–5% there). Its treasure only glints.
@@ -8879,8 +8882,6 @@ public enum PotStates {
     /// and laid on each state's treasure in code, tipped further open as it fills — GPT, asked to keep a lid while showing
     /// the treasure, took it away and every state after it grew without one (2026-10-05).
     public static func lidName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-lid" }
-    /// The lid as laid on a state (its own layer): taken off to grow the next state, and the animators' lid for that state.
-    public static func lidLayerName(pot i: Int, of total: Int, state k: Int) -> String { name(pot: i, of: total, state: k) + "_lid" }
     /// How far the lid is tipped at each state, in degrees.
     /// Gentle: a lid lifted by the treasure under it stays nearly level (a flat lid spun 30° read as sliding off, 2026-10-05).
     public static let lidTilt: [Double] = [0, 2, 3, 5, 6, 8]
@@ -8895,12 +8896,28 @@ public enum PotStates {
         for y in 0..<h { for x in a..<b where px[(y * w + x) * 4 + 3] > 128 { return y } }
         return nil
     }
-    /// The lid drawn alone (same canvas as State0) is a lid: high on the pot, no more than half its height, and over it.
-    public static func isLid(_ lid: [UInt8], empty: [UInt8], width w: Int, height h: Int) -> Bool {
-        guard let l = box(lid, width: w, height: h), let e = box(empty, width: w, height: h) else { return false }
-        var over = 0, all = 0
-        for i in 0..<(w * h) where lid[i * 4 + 3] > 128 { all += 1; if empty[i * 4 + 3] > 128 { over += 1 } }
-        return l.y < e.y + e.h / 3 && l.h <= e.h / 2 && Double(over) >= 0.8 * Double(max(1, all))
+    /// State0 with its lid taken off (GPT, laid on State0's foot), so its open mouth shows.
+    public static func openName(pot i: Int, of total: Int) -> String { name(pot: i, of: total, state: 0) + "_open" }
+    /// The lid, as State0's own pixels: where State0 is opaque and the open pot is not, or differs from it strongly, above
+    /// the open pot's rim — exactly the lid, in exactly its place (asked to draw the lid alone, GPT drew it larger and
+    /// centred, 2026-10-05). Nil when that is no lid: not in the pot's top half, or under 2% or over 45% of it.
+    public static func lidFrom(empty: [UInt8], open: [UInt8], width w: Int, height h: Int) -> [UInt8]? {
+        guard let e = box(empty, width: w, height: h), let o = box(open, width: w, height: h) else { return nil }
+        var lid = [UInt8](repeating: 0, count: w * h * 4), n = 0, all = 0
+        let band = o.y + Int(0.05 * Double(e.h))                 // the open pot's rim, and a little below it
+        for y in 0..<h { for x in 0..<w {
+            let i = (y * w + x) * 4
+            guard empty[i + 3] > 128 else { continue }
+            all += 1
+            let gone = open[i + 3] <= 128
+            let changed = y <= band && open[i + 3] > 128 && abs(Int(empty[i]) - Int(open[i])) + abs(Int(empty[i + 1]) - Int(open[i + 1])) + abs(Int(empty[i + 2]) - Int(open[i + 2])) > 90
+            guard y <= band && (gone || changed) else { continue }
+            for c in 0..<4 { lid[i + c] = empty[i + c] }
+            n += 1
+        } }
+        guard let l = box(lid, width: w, height: h), l.y + l.h <= e.y + e.h / 2 + e.h / 10,
+              Double(n) >= 0.02 * Double(all), Double(n) <= 0.45 * Double(all) else { return nil }
+        return lid
     }
     /// State0 without its lid: its pixels where the lid is not.
     public static func withoutLid(_ empty: [UInt8], lid: [UInt8]) -> [UInt8] {
@@ -8945,21 +8962,16 @@ public enum PotStates {
         FrameKit.over(&out, width: w, FrameKit.Piece(px: laid, w: w, h: h), at: 0, 0)
         return (out, laid)
     }
-    /// A drawn state with the lid as laid (its own layer) taken off: the body the next state grows from.
-    public static func withoutLaidLid(_ px: [UInt8], laid: [UInt8]) -> [UInt8] {
-        var out = px
-        for i in 0..<(px.count / 4) where laid[i * 4 + 3] > 128 { out[i * 4 + 3] = 0 }
-        return out
-    }
-    /// The lid where it was laid, still there in what was drawn: its share of the laid lid still opaque.
-    public static func lidKept(_ px: [UInt8], laid: [UInt8]) -> Double {
-        var all = 0, kept = 0
-        for i in 0..<(px.count / 4) where laid[i * 4 + 3] > 128 { all += 1; if px[i * 4 + 3] > 128 { kept += 1 } }
-        return Double(kept) / Double(max(1, all))
-    }
     /// How much of a cut-out is holes — transparent pixels it encloses, the backing showing through where the drawing left
     /// it (a magenta smudge in a pot's treasure, 2026-10-05) — as a share of its opaque pixels.
-    public static func holeShare(_ px: [UInt8], width w: Int, height h: Int) -> Double {
+    public static func holeShare(_ px: [UInt8], width w: Int, height h: Int, besides reference: [UInt8]? = nil) -> Double {
+        let mine = holes(px, width: w, height: h), theirs = reference.map { holes($0, width: w, height: h) }
+        var n = 0, solid = 0
+        for i in 0..<(w * h) { if px[i * 4 + 3] >= 128 { solid += 1 } else if mine[i] && !(theirs?[i] ?? false) { n += 1 } }
+        return Double(n) / Double(max(1, solid))
+    }
+    /// The transparent pixels a cut-out encloses (not reached from the picture's border).
+    static func holes(_ px: [UInt8], width w: Int, height h: Int) -> [Bool] {
         var outside = [Bool](repeating: false, count: w * h), stack: [Int] = []
         for x in 0..<w { stack.append(x); stack.append((h - 1) * w + x) }
         for y in 0..<h { stack.append(y * w); stack.append(y * w + w - 1) }
@@ -8970,9 +8982,7 @@ public enum PotStates {
             if x > 0 { stack.append(i - 1) }; if x < w - 1 { stack.append(i + 1) }
             if y > 0 { stack.append(i - w) }; if y < h - 1 { stack.append(i + w) }
         }
-        var holes = 0, solid = 0
-        for i in 0..<(w * h) { if px[i * 4 + 3] >= 128 { solid += 1 } else if !outside[i] { holes += 1 } }
-        return Double(holes) / Double(max(1, solid))
+        return (0..<(w * h)).map { px[$0 * 4 + 3] < 128 && !outside[$0] }
     }
     /// A pot's Power Bet look, beside its states.
     public static func boostedName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-boostedIdle" }
@@ -16081,11 +16091,11 @@ extension GDDAssetPrompts {
     /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
     /// A pot as it looks with the Power Bet on, in the GDD's own words: an edit of its full state, so it swaps in place.
-    /// A pot's lid alone, from State0 (attached): the same lid in the same place, the pot taken away.
-    static func potLidBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+    /// A pot with its lid off, from State0 (attached): the same pot in the same place, its open mouth showing, empty.
+    static func potOpenBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
         [
-            "Edit the attached image: it is a pot with its lid on, from a video slot game themed “\(theme.name)”. Show only its lid — exactly as it is: the same shape, size, position, material, colour and ornament — with the pot itself taken away: nothing but the lid, where it sits now.",
-            "No pot, treasure, text or anything else.",
+            "Edit the attached image: it is a pot with its lid on, from a video slot game themed “\(theme.name)”. Show the same pot with its lid taken off and gone from the picture: its open mouth and rim showing, the inside of its mouth dark and empty. Everything else stays exactly as it is — the pot's shape, size, position, material, colour and ornament.",
+            "No lid anywhere in the picture, no treasure, text or anything else.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -16102,7 +16112,8 @@ extension GDDAssetPrompts {
     /// it so it sits naturally — the lid itself kept exactly where it is.
     static func potLidStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
         [
-            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k) of 5. Its lid is shown exactly where it rests at this stage, lifted by the treasure beneath it: keep the lid exactly as it is — its shape, size, position, angle, material and ornament.",
+            (k > 1 ? "Image 2 is the same pot at the stage before, for its treasure's look only — the same coins and gems, their colours and size. " : "")
+            + "Edit the \(k > 1 ? "first" : "") attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k) of 5. Its lid is shown exactly where it rests at this stage, lifted by the treasure beneath it: keep the lid exactly as it is — its shape, size, position, angle, material and ornament.",
             k == 1
                 ? "Paint the first of its treasure — the theme's own coins, gems or gold, in the pot's own colours — glinting in the narrow gap between the lid and the rim, filling that gap solidly, with a soft warm glow spilling from it onto the lid's rim. Nothing of the background shows through between the lid and the pot."
                 : "The flat grey mound is the treasure that has risen under and round the lid: paint it as the pot's own treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure as before — heaped up to the grey's outline and pressing up against the lid's underside, so the lid truly rests on it: a soft contact shadow where the lid sits on the treasure, the treasure's warm glow lighting the lid's underside and rim, the heap filling the pot's mouth solidly. Nothing of the background shows through anywhere inside it.\(k == PotStates.levels ? " Full to overflowing: a few pieces spill over the rim." : "")",
@@ -16910,11 +16921,24 @@ public enum Legibility {
         let d = FrameKit.resized(crop, max(1, Int(Double(crop.w) * s)), max(1, Int(Double(crop.h) * s)))
         var m = clutter(d.px, width: d.w, height: d.h)
         // Lettering alone on its canvas that reaches the edge may be cut off there (Tiki's BONUS GAMES AWARDED!, 2026-10-05).
-        if kind == .title || kind == .message { m.edge = box.x <= 1 || box.y <= 1 || box.x + box.w >= w - 1 || box.y + box.h >= h - 1 }
+        // Solid lettering along a stretch of an edge, not a keying speck in a corner (one stray pixel flagged all five Tiki
+        // titles, 2026-10-05): at least a fifth of a percent of that edge, two pixels in.
+        if kind == .title || kind == .message {
+            func solid(_ x: Int, _ y: Int) -> Bool { px[(y * w + x) * 4 + 3] > 128 }
+            let rows = 0..<h, cols = 0..<w
+            let left = rows.filter { y in solid(0, y) || solid(1, y) }.count, right = rows.filter { y in solid(w - 1, y) || solid(w - 2, y) }.count
+            let top = cols.filter { x in solid(x, 0) || solid(x, 1) }.count, bottom = cols.filter { x in solid(x, h - 1) || solid(x, h - 2) }.count
+            m.edge = Double(max(left, right)) > 0.002 * Double(h) * 5 || Double(max(top, bottom)) > 0.002 * Double(w) * 5
+        }
         if let text, !text.isEmpty {
-            let se = 750.0 / 1170.0
-            let small = FrameKit.resized(d, max(1, Int(Double(d.w) * se)), max(1, Int(Double(d.h) * se)))
-            let got = read(small.px, width: small.w, height: small.h, languages: languages)
+            // At an iPhone SE's size; read again a little larger before it counts as unread: the recognizer, near its own
+            // limit, missed a plain “MINI” at 128 px it read at 200 (2026-10-05).
+            var got = ""
+            for scale in [750.0 / 1170.0, 0.72] {
+                let small = FrameKit.resized(d, max(1, Int(Double(d.w) * scale)), max(1, Int(Double(d.h) * scale)))
+                got = read(small.px, width: small.w, height: small.h, languages: languages)
+                if readScore(got, text) >= 1 { break }
+            }
             m.read = readScore(got, text)
             // Apple's recognizer reads a display “!” reliably (every one in the galactic and Tiki titles, 2026-10-05).
             if text.contains("!") { m.bang = got.contains("!") }
