@@ -14039,8 +14039,8 @@ final class PotSofteningTests: XCTestCase {
         for y in 20..<80 { for x in 20..<60 { let i = (y * w + x) * 4; open[i] = 30; open[i + 1] = 20; open[i + 2] = 10 } }   // its door swung open
         XCTAssertEqual(PotStates.changedShare(body, body: body, width: w, height: h), 0, accuracy: 0.01)
         XCTAssertEqual(PotStates.changedShare(open, body: body, width: w, height: h), 2400.0 / 6400, accuracy: 0.06)
-        XCTAssertEqual(PotKind.safe.revealCap(1), 0.10)
-        XCTAssertNil(PotKind.safe.revealCap(5))
+        XCTAssertEqual(PotKind.safe.revealCap(1), 0.22)
+        XCTAssertNil(PotKind.safe.revealCap(2))
         XCTAssertNil(PotKind.jar.revealCap(1))
     }
 }

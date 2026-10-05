@@ -8807,10 +8807,11 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
     /// The room it leaves under its foot at State0, in its canvas's heights: a safe's gold and a piggy bank's coins pile on
     /// the floor in front of it, lower than its foot (a safe's State5 pour ran off the canvas's bottom, 2026-10-05).
     public var footRoom: Double { anchor == .foot ? 0 : 0.08 }
-    /// The most of its State0's face a drawn state may have changed by (PotStates.changedShare): a safe back-loaded as the
-    /// rigs are — a crack, a quarter, half, most — where drawn freely it showed a quarter of its face open and full of gold
-    /// at State1 and hardly more until State5 (0.26, 0.29, 0.31, 0.36, 0.59; 2026-10-05). Nil: no cap.
-    public func revealCap(_ k: Int) -> Double? { self == .safe && (1...4).contains(k) ? [0.10, 0.20, 0.32, 0.48][k - 1] : nil }
+    /// The most of its State0's face a drawn state may have changed by (PotStates.changedShare): a safe's State1 is a door
+    /// open a crack — drawn freely it stood a quarter open, full of gold (0.26); held to its stage it measured 0.19. Later states
+    /// are not capped by it: a door swung open on a dark inside changes as much as gold filling it (the good safe measured
+    /// 0.30, 0.34, 0.36 against the overshooting one's 0.29, 0.31, 0.36, 2026-10-05) — Gemini judges those. Nil: no cap.
+    public func revealCap(_ k: Int) -> Double? { self == .safe && k == 1 ? 0.22 : nil }
     /// Its State0: closed, empty, unlit.
     var closed: String {
         switch self {

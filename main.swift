@@ -26373,13 +26373,16 @@ final class GDDToAssetsRun: ObservableObject {
                 guard let d = r.png, let drawn = pixels(d, w, h) else { problems.append("\(what): \(r.error ?? "no image")"); return best?.px }
                 let px = finish?(drawn) ?? drawn
                 let c = covered?(px) ?? 0, j = judge?(px) ?? (problems: [], excess: 0)
-                navLog(String(format: "gdd reel: %@ attempt %d covers %.1f%% of its openings, %d phone-size problems $%.3f", what, attempt, c * 100, j.problems.count, r.cost))
+                navLog(String(format: "gdd reel: %@ attempt %d covers %.1f%% of its openings, %d problems%@ $%.3f", what, attempt, c * 100, j.problems.count,
+                              j.problems.isEmpty ? "" : " (" + j.problems.map { String($0.prefix(60)) }.joined(separator: " | ") + ")", r.cost))
                 let score = (c > FrameStack.windowTolerance ? 10 + c : 0) + j.excess
                 if best == nil || score < best!.score { best = (px, c, j.problems, score) }
                 if c <= FrameStack.windowTolerance && j.problems.isEmpty { break }
                 if !j.problems.isEmpty {
-                    ask = prompt + "\n\nTHE LAST DRAWING DID NOT HOLD UP AT PHONE SIZE: " + j.problems.joined(separator: "; ")
-                        + ". Draw it again fixing exactly that: fewer and bolder details, smooth clean surfaces, almost no sparkles or glints; any letters with clean solid faces, thick strokes and a thick dark outline."
+                    // Each problem carries what to do about it (a phone-size one its own advice; a pot's stage what it should show).
+                    let phone = j.problems.contains { $0.contains("shipped") || $0.contains("read") || $0.contains("lettering") }
+                    ask = prompt + "\n\nTHE LAST DRAWING WAS NOT RIGHT: " + j.problems.joined(separator: "; ") + ". Draw it again fixing exactly that"
+                        + (phone ? ": fewer and bolder details, smooth clean surfaces, almost no sparkles or glints; any letters with clean solid faces, thick strokes and a thick dark outline." : ".")
                     log.write("prompts/\(what)-again.txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h), drawn again\n\n\(ask)")
                 }
             }
@@ -26668,12 +26671,10 @@ final class GDDToAssetsRun: ObservableObject {
                             if t.contains("toofar: yes") { p.append("it went too far for stage \(k) of 5 — only this: \(stage); the later stages show more") }
                         }
                         var x = Double(p.count)
-                        // Measured too: how much of its face has changed, held to the stage's share and a step past the last.
+                        // Measured too, where a measure can tell (a safe's State1): how much of its face has changed.
                         if let cap = kind.revealCap(k) {
                             let share = PotStates.changedShare(laid, body: e0.px, width: 1024, height: potH)
-                            let before = PotStates.changedShare(prev.px, body: e0.px, width: 1024, height: potH)
-                            if share > cap + 0.03 { p.append(String(format: "it went too far for stage %d of 5: %.0f%% of the %@ changed, at most %.0f%% — only %@, %@", k, share * 100, kind.noun, cap * 100, kind.opening(k), kind.treasure(k))); x += 1 }
-                            else if share < before + 0.03 { p.append("it is not further along than the stage before — \(kind.opening(k)), \(kind.treasure(k))"); x += 1 }
+                            if share > cap { p.append(String(format: "it went too far for stage %d of 5: %.0f%% of the %@ changed, at most %.0f%% — only %@, %@", k, share * 100, kind.noun, cap * 100, kind.opening(k), kind.treasure(k))); x += 1 }
                         }
                         if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure solid"); x += 1 }
                         if PotStates.cutOff(laid, width: 1024, height: potH) { p.append("it runs off the edge of the picture — the \(kind.noun) and all its treasure inside it, on the floor it stands on"); x += 1 }
