@@ -13822,6 +13822,8 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertGreaterThan(b.glints, a.glints)
         XCTAssertEqual(Legibility.readScore("BONUS GAMES", "Bonus Games!"), 1)
         XCTAssertEqual(Legibility.readScore("BONVS GAMES", "BONUS GAMES"), 0.9, accuracy: 0.001)
+        XCTAssertEqual(Legibility.readScore("MINI", "ΜΙΝΙ"), 1)                       // Greek capitals that are Latin ones
+        XCTAssertLessThan(Legibility.readScore("MIKPO MINI", "ΜΕΓΑΛΟ ΜΙΚΡΟ ΜΙΝΙ"), 0.7)    // a missing word still counts
     }
 }
 

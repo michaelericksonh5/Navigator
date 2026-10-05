@@ -21638,6 +21638,137 @@ if let flag = CommandLine.arguments.firstIndex(of: "--prompts"), flag + 2 < Comm
     app.run()
 }
 
+// PAID (~$2.25 for 4 pieces × 3 languages × 2 models, never past --budget, default $4):
+//   Navigator --reletter-compare <set folder> <out folder> [--languages fr,ja,el] [--pieces stem,stem] [--budget 4]
+// Each lettered piece in each language drawn once by GPT Image 2.5 and once by Nano Banana 2 (Vertex), from the same
+// brief and English picture, and scored alike: its words read back by Apple's recognizer and by Gemini, how far an
+// edit's outline moved from the English, and how much of the flat backing survived. A sheet to look at and a TSV.
+if let flag = CommandLine.arguments.firstIndex(of: "--reletter-compare"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1]), out = URL(fileURLWithPath: args[flag + 2])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder), let theme = run.theme else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        func list(_ f: String) -> [String]? { args.firstIndex(of: f).flatMap { $0 + 1 < args.count ? args[$0 + 1].split(separator: ",").map(String.init) : nil } }
+        let langs = list("--languages") ?? ["fr", "ja", "el"]
+        let want = list("--pieces") ?? ["transition_outro_totalWin", "base_popUp_bonusBtn", "base_popUp_grandAwarded", "shared_interface_jackpotTable"]
+        let budget = args.firstIndex(of: "--budget").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil } ?? 4
+        let pieces = want.compactMap { w in run.letteredPieces(folder).pieces.first { $0.stem == w } }
+        let b = run.backing.rgb, backing = (run.backing.name, b), space = CGColorSpace(name: CGColorSpace.sRGB)!
+        try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            func png(_ px: [UInt8], _ w: Int, _ h: Int) -> Data? { ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG) }
+            func pixels(_ d: Data) -> FrameKit.Piece? {
+                guard let cg = loadCGImage(data: d), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+                return FrameKit.Piece(px: px, w: cg.width, h: cg.height)
+            }
+            func flat(_ w: Int, _ h: Int) -> [UInt8] { [UInt8]((0..<(w * h)).flatMap { _ in [b.r, b.g, b.b, 255] }) }
+            // Nano Banana 2 takes these shapes only: the piece is padded out with backing to the one that adds least, and
+            // the drawing cropped back.
+            let shapes: [(String, Double)] = [("1:1", 1), ("3:2", 1.5), ("2:3", 2.0 / 3), ("3:4", 0.75), ("4:3", 4.0 / 3), ("4:5", 0.8), ("5:4", 1.25),
+                                              ("9:16", 9.0 / 16), ("16:9", 16.0 / 9), ("21:9", 21.0 / 9)]
+            func padded(_ w: Int, _ h: Int) -> (aspect: String, w: Int, h: Int) {
+                shapes.map { a -> (String, Int, Int) in
+                    let r = Double(w) / Double(h)
+                    return a.1 >= r ? (a.0, Int((Double(h) * a.1).rounded()), h) : (a.0, w, Int((Double(w) / a.1).rounded()))
+                }.min { $0.1 * $0.2 < $1.1 * $1.2 }!
+            }
+            var spent = 0.0, rows: [String] = ["piece\tlang\tmodel\tcost\tapple_read\tgemini_read\tgemini_text\toutline_iou\tbacking_kept\tphone_problems"]
+            var sheet: [(title: String, english: FrameKit.Piece, cells: [(model: String, px: FrameKit.Piece?, note: String)])] = []
+            for p in pieces {
+                guard let englishData = try? Data(contentsOf: folder.appendingPathComponent("\(p.from ?? p.stem).png")), let english = pixels(englishData) else { print("SKIP: \(p.stem) has no English picture"); continue }
+                let englishKeyed = FrameKit.keyed(FrameKit.resized(english, p.w, p.h).px, backing: b, width: p.w, height: p.h)
+                for lang in langs {
+                    guard case .draw(let words) = Localized.plan(p, lang: lang) else { print("SKIP: \(p.stem) \(lang): \(Localized.plan(p, lang: lang))"); continue }
+                    let text = words.joined(separator: " "), readers = Localized.readers(lang), alone = p.how == .alone
+                    let prompt = GDDAssetPrompts.reletteredBrief(theme: theme, backing: backing, english: p.words,
+                                                                 words: zip(p.words, words).map { Localized.lines($0.1, english: $0.0, lang: lang) },
+                                                                 language: Localized.languageName(lang), alone: alone)
+                    try? prompt.write(to: out.appendingPathComponent("\(p.stem)-\(lang)-prompt.txt"), atomically: true, encoding: .utf8)
+                    let reference = downsamplePNG(englishData, longEdge: 2048) ?? englishData
+                    var cells: [(model: String, px: FrameKit.Piece?, note: String)] = []
+                    for model in ["gpt", "nb2"] {
+                        let estimate = model == "gpt" ? AssetChecklist.gpt(p.w, p.h) : 0.101
+                        guard spent + estimate <= budget else { print("BUDGET: \(p.stem) \(lang) \(model) not drawn"); cells.append((model, nil, "not drawn: budget")); continue }
+                        var drawn: FrameKit.Piece?, cost = 0.0, error: String?
+                        if model == "gpt" {
+                            let (rw, rh) = GPTSize.fit(p.w, p.h)
+                            let r = OpenAIImages.edit(prompt: prompt, images: [reference] + (alone ? [png(flat(p.w, p.h), p.w, p.h)].compactMap { $0 } : []), size: rw, height: rh)
+                            cost = r.cost; error = r.error
+                            drawn = r.png.flatMap(pixels).map { FrameKit.resized($0, p.w, p.h) }
+                        } else {
+                            let pad = padded(p.w, p.h), ox = (pad.w - p.w) / 2, oy = (pad.h - p.h) / 2
+                            var target = flat(pad.w, pad.h)
+                            if !alone { FrameKit.over(&target, width: pad.w, FrameKit.resized(english, p.w, p.h), at: ox, oy) }
+                            let r = H5GService.image(prompt: prompt, modelID: "gemini-3.1-flash-image", inputPNGs: (alone ? [reference] : []) + [png(target, pad.w, pad.h)].compactMap { $0 },
+                                                     aspect: pad.aspect, size: "2K")
+                            cost = r.cost ?? (r.png == nil ? 0 : estimate); error = r.error
+                            drawn = r.png.flatMap(pixels).map { FrameKit.crop(FrameKit.resized($0, pad.w, pad.h).px, width: pad.w, ox, oy, p.w, p.h) }
+                        }
+                        spent += cost
+                        guard let px = drawn else { print("FAILED: \(p.stem) \(lang) \(model): \(error ?? "no image")"); cells.append((model, nil, error ?? "no image")); continue }
+                        if let d = png(px.px, px.w, px.h) { try? d.write(to: out.appendingPathComponent("\(p.stem)-\(lang).\(model).png")) }
+                        // The scores: read back (Apple's recognizer where it reads the language; Gemini always), outline moved, backing kept.
+                        let keyed = FrameKit.keyed(px.px, backing: b, width: p.w, height: p.h)
+                        let m = Legibility.measure(keyed, width: p.w, height: p.h, kind: p.kind, text: readers == nil ? nil : text, display: p.display, languages: readers)
+                        let g = png(px.px, px.w, px.h).map { H5GService.describe(prompt: "Write out exactly the words lettered in this picture, every letter and accent as drawn, line by line, and nothing else.", systemPrompt: nil, imagePNG: downsamplePNG($0, longEdge: 1024) ?? $0) }
+                        spent += g?.cost ?? 0
+                        let got = (g?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " / ")
+                        var inter = 0, union = 0
+                        for i in stride(from: 3, to: keyed.count, by: 4) { let a = keyed[i] > 128, e = englishKeyed[i] > 128; if a && e { inter += 1 }; if a || e { union += 1 } }
+                        let band = max(4, min(p.w, p.h) / 30)
+                        var edge = 0, kept = 0
+                        for y in 0..<p.h { for x in 0..<p.w where x < band || y < band || x >= p.w - band || y >= p.h - band {
+                            let i = (y * p.w + x) * 4; edge += 1
+                            if abs(Int(px.px[i]) - Int(b.r)) + abs(Int(px.px[i + 1]) - Int(b.g)) + abs(Int(px.px[i + 2]) - Int(b.b)) < 60 { kept += 1 }
+                        } }
+                        let apple = m?.read, gem = Legibility.readScore(got, text), iou = alone ? nil : Double(inter) / Double(max(1, union))
+                        let problems = m.map { Legibility.problems($0, kind: p.kind) } ?? []
+                        rows.append([p.stem, lang, model, String(format: "%.3f", cost), apple.map { String(format: "%.2f", $0) } ?? "-", String(format: "%.2f", gem), got,
+                                     iou.map { String(format: "%.3f", $0) } ?? "-", String(format: "%.3f", Double(kept) / Double(edge)), problems.joined(separator: "; ")].joined(separator: "\t"))
+                        let note = String(format: "%@ · read %@ apple, %.0f%% gemini%@ · backing %.0f%%", model == "gpt" ? "GPT Image 2.5" : "Nano Banana 2",
+                                          apple.map { String(format: "%.0f%%", $0 * 100) } ?? "n/a", gem * 100, iou.map { String(format: " · outline %.0f%%", $0 * 100) } ?? "", Double(kept) / Double(edge) * 100)
+                        print("\(p.stem) \(lang) \(note) · $\(String(format: "%.3f", cost)) · gemini read “\(got)”")
+                        cells.append((model, px, note + (problems.isEmpty ? "" : " · " + problems.joined(separator: "; "))))
+                    }
+                    sheet.append(("\(p.stem) · \(Localized.languageName(lang)) · “\(text)”", FrameKit.resized(english, p.w, p.h), cells))
+                }
+            }
+            try? rows.joined(separator: "\n").write(to: out.appendingPathComponent("scores.tsv"), atomically: true, encoding: .utf8)
+            // The sheet: a row per piece and language — the English, then each model's drawing with its scores under it.
+            DispatchQueue.main.sync {
+                let cellW = 620, capH = 64, titleH = 34
+                let rowHs = sheet.map { r in min(320, cellW * r.english.h / r.english.w) + capH + titleH }
+                let W = cellW * 3 + 40, H = rowHs.reduce(0, +) + 20
+                let img = NSImage(size: NSSize(width: W, height: H)); img.lockFocus()
+                NSColor(white: 0.13, alpha: 1).setFill(); NSRect(x: 0, y: 0, width: W, height: H).fill()
+                var top = H - 10
+                let titleAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.boldSystemFont(ofSize: 17), .foregroundColor: NSColor.white]
+                let noteAttrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: NSColor(white: 0.85, alpha: 1)]
+                for (r, rh) in zip(sheet, rowHs) {
+                    (r.title as NSString).draw(at: NSPoint(x: 10, y: top - 26), withAttributes: titleAttrs)
+                    let ih = rh - capH - titleH, iw = min(cellW - 20, ih * r.english.w / r.english.h)
+                    for (c, (label, px, note)) in ([("English", r.english, "the English piece")] + r.cells.map { ($0.model == "gpt" ? "GPT Image 2.5" : "Nano Banana 2", $0.px, $0.note) }).enumerated() {
+                        let x = 10 + c * (cellW + 10), y = top - titleH - ih
+                        if let px, let cg = ChromaKeyOutputRules.image(straightRGBA8: px.px, width: px.w, height: px.h, space: space) {
+                            NSImage(cgImage: cg, size: .zero).draw(in: NSRect(x: x + (cellW - 20 - iw) / 2, y: y, width: iw, height: ih))
+                        }
+                        ((c == 0 ? label : note) as NSString).draw(in: NSRect(x: x, y: y - capH, width: cellW - 10, height: capH - 4), withAttributes: noteAttrs)
+                    }
+                    top -= rh
+                }
+                img.unlockFocus()
+                if let t = img.tiffRepresentation, let rep = NSBitmapImageRep(data: t), let j = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) {
+                    try? j.write(to: out.appendingPathComponent("compare.jpg"))
+                }
+            }
+            print(String(format: "DONE: %d drawings\nSPENT: $%.4f", sheet.reduce(0) { $0 + $1.cells.filter { $0.px != nil }.count }, spent))
+            exit(0)
+        }
+    } }
+    app.run()
+}
+
 // PAID (~$0.10 an image):  Navigator --generate-set <set folder> <id,id,…>
 // (Not --generate: --design-test and --plan-test take that as an option.)
 // The GDD window's batch, headless, for those images of a reopened set — a layered set builds its

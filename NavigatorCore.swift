@@ -18315,8 +18315,14 @@ public enum Legibility {
         return lines.sorted { ($0.1.maxY, -$0.1.minX) > ($1.1.maxY, -$1.1.minX) }.map(\.0).joined(separator: " ")
     }
     /// 1 − edit distance ÷ length, letters and digits only (O and 0 alike).
+    /// Greek and Cyrillic capitals drawn exactly as Latin ones: a reader cannot tell lettered ΜΙΝΙ from MINI (Gemini read
+    /// the Greek jackpot table's ΜΙΝΙ as MINI, 2026-10-05), so both are read as the Latin letter.
+    static let lookAlikes: [Character: Character] = [
+        "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+        "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "У": "Y", "Х": "X",
+    ]
     static func readScore(_ got: String, _ ref: String) -> Double {
-        func norm(_ s: String) -> [Character] { Array(s.uppercased().replacingOccurrences(of: "0", with: "O").filter { $0.isLetter || $0.isNumber }) }
+        func norm(_ s: String) -> [Character] { s.uppercased().replacingOccurrences(of: "0", with: "O").filter { $0.isLetter || $0.isNumber }.map { lookAlikes[$0] ?? $0 } }
         let g = norm(got), r = norm(ref)
         guard !r.isEmpty else { return 1 }
         var prev = Array(0...g.count)
