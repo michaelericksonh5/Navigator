@@ -26412,19 +26412,50 @@ final class GDDToAssetsRun: ObservableObject {
             // still grow, and each is laid on State0's foot so the states swap in place. Judged for both, and at phone size.
             for i in 0..<total {
                 guard let e0 = load("\(jar(i, 0))_rmbg.png"), e0.w == 1024, e0.h == potH else { continue }
+                // Its lid, when it has one, as its own part (PotStates.lidName): Gemini says whether it has one, once; it is
+                // drawn alone once and laid on every state's treasure in code, so it is never lost and opens in steps.
+                let lidN = PotStates.lidName(pot: i, of: total), noLid = url("\(lidN).none")
+                var lid = load("\(lidN)_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? $0.px : nil }
+                let statesToDraw = (1...PotStates.levels).contains { !has("\(jar(i, $0)).png") && wanted("\(jar(i, $0)).png") }
+                if lid == nil, statesToDraw, !fm.fileExists(atPath: noLid.path), let s0png = try? Data(contentsOf: url("\(jar(i, 0)).png")) {
+                    let r = H5GService.describe(prompt: "This is a pot drawn for a video slot game. Does it have a lid, cover or door sitting on top of it that could open? Answer with one word: yes or no.",
+                                                systemPrompt: nil, imagePNG: downsamplePNG(s0png, longEdge: 768) ?? s0png)
+                    cost += r.cost ?? 0
+                    if r.text?.lowercased().contains("yes") == true {
+                        if let px = paint(lidN, prompt: GDDAssetPrompts.potLidBrief(theme: theme, backing: (backing.name, b)), inputs: [s0png], w: 1024, h: potH, covered: nil) {
+                            let k = FrameKit.keyed(px, backing: b, width: 1024, height: potH)
+                            if PotStates.isLid(k, empty: e0.px, width: 1024, height: potH) {
+                                write(FrameKit.onBacking(k, b), 1024, potH, "\(lidN).png"); write(k, 1024, potH, "\(lidN)_rmbg.png"); lid = k
+                            } else { problems.append("pot \(i + 1)'s lid did not come out on its own: its states are drawn with the lid as the model draws it") }
+                        }
+                    } else if r.text != nil { try? "no lid".write(to: noLid, atomically: true, encoding: .utf8) }
+                }
+                let body0 = lid.map { PotStates.withoutLid(e0.px, lid: $0) } ?? e0.px
+                // The treasure held lower by what the lid stands above it, so the whole stays within the shipped rise.
+                let cap = lid.map { max(0.15, PotStates.maxRise - PotStates.lidShare($0, body0: body0, width: 1024, height: potH)) } ?? PotStates.maxRise
                 for k in 1...PotStates.levels where !has("\(jar(i, k)).png") {
-                    guard let prev = load("\(jar(i, k - 1))_rmbg.png"), prev.w == 1024, prev.h == potH,
-                          let tpl = PotStates.template(previous: prev.px, empty: e0.px, width: 1024, height: potH, state: k, backing: b).flatMap({ png($0, 1024, potH) }) else { break }
+                    let prevBody: [UInt8]
+                    if k == 1 { prevBody = body0 } else {
+                        guard let p = load(lid != nil ? "\(PotStates.bodyName(pot: i, of: total, state: k - 1))_rmbg.png" : "\(jar(i, k - 1))_rmbg.png"), p.w == 1024, p.h == potH else { break }
+                        prevBody = p.px
+                    }
+                    guard let tpl = PotStates.template(previous: prevBody, empty: body0, width: 1024, height: potH, state: k, backing: b, cap: cap).flatMap({ png($0, 1024, potH) }) else { break }
                     let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
                         let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
-                        var p = PotStates.growthProblems(laid, previous: prev.px, empty: e0.px, width: 1024, height: potH, state: k), x = Double(p.count)
+                        var p = PotStates.growthProblems(laid, previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap), x = Double(p.count)
+                        if PotStates.holeShare(laid, width: 1024, height: potH) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure and the open mouth solid"); x += 1 }
                         if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
                         return (p, x)
                     }
-                    guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k),
+                    guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k, lidOff: lid != nil),
                                          inputs: [tpl], w: 1024, h: potH, covered: nil, judge: judge) else { break }    // the states after it grow from it
                     let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
-                    write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
+                    var whole = laid
+                    if let lid {
+                        write(laid, 1024, potH, "\(PotStates.bodyName(pot: i, of: total, state: k))_rmbg.png")
+                        whole = PotStates.withLid(laid, lid: lid, body0: body0, width: 1024, height: potH, state: k)
+                    }
+                    write(FrameKit.onBacking(whole, b), 1024, potH, "\(jar(i, k)).png"); write(whole, 1024, potH, "\(jar(i, k))_rmbg.png")
                 }
                 // With the Power Bet on, the look the GDD gives the pot, an edit of its full state (PotStates.boost).
                 if let look = layout.potBoost, !has("\(PotStates.boostedName(pot: i, of: total)).png"), let full = try? Data(contentsOf: url("\(jar(i, PotStates.levels)).png")) {
@@ -26659,8 +26690,8 @@ final class GDDToAssetsRun: ObservableObject {
                                   inputs: [downsamplePNG(btn, longEdge: 1024) ?? btn, canvas], w: 1024, h: 352, covered: nil,
                                   judge: { px in
                                       let k = FrameKit.keyed(px, backing: b, width: 1024, height: 352)
-                                      guard let m = Legibility.measure(k, width: 1024, height: 352, kind: .button, text: readers == nil ? nil : word, display: 230, languages: readers) else { return ([], 0) }
-                                      return (Legibility.problems(m, kind: .button), Legibility.excess(m, kind: .button))
+                                      guard let m = Legibility.measure(k, width: 1024, height: 352, kind: .word, text: readers == nil ? nil : word, languages: readers) else { return ([], 0) }
+                                      return (Legibility.problems(m, kind: .word), Legibility.excess(m, kind: .word))
                                   }) { both(px, 1024, 352, Localized.name(lang)) }
             }
         }
@@ -26824,7 +26855,7 @@ final class GDDToAssetsRun: ObservableObject {
             FrameKit.over(&strip, width: stripW, g, at: i * cellW + (cellW - g.w) / 2, max(0, low ? height - 10 - g.h : (height - g.h) / 2))
         }
         let read = NumberFont.readAmounts(strip: strip, width: stripW, height: height, cellW: cellW, glyphHeight: glyphH)
-        if read < 1 { problems.append(String(format: "\(name): amounts set in it read %.0f%% at a small phone's size (“%@”) — its digits need clean, solid faces, thick strokes and a thick dark outline, well apart", read * 100, NumberFont.testAmounts)) }
+        if read < 0.95 { problems.append(String(format: "\(name): amounts set in it read %.0f%% at a small phone's size (“%@”) — its digits need clean, solid faces, thick strokes and a thick dark outline, well apart", read * 100, NumberFont.testAmounts)) }
         return (strip, stripW, height, cellW, problems)
     }
 

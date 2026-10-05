@@ -8831,13 +8831,13 @@ public enum PotStates {
         return min(room, rp + max(0.04, (final - rp) * share))
     }
     /// Where a state stands, and how far it can rise, in State0's heights above State0's top.
-    static func standing(_ px: [UInt8], empty: [UInt8], width w: Int, height h: Int) -> (rise: Double, room: Double, s0: (top: Int, bottom: Int))? {
+    static func standing(_ px: [UInt8], empty: [UInt8], width w: Int, height h: Int, cap: Double = maxRise) -> (rise: Double, room: Double, s0: (top: Int, bottom: Int))? {
         guard let s0 = span(empty, width: w, height: h), let sp = span(px, width: w, height: h) else { return nil }
         let H0 = Double(max(1, s0.bottom - s0.top))
-        return (Double(s0.top - sp.top) / H0, min(maxRise, (Double(s0.top) - 0.03 * Double(h)) / H0), s0)
+        return (Double(s0.top - sp.top) / H0, min(cap, (Double(s0.top) - 0.03 * Double(h)) / H0), s0)
     }
-    static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8) -> [UInt8]? {
-        guard k > 0, k < rise.count, let st = standing(previous, empty: empty, width: w, height: h) else { return nil }
+    static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8, cap: Double = maxRise) -> [UInt8]? {
+        guard k > 0, k < rise.count, let st = standing(previous, empty: empty, width: w, height: h, cap: cap) else { return nil }
         let s0 = st.s0, H0 = Double(s0.bottom - s0.top)
         // The pot's top: its widest row in its top third.
         var x0 = 0, x1 = -1
@@ -8863,14 +8863,104 @@ public enum PotStates {
     /// What keeps a drawn state (laid on State0) from growing as the rig must: its top at least 3% of State0's height above
     /// the state before (shipped: every late step 5–9%), and near its crown — not far short, nor far past it (a lid thrown
     /// open early leaves the later states no room).
-    public static func growthProblems(_ px: [UInt8], previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int) -> [String] {
-        guard k > 0, k < rise.count, let p = standing(previous, empty: empty, width: w, height: h), let n = standing(px, empty: empty, width: w, height: h) else { return [] }
+    public static func growthProblems(_ px: [UInt8], previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise) -> [String] {
+        guard k > 0, k < rise.count, let p = standing(previous, empty: empty, width: w, height: h, cap: cap), let n = standing(px, empty: empty, width: w, height: h, cap: cap) else { return [] }
         let c = crown(k, after: p.rise, room: p.room), r = n.rise
         var out: [String] = []
         if k > 1 && r < p.rise + 0.03 { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, p.rise * 100)) }
         else if r < c - 0.06 { out.append(String(format: "too low: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure reaches the grey heap's top", r * 100, c * 100)) }
         if r > c + 0.06 { out.append(String(format: "too high: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure stops at the grey heap's top, and any lid rests low behind it, never raised above it", r * 100, c * 100)) }
         return out
+    }
+    /// A pot's lid as its own part, as the studio's rigs carry it (Cauldron Cash's `pupmkin_lid`): drawn once from State0
+    /// and laid on each state's treasure in code, tipped further open as it fills — GPT, asked to keep a lid while showing
+    /// the treasure, took it away and every state after it grew without one (2026-10-05).
+    public static func lidName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-lid" }
+    /// A state's body (the pot and its treasure, no lid), kept to grow the next state from.
+    public static func bodyName(pot i: Int, of total: Int, state k: Int) -> String { name(pot: i, of: total, state: k) + "_body" }
+    /// How far the lid is tipped at each state, in degrees.
+    public static let lidTilt: [Double] = [0, 6, 12, 18, 24, 30]
+    static func box(_ px: [UInt8], width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int)? {
+        var x0 = w, y0 = h, x1 = -1, y1 = -1
+        for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 128 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
+        return x1 < 0 ? nil : (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+    /// The first opaque row of `px` across the middle third of columns x0..<x0+cw — where a lid comes to rest.
+    static func restingTop(_ px: [UInt8], width w: Int, height h: Int, x0: Int, cw: Int) -> Int? {
+        let a = max(0, x0 + cw / 3), b = min(w, x0 + 2 * cw / 3)
+        for y in 0..<h { for x in a..<b where px[(y * w + x) * 4 + 3] > 128 { return y } }
+        return nil
+    }
+    /// The lid drawn alone (same canvas as State0) is a lid: high on the pot, no more than half its height, and over it.
+    public static func isLid(_ lid: [UInt8], empty: [UInt8], width w: Int, height h: Int) -> Bool {
+        guard let l = box(lid, width: w, height: h), let e = box(empty, width: w, height: h) else { return false }
+        var over = 0, all = 0
+        for i in 0..<(w * h) where lid[i * 4 + 3] > 128 { all += 1; if empty[i * 4 + 3] > 128 { over += 1 } }
+        return l.y < e.y + e.h / 3 && l.h <= e.h / 2 && Double(over) >= 0.8 * Double(max(1, all))
+    }
+    /// State0 without its lid: its pixels where the lid is not.
+    public static func withoutLid(_ empty: [UInt8], lid: [UInt8]) -> [UInt8] {
+        var out = empty
+        for i in 0..<(empty.count / 4) where lid[i * 4 + 3] > 128 { out[i * 4 + 3] = 0 }
+        return out
+    }
+    /// How much of the pot's height the lid stands above where it rests (so the treasure is held lower and the whole
+    /// stays within the shipped rise).
+    public static func lidShare(_ lid: [UInt8], body0: [UInt8], width w: Int, height h: Int) -> Double {
+        guard let l = box(lid, width: w, height: h), let b = box(body0, width: w, height: h),
+              let top = restingTop(body0, width: w, height: h, x0: l.x, cw: l.w) else { return 0 }
+        return Double(max(0, top - l.y)) / Double(max(1, b.h))
+    }
+    /// State `k`'s picture: its body with the lid laid on it, tipped `lidTilt[k]` degrees and slid a little aside as it opens,
+    /// then dropped until it rests on the treasure (or the rim) — settled into it a sixteenth of its height, as a lid sits —
+    /// so it lies on the heap wherever the heap is highest under it, never floating above it.
+    public static func withLid(_ body: [UInt8], lid: [UInt8], body0: [UInt8], width w: Int, height h: Int, state k: Int) -> [UInt8] {
+        guard let l = box(lid, width: w, height: h) else { return body }
+        let tilt = lidTilt[min(k, lidTilt.count - 1)], a = -tilt * .pi / 180
+        let piece = FrameKit.crop(lid, width: w, l.x, l.y, l.w, l.h)
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        // Tipped and slid aside, at its own height at first.
+        let cx = Double(l.x) + Double(l.w) / 2 + Double(l.w) * tilt / 150, cy = Double(l.y) + Double(l.h) / 2
+        guard let img = ChromaKeyOutputRules.image(straightRGBA8: piece.px, width: piece.w, height: piece.h, space: space),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return body }
+        ctx.interpolationQuality = .high
+        ctx.translateBy(x: cx, y: Double(h) - cy)                 // CG's y runs up
+        ctx.rotate(by: -a)
+        ctx.draw(img, in: CGRect(x: -Double(l.w) / 2, y: -Double(l.h) / 2, width: Double(l.w), height: Double(l.h)))
+        guard let laid = ctx.makeImage(), let lidPx = ChromaKeyOutputRules.straightRGBA8(laid) else { return body }
+        // Dropped (or lifted) until its underside meets the body's top in some column, settled a little into it.
+        var dy = Int.max
+        let sink = max(2, l.h / 16)
+        for x in 0..<w {
+            var lidBottom = -1, bodyTop = h
+            for y in 0..<h { if lidPx[(y * w + x) * 4 + 3] > 128 { lidBottom = y } }
+            guard lidBottom >= 0 else { continue }
+            for y in 0..<h where body[(y * w + x) * 4 + 3] > 128 { bodyTop = y; break }
+            guard bodyTop < h else { continue }
+            dy = min(dy, bodyTop + sink - lidBottom)
+        }
+        guard dy != Int.max else { return body }
+        var out = body
+        FrameKit.over(&out, width: w, FrameKit.Piece(px: lidPx, w: w, h: h), at: 0, dy)
+        return out
+    }
+    /// How much of a cut-out is holes — transparent pixels it encloses, the backing showing through where the drawing left
+    /// it (a magenta smudge in a pot's treasure, 2026-10-05) — as a share of its opaque pixels.
+    public static func holeShare(_ px: [UInt8], width w: Int, height h: Int) -> Double {
+        var outside = [Bool](repeating: false, count: w * h), stack: [Int] = []
+        for x in 0..<w { stack.append(x); stack.append((h - 1) * w + x) }
+        for y in 0..<h { stack.append(y * w); stack.append(y * w + w - 1) }
+        while let i = stack.popLast() {
+            guard !outside[i], px[i * 4 + 3] < 128 else { continue }
+            outside[i] = true
+            let x = i % w, y = i / w
+            if x > 0 { stack.append(i - 1) }; if x < w - 1 { stack.append(i + 1) }
+            if y > 0 { stack.append(i - w) }; if y < h - 1 { stack.append(i + w) }
+        }
+        var holes = 0, solid = 0
+        for i in 0..<(w * h) { if px[i * 4 + 3] >= 128 { solid += 1 } else if !outside[i] { holes += 1 } }
+        return Double(holes) / Double(max(1, solid))
     }
     /// A pot's Power Bet look, beside its states.
     public static func boostedName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-boostedIdle" }
@@ -9064,7 +9154,7 @@ public enum AssetChecklist {
                 let words = (l.potFeatures ?? []).indices.contains(i) ? l.potFeatures![i] : ""
                 out.append(Item(group: "Pots", name: PotStates.name(pot: i, of: n, state: 0).replacingOccurrences(of: "-State0Idle", with: ""),
                                 what: "pot \(i + 1), State0 to State\(PotStates.levels)" + (words.isEmpty ? "" : " — \(words)"),
-                                files: (0...PotStates.levels).map { "\(PotStates.name(pot: i, of: n, state: $0)).png" }, maker: "Pots", cost: Double(PotStates.levels + 1) * gpt(1024, PotStates.height(1024))))
+                                files: (0...PotStates.levels).map { "\(PotStates.name(pot: i, of: n, state: $0)).png" }, maker: "Pots", cost: Double(PotStates.levels + 2) * gpt(1024, PotStates.height(1024))))
                 if n > 1 { out.append(Item(group: "Pots", name: PotStates.plaqueName(pot: i), what: words.isEmpty ? "plaque, plain" : "plaque: \(words)",
                                            files: ["\(PotStates.plaqueName(pot: i)).png"], maker: "Pots", cost: gpt(1024, 384))) }
                 if let boost = l.potBoost {
@@ -9322,8 +9412,13 @@ public enum NumberFont {
     public static var size: (w: Int, h: Int) { (columns * cell, rows * cell) }
     /// The cell a glyph is drawn in, top-left based.
     public static func cell(_ i: Int) -> ReelArea.Rect { ReelArea.Rect(x: (i % columns) * cell, y: (i / columns) * cell, w: cell, h: cell) }
-    /// Amounts as the game prints them, every glyph but ¢, to read back once the font is cut.
+    /// Amounts as the game prints them, every glyph but ¢, to read back once the font is cut — a short line each, as the
+    /// recognizer splits a long one and returns its pieces out of order.
     public static let testAmounts = "$1,234,567.89 x5 10K 2.5M 1B 3T $0.60"
+    /// Long amounts, every digit and $ , . in them: the recognizer reads these reliably on every font measured; short
+    /// tokens (“x5 10K”, “3T $0.60”) it dropped or read upside down even on fonts that print well (2026-10-05), so the
+    /// letters K M B T x are checked by their count only (a glyph missing), not read.
+    static let testLines = ["$1,234,567,890", "$1,234,567.89"]
     /// `text` set in the cut font (its strip: one glyph a cell, `cellW` wide, in `glyphs` order): each glyph trimmed to
     /// its ink, set a twelfth of the line's height apart, words a third of it apart; the comma and full stop sit low as cut.
     public static func set(_ text: String, strip: [UInt8], width w: Int, height h: Int, cellW: Int) -> (px: [UInt8], w: Int, h: Int) {
@@ -9344,11 +9439,16 @@ public enum NumberFont {
     }
     /// How well the amounts read when the cut font is set at a phone's size for an iPhone SE: its glyphs as tall as
     /// shipped TOTAL WIN lettering (about 43 px on a 1170-px phone; research/legibility-measure.md), then 0.64 of that.
+    /// In an amount, an I or l is a 1 (the recognizer reads a display 1 as I with no words to guide it).
     public static func readAmounts(strip: [UInt8], width w: Int, height h: Int, cellW: Int, glyphHeight: Int) -> Double {
-        let line = set(testAmounts, strip: strip, width: w, height: h, cellW: cellW)
         let k = 43.0 * (750.0 / 1170.0) / Double(max(1, glyphHeight))
-        let small = FrameKit.resized(FrameKit.Piece(px: line.px, w: line.w, h: line.h), max(1, Int(Double(line.w) * k)), max(1, Int(Double(line.h) * k)))
-        return Legibility.readScore(Legibility.read(small.px, width: small.w, height: small.h), testAmounts)
+        let scores = testLines.map { text -> Double in
+            let line = set(text, strip: strip, width: w, height: h, cellW: cellW)
+            let small = FrameKit.resized(FrameKit.Piece(px: line.px, w: line.w, h: line.h), max(1, Int(Double(line.w) * k)), max(1, Int(Double(line.h) * k)))
+            let got = Legibility.read(small.px, width: small.w, height: small.h).map { "Il|".contains($0) ? "1" : String($0) }.joined()
+            return Legibility.readScore(got, text)
+        }
+        return scores.reduce(0, +) / Double(scores.count)
     }
 }
 
@@ -15969,6 +16069,14 @@ extension GDDAssetPrompts {
     /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
     /// A pot as it looks with the Power Bet on, in the GDD's own words: an edit of its full state, so it swaps in place.
+    /// A pot's lid alone, from State0 (attached): the same lid in the same place, the pot taken away.
+    static func potLidBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+        [
+            "Edit the attached image: it is a pot with its lid on, from a video slot game themed “\(theme.name)”. Show only its lid — exactly as it is: the same shape, size, position, material, colour and ornament — with the pot itself taken away: nothing but the lid, where it sits now.",
+            "No pot, treasure, text or anything else.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     static func potBoostBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), look: String) -> String {
         [
             "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, full. Show the same pot as it looks while the game's Power Bet is on, as the game's design says: “\(look)”",
@@ -15978,7 +16086,7 @@ extension GDDAssetPrompts {
     }
     /// A pot's fill state `k`, grown from state k−1 (attached, with the new treasure laid on it as a flat grey heap
     /// to the height PotStates.rise sets): the heap painted as more of the same treasure, nothing else changed.
-    static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
+    static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int, lidOff: Bool = false) -> String {
         let lid = ["", "still closed on its rim, the treasure only glinting in the seam beneath it", "lifted a little and tipped back, resting low behind the treasure",
                    "tipped further back, resting behind the heap", "swung open, resting behind the heap", "thrown open, resting behind the heap"][k]
         return [
@@ -15986,7 +16094,8 @@ extension GDDAssetPrompts {
              ? "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty. Show it at fill stage 1 of 5: the first of its treasure — the theme's own coins, gems or gold in the pot's own colours — just showing at its mouth, no higher than its rim, and a soft glow beginning within in the pot's own colour — never the background's."
              : "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). At a glance it must look clearly fuller and livelier than the stage before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.")
             + " The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces.",
-            "If the pot has a lid, cover or door, it is \(lid) — never raised up above the treasure, never taken away; a pot with no lid never gains one. Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
+            (lidOff ? "Its lid is off — it is laid back on afterwards: draw no lid, cover or door, and none of one. "
+                    : "If the pot has a lid, cover or door, it is \(lid) — never raised up above the treasure, never taken away; a pot with no lid never gains one. ") + "Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
@@ -16736,10 +16845,12 @@ public enum Legibility {
     /// whose shipped art is itself varied); `piece`: any other lettered or pictured piece (a logo, an intro card, a
     /// meter, the jackpot table) — its words read and its glints held to the titles' limit, the separator that held
     /// across every kind measured.
-    public enum Kind: String, Sendable { case title, message, button, panel, wedge, wheel, pot, coin, symbol, piece }
+    /// `word`: a word alone, laid on a blank button in code (the intro's CONTINUE in each language): read exactly in its
+    /// language, glints held — a bare word is mostly letter edges, so the button limits (measured on whole buttons) do not fit.
+    public enum Kind: String, Sendable { case title, message, button, panel, wedge, wheel, pot, coin, symbol, piece, word }
     /// Device pixels a kind is shown at on the 1170-px phone: across, or (a wedge) tall.
     static func displaySize(_ k: Kind) -> Int {
-        switch k { case .title: 520; case .message: 640; case .button: 330; case .panel: 700; case .wedge: 470; case .wheel: 1000; case .pot: 300; case .coin, .symbol: 200; case .piece: 360 }
+        switch k { case .title: 520; case .message: 640; case .button: 330; case .panel: 700; case .wedge: 470; case .wheel: 1000; case .pot: 300; case .coin, .symbol: 200; case .piece: 360; case .word: 230 }
     }
     /// Hard limits per kind (shipped p90): glints per 10,000 px, fine-detail share, edge density; nil: not limited.
     static func limits(_ k: Kind) -> (glints: Double?, hf: Double?, edges: Double?) {
@@ -16755,7 +16866,7 @@ public enum Legibility {
         case .pot: (53, 0.13, nil)
         case .coin: (nil, 0.20, nil)
         case .symbol: (54, 0.18, 0.27)
-        case .piece: (36, nil, nil)
+        case .piece, .word: (36, nil, nil)
         }
     }
     public struct Measure: Equatable, Sendable {
@@ -16915,7 +17026,8 @@ public enum Legibility {
         let req = VNRecognizeTextRequest()
         req.recognitionLevel = .accurate; req.usesLanguageCorrection = false; req.minimumTextHeight = 0
         if let languages { req.recognitionLanguages = languages }
-        try? VNImageRequestHandler(cgImage: cg).perform([req])
+        // Upright, always: left to guess, it read short lines of digits upside down (“$0.60” as “O9…”, 2026-10-05).
+        try? VNImageRequestHandler(cgImage: cg, orientation: .up).perform([req])
         let lines = (req.results ?? []).compactMap { o -> (String, CGRect)? in o.topCandidates(1).first.map { ($0.string, o.boundingBox) } }
         return lines.sorted { ($0.1.maxY, -$0.1.minX) > ($1.1.maxY, -$1.1.minX) }.map(\.0).joined(separator: " ")
     }

@@ -13807,3 +13807,25 @@ final class TitleAndCoinTests: XCTestCase {
         XCTAssertEqual(PopUps.lines("COLLECTOR BONUS WHEEL"), ["COLLECTOR", "BONUS WHEEL"])
     }
 }
+
+final class PotLidTests: XCTestCase {
+    // The lid, its own part, rests on the treasure wherever it is highest, and opens a little more each state.
+    func testTheLidRestsOnTheTreasure() {
+        let w = 120, h = 180
+        func rect(_ px: inout [UInt8], _ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) { for y in y0..<y1 { for x in x0..<x1 { px[(y * w + x) * 4 + 3] = 255; px[(y * w + x) * 4] = 200 } } }
+        var empty = [UInt8](repeating: 0, count: w * h * 4), lid = empty, body = empty
+        rect(&empty, 20, 80, 100, 180); rect(&empty, 30, 60, 90, 80)              // a pot, its lid on top
+        rect(&lid, 30, 60, 90, 80)
+        XCTAssertTrue(PotStates.isLid(lid, empty: empty, width: w, height: h))
+        let body0 = PotStates.withoutLid(empty, lid: lid)
+        rect(&body, 20, 80, 100, 180); rect(&body, 35, 50, 85, 80)               // treasure heaped above the rim
+        let whole = PotStates.withLid(body, lid: lid, body0: body0, width: w, height: h, state: 3)
+        let lidRows = (0..<h).filter { y in (0..<w).contains { x in whole[(y * w + x) * 4 + 3] > 128 && body[(y * w + x) * 4 + 3] <= 128 } }
+        XCTAssertLessThan(lidRows.last ?? h, 56)                                   // above the heap's top (50), touching it
+        XCTAssertGreaterThan(lidRows.last ?? 0, 40)
+        XCTAssertGreaterThan(PotStates.holeShare(body, width: w, height: h), -1)
+        var holed = body; for y in 100..<120 { for x in 50..<70 { holed[(y * w + x) * 4 + 3] = 0 } }
+        XCTAssertGreaterThan(PotStates.holeShare(holed, width: w, height: h), 0.03)
+        XCTAssertEqual(PotStates.lidTilt, PotStates.lidTilt.sorted())
+    }
+}
