@@ -13738,6 +13738,33 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertLessThanOrEqual(PotStates.crown(5, after: 0.45, room: 0.5), 0.5)
         XCTAssertFalse(PotStates.growthProblems(pot, previous: pot, empty: pot, width: w, height: h, state: 3).isEmpty)  // no rise: caught
     }
+    // The full pot is held to the shipped rigs' height; stage 1 lays no heap over a closed lid and need not rise yet.
+    func testPotsStayWithinTheShippedHeight() {
+        XCTAssertLessThanOrEqual(PotStates.crown(5, after: 0.25, room: PotStates.maxRise), PotStates.maxRise)
+        let w = 100, h = 150
+        var pot = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 70..<150 { for x in 20..<80 { pot[(y * w + x) * 4 + 3] = 255 } }
+        let t1 = PotStates.template(previous: pot, empty: pot, width: w, height: h, state: 1, backing: RGB8(255, 0, 255))!
+        XCTAssertEqual(t1, FrameKit.onBacking(pot, RGB8(255, 0, 255)))                   // no grey at stage 1
+        XCTAssertTrue(PotStates.growthProblems(pot, previous: pot, empty: pot, width: w, height: h, state: 1).isEmpty)
+        var tall = pot
+        for y in 30..<70 { for x in 30..<70 { tall[(y * w + x) * 4 + 3] = 255 } }          // 50% above at stage 2: too high
+        XCTAssertTrue(PotStates.growthProblems(tall, previous: pot, empty: pot, width: w, height: h, state: 2).contains { $0.hasPrefix("too high") })
+    }
+    // Words read in their own language where the recognizer reads it; amounts set in a cut number font.
+    func testWordsAndAmountsAreReadBack() {
+        XCTAssertEqual(Localized.readers("ja"), ["ja-JP"])
+        XCTAssertEqual(Localized.readers("ru"), ["ru-RU"])
+        XCTAssertNotNil(Localized.readers("fi"))
+        XCTAssertNil(Localized.readers("el"))
+        XCTAssertTrue(Localized.continueWord.allSatisfy { $0.lang == "el" || Localized.readers($0.lang) != nil })
+        let cellW = 40, h = 50, n = NumberFont.glyphs.count
+        var strip = [UInt8](repeating: 0, count: cellW * n * h * 4)
+        for i in 0..<n { for y in 5..<45 { for x in (i * cellW + 10)..<(i * cellW + 30) { strip[(y * cellW * n + x) * 4 + 3] = 255 } } }
+        let line = NumberFont.set("10K 2.5M", strip: strip, width: cellW * n, height: h, cellW: cellW)
+        XCTAssertEqual(line.h, h)
+        XCTAssertEqual(line.w, 7 * (20 + h / 12) + h / 3)                                  // seven glyphs, one space
+    }
     // The phone-size check: a speckled piece fails where a smooth one passes; reading is scored by letters.
     func testThePhoneSizeCheckSeesGlints() {
         let n = 300

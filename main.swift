@@ -26605,7 +26605,12 @@ final class GDDToAssetsRun: ObservableObject {
             }
             guard let canvas = blank(NumberFont.size.w, NumberFont.size.h),
                   let px = paint("\(fontName)_sheet", prompt: GDDAssetPrompts.fontBrief(theme: theme, backing: (backing.name, b), reference: refWhat),
-                                 inputs: [downsamplePNG(ref, longEdge: 1024) ?? ref, canvas], w: NumberFont.size.w, h: NumberFont.size.h, covered: nil) else { continue }
+                                 inputs: [downsamplePNG(ref, longEdge: 1024) ?? ref, canvas], w: NumberFont.size.w, h: NumberFont.size.h, covered: nil,
+                                 judge: { px in
+                                     // Its glyphs cut and set as amounts the game prints, read back: each problem one more to fix.
+                                     let p = self.numberFontCut(FrameKit.keyed(px, backing: b), name: fontName).problems
+                                     return (p, Double(p.count))
+                                 }) else { continue }
             both(px, NumberFont.size.w, NumberFont.size.h, "\(fontName)_sheet")
             if let strip = numberFontStrip(FrameKit.keyed(px, backing: b), folder: folder, name: fontName) { problems += strip }
         }
@@ -26646,8 +26651,17 @@ final class GDDToAssetsRun: ObservableObject {
         if localize, let btn = try? Data(contentsOf: url("base_popUp_bonusBtn.png")) {
             for (lang, word) in Localized.continueWord where !has("\(Localized.name(lang)).png") {
                 guard let canvas = blank(1024, 352) else { continue }
+                // Read in its own language at the size it is shown on the CONTINUE button (its word about 230 px across);
+                // a language the recognizer cannot read (Greek) is said, not guessed at.
+                let readers = Localized.readers(lang)
+                if readers == nil, !problems.contains(where: { $0.hasPrefix("not read back") }) { problems.append("not read back (no text recognizer for it here): the CONTINUE word in \(lang) — check it by eye") }
                 if let px = paint(Localized.name(lang), prompt: GDDAssetPrompts.localizedBrief(theme: theme, backing: (backing.name, b), word: word, lang: lang),
-                                  inputs: [downsamplePNG(btn, longEdge: 1024) ?? btn, canvas], w: 1024, h: 352, covered: nil) { both(px, 1024, 352, Localized.name(lang)) }
+                                  inputs: [downsamplePNG(btn, longEdge: 1024) ?? btn, canvas], w: 1024, h: 352, covered: nil,
+                                  judge: { px in
+                                      let k = FrameKit.keyed(px, backing: b, width: 1024, height: 352)
+                                      guard let m = Legibility.measure(k, width: 1024, height: 352, kind: .button, text: readers == nil ? nil : word, display: 230, languages: readers) else { return ([], 0) }
+                                      return (Legibility.problems(m, kind: .button), Legibility.excess(m, kind: .button))
+                                  }) { both(px, 1024, 352, Localized.name(lang)) }
             }
         }
         // 9. The loading screen and lobby icons, put together from the logo, the key art and the base background. Free.
@@ -26741,6 +26755,17 @@ final class GDDToAssetsRun: ObservableObject {
     }
 
     func numberFontStrip(_ px: [UInt8], folder: URL, name: String = "transition_font_totalWin") -> [String]? {
+        let cut = numberFontCut(px, name: name)
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        try? ChromaKeyOutputRules.image(straightRGBA8: cut.strip, width: cut.w, height: cut.h, space: space).flatMap(encodePNG)?
+            .write(to: folder.appendingPathComponent("\(name).png"))
+        let meta: [String: Any] = ["glyphs": NumberFont.glyphs, "cellWidth": cut.cellW, "height": cut.h, "problems": cut.problems]
+        try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]).write(to: folder.appendingPathComponent("\(name).json"))
+        return cut.problems
+    }
+    /// The font's grid (NumberFont, straight RGBA) cut into its strip, and what is wrong with it — a glyph missing,
+    /// cut off, or amounts set in it that do not read at a phone's size for an iPhone SE (NumberFont.readAmounts).
+    nonisolated func numberFontCut(_ px: [UInt8], name: String) -> (strip: [UInt8], w: Int, h: Int, cellW: Int, problems: [String]) {
         let (W, _) = NumberFont.size, height = 128, glyphH = 108
         var glyphs: [FrameKit.Piece] = [], problems: [String] = []
         // Each row's glyphs found by the gaps between them, not by cells: GPT spaces a short last row evenly
@@ -26798,12 +26823,9 @@ final class GDDToAssetsRun: ObservableObject {
             let low = NumberFont.glyphs[i] == "," || NumberFont.glyphs[i] == "."
             FrameKit.over(&strip, width: stripW, g, at: i * cellW + (cellW - g.w) / 2, max(0, low ? height - 10 - g.h : (height - g.h) / 2))
         }
-        let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        try? ChromaKeyOutputRules.image(straightRGBA8: strip, width: stripW, height: height, space: space).flatMap(encodePNG)?
-            .write(to: folder.appendingPathComponent("\(name).png"))
-        let meta: [String: Any] = ["glyphs": NumberFont.glyphs, "cellWidth": cellW, "height": height, "problems": problems]
-        try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]).write(to: folder.appendingPathComponent("\(name).json"))
-        return problems
+        let read = NumberFont.readAmounts(strip: strip, width: stripW, height: height, cellW: cellW, glyphHeight: glyphH)
+        if read < 1 { problems.append(String(format: "\(name): amounts set in it read %.0f%% at a small phone's size (“%@”) — its digits need clean, solid faces, thick strokes and a thick dark outline, well apart", read * 100, NumberFont.testAmounts)) }
+        return (strip, stripW, height, cellW, problems)
     }
 
     /// The loading screen and lobby icons (Composites): the base background filling each, the key art standing in

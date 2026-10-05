@@ -8811,6 +8811,9 @@ public enum PotStates {
     /// research/legibility-measure.md §6). Back-loaded, so the last states still grow: generated rigs drawn each from
     /// State0 reached 91–99% of their height by State3 and barely changed after it.
     public static let rise = [0.0, 0.03, 0.07, 0.13, 0.20, 0.26]
+    /// The full pot's top stands no higher than the shipped rigs' tallest (29%; research §6): the canvas's extra room
+    /// only keeps a drawing that overshoots from being cut off.
+    public static let maxRise = 0.30
     /// The rows a silhouette spans: those with an opaque pixel in at least 1% of the width.
     static func span(_ px: [UInt8], width w: Int, height h: Int) -> (top: Int, bottom: Int)? {
         let rows = (0..<h).filter { y in (0..<w).reduce(0) { $0 + (px[(y * w + $1) * 4 + 3] > 128 ? 1 : 0) } >= max(1, w / 100) }
@@ -8831,7 +8834,7 @@ public enum PotStates {
     static func standing(_ px: [UInt8], empty: [UInt8], width w: Int, height h: Int) -> (rise: Double, room: Double, s0: (top: Int, bottom: Int))? {
         guard let s0 = span(empty, width: w, height: h), let sp = span(px, width: w, height: h) else { return nil }
         let H0 = Double(max(1, s0.bottom - s0.top))
-        return (Double(s0.top - sp.top) / H0, (Double(s0.top) - 0.03 * Double(h)) / H0, s0)
+        return (Double(s0.top - sp.top) / H0, min(maxRise, (Double(s0.top) - 0.03 * Double(h)) / H0), s0)
     }
     static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8) -> [UInt8]? {
         guard k > 0, k < rise.count, let st = standing(previous, empty: empty, width: w, height: h) else { return nil }
@@ -8846,6 +8849,9 @@ public enum PotStates {
         let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.42
         let crown = max(0, Double(s0.top) - crown(k, after: st.rise, room: st.room) * H0), foot = Double(s0.top) + 0.12 * H0
         var out = FrameKit.onBacking(previous, b)
+        // Stage 1 has no heap: a grey band over a closed lid read as treasure piled on it, and GPT threw the lid open
+        // (20% of the pot's height at State1, 2026-10-05; shipped rigs rise 1–5% there). Its treasure only glints.
+        guard k > 1 else { return out }
         for y in Int(crown)..<min(h, Int(foot)) { for x in max(0, Int(cx - hw))..<min(w, Int(cx + hw) + 1) where previous[(y * w + x) * 4 + 3] < 128 {
             let dx = (Double(x) - cx) / hw, dy = (foot - Double(y)) / max(1, foot - crown)
             guard dx * dx + dy * dy <= 1 else { continue }
@@ -8861,9 +8867,9 @@ public enum PotStates {
         guard k > 0, k < rise.count, let p = standing(previous, empty: empty, width: w, height: h), let n = standing(px, empty: empty, width: w, height: h) else { return [] }
         let c = crown(k, after: p.rise, room: p.room), r = n.rise
         var out: [String] = []
-        if r < p.rise + (k == 1 ? 0.01 : 0.03) { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, p.rise * 100)) }
+        if k > 1 && r < p.rise + 0.03 { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, p.rise * 100)) }
         else if r < c - 0.06 { out.append(String(format: "too low: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure reaches the grey heap's top", r * 100, c * 100)) }
-        if r > c + 0.08 { out.append(String(format: "too high too soon: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure stops at the grey heap's top and any lid opens only as far as this stage says", r * 100, c * 100)) }
+        if r > c + 0.06 { out.append(String(format: "too high: its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%% — the treasure stops at the grey heap's top, and any lid rests low behind it, never raised above it", r * 100, c * 100)) }
         return out
     }
     /// A pot's Power Bet look, beside its states.
@@ -9205,6 +9211,15 @@ public enum Localized {
         ("ja", "続ける"), ("ko", "계속"), ("zh", "继续"),
     ]
     public static func name(_ lang: String) -> String { "shared_intro_continue-asset-txt-\(lang)" }
+    /// The text recognizer to read a language's word with (Apple Vision's, accurate, macOS 14: 18 of the 21); a Latin
+    /// script it has no recognizer for (Finnish, Hungarian) read as Latin; nil for one it cannot read at all (Greek).
+    public static func readers(_ lang: String) -> [String]? {
+        let own = ["en": "en-US", "de": "de-DE", "es": "es-ES", "fr": "fr-FR", "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "sv": "sv-SE",
+                   "da": "da-DK", "no": "nb-NO", "pl": "pl-PL", "cs": "cs-CZ", "ro": "ro-RO", "tr": "tr-TR", "ru": "ru-RU",
+                   "ja": "ja-JP", "ko": "ko-KR", "zh": "zh-Hans"]
+        if let v = own[lang] { return [v] }
+        return ["fi", "hu"].contains(lang) ? ["en-US", "de-DE"] : nil
+    }
 }
 
 /// What can be drawn from what is already made (asset inventory, 2026-10-04): the special symbols' lit "win"
@@ -9283,6 +9298,34 @@ public enum NumberFont {
     public static var size: (w: Int, h: Int) { (columns * cell, rows * cell) }
     /// The cell a glyph is drawn in, top-left based.
     public static func cell(_ i: Int) -> ReelArea.Rect { ReelArea.Rect(x: (i % columns) * cell, y: (i / columns) * cell, w: cell, h: cell) }
+    /// Amounts as the game prints them, every glyph but ¢, to read back once the font is cut.
+    public static let testAmounts = "$1,234,567.89 x5 10K 2.5M 1B 3T $0.60"
+    /// `text` set in the cut font (its strip: one glyph a cell, `cellW` wide, in `glyphs` order): each glyph trimmed to
+    /// its ink, set a twelfth of the line's height apart, words a third of it apart; the comma and full stop sit low as cut.
+    public static func set(_ text: String, strip: [UInt8], width w: Int, height h: Int, cellW: Int) -> (px: [UInt8], w: Int, h: Int) {
+        var pieces: [FrameKit.Piece?] = []
+        for ch in text {
+            guard ch != " " else { pieces.append(nil); continue }
+            guard let i = glyphs.firstIndex(of: String(ch)), (i + 1) * cellW <= w else { continue }
+            let cellPx = FrameKit.crop(strip, width: w, i * cellW, 0, cellW, h)
+            var x0 = cellW, x1 = -1
+            for y in 0..<h { for x in 0..<cellW where cellPx.px[(y * cellW + x) * 4 + 3] > 96 { x0 = min(x0, x); x1 = max(x1, x) } }
+            if x1 >= x0 { pieces.append(FrameKit.crop(cellPx.px, width: cellW, x0, 0, x1 - x0 + 1, h)) }
+        }
+        let gap = h / 12, space = h / 3
+        let W = max(1, pieces.reduce(0) { $0 + ($1.map { $0.w + gap } ?? space) })
+        var out = [UInt8](repeating: 0, count: W * h * 4), x = 0
+        for p in pieces { if let p { FrameKit.over(&out, width: W, p, at: x, 0); x += p.w + gap } else { x += space } }
+        return (out, W, h)
+    }
+    /// How well the amounts read when the cut font is set at a phone's size for an iPhone SE: its glyphs as tall as
+    /// shipped TOTAL WIN lettering (about 43 px on a 1170-px phone; research/legibility-measure.md), then 0.64 of that.
+    public static func readAmounts(strip: [UInt8], width w: Int, height h: Int, cellW: Int, glyphHeight: Int) -> Double {
+        let line = set(testAmounts, strip: strip, width: w, height: h, cellW: cellW)
+        let k = 43.0 * (750.0 / 1170.0) / Double(max(1, glyphHeight))
+        let small = FrameKit.resized(FrameKit.Piece(px: line.px, w: line.w, h: line.h), max(1, Int(Double(line.w) * k)), max(1, Int(Double(line.h) * k)))
+        return Legibility.readScore(Legibility.read(small.px, width: small.w, height: small.h), testAmounts)
+    }
 }
 
 /// Gemini's reading of what else a game needs on screen (ConceptPiece), given what Navigator already makes.
@@ -15460,7 +15503,7 @@ extension GDDAssetPrompts {
     /// Detail that holds up at phone size: shipped pieces have 2–5x fewer specular glints and 1.6–3.7x less detail
     /// finer than 1.5 px than generated ones, measured at display size (research/legibility-measure.md). Richness from
     /// light and big value masses, not texture (Valve's TF2 paper, Loomis' four values, Rosenholtz's clutter measures).
-    static let detailRules = "AT PHONE SIZE it must still read, so: a strong, simple silhouette and three or four big masses of light and shade; ornament in a few bold, chunky shapes — no fine filigree, hairline engraving, tiny gems or speckled glitter; smooth surfaces between the ornament. Keep it rich through light, not texture: warm highlights, cool shadows, a saturated edge between them and a crisp rim light, with a few deliberate highlights at most — no scattered sparkles, glints or star fields."
+    static let detailRules = "AT PHONE SIZE it must still read, so: a strong, simple silhouette and three or four big masses of light and shade; ornament in a few bold, chunky shapes — no fine filigree, hairline engraving, tiny gems or speckled glitter; smooth surfaces between the ornament. Keep it rich through light, not texture: warm highlights, cool shadows, a saturated edge between them and a crisp rim light, with a few deliberate highlights at most — no scattered sparkles, glints or star fields, and no sparkle stars, star-shaped flares or lens glints anywhere, whatever the look above says: the game animates its own shine."
 
     /// The same, short, for the symbols and their frames, whose briefs are held under 450 words.
     static let reelDetail = "Read at reel size: strong silhouette, big masses of light and shade, bold ornament; no fine filigree, tiny gems, glitter or scattered sparkles."
@@ -15788,7 +15831,7 @@ extension GDDAssetPrompts {
         switch kind {
         case .panel: what = "the blank panel the game's award pop-ups appear on — a grand plaque. Repaint it with an ornate frame in the reel frame's own material and craft; its inner face a rich deep colour of the theme, plain and empty: the game lays its titles and amounts on it. No text, numbers or icons."
         case .bar: what = "the long bar a pop-up's amount is printed in. Repaint it as a recessed dark field framed in the reel frame's trim, plain and empty: the game prints the number there. No text or numbers."
-        case .button: what = "a button on the game's pop-ups. Repaint it in the reel frame's own material, a raised pill with a smooth, plain face, lettered “\(text)” across its middle, spelled exactly so, spanning most of its width. No other text. " + letteringRules
+        case .button: what = "a button on the game's pop-ups. Repaint it in the reel frame's own material, a raised pill with a smooth, plain face and a plain, bold rim — no sparkle stars, flares, lens glints or rows of tiny lights on it or at its ends — lettered “\(text)” across its middle, spelled exactly so, spanning most of its width. No other text. " + letteringRules
         case .title: what = ""
         }
         return [
@@ -15815,7 +15858,7 @@ extension GDDAssetPrompts {
     /// what the pot unlocks, or plain when the game does not say.
     static func potPlaqueBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), word: String) -> String {
         [
-            "Image 1 is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is the small plaque that sits beneath that pot. Paint it in the pot's own colour and material, a raised plate with a simple bold trim and a smooth face.",
+            "Image 1 is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is the small plaque that sits beneath that pot. Paint it in the pot's own colour and material, a raised plate with a simple bold trim and a smooth face — no sparkle stars, flares, lens glints or rows of tiny lights on it or at its ends.",
             word.isEmpty ? "Its face stays plain and empty. No text or numbers." : "Letter “\(word)” across it, spelled exactly so, as large as the plaque allows. No other text. " + letteringRules,
             "It keeps exactly its size and outline.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
@@ -15892,11 +15935,14 @@ extension GDDAssetPrompts {
     /// A pot's fill state `k`, grown from state k−1 (attached, with the new treasure laid on it as a flat grey heap
     /// to the height PotStates.rise sets): the heap painted as more of the same treasure, nothing else changed.
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
-        let lid = ["", "still resting on its rim, lifted only a finger's width at the front so the treasure glints in the gap", "lifted a little, tilted back a quarter of the way",
-                   "tilted halfway open", "opened most of the way", "thrown fully open"][k]
+        let lid = ["", "still closed on its rim, the treasure only glinting in the seam beneath it", "lifted a little and tipped back, resting low behind the treasure",
+                   "tipped further back, resting behind the heap", "swung open, resting behind the heap", "thrown open, resting behind the heap"][k]
         return [
-            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, \(k == 1 ? "empty" : "at fill stage \(k - 1) of 5"). The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). At a glance this stage must look clearly fuller and livelier than the one before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.",
-            "If the pot has a lid, cover or door, the rising treasure lifts it: \(lid) on its hinge or resting tilted on the heap — never taken away; a pot with no lid never gains one. Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
+            (k == 1
+             ? "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty. Show it at fill stage 1 of 5: the first of its treasure — the theme's own coins, gems or gold in the pot's own colours — just showing at its mouth, no higher than its rim, and a soft glow beginning within in the pot's own colour — never the background's."
+             : "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). At a glance it must look clearly fuller and livelier than the stage before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.")
+            + " The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces.",
+            "If the pot has a lid, cover or door, it is \(lid) — never raised up above the treasure, never taken away; a pot with no lid never gains one. Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
@@ -16675,7 +16721,7 @@ public enum Legibility {
 
     /// The piece (straight RGBA) cropped to its silhouette and scaled to its display size, measured.
     /// `display`: the device pixels it is shown across, when not its kind's.
-    public static func measure(_ px: [UInt8], width w: Int, height h: Int, kind: Kind, text: String? = nil, display: Int? = nil) -> Measure? {
+    public static func measure(_ px: [UInt8], width w: Int, height h: Int, kind: Kind, text: String? = nil, display: Int? = nil, languages: [String]? = nil) -> Measure? {
         guard let box = opaqueBox(px, width: w, height: h) else { return nil }
         let crop = FrameKit.crop(px, width: w, box.x, box.y, box.w, box.h)
         let s = Double(display ?? displaySize(kind)) / Double(kind == .wedge ? crop.h : crop.w)
@@ -16684,7 +16730,7 @@ public enum Legibility {
         if let text, !text.isEmpty {
             let se = 750.0 / 1170.0
             let small = FrameKit.resized(d, max(1, Int(Double(d.w) * se)), max(1, Int(Double(d.h) * se)))
-            m.read = readScore(read(small.px, width: small.w, height: small.h), text)
+            m.read = readScore(read(small.px, width: small.w, height: small.h, languages: languages), text)
         }
         return m
     }
@@ -16692,11 +16738,21 @@ public enum Legibility {
     public static func problems(_ m: Measure, kind: Kind) -> [String] {
         let l = limits(kind)
         var out: [String] = []
-        if let g = l.glints, m.glints > g { out.append(String(format: "too many sparkles and glints (%.0f per 10,000 px at phone size; shipped art at most %.0f)", m.glints, g)) }
-        if let h = l.hf, m.hf > h { out.append(String(format: "too much fine detail and texture (%.2f of its light and shade is finer than the phone shows clearly; shipped at most %.2f)", m.hf, h)) }
+        if let g = l.glints, m.glints > g { out.append(String(format: "too many sparkles and glints (%.0f per 10,000 px at phone size; shipped art at most %.0f)", m.glints, g) + advice(kind, glints: true)) }
+        if let h = l.hf, m.hf > h { out.append(String(format: "too much fine detail and texture (%.2f of its light and shade is finer than the phone shows clearly; shipped at most %.2f)", m.hf, h) + advice(kind, glints: false)) }
         if let e = l.edges, m.edges > e { out.append(String(format: "too busy (%.0f%% of it is edges at phone size; shipped at most %.0f%%)", m.edges * 100, e * 100)) }
         if let r = m.read, r < (kind == .title || kind == .piece ? 0.8 : 1) { out.append(String(format: "its words do not read at a small phone's size (%.0f%% read)", r * 100)) }
         return out
+    }
+    /// What to change, for the redraw, by what the piece is.
+    static func advice(_ k: Kind, glints: Bool) -> String {
+        switch k {
+        case .pot: glints ? " — the treasure in fewer, bigger coins and gems with smooth faces and only a handful of highlights; no sparkle stars"
+                          : " — the treasure in fewer, bigger pieces and the pot's ornament in a few bold raised shapes with smooth metal between them"
+        case .button, .panel: " — a plain, bold frame with smooth surfaces: no sparkle stars, flares, lens glints or rows of tiny lights on it or at its ends"
+        case .title, .message, .coin: " — letters with clean solid faces and no sparkle in or around them"
+        default: " — fewer, bolder details and smooth surfaces, no sparkle stars or glitter"
+        }
     }
     /// How far past its limits a piece is, to keep the better of two drawings: 0 when it passes.
     public static func excess(_ m: Measure, kind: Kind) -> Double {
@@ -16794,7 +16850,7 @@ public enum Legibility {
 
     /// The words Apple's text recognition reads in a piece laid on a dark slate: accurate, with no language
     /// correction, so it reads the letter shapes rather than guessing words.
-    static func read(_ px: [UInt8], width w: Int, height h: Int) -> String {
+    static func read(_ px: [UInt8], width w: Int, height h: Int, languages: [String]? = nil) -> String {
         var flat = [UInt8](repeating: 255, count: w * h * 4)
         for i in 0..<(w * h) {
             let a = Double(px[i * 4 + 3]) / 255
@@ -16803,6 +16859,7 @@ public enum Legibility {
         guard let cg = ChromaKeyOutputRules.image(straightRGBA8: flat, width: w, height: h, space: CGColorSpace(name: CGColorSpace.sRGB)) else { return "" }
         let req = VNRecognizeTextRequest()
         req.recognitionLevel = .accurate; req.usesLanguageCorrection = false; req.minimumTextHeight = 0
+        if let languages { req.recognitionLanguages = languages }
         try? VNImageRequestHandler(cgImage: cg).perform([req])
         let lines = (req.results ?? []).compactMap { o -> (String, CGRect)? in o.topCandidates(1).first.map { ($0.string, o.boundingBox) } }
         return lines.sorted { ($0.1.maxY, -$0.1.minX) > ($1.1.maxY, -$1.1.minX) }.map(\.0).joined(separator: " ")
