@@ -26431,31 +26431,51 @@ final class GDDToAssetsRun: ObservableObject {
                     } else if r.text != nil { try? "no lid".write(to: noLid, atomically: true, encoding: .utf8) }
                 }
                 let body0 = lid.map { PotStates.withoutLid(e0.px, lid: $0) } ?? e0.px
-                // The treasure held lower by what the lid stands above it, so the whole stays within the shipped rise.
-                let cap = lid.map { max(0.15, PotStates.maxRise - PotStates.lidShare($0, body0: body0, width: 1024, height: potH)) } ?? PotStates.maxRise
+                // A lid resting on the treasure stands as far above it as it stood above the rim at State0, so the whole rises
+                // just as far as the treasure: the shipped rise holds for the treasure itself.
+                let cap = PotStates.maxRise
                 for k in 1...PotStates.levels where !has("\(jar(i, k)).png") {
+                    // What it grows from: the state before, its lid as laid taken off.
                     let prevBody: [UInt8]
                     if k == 1 { prevBody = body0 } else {
-                        guard let p = load(lid != nil ? "\(PotStates.bodyName(pot: i, of: total, state: k - 1))_rmbg.png" : "\(jar(i, k - 1))_rmbg.png"), p.w == 1024, p.h == potH else { break }
-                        prevBody = p.px
+                        guard let p = load("\(jar(i, k - 1))_rmbg.png"), p.w == 1024, p.h == potH else { break }
+                        if lid != nil {
+                            guard let l = load("\(PotStates.lidLayerName(pot: i, of: total, state: k - 1))_rmbg.png"), l.w == 1024, l.h == potH else { break }
+                            prevBody = PotStates.withoutLaidLid(p.px, laid: l.px)
+                        } else { prevBody = p.px }
                     }
-                    guard let tpl = PotStates.template(previous: prevBody, empty: body0, width: 1024, height: potH, state: k, backing: b, cap: cap).flatMap({ png($0, 1024, potH) }) else { break }
+                    // Its template: the grey heap to its height, and the lid laid on it by code where it rests now.
+                    guard var tplPx = PotStates.heaped(previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap) else { break }
+                    var laidLid: [UInt8]?
+                    if let lid {
+                        guard let placed = PotStates.placeLid(on: tplPx, lid: lid, width: 1024, height: potH, state: k) else { break }
+                        tplPx = placed.px; laidLid = placed.lid
+                    }
+                    guard let tpl = png(FrameKit.onBacking(tplPx, b), 1024, potH) else { break }
+                    let tplTop = PotStates.span(tplPx, width: 1024, height: potH)?.top ?? 0
                     let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
                         let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
-                        var p = PotStates.growthProblems(laid, previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap), x = Double(p.count)
-                        if PotStates.holeShare(laid, width: 1024, height: potH) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure and the open mouth solid"); x += 1 }
+                        var p: [String] = []
+                        if let laidLid {
+                            // The lid where code laid it, and the picture's top where the template's was.
+                            if PotStates.lidKept(laid, laid: laidLid) < 0.85 { p.append("the lid moved or was taken away — keep it exactly where it is, at that angle") }
+                            if let t = PotStates.span(laid, width: 1024, height: potH)?.top, abs(t - tplTop) > potH / 25 { p.append("its top is not where the lid rests — the treasure stops under the lid; nothing rises above it") }
+                            p += PotStates.growthProblems(PotStates.withoutLaidLid(laid, laid: laidLid), previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap)
+                                .filter { !$0.hasPrefix("too high") }        // the lid, laid by code, sets the height
+                        } else {
+                            p += PotStates.growthProblems(laid, previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap)
+                        }
+                        var x = Double(p.count)
+                        if PotStates.holeShare(laid, width: 1024, height: potH) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure and the gap under the lid solid"); x += 1 }
                         if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
                         return (p, x)
                     }
-                    guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k, lidOff: lid != nil),
-                                         inputs: [tpl], w: 1024, h: potH, covered: nil, judge: judge) else { break }    // the states after it grow from it
+                    let prompt = lid != nil ? GDDAssetPrompts.potLidStateBrief(theme: theme, backing: (backing.name, b), level: k)
+                                            : GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k)
+                    guard let px = paint(jar(i, k), prompt: prompt, inputs: [tpl], w: 1024, h: potH, covered: nil, judge: judge) else { break }    // the states after it grow from it
                     let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
-                    var whole = laid
-                    if let lid {
-                        write(laid, 1024, potH, "\(PotStates.bodyName(pot: i, of: total, state: k))_rmbg.png")
-                        whole = PotStates.withLid(laid, lid: lid, body0: body0, width: 1024, height: potH, state: k)
-                    }
-                    write(FrameKit.onBacking(whole, b), 1024, potH, "\(jar(i, k)).png"); write(whole, 1024, potH, "\(jar(i, k))_rmbg.png")
+                    write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
+                    if let laidLid { write(laidLid, 1024, potH, "\(PotStates.lidLayerName(pot: i, of: total, state: k))_rmbg.png") }
                 }
                 // With the Power Bet on, the look the GDD gives the pot, an edit of its full state (PotStates.boost).
                 if let look = layout.potBoost, !has("\(PotStates.boostedName(pot: i, of: total)).png"), let full = try? Data(contentsOf: url("\(jar(i, PotStates.levels)).png")) {

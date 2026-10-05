@@ -8837,18 +8837,21 @@ public enum PotStates {
         return (Double(s0.top - sp.top) / H0, min(cap, (Double(s0.top) - 0.03 * Double(h)) / H0), s0)
     }
     static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8, cap: Double = maxRise) -> [UInt8]? {
+        heaped(previous: previous, empty: empty, width: w, height: h, state: k, cap: cap).map { FrameKit.onBacking($0, b) }
+    }
+    /// State k−1 (straight RGBA) with its grey heap added, opaque — the template before it is laid on the backing.
+    static func heaped(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise) -> [UInt8]? {
         guard k > 0, k < rise.count, let st = standing(previous, empty: empty, width: w, height: h, cap: cap) else { return nil }
         let s0 = st.s0, H0 = Double(s0.bottom - s0.top)
-        // The pot's top: its widest row in its top third.
-        var x0 = 0, x1 = -1
-        for y in s0.top..<min(h, s0.top + Int(H0 * 0.35)) {
-            let xs = (0..<w).filter { empty[(y * w + $0) * 4 + 3] > 128 }
-            if let a = xs.first, let z = xs.last, z - a > x1 - x0 { x0 = a; x1 = z }
-        }
-        guard x1 > x0 else { return nil }
-        let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.42
-        let crown = max(0, Double(s0.top) - crown(k, after: st.rise, room: st.room) * H0), foot = Double(s0.top) + 0.12 * H0
-        var out = FrameKit.onBacking(previous, b)
+        // The pot's mouth: its first row at least 40% as wide as its widest (past a lid's knob), the heap as wide as
+        // that rim and rising from it — not from the shoulders, which put grey beside the neck (2026-10-05).
+        func extent(_ y: Int) -> (Int, Int)? { let xs = (0..<w).filter { empty[(y * w + $0) * 4 + 3] > 128 }; return xs.first.map { ($0, xs.last!) } }
+        let widest = (s0.top...s0.bottom).compactMap { extent($0).map { $0.1 - $0.0 } }.max() ?? 0
+        guard let rimY = (s0.top...s0.bottom).first(where: { y in extent(y).map { Double($0.1 - $0.0) >= 0.4 * Double(widest) } ?? false }),
+              let (x0, x1) = extent(rimY), x1 > x0 else { return nil }
+        let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.5
+        let crown = max(0, Double(s0.top) - crown(k, after: st.rise, room: st.room) * H0), foot = Double(rimY) + 0.03 * H0
+        var out = previous
         // Stage 1 has no heap: a grey band over a closed lid read as treasure piled on it, and GPT threw the lid open
         // (20% of the pot's height at State1, 2026-10-05; shipped rigs rise 1–5% there). Its treasure only glints.
         guard k > 1 else { return out }
@@ -8876,10 +8879,11 @@ public enum PotStates {
     /// and laid on each state's treasure in code, tipped further open as it fills — GPT, asked to keep a lid while showing
     /// the treasure, took it away and every state after it grew without one (2026-10-05).
     public static func lidName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-lid" }
-    /// A state's body (the pot and its treasure, no lid), kept to grow the next state from.
-    public static func bodyName(pot i: Int, of total: Int, state k: Int) -> String { name(pot: i, of: total, state: k) + "_body" }
+    /// The lid as laid on a state (its own layer): taken off to grow the next state, and the animators' lid for that state.
+    public static func lidLayerName(pot i: Int, of total: Int, state k: Int) -> String { name(pot: i, of: total, state: k) + "_lid" }
     /// How far the lid is tipped at each state, in degrees.
-    public static let lidTilt: [Double] = [0, 6, 12, 18, 24, 30]
+    /// Gentle: a lid lifted by the treasure under it stays nearly level (a flat lid spun 30° read as sliding off, 2026-10-05).
+    public static let lidTilt: [Double] = [0, 2, 3, 5, 6, 8]
     static func box(_ px: [UInt8], width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int)? {
         var x0 = w, y0 = h, x1 = -1, y1 = -1
         for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 128 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
@@ -8904,46 +8908,54 @@ public enum PotStates {
         for i in 0..<(empty.count / 4) where lid[i * 4 + 3] > 128 { out[i * 4 + 3] = 0 }
         return out
     }
-    /// How much of the pot's height the lid stands above where it rests (so the treasure is held lower and the whole
-    /// stays within the shipped rise).
-    public static func lidShare(_ lid: [UInt8], body0: [UInt8], width w: Int, height h: Int) -> Double {
-        guard let l = box(lid, width: w, height: h), let b = box(body0, width: w, height: h),
-              let top = restingTop(body0, width: w, height: h, x0: l.x, cw: l.w) else { return 0 }
-        return Double(max(0, top - l.y)) / Double(max(1, b.h))
-    }
-    /// State `k`'s picture: its body with the lid laid on it, tipped `lidTilt[k]` degrees and slid a little aside as it opens,
-    /// then dropped until it rests on the treasure (or the rim) — settled into it a sixteenth of its height, as a lid sits —
-    /// so it lies on the heap wherever the heap is highest under it, never floating above it.
-    public static func withLid(_ body: [UInt8], lid: [UInt8], body0: [UInt8], width w: Int, height h: Int, state k: Int) -> [UInt8] {
-        guard let l = box(lid, width: w, height: h) else { return body }
+    /// The lid laid on a state's template (straight RGBA: its body and grey heap): tipped `lidTilt[k]` degrees and dropped until
+    /// it rests on what is under it, settled into it a sixteenth of its height — at stage 1 then lifted just off its rim, by
+    /// 3% of the pot's height, for the first treasure to glint in the gap. Returns the template with the lid on, and the lid
+    /// as laid (its own layer, for the next state and for the animators).
+    public static func placeLid(on px: [UInt8], lid: [UInt8], width w: Int, height h: Int, state k: Int) -> (px: [UInt8], lid: [UInt8])? {
+        guard let l = box(lid, width: w, height: h), let b = box(px, width: w, height: h) else { return nil }
         let tilt = lidTilt[min(k, lidTilt.count - 1)], a = -tilt * .pi / 180
         let piece = FrameKit.crop(lid, width: w, l.x, l.y, l.w, l.h)
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        // Tipped and slid aside, at its own height at first.
-        let cx = Double(l.x) + Double(l.w) / 2 + Double(l.w) * tilt / 150, cy = Double(l.y) + Double(l.h) / 2
+        let cx = Double(l.x) + Double(l.w) / 2 + Double(l.w) * tilt / 300, cy = Double(l.y) + Double(l.h) / 2
         guard let img = ChromaKeyOutputRules.image(straightRGBA8: piece.px, width: piece.w, height: piece.h, space: space),
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return body }
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         ctx.interpolationQuality = .high
         ctx.translateBy(x: cx, y: Double(h) - cy)                 // CG's y runs up
         ctx.rotate(by: -a)
         ctx.draw(img, in: CGRect(x: -Double(l.w) / 2, y: -Double(l.h) / 2, width: Double(l.w), height: Double(l.h)))
-        guard let laid = ctx.makeImage(), let lidPx = ChromaKeyOutputRules.straightRGBA8(laid) else { return body }
-        // Dropped (or lifted) until its underside meets the body's top in some column, settled a little into it.
+        guard let laidImg = ctx.makeImage(), let lidPx = ChromaKeyOutputRules.straightRGBA8(laidImg) else { return nil }
+        // Dropped until its underside meets what is under it in some column, settled a little into it.
         var dy = Int.max
         let sink = max(2, l.h / 16)
         for x in 0..<w {
-            var lidBottom = -1, bodyTop = h
+            var lidBottom = -1, top = h
             for y in 0..<h { if lidPx[(y * w + x) * 4 + 3] > 128 { lidBottom = y } }
             guard lidBottom >= 0 else { continue }
-            for y in 0..<h where body[(y * w + x) * 4 + 3] > 128 { bodyTop = y; break }
-            guard bodyTop < h else { continue }
-            dy = min(dy, bodyTop + sink - lidBottom)
+            for y in 0..<h where px[(y * w + x) * 4 + 3] > 128 { top = y; break }
+            guard top < h else { continue }
+            dy = min(dy, top + sink - lidBottom)
         }
-        guard dy != Int.max else { return body }
-        var out = body
-        FrameKit.over(&out, width: w, FrameKit.Piece(px: lidPx, w: w, h: h), at: 0, dy)
+        guard dy != Int.max else { return nil }
+        if k == 1 { dy -= Int(0.03 * Double(b.h)) }
+        var laid = [UInt8](repeating: 0, count: w * h * 4)
+        FrameKit.over(&laid, width: w, FrameKit.Piece(px: lidPx, w: w, h: h), at: 0, dy)
+        var out = px
+        FrameKit.over(&out, width: w, FrameKit.Piece(px: laid, w: w, h: h), at: 0, 0)
+        return (out, laid)
+    }
+    /// A drawn state with the lid as laid (its own layer) taken off: the body the next state grows from.
+    public static func withoutLaidLid(_ px: [UInt8], laid: [UInt8]) -> [UInt8] {
+        var out = px
+        for i in 0..<(px.count / 4) where laid[i * 4 + 3] > 128 { out[i * 4 + 3] = 0 }
         return out
+    }
+    /// The lid where it was laid, still there in what was drawn: its share of the laid lid still opaque.
+    public static func lidKept(_ px: [UInt8], laid: [UInt8]) -> Double {
+        var all = 0, kept = 0
+        for i in 0..<(px.count / 4) where laid[i * 4 + 3] > 128 { all += 1; if px[i * 4 + 3] > 128 { kept += 1 } }
+        return Double(kept) / Double(max(1, all))
     }
     /// How much of a cut-out is holes — transparent pixels it encloses, the backing showing through where the drawing left
     /// it (a magenta smudge in a pot's treasure, 2026-10-05) — as a share of its opaque pixels.
@@ -16086,6 +16098,19 @@ extension GDDAssetPrompts {
     }
     /// A pot's fill state `k`, grown from state k−1 (attached, with the new treasure laid on it as a flat grey heap
     /// to the height PotStates.rise sets): the heap painted as more of the same treasure, nothing else changed.
+    /// A pot's state with its lid laid in the template by code (PotStates.placeLid): the treasure painted up under and round
+    /// it so it sits naturally — the lid itself kept exactly where it is.
+    static func potLidStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
+        [
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k) of 5. Its lid is shown exactly where it rests at this stage, lifted by the treasure beneath it: keep the lid exactly as it is — its shape, size, position, angle, material and ornament.",
+            k == 1
+                ? "Paint the first of its treasure — the theme's own coins, gems or gold, in the pot's own colours — glinting in the narrow gap between the lid and the rim, filling that gap solidly, with a soft warm glow spilling from it onto the lid's rim. Nothing of the background shows through between the lid and the pot."
+                : "The flat grey mound is the treasure that has risen under and round the lid: paint it as the pot's own treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure as before — heaped up to the grey's outline and pressing up against the lid's underside, so the lid truly rests on it: a soft contact shadow where the lid sits on the treasure, the treasure's warm glow lighting the lid's underside and rim, the heap filling the pot's mouth solidly. Nothing of the background shows through anywhere inside it.\(k == PotStates.levels ? " Full to overflowing: a few pieces spill over the rim." : "")",
+            "The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces. The pot itself stays exactly as it is: its shape, size, position, material, colour and ornament. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
+            detailRules,
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int, lidOff: Bool = false) -> String {
         let lid = ["", "still closed on its rim, the treasure only glinting in the seam beneath it", "lifted a little and tipped back, resting low behind the treasure",
                    "tipped further back, resting behind the heap", "swung open, resting behind the heap", "thrown open, resting behind the heap"][k]

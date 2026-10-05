@@ -13817,10 +13817,12 @@ final class PotLidTests: XCTestCase {
         rect(&empty, 20, 80, 100, 180); rect(&empty, 30, 60, 90, 80)              // a pot, its lid on top
         rect(&lid, 30, 60, 90, 80)
         XCTAssertTrue(PotStates.isLid(lid, empty: empty, width: w, height: h))
-        let body0 = PotStates.withoutLid(empty, lid: lid)
         rect(&body, 20, 80, 100, 180); rect(&body, 35, 50, 85, 80)               // treasure heaped above the rim
-        let whole = PotStates.withLid(body, lid: lid, body0: body0, width: w, height: h, state: 3)
+        let placed = PotStates.placeLid(on: body, lid: lid, width: w, height: h, state: 3)!
+        let whole = placed.px
         let lidRows = (0..<h).filter { y in (0..<w).contains { x in whole[(y * w + x) * 4 + 3] > 128 && body[(y * w + x) * 4 + 3] <= 128 } }
+        XCTAssertEqual(PotStates.lidKept(whole, laid: placed.lid), 1)
+        XCTAssertEqual(PotStates.withoutLaidLid(whole, laid: placed.lid)[(45 * w + 60) * 4 + 3], 0)
         XCTAssertLessThan(lidRows.last ?? h, 56)                                   // above the heap's top (50), touching it
         XCTAssertGreaterThan(lidRows.last ?? 0, 40)
         XCTAssertGreaterThan(PotStates.holeShare(body, width: w, height: h), -1)
