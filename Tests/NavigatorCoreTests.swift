@@ -13385,6 +13385,27 @@ final class StandardPiecesTests: XCTestCase {
         let v = ConceptPlan.parse(#"{"pieces": [{"name": "MU1", "what": "The multiplier symbol's values.", "look": "", "shape": "free", "width": 1024, "height": 1024, "lettering": "x2", "states": ["x3", "x5"], "source": "", "refs": ["MU1"]}]}"#, covered: [])
         XCTAssertEqual(v.first?.name, "MU1"); XCTAssertEqual(v.first?.refs, ["MU1"]); XCTAssertEqual(v.first?.stateName("x3"), "MU1-x3")
     }
+    // A win state drawn larger and off-centre is laid on its symbol's own box; one on a backdrop is caught.
+    func testAWinStateIsLaidOnItsSymbol() {
+        let n = 200
+        func disc(_ r: Double, _ cx: Double, _ cy: Double) -> [UInt8] {
+            var px = [UInt8](repeating: 0, count: n * n * 4)
+            for y in 0..<n { for x in 0..<n where (Double(x) - cx) * (Double(x) - cx) + (Double(y) - cy) * (Double(y) - cy) <= r * r { px[(y * n + x) * 4 + 3] = 255 } }
+            return px
+        }
+        let symbol = disc(60, 100, 100), win = disc(70, 108, 94)
+        let laid = Derived.registeredWin(win, to: symbol, width: n, height: n)
+        let a = Derived.body(laid, width: n, height: n)!, b = Derived.body(symbol, width: n, height: n)!
+        XCTAssertEqual(Double(a.x1 - a.x0), Double(b.x1 - b.x0), accuracy: 3); XCTAssertEqual(Double(a.x0), Double(b.x0), accuracy: 3)
+        XCTAssertTrue(Derived.registeredWin(laid, to: symbol, width: n, height: n) == laid, "laid again, it moved")
+        XCTAssertFalse(Derived.onBackdrop(symbol, width: n, height: n))
+        XCTAssertTrue(Derived.onBackdrop([UInt8](repeating: 255, count: n * n * 4), width: n, height: n))
+        // A coin redrawn on a square inside the picture: caught against the coin's own box.
+        var square = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 35..<165 { for x in 35..<165 { square[(y * n + x) * 4 + 3] = 255 } }
+        XCTAssertTrue(Derived.onBackdrop(square, width: n, height: n, symbol: symbol))
+        XCTAssertFalse(Derived.onBackdrop(laid, width: n, height: n, symbol: symbol))
+    }
     // The number font is drawn as a grid within GPT's limits, a glyph a cell.
     func testTheNumberFontGrid() {
         XCTAssertEqual(NumberFont.glyphs.count, 19); XCTAssertEqual(NumberFont.rows, 4)

@@ -26428,11 +26428,26 @@ final class GDDToAssetsRun: ObservableObject {
             both(px, NumberFont.size.w, NumberFont.size.h, "\(fontName)_sheet")
             if let strip = numberFontStrip(FrameKit.keyed(px, backing: b), folder: folder, name: fontName) { problems += strip }
         }
-        // 10. The special symbols' lit win states, each an edit of its symbol (Derived).
-        for j in Derived.winSymbols(jobs) where !has("\(Derived.winName(j.id)).png") {
-            guard let sym = try? Data(contentsOf: url("\(j.id).png")), let cg = loadCGImage(data: sym) else { continue }
-            if let px = paint(Derived.winName(j.id), prompt: GDDAssetPrompts.winStateBrief(theme: theme, backing: (backing.name, b)),
-                              inputs: [downsamplePNG(sym, longEdge: 2048) ?? sym], w: cg.width, h: cg.height, covered: nil) { both(px, cg.width, cg.height, Derived.winName(j.id)) }
+        // 10. The special symbols' lit win states, each an edit of its symbol (Derived), cleaned of the backing's
+        // fringe and laid on the symbol's own size and place so it swaps in without a jump. Laying is free.
+        for j in Derived.winSymbols(jobs) {
+            let n = Derived.winName(j.id)
+            if !has("\(n).png"), let sym = try? Data(contentsOf: url("\(j.id).png")), let cg = loadCGImage(data: sym),
+               let px = paint(n, prompt: GDDAssetPrompts.winStateBrief(theme: theme, backing: (backing.name, b)),
+                              inputs: [downsamplePNG(sym, longEdge: 2048) ?? sym], w: cg.width, h: cg.height, covered: nil) {
+                write(px, cg.width, cg.height, "\(n).png"); write(FrameKit.keyed(px, backing: b), cg.width, cg.height, "\(n)_rmbg.png")
+            }
+            guard var w = load("\(n)_rmbg.png") else { continue }
+            guard let base = load("\(j.id)_rmbg.png"), base.w == w.w, base.h == w.h else { continue }
+            let before = w.px
+            _ = CutoutEdgeRules.clean(&w.px, width: w.w, height: w.h, backing: b)
+            Derived.clearVeil(&w.px)
+            let laid = Derived.trimmedToSymbol(Derived.registeredWin(w.px, to: base.px, width: w.w, height: w.h), symbol: base.px, width: w.w, height: w.h)
+            // Judged once laid on its symbol: still filling the corners of a shape that has none, it is on a backdrop.
+            if Derived.onBackdrop(laid, width: w.w, height: w.h, symbol: base.px) { problems.append("\(n) was drawn on a backdrop: Make Again ▸ Symbol win states"); continue }
+            guard laid != before else { continue }
+            write(FrameKit.onBacking(laid, b), w.w, w.h, "\(n).png"); write(laid, w.w, w.h, "\(n)_rmbg.png")
+            navLog("gdd reel: \(n) cleaned and laid on \(j.id)")
         }
         // 11. Every background's landscape twin, the same scene widened (Derived).
         for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {

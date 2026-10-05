@@ -9090,6 +9090,58 @@ public enum Localized {
 public enum Derived {
     public static let landscape = (w: 2912, h: 1600)
     public static func winName(_ id: String) -> String { "\(id)_win" }
+
+    /// The solid body of a cut-out (alpha over 200, so a glow doesn't count): its box, or nil when empty.
+    /// Rows and columns with only a speck or two of it don't count: stray keying pixels at a picture's edge
+    /// stretched one win state's box to the whole canvas (2026-10-04).
+    static func body(_ px: [UInt8], width w: Int, height h: Int) -> (x0: Int, y0: Int, x1: Int, y1: Int)? {
+        var cols = [Int](repeating: 0, count: w), rows = [Int](repeating: 0, count: h)
+        for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 200 { cols[x] += 1; rows[y] += 1 } }
+        let cw = max(2, h / 200), rh = max(2, w / 200)
+        guard let x0 = cols.firstIndex(where: { $0 >= cw }), let x1 = cols.lastIndex(where: { $0 >= cw }),
+              let y0 = rows.firstIndex(where: { $0 >= rh }), let y1 = rows.lastIndex(where: { $0 >= rh }), x1 > x0, y1 > y0 else { return nil }
+        return (x0, y0, x1, y1)
+    }
+    /// A laid win state trimmed to its symbol's outline, `grow` pixels out: anything past it is a glow GPT drew
+    /// (pink from the magenta backing, 2026-10-04), and the game draws its own.
+    public static func trimmedToSymbol(_ win: [UInt8], symbol: [UInt8], width w: Int, height h: Int, grow: Int = 3) -> [UInt8] {
+        var inside = (0..<(w * h)).map { symbol[$0 * 4 + 3] > 16 }
+        for _ in 0..<grow {                 // grown a pixel at a time, four ways
+            var next = inside
+            for y in 0..<h { for x in 0..<w where !inside[y * w + x] {
+                if (x > 0 && inside[y * w + x - 1]) || (x < w - 1 && inside[y * w + x + 1]) || (y > 0 && inside[(y - 1) * w + x]) || (y < h - 1 && inside[(y + 1) * w + x]) { next[y * w + x] = true }
+            } }
+            inside = next
+        }
+        var out = win
+        for i in 0..<(w * h) where !inside[i] { out[i * 4 + 3] = 0 }
+        return out
+    }
+    /// A faint veil left where a backdrop was keyed out (alpha under 48) taken away.
+    public static func clearVeil(_ px: inout [UInt8]) { for i in stride(from: 3, to: px.count, by: 4) where px[i] < 48 { px[i] = 0 } }
+    /// A win state laid on its symbol: scaled and moved so its body takes the symbol's own box. GPT redrew the
+    /// lit symbols 10–15% larger (2026-10-04); swapped in game they would jump. Left alone when already in place.
+    public static func registeredWin(_ win: [UInt8], to symbol: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        guard let a = body(win, width: w, height: h), let b = body(symbol, width: w, height: h) else { return win }
+        let k = Double(b.x1 - b.x0) / Double(max(1, a.x1 - a.x0))
+        let acx = Double(a.x0 + a.x1) / 2, acy = Double(a.y0 + a.y1) / 2, bcx = Double(b.x0 + b.x1) / 2, bcy = Double(b.y0 + b.y1) / 2
+        // Already in place to resampling's pixel or two: left alone, so laying again never blurs it.
+        guard abs(k - 1) > 0.03 || abs(acx - bcx) > 3 || abs(acy - bcy) > 3 else { return win }
+        let scaled = FrameKit.resized(FrameKit.Piece(px: win, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        FrameKit.over(&out, width: w, scaled, at: Int((bcx - acx * k).rounded()), Int((bcy - acy * k).rounded()))
+        return out
+    }
+    /// Drawn on a backdrop instead of the backing: its picture's corners are not transparent once keyed — or,
+    /// given its symbol, the corners of the symbol's own box are filled where the symbol's are empty (a round
+    /// coin redrawn on a grey square, 2026-10-04).
+    public static func onBackdrop(_ px: [UInt8], width w: Int, height h: Int, symbol: [UInt8]? = nil) -> Bool {
+        if [(2, 2), (w - 3, 2), (2, h - 3), (w - 3, h - 3)].filter({ px[($0.1 * w + $0.0) * 4 + 3] > 64 }).count >= 2 { return true }
+        guard let symbol, let b = body(symbol, width: w, height: h) else { return false }
+        let ix = (b.x1 - b.x0) / 25, iy = (b.y1 - b.y0) / 25
+        let corners = [(b.x0 + ix, b.y0 + iy), (b.x1 - ix, b.y0 + iy), (b.x0 + ix, b.y1 - iy), (b.x1 - ix, b.y1 - iy)].map { ($0.1 * w + $0.0) * 4 + 3 }
+        return corners.filter { symbol[$0] < 64 }.count >= 3 && corners.filter { px[$0] > 200 }.count >= 3
+    }
     public static func landscapeName(_ id: String) -> String { "\(id)-landscape" }
     /// The special symbols that get a lit state: wilds, scatters, bonus, collector, jackpot and WYSIWYG symbols.
     public static func winSymbols(_ jobs: [AssetJob]) -> [AssetJob] {
@@ -15531,7 +15583,7 @@ extension GDDAssetPrompts {
     static func winStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
         [
             "Edit the attached image: it is a symbol of a video slot game themed “\(theme.name)”. Show the same symbol lit up as it is when it lands or wins: brighter and more saturated, glowing from within, its metal and gems gleaming.",
-            "Nothing moves or changes shape, size or position; any lettering stays exactly as it is. Only a soft glow close around it: no rays, burst or sparkles.",
+            "Nothing moves or changes shape, size or position; any lettering stays exactly as it is. No glow, rays, burst or sparkles beyond its own edge — the game adds those — and nothing drawn behind it.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
