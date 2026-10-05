@@ -12,6 +12,8 @@ import CryptoKit
 // lives here so `swift test` exercises the SHIPPED code rather than a copy of it.
 import CoreGraphics
 import ImageIO
+import Vision
+import CoreText
 
 import Darwin
 
@@ -8802,6 +8804,50 @@ public enum PotStates {
     public static func name(pot i: Int, of total: Int, state k: Int) -> String {
         "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-State\(k)Idle"
     }
+    /// How far each state's top stands above State0's, in State0's heights: the mean of the shipped rigs (88 Drums'
+    /// jar 0-2-4-13-23-29%, Jewel of Alexandria's chest 0-5-8-13-18-27%, Cauldron Cash's pumpkin 0-1-8-14-18-23%;
+    /// research/legibility-measure.md §6). Back-loaded, so the last states still grow: generated rigs drawn each from
+    /// State0 reached 91–99% of their height by State3 and barely changed after it.
+    public static let rise = [0.0, 0.03, 0.07, 0.13, 0.20, 0.26]
+    /// The rows a silhouette spans: those with an opaque pixel in at least 1% of the width.
+    static func span(_ px: [UInt8], width w: Int, height h: Int) -> (top: Int, bottom: Int)? {
+        let rows = (0..<h).filter { y in (0..<w).reduce(0) { $0 + (px[(y * w + $1) * 4 + 3] > 128 ? 1 : 0) } >= max(1, w / 100) }
+        return rows.first.map { ($0, rows.last!) }
+    }
+    /// State `k`'s template: state k−1 (straight RGBA on its tall canvas) on the backing, with flat grey treasure
+    /// heaped on the pot's mouth — a dome over most of the pot's top whose crown stands `rise[k]` of State0's height
+    /// above State0's top — for GPT to paint as more of the same treasure. The code sets how high it fills.
+    static func template(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, backing b: RGB8) -> [UInt8]? {
+        guard k > 0, k < rise.count, let s0 = span(empty, width: w, height: h) else { return nil }
+        let H0 = Double(s0.bottom - s0.top)
+        // The pot's top: its widest row in its top third.
+        var x0 = 0, x1 = -1
+        for y in s0.top..<min(h, s0.top + Int(H0 * 0.35)) {
+            let xs = (0..<w).filter { empty[(y * w + $0) * 4 + 3] > 128 }
+            if let a = xs.first, let z = xs.last, z - a > x1 - x0 { x0 = a; x1 = z }
+        }
+        guard x1 > x0 else { return nil }
+        let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.42
+        let crown = max(0, Double(s0.top) - rise[k] * H0), foot = Double(s0.top) + 0.12 * H0
+        var out = FrameKit.onBacking(previous, b)
+        for y in Int(crown)..<min(h, Int(foot)) { for x in max(0, Int(cx - hw))..<min(w, Int(cx + hw) + 1) where previous[(y * w + x) * 4 + 3] < 128 {
+            let dx = (Double(x) - cx) / hw, dy = (foot - Double(y)) / max(1, foot - crown)
+            guard dx * dx + dy * dy <= 1 else { continue }
+            let g = UInt8(135 + 45 * (1 - dy))           // lit from above, like every grey template
+            out[(y * w + x) * 4] = g; out[(y * w + x) * 4 + 1] = g; out[(y * w + x) * 4 + 2] = g; out[(y * w + x) * 4 + 3] = 255
+        } }
+        return out
+    }
+    /// What keeps a drawn state (laid on State0) from growing as the rig must: from State2 on its top at least 3% of
+    /// State0's height above the state before (shipped: every late step 5–9%), and within 5% of its height in `rise`.
+    public static func growthProblems(_ px: [UInt8], previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int) -> [String] {
+        guard k < rise.count, let s0 = span(empty, width: w, height: h), let sp = span(previous, width: w, height: h), let sk = span(px, width: w, height: h) else { return [] }
+        let H0 = Double(s0.bottom - s0.top), r = Double(s0.top - sk.top) / H0, rp = Double(s0.top - sp.top) / H0
+        var out: [String] = []
+        if k >= 2 && r < rp + 0.03 { out.append(String(format: "the treasure did not rise: its top stands %.0f%% of the pot's height above the empty pot's, the state before %.0f%%", r * 100, rp * 100)) }
+        if abs(r - rise[k]) > 0.05 { out.append(String(format: "its top stands %.0f%% of the pot's height above the empty pot's, not %.0f%%: the treasure reaches exactly the grey heap's top", r * 100, rise[k] * 100)) }
+        return out
+    }
     /// A pot's Power Bet look, beside its states.
     public static func boostedName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-boostedIdle" }
     /// How the pots look with the Power Bet on, in the GDD's own sentence — only one that gives them a look of
@@ -15253,7 +15299,7 @@ extension GDDAssetPrompts {
     }
     /// How it is lettered, for the drawing prompt.
     static func letteringLine(_ word: String) -> String {
-        "The word “\(word)” is lettered across it as part of the art, as this studio's symbols are: bold, dimensional letters in the set's own material and finish, spelled exactly so, on the symbol's own banner, plaque or face — large and legible at reel size."
+        "The word “\(word)” is lettered across it as part of the art, as this studio's symbols are, spelled exactly so, on the symbol's own banner, plaque or face — smooth and plain behind the word — spanning most of its width, the letters at least a fifth of the symbol's height. " + letteringRules
     }
 
     static func jackpotTierName(_ job: AssetJob) -> String {
@@ -15385,6 +15431,18 @@ extension GDDAssetPrompts {
         }
         return parts.filter { !$0.isEmpty }.joined(separator: " ")
     }
+
+    /// Lettering that reads on a phone. Measured at display size (research/legibility-measure.md, 2026-10-04: 507
+    /// shipped vs 196 generated pieces), shipped letter faces are flat (L* σ 7 against 16), strokes a quarter of the
+    /// cap height (0.21–0.25 against 0.11–0.16), the outline far darker than the face; Apple's OCR reads 84–92% of
+    /// shipped titles at phone size and 34–44% of generated. The causes — texture inside the letters, thin strokes,
+    /// glints — are the ones the standards and studies name (WCAG G18, Scharff & Ahumada 2002, Pelli 2006,
+    /// MIL-STD-1472: research/legibility-docs.md).
+    static let letteringRules = "Lettering that reads at a glance on a small phone screen: heavy, wide, simple capitals — every stroke about a quarter as thick as the letter is tall, open counters, the letters clearly apart and never touching. Each letter's face is a clean, solid fill: one light colour, or a smooth top-to-bottom gradient between two light tones of it — nothing inside the letters: no stars, nebula, sparkles, glitter, marble, cracks, gems, pattern or texture. Around every letter a thick, even, very dark outline, about a sixth of the letter's height, and a thin bright rim outside it, so the word stands out on dark and light alike. A soft bevel at most; any glint sits outside the letters, two or three at most. The theme shows in the colours, the outline's finish and the bevel — never as texture inside the letters."
+    /// Detail that holds up at phone size: shipped pieces have 2–5x fewer specular glints and 1.6–3.7x less detail
+    /// finer than 1.5 px than generated ones, measured at display size (research/legibility-measure.md). Richness from
+    /// light and big value masses, not texture (Valve's TF2 paper, Loomis' four values, Rosenholtz's clutter measures).
+    static let detailRules = "AT PHONE SIZE it must still read, so: a strong, simple silhouette and three or four big masses of light and shade; ornament in a few bold, chunky shapes — no fine filigree, hairline engraving, tiny gems or speckled glitter; smooth surfaces between the ornament. Keep it rich through light, not texture: warm highlights, cool shadows, a saturated edge between them and a crisp rim light, with a few deliberate highlights at most — no scattered sparkles, glints or star fields."
 
     /// The cast member a character-reference id belongs to.
     static func castMember(ref: String, _ design: SetDesign) -> CastMember? {
@@ -15604,6 +15662,7 @@ extension GDDAssetPrompts {
             "Edit the attached image: it is the plain grey reel frame of a video slot game themed “\(theme.name)” — a band round the reels\(hotReel ? ", a housing above them for one more row of reels with a bar between," : "") and narrow divider bars between the reels. Repaint it as the game's reel frame, its bezel: the same craft as its symbol frames — \(frame) — but heavier and grander, the frame of the whole game, with corner pieces and a crest at the top centre. Keep exactly the same band widths, the same divider bars and the same openings: its ornament may spread past its outer edge onto the background, never inward. Every opening stays the flat background, with nothing drawn in it.",
             "Lit from above, with bevel highlights along its top edges. No logo, title, text, lettering, numbers or symbols on it: the logo is a piece of its own.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15611,9 +15670,10 @@ extension GDDAssetPrompts {
     /// bezel's material (attached first), each value field left empty for the game's amount.
     static func jackpotTableBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), names: [String]) -> String {
         [
-            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: it is the plain grey jackpot table that sits above those reels — a plate with \(names.count) plaques in a row. Repaint it in the reel frame's own material and craft. Each plaque has its jackpot's name lettered across its top, in this order from left to right: \(names.map { "“\($0)”" }.joined(separator: ", ")) — bold, dimensional lettering, spelled exactly so, the grandest plaque the richest. Below each name its dark recessed field stays plain and empty: the game prints the amount there.",
+            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: it is the plain grey jackpot table that sits above those reels — a plate with \(names.count) plaques in a row. Repaint it in the reel frame's own material and craft. Each plaque has its jackpot's name lettered across its top, in this order from left to right: \(names.map { "“\($0)”" }.joined(separator: ", ")) — spelled exactly so, the grandest plaque the richest. Below each name its dark recessed field stays plain and empty: the game prints the amount there. " + letteringRules,
             "The only lettering is those names. No numbers, prices, logo or symbols. The plate keeps exactly its size and outline; its ornament may spread a little past its outer edge onto the background.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15626,6 +15686,7 @@ extension GDDAssetPrompts {
             ?? "Draw pot \(number) of the \(total) pots that stand above the reels of a video slot game themed “\(theme.name)”, which fill up as the game is played: a grand vessel of this theme, \(number > 1 ? "matching the attached pots in construction and size, a colour of its own, " : "")standing upright, seen straight on, empty and unlit — its lid closed if it has one, its mouth open and empty if not — the whole vessel in view with a small even margin.",
             "No text, lettering, numbers or symbols on it.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15654,23 +15715,13 @@ extension GDDAssetPrompts {
         return (options[label] ?? [("deep crimson", "red")]).first { !reserved.contains($0.1) }?.0 ?? "rich gold"
     }
 
-    /// A wedge's lettering as the studio sets it: one word stacked down the middle, a longer label's first
-    /// words across the wide outer end above the last word stacked (Founding Fortunes' FREE / GAMES wedge).
-    static func wedgeLettering(_ label: String) -> String {
-        let words = label.split(separator: " ").map(String.init)
-        let stacked = "in bold, dimensional display letters set one above another down the middle of the wedge, reading from the wide outer end toward the point, as large as the wedge allows"
-        guard words.count > 1 else { return "Letter “\(label)” on it \(stacked), spelled exactly so. No other words or numbers." }
-        return "Letter “\(words.dropLast().joined(separator: " "))” in smaller bold letters straight across the wide outer end of the wedge, and below it “\(words.last!)” \(stacked) — together reading “\(label)”, spelled exactly so. No other words or numbers."
-    }
     /// One wedge of a prize wheel, on its grey template (the last image); `matching` when another wedge of the
     /// same wheel is attached first, to match.
     static func wedgeBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), label: String, matching: Bool, wheel: [String] = []) -> String {
         [
-            (matching ? "Image 1 is another wedge of the same wheel: match its material, trim and lettering exactly — only the colour differs. " : "")
-            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a rich \(wedgeColour(label, backing: backing.name, with: wheel)) face in the theme's own material and craft, a fine trim along its two long sides and its curved outer end.",
-            label == "CREDITS"
-                ? "Its face stays plain and unlettered: the game prints the prize amount on it."
-                : wedgeLettering(label),
+            (matching ? "Image 1 is another wedge of the same wheel: match its material and trim exactly — only the colour differs. " : "")
+            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a smooth face of one rich \(wedgeColour(label, backing: backing.name, with: wheel)), deepening softly toward the point, in the theme's own material, with a simple bold trim along its two long sides and its curved outer end.",
+            "The face stays smooth and plain — no pattern, texture, gems, sparkles or engraving on it — and unlettered: the game's words and amounts are laid on it afterwards. No text, letters or numbers.",
             "Keep exactly the wedge's shape: paint nothing outside its outline, and the point stays sharp at the bottom.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
@@ -15679,9 +15730,10 @@ extension GDDAssetPrompts {
     /// The rim round the wheel, on its grey ring (the last image).
     static func wheelFrameBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8)) -> String {
         [
-            "Edit the attached image: the plain grey ring is the frame round the prize wheel of a video slot game themed “\(theme.name)”. Repaint it as the wheel's rim in the theme's own material and craft, richly ornamented, with small lamps or gems set evenly all the way round it.",
+            "Edit the attached image: the plain grey ring is the frame round the prize wheel of a video slot game themed “\(theme.name)”. Repaint it as the wheel's rim in the theme's own material and craft, with about sixteen large round lamps set evenly all the way round it.",
             "It keeps exactly its size and shape. Inside the ring stays the flat background, with nothing drawn in it: the wheel's wedges turn there. No text, numbers or pointer.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15691,6 +15743,7 @@ extension GDDAssetPrompts {
             "Image 1 is the rim of a prize wheel in a video slot game themed “\(theme.name)”. Edit the last attached image: the plain grey disc is the hub at that wheel's centre. Paint it as a polished cap in the rim's own material, the theme's emblem in relief at its middle. It stays round and its size.",
             "No text or numbers.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15700,6 +15753,7 @@ extension GDDAssetPrompts {
             "The attached image is the rim of a prize wheel in a video slot game themed “\(theme.name)”. Draw the pointer that sits at the top of that wheel and marks the winning wedge: one ornate pointer in the rim's own material, pointing straight down, its sharp tip at the bottom centre of the picture, filling about two thirds of the picture's height.",
             "Nothing else: no wheel, rim, text or numbers.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15711,13 +15765,14 @@ extension GDDAssetPrompts {
         switch kind {
         case .panel: what = "the blank panel the game's award pop-ups appear on — a grand plaque. Repaint it with an ornate frame in the reel frame's own material and craft; its inner face a rich deep colour of the theme, plain and empty: the game lays its titles and amounts on it. No text, numbers or icons."
         case .bar: what = "the long bar a pop-up's amount is printed in. Repaint it as a recessed dark field framed in the reel frame's trim, plain and empty: the game prints the number there. No text or numbers."
-        case .button: what = "a button on the game's pop-ups. Repaint it in the reel frame's own material, a raised pill, lettered “\(text)” across its middle in bold, clear display letters, spelled exactly so. No other text."
+        case .button: what = "a button on the game's pop-ups. Repaint it in the reel frame's own material, a raised pill with a smooth, plain face, lettered “\(text)” across its middle, spelled exactly so, spanning most of its width. No other text. " + letteringRules
         case .title: what = ""
         }
         return [
             "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is \(what)",
             "It keeps exactly its size and outline; its ornament may spread a little past its edge onto the background.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15725,8 +15780,8 @@ extension GDDAssetPrompts {
     static func popUpTitleBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), text: String, matching: Bool) -> String {
         let lines = text.components(separatedBy: "\n")
         return [
-            (matching ? "The attached image is another title of this game: match its lettering exactly — letterforms, colours, outline, bevel and finish. " : "")
-            + "Letter \(lines.count == 1 ? "the words" : "these \(lines.count) lines, one under another, the middle line largest,") \(lines.map { "“\($0)”" }.joined(separator: " / ")) as the title of an award pop-up in a video slot game themed “\(theme.name)”: bold, dimensional display lettering with a thick outline and a bevel, in the theme's richest colours and metal, a little sparkle. Spelled exactly so, nothing added.",
+            (matching ? "The attached image is another title of this game: match its lettering exactly — letterforms, colours, outline, bevel and finish — but never any texture or sparkle inside its letters. " : "")
+            + "Letter \(lines.count == 1 ? "the words" : "these \(lines.count) lines, one under another, the middle line largest,") \(lines.map { "“\($0)”" }.joined(separator: " / ")) as the title of an award pop-up in a video slot game themed “\(theme.name)”, in the theme's richest colours. Spelled exactly so, nothing added. " + letteringRules,
             "Only the lettering: no panel, plaque, banner, icons, characters or numbers behind or around it. It fills the picture's width with a small even margin.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
@@ -15737,8 +15792,8 @@ extension GDDAssetPrompts {
     /// what the pot unlocks, or plain when the game does not say.
     static func potPlaqueBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), word: String) -> String {
         [
-            "Image 1 is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is the small plaque that sits beneath that pot. Paint it in the pot's own colour and material, a raised plate with fine trim.",
-            word.isEmpty ? "Its face stays plain and empty. No text or numbers." : "Letter “\(word)” across it in bold, clear display letters, spelled exactly so, as large as the plaque allows. No other text.",
+            "Image 1 is one of the pots that stand above the reels of a video slot game themed “\(theme.name)”. Edit the last attached image: its plain grey shape is the small plaque that sits beneath that pot. Paint it in the pot's own colour and material, a raised plate with a simple bold trim and a smooth face.",
+            word.isEmpty ? "Its face stays plain and empty. No text or numbers." : "Letter “\(word)” across it, spelled exactly so, as large as the plaque allows. No other text. " + letteringRules,
             "It keeps exactly its size and outline.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
@@ -15748,7 +15803,7 @@ extension GDDAssetPrompts {
     /// attached first for the game's material.
     static func conceptBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, templated: Bool, refs: Int = 0) -> String {
         let shown = refs == 0 ? "" : refs == 1 ? " Image 2 is the game's own symbol it is drawn from: keep its likeness exactly." : " Images 2 to \(refs + 1) are the game's own symbols it is drawn from: keep their likeness exactly."
-        let letters = p.lettering.isEmpty ? "No text, lettering or numbers." : "Letter “\(p.lettering)” on it in bold, clear display letters, spelled exactly so. No other words or numbers."
+        let letters = p.lettering.isEmpty ? "No text, lettering or numbers." : "Letter “\(p.lettering)” on it, spelled exactly so, on a smooth, plain part of it. No other words or numbers. " + letteringRules
         return [
             "Image 1 is the reel frame of a video slot game themed “\(theme.name)”.\(shown) "
             + (templated ? "Edit the last attached image: its plain grey shape is \(p.what.lowercased().hasPrefix("the ") ? "" : "this game's ")\(p.what) Repaint it in the reel frame's own material and craft: \(p.look) It keeps exactly its size and outline; its ornament may spread a little past its edge."
@@ -15756,6 +15811,7 @@ extension GDDAssetPrompts {
                            + (refs > 0 ? "Centred, filling most of the picture with a small even margin." : "In the reel frame's own material and craft, seen straight on, centred, filling most of the picture with a small even margin.")),
             letters + " Static art only: no burst, rays or flying sparkles — the game animates those.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15774,7 +15830,7 @@ extension GDDAssetPrompts {
         let rows = stride(from: 0, to: NumberFont.glyphs.count, by: NumberFont.columns).map { NumberFont.glyphs[$0..<min($0 + NumberFont.columns, NumberFont.glyphs.count)].joined(separator: "  ") }
         return [
             "Image 1 is the \(reference) of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter these characters on it in exactly that \(reference.hasSuffix("title") ? "title's" : "piece's") lettering — the same letterforms, colours, outline, bevel and finish — as the font the game prints its amounts in.",
-            "Lay them out in a grid of \(NumberFont.columns) columns and \(NumberFont.rows) rows, one character centred in each cell, the cells evenly spaced across and down the whole picture, in this order: " + rows.enumerated().map { "row \($0.offset + 1): \($0.element)" }.joined(separator: "; ") + ". The digits and letters all the same height; the comma and full stop small, at the baseline; every character well apart from its neighbours. Nothing else: no frame, lines, boxes or other words.",
+            "Lay them out in a grid of \(NumberFont.columns) columns and \(NumberFont.rows) rows, one character centred in each cell, the cells evenly spaced across and down the whole picture, in this order: " + rows.enumerated().map { "row \($0.offset + 1): \($0.element)" }.joined(separator: "; ") + ". The digits and letters all the same height; the comma and full stop small, at the baseline; every character well apart from its neighbours. Nothing else: no frame, lines, boxes or other words. Each character heavy and simple, its face a clean solid fill with a thick, even, very dark outline — no texture, sparkle or pattern inside it, even if the title has some.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15782,7 +15838,7 @@ extension GDDAssetPrompts {
     /// A special symbol's lit state (Derived), an edit of the symbol (attached): the same symbol, lit as it lands or wins.
     static func winStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
         [
-            "Edit the attached image: it is a symbol of a video slot game themed “\(theme.name)”. Show the same symbol lit up as it is when it lands or wins: brighter and more saturated, glowing from within, its metal and gems gleaming.",
+            "Edit the attached image: it is a symbol of a video slot game themed “\(theme.name)”. Show the same symbol lit up as it is when it lands or wins: brighter and more saturated, a smooth glow from within — no added sparkles, glints or star points: the game animates those.",
             "Nothing moves or changes shape, size or position; any lettering stays exactly as it is. No glow, rays, burst or sparkles beyond its own edge — the game adds those — and nothing drawn behind it.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
@@ -15795,7 +15851,7 @@ extension GDDAssetPrompts {
     static func localizedBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), word: String, lang: String) -> String {
         [
             "Image 1 is the CONTINUE button of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter the word “\(word)” on it (the button's word in the language coded \(lang)) in exactly that button's lettering — letterforms, colours, outline and finish — spelled exactly so, every accent and character exactly as given.",
-            "Only the lettering: no button or plate behind it. It fills the picture's width with a small even margin.",
+            "Only the lettering: no button or plate behind it. It fills the picture's width with a small even margin. " + letteringRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -15810,14 +15866,14 @@ extension GDDAssetPrompts {
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
+    /// A pot's fill state `k`, grown from state k−1 (attached, with the new treasure laid on it as a flat grey heap
+    /// to the height PotStates.rise sets): the heap painted as more of the same treasure, nothing else changed.
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
         let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]
-        let heap = ["", "a few pieces just showing at its mouth", "a small heap at its mouth", "a heap rising above its mouth", "a tall heap well above its mouth",
-                    "heaped high and overflowing, a few pieces spilling over the rim"][k]
-        let glow = ["", "a faint", "a soft", "a warm", "a bright", "a radiant"][k]
         return [
-            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty and unlit. Show the same pot at stage \(k) of 5 as it fills: inside it, \(heap) of what it collects in this game — the theme's own treasure (coins, gems or gold as this theme would have them) in the pot's own colours; \(glow) glow from within, in the pot's own colour — never the background's. If the attached pot has a lid, cover or door, it is still there in this picture, on its hinge or resting tilted on the rim, \(lid) — never taken away; if it has none, add none.",
-            "The pot itself stays exactly as it is — its shape, size, position, material, colour and ornament: only its contents, their light and how far any lid it already has is open change. A lid it has stays with it in every state, opened further as it fills, as the studio's pots open theirs; a pot with no lid never gains one — an open mouth stays an open mouth, the treasure rising out of it. A calm, still pose: no burst, rays, explosion or flying pieces. The clear space above the pot is room for what rises from it; keep it all inside the picture. No text, lettering or numbers.",
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, \(k == 1 ? "empty" : "at fill stage \(k - 1) of 5"). The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). A soft glow from the treasure in the pot's own colour, a little brighter than before — never the background's colour.",
+            "If the pot has a lid, cover or door, the rising treasure lifts it: \(lid) on its hinge or resting tilted on the heap — never taken away; a pot with no lid never gains one. Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
+            detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -16549,5 +16605,297 @@ public enum SpineKitRules {
     /// The working document for a source canvas: `workingHeight` tall, the width in proportion.
     public static func workingSize(width w: Int, height h: Int) -> (w: Int, h: Int) {
         (Int((Double(w) * Double(workingHeight) / Double(max(h, 1))).rounded()), workingHeight)
+    }
+}
+
+
+// ===== Legibility at phone size =====
+
+/// How a piece reads at the size a phone shows it, against limits measured on the studio's shipped art
+/// (research/legibility-measure.md, 2026-10-04: 507 shipped vs 196 generated pieces, scaled to a 1170-px-wide
+/// phone). The three numbers that best told them apart — specular glints, detail finer than 1.5 px and
+/// visible edges, all inside the piece's silhouette — and, for lettering, whether Apple's text recognition reads
+/// it exactly at an iPhone SE's size. Each limit is the shipped 90th percentile: nine in ten shipped pieces pass.
+public enum Legibility {
+    public enum Kind: String, Sendable { case title, message, button, panel, wedge, wheel, pot, coin }
+    /// Device pixels a kind is shown at on the 1170-px phone: across, or (a wedge) tall.
+    static func displaySize(_ k: Kind) -> Int {
+        switch k { case .title: 520; case .message: 640; case .button: 330; case .panel: 700; case .wedge: 470; case .wheel: 1000; case .pot: 300; case .coin: 200 }
+    }
+    /// Hard limits per kind (shipped p90): glints per 10,000 px, fine-detail share, edge density; nil: not limited.
+    static func limits(_ k: Kind) -> (glints: Double?, hf: Double?, edges: Double?) {
+        switch k {
+        case .title: (36, 0.12, nil)
+        case .message: (22, 0.068, nil)
+        case .button: (22, 0.16, 0.28)
+        case .panel: (14, nil, 0.13)
+        case .wedge: (1.3, nil, 0.11)          // provisional: four shipped wedges
+        case .wheel: (20, nil, 0.19)
+        case .pot: (53, 0.13, nil)
+        case .coin: (nil, 0.20, nil)
+        }
+    }
+    public struct Measure: Equatable, Sendable {
+        public var glints: Double, hf: Double, edges: Double
+        public var read: Double?        // the words read at SE size, 0…1; nil when it carries none
+    }
+
+    /// The piece (straight RGBA) cropped to its silhouette and scaled to its display size, measured.
+    public static func measure(_ px: [UInt8], width w: Int, height h: Int, kind: Kind, text: String? = nil) -> Measure? {
+        guard let box = opaqueBox(px, width: w, height: h) else { return nil }
+        let crop = FrameKit.crop(px, width: w, box.x, box.y, box.w, box.h)
+        let s = Double(displaySize(kind)) / Double(kind == .wedge ? crop.h : crop.w)
+        let d = FrameKit.resized(crop, max(1, Int(Double(crop.w) * s)), max(1, Int(Double(crop.h) * s)))
+        var m = clutter(d.px, width: d.w, height: d.h)
+        if let text, !text.isEmpty {
+            let se = 750.0 / 1170.0
+            let small = FrameKit.resized(d, max(1, Int(Double(d.w) * se)), max(1, Int(Double(d.h) * se)))
+            m.read = readScore(read(small.px, width: small.w, height: small.h), text)
+        }
+        return m
+    }
+    /// What breaks a hard limit, in words a redraw can act on; empty when it reads.
+    public static func problems(_ m: Measure, kind: Kind) -> [String] {
+        let l = limits(kind)
+        var out: [String] = []
+        if let g = l.glints, m.glints > g { out.append(String(format: "too many sparkles and glints (%.0f per 10,000 px at phone size; shipped art at most %.0f)", m.glints, g)) }
+        if let h = l.hf, m.hf > h { out.append(String(format: "too much fine detail and texture (%.2f of its light and shade is finer than the phone shows clearly; shipped at most %.2f)", m.hf, h)) }
+        if let e = l.edges, m.edges > e { out.append(String(format: "too busy (%.0f%% of it is edges at phone size; shipped at most %.0f%%)", m.edges * 100, e * 100)) }
+        if let r = m.read, r < (kind == .title ? 0.8 : 1) { out.append(String(format: "its words do not read at a small phone's size (%.0f%% read)", r * 100)) }
+        return out
+    }
+    /// How far past its limits a piece is, to keep the better of two drawings: 0 when it passes.
+    public static func excess(_ m: Measure, kind: Kind) -> Double {
+        let l = limits(kind)
+        var e = 0.0
+        if let g = l.glints { e += max(0, m.glints / g - 1) }
+        if let h = l.hf { e += max(0, m.hf / h - 1) }
+        if let x = l.edges { e += max(0, m.edges / x - 1) }
+        if let r = m.read { e += max(0, (kind == .title ? 0.8 : 1) - r) * 3 }
+        return e
+    }
+
+    static func opaqueBox(_ px: [UInt8], width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int)? {
+        var x0 = w, y0 = h, x1 = -1, y1 = -1
+        for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 8 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
+        return x1 < 0 ? nil : (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    }
+    /// CIE L* of an sRGB pixel (D65).
+    static func lstar(_ r: UInt8, _ g: UInt8, _ b: UInt8) -> Double {
+        func lin(_ c: UInt8) -> Double { let v = Double(c) / 255; return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+        let y = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+        return y > 216.0 / 24389 ? 116 * cbrt(y) - 16 : 24389.0 / 27 * y
+    }
+    /// A Gaussian blur of `v` weighted by `wt` (normalised convolution), so the transparent surround does not darken the edge.
+    static func blur(_ v: [Double], _ wt: [Double], width w: Int, height h: Int, sigma: Double) -> [Double] {
+        let r = Int((3 * sigma).rounded(.up)), k = (-r...r).map { exp(-Double($0 * $0) / (2 * sigma * sigma)) }
+        func pass(_ a: [Double], horizontal: Bool) -> [Double] {
+            var o = [Double](repeating: 0, count: a.count)
+            for y in 0..<h { for x in 0..<w {
+                var acc = 0.0
+                for (i, kv) in k.enumerated() {
+                    let xx = horizontal ? x + i - r : x, yy = horizontal ? y : y + i - r
+                    guard xx >= 0, xx < w, yy >= 0, yy < h else { continue }
+                    acc += a[yy * w + xx] * kv
+                }
+                o[y * w + x] = acc
+            } }
+            return o
+        }
+        let num = pass(pass(zip(v, wt).map { $0 * $1 }, horizontal: true), horizontal: false)
+        let den = pass(pass(wt, horizontal: true), horizontal: false)
+        return zip(num, den).map { $0 / max($1, 1e-6) }
+    }
+    /// Glints, fine-detail share and edge density inside the silhouette (eroded 2 px, so its outline against the
+    /// background does not count), as research/legibility/scripts/legib.py measures them.
+    static func clutter(_ px: [UInt8], width w: Int, height h: Int) -> Measure {
+        let n = w * h
+        var L = [Double](repeating: 0, count: n), A = [Bool](repeating: false, count: n)
+        for i in 0..<n { L[i] = lstar(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]); A[i] = px[i * 4 + 3] > 127 }
+        var M = A
+        for _ in 0..<2 {
+            let prev = M
+            for y in 0..<h { for x in 0..<w where prev[y * w + x] {
+                if x == 0 || y == 0 || x == w - 1 || y == h - 1 || !prev[y * w + x - 1] || !prev[y * w + x + 1] || !prev[(y - 1) * w + x] || !prev[(y + 1) * w + x] { M[y * w + x] = false }
+            } }
+        }
+        if M.filter({ $0 }).count < 50 { M = A }
+        let inside = (0..<n).filter { M[$0] }
+        guard !inside.isEmpty else { return Measure(glints: 0, hf: 0, edges: 0) }
+        let W = A.map { $0 ? 1.0 : 0.0 }
+        let b15 = blur(L, W, width: w, height: h, sigma: 1.5), b3 = blur(L, W, width: w, height: h, sigma: 3)
+        func at(_ x: Int, _ y: Int) -> Double { L[min(max(y, 0), h - 1) * w + min(max(x, 0), w - 1)] }
+        var edges = 0
+        for i in inside {
+            let x = i % w, y = i / w
+            let gx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1))
+            let gy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1))
+            if (gx * gx + gy * gy).squareRoot() / 8 > 10 { edges += 1 }
+        }
+        let mean = inside.reduce(0) { $0 + L[$1] } / Double(inside.count)
+        let variance = inside.reduce(0) { $0 + (L[$1] - mean) * (L[$1] - mean) } / Double(inside.count)
+        let hfv = inside.map { L[$0] - b15[$0] }, hfMean = hfv.reduce(0, +) / Double(hfv.count)
+        let hfVar = hfv.reduce(0) { $0 + ($1 - hfMean) * ($1 - hfMean) } / Double(hfv.count)
+        // Glints: blobs of at most 25 px brighter than L* 70 and 15 above their surroundings.
+        var spec = [Bool](repeating: false, count: n)
+        for i in inside where L[i] > 70 && L[i] - b3[i] > 15 { spec[i] = true }
+        var seen = [Bool](repeating: false, count: n), glints = 0
+        for i in 0..<n where spec[i] && !seen[i] {
+            var stack = [i], size = 0
+            seen[i] = true
+            while let j = stack.popLast() {
+                size += 1
+                let x = j % w, y = j / w
+                for dy in -1...1 { for dx in -1...1 {
+                    let xx = x + dx, yy = y + dy
+                    guard xx >= 0, xx < w, yy >= 0, yy < h, spec[yy * w + xx], !seen[yy * w + xx] else { continue }
+                    seen[yy * w + xx] = true; stack.append(yy * w + xx)
+                } }
+            }
+            if size <= 25 { glints += 1 }
+        }
+        return Measure(glints: Double(glints) / Double(inside.count) * 1e4, hf: variance > 0 ? hfVar / variance : 0,
+                       edges: Double(edges) / Double(inside.count), read: nil)
+    }
+
+    /// The words Apple's text recognition reads in a piece laid on a dark slate: accurate, with no language
+    /// correction, so it reads the letter shapes rather than guessing words.
+    static func read(_ px: [UInt8], width w: Int, height h: Int) -> String {
+        var flat = [UInt8](repeating: 255, count: w * h * 4)
+        for i in 0..<(w * h) {
+            let a = Double(px[i * 4 + 3]) / 255
+            for (c, bg) in [32.0, 32, 40].enumerated() { flat[i * 4 + c] = UInt8((Double(px[i * 4 + c]) * a + bg * (1 - a)).rounded()) }
+        }
+        guard let cg = ChromaKeyOutputRules.image(straightRGBA8: flat, width: w, height: h, space: CGColorSpace(name: CGColorSpace.sRGB)) else { return "" }
+        let req = VNRecognizeTextRequest()
+        req.recognitionLevel = .accurate; req.usesLanguageCorrection = false; req.minimumTextHeight = 0
+        try? VNImageRequestHandler(cgImage: cg).perform([req])
+        let lines = (req.results ?? []).compactMap { o -> (String, CGRect)? in o.topCandidates(1).first.map { ($0.string, o.boundingBox) } }
+        return lines.sorted { ($0.1.maxY, -$0.1.minX) > ($1.1.maxY, -$1.1.minX) }.map(\.0).joined(separator: " ")
+    }
+    /// 1 − edit distance ÷ length, letters and digits only (O and 0 alike).
+    static func readScore(_ got: String, _ ref: String) -> Double {
+        func norm(_ s: String) -> [Character] { Array(s.uppercased().replacingOccurrences(of: "0", with: "O").filter { $0.isLetter || $0.isNumber }) }
+        let g = norm(got), r = norm(ref)
+        guard !r.isEmpty else { return 1 }
+        var prev = Array(0...g.count)
+        for (i, cr) in r.enumerated() {
+            var cur = [i + 1]
+            for (j, cg) in g.enumerated() { cur.append(min(prev[j + 1] + 1, cur[j] + 1, prev[j] + (cr == cg ? 0 : 1))) }
+            prev = cur
+        }
+        return max(0, 1 - Double(prev[g.count]) / Double(r.count))
+    }
+}
+
+/// A wedge's words lettered in code, as the studio laid Tiki Titans' (its "Tags", separate smart objects over the
+/// wedges): spelled right and upright by construction, never stacked letter over letter. In Impact, the heavy
+/// condensed face Gameforge ships for in-game text (Tiki Titans, Toyota, Blazing, Mines), with a light face, a thick
+/// outline in the wedge's own hue darkened nearly to black and a thin bright rim — the treatment shipped titles
+/// measure with (research/legibility-docs.md C1–C6, legibility-measure.md).
+public enum WheelLabel {
+    static let fontName = "Impact"
+    public enum Layout: String, Sendable { case across, along }
+    /// The outline and rim round each letter, in cap heights: outline about a sixth, rim a twentieth.
+    static let outline = 0.17, rim = 0.05, gap = 0.3
+    /// Where letters may sit, in the wedge's length: clear of the hub and of the trim at the rim.
+    static let inner = 0.32, outer = 0.93, sideMargin = 0.9
+
+    /// The largest letters a label can have: across the wedge (upright at the pointer) or along it (reading out
+    /// from the hub), on one line or two. Across is kept unless along gives letters more than a tenth bigger.
+    public static func fit(_ label: String, art: WheelArt) -> (layout: Layout, lines: [String], size: CGFloat) {
+        let words = label.split(separator: " ").map(String.init)
+        var splits = [[label]]
+        if words.count > 1 { splits += (1..<words.count).map { [words[..<$0].joined(separator: " "), words[$0...].joined(separator: " ")] } }
+        func best(_ l: Layout) -> (lines: [String], size: CGFloat) {
+            splits.map { ($0, size(for: $0, layout: l, art: art)) }.max { $0.1 < $1.1 }!
+        }
+        let a = best(.across), b = best(.along)
+        return a.size >= 0.9 * b.size ? (.across, a.lines, a.size) : (.along, b.lines, b.size)
+    }
+    /// The font size at which the lines just fit their place in the wedge.
+    static func size(for lines: [String], layout: Layout, art: WheelArt) -> CGFloat {
+        let font = CTFontCreateWithName(fontName as CFString, 100, nil), cap = CTFontGetCapHeight(font)
+        let w1 = lines.map { width($0, font) }.max() ?? 0, n = CGFloat(lines.count)
+        let pad = CGFloat(outline + rim + 0.04) * cap
+        let hw1 = w1 / 2 + pad, hh1 = (n * cap + (n - 1) * CGFloat(gap) * cap) / 2 + pad
+        let R = CGFloat(art.radius), rOut = CGFloat(outer) * R, rIn = CGFloat(inner) * R, t = CGFloat(tan(art.half) * sideMargin)
+        func fits(_ k: CGFloat) -> Bool {
+            let hw = k * hw1, hh = k * hh1
+            switch layout {
+            case .across:
+                guard hw < rOut else { return false }
+                let bottom = (rOut * rOut - hw * hw).squareRoot() - 2 * hh
+                return bottom >= rIn && hw <= bottom * t
+            case .along:
+                guard hh < rOut else { return false }
+                let d0 = (rOut * rOut - hh * hh).squareRoot() - 2 * hw
+                return d0 >= rIn && hh <= d0 * t
+            }
+        }
+        var lo: CGFloat = 0, hi: CGFloat = 50
+        for _ in 0..<40 { let m = (lo + hi) / 2; if fits(m) { lo = m } else { hi = m } }
+        return lo * 100
+    }
+    static func width(_ s: String, _ font: CTFont) -> CGFloat {
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
+        return CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+    }
+
+    /// The wedge (straight RGBA at its wedgeSize, cut to its sector) with its label lettered on, cut again.
+    public static func lettered(_ wedge: [UInt8], label: String, art: WheelArt) -> [UInt8] {
+        let (w, h) = art.wedgeSize
+        let f = fit(label, art: art)
+        guard f.size > 4, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return wedge }
+        let font = CTFontCreateWithName(fontName as CFString, f.size, nil), cap = CTFontGetCapHeight(font)
+        let n = CGFloat(f.lines.count), H = n * cap + (n - 1) * CGFloat(gap) * cap, pad = CGFloat(outline + rim + 0.04) * cap
+        let W = f.lines.map { width($0, font) }.max() ?? 0
+        let R = CGFloat(art.radius), rOut = CGFloat(outer) * R
+        // The block's centre on the wedge's axis, measured from the tip (12 px above the canvas's foot).
+        let centre: CGFloat
+        switch f.layout {
+        case .across: centre = (rOut * rOut - (W / 2 + pad) * (W / 2 + pad)).squareRoot() - (H / 2 + pad)
+        case .along: centre = (rOut * rOut - (H / 2 + pad) * (H / 2 + pad)).squareRoot() - (W / 2 + pad)
+        }
+        ctx.translateBy(x: CGFloat(w) / 2, y: 12 + centre)
+        if f.layout == .along { ctx.rotate(by: .pi / 2) }            // reading out from the hub
+        ctx.textMatrix = .identity
+        ctx.setLineJoin(.round)
+        // The outline: the wedge's own hue, darkened nearly to black.
+        let ink = darkInk(wedge, width: w, height: h)
+        let lines = f.lines.enumerated().map { (i, s) -> (CTLine, CGPoint) in
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: s, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
+            return (line, CGPoint(x: -width(s, font) / 2, y: H / 2 - cap - CGFloat(i) * cap * (1 + CGFloat(gap))))
+        }
+        func draw(_ mode: CGTextDrawingMode) { for (l, p) in lines { ctx.textPosition = p; ctx.setTextDrawingMode(mode); CTLineDraw(l, ctx) } }
+        // A soft shadow under the bright rim, the rim, the dark outline, then each line's face: light, top to bottom.
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -0.06 * cap), blur: 0.12 * cap, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+        ctx.setStrokeColor(CGColor(red: 1, green: 0.96, blue: 0.84, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline + rim) * cap)
+        draw(.stroke)
+        ctx.restoreGState()
+        ctx.setStrokeColor(CGColor(red: CGFloat(ink.r) / 255, green: CGFloat(ink.g) / 255, blue: CGFloat(ink.b) / 255, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline) * cap)
+        draw(.stroke)
+        let face = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: [CGColor(red: 1, green: 1, blue: 1, alpha: 1), CGColor(red: 1, green: 0.87, blue: 0.52, alpha: 1)] as CFArray, locations: [0, 1])!
+        for (l, p) in lines {
+            ctx.saveGState()
+            ctx.textPosition = p; ctx.setTextDrawingMode(.clip); CTLineDraw(l, ctx)
+            ctx.drawLinearGradient(face, start: CGPoint(x: 0, y: p.y + cap), end: CGPoint(x: 0, y: p.y), options: [])
+            ctx.restoreGState()
+        }
+        guard let img = ctx.makeImage(), let text = ChromaKeyOutputRules.straightRGBA8(img) else { return wedge }
+        var out = wedge
+        FrameKit.over(&out, width: w, FrameKit.Piece(px: text, w: w, h: h), at: 0, 0)
+        return art.cut(out)
+    }
+    /// The wedge's colour (its opaque pixels' median), darkened to about L* 12 for the outline.
+    static func darkInk(_ px: [UInt8], width w: Int, height h: Int) -> RGB8 {
+        var r: [Int] = [], g: [Int] = [], b: [Int] = []
+        for i in stride(from: 0, to: w * h, by: 7) where px[i * 4 + 3] > 200 { r.append(Int(px[i * 4])); g.append(Int(px[i * 4 + 1])); b.append(Int(px[i * 4 + 2])) }
+        guard !r.isEmpty else { return RGB8(20, 14, 10) }
+        func med(_ a: [Int]) -> Double { Double(a.sorted()[a.count / 2]) }
+        let (mr, mg, mb) = (med(r), med(g), med(b)), k = 34 / max(mr, mg, mb, 1)
+        return RGB8(UInt8(min(255, mr * k)), UInt8(min(255, mg * k)), UInt8(min(255, mb * k)))
     }
 }

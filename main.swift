@@ -21748,6 +21748,27 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --legibility <set folder>
+// Every interface piece measured at the size a phone shows it (Legibility): glints, fine detail, edges and, for
+// lettering, whether it reads at an iPhone SE's size — against the limits measured on the studio's shipped art.
+if let flag = CommandLine.arguments.firstIndex(of: "--legibility"), flag + 1 < CommandLine.arguments.count {
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        var failing = 0, total = 0
+        for (name, kind, text) in run.legibilityPieces() {
+            guard let cg = loadCGImage(folder.appendingPathComponent("\(name)_rmbg.png")), let px = ChromaKeyOutputRules.straightRGBA8(cg),
+                  let m = Legibility.measure(px, width: cg.width, height: cg.height, kind: kind, text: text) else { continue }
+            let p = Legibility.problems(m, kind: kind)
+            total += 1; failing += p.isEmpty ? 0 : 1
+            print(String(format: "%@ %@ [%@] glints %.1f · fine detail %.3f · edges %.3f%@%@", p.isEmpty ? "✓" : "✗", name, kind.rawValue, m.glints, m.hf, m.edges,
+                         m.read.map { String(format: " · read %.0f%%", $0 * 100) } ?? "", p.isEmpty ? "" : "\n    " + p.joined(separator: "\n    ")))
+        }
+        print("\(total - failing) of \(total) read at phone size"); exit(0)
+    } }
+    app.run()
+}
+
 // Free:  Navigator --checklist <set folder>
 // Every static asset the set's game needs, grouped, made or not, who makes it and about what the rest costs.
 if let flag = CommandLine.arguments.firstIndex(of: "--checklist"), flag + 1 < CommandLine.arguments.count {
@@ -26039,6 +26060,34 @@ final class GDDToAssetsRun: ObservableObject {
         jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
             .map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
     }
+    /// The interface pieces Legibility judges, with the kind each is shown as and the words it carries.
+    func legibilityPieces() -> [(name: String, kind: Legibility.Kind, text: String?)] {
+        guard let layout = reelLayout else { return [] }
+        var out: [(name: String, kind: Legibility.Kind, text: String?)] = []
+        for p in PopUps.plan(layout, jackpots: jackpotNames, bonus: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout)) {
+            switch p.kind {
+            case .title: out.append((p.name, p.text.contains("\n") ? .title : .message, p.text.replacingOccurrences(of: "\n", with: " ")))
+            case .button: out.append((p.name, .button, p.text))
+            case .panel: out.append((p.name, .panel, nil))
+            case .bar: break
+            }
+        }
+        for (wi, w) in (layout.wheels ?? []).enumerated() {
+            // The wedge's own face, before its words are lettered on in code: its letters are no clutter.
+            for label in Set(w.wedges) {
+                let n = "\(wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)")_interface_wedge-\(PopUps.key(label))"
+                let blank = lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent(n + "-blank_rmbg.png").path) } ?? false
+                out.append((blank ? n + "-blank" : n, .wedge, nil))
+            }
+        }
+        if let pots = layout.extras.first(where: { $0.what == "pots" }) {
+            let n = pots.count ?? max(1, jobs.filter { $0.role == .bonus }.count)
+            for i in 0..<n { for k in 0...PotStates.levels { out.append((PotStates.name(pot: i, of: n, state: k), .pot, nil)) } }
+        }
+        for j in jobs where j.kind == .symbol && j.role == .jackpot { out.append((j.id, .coin, GDDAssetPrompts.letteredWord(j))) }
+        return out
+    }
+
     /// Every static asset this game needs (AssetChecklist), with what is made already.
     func checklist() -> [(item: AssetChecklist.Item, made: Bool)] {
         let hasBonus = AssetChecklist.hasBonusGames(jobs: jobs, layout: reelLayout)
@@ -26111,8 +26160,9 @@ final class GDDToAssetsRun: ObservableObject {
             .map { p in list.filter { $0.item.files.contains(where: p.files) } } ?? list.filter { !$0.made }
         let alert = NSAlert()
         alert.messageText = redo.map { "Make the \($0) again?" } ?? "Make the game interface?"
-        alert.informativeText = String(format: "%d piece%@ — about $%.2f (GPT Image 2.5).%@", todo.count, todo.count == 1 ? "" : "s", todo.reduce(0) { $0 + $1.item.cost },
-                                       redo == nil ? "" : " The current files are kept in the set's versions folder.")
+        let total = todo.reduce(0) { $0 + $1.item.cost }
+        alert.informativeText = String(format: "%d piece%@ — about $%.2f (GPT Image 2.5). A piece that fails the phone-size check is drawn once more: at most $%.2f.%@",
+                                       todo.count, todo.count == 1 ? "" : "s", total, 2 * total, redo == nil ? "" : " The current files are kept in the set's versions folder.")
         alert.addButton(withTitle: redo == nil ? "Make" : "Make Again"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         if let redo { Self.keepForRedo(redo, folder: folder) }
@@ -26160,10 +26210,22 @@ final class GDDToAssetsRun: ObservableObject {
             return (px, cg.width, cg.height)
         }
         /// A piece drawn on a template and checked against its openings: up to two attempts, the best kept.
-        func paint(_ what: String, prompt: String, inputs: [Data], w: Int, h: Int, covered: (([UInt8]) -> Double)?) -> [UInt8]? {
+        /// A drawing judged at the size a phone shows it (Legibility), keyed off the backing first.
+        func legible(_ kind: Legibility.Kind, _ w: Int, _ h: Int, text: String? = nil, shape: (([UInt8]) -> [UInt8])? = nil) -> ([UInt8]) -> (problems: [String], excess: Double) {
+            { px in
+                let keyed = FrameKit.keyed(px, backing: b, width: w, height: h)
+                guard let m = Legibility.measure(shape?(keyed) ?? keyed, width: w, height: h, kind: kind, text: text) else { return ([], 0) }
+                return (Legibility.problems(m, kind: kind), Legibility.excess(m, kind: kind))
+            }
+        }
+        /// A piece drawn on a template, checked against its openings and, when `judge` is given, at phone size: drawn
+        /// once more when either fails (the second told what failed), the better of the two kept.
+        func paint(_ what: String, prompt: String, inputs: [Data], w: Int, h: Int, covered: (([UInt8]) -> Double)?,
+                   judge: (([UInt8]) -> (problems: [String], excess: Double))? = nil) -> [UInt8]? {
             guard wanted(what + ".png") else { return nil }
             log.write("prompts/\(what).txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h)\n\n\(prompt)")
-            var best: (px: [UInt8], c: Double)?
+            var best: (px: [UInt8], c: Double, failed: [String], score: Double)?
+            var ask = prompt
             // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up.
             // Small pieces (a wheel's wedge) asked at a megapixel at least, and scaled back down.
             let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
@@ -26171,16 +26233,23 @@ final class GDDToAssetsRun: ObservableObject {
             // Rounding to 16 can tip a 3:1 piece past GPT Image's 3:1 limit (1536x512 asked as 1760x576).
             if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
             if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
-            for attempt in 1...(covered == nil ? 1 : 2) {
-                let r = OpenAIImages.edit(prompt: prompt, images: inputs, size: rw, height: rh)
+            for attempt in 1...(covered == nil && judge == nil ? 1 : 2) {
+                let r = OpenAIImages.edit(prompt: ask, images: inputs, size: rw, height: rh)
                 cost += r.cost
                 guard let d = r.png, let px = pixels(d, w, h) else { problems.append("\(what): \(r.error ?? "no image")"); return best?.px }
-                let c = covered?(px) ?? 0
-                navLog(String(format: "gdd reel: %@ attempt %d covers %.1f%% of its openings $%.3f", what, attempt, c * 100, r.cost))
-                if best == nil || c < best!.c { best = (px, c) }
-                if c <= FrameStack.windowTolerance { break }
+                let c = covered?(px) ?? 0, j = judge?(px) ?? (problems: [], excess: 0)
+                navLog(String(format: "gdd reel: %@ attempt %d covers %.1f%% of its openings, %d phone-size problems $%.3f", what, attempt, c * 100, j.problems.count, r.cost))
+                let score = (c > FrameStack.windowTolerance ? 10 + c : 0) + j.excess
+                if best == nil || score < best!.score { best = (px, c, j.problems, score) }
+                if c <= FrameStack.windowTolerance && j.problems.isEmpty { break }
+                if !j.problems.isEmpty {
+                    ask = prompt + "\n\nTHE LAST DRAWING DID NOT HOLD UP AT PHONE SIZE: " + j.problems.joined(separator: "; ")
+                        + ". Draw it again fixing exactly that: fewer and bolder details, smooth clean surfaces, almost no sparkles or glints; any letters with clean solid faces, thick strokes and a thick dark outline."
+                    log.write("prompts/\(what)-again.txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h), drawn again\n\n\(ask)")
+                }
             }
             if let best, best.c > FrameStack.windowTolerance { problems.append(String(format: "the %@ covers %.1f%% of its openings", what, best.c * 100)) }
+            if let best, !best.failed.isEmpty { problems.append("\(what) at phone size: " + best.failed.joined(separator: "; ")) }
             return best?.px
         }
         // Modes: the base grid, then each bonus grid in turn, named as the studio's are.
@@ -26304,7 +26373,7 @@ final class GDDToAssetsRun: ObservableObject {
                                                       symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total)
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
                 // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
-                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil) {
+                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil, judge: legible(.pot, 1024, 1024)) {
                     let tall = PotStates.padded(FrameKit.keyed(px, backing: b, width: 1024, height: 1024), size: 1024)
                     write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
                     write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
@@ -26317,15 +26386,24 @@ final class GDDToAssetsRun: ObservableObject {
                 write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
                 write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
             }
-            // Its fill states, State1…State5, each an edit of State0 so they swap in place.
+            // Its fill states, State1…State5, each grown from the one before on a grey heap laid in code to its height
+            // (PotStates.rise, the shipped rigs' back-loaded schedule): the treasure only ever rises, the last states
+            // still grow, and each is laid on State0's foot so the states swap in place. Judged for both, and at phone size.
             for i in 0..<total {
-                guard let empty = try? Data(contentsOf: url("\(jar(i, 0)).png")) else { continue }
+                guard let e0 = load("\(jar(i, 0))_rmbg.png"), e0.w == 1024, e0.h == potH else { continue }
                 for k in 1...PotStates.levels where !has("\(jar(i, k)).png") {
-                    let prompt = GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k)
-                    if let px = paint(jar(i, k), prompt: prompt, inputs: [empty], w: 1024, h: potH, covered: nil) {
-                        write(px, 1024, potH, "\(jar(i, k)).png")
-                        write(FrameKit.keyed(px, backing: b, width: 1024, height: potH), 1024, potH, "\(jar(i, k))_rmbg.png")
+                    guard let prev = load("\(jar(i, k - 1))_rmbg.png"), prev.w == 1024, prev.h == potH,
+                          let tpl = PotStates.template(previous: prev.px, empty: e0.px, width: 1024, height: potH, state: k, backing: b).flatMap({ png($0, 1024, potH) }) else { break }
+                    let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
+                        let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                        var p = PotStates.growthProblems(laid, previous: prev.px, empty: e0.px, width: 1024, height: potH, state: k), x = Double(p.count)
+                        if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
+                        return (p, x)
                     }
+                    guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k),
+                                         inputs: [tpl], w: 1024, h: potH, covered: nil, judge: judge) else { break }    // the states after it grow from it
+                    let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
                 }
                 // With the Power Bet on, the look the GDD gives the pot, an edit of its full state (PotStates.boost).
                 if let look = layout.potBoost, !has("\(PotStates.boostedName(pot: i, of: total)).png"), let full = try? Data(contentsOf: url("\(jar(i, PotStates.levels)).png")) {
@@ -26357,7 +26435,8 @@ final class GDDToAssetsRun: ObservableObject {
                     let word = (layout.potFeatures ?? []).indices.contains(i) ? layout.potFeatures![i] : ""
                     guard let pot = try? Data(contentsOf: url("\(jar(i, 0)).png")), let tpl = png(PopUps.template(plaque, backing: b), plaque.w, plaque.h) else { continue }
                     if let px = paint(PotStates.plaqueName(pot: i), prompt: GDDAssetPrompts.potPlaqueBrief(theme: theme, design: design, backing: (backing.name, b), word: word),
-                                      inputs: [downsamplePNG(pot, longEdge: 1024) ?? pot, tpl], w: plaque.w, h: plaque.h, covered: nil) {
+                                      inputs: [downsamplePNG(pot, longEdge: 1024) ?? pot, tpl], w: plaque.w, h: plaque.h, covered: nil,
+                                      judge: legible(.button, plaque.w, plaque.h, text: word.isEmpty ? nil : word)) {
                         write(px, plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i)).png")
                         write(FrameKit.keyed(px, backing: b, width: plaque.w, height: plaque.h), plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i))_rmbg.png")
                     }
@@ -26403,14 +26482,20 @@ final class GDDToAssetsRun: ObservableObject {
             let (ww, wh) = art.wedgeSize
             var firstWedge: Data? = nil
             for label in order.reduce(into: [String](), { if !$0.contains($1) { $0.append($1) } }) {
-                let n = "\(prefix)_interface_wedge-\(PopUps.key(label))"
-                if !has("\(n).png"), let tpl = png(art.wedgeTemplate(backing: b), ww, wh),
+                // Drawn blank (its face plain, judged at phone size), its words lettered on in code (WheelLabel): spelled
+                // right and upright, free, and lettered again whenever the blank is drawn again.
+                let n = "\(prefix)_interface_wedge-\(PopUps.key(label))", blankName = n + "-blank"
+                if !has("\(n).png") && !has("\(blankName)_rmbg.png"), let tpl = png(art.wedgeTemplate(backing: b), ww, wh),
                    let px = paint(n, prompt: GDDAssetPrompts.wedgeBrief(theme: theme, design: design, backing: (backing.name, b), label: label, matching: firstWedge != nil, wheel: order),
-                                  inputs: (firstWedge.map { [$0] } ?? []) + [tpl], w: ww, h: wh, covered: nil) {
+                                  inputs: (firstWedge.map { [$0] } ?? []) + [tpl], w: ww, h: wh, covered: nil, judge: legible(.wedge, ww, wh, shape: art.cut)) {
                     let cut = art.cut(FrameKit.keyed(px, backing: b, width: ww, height: wh))
-                    write(FrameKit.onBacking(cut, b), ww, wh, "\(n).png"); write(cut, ww, wh, "\(n)_rmbg.png")
+                    write(FrameKit.onBacking(cut, b), ww, wh, "\(blankName).png"); write(cut, ww, wh, "\(blankName)_rmbg.png")
                 }
-                if firstWedge == nil { firstWedge = try? Data(contentsOf: url("\(n).png")) }
+                if !has("\(n).png"), let blank = load("\(blankName)_rmbg.png"), blank.w == ww, blank.h == wh {
+                    let done = label == "CREDITS" ? blank.px : WheelLabel.lettered(blank.px, label: label, art: art)
+                    write(FrameKit.onBacking(done, b), ww, wh, "\(n).png"); write(done, ww, wh, "\(n)_rmbg.png")
+                }
+                if firstWedge == nil { firstWedge = (try? Data(contentsOf: url("\(blankName).png"))) ?? (try? Data(contentsOf: url("\(n).png"))) }
             }
             wheelPreview(prefix: prefix, art: art, order: order, folder: folder)
         }
@@ -26430,13 +26515,15 @@ final class GDDToAssetsRun: ObservableObject {
             if piece.kind == .title {
                 guard let canvas = blank(piece.w, piece.h) else { continue }
                 let prompt = GDDAssetPrompts.popUpTitleBrief(theme: theme, design: design, backing: (backing.name, b), text: piece.text, matching: firstTitle != nil)
-                if let px = paint(piece.name, prompt: prompt, inputs: (firstTitle.map { [downsamplePNG($0, longEdge: 1024) ?? $0] } ?? []) + [canvas], w: piece.w, h: piece.h, covered: nil) {
+                if let px = paint(piece.name, prompt: prompt, inputs: (firstTitle.map { [downsamplePNG($0, longEdge: 1024) ?? $0] } ?? []) + [canvas], w: piece.w, h: piece.h, covered: nil,
+                                  judge: legible(piece.text.contains("\n") ? .title : .message, piece.w, piece.h, text: piece.text.replacingOccurrences(of: "\n", with: " "))) {
                     both(px, piece.w, piece.h, piece.name)
                     if firstTitle == nil { firstTitle = try? Data(contentsOf: url("\(piece.name).png")) }
                 }
             } else if let ref = bezelRef, let tpl = png(PopUps.template(piece, backing: b), piece.w, piece.h),
                       let px = paint(piece.name, prompt: GDDAssetPrompts.popUpPieceBrief(theme: theme, design: design, backing: (backing.name, b), kind: piece.kind, text: piece.text),
-                                     inputs: [ref, tpl], w: piece.w, h: piece.h, covered: nil) {
+                                     inputs: [ref, tpl], w: piece.w, h: piece.h, covered: nil,
+                                     judge: piece.kind == .bar ? nil : legible(piece.kind == .button ? .button : .panel, piece.w, piece.h, text: piece.kind == .button ? piece.text : nil)) {
                 both(px, piece.w, piece.h, piece.name)
             }
         }

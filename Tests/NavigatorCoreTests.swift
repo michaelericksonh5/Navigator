@@ -13691,3 +13691,50 @@ final class WinLadderAndBoostTests: XCTestCase {
         XCTAssertTrue(AssetChecklist.items(jobs: jobs, layout: l, jackpots: [], hasBonus: true).contains { $0.name == "shared_avatar_jar-boostedIdle" })
     }
 }
+
+final class ReadabilityTests: XCTestCase {
+    // Wheel words lettered in code: whole words on a line, never a letter a line, and large in their wedge.
+    func testWheelLabelsAreWholeWordsAndLarge() {
+        let art = WheelArt(segments: 12)
+        for label in ["MINI", "GRAND", "BONUS GAMES", "MULTIPLIER BONUS"] {
+            let f = WheelLabel.fit(label, art: art)
+            XCTAssertTrue(f.lines.allSatisfy { $0.count > 1 }, label)
+            XCTAssertEqual(f.lines.joined(separator: " "), label)
+            XCTAssertGreaterThan(f.size * 0.7, CGFloat(art.radius) * 0.06, label)       // cap height past 6% of the wedge
+        }
+        XCTAssertEqual(WheelLabel.fit("MINI", art: WheelArt(segments: 4)).layout, .across)   // a wide wedge: upright at the pointer
+        let blank = art.cut([UInt8](repeating: 120, count: art.wedgeSize.w * art.wedgeSize.h * 4).enumerated().map { $0.offset % 4 == 3 ? 255 : $0.element })
+        XCTAssertNotEqual(WheelLabel.lettered(blank, label: "MINI", art: art), blank)
+    }
+    // The pot's states: heaped to the shipped rigs' back-loaded heights, and a state that does not rise is caught.
+    func testPotsGrowOnTheShippedSchedule() {
+        let w = 100, h = 125
+        var pot = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 45..<125 { for x in 20..<80 { pot[(y * w + x) * 4 + 3] = 255 } }         // State0: rows 45…124
+        XCTAssertEqual(PotStates.rise.count, PotStates.levels + 1)
+        XCTAssertEqual(PotStates.rise, PotStates.rise.sorted())
+        XCTAssertGreaterThan(PotStates.rise[5] - PotStates.rise[3], PotStates.rise[5] * 0.35)    // shipped: about half the rise after State3
+        let t3 = PotStates.template(previous: pot, empty: pot, width: w, height: h, state: 3, backing: RGB8(255, 0, 255))!
+        let crown = (0..<h).first { y in (0..<w).contains { t3[(y * w + $0) * 4] != 255 || t3[(y * w + $0) * 4 + 2] != 255 } }!
+        XCTAssertEqual(Double(45 - crown) / 79, PotStates.rise[3], accuracy: 0.03)
+        XCTAssertFalse(PotStates.growthProblems(pot, previous: pot, empty: pot, width: w, height: h, state: 3).isEmpty)  // no rise: caught
+    }
+    // The phone-size check: a speckled piece fails where a smooth one passes; reading is scored by letters.
+    func testThePhoneSizeCheckSeesGlints() {
+        let n = 300
+        var smooth = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n where (x - 150) * (x - 150) + (y - 150) * (y - 150) < 140 * 140 {
+            let i = (y * n + x) * 4; smooth[i] = 120; smooth[i + 1] = UInt8(60 + y / 5); smooth[i + 2] = 40; smooth[i + 3] = 255
+        } }
+        var speckled = smooth
+        for y in stride(from: 30, to: 270, by: 9) { for x in stride(from: 30, to: 270, by: 9) where smooth[(y * n + x) * 4 + 3] == 255 {
+            for c in 0..<3 { speckled[(y * n + x) * 4 + c] = 255 }
+        } }
+        let a = Legibility.measure(smooth, width: n, height: n, kind: .pot)!, b = Legibility.measure(speckled, width: n, height: n, kind: .pot)!
+        XCTAssertTrue(Legibility.problems(a, kind: .pot).isEmpty)
+        XCTAssertFalse(Legibility.problems(b, kind: .pot).isEmpty)
+        XCTAssertGreaterThan(b.glints, a.glints)
+        XCTAssertEqual(Legibility.readScore("BONUS GAMES", "Bonus Games!"), 1)
+        XCTAssertEqual(Legibility.readScore("BONVS GAMES", "BONUS GAMES"), 0.9, accuracy: 0.001)
+    }
+}
