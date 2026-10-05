@@ -8971,7 +8971,7 @@ public enum AssetChecklist {
         }
         out.append(Item(group: "Fonts", name: "transition_font_totalWin", what: "the total-win number font: " + NumberFont.glyphs.joined(separator: " "),
                         files: ["transition_font_totalWin.png"], maker: "Number font", cost: gpt(NumberFont.size.w, NumberFont.size.h)))
-        for c in (standard ?? []) + (l.concepts ?? []) {
+        for c in (standard ?? []) + StandardPieces.without(l.concepts ?? [], standard ?? []) {
             out.append(Item(group: c.standard ? "Studio pieces" : "From the GDD", name: c.name, what: c.what + (c.states.isEmpty ? "" : " (states: \(c.states.joined(separator: ", ")))"),
                             files: ["\(c.name).png"] + c.states.map { "\(c.stateName($0)).png" }, maker: "Gemini concept", cost: Double(1 + c.states.count) * gpt(c.width, c.height)))
         }
@@ -9002,6 +9002,20 @@ public enum StandardPieces {
         t = t.replacingOccurrences(of: #"(?i)\b(GDD|game design document)\b"#, with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: #"^\s*\d+\s+"#, with: "", options: .regularExpression)
         return t.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "-–")))
+    }
+
+    /// Planned pieces with any a studio piece already makes taken out: a plan made before these existed drew a
+    /// second logo and a second sell-screen panel (Tiki, 2026-10-04).
+    public static func without(_ concepts: [ConceptPiece], _ standard: [ConceptPiece]) -> [ConceptPiece] {
+        let has = { (n: String) in standard.contains { $0.name == n } }
+        return concepts.filter { c in
+            let n = c.name.lowercased()
+            if n.contains("logo") && has("shared_logo_master") { return false }
+            if n.contains("sellscreen") && (n.contains("panel") || n.contains("background")) && has("shared_sellScreen_background") { return false }
+            if n.contains("powerbet") && (n.contains("drawer") || n.contains("toggle")) && has("shared_powerBet_drawer") { return false }
+            if n.contains("tutorial") && n.contains("background") && has("shared_tutorial_background") { return false }
+            return !has(c.name)
+        }
     }
 
     public static func pieces(game: String, gdd: String, layout: ReelLayout, hero: String?) -> [ConceptPiece] {

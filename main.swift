@@ -26395,8 +26395,9 @@ final class GDDToAssetsRun: ObservableObject {
         let (gameName, gddText) = DispatchQueue.main.sync { (self.gameName, self.gddText) }
         let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
         let standard = StandardPieces.pieces(game: gameName, gdd: gddText, layout: layout, hero: hero)
-        Self.conceptNames = (standard + (layout.concepts ?? [])).map(\.name)
-        for piece in standard + (layout.concepts ?? []) {
+        let planned = StandardPieces.without(layout.concepts ?? [], standard)
+        Self.conceptNames = (standard + planned).map(\.name)
+        for piece in standard + planned {
             if !has("\(piece.name).png"), let ref = bezelRef, let canvas = blank(piece.width, piece.height) {
                 let tpl = ConceptPiece.template(piece, backing: b).flatMap { png($0, piece.width, piece.height) }
                 // Set images it is drawn from: a symbol's own art, its cut-out subject when it has one.
@@ -26411,7 +26412,7 @@ final class GDDToAssetsRun: ObservableObject {
                                   inputs: [first], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.stateName(state)) }
             }
         }
-        conceptSheet(standard + (layout.concepts ?? []), folder: folder)
+        conceptSheet(standard + planned, folder: folder)
         // 8. The total-win number font: its glyphs drawn in a grid in the TOTAL WIN title's lettering, cut cell by
         // cell and laid out as the studio's strip (NumberFont).
         // And one for every counter and meter the game has, lettered as that piece (6 of 10 games).
