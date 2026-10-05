@@ -26473,7 +26473,9 @@ final class GDDToAssetsRun: ObservableObject {
                     }
                     guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
                                          inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge) else { break }
-                    let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    var laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
+                    FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
                     write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
                 }
                 for k in 1...PotStates.levels where kind == .jar && !has("\(jar(i, k)).png") {
@@ -26522,7 +26524,9 @@ final class GDDToAssetsRun: ObservableObject {
                     let prompt = lid != nil ? GDDAssetPrompts.potLidStateBrief(theme: theme, backing: (backing.name, b), level: k)
                                             : GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k)
                     guard let px = paint(jar(i, k), prompt: prompt, inputs: [tpl] + (reference.map { [$0] } ?? []), w: 1024, h: potH, covered: nil, judge: judge) else { break }
-                    let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    var laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
+                    FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
                     write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
                 }
                 // With the Power Bet on, the look the GDD gives the pot, an edit of its full state (PotStates.boost).
