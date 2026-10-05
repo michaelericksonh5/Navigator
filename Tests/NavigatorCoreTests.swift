@@ -13706,6 +13706,22 @@ final class ReadabilityTests: XCTestCase {
         let blank = art.cut([UInt8](repeating: 120, count: art.wedgeSize.w * art.wedgeSize.h * 4).enumerated().map { $0.offset % 4 == 3 ? 255 : $0.element })
         XCTAssertNotEqual(WheelLabel.lettered(blank, label: "MINI", art: art), blank)
     }
+    // Wheel words in the game's own lettering: a light-faced title gives its tones, light to deep; a dark one gives none.
+    func testWheelLabelsTakeTheGamesLettering() {
+        let w = 120, h = 60
+        func title(face: RGB8) -> [UInt8] {
+            var px = [UInt8](repeating: 0, count: w * h * 4)
+            for y in 5..<55 { for x in 5..<115 {
+                let edge = y < 12 || y > 47 || x < 12 || x > 107, i = (y * w + x) * 4
+                let c = edge ? RGB8(20, 10, 30) : RGB8(UInt8(min(255, Int(face.r) + (40 - y) / 2)), face.g, face.b)
+                px[i] = c.r; px[i + 1] = c.g; px[i + 2] = c.b; px[i + 3] = 255
+            } }
+            return px
+        }
+        let tones = WheelLabel.palette(fromTitle: title(face: RGB8(200, 230, 255)), width: w, height: h)
+        XCTAssertEqual(tones?.count, 3)
+        XCTAssertNil(WheelLabel.palette(fromTitle: title(face: RGB8(60, 30, 90)), width: w, height: h))
+    }
     // The pot's states: heaped to the shipped rigs' back-loaded heights, and a state that does not rise is caught.
     func testPotsGrowOnTheShippedSchedule() {
         let w = 100, h = 125

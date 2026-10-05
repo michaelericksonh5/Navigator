@@ -15462,6 +15462,9 @@ extension GDDAssetPrompts {
     /// light and big value masses, not texture (Valve's TF2 paper, Loomis' four values, Rosenholtz's clutter measures).
     static let detailRules = "AT PHONE SIZE it must still read, so: a strong, simple silhouette and three or four big masses of light and shade; ornament in a few bold, chunky shapes — no fine filigree, hairline engraving, tiny gems or speckled glitter; smooth surfaces between the ornament. Keep it rich through light, not texture: warm highlights, cool shadows, a saturated edge between them and a crisp rim light, with a few deliberate highlights at most — no scattered sparkles, glints or star fields."
 
+    /// The same, short, for the symbols and their frames, whose briefs are held under 450 words.
+    static let reelDetail = "Read at reel size: strong silhouette, big masses of light and shade, bold ornament; no fine filigree, tiny gems, glitter or scattered sparkles."
+
     /// The cast member a character-reference id belongs to.
     static func castMember(ref: String, _ design: SetDesign) -> CastMember? {
         design.cast.first { $0.refID == ref }
@@ -15619,6 +15622,7 @@ extension GDDAssetPrompts {
             "Draw \(role == .highPay ? "three" : "two") separate parts, well apart, nothing touching:\n\n1. Across the top third: ONE straight, horizontal length of the frame's moulding, running the full width of the image from the left edge to the right edge. A slim stick of moulding seen straight on: its whole cross-section shows, from its outer edge along the top to its finished inner edge — a narrow bead or lip — along the bottom, and it is the same all along its length, like a length of picture-frame moulding before it is cut. No corners, ends, gems or ornaments on it.\n\n2. Bottom left: ONE corner ornament — what sits on the frame's corners — set over its top-left corner, covering the joint where the top and left lengths meet. An ornament only, with no lengths of moulding attached to it, seen straight on, about a quarter of the image wide.\(centre)",
         ] + refs + [
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art)) Except the light: every part is lit evenly from straight in front — soft, even light with gentle highlights along the middle of each form and no strong shadow to either side — because the light's direction is added when the frame is built.",
+            reelDetail,
             backdropLine(backing, several: true),
             "No gems or jewels on any part: they are set in afterwards. No text, lettering or numbers, no watermark, no user interface.",
         ]).joined(separator: "\n\n")
@@ -15654,6 +15658,7 @@ extension GDDAssetPrompts {
         }
         let tail = [
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: art))",
+            reelDetail,
             backdropLine(backing),
             "No text, lettering or numbers, no watermark, no user interface.",
         ]
@@ -16044,7 +16049,8 @@ extension GDDAssetPrompts {
         if step.mode == .panel { return panelBrief(theme: theme, design: design) }
         if step.mode == .gem { return gemsBrief(job: job, theme: theme, design: design, backing: backing, jobs: jobs) }
         let artAttached = step.refs.contains(RenderPlan.themeArt)
-        let look = lookBlock(theme, design, artAttached: artAttached)
+        // Every symbol's look, held to what reads at reel size (shipped HP art: half the glints and fine detail of generated).
+        let look = lookBlock(theme, design, artAttached: artAttached) + " " + reelDetail
         let refs = referenceLines(step, job: job, jobs: jobs,
                                   anchorID: SetDesignRules.anchor(jobs, design)?.id, design: design)
         let game = "a video slot game themed “\(theme.name)”"
@@ -16636,10 +16642,14 @@ public enum SpineKitRules {
 /// visible edges, all inside the piece's silhouette — and, for lettering, whether Apple's text recognition reads
 /// it exactly at an iPhone SE's size. Each limit is the shipped 90th percentile: nine in ten shipped pieces pass.
 public enum Legibility {
-    public enum Kind: String, Sendable { case title, message, button, panel, wedge, wheel, pot, coin }
+    /// `symbol`: a reel symbol (shipped HP p75, the tighter limit research/legibility-measure.md §5 gives for symbols,
+    /// whose shipped art is itself varied); `piece`: any other lettered or pictured piece (a logo, an intro card, a
+    /// meter, the jackpot table) — its words read and its glints held to the titles' limit, the separator that held
+    /// across every kind measured.
+    public enum Kind: String, Sendable { case title, message, button, panel, wedge, wheel, pot, coin, symbol, piece }
     /// Device pixels a kind is shown at on the 1170-px phone: across, or (a wedge) tall.
     static func displaySize(_ k: Kind) -> Int {
-        switch k { case .title: 520; case .message: 640; case .button: 330; case .panel: 700; case .wedge: 470; case .wheel: 1000; case .pot: 300; case .coin: 200 }
+        switch k { case .title: 520; case .message: 640; case .button: 330; case .panel: 700; case .wedge: 470; case .wheel: 1000; case .pot: 300; case .coin, .symbol: 200; case .piece: 360 }
     }
     /// Hard limits per kind (shipped p90): glints per 10,000 px, fine-detail share, edge density; nil: not limited.
     static func limits(_ k: Kind) -> (glints: Double?, hf: Double?, edges: Double?) {
@@ -16648,10 +16658,14 @@ public enum Legibility {
         case .message: (22, 0.068, nil)
         case .button: (22, 0.16, 0.28)
         case .panel: (14, nil, 0.13)
-        case .wedge: (1.3, nil, 0.11)          // provisional: four shipped wedges
+        // A wedge is held to the whole wheel's limits (seven shipped wheels): the wedge-alone limits rest on four shipped
+        // wedges (1.3 glints, 0.11 edges) and failed every jewelled, glossy wedge the art director liked (2026-10-05).
+        case .wedge: (20, nil, 0.19)
         case .wheel: (20, nil, 0.19)
         case .pot: (53, 0.13, nil)
         case .coin: (nil, 0.20, nil)
+        case .symbol: (54, 0.18, 0.27)
+        case .piece: (36, nil, nil)
         }
     }
     public struct Measure: Equatable, Sendable {
@@ -16660,10 +16674,11 @@ public enum Legibility {
     }
 
     /// The piece (straight RGBA) cropped to its silhouette and scaled to its display size, measured.
-    public static func measure(_ px: [UInt8], width w: Int, height h: Int, kind: Kind, text: String? = nil) -> Measure? {
+    /// `display`: the device pixels it is shown across, when not its kind's.
+    public static func measure(_ px: [UInt8], width w: Int, height h: Int, kind: Kind, text: String? = nil, display: Int? = nil) -> Measure? {
         guard let box = opaqueBox(px, width: w, height: h) else { return nil }
         let crop = FrameKit.crop(px, width: w, box.x, box.y, box.w, box.h)
-        let s = Double(displaySize(kind)) / Double(kind == .wedge ? crop.h : crop.w)
+        let s = Double(display ?? displaySize(kind)) / Double(kind == .wedge ? crop.h : crop.w)
         let d = FrameKit.resized(crop, max(1, Int(Double(crop.w) * s)), max(1, Int(Double(crop.h) * s)))
         var m = clutter(d.px, width: d.w, height: d.h)
         if let text, !text.isEmpty {
@@ -16680,7 +16695,7 @@ public enum Legibility {
         if let g = l.glints, m.glints > g { out.append(String(format: "too many sparkles and glints (%.0f per 10,000 px at phone size; shipped art at most %.0f)", m.glints, g)) }
         if let h = l.hf, m.hf > h { out.append(String(format: "too much fine detail and texture (%.2f of its light and shade is finer than the phone shows clearly; shipped at most %.2f)", m.hf, h)) }
         if let e = l.edges, m.edges > e { out.append(String(format: "too busy (%.0f%% of it is edges at phone size; shipped at most %.0f%%)", m.edges * 100, e * 100)) }
-        if let r = m.read, r < (kind == .title ? 0.8 : 1) { out.append(String(format: "its words do not read at a small phone's size (%.0f%% read)", r * 100)) }
+        if let r = m.read, r < (kind == .title || kind == .piece ? 0.8 : 1) { out.append(String(format: "its words do not read at a small phone's size (%.0f%% read)", r * 100)) }
         return out
     }
     /// How far past its limits a piece is, to keep the better of two drawings: 0 when it passes.
@@ -16690,7 +16705,7 @@ public enum Legibility {
         if let g = l.glints { e += max(0, m.glints / g - 1) }
         if let h = l.hf { e += max(0, m.hf / h - 1) }
         if let x = l.edges { e += max(0, m.edges / x - 1) }
-        if let r = m.read { e += max(0, (kind == .title ? 0.8 : 1) - r) * 3 }
+        if let r = m.read { e += max(0, (kind == .title || kind == .piece ? 0.8 : 1) - r) * 3 }
         return e
     }
 
@@ -16861,8 +16876,26 @@ public enum WheelLabel {
         return CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
     }
 
-    /// The wedge (straight RGBA at its wedgeSize, cut to its sector) with its label lettered on, cut again.
-    public static func lettered(_ wedge: [UInt8], label: String, art: WheelArt) -> [UInt8] {
+    /// The game's own lettering colours, from one of its titles (straight RGBA, drawn by the lettering rules: a light,
+    /// clean face inside a dark outline): its face's light, middle and deep tones, top to bottom. Nil when the title's
+    /// face is not light enough to letter over a dark outline — the polished gold then.
+    static func palette(fromTitle px: [UInt8], width w: Int, height h: Int) -> [RGB8]? {
+        var tones: [(L: Double, c: RGB8)] = []
+        for i in stride(from: 0, to: w * h, by: 3) where px[i * 4 + 3] > 230 {
+            tones.append((Legibility.lstar(px[i * 4], px[i * 4 + 1], px[i * 4 + 2]), RGB8(px[i * 4], px[i * 4 + 1], px[i * 4 + 2])))
+        }
+        guard tones.count > 500 else { return nil }
+        tones.sort { $0.L < $1.L }
+        // The face: the lighter half of the lettering (the outline is the dark rest); its 95th, 75th and 55th percentiles.
+        func at(_ q: Double) -> (L: Double, c: RGB8) { tones[min(tones.count - 1, Int(Double(tones.count) * q))] }
+        let deep = at(0.55)
+        guard deep.L >= 55 else { return nil }
+        return [at(0.95).c, at(0.75).c, deep.c]
+    }
+
+    /// The wedge (straight RGBA at its wedgeSize, cut to its sector) with its label lettered on, cut again; its face in
+    /// the game's own lettering tones (`face`, light to deep: palette(fromTitle:)), or polished gold.
+    static func lettered(_ wedge: [UInt8], label: String, art: WheelArt, face tones: [RGB8]? = nil) -> [UInt8] {
         let (w, h) = art.wedgeSize
         let f = fit(label, art: art)
         guard f.size > 4, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
@@ -16899,8 +16932,9 @@ public enum WheelLabel {
         // The face: polished gold, cream at the top through gold to amber at the foot — a smooth gradient whose darkest
         // part still stands far lighter than the outline (WCAG G18) — with a gloss band across its upper third.
         let srgb = CGColorSpace(name: CGColorSpace.sRGB)
-        let face = CGGradient(colorsSpace: srgb, colors: [CGColor(red: 1, green: 0.98, blue: 0.88, alpha: 1), CGColor(red: 1, green: 0.84, blue: 0.36, alpha: 1),
-                                                          CGColor(red: 0.86, green: 0.56, blue: 0.13, alpha: 1)] as CFArray, locations: [0, 0.45, 1])!
+        func cg(_ c: RGB8) -> CGColor { CGColor(red: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1) }
+        let stops = (tones?.count == 3 ? tones! : [RGB8(255, 250, 224), RGB8(255, 214, 92), RGB8(219, 143, 33)]).map(cg)
+        let face = CGGradient(colorsSpace: srgb, colors: stops as CFArray, locations: [0, 0.45, 1])!
         let gloss = CGGradient(colorsSpace: srgb, colors: [CGColor(red: 1, green: 1, blue: 1, alpha: 0.55), CGColor(red: 1, green: 1, blue: 1, alpha: 0)] as CFArray, locations: [0, 1])!
         for (l, p) in lines {
             ctx.saveGState()

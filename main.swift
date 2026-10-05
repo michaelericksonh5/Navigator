@@ -26085,7 +26085,12 @@ final class GDDToAssetsRun: ObservableObject {
             let n = pots.count ?? max(1, jobs.filter { $0.role == .bonus }.count)
             for i in 0..<n { for k in 0...PotStates.levels { out.append((PotStates.name(pot: i, of: n, state: k), .pot, nil)) } }
         }
-        for j in jobs where j.kind == .symbol && j.role == .jackpot { out.append((j.id, .coin, GDDAssetPrompts.letteredWord(j))) }
+        // The symbols: a lettered one's word read at reel size, every one's clutter against shipped symbols; their win states.
+        for j in jobs where j.kind == .symbol {
+            let word = GDDAssetPrompts.letteredWord(j)
+            out.append((j.id, word == nil ? .symbol : .coin, word))
+        }
+        for j in Derived.winSymbols(jobs) { out.append((Derived.winName(j.id), .symbol, nil)) }
         return out
     }
 
@@ -26333,7 +26338,12 @@ final class GDDToAssetsRun: ObservableObject {
             let names = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
             if let tpl = png(table.template(backing: b), table.width, table.height),
                let px = paint("shared_interface_jackpotTable", prompt: GDDAssetPrompts.jackpotTableBrief(theme: theme, design: design, backing: (backing.name, b), names: names),
-                              inputs: [downsamplePNG(ref, longEdge: 2048) ?? ref, tpl], w: table.width, h: table.height, covered: nil) {
+                              inputs: [downsamplePNG(ref, longEdge: 2048) ?? ref, tpl], w: table.width, h: table.height, covered: nil,
+                              judge: { px in
+                                  let k = FrameKit.keyed(px, backing: b, width: table.width, height: table.height)
+                                  guard let m = Legibility.measure(k, width: table.width, height: table.height, kind: .piece, text: names.joined(separator: " "), display: 1100) else { return ([], 0) }
+                                  return (Legibility.problems(m, kind: .piece), Legibility.excess(m, kind: .piece))
+                              }) {
                 write(px, table.width, table.height, "shared_interface_jackpotTable.png")
                 write(FrameKit.keyed(px, backing: b, width: table.width, height: table.height), table.width, table.height, "shared_interface_jackpotTable_rmbg.png")
             }
@@ -26465,6 +26475,7 @@ final class GDDToAssetsRun: ObservableObject {
         }
         // 5. The wheels, built as the studio's wheelSpin mode is: a rim, a hub and a pointer shared by the game's
         // wheels, and one upright wedge per prize that the engine turns round the hub (WheelArt).
+        var wheels: [(prefix: String, art: WheelArt, order: [String])] = []
         for (wi, wheel) in (layout.wheels ?? []).enumerated() {
             let prefix = wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)"
             // Its jackpot wedges carry this game's own jackpot names (its symbols'), whatever words the GDD used.
@@ -26502,13 +26513,9 @@ final class GDDToAssetsRun: ObservableObject {
                     let cut = art.cut(FrameKit.keyed(px, backing: b, width: ww, height: wh))
                     write(FrameKit.onBacking(cut, b), ww, wh, "\(blankName).png"); write(cut, ww, wh, "\(blankName)_rmbg.png")
                 }
-                if !has("\(n).png"), let blank = load("\(blankName)_rmbg.png"), blank.w == ww, blank.h == wh {
-                    let done = label == "CREDITS" ? blank.px : WheelLabel.lettered(blank.px, label: label, art: art)
-                    write(FrameKit.onBacking(done, b), ww, wh, "\(n).png"); write(done, ww, wh, "\(n)_rmbg.png")
-                }
                 if firstWedge == nil { firstWedge = (try? Data(contentsOf: url("\(blankName).png"))) ?? (try? Data(contentsOf: url("\(n).png"))) }
             }
-            wheelPreview(prefix: prefix, art: art, order: order, folder: folder)
+            wheels.append((prefix, art, order))
         }
         // 6. The award pop-ups (PopUps): a blank panel, an empty value bar and a CONTINUE button in the reel
         // frame's material, and a lettered title per award this game has, each matched to the first.
@@ -26539,6 +26546,20 @@ final class GDDToAssetsRun: ObservableObject {
             }
         }
         popUpSheet(plan, folder: folder)
+        // The wheels' words, lettered on their blank wedges in code (WheelLabel) in the game's own lettering — the
+        // tones of its TOTAL WIN title, or its first title — free, and again whenever a blank is drawn again.
+        let titleTones = (["transition_outro_totalWin"] + plan.filter { $0.kind == .title }.map(\.name)).lazy
+            .compactMap { load("\($0)_rmbg.png") }.first.flatMap { WheelLabel.palette(fromTitle: $0.px, width: $0.w, height: $0.h) }
+        for (prefix, art, order) in wheels {
+            let (ww, wh) = art.wedgeSize
+            for label in Set(order) {
+                let n = "\(prefix)_interface_wedge-\(PopUps.key(label))"
+                guard !has("\(n).png"), let blank = load("\(n)-blank_rmbg.png"), blank.w == ww, blank.h == wh else { continue }
+                let done = label == "CREDITS" ? blank.px : WheelLabel.lettered(blank.px, label: label, art: art, face: titleTones)
+                write(FrameKit.onBacking(done, b), ww, wh, "\(n).png"); write(done, ww, wh, "\(n)_rmbg.png")
+            }
+            wheelPreview(prefix: prefix, art: art, order: order, folder: folder)
+        }
         // 7. The pieces Gemini planned from the GDD (ConceptPiece): each on its shape's grey template, or a plain
         // canvas, in the reel frame's material; each state an edit of the first.
         let (gameName, gddText) = DispatchQueue.main.sync { (self.gameName, self.gddText) }
@@ -26551,7 +26572,15 @@ final class GDDToAssetsRun: ObservableObject {
                 let refs = (piece.refs ?? []).compactMap { id in (try? Data(contentsOf: url("\(id)_alone.png"))) ?? (try? Data(contentsOf: url("\(id).png"))) }
                     .map { downsamplePNG($0, longEdge: 1536) ?? $0 }
                 let prompt = GDDAssetPrompts.conceptBrief(theme: theme, design: design, backing: (backing.name, b), piece: piece, templated: tpl != nil, refs: refs.count)
-                if let px = paint(piece.name, prompt: prompt, inputs: [ref] + refs + [tpl ?? canvas], w: piece.width, h: piece.height, covered: nil) { both(px, piece.width, piece.height, piece.name) }
+                // Shown about as wide as its kind is: a logo or lettering as a title, a button as a button, a card or meter
+                // at a third of the phone (research/legibility-measure.md §1).
+                let shown = piece.shape == "lettering" ? 520 : piece.shape == "button" ? 330 : piece.width >= 1536 ? 640 : 360
+                if let px = paint(piece.name, prompt: prompt, inputs: [ref] + refs + [tpl ?? canvas], w: piece.width, h: piece.height, covered: nil,
+                                  judge: { px in
+                                      let k = FrameKit.keyed(px, backing: b, width: piece.width, height: piece.height)
+                                      guard let m = Legibility.measure(k, width: piece.width, height: piece.height, kind: .piece, text: piece.lettering.isEmpty ? nil : piece.lettering, display: shown) else { return ([], 0) }
+                                      return (Legibility.problems(m, kind: .piece), Legibility.excess(m, kind: .piece))
+                                  }) { both(px, piece.width, piece.height, piece.name) }
             }
             guard let first = try? Data(contentsOf: url("\(piece.name).png")) else { continue }
             for state in piece.states where !has("\(piece.stateName(state)).png") {
@@ -27091,6 +27120,24 @@ final class GDDToAssetsRun: ObservableObject {
                 }
             }
             navLog("gdd image: \(job.id) letter redraw \(kept ? "kept" : "reads wrong too — first kept")")
+        }
+
+        // A symbol's word (WILD, BONUS, a jackpot's tier) that does not read at a phone's reel size: redrawn once, told
+        // so, the better read kept. Shipped coins read exactly at an iPhone SE's size 95% of the time, generated ones 56%
+        // (research/legibility-measure.md); the word must read at a glance.
+        func reelRead(_ png: Data, _ word: String) -> Double? {
+            guard let cg = loadCGImage(data: png), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            return Legibility.measure(FrameKit.keyed(px, backing: backingRGB, width: cg.width, height: cg.height), width: cg.width, height: cg.height, kind: .coin, text: word)?.read
+        }
+        if job.kind == .symbol, let word = GDDAssetPrompts.letteredWord(job), let png = r.png, let read = reelRead(png, word), read < 1 {
+            navLog(String(format: "gdd image: %@'s “%@” reads %.0f%% at a phone's reel size — redrawing once", job.id, word, read * 100))
+            let p2 = prompt + "\n\nTHE LAST DRAWING'S WORD “\(word)” DID NOT READ AT A PHONE'S REEL SIZE. Letter it larger and plainer, spanning most of the symbol's width: " + GDDAssetPrompts.letteringRules
+            log.write("prompts/\(job.id)-reads.txt", "MODE: \(step.mode.rawValue)\nATTACHED: \(step.refs.isEmpty ? "nothing" : step.refs.joined(separator: ", "))\n\n\(p2)")
+            let again = draw(p2, inputs)
+            r.cost += again.cost
+            var kept = false
+            if let png2 = again.png, let read2 = reelRead(png2, word), read2 > read { r.png = png2; rev = review(png2, job: checked, log: log); redrawn = true; kept = true }
+            navLog("gdd image: \(job.id) word redraw \(kept ? "kept" : "no better — first kept")")
         }
 
         if let png = r.png {
@@ -29843,9 +29890,13 @@ struct GDDToAssetsSheet: View {
     /// The fal.ai part, shown beside the Vertex estimate when the frames will be split: with no
     /// dialog any more, this is the only place that cost is seen before it is spent.
     private func splitCost(_ ids: Set<String>?) -> String {
-        guard removeBG && separateFrames else { return "" }
+        // A lettered symbol whose word does not read at reel size is drawn once more: said, as a ceiling.
+        let again = run.jobs.filter { $0.kind == .symbol && GDDAssetPrompts.letteredWord($0) != nil && !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
+            .reduce(0) { $0 + nbEstimatedCost(size: $1.size, modelFlag: run.modelFlag) }
+        let reads = again == 0 ? "" : String(format: " (+ up to ~$%.2f if lettered symbols need a second drawing)", again)
+        guard removeBG && separateFrames else { return reads }
         let l = run.layerizeEstimate(for: ids)
-        return l.symbols == 0 ? "" : String(format: " + ~$%.2f Layerize", l.cost)
+        return (l.symbols == 0 ? "" : String(format: " + ~$%.2f Layerize", l.cost)) + reads
     }
     private var generateLabel: String {
         guard readyJobs > 0 else { return "Generate" }
