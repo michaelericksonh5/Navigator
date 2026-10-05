@@ -26409,6 +26409,17 @@ final class GDDToAssetsRun: ObservableObject {
                 for k in 1...PotStates.levels { for sfx in [".png", "_rmbg.png"] { try? fm.moveItem(at: url(jar(i, k) + sfx), to: kept.appendingPathComponent(jar(i, k) + sfx)) } }
                 navLog("gdd reel: \(jar(i, 0)) given room to \(potH) px; its states kept in \(kept.lastPathComponent) to grow again")
             }
+            // One that must stand narrow (PotKind.bodyShare: a piggy bank, its coins piling up beside it) made so, free;
+            // states drawn round it before are kept in versions/ and drawn again round the narrower one.
+            for i in 0..<total {
+                guard let p = load("\(jar(i, 0))_rmbg.png"), p.w == 1024, p.h == potH,
+                      let n = PotStates.narrowed(p.px, width: 1024, height: potH, share: kind.bodyShare) else { continue }
+                write(FrameKit.onBacking(n, b), 1024, potH, "\(jar(i, 0)).png"); write(n, 1024, potH, "\(jar(i, 0))_rmbg.png")
+                let kept = folder.appendingPathComponent("versions/pots-before-narrow")
+                try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+                for k in 1...PotStates.levels { for sfx in [".png", "_rmbg.png"] { try? fm.moveItem(at: url(jar(i, k) + sfx), to: kept.appendingPathComponent(jar(i, k) + sfx)) } }
+                navLog("gdd reel: \(jar(i, 0)) made \(Int(kind.bodyShare * 100))% of its canvas wide; its states kept in \(kept.lastPathComponent) to draw again")
+            }
             // Its fill states, State1…State5, each grown from the one before on a grey heap laid in code to its height
             // (PotStates.rise, the shipped rigs' back-loaded schedule): the treasure only ever rises, the last states
             // still grow, and each is laid on State0's foot so the states swap in place. Judged for both, and at phone size.
@@ -26452,7 +26463,7 @@ final class GDDToAssetsRun: ObservableObject {
                     guard let prev = load("\(jar(i, k - 1))_rmbg.png"), prev.w == 1024, prev.h == potH,
                           let prevPNG = png(FrameKit.onBacking(prev.px, b), 1024, potH) else { break }
                     let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
-                        let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                        let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH, top: kind.anchoredAtTop)
                         var p: [String] = []
                         var pair = [UInt8](repeating: 0, count: 2048 * potH * 4)
                         FrameKit.over(&pair, width: 2048, FrameKit.Piece(px: FrameKit.onBacking(prev.px, b), w: 1024, h: potH), at: 0, 0)
@@ -26473,7 +26484,7 @@ final class GDDToAssetsRun: ObservableObject {
                     }
                     guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
                                          inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge) else { break }
-                    var laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    var laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH, top: kind.anchoredAtTop)
                     // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
                     FrameKit.despill(&laid, width: 1024, height: potH, backing: b)
                     write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
@@ -26545,7 +26556,7 @@ final class GDDToAssetsRun: ObservableObject {
                         problems.append("\(n) was drawn before pots had room above them: Make Again ▸ Pot States")
                         continue
                     }
-                    let laid = PotStates.registered(s.px, to: e.px, width: s.w, height: s.h)
+                    let laid = PotStates.registered(s.px, to: e.px, width: s.w, height: s.h, top: kind.anchoredAtTop)
                     guard laid != s.px else { continue }
                     write(FrameKit.onBacking(laid, b), s.w, s.h, "\(n).png")
                     write(laid, s.w, s.h, "\(n)_rmbg.png")

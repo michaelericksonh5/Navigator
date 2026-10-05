@@ -13546,7 +13546,7 @@ final class ReelAreaTests: XCTestCase {
         XCTAssertGreaterThan(abs(d.width - e.width), 3)
         let laid = PotStates.registered(drawn, to: empty, width: n, height: n)
         let l = PotStates.foot(laid, width: n, height: n)!
-        XCTAssertEqual(l.width, e.width, accuracy: 2); XCTAssertEqual(l.cx, e.cx, accuracy: 1.5); XCTAssertEqual(l.bottom, e.bottom, accuracy: 1)
+        XCTAssertEqual(l.width, e.width, accuracy: 2); XCTAssertEqual(l.cx, e.cx, accuracy: 1.5); XCTAssertEqual(Double(l.end), Double(e.end), accuracy: 1)
         XCTAssertEqual(PotStates.registered(laid, to: empty, width: n, height: n), laid)
         // The studio rig's names: State0 empty, five fill states, numbered when a game has several pots.
         XCTAssertEqual(PotStates.name(pot: 0, of: 1, state: 0), "shared_avatar_jar-State0Idle")
@@ -13556,7 +13556,7 @@ final class ReelAreaTests: XCTestCase {
         XCTAssertEqual(PotStates.height(1024), 1536)
         let tall = PotStates.padded(empty, size: n)
         XCTAssertEqual(tall.count, n * PotStates.height(n) * 4)
-        XCTAssertEqual(PotStates.foot(tall, width: n, height: PotStates.height(n))!.bottom, e.bottom + PotStates.height(n) - n)
+        XCTAssertEqual(PotStates.foot(tall, width: n, height: PotStates.height(n))!.end, e.end + PotStates.height(n) - n)
     }
 
     // A 3x5 grid: five openings, four dividers, the band and gaps in the studio's cell ratios, sizes GPT takes.
@@ -13849,6 +13849,28 @@ final class PotLidTests: XCTestCase {
 }
 
 final class PotKindTests: XCTestCase {
+    // A piggy bank whose coin pile widens round its feet keeps its size laid by its top; laid by its foot it would shrink.
+    func testAPileRoundItsFeetDoesNotShrinkIt() {
+        let w = 200, h = 200
+        func boxes(_ rects: [(Range<Int>, Range<Int>)]) -> [UInt8] {
+            var px = [UInt8](repeating: 0, count: w * h * 4)
+            for (xs, ys) in rects { for y in ys { for x in xs { px[(y * w + x) * 4 + 3] = 255 } } }
+            return px
+        }
+        let pig = boxes([(60..<140, 100..<180)]), piled = boxes([(60..<140, 100..<180), (20..<180, 170..<195)])
+        XCTAssertTrue(PotKind.piggyBank.anchoredAtTop && PotKind.safe.anchoredAtTop && !PotKind.chest.anchoredAtTop && !PotKind.jar.anchoredAtTop)
+        XCTAssertEqual(PotStates.registered(piled, to: pig, width: w, height: h, top: true), piled)
+        XCTAssertNotEqual(PotStates.registered(piled, to: pig, width: w, height: h), piled)
+        // Drawn too wide, it is made to its share of the canvas, centred, on the row it stood on; narrow enough, left alone.
+        let wide = boxes([(10..<170, 100..<199)])
+        let n = PotStates.narrowed(wide, width: w, height: h, share: PotKind.piggyBank.bodyShare)!
+        let cols = (0..<w).filter { x in (0..<h).contains { n[($0 * w + x) * 4 + 3] > 128 } }
+        XCTAssertEqual(Double(cols.last! - cols.first!), 0.45 * Double(w), accuracy: 3)
+        XCTAssertEqual(Double(cols.first! + cols.last!) / 2, 100, accuracy: 2)
+        XCTAssertEqual(Double(PotStates.foot(n, width: w, height: h)!.end), 198, accuracy: 1)
+        XCTAssertNil(PotStates.narrowed(pig, width: w, height: h, share: 0.45))
+        XCTAssertNil(PotStates.narrowed(wide, width: w, height: h, share: PotKind.jar.bodyShare))
+    }
     // What a pot is, from the document's own word (written for the test), and kept through a typed sheet.
     func testThePotsKindIsReadAndKept() {
         XCTAssertEqual(PotKind.read("A safe sits above the matrix and fills as wilds land."), .safe)

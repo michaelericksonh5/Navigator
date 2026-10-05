@@ -8795,6 +8795,13 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
     case piggyBank
     public var noun: String { switch self { case .jar: "pot"; case .chest: "treasure chest"; case .safe: "safe"; case .piggyBank: "piggy bank" } }
     public var nouns: String { switch self { case .jar: "pots"; case .chest: "treasure chests"; case .safe: "safes"; case .piggyBank: "piggy banks" } }
+    /// The end of it that stays put as it fills, to lay each state on State0 by: a jar's and a chest's lids rise, so their
+    /// foot; a safe's gold pours out over its sill and a piggy bank's coins pile round its feet, so their top (laid by the
+    /// foot, the piggy bank shrank to a third as its pile widened, 2026-10-05).
+    public var anchoredAtTop: Bool { self == .safe || self == .piggyBank }
+    /// The most of its canvas's width it stands in at State0: a piggy bank's coins pile up beside it (the Blitz
+    /// medallion's pile reached 2.6 times its width), so it stands narrow; the others may fill it.
+    public var bodyShare: Double { self == .piggyBank ? 0.45 : 1 }
     /// Its State0: closed, empty, unlit.
     var closed: String {
         switch self {
@@ -8823,7 +8830,7 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
         case .safe: return ["a glint of gold inside the gap", "gold bars and coins stacked on its lowest shelf", "gold stacked halfway up inside",
                             "gold stacked to the top inside, a few coins spilling out over the sill", "full to overflowing: gold pouring out of the door and piling in front of it"][i]
         case .piggyBank: return ["a few coins scattered at its feet", "a small pile of coins round its feet", "coins piled round it up to its belly",
-                                 "coins piled round and behind it up to its back, more falling from its slot", "full to overflowing: a great pile of coins round and behind it, spilling wide, coins bursting from its slot"][i]
+                                 "coins piled round and behind it up to its back", "full to overflowing: a great pile of coins round and behind it, spilling wide to both sides"][i]
         }
     }
     /// The kind a text names: the first vessel word in it.
@@ -9135,25 +9142,42 @@ public enum PotStates {
     }
 
     /// The foot of a cut-out pot (straight RGBA, `w` by `h`): its bottom row, and the centre and width of the
-    /// band just above it. Rows with only a few opaque pixels (strays at the edge) are not the bottom.
-    static func foot(_ keyed: [UInt8], width w: Int, height h: Int) -> (cx: Double, bottom: Int, width: Double)? {
+    /// band just above it — or, `top`, its top row and the band just below it. Rows with only a few opaque pixels
+    /// (strays at the edge) are not its end.
+    static func foot(_ keyed: [UInt8], width w: Int, height h: Int, top: Bool = false) -> (cx: Double, end: Int, width: Double)? {
         func opaque(_ x: Int, _ y: Int) -> Bool { keyed[(y * w + x) * 4 + 3] > 128 }
-        guard let bottom = (0..<h).reversed().first(where: { y in (0..<w).filter { opaque($0, y) }.count >= w / 50 }) else { return nil }
-        let top = max(0, bottom - Int(0.08 * Double(w))), low = max(top + 1, bottom - Int(0.03 * Double(w)))
-        let cols = (0..<w).filter { x in (top..<low).contains { opaque(x, $0) } }
+        let rows = top ? Array(0..<h) : (0..<h).reversed()
+        guard let end = rows.first(where: { y in (0..<w).filter { opaque($0, y) }.count >= w / 50 }) else { return nil }
+        let near = Int(0.03 * Double(w)), far = Int(0.08 * Double(w))
+        let band = top ? min(h - 1, end + near)..<min(h, end + far) : max(0, end - far)..<max(1, end - near)
+        let cols = (0..<w).filter { x in band.contains { opaque(x, $0) } }
         guard let a = cols.first, let b = cols.last else { return nil }
-        return (Double(a + b) / 2, bottom, Double(b - a))
+        return (Double(a + b) / 2, end, Double(b - a))
     }
 
-    /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas.
-    public static func registered(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int) -> [UInt8] {
-        guard let f = foot(state, width: w, height: h), let e = foot(empty, width: w, height: h), f.width > 0 else { return state }
+    /// A pot wider than `share` of its canvas (straight RGBA, `w` by `h`) made smaller to it, standing centred on the
+    /// row it stood on; nil when it is narrow enough already.
+    public static func narrowed(_ px: [UInt8], width w: Int, height h: Int, share: Double) -> [UInt8]? {
+        guard share < 1, let f = foot(px, width: w, height: h) else { return nil }
+        let cols = (0..<w).filter { x in (0..<h).reduce(0) { $0 + (px[($1 * w + x) * 4 + 3] > 128 ? 1 : 0) } >= max(1, h / 100) }
+        guard let a = cols.first, let b = cols.last, Double(b - a) > share * Double(w) + 2 else { return nil }
+        let k = share * Double(w) / Double(b - a)
+        let scaled = FrameKit.resized(FrameKit.Piece(px: px, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        FrameKit.over(&out, width: w, scaled, at: Int((Double(w) / 2 - Double(a + b) / 2 * k).rounded()), Int((Double(f.end) * (1 - k)).rounded()))
+        return out
+    }
+
+    /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas, by the end of it that stays put as it
+    /// fills (`top`: PotKind.anchoredAtTop).
+    public static func registered(_ state: [UInt8], to empty: [UInt8], width w: Int, height h: Int, top: Bool = false) -> [UInt8] {
+        guard let f = foot(state, width: w, height: h, top: top), let e = foot(empty, width: w, height: h, top: top), f.width > 0 else { return state }
         let k = e.width / f.width
         // Already in place (to a pixel or two of resampling): left alone, so laying again never blurs it.
-        guard abs(k - 1) > 0.01 || abs(f.cx - e.cx) >= 2 || abs(f.bottom - e.bottom) >= 2 else { return state }
+        guard abs(k - 1) > 0.01 || abs(f.cx - e.cx) >= 2 || abs(f.end - e.end) >= 2 else { return state }
         let scaled = FrameKit.resized(FrameKit.Piece(px: state, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
         var out = [UInt8](repeating: 0, count: w * h * 4)
-        FrameKit.over(&out, width: w, scaled, at: Int((e.cx - f.cx * k).rounded()), Int((Double(e.bottom) - Double(f.bottom) * k).rounded()))
+        FrameKit.over(&out, width: w, scaled, at: Int((e.cx - f.cx * k).rounded()), Int((Double(e.end) - Double(f.end) * k).rounded()))
         return out
     }
 }
