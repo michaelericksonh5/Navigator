@@ -14000,3 +14000,47 @@ final class SetSessionTests: XCTestCase {
         XCTAssertNil(SetLauncher.setFolder(of: lost))
     }
 }
+
+final class PotSofteningTests: XCTestCase {
+    // A glittering pot eased to the shipped limits in code, its outlines still crisp; one that passes is left as it is.
+    func testSparklesAreSoftenedToTheLimits() {
+        let w = 600, h = 600
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        var seed: UInt64 = 7
+        func rnd() -> Int { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Int(seed >> 33) }
+        for y in 50..<550 { for x in 50..<550 {
+            let i = (y * w + x) * 4, left = x < 300
+            let base = left ? 150 : 90, v = base + rnd() % 30                   // two flat halves, a little texture
+            px[i] = UInt8(v); px[i + 1] = UInt8(v * 8 / 10); px[i + 2] = UInt8(v / 3); px[i + 3] = 255
+        } }
+        for _ in 0..<500 { let x = 60 + rnd() % 478, y = 60 + rnd() % 478; for dy in 0..<3 { for dx in 0..<3 { let i = ((y + dy) * w + x + dx) * 4; for c in 0..<3 { px[i + c] = 255 } } } }  // glints
+        let before = Legibility.measure(px, width: w, height: h, kind: .pot)!
+        XCTAssertGreaterThan(before.glints, Legibility.limits(.pot).glints!)
+        let soft = Legibility.softened(px, width: w, height: h, kind: .pot)
+        let after = Legibility.measure(soft, width: w, height: h, kind: .pot)!
+        XCTAssertLessThanOrEqual(after.glints, Legibility.limits(.pot).glints!)            // as far as the limit, no further needed
+        // The edge between the halves is kept.
+        func lum(_ p: [UInt8], _ x: Int, _ y: Int) -> Double { let i = (y * w + x) * 4; return Double(p[i]) * 0.3 + Double(p[i + 1]) * 0.6 + Double(p[i + 2]) * 0.1 }
+        let edgeBefore = (290..<298).map { lum(px, $0, 300) }.reduce(0, +) / 8 - (302..<310).map { lum(px, $0, 300) }.reduce(0, +) / 8
+        let edgeAfter = (290..<298).map { lum(soft, $0, 300) }.reduce(0, +) / 8 - (302..<310).map { lum(soft, $0, 300) }.reduce(0, +) / 8
+        XCTAssertGreaterThan(edgeAfter, edgeBefore * 0.8)
+        XCTAssertEqual(soft[3], 0)                                                 // transparent stays transparent
+        // Already within the limits: untouched.
+        var calm = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 50..<550 { for x in 50..<550 { let i = (y * w + x) * 4; calm[i] = 160; calm[i + 1] = 120; calm[i + 2] = 50; calm[i + 3] = 255 } }
+        XCTAssertEqual(Legibility.softened(calm, width: w, height: h, kind: .pot), calm)
+    }
+    // A safe's states are held back-loaded: how much of its face changed, capped per state.
+    func testASafesRevealIsMeasuredAndCapped() {
+        let w = 100, h = 100
+        var body = [UInt8](repeating: 0, count: w * h * 4)
+        for y in 10..<90 { for x in 10..<90 { let i = (y * w + x) * 4; body[i] = (x / 5 + y / 5) % 2 == 0 ? 200 : 150; body[i + 1] = 150; body[i + 2] = 40; body[i + 3] = 255 } }
+        var open = body
+        for y in 20..<80 { for x in 20..<60 { let i = (y * w + x) * 4; open[i] = 30; open[i + 1] = 20; open[i + 2] = 10 } }   // its door swung open
+        XCTAssertEqual(PotStates.changedShare(body, body: body, width: w, height: h), 0, accuracy: 0.01)
+        XCTAssertEqual(PotStates.changedShare(open, body: body, width: w, height: h), 2400.0 / 6400, accuracy: 0.06)
+        XCTAssertEqual(PotKind.safe.revealCap(1), 0.10)
+        XCTAssertNil(PotKind.safe.revealCap(5))
+        XCTAssertNil(PotKind.jar.revealCap(1))
+    }
+}

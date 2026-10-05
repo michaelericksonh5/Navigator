@@ -22040,6 +22040,45 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
     app.run()
 }
 
+// Free:  Navigator --soften-pots <set folder>
+// A set's pots eased to the shipped phone-size limits in code (Legibility.softened), as new drawings now are: each drawing
+// softened once in place (the current one kept as a version); a pot built from parts is then built again from them.
+if let flag = CommandLine.arguments.firstIndex(of: "--soften-pots"), flag + 1 < CommandLine.arguments.count {
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder), let layout = run.reelLayout else { print("FAILED: no set or no structure"); exit(1) }
+        run.loadReview(folder)
+        let built = run.potKind == .jar || run.potKind == .chest
+        let names = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []).filter { $0.hasPrefix("shared_avatar_jar") && $0.hasSuffix("_rmbg.png") }
+        let sources = names.map { String($0.dropLast(9)) }.filter { s in
+            built ? (s.hasSuffix("-State0Idle") || s.hasSuffix("_open") || s.hasSuffix("_full")) : s.range(of: #"-State\dIdle$"#, options: .regularExpression) != nil
+        }.sorted()
+        for s in sources {
+            guard let cg = loadCGImage(folder.appendingPathComponent("\(s)_rmbg.png")), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+            let soft = Legibility.softened(px, width: cg.width, height: cg.height, kind: .pot)
+            let a = Legibility.measure(px, width: cg.width, height: cg.height, kind: .pot), z = Legibility.measure(soft, width: cg.width, height: cg.height, kind: .pot)
+            print(String(format: "%@: glints %.0f → %.0f, fine detail %.3f → %.3f%@", s, a?.glints ?? 0, z?.glints ?? 0, a?.hf ?? 0, z?.hf ?? 0, soft == px ? " (within the limits already)" : ""))
+            guard soft != px else { continue }
+            run.keepPicture(s, change: "Softened to the phone-size limits", mode: .edit, cost: 0, folder: folder)
+            run.writePicture(soft, width: cg.width, height: cg.height, stem: s, folder: folder, alpha: true)
+        }
+        guard built else { print("DONE"); exit(0) }
+        // Built again from the softened drawings: the states, the parts, and the lid cut again.
+        let fm = FileManager.default
+        let kept = folder.appendingPathComponent("versions/pot-before-soften")
+        try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+        for n in names.map({ String($0.dropLast(9)) }) where n.range(of: #"-State[1-5]Idle$|-body$|-treasure$|-spill$|-lid$"#, options: .regularExpression) != nil {
+            for f in ["\(n).png", "\(n)_rmbg.png"] { try? fm.moveItem(at: folder.appendingPathComponent(f), to: kept.appendingPathComponent(f)) }
+        }
+        DispatchQueue.global().async {
+            let r = run.generateReelArea(layout, folder: folder, only: ["Pots"], budget: 0)
+            print(String(format: "BUILT AGAIN · $%.4f%@", r.cost, r.problems.isEmpty ? "" : " — " + r.problems.joined(separator: "; "))); exit(0)
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --replace-picture <set folder> <picture id> <file.png>
 // One picture of a set replaced by a file, exactly as the asset browser's Use My Own Picture does it — the current one
 // kept as a version, and a pot's states built again when it was one of their sources (free from a heaped drawing).
@@ -24498,6 +24537,9 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var typed = false
     /// Letter the intro's CONTINUE in each of the studio's languages (Localized) — off: a localization tool may.
     @Published var localizeIntro = false
+    /// Pot drawings eased to the phone-size sparkle limits in code as they arrive (Legibility.softened). Off: the art director
+    /// found it soft and cheap-looking close up (2026-10-05) — an option, not the default.
+    @Published var softenPots = false
     @Published var symbols: [SlotSymbol] = []
     /// Symbol-set lines the parser could not read. A dropped symbol is invisible
     /// otherwise — it only shows up when someone counts the folder.
@@ -26311,7 +26353,7 @@ final class GDDToAssetsRun: ObservableObject {
         /// A piece drawn on a template, checked against its openings and, when `judge` is given, at phone size: drawn
         /// once more when either fails (the second told what failed), the better of the two kept.
         func paint(_ what: String, prompt: String, inputs: [Data], w: Int, h: Int, covered: (([UInt8]) -> Double)?,
-                   judge: (([UInt8]) -> (problems: [String], excess: Double))? = nil) -> [UInt8]? {
+                   judge: (([UInt8]) -> (problems: [String], excess: Double))? = nil, finish: (([UInt8]) -> [UInt8])? = nil) -> [UInt8]? {
             guard wanted(what + ".png") else { return nil }
             log.write("prompts/\(what).txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h)\n\n\(prompt)")
             var best: (px: [UInt8], c: Double, failed: [String], score: Double)?
@@ -26328,7 +26370,8 @@ final class GDDToAssetsRun: ObservableObject {
                 }
                 let r = OpenAIImages.edit(prompt: ask, images: inputs, size: rw, height: rh)
                 cost += r.cost
-                guard let d = r.png, let px = pixels(d, w, h) else { problems.append("\(what): \(r.error ?? "no image")"); return best?.px }
+                guard let d = r.png, let drawn = pixels(d, w, h) else { problems.append("\(what): \(r.error ?? "no image")"); return best?.px }
+                let px = finish?(drawn) ?? drawn
                 let c = covered?(px) ?? 0, j = judge?(px) ?? (problems: [], excess: 0)
                 navLog(String(format: "gdd reel: %@ attempt %d covers %.1f%% of its openings, %d phone-size problems $%.3f", what, attempt, c * 100, j.problems.count, r.cost))
                 let score = (c > FrameStack.windowTolerance ? 10 + c : 0) + j.excess
@@ -26445,6 +26488,13 @@ final class GDDToAssetsRun: ObservableObject {
         // As many pots as the GDD says ("3 pots"; without a number, one per bonus symbol), each drawn from the
         // bonus symbol it is tied to, in order; one with no symbol of its own matches the pots before it.
         let bonus = jobs.filter { $0.kind == .symbol && $0.role == .bonus }.sorted { $0.id < $1.id }
+        /// When asked (softenPots), a pot drawing eased to the shipped sparkle and fine-detail limits as it arrives, only as far
+        /// as it needs (Legibility.softened); off, drawings are kept as drawn.
+        let soften = DispatchQueue.main.sync { self.softenPots }
+        func softly(_ w: Int, _ h: Int) -> (([UInt8]) -> [UInt8])? {
+            guard soften else { return nil }
+            return { px in FrameKit.onBacking(Legibility.softened(FrameKit.keyed(px, backing: b, width: w, height: h), width: w, height: h, kind: .pot), b) }
+        }
         if let pots = layout.extras.first(where: { $0.what == "pots" }) {
             let total = pots.count ?? max(1, bonus.count)
             // What they are (PotKind): as the document says, else as the bonus symbol they are drawn from is, else a pot.
@@ -26472,7 +26522,7 @@ final class GDDToAssetsRun: ObservableObject {
                                                       symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total, kind: kind)
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
                 // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
-                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil, judge: legible(.pot, 1024, 1024)) {
+                if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil, judge: legible(.pot, 1024, 1024), finish: softly(1024, 1024)) {
                     let tall = PotStates.padded(FrameKit.keyed(px, backing: b, width: 1024, height: 1024), size: 1024)
                     write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
                     write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
@@ -26528,7 +26578,7 @@ final class GDDToAssetsRun: ObservableObject {
                         hasLid = r.text?.lowercased().contains("yes") == true
                         if r.text != nil && !hasLid { try? "no lid".write(to: noLid, atomically: true, encoding: .utf8) }
                     }
-                    if hasLid, let px = paint(openN, prompt: GDDAssetPrompts.potOpenBrief(theme: theme, backing: (backing.name, b), kind: kind), inputs: [s0png], w: 1024, h: potH, covered: nil) {
+                    if hasLid, let px = paint(openN, prompt: GDDAssetPrompts.potOpenBrief(theme: theme, backing: (backing.name, b), kind: kind), inputs: [s0png], w: 1024, h: potH, covered: nil, finish: softly(1024, potH)) {
                         let open = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
                         if let l = PotStates.lidFrom(empty: e0.px, open: open, width: 1024, height: potH) {
                             write(FrameKit.onBacking(open, b), 1024, potH, "\(openN).png"); write(open, 1024, potH, "\(openN)_rmbg.png")
@@ -26563,7 +26613,7 @@ final class GDDToAssetsRun: ObservableObject {
                             return (out, x)
                         }
                         if let px = paint(fullN, prompt: GDDAssetPrompts.potFullBrief(theme: theme, backing: (backing.name, b), kind: kind, lidless: lid == nil),
-                                          inputs: [from], w: 1024, h: potH, covered: nil, judge: judge) {
+                                          inputs: [from], w: 1024, h: potH, covered: nil, judge: judge, finish: softly(1024, potH)) {
                             let keyed = FrameKit.keyed(px, backing: b, width: 1024, height: potH)
                             write(FrameKit.onBacking(keyed, b), 1024, potH, "\(fullN).png"); write(keyed, 1024, potH, "\(fullN)_rmbg.png")
                             parts = cut(keyed)
@@ -26599,21 +26649,30 @@ final class GDDToAssetsRun: ObservableObject {
                         FrameKit.over(&pair, width: 2048, FrameKit.Piece(px: FrameKit.onBacking(laid, b), w: 1024, h: potH), at: 1024, 0)
                         if let pairPNG = png(pair, 2048, potH) {
                             let part = kind == .safe ? "door" : "lid"
-                            let r = H5GService.describe(prompt: "Left: a \(kind.noun) at one stage of filling. Right: the same \(kind.noun) at the next stage. Answer two questions with yes or no, in the form 'further: yes, attached: yes'. further — is the right one clearly further along than the left (\(kind == .piggyBank ? "more coins piled round it" : "its \(part) open wider, or more treasure")? attached — \(kind == .piggyBank ? "is the piggy bank itself unchanged?" : "is its \(part) still on it, attached?")",
+                            let stage = (kind.opening(k).isEmpty ? "" : kind.opening(k) + ", ") + kind.treasure(k)
+                            let r = H5GService.describe(prompt: "Left: a \(kind.noun) at one stage of filling. Right: the same \(kind.noun) at the next stage, stage \(k) of 5, which should show: \(stage). Answer three questions with yes or no, in the form 'further: yes, attached: yes, toofar: no'. further — is the right one clearly further along than the left (\(kind == .piggyBank ? "more coins piled round it" : "its \(part) open wider, or more treasure")? attached — \(kind == .piggyBank ? "is the piggy bank itself unchanged?" : "is its \(part) still on it, attached?") toofar — does the right one show clearly MORE than stage \(k) should (its \(kind == .piggyBank ? "pile" : part) further open or fuller than described)?",
                                                         systemPrompt: nil, imagePNG: downsamplePNG(pairPNG, longEdge: 1024) ?? pairPNG)
                             cost += r.cost ?? 0
                             let t = r.text?.lowercased() ?? ""
                             if t.contains("further: no") { p.append("it is not clearly further along than the stage before — \(kind.opening(k).isEmpty ? "" : kind.opening(k) + ", ")\(kind.treasure(k))") }
                             if t.contains("attached: no") { p.append(kind == .piggyBank ? "the piggy bank itself changed — keep it exactly as it is" : "its \(part) was taken away — it stays attached at its hinge") }
+                            if t.contains("toofar: yes") { p.append("it went too far for stage \(k) of 5 — only this: \(stage); the later stages show more") }
                         }
                         var x = Double(p.count)
+                        // Measured too: how much of its face has changed, held to the stage's share and a step past the last.
+                        if let cap = kind.revealCap(k) {
+                            let share = PotStates.changedShare(laid, body: e0.px, width: 1024, height: potH)
+                            let before = PotStates.changedShare(prev.px, body: e0.px, width: 1024, height: potH)
+                            if share > cap + 0.03 { p.append(String(format: "it went too far for stage %d of 5: %.0f%% of the %@ changed, at most %.0f%% — only %@, %@", k, share * 100, kind.noun, cap * 100, kind.opening(k), kind.treasure(k))); x += 1 }
+                            else if share < before + 0.03 { p.append("it is not further along than the stage before — \(kind.opening(k)), \(kind.treasure(k))"); x += 1 }
+                        }
                         if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure solid"); x += 1 }
                         if PotStates.cutOff(laid, width: 1024, height: potH) { p.append("it runs off the edge of the picture — the \(kind.noun) and all its treasure inside it, on the floor it stands on"); x += 1 }
                         if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
                         return (p, x)
                     }
                     guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
-                                         inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge) else { break }
+                                         inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge, finish: softly(1024, potH)) else { break }
                     var laid = PotStates.restored(PotStates.laid(FrameKit.keyed(px, backing: b, width: 1024, height: potH), on: e0.px, width: 1024, height: potH, by: kind.anchor),
                                                   body: e0.px, width: 1024, height: potH)
                     // The backing's colour taken out of the edges it tints (a lid's gap showed magenta fringes, 2026-10-05).
@@ -27744,6 +27803,7 @@ extension GDDToAssetsRun {
             run.lowPayCustom = s.lowPayCustom
             run.palette = s.palette.compactMap { $0.count == 3 ? RGB8(UInt8(clamping: $0[0]), UInt8(clamping: $0[1]), UInt8(clamping: $0[2])) : nil }
             run.lastVerdict = s.verdicts; run.delivered = s.delivered; run.failures = s.failures; run.spent = s.spent
+            run.softenPots = s.softenPots
             if s.styleChosen, let picked = SlotArtStyles.byID(s.styleID) { run.theme?.chosenStyle = picked }
         }
         ThemeHubClient.themes { list, _ in
@@ -29814,7 +29874,7 @@ struct GDDToAssetsSheet: View {
         s.manualSpec = manualSpec; s.sheet = sheet
         s.size = size; s.symbolAspect = symbolAspect; s.backgroundAspect = backgroundAspect; s.backgroundSize = backgroundSize
         s.removeBackground = removeBG; s.separateFrames = separateFrames; s.outputParent = outParent?.path
-        s.styleChosen = styleMode; s.styleID = styleID
+        s.styleChosen = styleMode; s.styleID = styleID; s.softenPots = run.softenPots
         s.lowPays = run.lowPays.rawValue; s.lowPayCustom = run.lowPayCustom
         s.palette = run.palette.map { [Int($0.r), Int($0.g), Int($0.b)] }
         s.verdicts = run.lastVerdict; s.delivered = run.delivered; s.failures = run.failures; s.spent = run.spent
@@ -30615,6 +30675,8 @@ struct GDDToAssetsSheet: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("After generating").font(.subheadline).bold().padding(.top, 4)
                 Toggle("Remove symbol backgrounds with Photoshop", isOn: $removeBG)
+                Toggle("Soften pot sparkle in code", isOn: $run.softenPots)
+                    .help("Eases each pot drawing's glitter and finest texture to the shipped phone-size limits as it arrives, only as far as it needs. It makes the art a little soft close up, so it is off unless you want it. Navigator --soften-pots does the same to a set drawn already.")
                 // Layerize is fal.ai's: without a key it is not offered, so nothing can start and then fail on it.
                 let fal = APIKeys.falAvailable
                 Toggle("Then split frames off the framed symbols with Layerize" + (fal ? "" : " — needs a fal.ai key"),

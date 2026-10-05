@@ -8807,6 +8807,10 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
     /// The room it leaves under its foot at State0, in its canvas's heights: a safe's gold and a piggy bank's coins pile on
     /// the floor in front of it, lower than its foot (a safe's State5 pour ran off the canvas's bottom, 2026-10-05).
     public var footRoom: Double { anchor == .foot ? 0 : 0.08 }
+    /// The most of its State0's face a drawn state may have changed by (PotStates.changedShare): a safe back-loaded as the
+    /// rigs are — a crack, a quarter, half, most — where drawn freely it showed a quarter of its face open and full of gold
+    /// at State1 and hardly more until State5 (0.26, 0.29, 0.31, 0.36, 0.59; 2026-10-05). Nil: no cap.
+    public func revealCap(_ k: Int) -> Double? { self == .safe && (1...4).contains(k) ? [0.10, 0.20, 0.32, 0.48][k - 1] : nil }
     /// Its State0: closed, empty, unlit.
     var closed: String {
         switch self {
@@ -8822,7 +8826,8 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .jar: return ["its lid lifted just off its rim", "its lid lifted a little and tipped back", "its lid tipped further back", "its lid swung open", "its lid thrown open"][i]
         case .chest: return ["its lid open just a crack on its hinge, about 15°", "its lid open about 30°", "its lid open about halfway, 45°", "its lid open about 60°", "its lid thrown fully open on its hinge, 75° or more"][i]
-        case .safe: return ["its door unlatched and open a crack", "its door open about a quarter", "its door open about halfway", "its door open most of the way", "its door swung wide open"][i]
+        case .safe: return ["its door unlatched and open just a crack — a narrow dark gap down its edge, the door still covering almost all of the opening",
+                            "its door open about a quarter", "its door open about halfway", "its door open most of the way", "its door swung wide open"][i]
         case .piggyBank: return ["", "", "", "", ""][i]
         }
     }
@@ -8832,7 +8837,7 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
         switch self {
         case .jar, .chest: return ["the first of its treasure glinting inside", "its treasure showing at the rim", "its treasure heaped level with the rim",
                                    "its treasure heaped above the rim, beginning to spill over the front", "full to overflowing: treasure pouring over the rim and down its front and sides"][i]
-        case .safe: return ["a glint of gold inside the gap", "gold bars and coins stacked on its lowest shelf", "gold stacked halfway up inside",
+        case .safe: return ["only a glint of gold in that narrow gap", "the first gold bars and coins on its lowest shelf, the rest of it still dark", "gold stacked halfway up inside",
                             "gold stacked to the top inside, a few coins spilling out over the sill", "full to overflowing: gold pouring out of the door and piling in front of it"][i]
         case .piggyBank: return ["a few coins scattered at its feet", "a small pile of coins round its feet", "coins piled round it up to its belly",
                                  "coins piled round and behind it up to its back, its face and ears in full view", "full to overflowing: a great pile of coins round and behind it, spilling wide to both sides, its face and ears in full view above them"][i]
@@ -9193,6 +9198,13 @@ public enum PotStates {
             if x > 0 { stack.append(i - 1) }; if x < w - 1 { stack.append(i + 1) }; if y > 0 { stack.append(i - w) }; if y < h - 1 { stack.append(i + w) }
         }
         return (0..<(w * h)).map { !outside[$0] && full[$0 * 4 + 3] > 128 }
+    }
+    /// How much of State0's face a drawn state has changed: the share of its body pixels with something new on them.
+    public static func changedShare(_ state: [UInt8], body: [UInt8], width w: Int, height h: Int) -> Double {
+        let t = treasure(state, base: body, width: w, height: h, whole: false)
+        var all = 0, changed = 0
+        for i in 0..<(w * h) where body[i * 4 + 3] > 128 { all += 1; if t[i] || state[i * 4 + 3] <= 128 { changed += 1 } }
+        return Double(changed) / Double(max(1, all))
     }
     /// A state drawn whole (a safe's, a piggy bank's) with its body put back exactly: State0's own pixels wherever the
     /// drawing has nothing new on it, so the body never drifts from state to state.
@@ -16223,7 +16235,7 @@ extension GDDAssetPrompts {
     static func potKindStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), kind: PotKind, level k: Int) -> String {
         let opening = kind.opening(k)
         return [
-            "Edit the attached image: it is the \(kind.noun) that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. Show the same \(kind.noun) at fill stage \(k) of 5: \(opening.isEmpty ? "" : opening + ", ")\(kind.treasure(k)) — this game's own riches as its theme and style call for them (gold coins, gems, gold bars, cash or the theme's own treasures), dozens of pieces each small against it — about a tenth of its width, never a few big ones — every piece solid with a smooth face and a soft highlight, no sparkle stars or glitter. At a glance it must look clearly further along than the stage before.",
+            "Edit the attached image: it is the \(kind.noun) that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. Show the same \(kind.noun) at fill stage \(k) of 5: \(opening.isEmpty ? "" : opening + ", ")\(kind.treasure(k)) — this game's own riches as its theme and style call for them (gold coins, gems, gold bars, cash or the theme's own treasures), dozens of pieces each small against it — about a tenth of its width, never a few big ones — every piece solid with a smooth face and a soft highlight, no sparkle stars or glitter. At a glance it must look clearly further along than the stage before — and no further than this stage: \(opening.isEmpty ? "" : "only as far open as said, ")the treasure only as much as said; the later stages show more.",
             "Everything else stays exactly as it is: its shape, size, position, material, colour and ornament\(kind == .piggyBank ? "" : ", and its \(kind == .safe ? "door" : "lid") stays attached at its hinge — never taken away"). A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
@@ -16904,6 +16916,7 @@ public struct SetSession: Codable, Equatable, Sendable {
     public var removeBackground = false, separateFrames = false
     public var outputParent: String?
     public var styleChosen = false, styleID = ""
+    public var softenPots = false
     public var lowPays = "", lowPayCustom = ""
     public var palette: [[Int]] = []
     public var verdicts: [String] = []
@@ -16920,7 +16933,7 @@ public struct SetSession: Codable, Equatable, Sendable {
         size = try v(.size, ""); symbolAspect = try v(.symbolAspect, ""); backgroundAspect = try v(.backgroundAspect, ""); backgroundSize = try v(.backgroundSize, "")
         removeBackground = try v(.removeBackground, false); separateFrames = try v(.separateFrames, false)
         outputParent = try c.decodeIfPresent(String.self, forKey: .outputParent)
-        styleChosen = try v(.styleChosen, false); styleID = try v(.styleID, "")
+        styleChosen = try v(.styleChosen, false); styleID = try v(.styleID, ""); softenPots = try v(.softenPots, false)
         lowPays = try v(.lowPays, ""); lowPayCustom = try v(.lowPayCustom, "")
         palette = try v(.palette, []); verdicts = try v(.verdicts, []); delivered = try v(.delivered, [:]); failures = try v(.failures, [:])
         spent = try v(.spent, 0)
@@ -17266,6 +17279,78 @@ public enum Legibility {
     /// Device pixels a kind is shown at on the 1170-px phone: across, or (a wedge) tall.
     static func displaySize(_ k: Kind) -> Int {
         switch k { case .title: 520; case .message: 640; case .button: 330; case .panel: 700; case .wedge: 470; case .wheel: 1000; case .pot: 300; case .coin, .symbol: 200; case .piece: 360; case .word: 230 }
+    }
+    /// A picture eased to the shipped limits at phone size, in code and only as far as it needs: bright peaks pulled toward
+    /// their surroundings (the sparkles counted as glints), then low-contrast texture flattened by an edge-keeping filter (a
+    /// guided filter, the picture its own guide), so outlines stay crisp close up. Tried mild to strong (Python study on the
+    /// galactic pots, 2026-10-05: jar 67→23–39 glints, hf 0.19→0.11–0.13); the first that passes is kept, else the strongest.
+    /// Straight RGBA; transparent pixels untouched.
+    public static func softened(_ px: [UInt8], width w: Int, height h: Int, kind: Kind) -> [UInt8] {
+        let l = limits(kind)
+        func passes(_ p: [UInt8]) -> Bool {
+            guard let m = measure(p, width: w, height: h, kind: kind) else { return true }
+            return (l.glints.map { m.glints <= $0 } ?? true) && (l.hf.map { m.hf <= $0 } ?? true)
+        }
+        if passes(px) { return px }
+        let ladder: [(peak: Double, r: Int, eps: Double)] = [(0.5, 2, 100), (0.6, 3, 200), (0.7, 3, 400), (0.8, 4, 800)]
+        var out = px
+        for step in ladder {
+            out = soften(px, width: w, height: h, peak: step.peak, radius: step.r, eps: step.eps)
+            if passes(out) { break }
+        }
+        return out
+    }
+    static func soften(_ px: [UInt8], width w: Int, height h: Int, peak: Double, radius r: Int, eps: Double) -> [UInt8] {
+        let n = w * h
+        var Y = [Double](repeating: 0, count: n), W = [Double](repeating: 0, count: n)
+        for i in 0..<n where px[i * 4 + 3] > 127 {
+            W[i] = 1
+            Y[i] = 0.2126 * Double(px[i * 4]) + 0.7152 * Double(px[i * 4 + 1]) + 0.0722 * Double(px[i * 4 + 2]) + 0.001
+        }
+        // Sums over a square of side 2r+1, by running sums along the rows and then the columns.
+        func box(_ x: [Double], _ r: Int) -> [Double] {
+            var a = x, b = [Double](repeating: 0, count: n)
+            for y in 0..<h {
+                var run = 0.0
+                for x in -r...r { run += a[y * w + min(max(x, 0), w - 1)] }
+                for x in 0..<w {
+                    b[y * w + x] = run
+                    run += a[y * w + min(x + r + 1, w - 1)] - a[y * w + max(x - r, 0)]
+                }
+            }
+            for x in 0..<w {
+                var run = 0.0
+                for y in -r...r { run += b[min(max(y, 0), h - 1) * w + x] }
+                for y in 0..<h {
+                    a[y * w + x] = run
+                    run += b[min(y + r + 1, h - 1) * w + x] - b[max(y - r, 0) * w + x]
+                }
+            }
+            return a
+        }
+        // Means over the picture only, so its edge is not darkened by what is outside it.
+        func mean(_ x: [Double], _ r: Int, _ wsum: [Double]) -> [Double] {
+            let num = box(zip(x, W).map { $0 * $1 }, r)
+            return (0..<n).map { wsum[$0] > 0 ? num[$0] / wsum[$0] : 0 }
+        }
+        // The surround a sparkle stands out of: a box run three times, about a Gaussian of 9 px.
+        let w9 = box(box(box(W, 5), 5), 5)
+        let num9 = box(box(box(zip(Y, W).map { $0 * $1 }, 5), 5), 5)
+        let Yp = (0..<n).map { i -> Double in
+            let local = w9[i] > 0 ? num9[i] / w9[i] : Y[i]
+            return Y[i] - max(0, Y[i] - local - 18) * peak
+        }
+        let wr = box(W, r)
+        let mI = mean(Yp, r, wr), mII = mean(Yp.map { $0 * $0 }, r, wr)
+        let a = (0..<n).map { i -> Double in let v = max(0, mII[i] - mI[i] * mI[i]); return v / (v + eps) }
+        let b = (0..<n).map { mI[$0] - a[$0] * mI[$0] }
+        let ma = mean(a, r, wr), mb = mean(b, r, wr)
+        var out = px
+        for i in 0..<n where W[i] > 0 {
+            let k = min(2, max(0, (ma[i] * Yp[i] + mb[i]) / Y[i]))
+            for c in 0..<3 { out[i * 4 + c] = UInt8(min(255, max(0, Double(px[i * 4 + c]) * k).rounded())) }
+        }
+        return out
     }
     /// Hard limits per kind (shipped p90): glints per 10,000 px, fine-detail share, edge density; nil: not limited.
     static func limits(_ k: Kind) -> (glints: Double?, hf: Double?, edges: Double?) {
