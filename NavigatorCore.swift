@@ -8203,6 +8203,10 @@ public struct ReelLayout: Equatable, Codable, Sendable {
     /// the document lists them ("the pots each unlock a feature …: a bigger matrix, …"); "" for one it
     /// names in words no plaque word fits.
     public var potFeatures: [String]? = nil
+    /// How the pots look with the Power Bet on, in the GDD's words, when it gives them a look of their own (PotStates.boost).
+    public var potBoost: String? = nil
+    /// The game's own win celebrations, lowest first, when its GDD names them (PopUps.winTiers(read:)); nil: the platform's.
+    public var winTiers: [String]? = nil
     /// The base game's grid, the one the bezel is built round.
     public var base: Grid? { grids.first { $0.mode == "base" } ?? grids.first }
     /// Every grid with the name its files take, as the studio names them: base first (the grid the bezel is
@@ -8517,6 +8521,8 @@ public enum ReelLayoutRules {
         }
         if gdd.lowercased().contains("one more chance") { out.awards = ["one more chance"] }
         if let pots = out.extras.first(where: { $0.what == "pots" }), (pots.count ?? 0) > 1 { out.potFeatures = PotStates.features(gdd, count: pots.count!) }
+        if out.extras.contains(where: { $0.what == "pots" }) { out.potBoost = PotStates.boost(gdd) }
+        out.winTiers = PopUps.winTiers(read: gdd)
         return out
     }
 }
@@ -8796,6 +8802,29 @@ public enum PotStates {
     public static func name(pot i: Int, of total: Int, state k: Int) -> String {
         "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-State\(k)Idle"
     }
+    /// A pot's Power Bet look, beside its states.
+    public static func boostedName(pot i: Int, of total: Int) -> String { "shared_avatar_jar\(total > 1 ? "\(i + 1)" : "")-boostedIdle" }
+    /// How the pots look with the Power Bet on, in the GDD's own sentence — only one that gives them a look of
+    /// their own, in a Power Bet passage ("The pot turns gold, with valuable gold coins appearing behind it",
+    /// Chevy). Their final state (Bankrush's safe: State5, drawn already) or an animation (88 Drums' "fancier
+    /// idle") is no new picture: nil.
+    public static func boost(_ gdd: String) -> String? {
+        var sincePowerBet = 99
+        for line in gdd.components(separatedBy: .newlines) {
+            let l = line.lowercased()
+            guard !l.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            sincePowerBet = l.range(of: #"power ?bets?|\bboost"#, options: .regularExpression) != nil ? 0 : min(sincePowerBet, 99) + 1
+            guard sincePowerBet <= 12 else { continue }
+            for sentence in line.components(separatedBy: ". ") {
+                let t = sentence.lowercased()
+                guard t.range(of: #"\b(pots?|jars?|safe|cauldron)\b[^.]{0,40}\b(turns?|becomes?|changes?|glows?)\b"#, options: .regularExpression) != nil,
+                      !t.contains("state"), !t.contains("animation") else { continue }    // its states (Bankrush's "final state"): drawn already
+                let clean = sentence.trimmingCharacters(in: CharacterSet(charactersIn: "*-•· \t")).trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                return Wording.noFree(clean) + "."
+            }
+        }
+        return nil
+    }
     /// The canvas height of a pot `n` wide: 1280 for 1024, a multiple of 16 as GPT Image takes sizes.
     public static func height(_ n: Int) -> Int { n + Int(headroom * Double(n)) / 16 * 16 }
     /// A pot drawn square (straight RGBA, `n` a side) stood at the bottom of its taller canvas.
@@ -8968,6 +8997,10 @@ public enum AssetChecklist {
                                 files: (0...PotStates.levels).map { "\(PotStates.name(pot: i, of: n, state: $0)).png" }, maker: "Pots", cost: Double(PotStates.levels + 1) * gpt(1024, 1280)))
                 if n > 1 { out.append(Item(group: "Pots", name: PotStates.plaqueName(pot: i), what: words.isEmpty ? "plaque, plain" : "plaque: \(words)",
                                            files: ["\(PotStates.plaqueName(pot: i)).png"], maker: "Pots", cost: gpt(1024, 384))) }
+                if let boost = l.potBoost {
+                    out.append(Item(group: "Pots", name: PotStates.boostedName(pot: i, of: n), what: "pot \(i + 1) with the Power Bet on: \(boost)",
+                                    files: ["\(PotStates.boostedName(pot: i, of: n)).png"], maker: "Pots", cost: gpt(1024, 1280)))
+                }
             }
         }
         for (wi, w) in (l.wheels ?? []).enumerated() {
@@ -9287,6 +9320,10 @@ public struct GameSheet: Equatable, Codable, Sendable {
     /// Power Bet (31 of 54 GDDs): the sell screen, drawer and toggles. A first-time tutorial: its panel and button.
     public var powerBet = false
     public var tutorial = false
+    /// With the Power Bet on, how the pots look, when they change ("The pot turns gold, gold coins behind it"); empty: no change.
+    public var potBoost = ""
+    /// The win celebrations, lowest first ("Big Win, Super Win, Ultra Win"); empty: the platform's.
+    public var winTiers = ""
 
     public init() {}
 
@@ -9301,6 +9338,14 @@ public struct GameSheet: Equatable, Codable, Sendable {
         holdAndSpin = try v(.holdAndSpin, ""); jackpotNames = try v(.jackpotNames, ""); jackpotTable = try v(.jackpotTable, true)
         pots = try v(.pots, 0); potFeatures = try v(.potFeatures, ""); wheel = try v(.wheel, .none); bonusWheel = try v(.bonusWheel, false)
         oneMoreChance = try v(.oneMoreChance, false); powerBet = try v(.powerBet, false); tutorial = try v(.tutorial, false)
+        potBoost = try v(.potBoost, ""); winTiers = try v(.winTiers, "")
+    }
+    /// The win celebrations as lettered ("BIG WIN!"), nil for the platform's.
+    var tiers: [String]? {
+        winTiers.split(separator: ",").map { t -> String in
+            let w = Wording.noFree(t.trimmingCharacters(in: .whitespaces)).uppercased().trimmingCharacters(in: CharacterSet(charactersIn: "!"))
+            return (w.hasSuffix(" WIN") ? w : w + " WIN") + "!"
+        }.filter { $0 != " WIN!" }.nilIfEmpty
     }
 
     /// The studio's ladder for `n` jackpots, top first: Grand, Major, Minor, Mini, then Micro below (Billionaire's
@@ -9349,6 +9394,9 @@ public struct GameSheet: Equatable, Codable, Sendable {
             out.extras.append(ReelLayout.Extra(what: "wheel", rows: nil, reels: nil, place: "", count: wheels.count))
         }
         if oneMoreChance { out.awards = ["one more chance"] }
+        let boost = potBoost.trimmingCharacters(in: .whitespaces)
+        if powerBet && pots > 0 && !boost.isEmpty { out.potBoost = Wording.noFree(boost) }
+        out.winTiers = tiers
         return out
     }
 
@@ -9382,6 +9430,9 @@ public struct GameSheet: Equatable, Codable, Sendable {
         }
         if oneMoreChance { d.append("One More Chance can trigger on a losing spin.") }
         if powerBet { d += ["Power Bet", "This game features a Power Bet, chosen on its sell screen."] }
+        let boost = potBoost.trimmingCharacters(in: .whitespaces)
+        if powerBet && pots > 0 && !boost.isEmpty { d.append("With the Power Bet on, the pot changes: " + Wording.noFree(boost).trimmingCharacters(in: CharacterSet(charactersIn: ".")) + ".") }
+        if let t = tiers { d += ["Win Celebrations", "The win celebrations are " + list(t.map { $0.dropLast().capitalized }) + "."] }
         if tutorial { d.append("This project should use an interactive tutorial system.") }
         return d.joined(separator: "\n")
     }
@@ -9406,7 +9457,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         let owned: (ReelLayout.Extra) -> Bool = { e in e.what == "jackpot table" || e.what == "pots" || e.what == "wheel"
             || ((e.what == "hot reel" || e.what == "extra reel") && e.place == "above" && e.mode == nil) }
         l.extras = l.extras.filter { !owned($0) } + fresh.extras
-        l.potFeatures = fresh.potFeatures
+        l.potFeatures = fresh.potFeatures; l.potBoost = fresh.potBoost; l.winTiers = fresh.winTiers
         l.awards = ((l0.awards ?? []).filter { $0 != "one more chance" } + (fresh.awards ?? [])).nilIfEmpty
         // A wheel of the same kind keeps the wedges read off the GDD; the Bonus Wheel comes and goes with the sheet.
         if wheel == .none { l.wheels = nil }
@@ -9435,10 +9486,12 @@ public struct GameSheet: Equatable, Codable, Sendable {
         // As many pots as the generator draws: the GDD's number, else one per bonus symbol.
         pots = l.extras.first { $0.what == "pots" }.map { $0.count ?? max(1, bonusSymbols) } ?? 0
         potFeatures = (l.potFeatures ?? []).map { $0.capitalized }.joined(separator: ", ")
-        powerBet = l.grids.contains { $0.mode.hasPrefix("power bet") }
+        powerBet = l.grids.contains { $0.mode.hasPrefix("power bet") } || l.potBoost != nil
         if let w = l.wheels?.first { wheel = w.wedges.contains("CREDITS") && !w.wedges.contains(where: WheelRules.tiers.map { $0.uppercased() }.contains) ? .credits : .jackpot }
         bonusWheel = l.wheels?.contains { $0.name.hasPrefix("Bonus") } ?? false
         oneMoreChance = l.awards?.contains("one more chance") ?? false
+        potBoost = l.potBoost ?? ""
+        winTiers = (l.winTiers ?? []).map { $0.dropLast().capitalized }.joined(separator: ", ")
     }
 }
 
@@ -9685,7 +9738,27 @@ public enum PopUps {
         return words.enumerated().map { $0.offset == 0 ? String($0.element) : $0.element.prefix(1).uppercased() + $0.element.dropFirst() }.joined()
     }
     /// The studio's celebration ladder (shared_celebration_message-1…4 in 59–67 shipped games).
-    public static let winTiers = ["BIG WIN!", "SUPER WIN!", "MEGA WIN!", "ULTRA WIN!"]
+    /// The platform's win ladder: BIG, SUPER, ULTRA (Gameforge's Tiki Titans, Spirits & Spice, Toyota and Wanted
+    /// ship big/super/ultra_win_message; Wanted's BigWinOverlay sets them at 10x, 25x and 100x the bet, 2026-10-04).
+    public static let winTiers = ["BIG WIN!", "SUPER WIN!", "ULTRA WIN!"]
+    static let tierWords = ["big", "super", "mega", "huge", "epic", "massive", "ultra", "colossal", "gigantic", "insane", "legendary", "enormous", "monster", "sensational", "titanic"]
+    /// A game's own ladder, as its GDD gives it: two or more "<word> Win"s on one line, in its order ("Big Win,
+    /// Mega Win, Epic Win"), or how many tiers ("3 tiers of Big Win FX", Blazing Stampede). Nil: the platform's.
+    public static func winTiers(read gdd: String) -> [String]? {
+        let re = try! NSRegularExpression(pattern: #"\b([a-z]+)[ -]wins?\b"#)
+        for line in gdd.lowercased().components(separatedBy: .newlines) {
+            var found: [String] = []
+            for m in re.matches(in: line, range: NSRange(line.startIndex..., in: line)) {
+                let w = String(line[Range(m.range(at: 1), in: line)!])
+                if tierWords.contains(w), !found.contains(w.uppercased() + " WIN!") { found.append(w.uppercased() + " WIN!") }
+            }
+            if found.count >= 2 { return found }
+        }
+        if let r = gdd.lowercased().range(of: #"\b[2-4] (tiers|levels) of big wins?"#, options: .regularExpression), let n = Int(gdd.lowercased()[r].prefix(1)) {
+            return [2: ["BIG WIN!", "SUPER WIN!"], 3: nil, 4: ["BIG WIN!", "SUPER WIN!", "MEGA WIN!", "ULTRA WIN!"]][n] ?? nil
+        }
+        return nil
+    }
 
     public static func plan(_ layout: ReelLayout, jackpots: [String], bonus: Bool) -> [Piece] {
         func title(_ name: String, _ text: String, _ w: Int = 1536, _ h: Int = 512) -> Piece { Piece(name: name, kind: .title, text: text, w: w, h: h) }
@@ -9714,7 +9787,7 @@ public enum PopUps {
         }
         if !(layout.wheels ?? []).isEmpty { out.append(title("wheelSpin_banner_spin", "PRESS TO SPIN", 1536, 512)) }
         if layout.awards?.contains("one more chance") == true { out.append(title("shared_popUp_oneMoreChance", "ONE MORE CHANCE")) }
-        for (i, t) in winTiers.enumerated() { out.append(title("shared_celebration_message-\(i + 1)", t)) }
+        for (i, t) in (layout.winTiers ?? winTiers).enumerated() { out.append(title("shared_celebration_message-\(i + 1)", t)) }
         return out
     }
 }
@@ -15729,6 +15802,14 @@ extension GDDAssetPrompts {
 
     /// Pot state `k` of PotStates.levels, an edit of the pot's State0 (attached): the same pot, its lid opened
     /// further, the game's treasure risen higher and its glow stronger — a calm pose, never the burst.
+    /// A pot as it looks with the Power Bet on, in the GDD's own words: an edit of its full state, so it swaps in place.
+    static func potBoostBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), look: String) -> String {
+        [
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, full. Show the same pot as it looks while the game's Power Bet is on, as the game's design says: “\(look)”",
+            "The pot keeps exactly its shape, size, position and ornament: only what that sentence describes changes. Anything it puts behind the pot stays behind it, inside the picture. A calm, still pose: no burst, rays, explosion or flying pieces. No text, lettering or numbers.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
         let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]
         let heap = ["", "a few pieces just showing at its mouth", "a small heap at its mouth", "a heap rising above its mouth", "a tall heap well above its mouth",

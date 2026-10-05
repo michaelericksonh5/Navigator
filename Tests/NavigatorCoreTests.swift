@@ -13514,12 +13514,12 @@ final class WheelAndPopUpTests: XCTestCase {
         XCTAssertTrue(titles.contains("BONUS GAMES AWARDED!")); XCTAssertTrue(titles.contains("TOTAL WIN"))
         XCTAssertTrue(titles.contains("YOU'VE WON THE\nGRAND\nJACKPOT")); XCTAssertTrue(titles.contains("LOOT LINK AWARDED!"))
         XCTAssertTrue(titles.contains("JACKPOT WHEEL AWARDED!")); XCTAssertTrue(titles.contains("ONE MORE CHANCE"))
-        XCTAssertEqual(Array(titles.suffix(4)), PopUps.winTiers)
+        XCTAssertEqual(Array(titles.suffix(PopUps.winTiers.count)), PopUps.winTiers)
         XCTAssertFalse(p.contains { $0.name.lowercased().contains("free") || $0.text.lowercased().contains("free") })
         XCTAssertEqual(Set(p.map(\.name)).count, p.count)
         XCTAssertFalse(p.contains { Double(max($0.w, $0.h)) / Double(min($0.w, $0.h)) > 3 || $0.w % 16 != 0 || $0.h % 16 != 0 })
         // A game without a bonus or jackpots still has its panel, bar, button and win ladder.
-        XCTAssertEqual(PopUps.plan(ReelLayoutRules.read("Example is a 3x5 lines game."), jackpots: [], bonus: false).count, 3 + 4)
+        XCTAssertEqual(PopUps.plan(ReelLayoutRules.read("Example is a 3x5 lines game."), jackpots: [], bonus: false).count, 3 + PopUps.winTiers.count)
     }
 }
 
@@ -13657,5 +13657,37 @@ final class SystemReviewFixTests: XCTestCase {
         XCTAssertEqual(WheelRules.order([], segments: 12), [])
         // A crop past the picture's edge is clipped, not a crash.
         XCTAssertEqual(FrameKit.crop([UInt8](repeating: 255, count: 4 * 4 * 4), width: 4, 2, 2, 8, 8).w, 8)
+    }
+}
+
+final class WinLadderAndBoostTests: XCTestCase {
+    // The win celebrations: the game's own when its document names them, else the platform's BIG, SUPER, ULTRA.
+    func testTheWinLadderIsTheGamesOwn() {
+        XCTAssertNil(PopUps.winTiers(read: "A big win plays a short fanfare. Wild wins pay double."))
+        XCTAssertEqual(PopUps.winTiers(read: "Celebrations: Big Win, Mega Win and Epic Win, each louder."), ["BIG WIN!", "MEGA WIN!", "EPIC WIN!"])
+        XCTAssertEqual(PopUps.winTiers(read: "There are 4 tiers of Big Win FX."), ["BIG WIN!", "SUPER WIN!", "MEGA WIN!", "ULTRA WIN!"])
+        XCTAssertNil(PopUps.winTiers(read: "There are 3 tiers of Big Win FX."))
+        var l = ReelLayout(); l.grids = [.init(mode: "base", rows: 3, reels: 5)]
+        XCTAssertEqual(PopUps.plan(l, jackpots: [], bonus: false).filter { $0.name.hasPrefix("shared_celebration_message") }.map(\.text), PopUps.winTiers)
+        l.winTiers = ["BIG WIN!", "EPIC WIN!"]
+        XCTAssertEqual(PopUps.plan(l, jackpots: [], bonus: false).filter { $0.name.hasPrefix("shared_celebration_message") }.map(\.text), ["BIG WIN!", "EPIC WIN!"])
+    }
+    // A boosted pot only when the Power Bet passage gives the pot a look of its own.
+    func testABoostedPotOnlyWhenTheDocumentDrawsOne() {
+        let gold = "Power Bets\n\nBoost\n* The reels glow green\n* The pot turns silver, with gems piled behind it"
+        XCTAssertEqual(PotStates.boost(gold), "The pot turns silver, with gems piled behind it.")
+        XCTAssertNil(PotStates.boost("Power Bet\nThe safe also changes to its final state and has a visual effect."))
+        XCTAssertNil(PotStates.boost("Power Bet\nThe collection pot gains a fancier idle animation."))
+        XCTAssertNil(PotStates.boost("Bonus\nThe pot turns red when the bonus is near."))       // no Power Bet nearby
+        // Typed: the look with the Power Bet on, written into the document and kept in the layout.
+        var sheet = GameSheet(); sheet.pots = 1; sheet.powerBet = true; sheet.potBoost = "turns silver, gems behind it"; sheet.winTiers = "Big, Super, Ultra"
+        let symbols = GDDSymbolSetRules.parseManual("WD, HP1-4, LP1-5, BO1").symbols
+        let l = sheet.layout(symbols)
+        XCTAssertEqual(l.potBoost, "turns silver, gems behind it"); XCTAssertEqual(l.winTiers, ["BIG WIN!", "SUPER WIN!", "ULTRA WIN!"])
+        let read = ReelLayoutRules.read(sheet.document(game: "Test", symbols: symbols))
+        XCTAssertNotNil(read.potBoost); XCTAssertEqual(read.winTiers, l.winTiers)
+        XCTAssertEqual(GameSheet(layout: l).potBoost, "turns silver, gems behind it")
+        let jobs = AssetPlanRules.symbolJobs(symbols)
+        XCTAssertTrue(AssetChecklist.items(jobs: jobs, layout: l, jackpots: [], hasBonus: true).contains { $0.name == "shared_avatar_jar-boostedIdle" })
     }
 }

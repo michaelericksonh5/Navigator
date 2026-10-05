@@ -26008,7 +26008,7 @@ final class GDDToAssetsRun: ObservableObject {
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
         ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") || $0.hasPrefix("shared_meter_") }),
         ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
-        ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
+        ("Pot states", { $0.hasPrefix("shared_avatar_jar") && ($0.contains("-State") && !$0.contains("-State0") || $0.contains("-boosted")) }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
         ("Number fonts", { $0.hasPrefix("transition_font_totalWin") || $0.hasPrefix("shared_font_") }),
         ("Symbol win states", { $0.contains("_win.png") || $0.contains("_win_rmbg") }),
@@ -26327,13 +26327,20 @@ final class GDDToAssetsRun: ObservableObject {
                         write(FrameKit.keyed(px, backing: b, width: 1024, height: potH), 1024, potH, "\(jar(i, k))_rmbg.png")
                     }
                 }
+                // With the Power Bet on, the look the GDD gives the pot, an edit of its full state (PotStates.boost).
+                if let look = layout.potBoost, !has("\(PotStates.boostedName(pot: i, of: total)).png"), let full = try? Data(contentsOf: url("\(jar(i, PotStates.levels)).png")) {
+                    let n = PotStates.boostedName(pot: i, of: total)
+                    if let px = paint(n, prompt: GDDAssetPrompts.potBoostBrief(theme: theme, backing: (backing.name, b), look: look), inputs: [full], w: 1024, h: potH, covered: nil) {
+                        write(px, 1024, potH, "\(n).png")
+                        write(FrameKit.keyed(px, backing: b, width: 1024, height: potH), 1024, potH, "\(n)_rmbg.png")
+                    }
+                }
                 // Each state laid on State0, so a swap in game does not jump (PotStates): free, and a state
                 // already in place is left as it is.
-                for k in 1...PotStates.levels {
-                    let n = jar(i, k)
+                for n in (1...PotStates.levels).map({ jar(i, $0) }) + [PotStates.boostedName(pot: i, of: total)] {
                     guard let s = load("\(n)_rmbg.png"), let e = load("\(jar(i, 0))_rmbg.png") else { continue }
                     guard e.w == s.w, e.h == s.h else {
-                        problems.append("pot \(i + 1)'s State\(k) was drawn before pots had room above them: Make Again ▸ Pot States")
+                        problems.append("\(n) was drawn before pots had room above them: Make Again ▸ Pot States")
                         continue
                     }
                     let laid = PotStates.registered(s.px, to: e.px, width: s.w, height: s.h)
@@ -26740,13 +26747,15 @@ final class GDDToAssetsRun: ObservableObject {
     /// `shared_avatar_jars-preview.jpg`: each pot's states side by side, State0 to State5 — to review.
     func potSheet(count: Int, folder: URL) {
         let cell = 300, states = 0...PotStates.levels
-        let W = (states.count + (count > 1 ? 1 : 0)) * cell, H = count * cell
+        let boosted = (0..<count).contains { FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(PotStates.boostedName(pot: $0, of: count))_rmbg.png").path) }
+        let W = (states.count + (boosted ? 1 : 0) + (count > 1 ? 1 : 0)) * cell, H = count * cell
         guard count > 0, let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
         ctx.setFillColor(CGColor(red: 0.08, green: 0.07, blue: 0.13, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
         ctx.interpolationQuality = .high
-        for i in 0..<count { for k in states {
-            guard let img = loadCGImage(folder.appendingPathComponent("\(PotStates.name(pot: i, of: count, state: k))_rmbg.png")) else { continue }
+        for i in 0..<count { for k in 0...(PotStates.levels + (boosted ? 1 : 0)) {
+            let n = k > PotStates.levels ? PotStates.boostedName(pot: i, of: count) : PotStates.name(pot: i, of: count, state: k)
+            guard let img = loadCGImage(folder.appendingPathComponent("\(n)_rmbg.png")) else { continue }
             let w = cell * img.width / max(1, img.height)
             ctx.draw(img, in: CGRect(x: k * cell + (cell - w) / 2, y: H - (i + 1) * cell, width: w, height: cell))
         } }
@@ -26754,7 +26763,7 @@ final class GDDToAssetsRun: ObservableObject {
         for i in 0..<count {
             guard count > 1, let img = loadCGImage(folder.appendingPathComponent("\(PotStates.plaqueName(pot: i))_rmbg.png")) else { continue }
             let h = (cell - 20) * img.height / max(1, img.width)
-            ctx.draw(img, in: CGRect(x: states.count * cell + 10, y: H - (i + 1) * cell + (cell - h) / 2, width: cell - 20, height: h))
+            ctx.draw(img, in: CGRect(x: (states.count + (boosted ? 1 : 0)) * cell + 10, y: H - (i + 1) * cell + (cell - h) / 2, width: cell - 20, height: h))
         }
         try? FileManager.default.removeItem(at: folder.appendingPathComponent("shared_interface_pots-states.jpg"))     // the two-state sheet it replaces
         if let img = ctx.makeImage(), let dest = CGImageDestinationCreateWithURL(folder.appendingPathComponent("shared_avatar_jars-preview.jpg") as CFURL, "public.jpeg" as CFString, 1, nil) {
@@ -28361,6 +28370,20 @@ struct GameSheetEditor: View {
             GridRow {
                 Text("Awards").foregroundColor(.secondary)
                 Toggle("One More Chance", isOn: $sheet.oneMoreChance)
+            }
+            GridRow {
+                Text("Win celebrations").foregroundColor(.secondary)
+                TextField(PopUps.winTiers.map { $0.dropLast().capitalized }.joined(separator: ", ") + " — the platform’s, when empty", text: $sheet.winTiers).frame(maxWidth: 360)
+            }
+            GridRow {
+                Text("Power Bet").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Toggle("Power Bet", isOn: $sheet.powerBet)
+                    if sheet.powerBet && sheet.pots > 0 {
+                        TextField("How the pot looks with it on, if it changes: e.g. turns gold, gold coins behind it", text: $sheet.potBoost).frame(maxWidth: 360)
+                    }
+                    Toggle("Tutorial", isOn: $sheet.tutorial)
+                }
             }
         }
         .font(.callout)
