@@ -15720,8 +15720,8 @@ extension GDDAssetPrompts {
     static func wedgeBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), label: String, matching: Bool, wheel: [String] = []) -> String {
         [
             (matching ? "Image 1 is another wedge of the same wheel: match its material and trim exactly — only the colour differs. " : "")
-            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a smooth face of one rich \(wedgeColour(label, backing: backing.name, with: wheel)), deepening softly toward the point, in the theme's own material, with a simple bold trim along its two long sides and its curved outer end.",
-            "The face stays smooth and plain — no pattern, texture, gems, sparkles or engraving on it — and unlettered: the game's words and amounts are laid on it afterwards. No text, letters or numbers.",
+            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge, rich and deep: a glossy \(wedgeColour(label, backing: backing.name, with: wheel)) face like polished enamel over the theme's own material, deepening toward the point, one broad curved highlight sweeping across its outer part; framed by a bold, bevelled trim in the theme's metal along its two long sides and its curved outer end, with one large jewel or stud set at each of its two outer corners.",
+            "Between the trim the face stays smooth — its depth from light and colour alone, with no pattern, texture, engraving, small gems or sparkles on it — and unlettered: the game's words and amounts are laid on it afterwards. No text, letters or numbers.",
             "Keep exactly the wedge's shape: paint nothing outside its outline, and the point stays sharp at the bottom.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
@@ -15871,7 +15871,7 @@ extension GDDAssetPrompts {
     static func potStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), level k: Int) -> String {
         let lid = ["", "opened just a crack", "opened a quarter of the way", "opened halfway", "opened most of the way", "thrown fully open"][k]
         return [
-            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, \(k == 1 ? "empty" : "at fill stage \(k - 1) of 5"). The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). A soft glow from the treasure in the pot's own colour, a little brighter than before — never the background's colour.",
+            "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, \(k == 1 ? "empty" : "at fill stage \(k - 1) of 5"). The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). At a glance this stage must look clearly fuller and livelier than the one before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.",
             "If the pot has a lid, cover or door, the rising treasure lifts it: \(lid) on its hinge or resting tilted on the heap — never taken away; a pot with no lid never gains one. Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
@@ -16872,16 +16872,22 @@ public enum WheelLabel {
         // A soft shadow under the bright rim, the rim, the dark outline, then each line's face: light, top to bottom.
         ctx.saveGState()
         ctx.setShadow(offset: CGSize(width: 0, height: -0.06 * cap), blur: 0.12 * cap, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
-        ctx.setStrokeColor(CGColor(red: 1, green: 0.96, blue: 0.84, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline + rim) * cap)
+        ctx.setStrokeColor(CGColor(red: 1, green: 0.88, blue: 0.55, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline + rim) * cap)
         draw(.stroke)
         ctx.restoreGState()
         ctx.setStrokeColor(CGColor(red: CGFloat(ink.r) / 255, green: CGFloat(ink.g) / 255, blue: CGFloat(ink.b) / 255, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline) * cap)
         draw(.stroke)
-        let face = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: [CGColor(red: 1, green: 1, blue: 1, alpha: 1), CGColor(red: 1, green: 0.87, blue: 0.52, alpha: 1)] as CFArray, locations: [0, 1])!
+        // The face: polished gold, cream at the top through gold to amber at the foot — a smooth gradient whose darkest
+        // part still stands far lighter than the outline (WCAG G18) — with a gloss band across its upper third.
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)
+        let face = CGGradient(colorsSpace: srgb, colors: [CGColor(red: 1, green: 0.98, blue: 0.88, alpha: 1), CGColor(red: 1, green: 0.84, blue: 0.36, alpha: 1),
+                                                          CGColor(red: 0.86, green: 0.56, blue: 0.13, alpha: 1)] as CFArray, locations: [0, 0.45, 1])!
+        let gloss = CGGradient(colorsSpace: srgb, colors: [CGColor(red: 1, green: 1, blue: 1, alpha: 0.55), CGColor(red: 1, green: 1, blue: 1, alpha: 0)] as CFArray, locations: [0, 1])!
         for (l, p) in lines {
             ctx.saveGState()
             ctx.textPosition = p; ctx.setTextDrawingMode(.clip); CTLineDraw(l, ctx)
             ctx.drawLinearGradient(face, start: CGPoint(x: 0, y: p.y + cap), end: CGPoint(x: 0, y: p.y), options: [])
+            ctx.drawLinearGradient(gloss, start: CGPoint(x: 0, y: p.y + cap), end: CGPoint(x: 0, y: p.y + cap * 0.6), options: [])
             ctx.restoreGState()
         }
         guard let img = ctx.makeImage(), let text = ChromaKeyOutputRules.straightRGBA8(img) else { return wedge }
