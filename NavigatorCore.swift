@@ -8196,6 +8196,9 @@ public struct ReelLayout: Equatable, Codable, Sendable {
     /// The pieces Gemini found the game needs that no dedicated generator makes (ConceptPlan): meters,
     /// collection areas, glass covers, counters, …, drawn by the generic generator.
     public var concepts: [ConceptPiece]? = nil
+    /// The reel set above the base grid in its housing — a hot reel, or any reel added above: the one definition
+    /// the bezel's template, its brief and the game sheet share.
+    public var hotReelAbove: Extra? { extras.first { ($0.what == "hot reel" || $0.what == "extra reel") && $0.place == "above" && $0.mode == nil } }
     /// What each pot unlocks, in order, as its plaque words ("EXPAND", "MULTI", "JACKPOTS OR WILDS"), when
     /// the document lists them ("the pots each unlock a feature …: a bigger matrix, …"); "" for one it
     /// names in words no plaque word fits.
@@ -8210,7 +8213,7 @@ public struct ReelLayout: Equatable, Codable, Sendable {
         var out: [(name: String, grid: Grid)] = [("base", base)]
         for g in grids where g != base {
             let words = g.mode.replacingOccurrences(of: #"\bbonus\b"#, with: "bonus games", options: .regularExpression).split(separator: " ")
-            let n = words.enumerated().map { $0.offset == 0 ? $0.element.lowercased() : $0.element.prefix(1).uppercased() + $0.element.dropFirst().lowercased() }.joined()
+            let n = Wording.noFreeName(words.enumerated().map { $0.offset == 0 ? $0.element.lowercased() : $0.element.prefix(1).uppercased() + $0.element.dropFirst().lowercased() }.joined())
             var name = n, i = 2
             while out.contains(where: { $0.name == name }) { name = n + "\(i)"; i += 1 }
             out.append((name, g))
@@ -8574,7 +8577,7 @@ public struct ReelArea: Equatable, Sendable {
     public init(_ layout: ReelLayout, grid: ReelLayout.Grid? = nil, cell: Int = 512) {
         let g = grid ?? layout.base ?? ReelLayout.Grid(mode: "base", rows: 3, reels: 5)
         // A hot reel, or any reel added above the base grid, sits in its housing on the top band.
-        let hot = g == layout.base ? layout.extras.first { ($0.what == "hot reel" || $0.what == "extra reel") && $0.place == "above" && $0.mode == nil } : nil
+        let hot = g == layout.base ? layout.hotReelAbove : nil
         self.init(rows: g.rows, reels: g.reels, hotRows: hot.map { $0.rows ?? 1 } ?? 0, independent: g.independent, cell: cell)
     }
     /// Where a pixel is: 0 outside the frame, 1 in the band (or the hot bar), 2 a divider, 3 an opening.
@@ -8779,10 +8782,10 @@ public enum PotStates {
                 if i.contains("respin") { return "RESPINS" }
                 if i.contains("collect") { return "COLLECT" }
                 if i.range(of: #"matrix|expand|grow|extra (row|reel)"#, options: .regularExpression) != nil { return "EXPAND" }
-                if i.range(of: #"bonus game|free (games|spins)"#, options: .regularExpression) != nil { return "BONUS GAMES" }
+                if i.range(of: #"bonus game|free (game|spin)"#, options: .regularExpression) != nil { return "BONUS GAMES" }
                 // Already a plaque's word or two ("multi"): as written.
                 let words = i.replacingOccurrences(of: #"^(and|or)\s+"#, with: "", options: .regularExpression)
-                return words.split(separator: " ").count <= 3 ? words.uppercased() : ""
+                return words.split(separator: " ").count <= 3 ? Wording.noFree(words).uppercased() : ""
             }
         }
         return nil
@@ -8824,6 +8827,20 @@ public enum PotStates {
     }
 }
 
+/// Player-facing words and file names never say "free": production says "bonus games" (legal). Whole words
+/// only, so "freeze" stays and "free spins" goes; a game's own title is not run through it.
+public enum Wording {
+    public static func noFree(_ t: String) -> String {
+        t.replacingOccurrences(of: #"(?i)\bfree[ -]?(games?|spins?)\b"#, with: "bonus games", options: .regularExpression)
+         .replacingOccurrences(of: #"(?i)\bfree\b"#, with: "bonus", options: .regularExpression)
+    }
+    /// For camel-case names: "freeSpinsCounter" → "bonusGamesCounter", "freezeMeter" untouched.
+    public static func noFreeName(_ n: String) -> String {
+        n.replacingOccurrences(of: #"(?<![a-zA-Z])[Ff]ree(Games|Spins|games|spins|Game|Spin)?(?![a-z])"#, with: "bonusGames", options: .regularExpression)
+         .replacingOccurrences(of: #"(?<=[a-z])Free(Games|Spins|Game|Spin)?(?![a-z])"#, with: "BonusGames", options: .regularExpression)
+    }
+}
+
 /// A piece of a game's static art that no dedicated generator makes, as Gemini plans it from the GDD
 /// (ConceptPlan): what it is and looks like, its shape, size, lettering and states. Drawn by the generic
 /// generator the way the dedicated ones are — a grey template by shape, painted in the set's material by
@@ -8849,15 +8866,10 @@ public struct ConceptPiece: Codable, Equatable, Sendable {
     /// no longer than 3:1, at most 2048 a side), at most five states, and never "free" in a name or a word.
     public func normalised() -> ConceptPiece {
         var p = self
-        func noFree(_ t: String) -> String {
-            t.replacingOccurrences(of: #"(?i)\bfree (games|spins)\b"#, with: "bonus games", options: .regularExpression)
-             .replacingOccurrences(of: #"(?i)\bfree\b"#, with: "bonus", options: .regularExpression)
-        }
-        let words = name.replacingOccurrences(of: #"(?i)free(games|spins)?"#, with: "bonusGames", options: .regularExpression)
-            .split { !$0.isLetter && !$0.isNumber && $0 != "_" && $0 != "-" }.joined()
+        let noFree = Wording.noFree
+        let words = Wording.noFreeName(name).split { !$0.isLetter && !$0.isNumber && $0 != "_" && $0 != "-" }.joined()
         p.name = words.isEmpty ? "base_interface_piece" : String(words.prefix(80))
-        // A symbol's own code (a value variant, "MU1") stays its name; anything else gets the studio's form.
-        if !p.name.contains("_"), p.name.range(of: #"^[A-Z]{1,5}\d{0,2}$"#, options: .regularExpression) == nil { p.name = "base_interface_" + p.name }
+        if !p.name.contains("_") { p.name = "base_interface_" + p.name }
         p.what = noFree(what); p.look = noFree(look); p.lettering = noFree(lettering).uppercased(); p.source = source
         p.shape = Self.shapes.contains(shape.lowercased()) ? shape.lowercased() : "free"
         var w = max(64, min(2048, width)), h = max(64, min(2048, height))
@@ -8915,6 +8927,14 @@ public enum AssetChecklist {
     /// square root of the size — $0.12 at 2048², $0.17 for a 3168×2304 bezel asked at 8 MP.
     public static func gpt(_ w: Int, _ h: Int) -> Double { 0.06 * max(1, Double(w * h) / 1_048_576).squareRoot() }
 
+    /// Bonus games, one definition for the pop-ups, the checklist and the intro cards: a bonus grid read or typed,
+    /// or — with no other mode — bonus symbols (a Loot-Link-only game has no "BONUS GAMES AWARDED!").
+    public static func hasBonusGames(jobs: [AssetJob], layout: ReelLayout?) -> Bool {
+        guard let l = layout else { return jobs.contains { $0.role == .bonus } }
+        if l.grids.contains(where: { $0.mode.hasPrefix("bonus") }) { return true }
+        return !l.grids.contains { $0.mode != "base" } && jobs.contains { $0.role == .bonus }
+    }
+
     public static func items(jobs: [AssetJob], layout: ReelLayout?, jackpots names: [String], hasBonus: Bool, standard: [ConceptPiece]? = nil) -> [Item] {
         var out: [Item] = []
         for j in jobs where j.kind == .symbol {
@@ -8939,7 +8959,8 @@ public enum AssetChecklist {
                             files: ["shared_interface_jackpotTable.png"], maker: "Jackpot table", cost: gpt(3008, 1008)))
         }
         if let pots = l.extras.first(where: { $0.what == "pots" }) {
-            let n = pots.count ?? 1
+            // As many as the generator draws: the GDD's number, else one per bonus symbol.
+            let n = pots.count ?? max(1, jobs.filter { $0.role == .bonus }.count)
             for i in 0..<n {
                 let words = (l.potFeatures ?? []).indices.contains(i) ? l.potFeatures![i] : ""
                 out.append(Item(group: "Pots", name: PotStates.name(pot: i, of: n, state: 0).replacingOccurrences(of: "-State0Idle", with: ""),
@@ -8959,7 +8980,7 @@ public enum AssetChecklist {
             let labels = WheelRules.labels(w, jackpots: names)
             let distinct = labels.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
             out.append(Item(group: "Wheels", name: "\(prefix)_interface_wedge", what: "\(w.name): " + distinct.joined(separator: ", "),
-                            files: distinct.map { "\(prefix)_interface_wedge-\(PopUps.key($0)).png" }, maker: "Wheels", cost: Double(distinct.count) * 0.04))
+                            files: distinct.map { "\(prefix)_interface_wedge-\(PopUps.key($0)).png" }, maker: "Wheels", cost: Double(distinct.count) * gpt(1024, 1024)))
         }
         for p in PopUps.plan(l, jackpots: names, bonus: hasBonus) {
             out.append(Item(group: "Pop-ups", name: p.name, what: p.text.isEmpty ? p.kind.rawValue : p.text.replacingOccurrences(of: "\n", with: " "),
@@ -8977,7 +8998,8 @@ public enum AssetChecklist {
         }
         if (standard ?? []).contains(where: { $0.name == "shared_logo_master" }) {
             out.append(Item(group: "Lobby and loading", name: "shared_preloader", what: "the loading screen and lobby icons, put together from the logo, the key art and the base background",
-                            files: Composites.all.map { "\($0.name).png" }, maker: "Composites", cost: 0))
+                            files: Composites.all.map { "\($0.name).png" } + ((standard ?? []).contains { $0.name == "shared_sellScreen_background" } ? ["shared_sellScreen_tutorialAvatar.png"] : []),
+                            maker: "Composites", cost: 0))
         }
         // What the GDD has that nothing makes yet: said, not dropped.
         if l.concepts == nil {
@@ -9010,7 +9032,8 @@ public enum StandardPieces {
         let has = { (n: String) in standard.contains { $0.name == n } }
         return concepts.filter { c in
             let n = c.name.lowercased()
-            if n.contains("logo") && has("shared_logo_master") { return false }
+            // The game's own logo planned again — not a feature's logo, which the plan asks for.
+            if (n.contains("gamelogo") || n.hasSuffix("_logo") || n.contains("logomaster")) && has("shared_logo_master") { return false }
             if n.contains("sellscreen") && (n.contains("panel") || n.contains("background")) && has("shared_sellScreen_background") { return false }
             if n.contains("powerbet") && (n.contains("drawer") || n.contains("toggle")) && has("shared_powerBet_drawer") { return false }
             if n.contains("tutorial") && n.contains("background") && has("shared_tutorial_background") { return false }
@@ -9018,14 +9041,17 @@ public enum StandardPieces {
         }
     }
 
-    public static func pieces(game: String, gdd: String, layout: ReelLayout, hero: String?) -> [ConceptPiece] {
+    public static func pieces(game: String, gdd: String, layout: ReelLayout, hero: String?, bonusGames: Bool? = nil) -> [ConceptPiece] {
         let name = title(game), l = gdd.lowercased()
         func piece(_ n: String, _ what: String, _ look: String, _ shape: String, _ w: Int, _ h: Int, _ letters: String = "", refs: [String]? = nil) -> ConceptPiece {
             ConceptPiece(name: n, what: what, look: look, shape: shape, width: w, height: h, lettering: letters, states: [], source: "", standard: true, refs: refs).normalised()
         }
         var out: [ConceptPiece] = []
-        if !name.isEmpty {
-            out.append(piece("shared_logo_master", "the game's title logo, “\(name)”.", "Bold, dimensional display lettering of the title in the theme's richest colours and metal, an emblem of the theme worked into it, as a slot game's logo is.", "lettering", 2048, 1024, name))
+        // The game's own title, as it is — not run through the "free" wording — and none for a game not named yet.
+        if !name.isEmpty && name.lowercased() != "untitled game" {
+            var logo = piece("shared_logo_master", "the game's title logo, “\(name)”.", "Bold, dimensional display lettering of the title in the theme's richest colours and metal, an emblem of the theme worked into it, as a slot game's logo is.", "lettering", 2048, 1024)
+            logo.lettering = name.uppercased(); logo.what = "the game's title logo, “\(name)”."
+            out.append(logo)
         }
         if let hero {
             out.append(piece("shared_character_keyArt", "the full figure of the game's hero — the character or object in the attached symbol — for the logo, lobby icons and loading screen.",
@@ -9041,7 +9067,7 @@ public enum StandardPieces {
         // The intro splash: a card for each feature the game has, a little scene of it lettered with its name,
         // shown before play (9 of 10 shipped games) — from the structure, as GDDs never list the cards.
         var features: [(key: String, title: String, refs: [String]?)] = []
-        if layout.grids.contains(where: { $0.mode.hasPrefix("bonus") }) { features.append(("bonusGames", "BONUS GAMES", nil)) }
+        if bonusGames ?? layout.grids.contains(where: { $0.mode.hasPrefix("bonus") }) { features.append(("bonusGames", "BONUS GAMES", nil)) }
         for g in layout.grids where ReelLayoutRules.holdModes.contains(g.mode) { features.append((PopUps.key(g.mode), g.mode.uppercased(), nil)) }
         for w in layout.wheels ?? [] where !w.name.hasPrefix("Bonus") { features.append((PopUps.key(w.name), w.name.uppercased(), nil)) }
         if layout.extras.contains(where: { $0.what == "pots" }) { features.append(("pots", "FILL THE POTS", nil)) }
@@ -9175,7 +9201,7 @@ public enum ConceptPlan {
 
         List every OTHER piece of static art this game shows on screen that the document describes or clearly needs: meters and their fill or lit states, collection areas or rows, counters' frames ("spins remaining"), glass or lock covers over reels or cells, cell backings and lock frames for hold-and-spin cells, multiplier badges, tubes, posters, avatars or mascots standing by the reels, each Power Bet boost's button with its off and lit states, mode intro titles, a feature's logo or title lettering, pick-bonus tiles. Static art only: animation, particles, glows and bursts are made in Spine, not here.
         Also, when the document has them:
-        - VALUE VARIANTS of a special symbol (a multiplier symbol's values x2, x3, x5…; a WYSIWYG's tiers or colours): one piece named after the symbol's code (e.g. MU1), shape "free", refs [that code], lettering its first value, states its other values in order.
+        - VALUE VARIANTS of a special symbol (a multiplier symbol's values x2, x3, x5…; a WYSIWYG's tiers or colours): one piece named <code>_values (e.g. MU1_values), shape "free", refs [that code], lettering its first value, states its other values in order.
         - TUTORIAL CARDS, one per tutorial point the document lists: name shared_tutorial_card-<topic>, shape "panel", 1536x768, lettering the tip's own short text (at most 10 words).
 
         For each piece:
@@ -9258,15 +9284,38 @@ public struct GameSheet: Equatable, Codable, Sendable {
     /// A wedge on the wheel that opens a second wheel picking the bonus (Tiki Titans).
     public var bonusWheel = false
     public var oneMoreChance = false
+    /// Power Bet (31 of 54 GDDs): the sell screen, drawer and toggles. A first-time tutorial: its panel and button.
+    public var powerBet = false
+    public var tutorial = false
 
     public init() {}
 
-    /// The studio's ladder for `n` jackpots, top first (Micro below Mini as Billionaire's Gamma has it).
-    public static func ladder(_ n: Int) -> [String] { Array(["Grand", "Major", "Minor", "Mini", "Micro", "Mega"].prefix(max(0, n))) }
-    /// The jackpots' names: as typed, or the ladder for the set's JP symbols.
+    /// Every field optional in a saved or hand-written sheet: one missing key no longer turns the whole sheet
+    /// into the default 3x5 before a paid run (system review, 2026-10-04).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ k: CodingKeys, _ d: T) throws -> T { try c.decodeIfPresent(T.self, forKey: k) ?? d }
+        rows = try v(.rows, 3); reels = try v(.reels, 5); hotReel = try v(.hotReel, false)
+        bonus = try v(.bonus, .sameReels); bonusRows = try v(.bonusRows, 3); bonusReels = try v(.bonusReels, 5)
+        bonusIndependent = try v(.bonusIndependent, false); bonusGrowsTo = try v(.bonusGrowsTo, 0)
+        holdAndSpin = try v(.holdAndSpin, ""); jackpotNames = try v(.jackpotNames, ""); jackpotTable = try v(.jackpotTable, true)
+        pots = try v(.pots, 0); potFeatures = try v(.potFeatures, ""); wheel = try v(.wheel, .none); bonusWheel = try v(.bonusWheel, false)
+        oneMoreChance = try v(.oneMoreChance, false); powerBet = try v(.powerBet, false); tutorial = try v(.tutorial, false)
+    }
+
+    /// The studio's ladder for `n` jackpots, top first: Grand, Major, Minor, Mini, then Micro below (Billionaire's
+    /// Gamma); a sixth takes Mega between Grand and Major, as the wheels rank it.
+    public static func ladder(_ n: Int) -> [String] {
+        n >= 6 ? Array(["Grand", "Mega", "Major", "Minor", "Mini", "Micro"].prefix(n)) : Array(["Grand", "Major", "Minor", "Mini", "Micro"].prefix(max(0, n)))
+    }
+    /// The jackpots' names: as typed (never "free"), or the ladder for the set's JP symbols.
     public func jackpots(_ symbols: [SlotSymbol]) -> [String] {
-        let typed = jackpotNames.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let typed = jackpotNames.split(separator: ",").map { Wording.noFree($0.trimmingCharacters(in: .whitespaces)) }.filter { !$0.isEmpty }
         return typed.isEmpty ? Self.ladder(symbols.filter { $0.role == .jackpot }.count) : typed
+    }
+    /// What each pot unlocks, by position — an empty one keeps its place, so pot 1 is never given pot 2's word.
+    var potWords: [String] {
+        potFeatures.components(separatedBy: ",").map { Wording.noFree($0.trimmingCharacters(in: .whitespaces)).uppercased() }
     }
 
     public func layout(_ symbols: [SlotSymbol]) -> ReelLayout {
@@ -9280,14 +9329,14 @@ public struct GameSheet: Equatable, Codable, Sendable {
             out.grids.append(ReelLayout.Grid(mode: "bonus", rows: max(r, bonusGrowsTo), reels: k, independent: bonusIndependent,
                                              note: "typed", startRows: bonusGrowsTo > r ? r : nil))
         }
-        let hold = holdAndSpin.trimmingCharacters(in: .whitespaces)
+        let hold = Wording.noFree(holdAndSpin.trimmingCharacters(in: .whitespaces))
         if !hold.isEmpty { out.grids.append(ReelLayout.Grid(mode: hold.lowercased(), rows: rows, reels: reels, independent: true, note: "typed")) }
         if hotReel { out.extras.append(ReelLayout.Extra(what: "hot reel", rows: 1, reels: reels, place: "above")) }
         let names = jackpots(symbols)
         if jackpotTable && !names.isEmpty { out.extras.append(ReelLayout.Extra(what: "jackpot table", rows: nil, reels: nil, place: "above")) }
         if pots > 0 {
             out.extras.append(ReelLayout.Extra(what: "pots", rows: nil, reels: nil, place: "above", count: pots))
-            let words = potFeatures.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+            let words = potWords
             if pots > 1 { out.potFeatures = (0..<pots).map { $0 < words.count ? words[$0] : "" } }
         }
         if wheel != .none {
@@ -9316,12 +9365,12 @@ public struct GameSheet: Equatable, Codable, Sendable {
             d += ["Bonus Games", "The bonus games are played on a \(r)x\(k) matrix" + (bonusIndependent ? " of independent reels" : "")
                   + (bonusGrowsTo > r ? ", and the matrix can grow from a \(r)x\(k) to a \(bonusGrowsTo)x\(k) matrix." : ".")]
         }
-        let hold = holdAndSpin.trimmingCharacters(in: .whitespaces)
+        let hold = Wording.noFree(holdAndSpin.trimmingCharacters(in: .whitespaces))
         if !hold.isEmpty { d += [hold, "\(hold) is played on a \(rows)x\(reels) matrix of independent reels."] }
         if !names.isEmpty { d += ["Jackpots", "The jackpots are the \(list(names)) jackpots" + (jackpotTable ? ", shown on the jackpot table above the matrix." : ".")] }
         if pots > 0 {
             d += ["Pots", "There \(pots == 1 ? "is 1 pot" : "are \(pots) pots") that sit above the matrix and fill as the game is played."]
-            let f = potFeatures.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+            let f = potWords.map { $0.lowercased() }.filter { !$0.isEmpty }
             if pots > 1 && f.count == pots { d.append("The pots are tied to \(pots) features: \(f.joined(separator: ", ")).") }
         }
         if wheel != .none {
@@ -9332,14 +9381,49 @@ public struct GameSheet: Equatable, Codable, Sendable {
             if bonusWheel { d.append("When the Bonus wedge is selected, the Bonus Wheel appears. Each wedge on the Bonus Wheel represents a mode for entering the bonus: the standard bonus, random wilds, or a multiplier bonus.") }
         }
         if oneMoreChance { d.append("One More Chance can trigger on a losing spin.") }
+        if powerBet { d += ["Power Bet", "This game features a Power Bet, chosen on its sell screen."] }
+        if tutorial { d.append("This project should use an interactive tutorial system.") }
         return d.joined(separator: "\n")
+    }
+
+    /// The sheet laid over a layout read off a GDD: what the sheet holds — the base grid, the first bonus grid,
+    /// the first hold-and-spin mode, the hot reel, jackpot table, pots and their words, the wheels and One More
+    /// Chance — set as it says; everything else the reading had (power bet and second bonus grids, meters,
+    /// collection areas, reels beside, a wheel's own wedges, notes, planned pieces) kept.
+    public func apply(to l0: ReelLayout, _ symbols: [SlotSymbol]) -> ReelLayout {
+        let fresh = layout(symbols)
+        var l = l0
+        func replace(_ match: (ReelLayout.Grid) -> Bool, with g: ReelLayout.Grid?, keepMode: Bool) {
+            if let i = l.grids.firstIndex(where: match) {
+                if var g { if keepMode { g.mode = l.grids[i].mode }; l.grids[i] = g } else { l.grids.remove(at: i) }
+            } else if let g { l.grids.append(g) }
+        }
+        replace({ $0.mode == "base" }, with: fresh.grids.first { $0.mode == "base" }, keepMode: true)
+        if let i = l.grids.firstIndex(where: { $0.mode == "base" }), i != 0 { l.grids.insert(l.grids.remove(at: i), at: 0) }
+        replace({ $0.mode.hasPrefix("bonus") }, with: fresh.grids.first { $0.mode == "bonus" }, keepMode: true)
+        replace({ ReelLayoutRules.holdModes.contains($0.mode) || $0.note == "typed" && $0.independent && !$0.mode.hasPrefix("bonus") && $0.mode != "base" },
+                with: fresh.grids.first { $0.mode != "base" && $0.mode != "bonus" }, keepMode: false)
+        let owned: (ReelLayout.Extra) -> Bool = { e in e.what == "jackpot table" || e.what == "pots" || e.what == "wheel"
+            || ((e.what == "hot reel" || e.what == "extra reel") && e.place == "above" && e.mode == nil) }
+        l.extras = l.extras.filter { !owned($0) } + fresh.extras
+        l.potFeatures = fresh.potFeatures
+        l.awards = ((l0.awards ?? []).filter { $0 != "one more chance" } + (fresh.awards ?? [])).nilIfEmpty
+        // A wheel of the same kind keeps the wedges read off the GDD; the Bonus Wheel comes and goes with the sheet.
+        if wheel == .none { l.wheels = nil }
+        else if let w0 = l0.wheels, !w0.isEmpty, GameSheet(layout: l0).wheel == wheel {
+            var w = w0.filter { !$0.name.hasPrefix("Bonus") }
+            if bonusWheel { w.append(w0.first { $0.name.hasPrefix("Bonus") } ?? fresh.wheels?.first { $0.name.hasPrefix("Bonus") } ?? ReelLayout.Wheel(name: "Bonus Wheel", wedges: ["BONUS GAMES"])) }
+            l.wheels = w
+            if let i = l.extras.firstIndex(where: { $0.what == "wheel" }) { l.extras[i].count = w.count }
+        } else { l.wheels = fresh.wheels }
+        return l
     }
 
     /// A sheet from a layout read off a GDD, to correct it: its base and first bonus grid, its hold-and-spin
     /// mode, extras, wheels and awards. Modes beyond those are not editable here.
-    public init(layout l: ReelLayout) {
+    public init(layout l: ReelLayout, bonusSymbols: Int = 0) {
         if let b = l.base { rows = b.rows; reels = b.reels }
-        hotReel = l.extras.contains { $0.what == "hot reel" || $0.what == "extra reel" }
+        hotReel = l.hotReelAbove != nil
         if let g = l.grids.first(where: { $0.mode.hasPrefix("bonus") }) {
             bonus = g.rows == rows && g.reels == reels && g.startRows == nil ? .sameReels : .ownGrid
             bonusRows = g.startRows ?? g.rows; bonusReels = g.reels; bonusIndependent = g.independent
@@ -9348,8 +9432,10 @@ public struct GameSheet: Equatable, Codable, Sendable {
         } else { bonus = .none }
         if let h = l.grids.first(where: { ReelLayoutRules.holdModes.contains($0.mode) }) { holdAndSpin = h.mode.capitalized }
         jackpotTable = l.extras.contains { $0.what == "jackpot table" }
-        pots = l.extras.first { $0.what == "pots" }?.count ?? (l.extras.contains { $0.what == "pots" } ? 1 : 0)
+        // As many pots as the generator draws: the GDD's number, else one per bonus symbol.
+        pots = l.extras.first { $0.what == "pots" }.map { $0.count ?? max(1, bonusSymbols) } ?? 0
         potFeatures = (l.potFeatures ?? []).map { $0.capitalized }.joined(separator: ", ")
+        powerBet = l.grids.contains { $0.mode.hasPrefix("power bet") }
         if let w = l.wheels?.first { wheel = w.wedges.contains("CREDITS") && !w.wedges.contains(where: WheelRules.tiers.map { $0.uppercased() }.contains) ? .credits : .jackpot }
         bonusWheel = l.wheels?.contains { $0.name.hasPrefix("Bonus") } ?? false
         oneMoreChance = l.awards?.contains("one more chance") ?? false
@@ -9359,6 +9445,10 @@ public struct GameSheet: Equatable, Codable, Sendable {
 /// What a wheel's wedges carry, from what the document says of it. The studio letters tier words and feature
 /// names into its wedges (GRAND, MAJOR, FREE GAMES on Founding Fortunes; MEGA, MINI on Tiki Titans) and leaves
 /// credit amounts to a number font. "Free" is never lettered: production says bonus games.
+extension Array {
+    var nilIfEmpty: [Element]? { isEmpty ? nil : self }
+}
+
 public enum WheelRules {
     static let tiers = ["grand", "mega", "major", "minor", "mini", "micro"]
 
@@ -9394,6 +9484,7 @@ public enum WheelRules {
     /// tier once, each tier below once more (Tiki Titans: MEGA 1, MAJOR 2, MINOR 3, MINI 4, bonus 2), features
     /// twice, credits filling the rest — spread so no two alike sit side by side where it can be helped.
     public static func order(_ labels: [String], segments: Int?) -> [String] {
+        guard !labels.isEmpty else { return [] }
         var counts: [(String, Int)] = []
         var tier = 0
         for l in labels {
@@ -9475,6 +9566,7 @@ public struct WheelArt: Equatable, Sendable {
     public func face(_ wedges: [String: [UInt8]], order: [String], size: Int) -> [UInt8] {
         let (w, h) = wedgeSize, c = Double(size) / 2, scale = Double(radius) / (c * 0.86)
         var out = [UInt8](repeating: 0, count: size * size * 4)
+        guard !order.isEmpty else { return out }
         // Bilinear on premultiplied colour, so a wedge's keyed-out edge brings none of the backing with it.
         func sample(_ p: [UInt8], _ x: Double, _ y: Double) -> (Double, Double, Double, Double) {
             let x0 = Int(x.rounded(.down)), y0 = Int(y.rounded(.down)), fx = x - Double(x0), fy = y - Double(y0)
@@ -9612,7 +9704,7 @@ public enum PopUps {
             out.append(title("base_popUp_\(key)Awarded", "YOU'VE WON THE\n\(tier)\nJACKPOT", 1024, 768))
         }
         // Modes of their own (Loot Link, Lock and Respin, …), awarded by name.
-        for (name, g) in layout.fileModes.dropFirst() where !g.mode.hasPrefix("bonus") && !g.mode.hasPrefix("power bet") && !g.mode.hasSuffix("bonus") {
+        for (name, g) in layout.fileModes.dropFirst() where g.mode != "base" && !g.mode.hasPrefix("bonus") && !g.mode.hasPrefix("power bet") && !g.mode.hasSuffix("bonus") {
             let words = g.mode.replacingOccurrences(of: " mode", with: "").uppercased()
             guard !out.contains(where: { $0.text == "\(words) AWARDED!" }) else { continue }
             out.append(title("base_popUp_\(name)Awarded", "\(words) AWARDED!"))
@@ -13105,6 +13197,32 @@ public enum FrameKit {
         return out
     }
 
+    /// Keyed, then its outer `ring` of pixels despilled: an edge GPT Image antialiased against the backing keeps
+    /// that colour in pixels too far from it to key out (a pink rim round the gold coins, 2026-10-04). Only the
+    /// ring, so the art's own colours inside are never touched.
+    static func keyed(_ px: [UInt8], backing b: RGB8, width w: Int, height h: Int, ring: Int = 3) -> [UInt8] {
+        var out = keyed(px, backing: b)
+        despill(&out, width: w, height: h, backing: b, ring: ring)
+        return out
+    }
+    /// The backing's colour taken out of a cut-out's outer `ring` and its soft pixels (straight RGBA): its own
+    /// channels (magenta: red and blue) brought down to the others where they run ahead of them.
+    static func despill(_ out: inout [UInt8], width w: Int, height h: Int, backing b: RGB8, ring: Int = 3) {
+        guard out.count == w * h * 4 else { return }
+        let ch = [Int(b.r), Int(b.g), Int(b.b)]
+        let high = (0..<3).filter { ch[$0] >= 128 }, low = (0..<3).filter { ch[$0] < 128 }
+        guard !high.isEmpty, !low.isEmpty else { return }
+        let d = distance((0..<(w * h)).map { out[$0 * 4 + 3] == 0 }, width: w, height: h)
+        let r2 = Double(ring * ring)
+        // The outer ring, and every pixel that is not solid: a soft edge or a glow is never the art's own inside.
+        for i in 0..<(w * h) where out[i * 4 + 3] > 0 && (d[i] <= r2 || out[i * 4 + 3] < 250) {
+            let p = i * 4
+            let spill = (high.map { Int(out[p + $0]) }.min() ?? 0) - (low.map { Int(out[p + $0]) }.max() ?? 0)
+            guard spill > 0 else { continue }
+            for c in high { out[p + c] = UInt8(max(0, Int(out[p + c]) - spill)) }
+        }
+    }
+
     /// Squared Euclidean distance to the nearest `seed` (Felzenszwalb–Huttenlocher), per pixel.
     static func distance(_ seed: [Bool], width w: Int, height h: Int) -> [Double] {
         // finite, so the envelope's arithmetic stays exact: any real distance on a sheet is far below it
@@ -13165,7 +13283,10 @@ public enum FrameKit {
     }
     static func crop(_ px: [UInt8], width w: Int, _ x: Int, _ y: Int, _ cw: Int, _ ch: Int, only: ((Int) -> Bool)? = nil) -> Piece {
         var out = [UInt8](repeating: 0, count: cw * ch * 4)
+        let rows = px.count / max(1, w * 4)
         for yy in 0..<ch { for xx in 0..<cw {
+            // Past the source's edge reads as transparent: a crop laid for another size must not trap.
+            guard x + xx >= 0, x + xx < w, y + yy >= 0, y + yy < rows else { continue }
             let s = ((y + yy) * w + x + xx), d = (yy * cw + xx) * 4
             if let only, !only(s) { continue }
             for c in 0..<4 { out[d + c] = px[s * 4 + c] }
@@ -15065,6 +15186,9 @@ extension GDDAssetPrompts {
     static func jackpotTierName(_ job: AssetJob) -> String {
         let t = (job.title + " " + job.subject).lowercased()
         for n in ["grand", "mega", "major", "minor", "mini", "micro"] where t.contains(n) { return n.uppercased() }
+        // A name of the game's own ("Diamond jackpot", typed): as given, never "free".
+        let title = job.title.trimmingCharacters(in: .whitespaces)
+        if title.lowercased().hasSuffix(" jackpot"), title.count > 8 { return Wording.noFree(String(title.dropLast(8))).uppercased() }
         return "tier \(job.tier ?? 1)"
     }
 
@@ -15438,7 +15562,9 @@ extension GDDAssetPrompts {
     // MARK: Wheels and pop-ups
 
     /// A wedge's colour: its tier's or feature's, never one the backing claims (SlotBackingRules.reserved).
-    static func wedgeColour(_ label: String, backing: String) -> String {
+    static func wedgeColour(_ label: String, backing: String, with others: [String] = []) -> String {
+        // MEGA takes the top tier's red only when it is the top tier; under a GRAND it is the next.
+        if label == "MEGA" && others.contains("GRAND") { return wedgeColour("MAJOR", backing: backing) == "royal purple" ? "deep orange" : "royal purple" }
         let options: [String: [(String, String)]] = [
             "GRAND": [("crimson red", "red")], "MEGA": [("crimson red", "red")],
             "MAJOR": [("royal purple", "purple"), ("deep orange", "orange")],
@@ -15465,10 +15591,10 @@ extension GDDAssetPrompts {
     }
     /// One wedge of a prize wheel, on its grey template (the last image); `matching` when another wedge of the
     /// same wheel is attached first, to match.
-    static func wedgeBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), label: String, matching: Bool) -> String {
+    static func wedgeBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), label: String, matching: Bool, wheel: [String] = []) -> String {
         [
             (matching ? "Image 1 is another wedge of the same wheel: match its material, trim and lettering exactly — only the colour differs. " : "")
-            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a rich \(wedgeColour(label, backing: backing.name)) face in the theme's own material and craft, a fine trim along its two long sides and its curved outer end.",
+            + "Edit the last attached image: it is the plain grey template of one wedge of the prize wheel in a video slot game themed “\(theme.name)”, standing upright, its point at the bottom where the wheel's centre is. Paint it as that wedge: a rich \(wedgeColour(label, backing: backing.name, with: wheel)) face in the theme's own material and craft, a fine trim along its two long sides and its curved outer end.",
             label == "CREDITS"
                 ? "Its face stays plain and unlettered: the game prints the prize amount on it."
                 : wedgeLettering(label),
@@ -15549,11 +15675,12 @@ extension GDDAssetPrompts {
     /// attached first for the game's material.
     static func conceptBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, templated: Bool, refs: Int = 0) -> String {
         let shown = refs == 0 ? "" : refs == 1 ? " Image 2 is the game's own symbol it is drawn from: keep its likeness exactly." : " Images 2 to \(refs + 1) are the game's own symbols it is drawn from: keep their likeness exactly."
-        let letters = p.lettering.isEmpty ? "No text, lettering or numbers." : "Letter “\(p.lettering)” on it in bold, clear display letters, spelled exactly so. No other words, and no numbers or amounts."
+        let letters = p.lettering.isEmpty ? "No text, lettering or numbers." : "Letter “\(p.lettering)” on it in bold, clear display letters, spelled exactly so. No other words or numbers."
         return [
             "Image 1 is the reel frame of a video slot game themed “\(theme.name)”.\(shown) "
             + (templated ? "Edit the last attached image: its plain grey shape is \(p.what.lowercased().hasPrefix("the ") ? "" : "this game's ")\(p.what) Repaint it in the reel frame's own material and craft: \(p.look) It keeps exactly its size and outline; its ornament may spread a little past its edge."
-                         : "Edit the last attached image, a plain canvas: draw on it \(p.what) \(p.look) In the reel frame's own material and craft, seen straight on, centred, filling most of the picture with a small even margin."),
+                         : "Edit the last attached image, a plain canvas: draw on it \(p.what) \(p.look) "
+                           + (refs > 0 ? "Centred, filling most of the picture with a small even margin." : "In the reel frame's own material and craft, seen straight on, centred, filling most of the picture with a small even margin.")),
             letters + " Static art only: no burst, rays or flying sparkles — the game animates those.",
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
             backdropLine(backing),
@@ -15563,7 +15690,7 @@ extension GDDAssetPrompts {
     static func conceptStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), piece p: ConceptPiece, state: String) -> String {
         [
             "Edit the attached image: it is \(p.what) in a video slot game themed “\(theme.name)”. Show the same piece in its “\(state)” state, as the game shows it then — lit, filled, opened or changed only as that state means.",
-            "Everything else stays exactly as it is: its shape, size, position, material and lettering. Static art: no burst, rays or flying pieces. No new text or numbers.",
+            "Everything else stays exactly as it is: its shape, size, position and material, and its lettering — unless “\(state)” is itself new lettering for it (a value such as “x3”), which then replaces the old exactly, in the same lettering. Static art: no burst, rays or flying pieces. No other new text or numbers.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -16000,7 +16127,11 @@ public struct SetManifest: Codable, Equatable {
     public struct Cast: Codable, Equatable { public var name: String, kind: String, look: String, inArt: Bool }
 
     public static let fileName = "navigator-set.json"
+    /// The game's document beside it, as read (or written from a typed sheet).
+    public static let documentName = "navigator-gdd.txt"
     public var format = 1
+    /// A set typed by hand (GameSheet), not read from a GDD; the intro's CONTINUE localized. Nil in older sets.
+    public var typed: Bool?, localize: Bool?
     public var game: String
     public var gdd: String
     public var themeName: String, themeCategory: String, themeLook: String, themeStyle: String

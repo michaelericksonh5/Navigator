@@ -21699,9 +21699,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--draw-frames"), flag + 2 < 
     app.run()
 }
 
-// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>]
+// PAID (~$0.15 a bezel, table or pot, GPT Image 2.5):  Navigator --reel-area <set folder> [--gdd-file <gdd.txt>] [--again | --redo <piece>] [--only "<piece>,<piece>"] [--localize]
 // The reel area for every grid the GDD gives — bezel, dividers, reel texture, reel fade — the jackpot table and
-// pots above the reels when it has them, and a preview per mode. What is there already is kept, unless --again.
+// pots above the reels when it has them, and a preview per mode. What is there already is kept, unless --again,
+// which keeps it in versions/ and draws it all again (or only the --only pieces). Run --checklist first for the cost.
 if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < CommandLine.arguments.count {
     let args = CommandLine.arguments
     let folder = URL(fileURLWithPath: args[flag + 1])
@@ -21710,9 +21711,10 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
         // The reels saved with the set, or read from --gdd-file for a set made before they were.
         let text = args.firstIndex(of: "--gdd-file").flatMap { $0 + 1 < args.count ? try? String(contentsOfFile: args[$0 + 1], encoding: .utf8) : nil }
-        guard let layout = text.map(ReelLayoutRules.read) ?? run.reelLayout else { print("FAILED: this set has no reels saved: add --gdd-file <the GDD's text>"); exit(1) }
-        // Read again from the document, it keeps the pieces planned for it (ConceptPlan).
-        if let text { var l = layout; l.concepts = run.reelLayout?.concepts; run.reelLayout = l; run.gddText = text; run.writeManifest(to: folder) }
+        // The structure saved with the set wins (it may have been corrected by hand); --gdd-file gives the document's
+        // text, and the structure only to a set saved without one.
+        guard let layout = run.reelLayout ?? text.map(ReelLayoutRules.read) else { print("FAILED: this set has no reels saved: add --gdd-file <the GDD's text>"); exit(1) }
+        if let text { run.gddText = text; run.reelLayout = layout; run.writeManifest(to: folder) }
         guard let base = layout.base else { print("FAILED: the document gives no reel size"); exit(1) }
         let area = ReelArea(layout)
         print("REELS: base \(base.rows)x\(base.reels)" + layout.extras.map { " + \($0.what) \($0.place)" }.joined()
@@ -21720,15 +21722,25 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         for n in layout.notes { print("NOTE: \(n)") }
         // --redo "Pot States": one piece drawn again, its files kept in versions/ — the window's Make Again.
         let full = run.reelLayout ?? layout
-        GDDToAssetsRun.conceptNames = (full.concepts ?? []).map(\.name) + ["shared_logo_master", "shared_character_keyArt", "shared_sellScreen", "shared_powerBet", "shared_tutorial"]
-        if let i = args.firstIndex(of: "--redo"), i + 1 < args.count, !GDDToAssetsRun.keepForRedo(args[i + 1], folder: folder) {
-            print("FAILED: no piece \(args[i + 1]): " + GDDToAssetsRun.reelPieces.map(\.name).joined(separator: ", ")); exit(1)
+        let pieces = GDDToAssetsRun.studioPieces(full, jobs: run.jobs, game: run.gameName, gdd: run.gddText)
+        GDDToAssetsRun.conceptNames = (pieces.standard + pieces.planned).map(\.name)
+        // Pieces by Make Again's names, any case: a misspelt one stops the run rather than silently drawing nothing.
+        @MainActor func piece(_ n: String) -> String {
+            guard let p = GDDToAssetsRun.reelPieces.first(where: { $0.name.caseInsensitiveCompare(n) == .orderedSame }) else {
+                print("FAILED: no piece \(n): " + GDDToAssetsRun.reelPieces.map(\.name).joined(separator: ", ")); exit(1)
+            }
+            return p.name
         }
+        // --only "Studio and GDD pieces,Number fonts": draw only those.
+        let only = args.firstIndex(of: "--only").flatMap { $0 + 1 < args.count ? Set(args[$0 + 1].split(separator: ",").map { piece($0.trimmingCharacters(in: .whitespaces)) }) : nil }
+        if let i = args.firstIndex(of: "--redo"), i + 1 < args.count { GDDToAssetsRun.keepForRedo(piece(args[i + 1]), folder: folder) }
+        // --again: every piece (or every --only piece) kept in versions/ first, then drawn again — never overwritten.
+        if args.contains("--again") {
+            for p in GDDToAssetsRun.reelPieces where only?.contains(p.name) ?? true { GDDToAssetsRun.keepForRedo(p.name, folder: folder) }
+        }
+        if args.contains("--localize") { run.localizeIntro = true }
         DispatchQueue.global(qos: .userInitiated).async {
-            // --only "Studio and GDD pieces,Number font": draw only those (Make Again's pieces).
-            if args.contains("--localize") { DispatchQueue.main.sync { run.localizeIntro = true } }
-            let only = args.firstIndex(of: "--only").flatMap { $0 + 1 < args.count ? Set(args[$0 + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }) : nil }
-            let r = run.generateReelArea(full, folder: folder, again: args.contains("--again"), only: only)
+            let r = run.generateReelArea(full, folder: folder, only: only)
             print(String(format: "DONE: %@\nSPENT: $%.4f", r.problems.isEmpty ? "reel area made" : r.problems.joined(separator: "; "), r.cost))
             exit(0)
         }
@@ -21778,7 +21790,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--find-concepts"), flag + 1 
 // The grey templates GPT Image paints the wheel and pop-ups on, on chroma magenta, to look at before paying.
 if let flag = CommandLine.arguments.firstIndex(of: "--interface-templates"), flag + 1 < CommandLine.arguments.count {
     let out = URL(fileURLWithPath: CommandLine.arguments[flag + 1]), b = RGB8(255, 0, 255), space = CGColorSpace(name: CGColorSpace.sRGB)!
-    let n = flag + 2 < CommandLine.arguments.count ? Int(CommandLine.arguments[flag + 2]) ?? 12 : 12
+    let n = max(3, flag + 2 < CommandLine.arguments.count ? Int(CommandLine.arguments[flag + 2]) ?? 12 : 12)
     try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
     func save(_ px: [UInt8], _ w: Int, _ h: Int, _ name: String) {
         try? ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG)?.write(to: out.appendingPathComponent("\(name).png"))
@@ -24795,9 +24807,11 @@ final class GDDToAssetsRun: ObservableObject {
             symbols = jobs.filter { $0.kind == .symbol }.enumerated().map { SlotSymbol(code: $0.element.id, index: $0.offset, role: $0.element.role, tier: $0.element.tier, note: $0.element.title) }
         }
         guard !symbols.isEmpty else { return }
+        // A GDD's reading corrected where the sheet says, the rest it read kept (power bet, meters, wheel names…).
         let concepts = reelLayout?.concepts
-        reelLayout = sheet.layout(symbols)
+        reelLayout = !typed ? reelLayout.map { sheet.apply(to: $0, symbols) } ?? sheet.layout(symbols) : sheet.layout(symbols)
         reelLayout?.concepts = concepts
+        defer { if let f = lastFolder { writeManifest(to: f) } }
         guard typed else { return }
         symbols = Self.namingJackpots(symbols, sheet: sheet)
         gddText = sheet.document(game: gameName, symbols: symbols)
@@ -25979,10 +25993,20 @@ final class GDDToAssetsRun: ObservableObject {
     /// base's, every mode's texture the base texture, and the pot states their pot.
     /// The planned pieces' names, for Make Again (set as a set is made or reopened).
     nonisolated(unsafe) static var conceptNames: [String] = []
+    /// A file of a studio or planned piece: its picture, cut-out or a state — by its exact name.
+    nonisolated static func isConcept(_ n: String) -> Bool {
+        conceptNames.contains { n == $0 + ".png" || n == $0 + "_rmbg.png" || n.hasPrefix($0 + "-") }
+    }
+    /// The studio's standard pieces and the ones Gemini planned, as the generator draws them, one rule for all callers.
+    nonisolated static func studioPieces(_ layout: ReelLayout, jobs: [AssetJob], game: String, gdd: String) -> (standard: [ConceptPiece], planned: [ConceptPiece]) {
+        let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
+        let standard = StandardPieces.pieces(game: game, gdd: gdd, layout: layout, hero: hero, bonusGames: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout))
+        return (standard, StandardPieces.without(layout.concepts ?? [], standard))
+    }
     static let reelPieces: [(name: String, files: (String) -> Bool)] = [
         ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
-        ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") }),
+        ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") || $0.hasPrefix("shared_meter_") }),
         ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
@@ -25991,10 +26015,11 @@ final class GDDToAssetsRun: ObservableObject {
         ("Landscape backgrounds", { $0.contains("-landscape") }),
         ("Localized CONTINUE", { $0.hasPrefix("shared_intro_continue-asset-txt") }),
         ("Lobby and loading", { n in Composites.all.contains { n.hasPrefix($0.name + ".png") } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
-        ("Studio and GDD pieces", { n in n.hasPrefix("shared_concepts") || (GDDToAssetsRun.conceptNames.contains { n.hasPrefix($0 + ".") || n.hasPrefix($0 + "_rmbg") || n.hasPrefix($0 + "-") }) }),
+        // The lobby and loading pictures and the sell screen's avatar are made from the logo and key art: redone with them.
+        ("Studio and GDD pieces", { n in n.hasPrefix("shared_concepts") || isConcept(n) || Composites.all.contains { n == $0.name + ".png" } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
-        ("Pop-ups", { $0.contains("_popUp_") || $0.hasPrefix("shared_popUps") || $0.hasPrefix("transition_outro_") || $0.hasPrefix("shared_celebration_message")
-            || $0.hasPrefix("base_banner_event-") || $0.hasPrefix("wheelSpin_banner") }),
+        ("Pop-ups", { n in !isConcept(n) && (n.contains("_popUp_") || n.hasPrefix("shared_popUps") || n.hasPrefix("transition_outro_") || n.hasPrefix("shared_celebration_")
+            || n.hasPrefix("base_banner_event-") || n.hasPrefix("wheelSpin_banner")) }),
     ]
 
     /// A reel piece's files moved into versions/ so the next reel-area run draws it again. False: no such piece.
@@ -26016,16 +26041,16 @@ final class GDDToAssetsRun: ObservableObject {
     }
     /// Every static asset this game needs (AssetChecklist), with what is made already.
     func checklist() -> [(item: AssetChecklist.Item, made: Bool)] {
-        let hasBonus = jobs.contains { $0.role == .bonus } || (reelLayout?.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") } ?? false)
-        let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
-        let standard = reelLayout.map { StandardPieces.pieces(game: gameName, gdd: gddText, layout: $0, hero: hero) }
+        let hasBonus = AssetChecklist.hasBonusGames(jobs: jobs, layout: reelLayout)
+        let standard = reelLayout.map { Self.studioPieces($0, jobs: jobs, game: gameName, gdd: gddText).standard }
         var items = AssetChecklist.items(jobs: jobs, layout: reelLayout, jackpots: jackpotNames, hasBonus: hasBonus, standard: standard)
         if reelLayout != nil {
             for (n, _, what) in Self.numberFonts(reelLayout?.concepts ?? []).dropFirst() {
                 items.append(AssetChecklist.Item(group: "Fonts", name: n, what: "number font for the " + what.replacingOccurrences(of: "game's ", with: ""), files: ["\(n).png"], maker: "Number font", cost: AssetChecklist.gpt(NumberFont.size.w, NumberFont.size.h)))
             }
             for j in Derived.winSymbols(jobs) {
-                items.append(AssetChecklist.Item(group: "Symbol states", name: Derived.winName(j.id), what: "\(j.id) lit, as it lands or wins", files: ["\(Derived.winName(j.id)).png"], maker: "Symbol states", cost: AssetChecklist.gpt(2048, 2048)))
+                let side = ["1K": 1024, "4K": 4096][j.size] ?? 2048
+                items.append(AssetChecklist.Item(group: "Symbol states", name: Derived.winName(j.id), what: "\(j.id) lit, as it lands or wins", files: ["\(Derived.winName(j.id)).png"], maker: "Symbol states", cost: AssetChecklist.gpt(side, side)))
             }
             for j in jobs where j.kind == .background {
                 items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
@@ -26047,11 +26072,14 @@ final class GDDToAssetsRun: ObservableObject {
         let prompt = ConceptPlan.prompt(gdd: gddText, game: gameName, covered: covered)
         busy = true
         status = "Gemini is reading the GDD for anything else the game needs…"
+        let rev = revision
         DispatchQueue.global(qos: .userInitiated).async {
             let r = H5GService.describe(prompt: prompt, systemPrompt: nil, imagePNG: nil, model: ConceptPlan.model, schema: ConceptPlan.schema)
             DispatchQueue.main.async {
                 self.busy = false
                 self.spent += r.cost ?? 0
+                // Another game picked while Gemini read: its pieces are not this one's.
+                guard rev == self.revision else { completion?("another game was opened"); return }
                 guard let text = r.text else { self.status = "Couldn’t plan the other pieces: \(r.error ?? "no reply")"; completion?(r.error); return }
                 let found = ConceptPlan.parse(text, covered: Set(covered))
                 self.reelLayout?.concepts = (self.reelLayout?.concepts ?? []).filter(\.standard) + found
@@ -26075,12 +26103,23 @@ final class GDDToAssetsRun: ObservableObject {
     /// `redo` names a piece (reelPieces) to make again: its files are kept in versions/ first, never deleted.
     func makeReelArea(redo: String? = nil) {
         guard let folder = lastFolder, let layout = reelLayout else { return }
-        Self.conceptNames = (layout.concepts ?? []).map(\.name)
+        let pieces = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
+        Self.conceptNames = (pieces.standard + pieces.planned).map(\.name)
+        // The cost said before anything is paid for: what isn't made yet, or the piece made again.
+        let list = checklist().filter { $0.item.supported && !["Symbols", "Backgrounds"].contains($0.item.maker) }
+        let todo = redo.flatMap { r in Self.reelPieces.first { $0.name == r } }
+            .map { p in list.filter { $0.item.files.contains(where: p.files) } } ?? list.filter { !$0.made }
+        let alert = NSAlert()
+        alert.messageText = redo.map { "Make the \($0) again?" } ?? "Make the game interface?"
+        alert.informativeText = String(format: "%d piece%@ — about $%.2f (GPT Image 2.5).%@", todo.count, todo.count == 1 ? "" : "s", todo.reduce(0) { $0 + $1.item.cost },
+                                       redo == nil ? "" : " The current files are kept in the set's versions folder.")
+        alert.addButton(withTitle: redo == nil ? "Make" : "Make Again"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
         if let redo { Self.keepForRedo(redo, folder: folder) }
         keying = true
         status = "Making the game interface — reel area, \(layout.wheels.map { "\($0.count) wheel\($0.count == 1 ? "" : "s"), " } ?? "")pop-ups — for the \(layout.base.map { "\($0.rows)×\($0.reels)" } ?? "") grid…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = self.generateReelArea(layout, folder: folder)
+            let r = self.generateReelArea(layout, folder: folder, only: redo.map { [$0] })
             DispatchQueue.main.async {
                 self.keying = false
                 self.status = (r.problems.isEmpty ? "Game interface made" : "Game interface made — " + r.problems.joined(separator: "; "))
@@ -26100,14 +26139,16 @@ final class GDDToAssetsRun: ObservableObject {
     /// - Pots: one per bonus symbol they are tied to, drawn from it.
     /// What is already there is kept unless `again`. Blocks: call off the main thread.
     /// `only`: Make Again's pieces (reelPieces names) to draw; nothing else is drawn, though free steps still run.
-    func generateReelArea(_ layout: ReelLayout, folder: URL, again: Bool = false, only: Set<String>? = nil) -> (cost: Double, problems: [String]) {
+    func generateReelArea(_ layout: ReelLayout, folder: URL, only: Set<String>? = nil) -> (cost: Double, problems: [String]) {
         let (theme0, design, backing, jobs) = DispatchQueue.main.sync { (self.theme, self.styledDesign, self.backing, self.jobs) }
         guard let theme = theme0, let baseGrid = layout.base else { return (0, ["no theme or no grid"]) }
         let b = backing.rgb, space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
         let log = DispatchQueue.main.sync { self.session() }
         var cost = 0.0, problems: [String] = []
         func url(_ n: String) -> URL { folder.appendingPathComponent(n) }
-        func has(_ n: String) -> Bool { !again && fm.fileExists(atPath: url(n).path) }
+        func has(_ n: String) -> Bool { fm.fileExists(atPath: url(n).path) }
+        /// A file of a piece asked for (`only`), or any file when nothing was named.
+        func wanted(_ file: String) -> Bool { only.map { o in Self.reelPieces.contains { o.contains($0.name) && $0.files(file) } } ?? true }
         func png(_ px: [UInt8], _ w: Int, _ h: Int) -> Data? { ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space).flatMap(encodePNG) }
         func write(_ px: [UInt8], _ w: Int, _ h: Int, _ n: String) { try? png(px, w, h)?.write(to: url(n)) }
         func pixels(_ d: Data, _ w: Int, _ h: Int) -> [UInt8]? {
@@ -26120,7 +26161,7 @@ final class GDDToAssetsRun: ObservableObject {
         }
         /// A piece drawn on a template and checked against its openings: up to two attempts, the best kept.
         func paint(_ what: String, prompt: String, inputs: [Data], w: Int, h: Int, covered: (([UInt8]) -> Double)?) -> [UInt8]? {
-            if let only, !Self.reelPieces.contains(where: { only.contains($0.name) && $0.files(what + ".png") }) { return nil }
+            guard wanted(what + ".png") else { return nil }
             log.write("prompts/\(what).txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h)\n\n\(prompt)")
             var best: (px: [UInt8], c: Double)?
             // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up.
@@ -26148,15 +26189,15 @@ final class GDDToAssetsRun: ObservableObject {
         // 1. The base bezel and texture.
         let base = ReelArea(layout)
         if !has("base_interface_bezel.png"), let tpl = png(base.template(backing: b), base.width, base.height) {
-            let prompt = GDDAssetPrompts.bezelBrief(theme: theme, design: design, backing: (backing.name, b), hotReel: layout.extras.contains { $0.what == "hot reel" })
+            let prompt = GDDAssetPrompts.bezelBrief(theme: theme, design: design, backing: (backing.name, b), hotReel: layout.hotReelAbove != nil)
             if let px = paint("base_interface_bezel", prompt: prompt, inputs: [tpl], w: base.width, h: base.height, covered: { base.covered($0, backing: b) }) {
-                let (bezel, div) = base.layers(FrameKit.keyed(px, backing: b))
+                let (bezel, div) = base.layers(FrameKit.keyed(px, backing: b, width: base.width, height: base.height))
                 write(px, base.width, base.height, "base_interface_bezel.png")
                 write(bezel, base.width, base.height, "base_interface_bezel_rmbg.png")
                 write(div, base.width, base.height, "base_interface_dividers_rmbg.png")
             }
         }
-        if !has("base_interface_reelTexture.png") {
+        if !has("base_interface_reelTexture.png") && wanted("base_interface_reelTexture.png") {
             let g = base.grid, k = 2048.0 / Double(max(g.w, g.h))
             let tw = Int((Double(g.w) * k / 16).rounded()) * 16, th = Int((Double(g.h) * k / 16).rounded()) * 16
             let prompt = GDDAssetPrompts.reelTextureBrief(theme: theme, design: design)
@@ -26180,7 +26221,8 @@ final class GDDToAssetsRun: ObservableObject {
         }
         for (name, grid) in modes {
             let area = ReelArea(layout, grid: grid)
-            let sameAsBase = name != "base" && grid.rows == baseGrid.rows && grid.reels == baseGrid.reels && grid.independent == baseGrid.independent
+            // The same openings in the same canvas (a hot reel above the base makes it another).
+            let sameAsBase = name != "base" && area.width == base.width && area.height == base.height && area.windows == base.windows
             if name != "base", fm.fileExists(atPath: url("\(name)_interface_bezel_rmbg.png").path), !laidFor(area, "\(name)_interface_bezel_rmbg.png") {
                 let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
                 let kept = folder.appendingPathComponent("versions/reel-\(f.string(from: Date()))")
@@ -26191,14 +26233,15 @@ final class GDDToAssetsRun: ObservableObject {
             if name != "base" && !has("\(name)_interface_bezel_rmbg.png") {
                 if sameAsBase {
                     for part in ["bezel", "bezel_rmbg", "dividers_rmbg"] { try? fm.removeItem(at: url("\(name)_interface_\(part).png")); try? fm.copyItem(at: url("base_interface_\(part).png"), to: url("\(name)_interface_\(part).png")) }
-                } else if let bz = load("base_interface_bezel_rmbg.png"), let dv = load("base_interface_dividers_rmbg.png"), bz.w == base.width, dv.w == base.width {
+                } else if let bz = load("base_interface_bezel_rmbg.png"), let dv = load("base_interface_dividers_rmbg.png"),
+                          bz.w == base.width, bz.h == base.height, dv.w == base.width, dv.h == base.height {
                     // A new grid: the base bezel re-laid round it in code (ReelArea.relay) — exact, the same material, free.
                     let (bezel, div) = ReelArea.relay(bezel: bz.px, dividers: dv.px, from: base, to: area)
                     write(FrameKit.onBacking(bezel, b), area.width, area.height, "\(name)_interface_bezel.png")
                     write(bezel, area.width, area.height, "\(name)_interface_bezel_rmbg.png")
                     write(div, area.width, area.height, "\(name)_interface_dividers_rmbg.png")
                     navLog("gdd reel: \(name) \(grid.rows)x\(grid.reels) bezel re-laid from the base game's $0")
-                } else { problems.append("\(name): the base bezel is missing to re-lay") }
+                } else { problems.append("\(name): the base bezel is missing, or drawn for another grid, to re-lay: Make Again ▸ Bezel") }
             }
             if let t = texture {
                 var tex = t.px
@@ -26217,7 +26260,7 @@ final class GDDToAssetsRun: ObservableObject {
                let px = paint("shared_interface_jackpotTable", prompt: GDDAssetPrompts.jackpotTableBrief(theme: theme, design: design, backing: (backing.name, b), names: names),
                               inputs: [downsamplePNG(ref, longEdge: 2048) ?? ref, tpl], w: table.width, h: table.height, covered: nil) {
                 write(px, table.width, table.height, "shared_interface_jackpotTable.png")
-                write(FrameKit.keyed(px, backing: b), table.width, table.height, "shared_interface_jackpotTable_rmbg.png")
+                write(FrameKit.keyed(px, backing: b, width: table.width, height: table.height), table.width, table.height, "shared_interface_jackpotTable_rmbg.png")
             }
         }
         // The jackpot meters as the studio ships them, a plaque per tier (shared_meter_<tier>), cut from the table. Free.
@@ -26237,7 +26280,7 @@ final class GDDToAssetsRun: ObservableObject {
         // bonus symbol it is tied to, in order; one with no symbol of its own matches the pots before it.
         let bonus = jobs.filter { $0.kind == .symbol && $0.role == .bonus }.sorted { $0.id < $1.id }
         if let pots = layout.extras.first(where: { $0.what == "pots" }) {
-            let total = pots.count ?? bonus.count
+            let total = pots.count ?? max(1, bonus.count)
             if total == 0 { problems.append("the GDD has pots above the reels but says neither how many nor ties them to bonus symbols") }
             let potH = PotStates.height(1024)
             func jar(_ i: Int, _ k: Int) -> String { PotStates.name(pot: i, of: total, state: k) }
@@ -26262,7 +26305,7 @@ final class GDDToAssetsRun: ObservableObject {
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
                 // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
                 if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil) {
-                    let tall = PotStates.padded(FrameKit.keyed(px, backing: b), size: 1024)
+                    let tall = PotStates.padded(FrameKit.keyed(px, backing: b, width: 1024, height: 1024), size: 1024)
                     write(FrameKit.onBacking(tall, b), 1024, potH, "\(jar(i, 0)).png")
                     write(tall, 1024, potH, "\(jar(i, 0))_rmbg.png")
                 }
@@ -26281,7 +26324,7 @@ final class GDDToAssetsRun: ObservableObject {
                     let prompt = GDDAssetPrompts.potStateBrief(theme: theme, backing: (backing.name, b), level: k)
                     if let px = paint(jar(i, k), prompt: prompt, inputs: [empty], w: 1024, h: potH, covered: nil) {
                         write(px, 1024, potH, "\(jar(i, k)).png")
-                        write(FrameKit.keyed(px, backing: b), 1024, potH, "\(jar(i, k))_rmbg.png")
+                        write(FrameKit.keyed(px, backing: b, width: 1024, height: potH), 1024, potH, "\(jar(i, k))_rmbg.png")
                     }
                 }
                 // Each state laid on State0, so a swap in game does not jump (PotStates): free, and a state
@@ -26309,7 +26352,7 @@ final class GDDToAssetsRun: ObservableObject {
                     if let px = paint(PotStates.plaqueName(pot: i), prompt: GDDAssetPrompts.potPlaqueBrief(theme: theme, design: design, backing: (backing.name, b), word: word),
                                       inputs: [downsamplePNG(pot, longEdge: 1024) ?? pot, tpl], w: plaque.w, h: plaque.h, covered: nil) {
                         write(px, plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i)).png")
-                        write(FrameKit.keyed(px, backing: b), plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i))_rmbg.png")
+                        write(FrameKit.keyed(px, backing: b, width: plaque.w, height: plaque.h), plaque.w, plaque.h, "\(PotStates.plaqueName(pot: i))_rmbg.png")
                     }
                 }
             }
@@ -26321,7 +26364,7 @@ final class GDDToAssetsRun: ObservableObject {
             png([UInt8]((0..<(w * h)).flatMap { _ in [b.r, b.g, b.b, 255] }), w, h)
         }
         func both(_ px: [UInt8], _ w: Int, _ h: Int, _ n: String) {
-            write(px, w, h, "\(n).png"); write(FrameKit.keyed(px, backing: b), w, h, "\(n)_rmbg.png")
+            write(px, w, h, "\(n).png"); write(FrameKit.keyed(px, backing: b, width: w, height: h), w, h, "\(n)_rmbg.png")
         }
         // 5. The wheels, built as the studio's wheelSpin mode is: a rim, a hub and a pointer shared by the game's
         // wheels, and one upright wedge per prize that the engine turns round the hub (WheelArt).
@@ -26355,9 +26398,9 @@ final class GDDToAssetsRun: ObservableObject {
             for label in order.reduce(into: [String](), { if !$0.contains($1) { $0.append($1) } }) {
                 let n = "\(prefix)_interface_wedge-\(PopUps.key(label))"
                 if !has("\(n).png"), let tpl = png(art.wedgeTemplate(backing: b), ww, wh),
-                   let px = paint(n, prompt: GDDAssetPrompts.wedgeBrief(theme: theme, design: design, backing: (backing.name, b), label: label, matching: firstWedge != nil),
+                   let px = paint(n, prompt: GDDAssetPrompts.wedgeBrief(theme: theme, design: design, backing: (backing.name, b), label: label, matching: firstWedge != nil, wheel: order),
                                   inputs: (firstWedge.map { [$0] } ?? []) + [tpl], w: ww, h: wh, covered: nil) {
-                    let cut = art.cut(FrameKit.keyed(px, backing: b))
+                    let cut = art.cut(FrameKit.keyed(px, backing: b, width: ww, height: wh))
                     write(FrameKit.onBacking(cut, b), ww, wh, "\(n).png"); write(cut, ww, wh, "\(n)_rmbg.png")
                 }
                 if firstWedge == nil { firstWedge = try? Data(contentsOf: url("\(n).png")) }
@@ -26372,8 +26415,9 @@ final class GDDToAssetsRun: ObservableObject {
                 try? fm.moveItem(at: url(old + sfx), to: url(new + sfx))
             }
         }
-        let hasBonus = !bonus.isEmpty || layout.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") }
-        let plan = PopUps.plan(layout, jackpots: names, bonus: hasBonus)
+        let plan = PopUps.plan(layout, jackpots: names, bonus: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout))
+        // Panels, buttons and the studio's pieces are drawn in the bezel's material: without it, said, not skipped.
+        if bezelRef == nil && wanted("shared_celebration_backing-2.png") { problems.append("the pop-up panels and studio pieces need the base bezel: Make Again ▸ Bezel") }
         var firstTitle = plan.first { $0.kind == .title && fm.fileExists(atPath: url("\($0.name).png").path) }.flatMap { try? Data(contentsOf: url("\($0.name).png")) }
         for piece in plan where !has("\(piece.name).png") {
             if piece.kind == .title {
@@ -26393,9 +26437,7 @@ final class GDDToAssetsRun: ObservableObject {
         // 7. The pieces Gemini planned from the GDD (ConceptPiece): each on its shape's grey template, or a plain
         // canvas, in the reel frame's material; each state an edit of the first.
         let (gameName, gddText) = DispatchQueue.main.sync { (self.gameName, self.gddText) }
-        let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
-        let standard = StandardPieces.pieces(game: gameName, gdd: gddText, layout: layout, hero: hero)
-        let planned = StandardPieces.without(layout.concepts ?? [], standard)
+        let (standard, planned) = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
         Self.conceptNames = (standard + planned).map(\.name)
         for piece in standard + planned {
             if !has("\(piece.name).png"), let ref = bezelRef, let canvas = blank(piece.width, piece.height) {
@@ -26422,7 +26464,12 @@ final class GDDToAssetsRun: ObservableObject {
                 if let strip = numberFontStrip(sheet.px, folder: folder, name: fontName) { problems += strip }
                 continue
             }
-            guard let ref = try? Data(contentsOf: url(refName)), let canvas = blank(NumberFont.size.w, NumberFont.size.h),
+            guard wanted("\(fontName).png") else { continue }
+            // The total win's lettering is its TOTAL WIN title's; a game with no bonus games has none: the CONTINUE button's.
+            guard let ref = [refName, "base_popUp_bonusBtn.png"].lazy.compactMap({ try? Data(contentsOf: url($0)) }).first else {
+                problems.append("\(fontName): \(refName.dropLast(4)) is not drawn to letter it from"); continue
+            }
+            guard let canvas = blank(NumberFont.size.w, NumberFont.size.h),
                   let px = paint("\(fontName)_sheet", prompt: GDDAssetPrompts.fontBrief(theme: theme, backing: (backing.name, b), reference: refWhat),
                                  inputs: [downsamplePNG(ref, longEdge: 1024) ?? ref, canvas], w: NumberFont.size.w, h: NumberFont.size.h, covered: nil) else { continue }
             both(px, NumberFont.size.w, NumberFont.size.h, "\(fontName)_sheet")
@@ -26435,13 +26482,14 @@ final class GDDToAssetsRun: ObservableObject {
             if !has("\(n).png"), let sym = try? Data(contentsOf: url("\(j.id).png")), let cg = loadCGImage(data: sym),
                let px = paint(n, prompt: GDDAssetPrompts.winStateBrief(theme: theme, backing: (backing.name, b)),
                               inputs: [downsamplePNG(sym, longEdge: 2048) ?? sym], w: cg.width, h: cg.height, covered: nil) {
-                write(px, cg.width, cg.height, "\(n).png"); write(FrameKit.keyed(px, backing: b), cg.width, cg.height, "\(n)_rmbg.png")
+                write(px, cg.width, cg.height, "\(n).png"); write(FrameKit.keyed(px, backing: b, width: cg.width, height: cg.height), cg.width, cg.height, "\(n)_rmbg.png")
             }
             guard var w = load("\(n)_rmbg.png") else { continue }
             guard let base = load("\(j.id)_rmbg.png"), base.w == w.w, base.h == w.h else { continue }
             let before = w.px
             _ = CutoutEdgeRules.clean(&w.px, width: w.w, height: w.h, backing: b)
             Derived.clearVeil(&w.px)
+            FrameKit.despill(&w.px, width: w.w, height: w.h, backing: b)
             let laid = Derived.trimmedToSymbol(Derived.registeredWin(w.px, to: base.px, width: w.w, height: w.h), symbol: base.px, width: w.w, height: w.h)
             // Judged once laid on its symbol: still filling the corners of a shape that has none, it is on a backdrop.
             if Derived.onBackdrop(laid, width: w.w, height: w.h, symbol: base.px) { problems.append("\(n) was drawn on a backdrop: Make Again ▸ Symbol win states"); continue }
@@ -26457,7 +26505,11 @@ final class GDDToAssetsRun: ObservableObject {
                               inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(Derived.landscapeName(j.id)).png") }
         }
         // 12. The intro button's word in each language, when asked (Localized): lettered as the CONTINUE button.
-        if DispatchQueue.main.sync(execute: { self.localizeIntro }), let btn = try? Data(contentsOf: url("base_popUp_bonusBtn.png")) {
+        let localize = DispatchQueue.main.sync(execute: { self.localizeIntro })
+        if localize && wanted("\(Localized.name("fr")).png") && !fm.fileExists(atPath: url("base_popUp_bonusBtn.png").path) {
+            problems.append("the localized CONTINUE needs the CONTINUE button: Make Again ▸ Pop-ups")
+        }
+        if localize, let btn = try? Data(contentsOf: url("base_popUp_bonusBtn.png")) {
             for (lang, word) in Localized.continueWord where !has("\(Localized.name(lang)).png") {
                 guard let canvas = blank(1024, 352) else { continue }
                 if let px = paint(Localized.name(lang), prompt: GDDAssetPrompts.localizedBrief(theme: theme, backing: (backing.name, b), word: word, lang: lang),
@@ -26549,7 +26601,7 @@ final class GDDToAssetsRun: ObservableObject {
         for c in concepts where c.name.lowercased().contains("counter") || c.name.lowercased().contains("meter") {
             let tail: String = c.name.split(separator: "_").last.map(String.init) ?? c.name
             let what: String = c.what.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
-            out.append(("shared_font_" + tail, c.name + ".png", "game's " + what))
+            out.append(c.lettering.isEmpty ? ("shared_font_" + tail, "transition_outro_totalWin.png", "TOTAL WIN title") : ("shared_font_" + tail, c.name + ".png", "game's " + what))
         }
         return out
     }
@@ -26615,7 +26667,7 @@ final class GDDToAssetsRun: ObservableObject {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
         try? ChromaKeyOutputRules.image(straightRGBA8: strip, width: stripW, height: height, space: space).flatMap(encodePNG)?
             .write(to: folder.appendingPathComponent("\(name).png"))
-        let meta: [String: Any] = ["glyphs": NumberFont.glyphs, "cellWidth": cellW, "height": height]
+        let meta: [String: Any] = ["glyphs": NumberFont.glyphs, "cellWidth": cellW, "height": height, "problems": problems]
         try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]).write(to: folder.appendingPathComponent("\(name).json"))
         return problems
     }
@@ -27250,9 +27302,13 @@ extension GDDToAssetsRun {
     /// navigator-set.json in `folder`: what the set needs to be reopened, revised and handed on.
     func writeManifest(to folder: URL) {
         guard let theme else { return }
-        let m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
+        var m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
                             backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
+        m.typed = typed; m.localize = localizeIntro
         if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
+        // The document itself (read, or written from a typed sheet): the studio pieces, Find What Else It Needs and
+        // a corrected structure all read it again after the set is reopened.
+        if !gddText.isEmpty { try? gddText.write(to: folder.appendingPathComponent(SetManifest.documentName), atomically: true, encoding: .utf8) }
     }
 
     /// A set folder rebuilt into a run from its manifest, with its review, so it can be revised
@@ -27278,6 +27334,8 @@ extension GDDToAssetsRun {
         run.backing = (name: m.backingName, rgb: m.backingRGB)
         run.modelFlag = m.model
         run.reelLayout = m.reels
+        run.typed = m.typed ?? false; run.localizeIntro = m.localize ?? false
+        run.gddText = (try? String(contentsOf: folder.appendingPathComponent(SetManifest.documentName), encoding: .utf8)) ?? ""
         run.lastFolder = folder
         run.loadReview(folder)
         ThemeHubClient.themes { list, _ in
@@ -27318,7 +27376,8 @@ extension GDDToAssetsRun {
     /// What one revision costs: one image at the symbol's size — and a layered frame's, one more
     /// for each of its symbols whose gems are set into it again.
     func revisionEstimate(_ id: String) -> Double {
-        let one = nbEstimatedCost(size: jobs.first { $0.id == id }?.size ?? "2K", modelFlag: modelFlag)
+        let gptFrame = FrameRules.parse(id) != nil && id != FrameStack.panelID && frameArtist == .gpt && OpenAIImages.available
+        let one = gptFrame ? OpenAIImages.estimate : nbEstimatedCost(size: jobs.first { $0.id == id }?.size ?? "2K", modelFlag: modelFlag)
         guard framing == .layered, FrameRules.parse(id) != nil, let folder = lastFolder else { return one }
         let gemmed = Set(gemOwners())
         return one * Double(1 + frameMembers(id, folder: folder).filter(gemmed.contains).count)
@@ -29210,7 +29269,7 @@ struct GDDToAssetsSheet: View {
                             }
                         }
                         .font(.callout)
-                        .onChange(of: correctingStructure) { if correctingStructure { sheet = run.reelLayout.map { GameSheet(layout: $0) } ?? GameSheet() } }
+                        .onChange(of: correctingStructure) { if correctingStructure { sheet = run.reelLayout.map { GameSheet(layout: $0, bonusSymbols: run.symbols.filter { $0.role == .bonus }.count) } ?? GameSheet() } }
                     }
                 }
             }
@@ -29700,7 +29759,7 @@ struct GDDToAssetsSheet: View {
         // A typed set's document is written from its sheet, not a GDD to read again.
         guard !run.gddText.isEmpty, !run.typed else { return }
         let keep = Dictionary(uniqueKeysWithValues: run.jobs.map { ($0.id, $0) })
-        let design = run.design, fixed = run.fixedProblems
+        let design = run.design, fixed = run.fixedProblems, layout = run.reelLayout
         run.load(gddText: run.gddText, gameName: run.gameName, size: size,
                  symbolAspect: symbolAspect, backgroundAspect: backgroundAspect,
                  backgroundSize: backgroundSize)
@@ -29713,7 +29772,7 @@ struct GDDToAssetsSheet: View {
             }
             return j
         }
-        run.design = design; run.fixedProblems = fixed
+        run.design = design; run.fixedProblems = fixed; run.reelLayout = layout
     }
 
     // Navigator's own picker, not NSOpenPanel. See NavigatorFolderPicker.

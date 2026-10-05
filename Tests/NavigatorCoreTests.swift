@@ -13381,9 +13381,10 @@ final class StandardPiecesTests: XCTestCase {
         XCTAssertEqual(Set(Derived.winSymbols(jobs).map(\.id)), ["WD", "SC", "BO", "JP1", "JP2", "JP3", "JP4", "MU1"])
         XCTAssertEqual(Localized.continueWord.first?.word, "CONTINUE"); XCTAssertEqual(Localized.name("de"), "shared_intro_continue-asset-txt-de")
         XCTAssertFalse(Localized.continueWord.contains { $0.word.lowercased().contains("free") })
-        // A value variant planned by Gemini keeps its symbol's code for a name, and its refs.
-        let v = ConceptPlan.parse(#"{"pieces": [{"name": "MU1", "what": "The multiplier symbol's values.", "look": "", "shape": "free", "width": 1024, "height": 1024, "lettering": "x2", "states": ["x3", "x5"], "source": "", "refs": ["MU1"]}]}"#, covered: [])
-        XCTAssertEqual(v.first?.name, "MU1"); XCTAssertEqual(v.first?.refs, ["MU1"]); XCTAssertEqual(v.first?.stateName("x3"), "MU1-x3")
+        // A value variant planned by Gemini is named after its symbol, never as it (MU1.png is the symbol), and keeps its refs.
+        let v = ConceptPlan.parse(#"{"pieces": [{"name": "MU1_values", "what": "The multiplier symbol's values.", "look": "", "shape": "free", "width": 1024, "height": 1024, "lettering": "x2", "states": ["x3", "x5"], "source": "", "refs": ["MU1"]}]}"#, covered: [])
+        XCTAssertEqual(v.first?.name, "MU1_values"); XCTAssertEqual(v.first?.refs, ["MU1"]); XCTAssertEqual(v.first?.stateName("x3"), "MU1_values-x3")
+        XCTAssertEqual(ConceptPlan.parse(#"{"pieces": [{"name": "MU1", "what": "x", "look": "", "shape": "free", "width": 1024, "height": 1024, "lettering": "", "states": [], "source": ""}]}"#, covered: []).first?.name, "base_interface_MU1")
     }
     // A win state drawn larger and off-centre is laid on its symbol's own box; one on a backdrop is caught.
     func testAWinStateIsLaidOnItsSymbol() {
@@ -13405,6 +13406,16 @@ final class StandardPiecesTests: XCTestCase {
         for y in 35..<165 { for x in 35..<165 { square[(y * n + x) * 4 + 3] = 255 } }
         XCTAssertTrue(Derived.onBackdrop(square, width: n, height: n, symbol: symbol))
         XCTAssertFalse(Derived.onBackdrop(laid, width: n, height: n, symbol: symbol))
+    }
+    // A cut-out's outer ring loses the backing's spill (a pink rim on gold); its inside keeps its own colours.
+    func testDespillTouchesOnlyTheOuterRing() {
+        let n = 40
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 10..<30 { for x in 10..<30 { let i = (y * n + x) * 4; px[i] = 220; px[i + 1] = 150; px[i + 2] = 200; px[i + 3] = 255 } }
+        FrameKit.despill(&px, width: n, height: n, backing: RGB8(255, 0, 255), ring: 2)
+        let edge = (10 * n + 20) * 4, inside = (20 * n + 20) * 4
+        XCTAssertLessThanOrEqual(Int(px[edge + 2]), Int(px[edge + 1]))          // blue brought down to green on the edge
+        XCTAssertEqual(px[inside + 2], 200)                                         // the inside left as it was
     }
     // The number font is drawn as a grid within GPT's limits, a glyph a cell.
     func testTheNumberFontGrid() {
@@ -13619,5 +13630,32 @@ final class ReelAreaTests: XCTestCase {
         let px = a.template(backing: RGB8(255, 0, 255))
         let barY = a.windows[3].y - a.band / 2, bi = (barY * a.width + a.grid.x + 50) * 4
         XCTAssertGreaterThan(px[bi], 100)                                                // the bar under it is shaded, not black
+    }
+}
+
+final class SystemReviewFixTests: XCTestCase {
+    // The fixes from the 2026-10-04 system review, one check each.
+    func testTheReviewFixesHold() {
+        let jobs = AssetPlanRules.symbolJobs(GDDSymbolSetRules.parseManual("WD, HP1-4, LP1-5, BO1-3").symbols)
+        // Bonus games: a bonus grid, or bonus symbols with no other mode; a hold-and-spin game's bonus symbols are not.
+        var hold = ReelLayout(); hold.grids = [.init(mode: "base", rows: 3, reels: 5), .init(mode: "hold and spin", rows: 3, reels: 5)]
+        XCTAssertFalse(AssetChecklist.hasBonusGames(jobs: jobs, layout: hold))
+        var plain = ReelLayout(); plain.grids = [.init(mode: "base", rows: 3, reels: 5)]
+        XCTAssertTrue(AssetChecklist.hasBonusGames(jobs: jobs, layout: plain))
+        // Pots with no number: one per bonus symbol, in the checklist as in the generator.
+        plain.extras = [ReelLayout.Extra(what: "pots", rows: nil, reels: nil, place: "above", count: nil)]
+        XCTAssertEqual(AssetChecklist.items(jobs: jobs, layout: plain, jackpots: [], hasBonus: true).filter { $0.group == "Pots" }.count, 3 + 3)
+        // File names and lettering never say "free"; a game's own title is its own.
+        XCTAssertEqual(Wording.noFreeName("freeGames"), "bonusGames")
+        XCTAssertEqual(Wording.noFree("8 free spins"), "8 bonus games")
+        let logo = StandardPieces.pieces(game: "Free Spirit", gdd: "", layout: plain, hero: nil).first { $0.name == "shared_logo_master" }
+        XCTAssertEqual(logo?.lettering, "FREE SPIRIT")
+        XCTAssertFalse(StandardPieces.pieces(game: "Untitled game", gdd: "", layout: plain, hero: nil).contains { $0.name == "shared_logo_master" })
+        // MEGA is red only when it is the top tier.
+        XCTAssertEqual(GDDAssetPrompts.wedgeColour("MEGA", backing: "magenta"), "crimson red")
+        XCTAssertNotEqual(GDDAssetPrompts.wedgeColour("MEGA", backing: "magenta", with: ["GRAND", "MEGA"]), "crimson red")
+        XCTAssertEqual(WheelRules.order([], segments: 12), [])
+        // A crop past the picture's edge is clipped, not a crash.
+        XCTAssertEqual(FrameKit.crop([UInt8](repeating: 255, count: 4 * 4 * 4), width: 4, 2, 2, 8, 8).w, 8)
     }
 }
