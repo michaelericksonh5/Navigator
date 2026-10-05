@@ -8856,7 +8856,8 @@ public struct ConceptPiece: Codable, Equatable, Sendable {
         let words = name.replacingOccurrences(of: #"(?i)free(games|spins)?"#, with: "bonusGames", options: .regularExpression)
             .split { !$0.isLetter && !$0.isNumber && $0 != "_" && $0 != "-" }.joined()
         p.name = words.isEmpty ? "base_interface_piece" : String(words.prefix(80))
-        if !p.name.contains("_") { p.name = "base_interface_" + p.name }
+        // A symbol's own code (a value variant, "MU1") stays its name; anything else gets the studio's form.
+        if !p.name.contains("_"), p.name.range(of: #"^[A-Z]{1,5}\d{0,2}$"#, options: .regularExpression) == nil { p.name = "base_interface_" + p.name }
         p.what = noFree(what); p.look = noFree(look); p.lettering = noFree(lettering).uppercased(); p.source = source
         p.shape = Self.shapes.contains(shape.lowercased()) ? shape.lowercased() : "free"
         var w = max(64, min(2048, width)), h = max(64, min(2048, height))
@@ -9023,6 +9024,22 @@ public enum StandardPieces {
                     piece("shared_powerBet_toggleOff", "the Power Bet switch, off.", "A small toggle switch, dark.", "button", 512, 224, "OFF"),
                     piece("shared_powerBet_toggleOn", "the Power Bet switch, on.", "A small toggle switch, lit.", "button", 512, 224, "ON")]
         }
+        // The intro splash: a card for each feature the game has, a little scene of it lettered with its name,
+        // shown before play (9 of 10 shipped games) — from the structure, as GDDs never list the cards.
+        var features: [(key: String, title: String, refs: [String]?)] = []
+        if layout.grids.contains(where: { $0.mode.hasPrefix("bonus") }) { features.append(("bonusGames", "BONUS GAMES", nil)) }
+        for g in layout.grids where ReelLayoutRules.holdModes.contains(g.mode) { features.append((PopUps.key(g.mode), g.mode.uppercased(), nil)) }
+        for w in layout.wheels ?? [] where !w.name.hasPrefix("Bonus") { features.append((PopUps.key(w.name), w.name.uppercased(), nil)) }
+        if layout.extras.contains(where: { $0.what == "pots" }) { features.append(("pots", "FILL THE POTS", nil)) }
+        if layout.extras.contains(where: { $0.what == "hot reel" }) { features.append(("hotReel", "HOT REEL", nil)) }
+        if layout.awards?.contains("one more chance") == true { features.append(("oneMoreChance", "ONE MORE CHANCE", nil)) }
+        for f in features.prefix(4) {
+            out.append(piece("shared_intro_featureCard-\(f.key)", "the intro screen's card for the game's \(f.title.capitalized) feature: a small, bright scene showing it at work on the reels.",
+                             "A square card with a fine frame in the reel frame's material, the scene inside it, the feature's name lettered across its foot.", "panel", 512, 512, f.title, refs: hero.map { [$0] }))
+        }
+        if !features.isEmpty {
+            out.append(piece("shared_intro_continueBtn", "the intro screen's CONTINUE button, blank: its words are laid on it in each language.", "A raised, glowing button, its face plain.", "button", 1024, 384))
+        }
         if l.contains("tutorial") {
             out += [piece("shared_tutorial_background", "the blank panel the game's first-time tutorial cards appear on.", "A plain panel with a fine frame, its face empty.", "panel", 1024, 640),
                     piece("shared_tutorial_button", "the tutorial's button.", "A small raised button.", "button", 448, 208, "GOT IT!")]
@@ -9039,6 +9056,32 @@ public enum Composites {
         ("shared_interface-gameIcon1x2", 317, 586), ("shared_interface-gameArt.600x600", 600, 600), ("shared_interface-gameArt.176x176", 176, 176),
         ("shared_interface-sharedIcon", 1200, 630), ("shared_interface-icon", 309, 230),
     ]
+}
+
+/// The intro button's word in each language the studio's intro splashes ship with (`continue-asset-txt-<lang>`,
+/// about twenty in 9 of 10 games). Off unless asked: a studio localization tool may make these already.
+public enum Localized {
+    public static let continueWord: [(lang: String, word: String)] = [
+        ("en", "CONTINUE"), ("de", "WEITER"), ("es", "CONTINUAR"), ("fr", "CONTINUER"), ("it", "CONTINUA"), ("pt", "CONTINUAR"),
+        ("nl", "DOORGAAN"), ("sv", "FORTSÄTT"), ("da", "FORTSÆT"), ("no", "FORTSETT"), ("fi", "JATKA"), ("pl", "DALEJ"),
+        ("cs", "POKRAČOVAT"), ("ro", "CONTINUĂ"), ("hu", "TOVÁBB"), ("el", "ΣΥΝΕΧΕΙΑ"), ("tr", "DEVAM"), ("ru", "ПРОДОЛЖИТЬ"),
+        ("ja", "続ける"), ("ko", "계속"), ("zh", "继续"),
+    ]
+    public static func name(_ lang: String) -> String { "shared_intro_continue-asset-txt-\(lang)" }
+}
+
+/// What can be drawn from what is already made (asset inventory, 2026-10-04): the special symbols' lit "win"
+/// state (4 of 10 games, signalled by any landing or collecting special) and every background's landscape twin
+/// (10 of 10 older games ship one; GameForge's landscape is 4608x2532, drawn here at its shape within GPT's limits).
+public enum Derived {
+    public static let landscape = (w: 2912, h: 1600)
+    public static func winName(_ id: String) -> String { "\(id)_win" }
+    public static func landscapeName(_ id: String) -> String { "\(id)-landscape" }
+    /// The special symbols that get a lit state: wilds, scatters, bonus, collector, jackpot and WYSIWYG symbols.
+    public static func winSymbols(_ jobs: [AssetJob]) -> [AssetJob] {
+        jobs.filter { j in j.kind == .symbol && ([.wild, .scatter, .bonus, .jackpot].contains(j.role) || ["SF", "WY", "MU", "CO"].contains { j.id.hasPrefix($0) }) }
+    }
+
 }
 
 /// A bitmap number font as the studio ships them: a strip of glyphs the engine prints amounts with
@@ -9064,7 +9107,10 @@ public enum ConceptPlan {
         ALREADY MADE (do not list any of these, or anything they cover): \(covered.joined(separator: "; ")).
         Already covered as kinds: every symbol; every background; the reel frame (bezel), reel dividers, reel texture and reel fade for each mode; a hot reel housing; the jackpot table; pots and their fill states and plaques; prize wheels; award pop-ups (panel, value bar, CONTINUE button, award titles, the win ladder).
 
-        List every OTHER piece of static art this game shows on screen that the document describes or clearly needs: meters and their fill or lit states, collection areas or rows, counters' frames ("spins remaining"), glass or lock covers over reels or cells, cell backings and lock frames for hold-and-spin cells, multiplier badges, tubes, posters, avatars or mascots standing by the reels, Power Bet sell screens and their buttons, mode intro titles, a feature's logo or title lettering. Static art only: animation, particles, glows and bursts are made in Spine, not here.
+        List every OTHER piece of static art this game shows on screen that the document describes or clearly needs: meters and their fill or lit states, collection areas or rows, counters' frames ("spins remaining"), glass or lock covers over reels or cells, cell backings and lock frames for hold-and-spin cells, multiplier badges, tubes, posters, avatars or mascots standing by the reels, each Power Bet boost's button with its off and lit states, mode intro titles, a feature's logo or title lettering, pick-bonus tiles. Static art only: animation, particles, glows and bursts are made in Spine, not here.
+        Also, when the document has them:
+        - VALUE VARIANTS of a special symbol (a multiplier symbol's values x2, x3, x5…; a WYSIWYG's tiers or colours): one piece named after the symbol's code (e.g. MU1), shape "free", refs [that code], lettering its first value, states its other values in order.
+        - TUTORIAL CARDS, one per tutorial point the document lists: name shared_tutorial_card-<topic>, shape "panel", 1536x768, lettering the tip's own short text (at most 10 words).
 
         For each piece:
         - name: the studio's file name, <mode>_<category>_<name> in camelCase, e.g. base_interface_multiplierMeter, bonusGames_interface_spinsCounter, shared_sellScreen_background. Modes: base, bonusGames, shared, transition, or the game's own mode names (lootLink, …). Categories: interface, popUp, banner, sellScreen, intro, outro, avatar. Never the word "free": production says "bonus games".
@@ -9075,6 +9121,7 @@ public enum ConceptPlan {
         - lettering: the words lettered into it as the art, or "" — never a number or amount the game prints (the engine draws those in its own font).
         - states: the names of its states after the first, if the document has them (["lit"], ["filling", "full"]); [] for one image.
         - source: the document's own words it comes from (a short quote), or "" for a piece every game of this kind has.
+        - refs: the codes of the game's symbols it is drawn from (a value variant's own symbol), or [].
         Only pieces this game really has. If it needs nothing more, return an empty list.
 
         GAME: \(game)
@@ -9094,6 +9141,7 @@ public enum ConceptPlan {
                     "width": ["type": "INTEGER"], "height": ["type": "INTEGER"],
                     "lettering": ["type": "STRING"], "states": ["type": "ARRAY", "items": ["type": "STRING"]],
                     "source": ["type": "STRING"],
+                    "refs": ["type": "ARRAY", "items": ["type": "STRING"]],
                 ],
                 "required": ["name", "what", "look", "shape", "width", "height", "lettering", "states", "source"],
             ]],
@@ -9109,7 +9157,7 @@ public enum ConceptPlan {
             let p = ConceptPiece(name: d["name"] as? String ?? "", what: d["what"] as? String ?? "", look: d["look"] as? String ?? "",
                                  shape: d["shape"] as? String ?? "free", width: d["width"] as? Int ?? 1024, height: d["height"] as? Int ?? 1024,
                                  lettering: d["lettering"] as? String ?? "", states: d["states"] as? [String] ?? [],
-                                 source: d["source"] as? String ?? "").normalised()
+                                 source: d["source"] as? String ?? "", refs: (d["refs"] as? [String]).flatMap { $0.isEmpty ? nil : $0 }).normalised()
             guard !p.what.isEmpty, !covered.contains(p.name), !out.contains(where: { $0.name == p.name }) else { continue }
             out.append(p)
         }
@@ -15456,11 +15504,32 @@ extension GDDAssetPrompts {
 
     /// The number font's glyphs (NumberFont) in a grid on a plain canvas (the last image), lettered as the game's
     /// TOTAL WIN title (attached first) is.
-    static func fontBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+    static func fontBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), reference: String = "TOTAL WIN title") -> String {
         let rows = stride(from: 0, to: NumberFont.glyphs.count, by: NumberFont.columns).map { NumberFont.glyphs[$0..<min($0 + NumberFont.columns, NumberFont.glyphs.count)].joined(separator: "  ") }
         return [
-            "Image 1 is the TOTAL WIN title of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter these characters on it in exactly that title's lettering — the same letterforms, colours, outline, bevel and finish — as the font the game prints its amounts in.",
+            "Image 1 is the \(reference) of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter these characters on it in exactly that \(reference.hasSuffix("title") ? "title's" : "piece's") lettering — the same letterforms, colours, outline, bevel and finish — as the font the game prints its amounts in.",
             "Lay them out in a grid of \(NumberFont.columns) columns and \(NumberFont.rows) rows, one character centred in each cell, the cells evenly spaced across and down the whole picture, in this order: " + rows.enumerated().map { "row \($0.offset + 1): \($0.element)" }.joined(separator: "; ") + ". The digits and letters all the same height; the comma and full stop small, at the baseline; every character well apart from its neighbours. Nothing else: no frame, lines, boxes or other words.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+
+    /// A special symbol's lit state (Derived), an edit of the symbol (attached): the same symbol, lit as it lands or wins.
+    static func winStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+        [
+            "Edit the attached image: it is a symbol of a video slot game themed “\(theme.name)”. Show the same symbol lit up as it is when it lands or wins: brighter and more saturated, glowing from within, its metal and gems gleaming.",
+            "Nothing moves or changes shape, size or position; any lettering stays exactly as it is. Only a soft glow close around it: no rays, burst or sparkles.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// A background's landscape twin (Derived), an edit of the portrait one (attached).
+    static func landscapeBrief(theme: GameTheme) -> String {
+        "Edit the attached image: it is the portrait background of a video slot game themed “\(theme.name)”. Make the same scene as a wide landscape picture: keep its centre — its main features, light and colours — as it is, and extend the scene naturally to the left and right to fill the wider frame, the reels' place in the middle kept as clear as it is. No text, reels, frames or characters added."
+    }
+    /// A language's word for the intro button (Localized), lettered as the game's CONTINUE button (attached first) is.
+    static func localizedBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), word: String, lang: String) -> String {
+        [
+            "Image 1 is the CONTINUE button of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain canvas: letter the word “\(word)” on it (the button's word in the language coded \(lang)) in exactly that button's lettering — letterforms, colours, outline and finish — spelled exactly so, every accent and character exactly as given.",
+            "Only the lettering: no button or plate behind it. It fills the picture's width with a small even margin.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }

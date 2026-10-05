@@ -21711,18 +21711,24 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
         // The reels saved with the set, or read from --gdd-file for a set made before they were.
         let text = args.firstIndex(of: "--gdd-file").flatMap { $0 + 1 < args.count ? try? String(contentsOfFile: args[$0 + 1], encoding: .utf8) : nil }
         guard let layout = text.map(ReelLayoutRules.read) ?? run.reelLayout else { print("FAILED: this set has no reels saved: add --gdd-file <the GDD's text>"); exit(1) }
-        if let text { run.reelLayout = layout; run.gddText = text; run.writeManifest(to: folder) }
+        // Read again from the document, it keeps the pieces planned for it (ConceptPlan).
+        if let text { var l = layout; l.concepts = run.reelLayout?.concepts; run.reelLayout = l; run.gddText = text; run.writeManifest(to: folder) }
         guard let base = layout.base else { print("FAILED: the document gives no reel size"); exit(1) }
         let area = ReelArea(layout)
         print("REELS: base \(base.rows)x\(base.reels)" + layout.extras.map { " + \($0.what) \($0.place)" }.joined()
               + "; \(area.width)x\(area.height) px, cell \(area.cell)")
         for n in layout.notes { print("NOTE: \(n)") }
         // --redo "Pot States": one piece drawn again, its files kept in versions/ — the window's Make Again.
+        let full = run.reelLayout ?? layout
+        GDDToAssetsRun.conceptNames = (full.concepts ?? []).map(\.name) + ["shared_logo_master", "shared_character_keyArt", "shared_sellScreen", "shared_powerBet", "shared_tutorial"]
         if let i = args.firstIndex(of: "--redo"), i + 1 < args.count, !GDDToAssetsRun.keepForRedo(args[i + 1], folder: folder) {
             print("FAILED: no piece \(args[i + 1]): " + GDDToAssetsRun.reelPieces.map(\.name).joined(separator: ", ")); exit(1)
         }
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = run.generateReelArea(layout, folder: folder, again: args.contains("--again"))
+            // --only "Studio and GDD pieces,Number font": draw only those (Make Again's pieces).
+            if args.contains("--localize") { DispatchQueue.main.sync { run.localizeIntro = true } }
+            let only = args.firstIndex(of: "--only").flatMap { $0 + 1 < args.count ? Set(args[$0 + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }) : nil }
+            let r = run.generateReelArea(full, folder: folder, again: args.contains("--again"), only: only)
             print(String(format: "DONE: %@\nSPENT: $%.4f", r.problems.isEmpty ? "reel area made" : r.problems.joined(separator: "; "), r.cost))
             exit(0)
         }
@@ -24388,6 +24394,8 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var reelLayout: ReelLayout?
     /// A set typed by hand (no GDD): its document is written from its GameSheet, not read from a file.
     @Published var typed = false
+    /// Letter the intro's CONTINUE in each of the studio's languages (Localized) — off: a localization tool may.
+    @Published var localizeIntro = false
     @Published var symbols: [SlotSymbol] = []
     /// Symbol-set lines the parser could not read. A dropped symbol is invisible
     /// otherwise — it only shows up when someone counts the folder.
@@ -25978,7 +25986,10 @@ final class GDDToAssetsRun: ObservableObject {
         ("Pots", { $0.hasPrefix("shared_avatar_jar") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-State") && !$0.contains("-State0") }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
-        ("Number font", { $0.hasPrefix("transition_font_totalWin") }),
+        ("Number fonts", { $0.hasPrefix("transition_font_totalWin") || $0.hasPrefix("shared_font_") }),
+        ("Symbol win states", { $0.contains("_win.png") || $0.contains("_win_rmbg") }),
+        ("Landscape backgrounds", { $0.contains("-landscape") }),
+        ("Localized CONTINUE", { $0.hasPrefix("shared_intro_continue-asset-txt") }),
         ("Lobby and loading", { n in Composites.all.contains { n.hasPrefix($0.name + ".png") } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
         ("Studio and GDD pieces", { n in n.hasPrefix("shared_concepts") || (GDDToAssetsRun.conceptNames.contains { n.hasPrefix($0 + ".") || n.hasPrefix($0 + "_rmbg") || n.hasPrefix($0 + "-") }) }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
@@ -26008,7 +26019,22 @@ final class GDDToAssetsRun: ObservableObject {
         let hasBonus = jobs.contains { $0.role == .bonus } || (reelLayout?.grids.contains { $0.mode != "base" && !$0.mode.hasPrefix("power bet") } ?? false)
         let hero = jobs.first { $0.kind == .symbol && $0.role == .highPay && ($0.tier ?? 1) == 1 }?.id
         let standard = reelLayout.map { StandardPieces.pieces(game: gameName, gdd: gddText, layout: $0, hero: hero) }
-        let items = AssetChecklist.items(jobs: jobs, layout: reelLayout, jackpots: jackpotNames, hasBonus: hasBonus, standard: standard)
+        var items = AssetChecklist.items(jobs: jobs, layout: reelLayout, jackpots: jackpotNames, hasBonus: hasBonus, standard: standard)
+        if reelLayout != nil {
+            for (n, _, what) in Self.numberFonts(reelLayout?.concepts ?? []).dropFirst() {
+                items.append(AssetChecklist.Item(group: "Fonts", name: n, what: "number font for the " + what.replacingOccurrences(of: "game's ", with: ""), files: ["\(n).png"], maker: "Number font", cost: AssetChecklist.gpt(NumberFont.size.w, NumberFont.size.h)))
+            }
+            for j in Derived.winSymbols(jobs) {
+                items.append(AssetChecklist.Item(group: "Symbol states", name: Derived.winName(j.id), what: "\(j.id) lit, as it lands or wins", files: ["\(Derived.winName(j.id)).png"], maker: "Symbol states", cost: AssetChecklist.gpt(2048, 2048)))
+            }
+            for j in jobs where j.kind == .background {
+                items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
+            }
+            if localizeIntro {
+                items.append(AssetChecklist.Item(group: "Intro", name: "shared_intro_continue-asset-txt", what: "CONTINUE in \(Localized.continueWord.count) languages",
+                                                 files: Localized.continueWord.map { "\(Localized.name($0.lang)).png" }, maker: "Localized", cost: Double(Localized.continueWord.count) * AssetChecklist.gpt(1024, 352)))
+            }
+        }
         let fm = FileManager.default
         return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) } } ?? false) }
     }
@@ -26073,7 +26099,8 @@ final class GDDToAssetsRun: ObservableObject {
     /// - The jackpot table: a plate of plaques lettered with the jackpots' names over empty value fields.
     /// - Pots: one per bonus symbol they are tied to, drawn from it.
     /// What is already there is kept unless `again`. Blocks: call off the main thread.
-    func generateReelArea(_ layout: ReelLayout, folder: URL, again: Bool = false) -> (cost: Double, problems: [String]) {
+    /// `only`: Make Again's pieces (reelPieces names) to draw; nothing else is drawn, though free steps still run.
+    func generateReelArea(_ layout: ReelLayout, folder: URL, again: Bool = false, only: Set<String>? = nil) -> (cost: Double, problems: [String]) {
         let (theme0, design, backing, jobs) = DispatchQueue.main.sync { (self.theme, self.styledDesign, self.backing, self.jobs) }
         guard let theme = theme0, let baseGrid = layout.base else { return (0, ["no theme or no grid"]) }
         let b = backing.rgb, space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
@@ -26093,6 +26120,7 @@ final class GDDToAssetsRun: ObservableObject {
         }
         /// A piece drawn on a template and checked against its openings: up to two attempts, the best kept.
         func paint(_ what: String, prompt: String, inputs: [Data], w: Int, h: Int, covered: (([UInt8]) -> Double)?) -> [UInt8]? {
+            if let only, !Self.reelPieces.contains(where: { only.contains($0.name) && $0.files(what + ".png") }) { return nil }
             log.write("prompts/\(what).txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h)\n\n\(prompt)")
             var best: (px: [UInt8], c: Double)?
             // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up.
@@ -26386,12 +26414,39 @@ final class GDDToAssetsRun: ObservableObject {
         conceptSheet(standard + (layout.concepts ?? []), folder: folder)
         // 8. The total-win number font: its glyphs drawn in a grid in the TOTAL WIN title's lettering, cut cell by
         // cell and laid out as the studio's strip (NumberFont).
-        if !has("transition_font_totalWin.png"), let title = try? Data(contentsOf: url("transition_outro_totalWin.png")),
-           let canvas = blank(NumberFont.size.w, NumberFont.size.h),
-           let px = paint("transition_font_totalWin_sheet", prompt: GDDAssetPrompts.fontBrief(theme: theme, backing: (backing.name, b)),
-                          inputs: [downsamplePNG(title, longEdge: 1024) ?? title, canvas], w: NumberFont.size.w, h: NumberFont.size.h, covered: nil) {
-            both(px, NumberFont.size.w, NumberFont.size.h, "transition_font_totalWin_sheet")
-            if let strip = numberFontStrip(FrameKit.keyed(px, backing: b), folder: folder) { problems += strip }
+        // And one for every counter and meter the game has, lettered as that piece (6 of 10 games).
+        for (fontName, refName, refWhat) in Self.numberFonts(layout.concepts ?? []) where !has("\(fontName).png") {
+            // A sheet already drawn is cut again, free.
+            if let sheet = load("\(fontName)_sheet_rmbg.png"), sheet.w == NumberFont.size.w, sheet.h == NumberFont.size.h {
+                if let strip = numberFontStrip(sheet.px, folder: folder, name: fontName) { problems += strip }
+                continue
+            }
+            guard let ref = try? Data(contentsOf: url(refName)), let canvas = blank(NumberFont.size.w, NumberFont.size.h),
+                  let px = paint("\(fontName)_sheet", prompt: GDDAssetPrompts.fontBrief(theme: theme, backing: (backing.name, b), reference: refWhat),
+                                 inputs: [downsamplePNG(ref, longEdge: 1024) ?? ref, canvas], w: NumberFont.size.w, h: NumberFont.size.h, covered: nil) else { continue }
+            both(px, NumberFont.size.w, NumberFont.size.h, "\(fontName)_sheet")
+            if let strip = numberFontStrip(FrameKit.keyed(px, backing: b), folder: folder, name: fontName) { problems += strip }
+        }
+        // 10. The special symbols' lit win states, each an edit of its symbol (Derived).
+        for j in Derived.winSymbols(jobs) where !has("\(Derived.winName(j.id)).png") {
+            guard let sym = try? Data(contentsOf: url("\(j.id).png")), let cg = loadCGImage(data: sym) else { continue }
+            if let px = paint(Derived.winName(j.id), prompt: GDDAssetPrompts.winStateBrief(theme: theme, backing: (backing.name, b)),
+                              inputs: [downsamplePNG(sym, longEdge: 2048) ?? sym], w: cg.width, h: cg.height, covered: nil) { both(px, cg.width, cg.height, Derived.winName(j.id)) }
+        }
+        // 11. Every background's landscape twin, the same scene widened (Derived).
+        for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {
+            guard let bgPNG = try? Data(contentsOf: url("\(j.id).png")) else { continue }
+            let (w, h) = Derived.landscape
+            if let px = paint(Derived.landscapeName(j.id), prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
+                              inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(Derived.landscapeName(j.id)).png") }
+        }
+        // 12. The intro button's word in each language, when asked (Localized): lettered as the CONTINUE button.
+        if DispatchQueue.main.sync(execute: { self.localizeIntro }), let btn = try? Data(contentsOf: url("base_popUp_bonusBtn.png")) {
+            for (lang, word) in Localized.continueWord where !has("\(Localized.name(lang)).png") {
+                guard let canvas = blank(1024, 352) else { continue }
+                if let px = paint(Localized.name(lang), prompt: GDDAssetPrompts.localizedBrief(theme: theme, backing: (backing.name, b), word: word, lang: lang),
+                                  inputs: [downsamplePNG(btn, longEdge: 1024) ?? btn, canvas], w: 1024, h: 352, covered: nil) { both(px, 1024, 352, Localized.name(lang)) }
+            }
         }
         // 9. The loading screen and lobby icons, put together from the logo, the key art and the base background. Free.
         composites(folder: folder)
@@ -26471,17 +26526,64 @@ final class GDDToAssetsRun: ObservableObject {
     /// The number font's grid (NumberFont, straight RGBA) cut a glyph a cell into `transition_font_totalWin.png`:
     /// every glyph scaled to one height, centred in cells of one width, with the order and cell width beside it in
     /// `transition_font_totalWin.json`. Returns problems — an empty cell, a glyph that spills into its neighbour's.
-    func numberFontStrip(_ px: [UInt8], folder: URL) -> [String]? {
+    /// The game's number fonts: the total win's, lettered as its TOTAL WIN title, and one for every counter and
+    /// meter planned for it (`shared_font_<piece>`), lettered as that piece.
+    static func numberFonts(_ concepts: [ConceptPiece]) -> [(name: String, ref: String, what: String)] {
+        var out: [(name: String, ref: String, what: String)] = [("transition_font_totalWin", "transition_outro_totalWin.png", "TOTAL WIN title")]
+        for c in concepts where c.name.lowercased().contains("counter") || c.name.lowercased().contains("meter") {
+            let tail: String = c.name.split(separator: "_").last.map(String.init) ?? c.name
+            let what: String = c.what.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+            out.append(("shared_font_" + tail, c.name + ".png", "game's " + what))
+        }
+        return out
+    }
+
+    func numberFontStrip(_ px: [UInt8], folder: URL, name: String = "transition_font_totalWin") -> [String]? {
         let (W, _) = NumberFont.size, height = 128, glyphH = 108
         var glyphs: [FrameKit.Piece] = [], problems: [String] = []
-        for (i, g) in NumberFont.glyphs.enumerated() {
-            let c = NumberFont.cell(i)
-            let cell = FrameKit.crop(px, width: W, c.x, c.y, c.w, c.h)
-            var x0 = c.w, y0 = c.h, x1 = -1, y1 = -1
-            for y in 0..<c.h { for x in 0..<c.w where cell.px[(y * c.w + x) * 4 + 3] > 96 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
-            guard x1 > x0, y1 > y0 else { problems.append("number font: no “\(g)” in its cell"); glyphs.append(FrameKit.Piece(px: [], w: 0, h: 0)); continue }
-            if x0 == 0 || y0 == 0 || x1 == c.w - 1 || y1 == c.h - 1 { problems.append("number font: “\(g)” runs out of its cell") }
-            glyphs.append(FrameKit.crop(cell.px, width: c.w, x0, y0, x1 - x0 + 1, y1 - y0 + 1))
+        // Each row's glyphs found by the gaps between them, not by cells: GPT spaces a short last row evenly
+        // across the picture (K M B T over five columns, 2026-10-04).
+        let cell = NumberFont.cell, H = px.count / (W * 4)
+        // The rows by the gaps between them too (GPT spaces rows unevenly); the grid's own bands when they can't be told apart.
+        var rowUsed = [Bool](repeating: false, count: H)
+        for y in 0..<H { var n = 0; for x in 0..<W where px[(y * W + x) * 4 + 3] > 96 { n += 1; if n >= 3 { rowUsed[y] = true; break } } }
+        var bands: [(Int, Int)] = [], yy = 0
+        while yy < H {
+            guard rowUsed[yy] else { yy += 1; continue }
+            var e = yy
+            while e + 1 < H && (rowUsed[e + 1] || (e + 12 < H && rowUsed[(e + 1)...(e + 12)].contains(true))) { e += 1 }
+            if e - yy >= 20 { bands.append((yy, e + 1)) }
+            yy = e + 1
+        }
+        if bands.count != NumberFont.rows { bands = (0..<NumberFont.rows).map { ($0 * cell, min(($0 + 1) * cell, H)) } }
+        for r in 0..<NumberFont.rows {
+            let want = Array(NumberFont.glyphs[(r * NumberFont.columns)..<min((r + 1) * NumberFont.columns, NumberFont.glyphs.count)])
+            let (y0, y1) = bands[r]
+            var used = [Bool](repeating: false, count: W)
+            for x in 0..<W { for y in y0..<y1 where px[(y * W + x) * 4 + 3] > 96 { used[x] = true; break } }
+            // Runs of used columns, gaps under 6 px closed (a "$" or "¢" drawn in parts is one glyph).
+            var runs: [(Int, Int)] = [], x = 0
+            while x < W {
+                guard used[x] else { x += 1; continue }
+                var e = x
+                while e + 1 < W && (used[e + 1] || (e + 6 < W && used[(e + 1)...(e + 6)].contains(true))) { e += 1 }
+                if e - x >= 8 { runs.append((x, e)) }       // a speck of keying at an edge is no glyph
+                x = e + 1
+            }
+            if runs.count != want.count { problems.append("\(name): row \(r + 1) has \(runs.count) glyphs, not \(want.count)") }
+            for (k, g) in want.enumerated() {
+                guard k < runs.count else { glyphs.append(FrameKit.Piece(px: [], w: 0, h: 0)); problems.append("\(name): no “\(g)”"); continue }
+                let (gx0, gx1) = runs[k]
+                var top = y1, bottom = y0 - 1
+                for y in y0..<y1 {
+                    var n = 0
+                    for xx in gx0...gx1 where px[(y * W + xx) * 4 + 3] > 96 { n += 1 }
+                    if n >= 3 { top = min(top, y); bottom = max(bottom, y) }
+                }
+                guard bottom >= top else { glyphs.append(FrameKit.Piece(px: [], w: 0, h: 0)); continue }
+                if top == 0 || bottom == H - 1 { problems.append("\(name): “\(g)” is cut off by the picture's edge") }
+                glyphs.append(FrameKit.crop(px, width: W, gx0, top, gx1 - gx0 + 1, bottom - top + 1))
+            }
         }
         // One scale for all, from the tallest digit, so the small marks stay small.
         let tallest = glyphs.prefix(10).map(\.h).max() ?? 1
@@ -26496,9 +26598,9 @@ final class GDDToAssetsRun: ObservableObject {
         }
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
         try? ChromaKeyOutputRules.image(straightRGBA8: strip, width: stripW, height: height, space: space).flatMap(encodePNG)?
-            .write(to: folder.appendingPathComponent("transition_font_totalWin.png"))
+            .write(to: folder.appendingPathComponent("\(name).png"))
         let meta: [String: Any] = ["glyphs": NumberFont.glyphs, "cellWidth": cellW, "height": height]
-        try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]).write(to: folder.appendingPathComponent("transition_font_totalWin.json"))
+        try? JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted]).write(to: folder.appendingPathComponent("\(name).json"))
         return problems
     }
 
@@ -28662,6 +28764,8 @@ struct GDDToAssetsSheet: View {
                     }
                 }
                 HStack {
+                    Toggle("CONTINUE in \(Localized.continueWord.count) languages", isOn: $run.localizeIntro)
+                        .help("The intro splash's CONTINUE lettered in each of the studio's languages, as its shipped games carry. Off when your localization tool makes these.")
                     Button("Find What Else It Needs…") { run.findConcepts() }
                         .disabled(run.gddText.isEmpty || run.busy || run.reelLayout == nil)
                         .help("Gemini reads the GDD for every other static piece the game shows — meters, collection areas, glass covers, counters, sell screens, a feature's lettering — and adds them here, made with the game interface. About $0.02.")

@@ -13370,6 +13370,21 @@ final class StandardPiecesTests: XCTestCase {
         XCTAssertFalse(full.contains { $0.name == "shared_character_keyArt" })
         XCTAssertTrue(full.allSatisfy { $0.standard && $0.width % 16 == 0 && $0.height % 16 == 0 })
     }
+    // The intro splash's cards follow the game's features; derived pieces and localized words are named as the studio's.
+    func testIntroCardsDerivedPiecesAndLocalizedWords() {
+        let layout = ReelLayoutRules.read(WheelAndPopUpTests.wheels + "\nLoot Link\nThe matrix changes to a 20x1 independent reels matrix.\nThe bonus games are played on a 4x5 matrix.")
+        let cards = StandardPieces.pieces(game: "Example", gdd: "", layout: layout, hero: "HP1").filter { $0.name.hasPrefix("shared_intro_featureCard-") }
+        XCTAssertEqual(cards.map(\.lettering), ["BONUS GAMES", "LOOT LINK", "JACKPOT WHEEL", "ONE MORE CHANCE"])
+        XCTAssertTrue(StandardPieces.pieces(game: "Example", gdd: "", layout: layout, hero: nil).contains { $0.name == "shared_intro_continueBtn" && $0.lettering.isEmpty })
+        XCTAssertEqual(Derived.winName("SC"), "SC_win"); XCTAssertEqual(Derived.landscapeName("bg_base"), "bg_base-landscape")
+        let jobs = AssetPlanRules.symbolJobs(GDDSymbolSetRules.parseManual("WD, HP1-4, LP1-5, SC, BO, JP1-4, MU1").symbols)
+        XCTAssertEqual(Set(Derived.winSymbols(jobs).map(\.id)), ["WD", "SC", "BO", "JP1", "JP2", "JP3", "JP4", "MU1"])
+        XCTAssertEqual(Localized.continueWord.first?.word, "CONTINUE"); XCTAssertEqual(Localized.name("de"), "shared_intro_continue-asset-txt-de")
+        XCTAssertFalse(Localized.continueWord.contains { $0.word.lowercased().contains("free") })
+        // A value variant planned by Gemini keeps its symbol's code for a name, and its refs.
+        let v = ConceptPlan.parse(#"{"pieces": [{"name": "MU1", "what": "The multiplier symbol's values.", "look": "", "shape": "free", "width": 1024, "height": 1024, "lettering": "x2", "states": ["x3", "x5"], "source": "", "refs": ["MU1"]}]}"#, covered: [])
+        XCTAssertEqual(v.first?.name, "MU1"); XCTAssertEqual(v.first?.refs, ["MU1"]); XCTAssertEqual(v.first?.stateName("x3"), "MU1-x3")
+    }
     // The number font is drawn as a grid within GPT's limits, a glyph a cell.
     func testTheNumberFontGrid() {
         XCTAssertEqual(NumberFont.glyphs.count, 19); XCTAssertEqual(NumberFont.rows, 4)
