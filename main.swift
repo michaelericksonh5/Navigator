@@ -26409,16 +26409,18 @@ final class GDDToAssetsRun: ObservableObject {
                 for k in 1...PotStates.levels { for sfx in [".png", "_rmbg.png"] { try? fm.moveItem(at: url(jar(i, k) + sfx), to: kept.appendingPathComponent(jar(i, k) + sfx)) } }
                 navLog("gdd reel: \(jar(i, 0)) given room to \(potH) px; its states kept in \(kept.lastPathComponent) to grow again")
             }
-            // One that must stand narrow (PotKind.bodyShare: a piggy bank, its coins piling up beside it) made so, free;
-            // states drawn round it before are kept in versions/ and drawn again round the narrower one.
+            // Each stood as its kind needs (PotKind.bodyShare, footRoom), free: a piggy bank narrow, its coins piling up
+            // beside it; a safe and a piggy bank raised, their pile on the floor in front. Made narrower, the states drawn
+            // round it before are kept in versions/ and drawn again; only raised, they are laid on it again below.
             for i in 0..<total {
                 guard let p = load("\(jar(i, 0))_rmbg.png"), p.w == 1024, p.h == potH,
-                      let n = PotStates.narrowed(p.px, width: 1024, height: potH, share: kind.bodyShare) else { continue }
+                      let n = PotStates.stood(p.px, width: 1024, height: potH, share: kind.bodyShare, room: kind.footRoom) else { continue }
                 write(FrameKit.onBacking(n, b), 1024, potH, "\(jar(i, 0)).png"); write(n, 1024, potH, "\(jar(i, 0))_rmbg.png")
+                navLog("gdd reel: \(jar(i, 0)) stood as a \(kind.noun) stands")
+                guard PotStates.stood(p.px, width: 1024, height: potH, share: kind.bodyShare, room: 0) != nil else { continue }
                 let kept = folder.appendingPathComponent("versions/pots-before-narrow")
                 try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
                 for k in 1...PotStates.levels { for sfx in [".png", "_rmbg.png"] { try? fm.moveItem(at: url(jar(i, k) + sfx), to: kept.appendingPathComponent(jar(i, k) + sfx)) } }
-                navLog("gdd reel: \(jar(i, 0)) made \(Int(kind.bodyShare * 100))% of its canvas wide; its states kept in \(kept.lastPathComponent) to draw again")
             }
             // Its fill states, State1…State5, each grown from the one before on a grey heap laid in code to its height
             // (PotStates.rise, the shipped rigs' back-loaded schedule): the treasure only ever rises, the last states
@@ -26479,6 +26481,7 @@ final class GDDToAssetsRun: ObservableObject {
                         }
                         var x = Double(p.count)
                         if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure solid"); x += 1 }
+                        if PotStates.cutOff(laid, width: 1024, height: potH) { p.append("it runs off the edge of the picture — the \(kind.noun) and all its treasure inside it, on the floor it stands on"); x += 1 }
                         if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
                         return (p, x)
                     }
@@ -26529,6 +26532,7 @@ final class GDDToAssetsRun: ObservableObject {
                         }
                         var x = Double(p.count)
                         if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure and the gap under the lid solid"); x += 1 }
+                        if PotStates.cutOff(laid, width: 1024, height: potH) { p.append("it runs off the edge of the picture — the pot and all its treasure inside it"); x += 1 }
                         if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
                         return (p, x)
                     }

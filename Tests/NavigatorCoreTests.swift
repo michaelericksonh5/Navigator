@@ -13861,15 +13861,22 @@ final class PotKindTests: XCTestCase {
         XCTAssertTrue(PotKind.piggyBank.anchoredAtTop && PotKind.safe.anchoredAtTop && !PotKind.chest.anchoredAtTop && !PotKind.jar.anchoredAtTop)
         XCTAssertEqual(PotStates.registered(piled, to: pig, width: w, height: h, top: true), piled)
         XCTAssertNotEqual(PotStates.registered(piled, to: pig, width: w, height: h), piled)
-        // Drawn too wide, it is made to its share of the canvas, centred, on the row it stood on; narrow enough, left alone.
+        // Drawn too wide, it is made to its share of the canvas, centred, and raised off the bottom; standing so, left alone.
         let wide = boxes([(10..<170, 100..<199)])
-        let n = PotStates.narrowed(wide, width: w, height: h, share: PotKind.piggyBank.bodyShare)!
+        let n = PotStates.stood(wide, width: w, height: h, share: PotKind.piggyBank.bodyShare, room: PotKind.piggyBank.footRoom)!
         let cols = (0..<w).filter { x in (0..<h).contains { n[($0 * w + x) * 4 + 3] > 128 } }
         XCTAssertEqual(Double(cols.last! - cols.first!), 0.45 * Double(w), accuracy: 3)
         XCTAssertEqual(Double(cols.first! + cols.last!) / 2, 100, accuracy: 2)
-        XCTAssertEqual(Double(PotStates.foot(n, width: w, height: h)!.end), 198, accuracy: 1)
-        XCTAssertNil(PotStates.narrowed(pig, width: w, height: h, share: 0.45))
-        XCTAssertNil(PotStates.narrowed(wide, width: w, height: h, share: PotKind.jar.bodyShare))
+        XCTAssertEqual(Double(PotStates.foot(n, width: w, height: h)!.end), 199 - 0.08 * 200, accuracy: 1.5)
+        XCTAssertNil(PotStates.stood(n, width: w, height: h, share: 0.45, room: 0.08))
+        XCTAssertNil(PotStates.stood(wide, width: w, height: h, share: PotKind.jar.bodyShare, room: PotKind.jar.footRoom))
+        // Only raised: the same size, in the same place across.
+        let raised = PotStates.stood(wide, width: w, height: h, share: 1, room: 0.1)!
+        XCTAssertEqual(PotStates.foot(raised, width: w, height: h)!.width, PotStates.foot(wide, width: w, height: h)!.width, accuracy: 1)
+        // A state running off the canvas is told; one inside it is not.
+        XCTAssertTrue(PotStates.cutOff(boxes([(20..<180, 150..<200)]), width: w, height: h))
+        XCTAssertTrue(PotStates.cutOff(boxes([(0..<100, 50..<150)]), width: w, height: h))
+        XCTAssertFalse(PotStates.cutOff(wide, width: w, height: h))
     }
     // What a pot is, from the document's own word (written for the test), and kept through a typed sheet.
     func testThePotsKindIsReadAndKept() {

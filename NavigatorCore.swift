@@ -8802,6 +8802,9 @@ public enum PotKind: String, Codable, CaseIterable, Sendable {
     /// The most of its canvas's width it stands in at State0: a piggy bank's coins pile up beside it (the Blitz
     /// medallion's pile reached 2.6 times its width), so it stands narrow; the others may fill it.
     public var bodyShare: Double { self == .piggyBank ? 0.45 : 1 }
+    /// The room it leaves under its foot at State0, in its canvas's heights: a safe's gold and a piggy bank's coins pile on
+    /// the floor in front of it, lower than its foot (a safe's State5 pour ran off the canvas's bottom, 2026-10-05).
+    public var footRoom: Double { anchoredAtTop ? 0.08 : 0 }
     /// Its State0: closed, empty, unlit.
     var closed: String {
         switch self {
@@ -9155,17 +9158,23 @@ public enum PotStates {
         return (Double(a + b) / 2, end, Double(b - a))
     }
 
-    /// A pot wider than `share` of its canvas (straight RGBA, `w` by `h`) made smaller to it, standing centred on the
-    /// row it stood on; nil when it is narrow enough already.
-    public static func narrowed(_ px: [UInt8], width w: Int, height h: Int, share: Double) -> [UInt8]? {
-        guard share < 1, let f = foot(px, width: w, height: h) else { return nil }
+    /// A pot made to stand as its kind needs (PotKind.bodyShare, footRoom): no wider than `share` of its canvas, centred,
+    /// and its foot `room` of the canvas's height above its bottom; nil when it stands so already.
+    public static func stood(_ px: [UInt8], width w: Int, height h: Int, share: Double, room: Double) -> [UInt8]? {
+        guard let f = foot(px, width: w, height: h) else { return nil }
         let cols = (0..<w).filter { x in (0..<h).reduce(0) { $0 + (px[($1 * w + x) * 4 + 3] > 128 ? 1 : 0) } >= max(1, h / 100) }
-        guard let a = cols.first, let b = cols.last, Double(b - a) > share * Double(w) + 2 else { return nil }
-        let k = share * Double(w) / Double(b - a)
+        guard let a = cols.first, let b = cols.last else { return nil }
+        let k = min(1, share * Double(w) / Double(max(1, b - a))), end = min(Double(f.end), Double(h - 1) - room * Double(h))
+        guard k < 0.99 || Double(f.end) - end > 2 else { return nil }
         let scaled = FrameKit.resized(FrameKit.Piece(px: px, w: w, h: h), Int((Double(w) * k).rounded()), Int((Double(h) * k).rounded()))
         var out = [UInt8](repeating: 0, count: w * h * 4)
-        FrameKit.over(&out, width: w, scaled, at: Int((Double(w) / 2 - Double(a + b) / 2 * k).rounded()), Int((Double(f.end) * (1 - k)).rounded()))
+        FrameKit.over(&out, width: w, scaled, at: k < 0.99 ? Int((Double(w) / 2 - Double(a + b) / 2 * k).rounded()) : 0, Int((end - Double(f.end) * k).rounded()))
         return out
+    }
+    /// Whether a state runs off its canvas: more than a speck of it on the bottom row or a side column.
+    public static func cutOff(_ px: [UInt8], width w: Int, height h: Int) -> Bool {
+        (0..<w).filter { px[((h - 1) * w + $0) * 4 + 3] > 128 }.count > w / 50
+            || (0..<h).filter { px[$0 * w * 4 + 3] > 128 || px[($0 * w + w - 1) * 4 + 3] > 128 }.count > h / 50
     }
 
     /// `state` laid on `empty`, both straight RGBA on the same `w` by `h` canvas, by the end of it that stays put as it
