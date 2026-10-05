@@ -765,7 +765,8 @@ enum APIKeys {
     /// That key, from the environment (a run started from Claude Code inherits it) or from the hub's
     /// store, the `env` block of ~/.claude/settings.json (what Navigator sees when opened from Finder).
     static func hubKey(_ account: String) -> String? {
-        guard let name = hubNames[account] else { return nil }
+        // NAVIGATOR_IGNORE_HUB=1: as on a Mac without Claude Code — only the keys Navigator keeps itself.
+        guard let name = hubNames[account], ProcessInfo.processInfo.environment["NAVIGATOR_IGNORE_HUB"] == nil else { return nil }
         func clean(_ s: String?) -> String? {
             let t = s?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return t.isEmpty ? nil : t
@@ -785,6 +786,8 @@ enum APIKeys {
     // The OpenAI API key (GPT Image 2.5 frames): the art director's own, set with the H5G AI Connect hub
     // (`keys.mjs set openai`, masked) or in AI → API Keys…
     static var openAI: String? { get { get("OpenAI") } set { set(newValue ?? "", "OpenAI") } }
+    /// Posted when AI ▸ API Keys… saves, so windows showing what a key enables look again.
+    static let changed = Notification.Name("NavigatorAPIKeysChanged")
 }
 
 // MARK: - OpenAI images (GPT Image 2.5)
@@ -797,14 +800,20 @@ enum OpenAIImages {
     /// A 2048 high-quality edit before its usage is known: measured $0.121–0.134 a call over 14 calls,
     /// one in four drawn twice (2026-10-03).
     static let estimate = 0.16
-    static var available: Bool { APIKeys.lookup("OpenAI").key != nil }
+    /// Whether a key is set up — asked without reading it, so a window drawing its buttons never raises the keychain's
+    /// password prompt (which it does once after every update of a self-signed app).
+    static var available: Bool { PermissionProbe.keyStored(account: "OpenAI") == .granted }
 
     /// With no images, a new image from the prompt (images/generations); with some, an edit of the last,
     /// the others its references (images/edits).
     /// `size` wide, `height` tall (square when nil): each a multiple of 16, as GPT Image takes them.
     static func edit(prompt: String, images: [Data], size: Int = 2048, height: Int? = nil, quality: String = "high") -> (png: Data?, cost: Double, error: String?) {
         let dims = "\(size)x\(height ?? size)"
-        guard let key = APIKeys.openAI else { return (nil, 0, "No OpenAI API key: set one in AI → API Keys…") }
+        let found = APIKeys.lookup("OpenAI")
+        guard let key = found.key else {
+            return (nil, 0, found.accessDenied ? "The keychain didn’t hand over the OpenAI key — choose Always Allow when it asks (once after each Navigator update)."
+                                               : "No OpenAI API key: add one in AI ▸ API Keys…")
+        }
         guard !PaidCalls.disabled else { return (nil, 0, PaidCalls.refusal) }
         var req = URLRequest(url: URL(string: "https://api.openai.com/v1/images/\(images.isEmpty ? "generations" : "edits")")!, timeoutInterval: 360)
         req.httpMethod = "POST"
@@ -19219,7 +19228,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc func apiKeysAction(_ sender: Any?) {
         let a = NSAlert()
         a.messageText = "API keys"
-        a.informativeText = "fal.ai: Layerize and the Topaz upscaler. OpenAI: GPT Image 2.5, which draws the symbol frames. Stored in your macOS keychain, not in a file. A key set with the H5G AI Connect hub is used first.\n\nNo fal key yet? Get Key opens fal’s dashboard. Switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
+        let falHub = APIKeys.hubKey("fal.ai") != nil, openAIHub = APIKeys.hubKey("OpenAI") != nil
+        a.informativeText = "OpenAI: GPT Image 2.5, which draws GDD to Assets' frames, reel area, pots, pop-ups and localized lettering — on OpenAI's own API, billed to the account the key belongs to. fal.ai: Layerize and the Topaz upscaler. Both are kept in your Mac's keychain, not in a file."
+            + (falHub || openAIHub ? " The \([falHub ? "fal" : nil, openAIHub ? "OpenAI" : nil].compactMap { $0 }.joined(separator: " and ")) key comes from the H5G AI Connect hub, so it is changed there." : "")
+            + "\n\nNo OpenAI key yet? Get OpenAI Key opens OpenAI's key page. No fal key? Get fal Key opens fal's dashboard — switch to the High5games team there first (account switcher, top left) so usage bills the team, not you."
         func field(_ placeholder: String, _ value: String?) -> NSSecureTextField {
             let f = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
             f.placeholderString = placeholder; f.stringValue = value ?? ""
@@ -19227,17 +19239,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         let fal = field("fal.ai key (e.g. 1234abcd-…:…)", APIKeys.fal)
         let openAI = field("OpenAI key (sk-…)", APIKeys.lookup("OpenAI").key)
-        let stack = NSStackView(views: [fal, openAI]); stack.orientation = .vertical; stack.spacing = 8
+        fal.isEnabled = !falHub; openAI.isEnabled = !openAIHub
+        let stack = NSStackView(views: [openAI, fal]); stack.orientation = .vertical; stack.spacing = 8
         stack.frame = NSRect(x: 0, y: 0, width: 380, height: 56)
         a.accessoryView = stack
-        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel"); a.addButton(withTitle: "Get Key…")
-        a.window.initialFirstResponder = fal
+        a.addButton(withTitle: "Save"); a.addButton(withTitle: "Cancel"); a.addButton(withTitle: "Get OpenAI Key…"); a.addButton(withTitle: "Get fal Key…")
+        a.window.initialFirstResponder = openAIHub ? fal : openAI
         switch a.runModal() {
         case .alertFirstButtonReturn:
             let key = fal.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let oKey = openAI.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if key != (APIKeys.fal ?? "") { APIKeys.fal = key; FalKeyCheck.last = nil }   // a new key has no verdict yet
-            if APIKeys.hubKey("OpenAI") == nil && oKey != (APIKeys.openAI ?? "") { APIKeys.openAI = oKey; OpenAIKeyCheck.last = nil }
+            if !falHub && key != (APIKeys.fal ?? "") { APIKeys.fal = key; FalKeyCheck.last = nil }   // a new key has no verdict yet
+            if !openAIHub && oKey != (APIKeys.openAI ?? "") { APIKeys.openAI = oKey; OpenAIKeyCheck.last = nil }
+            NotificationCenter.default.post(name: APIKeys.changed, object: nil)
             // Checked now, while the keys are in hand — no keychain read, so no prompt.
             DispatchQueue.global(qos: .userInitiated).async {
                 var lines: [String] = []
@@ -19251,6 +19265,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 }
             }
         case .alertThirdButtonReturn:
+            NSWorkspace.shared.open(URL(string: "https://platform.openai.com/api-keys")!)
+        case NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertThirdButtonReturn.rawValue + 1):
             NSWorkspace.shared.open(URL(string: "https://fal.ai/dashboard/keys")!)
         default: break
         }
@@ -26687,7 +26703,12 @@ final class GDDToAssetsRun: ObservableObject {
                 }
                 let r = OpenAIImages.edit(prompt: ask, images: inputs, size: rw, height: rh)
                 cost += r.cost
-                guard let d = r.png, let drawn = pixels(d, w, h) else { problems.append("\(what): \(r.error ?? "no image")"); return best?.px }
+                guard let d = r.png, let drawn = pixels(d, w, h) else {
+                    // A missing or refused key fails every drawing alike: said once, not once a piece.
+                    let e = r.error ?? "no image"
+                    if e.contains("OpenAI API key") || e.contains("keychain") { if !problems.contains(e) { problems.append(e) } } else { problems.append("\(what): \(e)") }
+                    return best?.px
+                }
                 let px = finish?(drawn) ?? drawn
                 let c = covered?(px) ?? 0, j = judge?(px) ?? (problems: [], excess: 0)
                 navLog(String(format: "gdd reel: %@ attempt %d covers %.1f%% of its openings, %d problems%@ $%.3f", what, attempt, c * 100, j.problems.count,
@@ -28100,6 +28121,18 @@ final class GDDToAssetsRun: ObservableObject {
 }
 
 
+/// Said where GPT Image 2.5 is needed and no OpenAI key is set up — a Mac without Claude Code has none until one is added.
+struct OpenAIKeyNote: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "key.fill").foregroundColor(.orange)
+            Text("GPT Image 2.5 draws the frames and the game interface on your own OpenAI key, and none is set up yet.")
+                .font(.caption).foregroundColor(.orange).fixedSize(horizontal: false, vertical: true)
+            Button("Add OpenAI Key…") { NSApp.sendAction(#selector(AppDelegate.apiKeysAction(_:)), to: nil, from: nil) }
+        }
+    }
+}
+
 /// The languages a set's lettered pieces are localized into (phase 3), from the studio's own.
 struct LanguagePicker: View {
     @Binding var selection: [String]
@@ -29192,6 +29225,7 @@ struct AssetBrowserView: View {
             lightbox = startLightbox
         }
         .onChange(of: run.imagesVersion) { _, _ in reload() }
+        .onReceive(NotificationCenter.default.publisher(for: APIKeys.changed)) { _ in run.objectWillChange.send() }
         .onReceive(tick) { _ in if folderPrint() != fingerprint { reload() } }
         .onReceive(NotificationCenter.default.publisher(for: GDDReviewWindow.select)) { n in
             guard (n.object as? URL) == folder, let id = n.userInfo?["id"] as? String else { return }
@@ -29580,6 +29614,7 @@ struct AssetBrowserView: View {
                     .disabled(empty || working != nil || !OpenAIImages.available || GDDToAssetsRun.piece(of: a.id) == nil || run.reelLayout == nil)
                     .help("Drawn again the way the set drew it, with your change added to its brief")
             }
+            if !OpenAIImages.available { OpenAIKeyNote() }
         }
     }
 
@@ -29660,6 +29695,7 @@ struct AssetBrowserView: View {
             }
             .fixedSize()
             .disabled(run.reelLayout == nil || !OpenAIImages.available || run.keying)
+            .help(OpenAIImages.available ? "Draw the game interface by phase, or one piece again." : "The game interface is drawn by GPT Image 2.5 on your own OpenAI key: add one in AI ▸ API Keys…")
             LanguagePicker(selection: $run.languages)
                 .onChange(of: run.languages) { _, _ in run.writeManifest(to: folder) }
             let missing = folder.appendingPathComponent("localization-missing.txt")
@@ -30264,6 +30300,7 @@ struct GDDToAssetsSheet: View {
         .onChange(of: outParent) { _, _ in placeSet() }
         .onChange(of: run.jobs.map { $0.subject + "|" + $0.silhouette }) { _, _ in save(currentSession) }
         .onChange(of: run.languages) { _, _ in save(currentSession) }
+        .onReceive(NotificationCenter.default.publisher(for: APIKeys.changed)) { _ in run.objectWillChange.send() }
         .onDisappear { saveWork?.perform() }
         .sheet(item: $picking) { which in
             NavigatorFolderPicker(
@@ -31061,6 +31098,7 @@ struct GDDToAssetsSheet: View {
                             .font(.caption).foregroundColor(core.left.isEmpty && core.total > 0 ? .green : .secondary)
                             .id(run.review.approvedCount(in: core.left) + run.imagesVersion)
                     }
+                    if !OpenAIImages.available { OpenAIKeyNote() }
                     HStack(spacing: 8) {
                         LanguagePicker(selection: $run.languages)
                         Text(run.languages.isEmpty ? "Phase 3 letters the game's pieces in the languages chosen here."
@@ -31120,6 +31158,9 @@ struct GDDToAssetsSheet: View {
                         ForEach(FrameArtist.allCases, id: \.self) { Text($0.rawValue) }
                     }.labelsHidden().fixedSize()
                     .help("GPT Image 2.5 (your OpenAI key, AI ▸ API Keys…) paints each frame on Navigator's moulding and keeps its window; one that drifts is drawn again, then built from parts. Parts sheet: a length of moulding and its ornaments, swept round the outline in code — exact for every shape.")
+                    if run.frameArtist == .gpt && !OpenAIImages.available {
+                        Text("No OpenAI key yet: built from the parts sheet until one is added.").font(.caption).foregroundColor(.orange)
+                    }
                 }
                 HStack(spacing: 6) {
                     Text("High-pay ranks")
