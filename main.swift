@@ -26366,6 +26366,8 @@ final class GDDToAssetsRun: ObservableObject {
         let bonus = jobs.filter { $0.kind == .symbol && $0.role == .bonus }.sorted { $0.id < $1.id }
         if let pots = layout.extras.first(where: { $0.what == "pots" }) {
             let total = pots.count ?? max(1, bonus.count)
+            // What they are (PotKind): as the document says, else as the bonus symbol they are drawn from is, else a pot.
+            let kind = layout.potKind ?? bonus.lazy.compactMap { PotKind.read($0.subject + " " + $0.title) }.first ?? .jar
             if total == 0 { problems.append("the GDD has pots above the reels but says neither how many nor ties them to bonus symbols") }
             let potH = PotStates.height(1024)
             func jar(_ i: Int, _ k: Int) -> String { PotStates.name(pot: i, of: total, state: k) }
@@ -26386,7 +26388,7 @@ final class GDDToAssetsRun: ObservableObject {
                 if bo != nil && symbol == nil { problems.append("pot \(i + 1): \(bo!.id) is not drawn"); continue }
                 let earlier = (0..<i).compactMap { try? Data(contentsOf: url("\(jar($0, 0)).png")) }.prefix(2)
                 let prompt = GDDAssetPrompts.potBrief(theme: theme, design: design, backing: (backing.name, b),
-                                                      symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total)
+                                                      symbol: bo?.subject.trimmingCharacters(in: CharacterSet(charactersIn: ". ")), number: i + 1, of: total, kind: kind)
                 let inputs = symbol.map { [downsamplePNG($0, longEdge: 1536) ?? $0] } ?? earlier.map { downsamplePNG($0, longEdge: 1024) ?? $0 }
                 // Stood at the bottom of a taller canvas: room for what rises from it when full (PotStates).
                 if let px = paint(jar(i, 0), prompt: prompt, inputs: inputs, w: 1024, h: 1024, covered: nil, judge: legible(.pot, 1024, 1024)) {
@@ -26418,11 +26420,11 @@ final class GDDToAssetsRun: ObservableObject {
                 var lid = load("\(lidN)_rmbg.png").flatMap { $0.w == 1024 && $0.h == potH ? $0.px : nil }
                 let statesToDraw = (1...PotStates.levels).contains { !has("\(jar(i, $0)).png") && wanted("\(jar(i, $0)).png") }
                 // An open pot drawn already: its lid taken from it again, free.
-                if lid == nil, statesToDraw, let open = load("\(PotStates.openName(pot: i, of: total))_rmbg.png"), open.w == 1024, open.h == potH,
+                if kind == .jar, lid == nil, statesToDraw, let open = load("\(PotStates.openName(pot: i, of: total))_rmbg.png"), open.w == 1024, open.h == potH,
                    let l = PotStates.lidFrom(empty: e0.px, open: open.px, width: 1024, height: potH) {
                     write(FrameKit.onBacking(l, b), 1024, potH, "\(lidN).png"); write(l, 1024, potH, "\(lidN)_rmbg.png"); lid = l
                 }
-                if lid == nil, statesToDraw, !fm.fileExists(atPath: noLid.path), let s0png = try? Data(contentsOf: url("\(jar(i, 0)).png")) {
+                if kind == .jar, lid == nil, statesToDraw, !fm.fileExists(atPath: noLid.path), let s0png = try? Data(contentsOf: url("\(jar(i, 0)).png")) {
                     let r = H5GService.describe(prompt: "This is a pot drawn for a video slot game. Does it have a lid, cover or door sitting on top of it that could open? Answer with one word: yes or no.",
                                                 systemPrompt: nil, imagePNG: downsamplePNG(s0png, longEdge: 768) ?? s0png)
                     cost += r.cost ?? 0
@@ -26443,7 +26445,38 @@ final class GDDToAssetsRun: ObservableObject {
                 // A lid resting on the treasure stands as far above it as it stood above the rim at State0, so the whole rises
                 // just as far as the treasure: the shipped rise holds for the treasure itself.
                 let cap = PotStates.maxRise
-                for k in 1...PotStates.levels where !has("\(jar(i, k)).png") {
+                for k in 1...PotStates.levels where kind != .jar && !has("\(jar(i, k)).png") {
+                    // A chest, safe or piggy bank: a hinged lid or a door cannot be laid in code, so each state is an edit of
+                    // the one before, opened a step further by the shipped rigs' schedule (PotKind), and judged by Gemini
+                    // against it side by side: clearly further along, lid or door still on.
+                    guard let prev = load("\(jar(i, k - 1))_rmbg.png"), prev.w == 1024, prev.h == potH,
+                          let prevPNG = png(FrameKit.onBacking(prev.px, b), 1024, potH) else { break }
+                    let judge: ([UInt8]) -> (problems: [String], excess: Double) = { px in
+                        let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                        var p: [String] = []
+                        var pair = [UInt8](repeating: 0, count: 2048 * potH * 4)
+                        FrameKit.over(&pair, width: 2048, FrameKit.Piece(px: FrameKit.onBacking(prev.px, b), w: 1024, h: potH), at: 0, 0)
+                        FrameKit.over(&pair, width: 2048, FrameKit.Piece(px: FrameKit.onBacking(laid, b), w: 1024, h: potH), at: 1024, 0)
+                        if let pairPNG = png(pair, 2048, potH) {
+                            let part = kind == .safe ? "door" : "lid"
+                            let r = H5GService.describe(prompt: "Left: a \(kind.noun) at one stage of filling. Right: the same \(kind.noun) at the next stage. Answer two questions with yes or no, in the form 'further: yes, attached: yes'. further — is the right one clearly further along than the left (\(kind == .piggyBank ? "more coins piled round it" : "its \(part) open wider, or more treasure")? attached — \(kind == .piggyBank ? "is the piggy bank itself unchanged?" : "is its \(part) still on it, attached?")",
+                                                        systemPrompt: nil, imagePNG: downsamplePNG(pairPNG, longEdge: 1024) ?? pairPNG)
+                            cost += r.cost ?? 0
+                            let t = r.text?.lowercased() ?? ""
+                            if t.contains("further: no") { p.append("it is not clearly further along than the stage before — \(kind.opening(k).isEmpty ? "" : kind.opening(k) + ", ")\(kind.treasure(k))") }
+                            if t.contains("attached: no") { p.append(kind == .piggyBank ? "the piggy bank itself changed — keep it exactly as it is" : "its \(part) was taken away — it stays attached at its hinge") }
+                        }
+                        var x = Double(p.count)
+                        if PotStates.holeShare(laid, width: 1024, height: potH, besides: e0.px) > 0.005 { p.append("the background shows through inside it — paint every part of the treasure solid"); x += 1 }
+                        if let m = Legibility.measure(laid, width: 1024, height: potH, kind: .pot) { p += Legibility.problems(m, kind: .pot); x += Legibility.excess(m, kind: .pot) }
+                        return (p, x)
+                    }
+                    guard let px = paint(jar(i, k), prompt: GDDAssetPrompts.potKindStateBrief(theme: theme, backing: (backing.name, b), kind: kind, level: k),
+                                         inputs: [prevPNG], w: 1024, h: potH, covered: nil, judge: judge) else { break }
+                    let laid = PotStates.registered(FrameKit.keyed(px, backing: b, width: 1024, height: potH), to: e0.px, width: 1024, height: potH)
+                    write(FrameKit.onBacking(laid, b), 1024, potH, "\(jar(i, k)).png"); write(laid, 1024, potH, "\(jar(i, k))_rmbg.png")
+                }
+                for k in 1...PotStates.levels where kind == .jar && !has("\(jar(i, k)).png") {
                     // A pot whose lid is its own part: each state from the open pot, the heap to the schedule's height and the
                     // lid laid on it — GPT lifts what it is given a little, and grown from each other the overshoot compounded
                     // (37% by State5, 2026-10-05); the state before attached only for the treasure's look. Without a lid part:
@@ -28604,6 +28637,9 @@ struct GameSheetEditor: View {
                 Text("Pots").foregroundColor(.secondary)
                 HStack(spacing: 6) {
                     Stepper(sheet.pots == 0 ? "None" : "\(sheet.pots) pot\(sheet.pots == 1 ? "" : "s") above the reels", value: $sheet.pots, in: 0...6).fixedSize()
+                    if sheet.pots > 0 {
+                        Picker("", selection: $sheet.potKind) { ForEach(PotKind.allCases, id: \.self) { Text($0.noun.capitalized) } }.labelsHidden().fixedSize()
+                    }
                     if sheet.pots > 1 {
                         TextField("What each unlocks, for its plaque: Expand, Multi, …", text: $sheet.potFeatures).frame(maxWidth: 300)
                     }

@@ -13834,3 +13834,25 @@ final class PotLidTests: XCTestCase {
         XCTAssertEqual(PotStates.lidTilt, PotStates.lidTilt.sorted())
     }
 }
+
+final class PotKindTests: XCTestCase {
+    // What a pot is, from the document's own word (written for the test), and kept through a typed sheet.
+    func testThePotsKindIsReadAndKept() {
+        XCTAssertEqual(PotKind.read("A safe sits above the matrix and fills as wilds land."), .safe)
+        XCTAssertEqual(PotKind.read("Three treasure chests above the reels fill with coins."), .chest)
+        XCTAssertEqual(PotKind.read("The piggy bank above the matrix collects coins."), .piggyBank)
+        XCTAssertEqual(PotKind.read("A coin collection pot sits above the matrix."), .jar)
+        XCTAssertNil(PotKind.read("The bonus games are played on a 3x5 matrix."))
+        var sheet = GameSheet(); sheet.pots = 2; sheet.potKind = .chest
+        let symbols = GDDSymbolSetRules.parseManual("WD, HP1-4, LP1-5, BO1-2").symbols
+        XCTAssertEqual(sheet.layout(symbols).potKind, .chest)
+        XCTAssertEqual(ReelLayoutRules.read(sheet.document(game: "Test", symbols: symbols)).potKind, .chest)
+        XCTAssertEqual(GameSheet(layout: sheet.layout(symbols)).potKind, .chest)
+        // Each kind opens by its own schedule, a step each state, and its closed state says it is shut.
+        for kind in [PotKind.chest, .safe] {
+            XCTAssertEqual(Set((1...5).map { kind.opening($0) }).count, 5)
+            XCTAssertTrue(kind.closed.contains("shut"))
+        }
+        XCTAssertTrue(GDDAssetPrompts.potKindStateBrief(theme: GameTheme(name: "Test"), backing: ("magenta", RGB8(255, 0, 255)), kind: .chest, level: 5).contains("fully open"))
+    }
+}

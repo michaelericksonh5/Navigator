@@ -8207,6 +8207,8 @@ public struct ReelLayout: Equatable, Codable, Sendable {
     public var potFeatures: [String]? = nil
     /// How the pots look with the Power Bet on, in the GDD's words, when it gives them a look of their own (PotStates.boost).
     public var potBoost: String? = nil
+    /// What the pots are (PotKind), when the document says: a chest, a safe, a piggy bank, a pot.
+    public var potKind: PotKind? = nil
     /// The game's own win celebrations, lowest first, when its GDD names them (PopUps.winTiers(read:)); nil: the platform's.
     public var winTiers: [String]? = nil
     /// The base game's grid, the one the bezel is built round.
@@ -8478,9 +8480,15 @@ public enum ReelLayoutRules {
                 if lower.range(of: #"\bjackpot (table|paytable|pay table|area|display|meters?|plaques?|banner)s?\b|\bpaytables? above"#, options: .regularExpression) != nil {
                     addExtra(ReelLayout.Extra(what: "jackpot table", rows: nil, reels: nil, place: place(lower)))
                 }
-                if lower.range(of: #"\b(pots?|pot avatar|collection pot)\b|\bsafe (above|fills|at the top)|\bthe safe\b|\b(hoard|basket) (above|fills)"#, options: .regularExpression) != nil {
-                    let n = groups(re(#"\b\#(num) (?:\w+ ){0,2}pots\b"#), lower).compactMap { number($0.g[1]) }.first
-                    let singular = lower.range(of: #"\bpots\b|\bpot \d"#, options: .regularExpression) == nil
+                // Pots, or the vessel a game fills instead — a chest, safe, vault or piggy bank — when it sits above the reels
+                // or fills (a pick bonus's chests do neither).
+                let vessel = #"(chests?|coffers?|vaults?|piggy ?banks?|piggies|jars?|cauldrons?|urns?)"#
+                if lower.range(of: #"\b(pots?|pot avatar|collection pot)\b|\bsafe (above|fills|at the top)|\bthe safe\b|\b(hoard|basket) (above|fills)"#, options: .regularExpression) != nil
+                    || (lower.range(of: #"\b\#(vessel)\b"#, options: .regularExpression) != nil
+                        && lower.range(of: #"\babove the (matrix|reels)\b|\b(fills?|filling|fill up)\b"#, options: .regularExpression) != nil
+                        && lower.range(of: #"\b(pick|picks|picking|select|reveal)\b"#, options: .regularExpression) == nil) {
+                    let n = groups(re(#"\b\#(num) (?:\w+ ){0,2}(?:pots|chests|coffers|safes|vaults|piggy ?banks|piggies|jars|cauldrons|urns)\b"#), lower).compactMap { number($0.g[1]) }.first
+                    let singular = lower.range(of: #"\b(pots|chests|coffers|safes|vaults|piggy ?banks|piggies|jars|cauldrons|urns)\b|\bpot \d"#, options: .regularExpression) == nil
                     addExtra(ReelLayout.Extra(what: "pots", rows: nil, reels: nil, place: place(lower), count: n ?? (singular ? 1 : nil)))
                 }
                 if lower.range(of: #"\bmeters?\b"#, options: .regularExpression) != nil,
@@ -8523,7 +8531,12 @@ public enum ReelLayoutRules {
         }
         if gdd.lowercased().contains("one more chance") { out.awards = ["one more chance"] }
         if let pots = out.extras.first(where: { $0.what == "pots" }), (pots.count ?? 0) > 1 { out.potFeatures = PotStates.features(gdd, count: pots.count!) }
-        if out.extras.contains(where: { $0.what == "pots" }) { out.potBoost = PotStates.boost(gdd) }
+        if out.extras.contains(where: { $0.what == "pots" }) {
+            out.potBoost = PotStates.boost(gdd)
+            // What they are: the vessel word in the lines that speak of them filling or sitting above the reels.
+            let lines = gdd.components(separatedBy: .newlines).filter { $0.range(of: #"(?i)\b(fill|fills|filling|collect|collects|above the (matrix|reels)|feeds?)\b"#, options: .regularExpression) != nil }
+            out.potKind = lines.lazy.compactMap { PotKind.read($0) }.first
+        }
         out.winTiers = PopUps.winTiers(read: gdd)
         return out
     }
@@ -8766,6 +8779,63 @@ extension ReelArea {
 /// state swap in game would jump. The foot is what filling leaves alone: each state is scaled to the empty
 /// pot's foot width and set on its foot's bottom centre. Every pot file has `headroom` clear above the pot,
 /// room for what rises from it when full (square, GPT filled the canvas and the treasure was cut flat).
+/// What a game's pot is, and so how it shows that it fills. Every shipped rig (18 exports, research/pots.md) is a fixed
+/// body, a lid or door that opens a little more each state, and treasure that rises until it overflows — or, with no
+/// opening, treasure piling up round it. The rig is `shared_avatar_jar` whatever the object.
+public enum PotKind: String, Codable, CaseIterable, Sendable {
+    /// A pot, jar, urn, cauldron or drum: its lid lifted by the treasure (88 Drums, Cauldron Cash; the lid its own part).
+    case jar
+    /// A chest, coffer or casket: its lid swinging open on its hinge in steps (Da Vinci 77: about 74° to fully open over
+    /// five states; Jewel of Alexandria), the treasure rising and spilling over its front.
+    case chest
+    /// A safe, vault or strongbox: its door swinging open in steps, gold stacked inside (Bankrush's safe).
+    case safe
+    /// A piggy bank, or any closed figure with no lid: the treasure piling up round its base and behind it (the Blitz
+    /// vault medallion's pile grows sideways round its base, to about 2.6 times its width).
+    case piggyBank
+    public var noun: String { switch self { case .jar: "pot"; case .chest: "treasure chest"; case .safe: "safe"; case .piggyBank: "piggy bank" } }
+    public var nouns: String { switch self { case .jar: "pots"; case .chest: "treasure chests"; case .safe: "safes"; case .piggyBank: "piggy banks" } }
+    /// Its State0: closed, empty, unlit.
+    var closed: String {
+        switch self {
+        case .jar: "empty and unlit — its lid closed if it has one, its mouth open and empty if not"
+        case .chest: "closed and unlit: its lid shut on its hinge, nothing of its treasure showing"
+        case .safe: "closed and unlit: its door shut and locked, nothing of its treasure showing"
+        case .piggyBank: "unlit, nothing round it: a sturdy piggy bank with a coin slot in its back"
+        }
+    }
+    /// How far it has opened at each state, 1…5 (the jar's lid is laid in code; this is its words when it is not).
+    func opening(_ k: Int) -> String {
+        let i = min(max(k, 1), 5) - 1
+        switch self {
+        case .jar: return ["its lid lifted just off its rim", "its lid lifted a little and tipped back", "its lid tipped further back", "its lid swung open", "its lid thrown open"][i]
+        case .chest: return ["its lid open just a crack on its hinge, about 15°", "its lid open about 30°", "its lid open about halfway, 45°", "its lid open about 60°", "its lid thrown fully open on its hinge, 75° or more"][i]
+        case .safe: return ["its door unlatched and open a crack", "its door open about a quarter", "its door open about halfway", "its door open most of the way", "its door swung wide open"][i]
+        case .piggyBank: return ["", "", "", "", ""][i]
+        }
+    }
+    /// Where its treasure is at each state, 1…5.
+    func treasure(_ k: Int) -> String {
+        let i = min(max(k, 1), 5) - 1
+        switch self {
+        case .jar, .chest: return ["the first of its treasure glinting inside", "its treasure showing at the rim", "its treasure heaped level with the rim",
+                                   "its treasure heaped above the rim, beginning to spill over the front", "full to overflowing: treasure pouring over the rim and down its front and sides"][i]
+        case .safe: return ["a glint of gold inside the gap", "gold bars and coins stacked on its lowest shelf", "gold stacked halfway up inside",
+                            "gold stacked to the top inside, a few coins spilling out over the sill", "full to overflowing: gold pouring out of the door and piling in front of it"][i]
+        case .piggyBank: return ["a few coins scattered at its feet", "a small pile of coins round its feet", "coins piled round it up to its belly",
+                                 "coins piled round and behind it up to its back, more falling from its slot", "full to overflowing: a great pile of coins round and behind it, spilling wide, coins bursting from its slot"][i]
+        }
+    }
+    /// The kind a text names: the first vessel word in it.
+    public static func read(_ text: String) -> PotKind? {
+        let l = text.lowercased()
+        let words: [(String, PotKind)] = [(#"\bpiggy[ -]?banks?\b|\bpiggies\b|\bpiggy\b"#, .piggyBank), (#"\b(safes?|vaults?|strongbox(es)?|strong box(es)?)\b"#, .safe),
+                                          (#"\b(chests?|coffers?|caskets?|treasure box(es)?)\b"#, .chest),
+                                          (#"\b(pots?|jars?|urns?|cauldrons?|drums?|vases?|pumpkins?|chalices?|amphoras?)\b"#, .jar)]
+        return words.compactMap { (re, k) in l.range(of: re, options: .regularExpression).map { ($0.lowerBound, k) } }.min { $0.0 < $1.0 }?.1
+    }
+}
+
 public enum PotStates {
     /// Room above the pot, in its width: half — a lid thrown open early (GPT, 2026-10-04: 16% of the pot's height at
     /// State1) still leaves the later states room to keep rising; 1024x1536 is a size GPT Image draws natively.
@@ -9625,6 +9695,8 @@ public struct GameSheet: Equatable, Codable, Sendable {
     public var tutorial = false
     /// With the Power Bet on, how the pots look, when they change ("The pot turns gold, gold coins behind it"); empty: no change.
     public var potBoost = ""
+    /// What the pots are; a jar unless set.
+    public var potKind = PotKind.jar
     /// The win celebrations, lowest first ("Big Win, Super Win, Ultra Win"); empty: the platform's.
     public var winTiers = ""
 
@@ -9641,7 +9713,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         holdAndSpin = try v(.holdAndSpin, ""); jackpotNames = try v(.jackpotNames, ""); jackpotTable = try v(.jackpotTable, true)
         pots = try v(.pots, 0); potFeatures = try v(.potFeatures, ""); wheel = try v(.wheel, .none); bonusWheel = try v(.bonusWheel, false)
         oneMoreChance = try v(.oneMoreChance, false); powerBet = try v(.powerBet, false); tutorial = try v(.tutorial, false)
-        potBoost = try v(.potBoost, ""); winTiers = try v(.winTiers, "")
+        potBoost = try v(.potBoost, ""); winTiers = try v(.winTiers, ""); potKind = try v(.potKind, .jar)
     }
     /// The win celebrations as lettered ("BIG WIN!"), nil for the platform's.
     var tiers: [String]? {
@@ -9699,6 +9771,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         if oneMoreChance { out.awards = ["one more chance"] }
         let boost = potBoost.trimmingCharacters(in: .whitespaces)
         if powerBet && pots > 0 && !boost.isEmpty { out.potBoost = Wording.noFree(boost) }
+        if pots > 0 { out.potKind = potKind }
         out.winTiers = tiers
         return out
     }
@@ -9720,7 +9793,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         if !hold.isEmpty { d += [hold, "\(hold) is played on a \(rows)x\(reels) matrix of independent reels."] }
         if !names.isEmpty { d += ["Jackpots", "The jackpots are the \(list(names)) jackpots" + (jackpotTable ? ", shown on the jackpot table above the matrix." : ".")] }
         if pots > 0 {
-            d += ["Pots", "There \(pots == 1 ? "is 1 pot" : "are \(pots) pots") that sit above the matrix and fill as the game is played."]
+            d += ["Pots", "There \(pots == 1 ? "is 1 \(potKind.noun)" : "are \(pots) \(potKind.nouns)") that sit above the matrix and fill as the game is played."]
             let f = potWords.map { $0.lowercased() }.filter { !$0.isEmpty }
             if pots > 1 && f.count == pots { d.append("The pots are tied to \(pots) features: \(f.joined(separator: ", ")).") }
         }
@@ -9760,7 +9833,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         let owned: (ReelLayout.Extra) -> Bool = { e in e.what == "jackpot table" || e.what == "pots" || e.what == "wheel"
             || ((e.what == "hot reel" || e.what == "extra reel") && e.place == "above" && e.mode == nil) }
         l.extras = l.extras.filter { !owned($0) } + fresh.extras
-        l.potFeatures = fresh.potFeatures; l.potBoost = fresh.potBoost; l.winTiers = fresh.winTiers
+        l.potFeatures = fresh.potFeatures; l.potBoost = fresh.potBoost; l.winTiers = fresh.winTiers; l.potKind = fresh.potKind
         l.awards = ((l0.awards ?? []).filter { $0 != "one more chance" } + (fresh.awards ?? [])).nilIfEmpty
         // A wheel of the same kind keeps the wedges read off the GDD; the Bonus Wheel comes and goes with the sheet.
         if wheel == .none { l.wheels = nil }
@@ -9794,6 +9867,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         bonusWheel = l.wheels?.contains { $0.name.hasPrefix("Bonus") } ?? false
         oneMoreChance = l.awards?.contains("one more chance") ?? false
         potBoost = l.potBoost ?? ""
+        potKind = l.potKind ?? .jar
         winTiers = (l.winTiers ?? []).map { $0.dropLast().capitalized }.joined(separator: ", ")
     }
 }
@@ -15961,12 +16035,24 @@ extension GDDAssetPrompts {
     /// A pot above the reels, tied to a bonus symbol (attached): the same vessel, larger and grander, empty.
     /// `symbol` nil: a pot with no bonus symbol of its own (the GDD names more pots than it has), drawn to
     /// match the game's other pots (attached when there are any).
-    static func potBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), symbol: String?, number: Int, of total: Int) -> String {
-        [
-            symbol.map { "Image 1 is a bonus symbol of a video slot game themed “\(theme.name)”: \($0). Draw the pot that stands above the reels for it, which fills up as the game is played: the same vessel — its shape, material, colour and ornament — larger and grander, standing upright, seen straight on, empty and unlit — its lid closed if it has one, its mouth open and empty if not — the whole vessel in view with a small even margin." }
-            ?? "Draw pot \(number) of the \(total) pots that stand above the reels of a video slot game themed “\(theme.name)”, which fill up as the game is played: a grand vessel of this theme, \(number > 1 ? "matching the attached pots in construction and size, a colour of its own, " : "")standing upright, seen straight on, empty and unlit — its lid closed if it has one, its mouth open and empty if not — the whole vessel in view with a small even margin.",
-            "No text, lettering, numbers or symbols on it.",
+    static func potBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), symbol: String?, number: Int, of total: Int, kind: PotKind = .jar) -> String {
+        let what = kind == .jar ? "vessel" : kind.noun
+        return [
+            symbol.map { "Image 1 is a bonus symbol of a video slot game themed “\(theme.name)”: \($0). Draw the \(kind.noun) that stands above the reels for it, which fills up as the game is played: \(kind == .jar ? "the same vessel" : "a \(kind.noun) in that symbol's style") — its \(kind == .jar ? "shape, " : "")material, colour and ornament — larger and grander, standing upright, seen straight on, \(kind.closed), the whole \(what) in view with a small even margin." }
+            ?? "Draw \(kind.noun) \(number) of the \(total) \(kind.nouns) that stand above the reels of a video slot game themed “\(theme.name)”, which fill up as the game is played: a grand \(what) of this theme, \(number > 1 ? "matching the attached ones in construction and size, a colour of its own, " : "")standing upright, seen straight on, \(kind.closed), the whole \(what) in view with a small even margin.",
+            "No text, lettering, numbers or symbols on it." + (kind == .piggyBank ? " Leave room round its base and behind it: coins will pile up there." : ""),
             "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// A chest's, safe's or piggy bank's state `k`, an edit of the state before (attached): opened a step further by the
+    /// shipped rigs' schedule (PotKind.opening) and its treasure a step higher (PotKind.treasure), nothing else changed.
+    static func potKindStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), kind: PotKind, level k: Int) -> String {
+        let opening = kind.opening(k)
+        return [
+            "Edit the attached image: it is the \(kind.noun) that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. Show the same \(kind.noun) at fill stage \(k) of 5: \(opening.isEmpty ? "" : opening + ", ")\(kind.treasure(k)) — the theme's own coins, gems or gold, as large, chunky pieces with smooth faces and a handful of bright highlights, never a glittering mass of tiny pieces. At a glance it must look clearly further along than the stage before.",
+            "Everything else stays exactly as it is: its shape, size, position, material, colour and ornament\(kind == .piggyBank ? "" : ", and its \(kind == .safe ? "door" : "lid") stays attached at its hinge — never taken away"). A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
         ].joined(separator: "\n\n")
