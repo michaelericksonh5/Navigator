@@ -18159,6 +18159,8 @@ final class SetupAssistantController {
 // never finds it and never calls it. Verified live — File → Eject stayed enabled on
 // a disk that can't be ejected, and Edit → Undo never greyed out or renamed itself.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate {
+    /// AI ▸ Open Recent Set, filled each time it opens (RecentSets).
+    var recentSetsMenu: NSMenu?
     var window: NavWindow!
     /// View ▸ Columns. Rebuilt on open (menuNeedsUpdate) rather than filled once at
     /// startup, because its tick marks belong to whichever folder is showing right now —
@@ -18669,7 +18671,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // Finder Quick Actions call back via our navigatoraction:// scheme.
         let actionURLs = urls.filter { $0.scheme == "navigatoraction" }
         if !actionURLs.isEmpty { actionURLs.forEach { handleActionURL($0) }; return }
-        let urls = urls.filter { $0.isFileURL }
+        var urls = urls.filter { $0.isFileURL }
+        // A set's .navset file: the set, in the editor, as it was left.
+        let sets = urls.filter { $0.pathExtension == SetLauncher.fileExtension }
+        if !sets.isEmpty {
+            if !mainWindowShown { suppressMainWindow = true }
+            Task { @MainActor in sets.forEach { GDDToAssetsWindow.open(set: $0) } }
+            urls.removeAll { $0.pathExtension == SetLauncher.fileExtension }
+        }
         guard !urls.isEmpty else { return }
         // Images → our built-in viewer (when Navigator is the default image app,
         // opening one from Finder lands here). Do NOT NSWorkspace.open them, or it
@@ -19090,6 +19099,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let gddItem = aiMenu.addItem(withTitle: "GDD to Assets…",
                                      action: #selector(gddToAssetsAction(_:)), keyEquivalent: "")
         gddItem.target = self
+        let openSetItem = aiMenu.addItem(withTitle: "Open Set…", action: #selector(openSetAction(_:)), keyEquivalent: "")
+        openSetItem.target = self
+        let recentItem = aiMenu.addItem(withTitle: "Open Recent Set", action: nil, keyEquivalent: "")
+        let recent = NSMenu(title: "Open Recent Set"); recent.delegate = self; recentItem.submenu = recent
+        recentSetsMenu = recent
         let reviewItem = aiMenu.addItem(withTitle: "Open a Set’s Assets…",
                                         action: #selector(reviewSetAction(_:)), keyEquivalent: "")
         reviewItem.target = self
@@ -19123,6 +19137,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     // hub, and generate the game's whole symbol set and backgrounds.
     @objc func gddToAssetsAction(_ sender: Any?) {
         Task { @MainActor in GDDToAssetsWindow.open() }
+    }
+    /// AI ▸ Open Set… — a set's .navset file, or its folder, in the editor as it was left.
+    @objc func openSetAction(_ sender: Any?) {
+        Task { @MainActor in
+            let p = NSOpenPanel()
+            p.canChooseDirectories = true; p.canChooseFiles = true; p.allowsMultipleSelection = false
+            p.allowedContentTypes = [UTType(filenameExtension: SetLauncher.fileExtension) ?? .json, .folder]
+            p.message = "Choose a set: its .navset file, or the folder GDD to Assets made it in"
+            guard p.runModal() == .OK, let u = p.url else { return }
+            GDDToAssetsWindow.open(set: u)
+        }
+    }
+    @objc func openRecentSetAction(_ sender: NSMenuItem) {
+        guard let f = sender.representedObject as? URL else { return }
+        Task { @MainActor in GDDToAssetsWindow.open(set: f) }
     }
 
     // AI → Review & Revise a Set… — reopen any set folder GDD to Assets made (it carries
@@ -19615,6 +19644,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     /// right-click menu reads and writes (see ColumnMenu). Neither menu keeps its own copy,
     /// so toggling Owner in one shows it ticked in the other.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === recentSetsMenu {
+            menu.removeAllItems()
+            let list = RecentSets.list()
+            for s in list {
+                let item = menu.addItem(withTitle: s.game, action: #selector(openRecentSetAction(_:)), keyEquivalent: "")
+                item.target = self; item.representedObject = s.folder; item.toolTip = s.folder.path
+            }
+            if list.isEmpty { menu.addItem(withTitle: "No sets yet", action: nil, keyEquivalent: "").isEnabled = false }
+            return
+        }
         guard menu === columnsMenu else { return }
         menu.removeAllItems()
         let visible = appModel.active.visibleColumns
@@ -21952,7 +21991,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gdd-snapshot"), flag + 2 <
                          backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
         w.appearance = NSAppearance(named: .darkAqua)
-        w.contentView = NSHostingView(rootView: GDDToAssetsSheet(run: run, initialDocument: nil, onClose: {}))
+        // As Open Set opens it: the editor put back as it was left.
+        w.contentView = NSHostingView(rootView: GDDToAssetsSheet(run: run, initialDocument: nil, restore: run.editorSession, onClose: {}))
         w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
         w.orderFrontRegardless()
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
@@ -21961,6 +22001,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gdd-snapshot"), flag + 2 <
                let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) {
                 try? png.write(to: out)
             }
+            print("STATUS: \(run.status)\nJOBS WITH SUBJECTS: \(run.jobs.filter { !$0.subject.isEmpty }.count) of \(run.jobs.count)\nSPENT: \(run.spent)")
             print("WROTE: \(out.path)"); exit(0)
         }
     } }
@@ -24610,6 +24651,8 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var imagesVersion = 0
     /// Changes asked for in the asset browser's Draw Again, by picture, added to that picture's brief on its next drawing.
     var pictureNotes: [String: String] = [:]
+    /// What the editor held for this set (SetSession), saved with it so it opens back up where it was left.
+    var editorSession: SetSession?
     /// What each finished image actually came back as, e.g. "2048x2048". Shown per
     /// row because the requested size is not a promise — see GeneratedSizeRules.
     @Published var delivered: [String: String] = [:]
@@ -27649,7 +27692,15 @@ extension GDDToAssetsRun {
         var m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
                             backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
         m.typed = typed; m.localize = localizeIntro
+        if var s = editorSession { s.savedAt = Date(); m.session = s }
         if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
+        // The file it opens from — one per set, named for the game — and the recent sets.
+        let launcher = SetLauncher.fileName(game: gameName, folder: folder)
+        for n in ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []) where n.hasSuffix("." + SetLauncher.fileExtension) && n != launcher {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(n))
+        }
+        try? SetLauncher(game: gameName, folder: folder.path).encoded()?.write(to: folder.appendingPathComponent(launcher))
+        RecentSets.add(folder)
         // The document itself (read, or written from a typed sheet): the studio pieces, Find What Else It Needs and
         // a corrected structure all read it again after the set is reopened.
         if !gddText.isEmpty { try? gddText.write(to: folder.appendingPathComponent(SetManifest.documentName), atomically: true, encoding: .utf8) }
@@ -27667,6 +27718,9 @@ extension GDDToAssetsRun {
         run.theme = t
         run.gameName = m.gdd
         run.jobs = m.jobs()
+        run.symbols = run.jobs.filter { $0.kind == .symbol }.enumerated().map {
+            SlotSymbol(code: $0.element.id, index: $0.offset, role: $0.element.role, tier: $0.element.tier, note: $0.element.title)
+        }
         run.design = m.design()
         let picked = run.design
         run.framing = Framing(picked)
@@ -27682,10 +27736,21 @@ extension GDDToAssetsRun {
         run.gddText = (try? String(contentsOf: folder.appendingPathComponent(SetManifest.documentName), encoding: .utf8)) ?? ""
         run.lastFolder = folder
         run.loadReview(folder)
+        // What the editor held, and what the run had learned: no style read, no plan, nothing paid on opening.
+        run.styleRead = m.themeStyle.isEmpty ? .noArt : .ok
+        if let s = m.session {
+            run.editorSession = s
+            if let k = LowPayKind(rawValue: s.lowPays) { run.lowPays = k }
+            run.lowPayCustom = s.lowPayCustom
+            run.palette = s.palette.compactMap { $0.count == 3 ? RGB8(UInt8(clamping: $0[0]), UInt8(clamping: $0[1]), UInt8(clamping: $0[2])) : nil }
+            run.lastVerdict = s.verdicts; run.delivered = s.delivered; run.failures = s.failures; run.spent = s.spent
+            if s.styleChosen, let picked = SlotArtStyles.byID(s.styleID) { run.theme?.chosenStyle = picked }
+        }
         ThemeHubClient.themes { list, _ in
             guard let hub = list?.first(where: { $0.name == m.themeName }) else { return }
             DispatchQueue.main.async {
                 var t2 = hub; t2.styleFromArt = m.themeStyle
+                t2.chosenStyle = run.theme?.chosenStyle
                 run.theme = t2
             }
         }
@@ -28447,6 +28512,24 @@ extension GDDToAssetsRun {
     }
 }
 
+/// The sets opened or saved lately, newest first, for AI ▸ Open Recent Set.
+enum RecentSets {
+    private static let key = "recentSets"
+    static func add(_ folder: URL) {
+        var list = (UserDefaults.standard.stringArray(forKey: key) ?? []).filter { $0 != folder.path }
+        list.insert(folder.path, at: 0)
+        UserDefaults.standard.set(Array(list.prefix(12)), forKey: key)
+    }
+    /// The ones still there, with their games' names.
+    static func list() -> [(folder: URL, game: String)] {
+        (UserDefaults.standard.stringArray(forKey: key) ?? []).compactMap { p in
+            let f = URL(fileURLWithPath: p)
+            guard let d = try? Data(contentsOf: f.appendingPathComponent(SetManifest.fileName)), let m = SetManifest.decode(d) else { return nil }
+            return (f, m.gdd.isEmpty ? f.lastPathComponent : m.gdd)
+        }
+    }
+}
+
 /// GPT Image's sizes: within 8.29 MP and 3840 a side, a megapixel at least, multiples of 16, no more than 3:1.
 enum GPTSize {
     static func fit(_ w: Int, _ h: Int) -> (w: Int, h: Int) {
@@ -28680,6 +28763,8 @@ struct AssetBrowserView: View {
                 Text("Dark").tag("dark"); Text("Checker").tag("checker"); Text("Light").tag("light")
             }
             .labelsHidden().fixedSize().help("What shows through the cut-outs")
+            Button { GDDToAssetsWindow.open(set: folder) } label: { Label("Editor", systemImage: "slider.horizontal.3") }
+                .help("This set in the GDD to Assets editor, as it was left — its document, theme, sizes, structure and plan")
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
     }
@@ -29463,7 +29548,15 @@ struct GDDToAssetsSheet: View {
     var initialDocument: URL? = nil
     /// Open on "No GDD yet — type the set" (the typed-set snapshot).
     var startTyped = false
+    /// A saved set's editor state, put back on opening (GDDToAssetsWindow.open(set:)).
+    var restore: SetSession? = nil
     let onClose: () -> Void
+    /// While a saved set is put back, the handlers that would read the document again, clear the plan for a "new" theme or
+    /// start a style read stand aside: opening a set never pays for anything.
+    @State private var restoring = false
+    @State private var restoringTheme: String?
+    @State private var restoringGDD: String?
+    @State private var saveWork: DispatchWorkItem?
 
     @State private var gddFolder: URL? = GDDLibrary.folder
     @State private var entries: [GDDLibrary.Entry] = []
@@ -29667,8 +29760,13 @@ struct GDDToAssetsSheet: View {
                 // else starts the read.
                 loadGDD()
             } else if let f = gddFolder { entries = GDDLibrary.entries(in: f) }
+            if let s = restore { putBack(s) }
             loadThemes()
         }
+        // Saved as it goes, a moment after each change, once the set has its folder: the editor and the plan.
+        .onChange(of: currentSession) { _, s in save(s) }
+        .onChange(of: run.jobs.map { $0.subject + "|" + $0.silhouette }) { _, _ in save(currentSession) }
+        .onDisappear { saveWork?.perform() }
         .sheet(item: $picking) { which in
             NavigatorFolderPicker(
                 title: which == .gdds ? "Choose the GDDs folder"
@@ -29707,6 +29805,54 @@ struct GDDToAssetsSheet: View {
             content().padding(.leading, 26)
         }
         .id("step\(n)")
+    }
+
+    /// The editor as it stands, as a set saves it (SetSession).
+    private var currentSession: SetSession {
+        var s = SetSession(); s.savedAt = .distantPast
+        s.fromDocument = fromDocument; s.gddFolder = gddFolder?.path; s.gddFile = pickedGDD?.url.path
+        s.manualSpec = manualSpec; s.sheet = sheet
+        s.size = size; s.symbolAspect = symbolAspect; s.backgroundAspect = backgroundAspect; s.backgroundSize = backgroundSize
+        s.removeBackground = removeBG; s.separateFrames = separateFrames; s.outputParent = outParent?.path
+        s.styleChosen = styleMode; s.styleID = styleID
+        s.lowPays = run.lowPays.rawValue; s.lowPayCustom = run.lowPayCustom
+        s.palette = run.palette.map { [Int($0.r), Int($0.g), Int($0.b)] }
+        s.verdicts = run.lastVerdict; s.delivered = run.delivered; s.failures = run.failures; s.spent = run.spent
+        return s
+    }
+    /// Kept with the set a second after the last change (its navigator-set.json and .navset), never while putting one back.
+    private func save(_ s: SetSession) {
+        guard !restoring else { return }
+        run.editorSession = s
+        saveWork?.cancel()
+        let work = DispatchWorkItem { if let f = run.lastFolder, run.theme != nil { run.writeManifest(to: f) } }
+        saveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+    }
+    /// A saved set's editor put back as it was left — nothing read again, nothing redesigned, nothing paid.
+    private func putBack(_ s: SetSession) {
+        restoring = true
+        fromDocument = s.fromDocument
+        if let f = s.gddFolder {
+            gddFolder = URL(fileURLWithPath: f)
+            entries = GDDLibrary.entries(in: gddFolder!)
+            if let g = s.gddFile, let e = entries.first(where: { $0.url.path == g }) { restoringGDD = g; pickedGDD = e }
+        }
+        if !s.manualSpec.isEmpty { manualSpec = s.manualSpec }
+        manualName = run.gameName
+        if let sh = s.sheet { sheet = sh }
+        if !s.size.isEmpty { size = s.size }
+        if !s.symbolAspect.isEmpty { symbolAspect = s.symbolAspect }
+        if !s.backgroundAspect.isEmpty { backgroundAspect = s.backgroundAspect }
+        if !s.backgroundSize.isEmpty { backgroundSize = s.backgroundSize }
+        removeBG = s.removeBackground; separateFrames = s.separateFrames
+        // Where it goes: where it was saved going, else beside the set itself.
+        outParent = s.outputParent.map { URL(fileURLWithPath: $0) } ?? run.lastFolder?.deletingLastPathComponent()
+        styleMode = s.styleChosen; styleID = s.styleID
+        restoringTheme = run.theme?.name
+        run.status = "Opened \(run.gameName.isEmpty ? "the set" : run.gameName) as it was left"
+            + (s.savedAt > .distantPast ? " on \(s.savedAt.formatted(date: .abbreviated, time: .shortened))" : "") + "."
+        DispatchQueue.main.async { restoring = false }
     }
 
     /// The four steps as tabs along the top — each a click away however long the page — with where the set stands,
@@ -29823,7 +29969,10 @@ struct GDDToAssetsSheet: View {
                           let e = visibleEntries.first(where: { $0.name == name }) else { return }
                     pickedGDD = e
                 }
-                .onChange(of: pickedGDD) { loadGDD() }
+                .onChange(of: pickedGDD) {
+                    if let r = restoringGDD, pickedGDD?.url.path == r { restoringGDD = nil; return }
+                    loadGDD()
+                }
                 .disabled(run.busy || run.running)
 
                 // Read it yourself. The window says what it found in the document; this
@@ -29920,7 +30069,7 @@ struct GDDToAssetsSheet: View {
             }
             Text("The game").bold().padding(.top, 4)
             GameSheetEditor(sheet: $sheet, jackpots: run.symbols.filter { $0.role == .jackpot }.count)
-                .onChange(of: sheet) { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect) }
+                .onChange(of: sheet) { if !restoring { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect) } }
         }
         .disabled(run.busy || run.running)
     }
@@ -30055,6 +30204,8 @@ struct GDDToAssetsSheet: View {
                     pickedTheme = t
                 }
                 .onChange(of: pickedTheme) {
+                    // A saved set's own theme, shown again: its style, plan and choices stay as they were.
+                    if let r = restoringTheme, pickedTheme?.name == r { restoringTheme = nil; return }
                     run.theme = pickedTheme
                     // A style picked for the previous game is not a choice about this
                     // one. Left set, the picker would still read "Choose a style" while
@@ -30183,7 +30334,7 @@ struct GDDToAssetsSheet: View {
                 }
                 .pickerStyle(.segmented).frame(width: 340).labelsHidden()
                 .disabled(run.busy || run.running)
-                .onChange(of: styleMode) { applyArtStyle() }
+                .onChange(of: styleMode) { if !restoring { applyArtStyle() } }
                 if !styleMode, run.busy {
                     ProgressView().controlSize(.small)
                 }
@@ -30210,7 +30361,7 @@ struct GDDToAssetsSheet: View {
                     }
                     .frame(maxWidth: 320).labelsHidden()
                     .disabled(run.busy || run.running)
-                    .onChange(of: styleID) { applyArtStyle() }
+                    .onChange(of: styleID) { if !restoring { applyArtStyle() } }
                     Spacer()
                 }
                 if !styleQuery.trimmingCharacters(in: .whitespaces).isEmpty,
@@ -30348,10 +30499,10 @@ struct GDDToAssetsSheet: View {
                 }
             }
             .disabled(run.busy || run.running)
-            .onChange(of: size) { reflow() }
-            .onChange(of: symbolAspect) { reflow() }
-            .onChange(of: backgroundAspect) { reflow() }
-            .onChange(of: backgroundSize) { reflow() }
+            .onChange(of: size) { if !restoring { reflow() } }
+            .onChange(of: symbolAspect) { if !restoring { reflow() } }
+            .onChange(of: backgroundAspect) { if !restoring { reflow() } }
+            .onChange(of: backgroundSize) { if !restoring { reflow() } }
             if run.modelFlag == "nb2" && size == "2K" {
                 // Beside the setting it is about, not below the post-processing options.
                 Label("2K often comes back at half size. Navigator retries at 4K and scales "
@@ -31006,6 +31157,7 @@ struct GDDToAssetsSheet: View {
             loadingThemes = false
             if let list {
                 themes = list; themeError = nil; run.status = "\(list.count) themes loaded."
+                if let r = restoringTheme { pickedTheme = list.first { $0.name == r } }
                 if PaidCalls.disabled { ArtPanelProbe.windowThemes = list.count }
                 return
             }
@@ -31340,19 +31492,33 @@ enum GDDToAssetsWindow {
     private static var guards: [CloseGuard] = []
     /// `document`: a GDD right-clicked in Finder — the window opens on its folder with it
     /// picked. The saved GDD folder is left alone; that stays the user's choice.
-    @MainActor static func open(document: URL? = nil) {
+    /// A saved set (its folder, or its .navset file) in the editor, as it was left — or, when it is open already, that window.
+    @MainActor static func open(set: URL) {
+        let folder = set.pathExtension == SetLauncher.fileExtension ? SetLauncher.setFolder(of: set) : set
+        guard let folder, let run = GDDToAssetsRun.reopen(folder) else {
+            reportFileError("Not a set Navigator can open", "“\(set.lastPathComponent)” is not a GDD to Assets set, or its folder has moved.")
+            return
+        }
+        if let w = windows.first(where: { $0.representedURL == folder }) { w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        RecentSets.add(folder)
+        open(document: nil, run: run, restore: run.editorSession ?? SetSession(), folder: folder)
+    }
+
+    @MainActor static func open(document: URL? = nil, run given: GDDToAssetsRun? = nil, restore: SetSession? = nil, folder: URL? = nil) {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 740),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
         w.minSize = NSSize(width: 940, height: 700)
-        w.title = "GDD to Assets"
-        let run = GDDToAssetsRun()
+        w.title = folder.map { "GDD to Assets — \(given?.gameName.isEmpty == false ? given!.gameName : $0.lastPathComponent)" } ?? "GDD to Assets"
+        w.representedURL = folder
+        w.setFrameAutosaveName("GDDToAssets")
+        let run = given ?? GDDToAssetsRun()
         let guardian = CloseGuard(run: run)
         w.delegate = guardian
         guards.append(guardian)
         w.contentView = NSHostingView(
-            rootView: GDDToAssetsSheet(run: run, initialDocument: document, onClose: { [weak w] in
+            rootView: GDDToAssetsSheet(run: run, initialDocument: document, restore: restore, onClose: { [weak w] in
                 guardian.force = true
                 w?.close()
             }))

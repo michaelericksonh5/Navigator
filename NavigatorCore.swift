@@ -16840,6 +16840,9 @@ public struct SetManifest: Codable, Equatable {
     public var symbols: [Symbol]
     /// The reels the GDD lays out (ReelLayoutRules), read when it was loaded; nil in sets made before.
     public var reels: ReelLayout?
+    /// The editor as it was left — the document, theme style, sizes, structure, low pays, the run's checks and spend —
+    /// so the set opens back up in the editor where it stood (SetSession). Nil in sets saved before.
+    public var session: SetSession?
 
     init(game: String, gdd: String, theme: GameTheme, design: SetDesign, jobs: [AssetJob],
                 backing: (name: String, rgb: RGB8), model: String, reels: ReelLayout? = nil) {
@@ -16875,11 +16878,88 @@ public struct SetManifest: Codable, Equatable {
         SetDesign(hero: hero, anchorID: anchorID, look: look, families: families,
                   cast: cast.map { CastMember(name: $0.name, kind: $0.kind, look: $0.look, inArt: $0.inArt) })
     }
-    public func encoded() -> Data? {
-        let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return try? e.encode(self)
+    public func encoded() -> Data? { try? JSONEncoder.withDates.encode(self) }
+    /// A set always opens: an editor session it cannot read (written by a newer Navigator, or edited by hand) is dropped,
+    /// never the set with it.
+    public static func decode(_ data: Data) -> SetManifest? {
+        if let m = try? JSONDecoder.withDates.decode(SetManifest.self, from: data) { return m }
+        guard var o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], o["session"] != nil else { return nil }
+        o["session"] = nil
+        return (try? JSONSerialization.data(withJSONObject: o)).flatMap { try? JSONDecoder.withDates.decode(SetManifest.self, from: $0) }
     }
-    public static func decode(_ data: Data) -> SetManifest? { try? JSONDecoder().decode(SetManifest.self, from: data) }
+}
+
+/// What the GDD to Assets editor held for a set, saved with it (SetManifest.session) so the set opens back up where it was
+/// left: what was picked and typed, and what the run learned along the way. The pictures, their earlier versions, the
+/// review and the prompts are files in the set's folder already. Every field optional when read: a set saved by an older
+/// Navigator opens with the rest at their defaults.
+public struct SetSession: Codable, Equatable, Sendable {
+    public var savedAt = Date()
+    public var fromDocument = true
+    public var gddFolder: String?
+    public var gddFile: String?
+    public var manualSpec = ""
+    public var sheet: GameSheet?
+    public var size = "", symbolAspect = "", backgroundAspect = "", backgroundSize = ""
+    public var removeBackground = false, separateFrames = false
+    public var outputParent: String?
+    public var styleChosen = false, styleID = ""
+    public var lowPays = "", lowPayCustom = ""
+    public var palette: [[Int]] = []
+    public var verdicts: [String] = []
+    public var delivered: [String: String] = [:]
+    public var failures: [String: String] = [:]
+    public var spent = 0.0
+    public init() {}
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ k: CodingKeys, _ d: T) throws -> T { try c.decodeIfPresent(T.self, forKey: k) ?? d }
+        savedAt = try v(.savedAt, Date.distantPast); fromDocument = try v(.fromDocument, true)
+        gddFolder = try c.decodeIfPresent(String.self, forKey: .gddFolder); gddFile = try c.decodeIfPresent(String.self, forKey: .gddFile)
+        manualSpec = try v(.manualSpec, ""); sheet = (try? c.decodeIfPresent(GameSheet.self, forKey: .sheet)) ?? nil
+        size = try v(.size, ""); symbolAspect = try v(.symbolAspect, ""); backgroundAspect = try v(.backgroundAspect, ""); backgroundSize = try v(.backgroundSize, "")
+        removeBackground = try v(.removeBackground, false); separateFrames = try v(.separateFrames, false)
+        outputParent = try c.decodeIfPresent(String.self, forKey: .outputParent)
+        styleChosen = try v(.styleChosen, false); styleID = try v(.styleID, "")
+        lowPays = try v(.lowPays, ""); lowPayCustom = try v(.lowPayCustom, "")
+        palette = try v(.palette, []); verdicts = try v(.verdicts, []); delivered = try v(.delivered, [:]); failures = try v(.failures, [:])
+        spent = try v(.spent, 0)
+    }
+    /// The same session but for when it was saved: two sessions that differ only in that are the same edit.
+    public func sameEdit(as o: SetSession) -> Bool { var a = self, b = o; a.savedAt = .distantPast; b.savedAt = .distantPast; return a == b }
+}
+
+/// The file a set opens from: `<Game>.navset` in its folder, double-clicked in Finder or picked in Navigator. It names its
+/// folder, so a copy moved elsewhere still finds the set; a set folder moved with its file in it is found beside it.
+public struct SetLauncher: Codable, Equatable, Sendable {
+    public static let fileExtension = "navset"
+    public var format = 1
+    public var game: String
+    public var folder: String
+    public var savedAt: Date
+    public init(game: String, folder: String, savedAt: Date = Date()) { self.game = game; self.folder = folder; self.savedAt = savedAt }
+    /// `<Game>.navset`, the game's name made safe for a file name; the folder's own name when the game has none.
+    public static func fileName(game: String, folder: URL) -> String {
+        let bad = CharacterSet(charactersIn: "/:\\?%*|\"<>").union(.newlines).union(.controlCharacters)
+        let name = game.components(separatedBy: bad).joined(separator: "-").trimmingCharacters(in: .whitespaces)
+        return (name.isEmpty ? folder.lastPathComponent : name) + "." + fileExtension
+    }
+    /// The set folder a launcher opens: its own folder when that holds the set, else the folder it names.
+    public static func setFolder(of launcher: URL, manifestName: String = SetManifest.fileName) -> URL? {
+        let beside = launcher.deletingLastPathComponent()
+        if FileManager.default.fileExists(atPath: beside.appendingPathComponent(manifestName).path) { return beside }
+        guard let d = try? Data(contentsOf: launcher), let l = try? JSONDecoder.withDates.decode(SetLauncher.self, from: d) else { return nil }
+        let named = URL(fileURLWithPath: l.folder)
+        return FileManager.default.fileExists(atPath: named.appendingPathComponent(manifestName).path) ? named : nil
+    }
+    public func encoded() -> Data? { try? JSONEncoder.withDates.encode(self) }
+}
+
+extension JSONEncoder {
+    static var withDates: JSONEncoder { let e = JSONEncoder(); e.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]; e.dateEncodingStrategy = .iso8601; return e }
+}
+extension JSONDecoder {
+    static var withDates: JSONDecoder { let d = JSONDecoder(); d.dateDecodingStrategy = .iso8601; return d }
 }
 
 /// How a change asked for in review is made.

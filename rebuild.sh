@@ -91,6 +91,21 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSHandlerRank</key><string>Alternate</string>
     <key>LSItemContentTypes</key><array><string>public.image</string></array>
   </dict>
+  <dict>
+    <key>CFBundleTypeName</key><string>Navigator Set</string>
+    <key>CFBundleTypeRole</key><string>Editor</string>
+    <key>LSHandlerRank</key><string>Owner</string>
+    <key>LSItemContentTypes</key><array><string>com.merickson.navigator.set</string></array>
+  </dict>
+</array>
+<key>UTExportedTypeDeclarations</key>
+<array>
+  <dict>
+    <key>UTTypeIdentifier</key><string>com.merickson.navigator.set</string>
+    <key>UTTypeDescription</key><string>Navigator Set</string>
+    <key>UTTypeConformsTo</key><array><string>public.json</string></array>
+    <key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>navset</string></array></dict>
+  </dict>
 </array>
 <key>NSServices</key>
 <array>

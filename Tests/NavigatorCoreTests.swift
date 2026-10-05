@@ -13951,3 +13951,52 @@ final class PotKindTests: XCTestCase {
         XCTAssertTrue(GDDAssetPrompts.potKindStateBrief(theme: GameTheme(name: "Test"), backing: ("magenta", RGB8(255, 0, 255)), kind: .chest, level: 5).contains("fully open"))
     }
 }
+
+final class SetSessionTests: XCTestCase {
+    // A set saved with its session opens with it; one saved before sessions, or missing fields, still opens.
+    func testASetsSessionIsSavedAndReadBack() throws {
+        var s = SetSession()
+        s.fromDocument = false; s.manualSpec = "HP1-HP4, MP1-MP4"; s.size = "2K"; s.styleChosen = true; s.styleID = "x"
+        var sheet = GameSheet(); sheet.pots = 2; sheet.potKind = .chest; s.sheet = sheet
+        s.palette = [[1, 2, 3]]; s.delivered = ["HP1": "2048x2048"]; s.spent = 1.25
+        let theme = GameTheme(name: "Test Theme", category: "c", look: "l")
+        var m = SetManifest(game: "Test Game", gdd: "Test Game", theme: theme, design: SetDesign(), jobs: [], backing: ("magenta", RGB8(255, 0, 255)), model: "nb2")
+        m.session = s
+        let back = try XCTUnwrap(SetManifest.decode(try XCTUnwrap(m.encoded())))
+        XCTAssertTrue(try XCTUnwrap(back.session).sameEdit(as: s))
+        XCTAssertEqual(back.session!.savedAt.timeIntervalSince1970, s.savedAt.timeIntervalSince1970, accuracy: 1)
+        XCTAssertEqual(back.session?.sheet?.potKind, .chest)
+        // Older: no session at all; a session with only some fields.
+        var old = m; old.session = nil
+        XCTAssertNil(SetManifest.decode(try XCTUnwrap(old.encoded()))?.session)
+        let partial = try JSONDecoder.withDates.decode(SetSession.self, from: Data(#"{"size": "4K"}"#.utf8))
+        XCTAssertEqual(partial.size, "4K"); XCTAssertTrue(partial.fromDocument)
+        // A session it cannot read never stops the set opening: a bad sheet is dropped, a bad session too.
+        let badSheet = try JSONDecoder.withDates.decode(SetSession.self, from: Data(#"{"size": "4K", "sheet": {"wheel": "no such wheel"}}"#.utf8))
+        XCTAssertNil(badSheet.sheet); XCTAssertEqual(badSheet.size, "4K")
+        var o = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(m.encoded())) as? [String: Any])
+        o["session"] = ["savedAt": 12]
+        let opened = SetManifest.decode(try JSONSerialization.data(withJSONObject: o))
+        XCTAssertNotNil(opened); XCTAssertNil(opened?.session); XCTAssertEqual(opened?.game, "Test Game")
+        // The same edit saved twice is the same edit.
+        var later = s; later.savedAt = Date().addingTimeInterval(60)
+        XCTAssertTrue(later.sameEdit(as: s))
+    }
+    // The launcher file: a safe name, and its set found beside it or where it says.
+    func testTheLauncherFindsItsSet() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("set-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        XCTAssertEqual(SetLauncher.fileName(game: "Tiki: Titans/2", folder: dir), "Tiki- Titans-2.navset")
+        XCTAssertEqual(SetLauncher.fileName(game: "", folder: dir), dir.lastPathComponent + ".navset")
+        try Data("{}".utf8).write(to: dir.appendingPathComponent(SetManifest.fileName))
+        let beside = dir.appendingPathComponent("Game.navset")
+        try XCTUnwrap(SetLauncher(game: "Game", folder: "/nowhere").encoded()).write(to: beside)
+        XCTAssertEqual(SetLauncher.setFolder(of: beside)?.path, dir.path)
+        let elsewhere = FileManager.default.temporaryDirectory.appendingPathComponent("moved-\(UUID().uuidString).navset")
+        try XCTUnwrap(SetLauncher(game: "Game", folder: dir.path).encoded()).write(to: elsewhere)
+        XCTAssertEqual(SetLauncher.setFolder(of: elsewhere)?.path, dir.path)
+        let lost = FileManager.default.temporaryDirectory.appendingPathComponent("lost-\(UUID().uuidString).navset")
+        try XCTUnwrap(SetLauncher(game: "Game", folder: "/nowhere").encoded()).write(to: lost)
+        XCTAssertNil(SetLauncher.setFolder(of: lost))
+    }
+}
