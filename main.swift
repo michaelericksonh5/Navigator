@@ -14637,8 +14637,9 @@ final class ZoomView: NSView {
     /// did not yet. They used to disagree - layout() always fitted - so which one won was a
     /// race on load timing: a 3000x2000 image arriving before layout opened fitted at 31%
     /// while a 400x300 image arriving after opened at 100%.
+    var fitOnLoad = false
     private func applyInitialZoom() {
-        guard Prefs.imageViewerActualSize else { fit(); return }
+        guard Prefs.imageViewerActualSize, !fitOnLoad else { fit(); return }
         // Set _zoom directly rather than calling actualSize(): that routes through zoomAt(),
         // which early-returns when the zoom does not change, and _zoom is already 1 on a fresh
         // view - so needsDisplay was never set and the image never got its first paint.
@@ -14740,8 +14741,11 @@ final class ZoomController: ObservableObject {
 struct ZoomableImageView: NSViewRepresentable {
     let url: URL
     let controller: ZoomController
+    /// Opens fitted whatever the viewer preference says (the asset browser's close-up).
+    var fitOnLoad = false
     func makeNSView(context: Context) -> ZoomView {
         let v = ZoomView()
+        v.fitOnLoad = fitOnLoad
         v.onZoomChange = { z, fit in DispatchQueue.main.async { controller.zoom = z; controller.fitZoom = fit } }
         controller.view = v
         context.coordinator.url = url
@@ -19086,7 +19090,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         let gddItem = aiMenu.addItem(withTitle: "GDD to Assets…",
                                      action: #selector(gddToAssetsAction(_:)), keyEquivalent: "")
         gddItem.target = self
-        let reviewItem = aiMenu.addItem(withTitle: "Review & Revise a Set…",
+        let reviewItem = aiMenu.addItem(withTitle: "Open a Set’s Assets…",
                                         action: #selector(reviewSetAction(_:)), keyEquivalent: "")
         reviewItem.target = self
         aiMenu.addItem(NSMenuItem.separator())
@@ -21899,8 +21903,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--finish"), flag + 2 < Comma
     app.run()
 }
 
-// Free:  Navigator --review-snapshot <set folder> <out.png> [image id]
-// The Review & revise window for a set folder, drawn off screen into a PNG — to check the design
+// Free:  Navigator --review-snapshot <set folder> <out.png> [image id] [--lightbox]
+// The asset browser for a set folder, drawn off screen into a PNG — to check the design
 // without opening anything on the display.
 // Free, and only with NAVIGATOR_NO_PAID_CALLS=1:  Navigator --gdd-snapshot <set folder> <out.png>
 // The GDD window around a reopened set, off screen — its plan's frames and picks as the window shows them.
@@ -21970,13 +21974,14 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
     DispatchQueue.main.async { MainActor.assumeIsolated {
         guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName) in \(folder.path)"); exit(1) }
         // Borderless and far off screen: drawn by the window server like any window, seen by no one.
-        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 1240, height: 860), styleMask: [.borderless],
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 1440, height: 900), styleMask: [.borderless],
                          backing: .buffered, defer: false)
         w.appearance = NSAppearance(named: .darkAqua)
-        w.contentView = NSHostingView(rootView: GDDReviewView(run: run, folder: folder, startID: flag + 3 < args.count ? args[flag + 3] : nil))
+        w.contentView = NSHostingView(rootView: AssetBrowserView(run: run, folder: folder, startID: flag + 3 < args.count ? args[flag + 3] : nil,
+                                                                 startLightbox: args.contains("--lightbox")))
         w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
         w.orderFrontRegardless()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
             guard let v = w.contentView else { print("FAILED: no view"); exit(1) }
             v.layoutSubtreeIfNeeded(); v.display()
             // What the window server composited, controls and all; cacheDisplay leaves layer-drawn
@@ -21990,6 +21995,28 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
             }
             print("WROTE: \(out.path)"); exit(0)
         }
+    } }
+    app.run()
+}
+
+// Free:  Navigator --replace-picture <set folder> <picture id> <file.png>
+// One picture of a set replaced by a file, exactly as the asset browser's Use My Own Picture does it — the current one
+// kept as a version, and a pot's states built again when it was one of their sources (free from a heaped drawing).
+if let flag = CommandLine.arguments.firstIndex(of: "--replace-picture"), flag + 3 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let folder = URL(fileURLWithPath: args[flag + 1]), id = args[flag + 2], file = URL(fileURLWithPath: args[flag + 3])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        run.loadReview(folder)
+        let symbol = run.reviewIDs(folder).contains(id)
+        if let e = symbol ? run.replaceSymbol(id, with: file, folder: folder) : run.replacePicture(id, with: file, folder: folder) { print("FAILED: \(e)"); exit(1) }
+        // A pot rebuilt in the background: waited for.
+        @MainActor func finish() {
+            if run.keying { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { finish() } }; return }
+            print("STATUS: \(run.status)\nVERSIONS: \(run.review.entry(id).versions.map(\.file).joined(separator: ", "))\nSPENT: \(String(format: "$%.4f", run.spent))"); exit(0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { finish() } }
     } }
     app.run()
 }
@@ -24581,6 +24608,8 @@ final class GDDToAssetsRun: ObservableObject {
     @Published var review = SetReview()
     /// Bumped whenever an image in the set folder is replaced, so views showing it reload.
     @Published var imagesVersion = 0
+    /// Changes asked for in the asset browser's Draw Again, by picture, added to that picture's brief on its next drawing.
+    var pictureNotes: [String: String] = [:]
     /// What each finished image actually came back as, e.g. "2048x2048". Shown per
     /// row because the requested size is not a promise — see GeneratedSizeRules.
     @Published var delivered: [String: String] = [:]
@@ -24834,7 +24863,17 @@ final class GDDToAssetsRun: ObservableObject {
         reelLayout = !typed ? reelLayout.map { sheet.apply(to: $0, symbols) } ?? sheet.layout(symbols) : sheet.layout(symbols)
         reelLayout?.concepts = concepts
         defer { if let f = lastFolder { writeManifest(to: f) } }
-        guard typed else { return }
+        guard typed else {
+            // A GDD's set: the jackpots' names as typed, and a tutorial when asked for (the run reads it from the document).
+            let names = sheet.jackpots(symbols)
+            let order = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }.map(\.id)
+            let current = order.compactMap { id in jobs.first { $0.id == id } }.map { (GDDAssetPrompts.letteredWord($0) ?? $0.title).capitalized }
+            if !sheet.jackpotNames.trimmingCharacters(in: .whitespaces).isEmpty, names.map({ $0.capitalized }) != current {
+                jobs = jobs.map { j in var j = j; if let i = order.firstIndex(of: j.id), i < names.count { j.title = "\(names[i]) jackpot" }; return j }
+            }
+            if sheet.tutorial, !gddText.lowercased().contains("tutorial") { gddText += "\n\nThis project should use an interactive tutorial system." }
+            return
+        }
         symbols = Self.namingJackpots(symbols, sheet: sheet)
         gddText = sheet.document(game: gameName, symbols: symbols)
         let names = Dictionary(uniqueKeysWithValues: symbols.map { ($0.code, $0.note) })
@@ -26201,6 +26240,7 @@ final class GDDToAssetsRun: ObservableObject {
         guard let theme = theme0, let baseGrid = layout.base else { return (0, ["no theme or no grid"]) }
         let b = backing.rgb, space = CGColorSpace(name: CGColorSpace.sRGB)!, fm = FileManager.default
         let log = DispatchQueue.main.sync { self.session() }
+        let notes = DispatchQueue.main.sync { self.pictureNotes }
         var cost = 0.0, problems: [String] = []
         func url(_ n: String) -> URL { folder.appendingPathComponent(n) }
         func has(_ n: String) -> Bool { fm.fileExists(atPath: url(n).path) }
@@ -26232,14 +26272,12 @@ final class GDDToAssetsRun: ObservableObject {
             guard wanted(what + ".png") else { return nil }
             log.write("prompts/\(what).txt", "MODE: \(what) (GPT Image 2.5), \(w)x\(h)\n\n\(prompt)")
             var best: (px: [UInt8], c: Double, failed: [String], score: Double)?
+            // The art director's note for this picture, from the asset browser's Draw Again.
+            let prompt = notes[what].map { prompt + "\n\nTHE ART DIRECTOR ASKED FOR THIS CHANGE — make it: " + $0 } ?? prompt
             var ask = prompt
-            // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up.
-            // Small pieces (a wheel's wedge) asked at a megapixel at least, and scaled back down.
-            let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
-            var rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
-            // Rounding to 16 can tip a 3:1 piece past GPT Image's 3:1 limit (1536x512 asked as 1760x576).
-            if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
-            if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
+            // Within GPT Image's limits — 8.29 MP, 3840 a side — asked smaller and scaled back up; small pieces (a wheel's
+            // wedge) asked at a megapixel at least, and scaled back down; never past 3:1 (GPTSize).
+            let (rw, rh) = GPTSize.fit(w, h)
             for attempt in 1...(covered == nil && judge == nil ? 1 : 2) {
                 if let budget, cost + AssetChecklist.gpt(rw, rh) > budget {
                     if !problems.contains(where: { $0.hasPrefix("stopped at the budget") }) { problems.append(String(format: "stopped at the budget of $%.2f: what is not drawn yet is drawn by the next run", budget)) }
@@ -28120,6 +28158,306 @@ extension GDDToAssetsRun {
 }
 
 
+// ===== GDD to Assets: Asset browser — every image of a set, and every one changeable =====
+
+/// One image of a set as the browser shows it.
+struct SetAsset: Identifiable, Hashable {
+    enum Kind: String { case symbol, interface, potState, potDrawing, potPart, preview }
+    let id: String            // its file stem: HP1, base_interface_bezel, shared_avatar_jar-State3Idle
+    let file: URL             // what is shown: its cut-out when it has one
+    let kind: Kind
+    var label: String
+    /// When the file was last written, so a picture changed on disk shows changed at once.
+    var stamp: Int = 0
+}
+/// A section of the browser: a family of symbols, the backgrounds, a piece of the game interface, a pot, the previews.
+struct SetSection: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let assets: [SetAsset]
+    var pot = false
+}
+
+extension GDDToAssetsRun {
+    /// What the pots of this set are (PotKind), as the run draws them.
+    var potKind: PotKind {
+        reelLayout?.potKind ?? jobs.filter { $0.kind == .symbol && $0.role == .bonus }.sorted { $0.id < $1.id }
+            .lazy.compactMap { PotKind.read($0.subject + " " + $0.title) }.first ?? .jar
+    }
+    /// Everything in the set's folder, in sections: the symbols by family (review order) and the backgrounds, then the
+    /// game interface piece by piece — each pot as its six states with the drawings and parts they are built from — and
+    /// the contact sheets last. Helper files (a wedge's blank, a cut-out beside its picture) are not listed on their own.
+    func catalog(_ folder: URL) -> [SetSection] {
+        let fm = FileManager.default
+        if let layout = reelLayout {
+            let pieces = Self.studioPieces(layout, jobs: jobs, game: gameName, gdd: gddText)
+            Self.conceptNames = (pieces.standard + pieces.planned).map(\.name)
+        }
+        let names = Set((try? fm.contentsOfDirectory(atPath: folder.path)) ?? [])
+        func shown(_ stem: String) -> URL {
+            folder.appendingPathComponent(names.contains("\(stem)_rmbg.png") ? "\(stem)_rmbg.png" : names.contains("\(stem).png") ? "\(stem).png" : "\(stem).jpg")
+        }
+        var sections: [SetSection] = []
+        let symbolIDs = reviewIDs(folder)
+        for g in ReviewOrder.groups(symbolIDs) {
+            sections.append(SetSection(id: "sym-\(g.family)", title: ReviewOrder.title(g.family),
+                                       assets: g.ids.map { SetAsset(id: $0, file: folder.appendingPathComponent("\($0).png"), kind: .symbol, label: $0) }))
+        }
+        let symbols = Set(symbolIDs)
+        // The interface: every picture's stem, its cut-out folded into it.
+        var stems = Set<String>()
+        for n in names where n.hasSuffix(".png") && !n.contains("-blank") {
+            let stem = n.hasSuffix("_rmbg.png") ? String(n.dropLast(9)) : String(n.dropLast(4))
+            guard !symbols.contains(stem), !symbols.contains(where: { stem.hasPrefix($0 + "_") && !stem.hasSuffix("_win") }) else { continue }
+            stems.insert(stem)
+        }
+        // Each pot: its six states in order, the boosted look, then what they are built from.
+        let pots = Dictionary(grouping: stems.filter { $0.hasPrefix("shared_avatar_jar") }) { s -> String in
+            String(s.prefix(while: { $0 != "-" }))
+        }
+        for key in pots.keys.sorted() {
+            let all = pots[key]!
+            let n = key.dropFirst("shared_avatar_jar".count)
+            func order(_ s: String) -> (Int, String) {
+                if let r = s.range(of: #"-State(\d)Idle$"#, options: .regularExpression) { return (Int(s[r].dropFirst(6).prefix(1)) ?? 0, s) }
+                if s.hasSuffix("-boostedIdle") { return (6, s) }
+                if s.hasSuffix("_open") { return (7, s) }
+                if s.hasSuffix("_full") { return (8, s) }
+                if s.hasSuffix("-lid") { return (9, s) }
+                if s.hasSuffix("-body") || s.hasSuffix("-treasure") || s.hasSuffix("-spill") { return (10, s) }
+                return (11, s)
+            }
+            let assets = all.sorted { order($0) < order($1) }.map { s -> SetAsset in
+                let o = order(s).0
+                let kind: SetAsset.Kind = o <= 6 ? .potState : o <= 8 ? .potDrawing : o <= 10 ? .potPart : .interface
+                let label = o <= 5 ? "State \(o)" : o == 6 ? "Power Bet" : o == 7 ? "Open, empty" : o == 8 ? "Heaped full" : o == 9 ? "Lid"
+                    : s.hasSuffix("-body") ? "Body" : s.hasSuffix("-treasure") ? "Treasure" : s.hasSuffix("-spill") ? "Spill" : s.hasSuffix("-plaque") ? "Plaque" : s
+                return SetAsset(id: s, file: shown(s), kind: kind, label: label)
+            }
+            sections.append(SetSection(id: "pot-\(key)", title: n.isEmpty ? "Pot" : "Pot \(n)", assets: assets, pot: true))
+        }
+        stems.subtract(pots.values.flatMap { $0 })
+        // The rest of the interface, piece by piece, as Make Again names them.
+        for p in Self.reelPieces where !p.name.hasPrefix("Pot") {
+            let mine = stems.filter { p.files("\($0).png") || p.files("\($0)_rmbg.png") }.sorted()
+            guard !mine.isEmpty else { continue }
+            stems.subtract(mine)
+            sections.append(SetSection(id: "ui-\(p.name)", title: p.name, assets: mine.map { SetAsset(id: $0, file: shown($0), kind: .interface, label: $0) }))
+        }
+        let others = stems.filter { !$0.hasPrefix("bg_") }.sorted()
+        if !others.isEmpty { sections.append(SetSection(id: "ui-other", title: "Other pictures", assets: others.map { SetAsset(id: $0, file: shown($0), kind: .interface, label: $0) })) }
+        let previews = names.filter { $0.hasSuffix("-preview.jpg") }.sorted()
+        if !previews.isEmpty {
+            sections.append(SetSection(id: "previews", title: "Previews", assets: previews.map {
+                SetAsset(id: String($0.dropLast(4)), file: folder.appendingPathComponent($0), kind: .preview, label: String($0.dropLast(12)))
+            }))
+        }
+        // Each picture's write time, so the browser reloads one the moment it changes.
+        return sections.map { s in
+            var s = s
+            s = SetSection(id: s.id, title: s.title, assets: s.assets.map { a in
+                var a = a
+                a.stamp = Int(((try? a.file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+                return a
+            }, pot: s.pot)
+            return s
+        }
+    }
+
+    // MARK: Changing an interface picture
+
+    /// The Make Again piece an interface picture is made by.
+    static func piece(of stem: String) -> String? {
+        if stem.hasPrefix("shared_avatar_jar") { return stem.contains("-plaque") ? "Pot plaques" : "Pots" }
+        return reelPieces.first { $0.files("\(stem).png") || $0.files("\(stem)_rmbg.png") }?.name
+    }
+    /// A pot picture the six states are built from (PotStates.parts), for a pot made of parts (a jar, a chest).
+    func isPotSource(_ stem: String) -> Bool {
+        (potKind == .jar || potKind == .chest) && (stem.hasSuffix("-State0Idle") || stem.hasSuffix("_open") || stem.hasSuffix("_full"))
+    }
+    /// A pot state built from parts: changed by changing what it is built from.
+    func isBuiltState(_ stem: String) -> Bool {
+        (potKind == .jar || potKind == .chest) && stem.hasPrefix("shared_avatar_jar")
+            && (stem.range(of: #"-State[1-5]Idle$"#, options: .regularExpression) != nil || stem.hasSuffix("-body") || stem.hasSuffix("-treasure") || stem.hasSuffix("-spill"))
+    }
+    /// The current picture and its cut-out kept as a version (review.json), as a revised symbol's are. Returns the archive.
+    @discardableResult func keepPicture(_ stem: String, change: String, mode: ReviewMode, cost: Double, folder: URL) -> String? {
+        let fm = FileManager.default, src = folder.appendingPathComponent("\(stem).png")
+        guard fm.fileExists(atPath: src.path) else { return nil }
+        let archive = review.archiveName(stem), kept = folder.appendingPathComponent(archive)
+        try? fm.createDirectory(at: kept.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.copyItem(at: src, to: kept)
+        let cut = folder.appendingPathComponent("\(stem)_rmbg.png")
+        if fm.fileExists(atPath: cut.path) {
+            let d = folder.appendingPathComponent(SetReview.derivedFolder(archive))
+            try? fm.createDirectory(at: d, withIntermediateDirectories: true)
+            try? fm.copyItem(at: cut, to: d.appendingPathComponent(cut.lastPathComponent))
+        }
+        review.record(stem, replaced: archive, change: change, mode: mode, cost: cost)
+        saveReview(folder)
+        return archive
+    }
+    /// A picture written in place: on the backing as `<stem>.png` and, when the set keeps a cut-out of it, `<stem>_rmbg.png`.
+    func writePicture(_ px: [UInt8], width w: Int, height h: Int, stem: String, folder: URL, alpha: Bool) {
+        let fm = FileManager.default, b = backing.rgb, space = CGColorSpace(name: CGColorSpace.sRGB)!
+        func save(_ p: [UInt8], _ n: String) {
+            if let cg = ChromaKeyOutputRules.image(straightRGBA8: p, width: w, height: h, space: space), let d = encodePNG(cg) { try? d.write(to: folder.appendingPathComponent(n)) }
+        }
+        let cut = folder.appendingPathComponent("\(stem)_rmbg.png")
+        if fm.fileExists(atPath: cut.path) || alpha {
+            let keyed = alpha ? px : FrameKit.keyed(px, backing: b, width: w, height: h)
+            save(keyed, "\(stem)_rmbg.png")
+            save(FrameKit.onBacking(keyed, b), "\(stem).png")
+        } else { save(px, "\(stem).png") }
+        imagesVersion += 1
+    }
+    /// What one change to an interface picture costs: one GPT Image drawing at its size (a pot's source: the drawings
+    /// after it too).
+    func pieceEstimate(_ stem: String, folder: URL) -> Double {
+        guard let cg = loadCGImage(folder.appendingPathComponent("\(stem).png")) else { return AssetChecklist.gpt(1024, 1024) }
+        let one = AssetChecklist.gpt(cg.width, cg.height)
+        if isPotSource(stem) { return one * (stem.hasSuffix("-State0Idle") ? 3 : 1) }
+        return one
+    }
+    /// An interface picture EDITED by GPT Image as described — only what is asked changes — the current one kept as a version.
+    func editPicture(_ stem: String, change: String, folder: URL, done: @escaping (String?) -> Void) {
+        let src = folder.appendingPathComponent("\(stem).png")
+        guard let data = try? Data(contentsOf: src), let cg = loadCGImage(src) else { done("\(stem).png is not in the set folder."); return }
+        let w = cg.width, h = cg.height, b = backing, keyedSet = FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(stem)_rmbg.png").path)
+        let prompt = GDDAssetPrompts.pictureEditBrief(change: change, backing: keyedSet ? (b.name, b.rgb) : nil)
+        status = "Editing \(stem)…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let s = GPTSize.fit(w, h)
+            let r = OpenAIImages.edit(prompt: prompt, images: [downsamplePNG(data, longEdge: max(s.w, s.h)) ?? data], size: s.w, height: s.h)
+            let px = r.png.flatMap(loadCGImage(data:)).flatMap { g -> [UInt8]? in
+                guard let p = ChromaKeyOutputRules.straightRGBA8(g) else { return nil }
+                return g.width == w && g.height == h ? p : FrameKit.resized(FrameKit.Piece(px: p, w: g.width, h: g.height), w, h).px
+            }
+            DispatchQueue.main.async {
+                self.spent += r.cost
+                guard let px else { self.status = "\(stem) not changed: \(r.error ?? "no image came back")"; done(r.error ?? "No image came back."); return }
+                self.keepPicture(stem, change: change, mode: .edit, cost: r.cost, folder: folder)
+                self.writePicture(px, width: w, height: h, stem: stem, folder: folder, alpha: false)
+                self.status = String(format: "%@ changed · $%.2f", stem, r.cost)
+                self.afterPotSourceChanged(stem, folder: folder) { done(nil) }
+            }
+        }
+    }
+    /// An interface picture DRAWN AGAIN the way the run draws it, the change added to its brief; the current one kept.
+    func redrawPicture(_ stem: String, change: String, folder: URL, done: @escaping (String?) -> Void) {
+        guard let layout = reelLayout, let piece = Self.piece(of: stem) else { done("This picture is not made by the game interface run."); return }
+        keepPicture(stem, change: change, mode: .redraw, cost: 0, folder: folder)
+        let fm = FileManager.default
+        for n in ["\(stem).png", "\(stem)_rmbg.png"] { try? fm.removeItem(at: folder.appendingPathComponent(n)) }
+        if isPotSource(stem) { clearBuiltPot(from: stem, folder: folder) }
+        pictureNotes[stem] = change
+        keying = true
+        status = "Drawing \(stem) again…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = self.generateReelArea(layout, folder: folder, only: [piece])
+            DispatchQueue.main.async {
+                self.keying = false; self.pictureNotes[stem] = nil; self.imagesVersion += 1
+                self.status = String(format: "%@ drawn again · $%.2f", stem, r.cost) + (r.problems.isEmpty ? "" : " — " + r.problems.joined(separator: "; "))
+                done(fm.fileExists(atPath: folder.appendingPathComponent("\(stem).png").path) ? nil : (r.problems.first ?? "Nothing came back."))
+            }
+        }
+    }
+    /// The user's own picture put in place of one of the set's, resized to its size; the current one kept.
+    func replacePicture(_ id: String, with file: URL, folder: URL) -> String? {
+        guard let cg = loadCGImage(file), let px0 = ChromaKeyOutputRules.straightRGBA8(cg) else { return "\(file.lastPathComponent) is not a picture Navigator can read." }
+        let cur = loadCGImage(folder.appendingPathComponent("\(id).png"))
+        let w = cur?.width ?? cg.width, h = cur?.height ?? cg.height
+        let px = cg.width == w && cg.height == h ? px0 : FrameKit.resized(FrameKit.Piece(px: px0, w: cg.width, h: cg.height), w, h).px
+        let alpha = stride(from: 3, to: px.count, by: 4).contains { px[$0] < 250 }
+        keepPicture(id, change: "Replaced with \(file.lastPathComponent)", mode: .edit, cost: 0, folder: folder)
+        writePicture(px, width: w, height: h, stem: id, folder: folder, alpha: alpha)
+        status = "\(id) replaced with \(file.lastPathComponent)" + (cg.width == w && cg.height == h ? "" : " (resized from \(cg.width)×\(cg.height) to \(w)×\(h))")
+        afterPotSourceChanged(id, folder: folder) {}
+        return nil
+    }
+    /// An earlier version of an interface picture put back; the one it replaces kept as a version too.
+    func restorePicture(_ stem: String, version file: String, folder: URL) {
+        let fm = FileManager.default, old = folder.appendingPathComponent(file)
+        guard fm.fileExists(atPath: old.path) else { return }
+        keepPicture(stem, change: "Restored \(file)", mode: .edit, cost: 0, folder: folder)
+        try? fm.removeItem(at: folder.appendingPathComponent("\(stem).png"))
+        try? fm.copyItem(at: old, to: folder.appendingPathComponent("\(stem).png"))
+        let kept = folder.appendingPathComponent(SetReview.derivedFolder(file))
+        for n in (try? fm.contentsOfDirectory(atPath: kept.path)) ?? [] {
+            try? fm.removeItem(at: folder.appendingPathComponent(n))
+            try? fm.copyItem(at: kept.appendingPathComponent(n), to: folder.appendingPathComponent(n))
+        }
+        imagesVersion += 1
+        afterPotSourceChanged(stem, folder: folder) {}
+    }
+    /// A built pot's states and parts moved aside (versions/), so the next run builds them again from what changed —
+    /// and, when State0 changed, its open and heaped drawings and lid too, which are drawn from it.
+    func clearBuiltPot(from stem: String, folder: URL) {
+        let fm = FileManager.default, pot = String(stem.prefix(while: { $0 != "-" }))
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+        let kept = folder.appendingPathComponent("versions/pot-\(f.string(from: Date()))")
+        let all = (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+        let sourceChanged = stem.hasSuffix("-State0Idle")
+        for n in all where n.hasPrefix(pot + "-") || n.hasPrefix(pot + "_") {
+            let base = n.replacingOccurrences(of: "_rmbg", with: "").replacingOccurrences(of: ".png", with: "")
+            let built = base.range(of: #"-State[1-5]Idle$"#, options: .regularExpression) != nil || base.hasSuffix("-body") || base.hasSuffix("-treasure") || base.hasSuffix("-spill")
+            let drawnFromState0 = base.hasSuffix("_open") || base.hasSuffix("_full") || base.hasSuffix("-lid") || base.hasSuffix(".none")
+            // The lid is cut from State0 and the open pot: cut again when either changed.
+            let lid = base.hasSuffix("-lid") && stem.hasSuffix("_open")
+            guard base != stem, built || lid || (sourceChanged && drawnFromState0) else { continue }
+            try? fm.createDirectory(at: kept, withIntermediateDirectories: true)
+            try? fm.moveItem(at: folder.appendingPathComponent(n), to: kept.appendingPathComponent(n))
+        }
+    }
+    /// The user's own picture in place of a symbol, at its size: the current one and its cut-outs kept as a version, so
+    /// the review says it is to be cut out again.
+    func replaceSymbol(_ id: String, with file: URL, folder: URL) -> String? {
+        let fm = FileManager.default, cur = folder.appendingPathComponent("\(id).png")
+        guard let cg = loadCGImage(file), let px0 = ChromaKeyOutputRules.straightRGBA8(cg) else { return "\(file.lastPathComponent) is not a picture Navigator can read." }
+        let size = loadCGImage(cur).map { ($0.width, $0.height) } ?? (cg.width, cg.height)
+        let px = (cg.width, cg.height) == size ? px0 : FrameKit.resized(FrameKit.Piece(px: px0, w: cg.width, h: cg.height), size.0, size.1).px
+        let archive = review.archiveName(id)
+        try? fm.createDirectory(at: folder.appendingPathComponent("versions"), withIntermediateDirectories: true)
+        try? fm.copyItem(at: cur, to: folder.appendingPathComponent(archive))
+        Self.archiveDerived(id, archive: archive, folder: folder)
+        guard let out = ChromaKeyOutputRules.image(straightRGBA8: px, width: size.0, height: size.1, space: CGColorSpace(name: CGColorSpace.sRGB)!),
+              let d = encodePNG(out) else { return "That picture could not be written." }
+        try? d.write(to: cur)
+        review.record(id, replaced: archive, change: "Replaced with \(file.lastPathComponent)", mode: .edit, cost: 0)
+        saveReview(folder)
+        imagesVersion += 1
+        status = "\(id) replaced with \(file.lastPathComponent)"
+        return nil
+    }
+    /// After a pot's State0, open or heaped drawing changed: its states built again — free from the heaped drawing, or
+    /// with the drawings that follow from State0 drawn again (paid, priced on the button that started it).
+    func afterPotSourceChanged(_ stem: String, folder: URL, done: @escaping () -> Void) {
+        guard isPotSource(stem), let layout = reelLayout else { done(); return }
+        clearBuiltPot(from: stem, folder: folder)
+        keying = true
+        status = "Building the pot's six states again…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = self.generateReelArea(layout, folder: folder, only: ["Pots"])
+            DispatchQueue.main.async {
+                self.keying = false; self.imagesVersion += 1
+                self.status = String(format: "The pot's states are built again · $%.2f", r.cost) + (r.problems.isEmpty ? "" : " — " + r.problems.joined(separator: "; "))
+                done()
+            }
+        }
+    }
+}
+
+/// GPT Image's sizes: within 8.29 MP and 3840 a side, a megapixel at least, multiples of 16, no more than 3:1.
+enum GPTSize {
+    static func fit(_ w: Int, _ h: Int) -> (w: Int, h: Int) {
+        let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
+        var rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
+        if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
+        if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
+        return (rw, rh)
+    }
+}
+
 // ===== GDD to Assets: Review & revise =====
 
 /// Filmstrip-size images, decoded once per file version so a revised image shows at once.
@@ -28140,255 +28478,577 @@ final class ReviewThumbs {
     }
 }
 
-/// The second pass over a finished set. Every image large, stepped through left and right in
-/// review order (frames, then each symbol type together, backgrounds last); a change typed for
-/// any of them, made as an edit of the image or a redraw from its plan, each priced before it
-/// runs and every earlier version kept; approvals; then the backgrounds cut and the frames split
-/// on what was approved, and the set exported for Spine.
-struct GDDReviewView: View {
+/// Thumbnails decoded off the main thread and kept while memory allows, keyed by file and write time.
+final class ThumbStore: @unchecked Sendable {
+    static let shared = ThumbStore()
+    private let cache = NSCache<NSString, NSImage>()
+    init() { cache.countLimit = 800 }
+    func cached(_ key: String) -> NSImage? { cache.object(forKey: key as NSString) }
+    func load(_ url: URL, key: String, side: Int, backing: RGB8? = nil, trim: Bool = false) async -> NSImage? {
+        if let i = cached(key) { return i }
+        let img: NSImage? = await Task.detached(priority: .userInitiated) {
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                        kCGImageSourceThumbnailMaxPixelSize: side,
+                                                                        kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
+            else { return nil }
+            var shown = backing.flatMap { KeyedPreview.cutOut(cg, backing: $0) } ?? cg
+            if trim, let px = ChromaKeyOutputRules.straightRGBA8(shown) {
+                let w = shown.width, h = shown.height
+                var x0 = w, y0 = h, x1 = -1, y1 = -1
+                for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 24 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
+                let m = max(2, max(x1 - x0, y1 - y0) / 20)
+                if x1 >= 0, (x1 - x0) * (y1 - y0) < w * h * 3 / 4,
+                   let c = shown.cropping(to: CGRect(x: max(0, x0 - m), y: max(0, y0 - m), width: min(w, x1 + m + 1) - max(0, x0 - m), height: min(h, y1 + m + 1) - max(0, y0 - m))) { shown = c }
+            }
+            return NSImage(cgImage: shown, size: NSSize(width: shown.width, height: shown.height))
+        }.value
+        if let img { cache.setObject(img, forKey: key as NSString) }
+        return img
+    }
+}
+
+/// A picture still on the set's backing (a symbol not cut out yet, a frame) shown cut out, as it will be: keyed on the fly
+/// for thumbnails, and once into the caches folder for a close-up. Only when its corners are the backing.
+enum KeyedPreview {
+    static func cutOut(_ cg: CGImage, backing b: RGB8) -> CGImage? {
+        guard let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+        let w = cg.width, h = cg.height
+        let corners = [0, w - 1, (h - 1) * w, h * w - 1].map { i -> Bool in
+            let p = i * 4
+            return px[p + 3] > 250 && abs(Int(px[p]) - Int(b.r)) + abs(Int(px[p + 1]) - Int(b.g)) + abs(Int(px[p + 2]) - Int(b.b)) < 60
+        }
+        guard corners.filter({ $0 }).count >= 3 else { return nil }
+        return ChromaKeyOutputRules.image(straightRGBA8: FrameKit.keyed(px, backing: b, width: w, height: h), width: w, height: h, space: CGColorSpace(name: CGColorSpace.sRGB)!)
+    }
+    /// The file to show close up: a cut-out copy in the caches folder when `file` is on the backing, else `file` itself.
+    static func url(for file: URL, stamp: Int, backing: RGB8) async -> URL {
+        await Task.detached(priority: .userInitiated) {
+            let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Navigator/cut-out previews")
+            let out = dir.appendingPathComponent("\(abs((file.path + "#\(stamp)").hashValue)).png")
+            if FileManager.default.fileExists(atPath: out.path) { return out }
+            guard let cg = loadCGImage(file), let cut = cutOut(cg, backing: backing), let d = encodePNG(cut) else { return file }
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? d.write(to: out)
+            return out
+        }.value
+    }
+}
+
+struct AsyncThumb: View {
+    let url: URL
+    var stamp = 0
+    var side = 320
+    var backing: RGB8? = nil
+    /// Cropped to what is on the canvas (a lid on a tall pot canvas is otherwise a speck).
+    var trim = false
+    @State private var image: NSImage?
+    private var key: String { "\(url.path)#\(stamp)#\(side)#\(backing.map { "\($0.r)" } ?? "")#\(trim)" }
+    var body: some View {
+        Group {
+            if let image { Image(nsImage: image).resizable().interpolation(.high).scaledToFit() }
+            else { Color.clear.overlay(ProgressView().controlSize(.small)) }
+        }
+        .task(id: key) {
+            if let hit = ThumbStore.shared.cached(key) { image = hit; return }
+            image = await ThumbStore.shared.load(url, key: key, side: side, backing: backing, trim: trim)
+        }
+    }
+}
+
+/// The browser's backdrops: what shows through a cut-out.
+struct AssetBackdrop: View {
+    let style: String
+    var body: some View {
+        switch style {
+        case "checker": CheckerboardBackground(square: 10)
+        case "light": Color(white: 0.92)
+        default: Color(white: 0.11)
+        }
+    }
+}
+
+/// Every picture of a set in one place — the symbols, backgrounds and the whole game interface, each pot's six states
+/// side by side — seen as a grid or close up in a lightbox (zoom, pan, step through), each one approvable, changeable
+/// (an edit as described, drawn again, or your own picture put in its place, priced before it runs), and every earlier
+/// version kept and restorable. Symbols keep the review's queue, cut-out, Layerize and Spine export.
+struct AssetBrowserView: View {
     @ObservedObject var run: GDDToAssetsRun
     let folder: URL
     var startID: String? = nil
-    @State private var ids: [String] = []
-    @State private var index = 0
-    @State private var draft = ""
-    @State private var mode: ReviewMode = .edit
+    var startLightbox = false
+    enum Filter: String, CaseIterable { case all = "All", open = "To approve", changed = "Changed" }
+    @State private var sections: [SetSection] = []
+    @State private var sectionID: String?
+    @State private var selection: String?
+    @State private var lightbox = false
+    @AppStorage("assetThumb") private var thumb = 150.0
+    @AppStorage("assetBackdrop") private var backdrop = "dark"
+    @State private var search = ""
+    @State private var filter = Filter.all
+    @State private var drafts: [String: String] = [:]
+    @State private var modes: [String: ReviewMode] = [:]
     @State private var working: String?
     @State private var queueRunning = false
     @State private var layerizeToo = true
+    @State private var dropping = false
+    @State private var fingerprint = 0
+    @State private var closeUp: URL?
     @FocusState private var editing: Bool
     @StateObject private var zoom = ZoomController()
+    private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
-    private var current: String? { ids.indices.contains(index) ? ids[index] : nil }
-    private var job: AssetJob? { current.flatMap { id in run.jobs.first { $0.id == id } } }
-    private var symbols: [String] { ids.filter { ReviewOrder.family($0) != "Backgrounds" } }
+    private var all: [SetAsset] { sections.flatMap(\.assets) }
+    private var shownSections: [SetSection] {
+        sections.filter { sectionID == nil || $0.id == sectionID }.map { s in
+            SetSection(id: s.id, title: s.title, assets: s.assets.filter(passes), pot: s.pot)
+        }.filter { !$0.assets.isEmpty }
+    }
+    private var shown: [SetAsset] { shownSections.flatMap(\.assets) }
+    private var current: SetAsset? { selection.flatMap { id in all.first { $0.id == id } } }
+    private var currentIndex: Int? { current.flatMap { c in shown.firstIndex(of: c) } }
+    private func passes(_ a: SetAsset) -> Bool {
+        if !search.isEmpty, !a.id.localizedCaseInsensitiveContains(search), !a.label.localizedCaseInsensitiveContains(search) { return false }
+        switch filter {
+        case .all: return true
+        case .open: return a.kind != .preview && !run.review.entry(a.id).approved
+        case .changed: return !run.review.entry(a.id).versions.isEmpty
+        }
+    }
+    private var reviewable: [SetAsset] { all.filter { $0.kind != .preview } }
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            toolbar
             Divider()
             HStack(spacing: 0) {
-                viewer
+                sidebar.frame(width: 220)
                 Divider()
-                ScrollView { sidebar.padding(14) }.frame(width: 350)
+                VStack(spacing: 0) {
+                    if lightbox { lightboxView; Divider(); filmstrip } else { gridView }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                ScrollView { inspector.padding(14) }.frame(width: 340)
             }
-            Divider()
-            filmstrip
             Divider()
             footer
         }
-        .frame(minWidth: 1100, minHeight: 760)
-        .onAppear { reload() }
-        .onChange(of: index) { _, _ in loadDraft() }
+        .frame(minWidth: 1180, minHeight: 760)
+        .background(keys)
+        .onAppear {
+            reload()
+            if let s = startID { selection = s; sectionID = sections.first { $0.assets.contains { $0.id == s } }?.id }
+            if selection == nil { selection = shown.first?.id }
+            lightbox = startLightbox
+        }
+        .onChange(of: run.imagesVersion) { _, _ in reload() }
+        .onReceive(tick) { _ in if folderPrint() != fingerprint { reload() } }
+        .onReceive(NotificationCenter.default.publisher(for: GDDReviewWindow.select)) { n in
+            guard (n.object as? URL) == folder, let id = n.userInfo?["id"] as? String else { return }
+            selection = id; sectionID = sections.first { $0.assets.contains { $0.id == id } }?.id; lightbox = true
+        }
     }
 
-    // MARK: Pieces
+    // MARK: Toolbar and sidebar
 
-    private var header: some View {
-        HStack {
+    private var toolbar: some View {
+        HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(run.gameName) — \(run.theme?.name ?? "")").font(.headline)
+                Text("\(run.gameName.isEmpty ? folder.lastPathComponent : run.gameName)\(run.theme.map { " — \($0.name)" } ?? "")").font(.headline)
                 Text(folder.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Spacer()
-            Text("\(run.review.approvedCount(in: ids)) of \(ids.count) approved").font(.callout)
-            Text(String(format: "· $%.2f on revisions", run.review.revisionCost)).font(.callout).foregroundStyle(.secondary)
+            let done = run.review.approvedCount(in: reviewable.map(\.id))
+            ProgressView(value: Double(done), total: Double(max(1, reviewable.count))).frame(width: 110)
+            Text("\(done) of \(reviewable.count) approved").font(.callout).monospacedDigit()
+            Divider().frame(height: 22)
+            TextField("Find a picture", text: $search).textFieldStyle(.roundedBorder).frame(width: 170).focused($editing)
+            Picker("", selection: $filter) { ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) } }
+                .pickerStyle(.segmented).labelsHidden().fixedSize()
+            Picker("", selection: $lightbox) {
+                Image(systemName: "square.grid.2x2").help("Grid (Esc)").tag(false)
+                Image(systemName: "rectangle.inset.filled").help("Lightbox (Space)").tag(true)
+            }
+            .pickerStyle(.segmented).labelsHidden().fixedSize()
+            if !lightbox {
+                Image(systemName: "photo").font(.caption).foregroundStyle(.secondary)
+                Slider(value: $thumb, in: 90...360).frame(width: 110).help("Picture size")
+                Image(systemName: "photo").font(.body).foregroundStyle(.secondary)
+            }
+            Picker("", selection: $backdrop) {
+                Text("Dark").tag("dark"); Text("Checker").tag("checker"); Text("Light").tag("light")
+            }
+            .labelsHidden().fixedSize().help("What shows through the cut-outs")
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
+        .padding(.horizontal, 14).padding(.vertical, 9)
     }
 
-    private var viewer: some View {
+    private var sidebar: some View {
+        List(selection: Binding(get: { sectionID ?? "all" }, set: { sectionID = $0 == "all" ? nil : $0 })) {
+            sideRow("all", "Everything", all.filter { $0.kind != .preview })
+            Section("Symbols") { ForEach(sections.filter { $0.id.hasPrefix("sym-") }) { sideRow($0.id, $0.title, $0.assets) } }
+            let pots = sections.filter(\.pot)
+            if !pots.isEmpty { Section("Pots") { ForEach(pots) { sideRow($0.id, $0.title, $0.assets) } } }
+            let ui = sections.filter { $0.id.hasPrefix("ui-") }
+            if !ui.isEmpty { Section("Game interface") { ForEach(ui) { sideRow($0.id, $0.title, $0.assets) } } }
+            if let p = sections.first(where: { $0.id == "previews" }) { Section("Contact sheets") { sideRow(p.id, p.title, p.assets) } }
+        }
+        .listStyle(.sidebar)
+    }
+
+    private func sideRow(_ id: String, _ title: String, _ assets: [SetAsset]) -> some View {
+        let approved = assets.filter { run.review.entry($0.id).approved }.count
+        return HStack {
+            Text(title).lineLimit(1)
+            Spacer()
+            if approved == assets.count && !assets.isEmpty && assets.first?.kind != .preview {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)
+            } else {
+                Text("\(assets.count)").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+            }
+        }
+        .tag(id)
+    }
+
+    // MARK: Grid
+
+    private var gridView: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 22, pinnedViews: [.sectionHeaders]) {
+                    ForEach(shownSections) { sec in
+                        Section {
+                            if sec.pot { potStates(sec) }
+                            let rest = sec.pot ? sec.assets.filter { $0.kind != .potState } : sec.assets
+                            if !rest.isEmpty {
+                                if sec.pot { Text("What the states are built from, and its plaque").font(.caption).foregroundStyle(.secondary) }
+                                LazyVGrid(columns: [GridItem(.adaptive(minimum: thumb, maximum: thumb * 1.5), spacing: 12)], alignment: .leading, spacing: 14) {
+                                    ForEach(rest) { cell($0, size: thumb).id($0.id) }
+                                }
+                            }
+                        } header: {
+                            HStack {
+                                Text(sec.title).font(.title3.bold())
+                                Text("\(sec.assets.count)").foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                            .padding(.vertical, 6).background(.bar)
+                        }
+                    }
+                    if shownSections.isEmpty {
+                        Text(sections.isEmpty ? "No pictures in this set yet." : "Nothing matches.").foregroundStyle(.secondary).frame(maxWidth: .infinity).padding(40)
+                    }
+                }
+                .padding(14)
+            }
+            .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { if let s = selection { proxy.scrollTo(s, anchor: .center) } } }
+            .onChange(of: sectionID) { _, _ in DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { if let s = selection { proxy.scrollTo(s, anchor: .center) } } }
+        }
+    }
+
+    /// A pot's six states in one row, in order — the way the art director reads them.
+    private func potStates(_ sec: SetSection) -> some View {
+        let states = sec.assets.filter { $0.kind == .potState }
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(run.isBuiltState(states.dropFirst().first?.id ?? "")
+                 ? "The six states, built from the pot's drawings as the studio's rigs are: change State 0, the open pot or the heaped drawing and they are built again."
+                 : "The six states, each drawn from the one before, the body kept exactly as State 0.")
+                .font(.caption).foregroundStyle(.secondary)
+            // Six across whatever the window's width, each the pot's own tall shape, so the rise reads at a glance.
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: max(1, states.count)), spacing: 10) {
+                ForEach(states) { cell($0, size: nil, tall: true).id($0.id) }
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// A picture in the grid: `size` across, or the column's width when nil; `tall`, the pot canvas's 2:3.
+    private func cell(_ a: SetAsset, size: Double?, tall: Bool = false) -> some View {
+        let e = run.review.entry(a.id)
+        return VStack(spacing: 5) {
+            ZStack {
+                AssetBackdrop(style: backdrop)
+                AsyncThumb(url: a.file, stamp: a.stamp, side: Int((size ?? 240) * 2), backing: run.backing.rgb,
+                           trim: !tall && (a.kind == .potPart || a.kind == .potDrawing || a.kind == .interface)).padding(6)
+            }
+            .overlay(alignment: .topTrailing) {
+                HStack(spacing: 3) {
+                    if !e.versions.isEmpty { Image(systemName: "clock.arrow.circlepath").foregroundStyle(.white).help("\(e.versions.count) earlier version\(e.versions.count == 1 ? "" : "s")") }
+                    if !e.pending.isEmpty { Image(systemName: "pencil.circle.fill").foregroundStyle(.orange).help(e.pending) }
+                    if e.approved { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                    if working == a.id { ProgressView().controlSize(.small) }
+                }
+                .font(.body).padding(5)
+            }
+            .frame(width: size.map { CGFloat($0) }, height: size.map { CGFloat(tall ? $0 * 1.5 : $0) })
+            .frame(maxWidth: size == nil ? .infinity : nil)
+            .aspectRatio(tall ? 2.0 / 3 : 1, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(a.id == selection ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: a.id == selection ? 3 : 1))
+            Text(a.label).font(.caption).lineLimit(1).truncationMode(.middle).frame(width: size.map { CGFloat($0) }).frame(maxWidth: size == nil ? .infinity : nil)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { selection = a.id; lightbox = true }
+        .onTapGesture { selection = a.id }
+        .contextMenu {
+            Button("Open Close Up") { selection = a.id; lightbox = true }
+            if a.kind != .preview {
+                Button(run.review.entry(a.id).approved ? "Not Approved" : "Approve") { toggleApproved(a.id) }
+                Button("Use My Own Picture…") { selection = a.id; chooseReplacement(a) }.disabled(!canReplace(a))
+            }
+            Divider()
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([a.file]) }
+            Button("Open in Preview") { NSWorkspace.shared.open(a.file) }
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in dropped(providers, on: a) }
+    }
+
+    // MARK: Lightbox
+
+    private var lightboxView: some View {
         ZStack {
-            Color(nsColor: .underPageBackgroundColor)
-            if let id = current {
-                ZoomableImageView(url: folder.appendingPathComponent("\(id).png"), controller: zoom)
-                    .id("\(id)#\(run.imagesVersion)")
-                if working == id {
-                    ProgressView("Revising \(id)…").padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            AssetBackdrop(style: backdrop)
+            if let a = current {
+                ZoomableImageView(url: closeUp ?? a.file, controller: zoom, fitOnLoad: true).id("\(a.id)#\(a.stamp)#\(closeUp?.lastPathComponent ?? "")")
+                    .task(id: "\(a.id)#\(a.stamp)") { closeUp = nil; closeUp = await KeyedPreview.url(for: a.file, stamp: a.stamp, backing: run.backing.rgb) }
+                if working == a.id {
+                    ProgressView("Working on \(a.label)…").padding(14).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                }
+                VStack {
+                    HStack {
+                        tag("\(a.label)\(currentIndex.map { "  ·  \($0 + 1) of \(shown.count)" } ?? "")")
+                        Spacer()
+                        Button { lightbox = false } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).padding(8)
+                            .background(.black.opacity(0.45), in: Circle()).foregroundStyle(.white).help("Back to the grid (Esc)")
+                    }
+                    Spacer()
+                    zoomBar
+                }
+                .padding(12)
+                HStack {
+                    arrow("chevron.left", -1)
+                    Spacer()
+                    arrow("chevron.right", 1)
                 }
             } else {
-                Text("No images in this set yet.").foregroundStyle(.secondary)
+                Text("Choose a picture.").foregroundStyle(.secondary)
             }
-            HStack {
-                Button { step(-1) } label: { Image(systemName: "chevron.left").font(.title) }
-                    .keyboardShortcut(editing ? nil : KeyboardShortcut(.leftArrow, modifiers: []))
-                    .disabled(index == 0).buttonStyle(.borderless).padding(12)
-                Spacer()
-                Button { step(1) } label: { Image(systemName: "chevron.right").font(.title) }
-                    .keyboardShortcut(editing ? nil : KeyboardShortcut(.rightArrow, modifiers: []))
-                    .disabled(index >= ids.count - 1).buttonStyle(.borderless).padding(12)
-            }
+            if dropping { RoundedRectangle(cornerRadius: 12).stroke(Color.accentColor, style: StrokeStyle(lineWidth: 4, dash: [10])).padding(8) }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .onDrop(of: [.fileURL], isTargeted: $dropping) { providers in current.map { dropped(providers, on: $0) } ?? false }
     }
 
-    @ViewBuilder private var sidebar: some View {
-        if let id = current {
-            let entry = run.review.entry(id)
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(job.map { $0.docName.isEmpty ? id : "\(id) · \($0.docName)" } ?? id).font(.title3).bold()
-                    Text(ReviewOrder.title(ReviewOrder.family(id))).font(.caption).foregroundStyle(.secondary)
-                }
-                if let j = job {
-                    if !j.job.isEmpty { labelled("What it does", j.job) }
-                    labelled("Planned", j.subject)
-                    if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, design: run.styledDesign)[j.id] { labelled("Frame", f) }
-                } else if id == FrameStack.panelID {
-                    labelled("Panel", "The grey panel every framed pay is set on, tinted for each one. Editing it builds them all again, free.")
-                } else if let owner = FrameStack.gemsOwner(id) {
-                    let pass = GDDToAssetsRun.currentGemPass(owner, folder: folder)
-                    labelled("Gems", "\(owner)'s frame with its gems set in, in \(owner)'s colour; the gems are cut from it by their places. "
-                             + "Editing it sets them in again, in the same places, and builds \(owner) again.")
-                    labelled("Checks", pass.map { p in p.check.passed
-                        ? String(format: "Passed: every gem in place, %.1f:1 or more against the frame (needs 3:1).", p.check.contrast.min() ?? 0)
-                        : "Look at: " + p.check.problems.joined(separator: "; ") + "." } ?? GDDToAssetsRun.gemsMissing(owner, folder: folder).prefix(1).uppercased() + GDDToAssetsRun.gemsMissing(owner, folder: folder).dropFirst() + ".")
-                } else if let f = FrameRules.parse(id), run.framing == .layered {
-                    let gemmed = run.frameMembers(id, folder: folder).filter(Set(run.gemOwners()).contains)
-                    labelled("Frame", (f.isShared ? "The frame \(f.owner) share. Editing it builds them all again"
-                                                  : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's. Editing it builds that symbol again")
-                             + (gemmed.isEmpty ? ", free." : " and sets the gems of \(gemmed.joined(separator: ", ")) into it again, one edit each."))
-                } else if let f = FrameRules.parse(id) {
-                    labelled("Frame", (f.isShared ? "The empty frame \(f.owner) are painted into." : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's.")
-                             + " Editing it changes this file only: repaint into it afterwards to use it.")
-                    let members = run.frameMembers(id, folder: folder)
-                    if !members.isEmpty {
-                        Button(String(format: "Repaint its %d symbols — ~$%.2f", members.count,
-                                      members.reduce(0) { $0 + run.revisionEstimate($1) })) {
-                            for m in members { run.review.queue(m, change: "Painted again into the revised frame", mode: .redraw) }
-                            run.saveReview(folder)
-                            apply(members, first: nil)
-                        }
-                        .disabled(working != nil || queueRunning)
-                        .help("\(members.joined(separator: ", ")) are each drawn again into the frame as it is now; every earlier image is kept as a version")
-                    }
-                }
-                if ReviewOrder.family(id) != "Frames", ReviewOrder.family(id) != "Backgrounds",
-                   !FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(id)_rmbg.png").path) {
-                    Text(entry.versions.isEmpty ? "Not cut out yet." : "Revised since it was cut out: remove its background (and split it) again.")
-                        .font(.caption).foregroundStyle(.orange)
-                }
-                Toggle("Approved", isOn: Binding(get: { run.review.entry(id).approved },
-                                                 set: { run.review.setApproved(id, $0); run.saveReview(folder) }))
-                    .disabled(!entry.pending.isEmpty || working != nil)
-                Divider()
-                Text("What should change?").font(.subheadline).bold()
-                TextEditor(text: $draft)
-                    .font(.body).frame(height: 96).focused($editing)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.35)))
-                Picker("", selection: $mode) {
-                    Text("Edit this image").tag(ReviewMode.edit)
-                    Text("Redraw").tag(ReviewMode.redraw)
-                }
-                .pickerStyle(.segmented).labelsHidden()
-                .disabled(ReviewOrder.family(id) == "Frames")
-                Text(mode == .edit || ReviewOrder.family(id) == "Frames"
-                     ? "Only what you describe changes; the rest of the image, and its frame, stay as they are."
-                     : "Drawn again from its plan with your change added, the way the set drew it.")
-                    .font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button("Queue") { run.review.queue(id, change: draft, mode: mode); run.saveReview(folder) }
-                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    Spacer()
-                    Button(String(format: "Apply now — ~$%.2f", run.revisionEstimate(id))) { apply([id], first: draft) }
-                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || working != nil || queueRunning)
-                }
-                if !entry.versions.isEmpty {
-                    Divider()
-                    Text("Earlier versions").font(.subheadline).bold()
-                    ForEach(Array(entry.versions.enumerated().reversed()), id: \.offset) { _, v in
-                        HStack(alignment: .top, spacing: 8) {
-                            if let img = ReviewThumbs.shared.image(folder.appendingPathComponent(v.file), version: 0, side: 120) {
-                                Image(nsImage: img).resizable().scaledToFit().frame(width: 56, height: 56)
-                            }
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Replaced by: \(v.change)").font(.caption).lineLimit(3)
-                                Text(String(format: "%@ · $%.2f", v.mode, v.cost)).font(.caption2).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("Use") { run.restore(id, version: v.file, folder: folder) }.controlSize(.small)
-                        }
-                    }
-                }
+    private var zoomBar: some View {
+        HStack(spacing: 12) {
+            Button { zoom.zoomBy(1 / 1.25) } label: { Image(systemName: "minus.magnifyingglass") }.help("Zoom out (⌘−)")
+            Text("\(zoom.percent)%").monospacedDigit().frame(width: 48)
+            Button { zoom.zoomBy(1.25) } label: { Image(systemName: "plus.magnifyingglass") }.help("Zoom in (⌘=)")
+            Button("Fit") { zoom.fit() }.help("Fit (⌘0)")
+            Button("100%") { zoom.actualSize() }.help("Actual pixels (⌘1)")
+            if let a = current, !versions(a).isEmpty {
+                Button { compare(a) } label: { Label("Compare", systemImage: "rectangle.split.2x1") }.help("Swipe between this and its earlier versions")
             }
+            Text("Scroll to zoom · drag to pan · ← → to step").font(.caption).foregroundStyle(.white.opacity(0.7))
         }
+        .buttonStyle(.borderless).foregroundStyle(.white)
+        .padding(.horizontal, 14).padding(.vertical, 7)
+        .background(.black.opacity(0.55), in: Capsule())
+    }
+
+    private func arrow(_ name: String, _ d: Int) -> some View {
+        Button { step(d) } label: {
+            Image(systemName: name).font(.title.weight(.semibold)).foregroundStyle(.white).padding(14).background(.black.opacity(0.35), in: Circle())
+        }
+        .buttonStyle(.plain).padding(10)
+        .disabled(currentIndex.map { d < 0 ? $0 == 0 : $0 >= shown.count - 1 } ?? true)
+    }
+
+    private func tag(_ text: String) -> some View {
+        Text(text).font(.callout).foregroundStyle(.white).lineLimit(1)
+            .padding(.horizontal, 10).padding(.vertical, 5).background(.black.opacity(0.55), in: Capsule())
     }
 
     private var filmstrip: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 18) {
-                    ForEach(ReviewOrder.groups(ids), id: \.family) { g in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(ReviewOrder.title(g.family)).font(.caption).foregroundStyle(.secondary)
-                            HStack(spacing: 6) { ForEach(g.ids, id: \.self) { thumb($0).id($0) } }
+                LazyHStack(spacing: 8) {
+                    ForEach(shown) { a in
+                        Button { selection = a.id } label: {
+                            ZStack {
+                                AssetBackdrop(style: backdrop)
+                                AsyncThumb(url: a.file, stamp: a.stamp, side: 160, backing: run.backing.rgb).padding(3)
+                            }
+                            .overlay(alignment: .topTrailing) {
+                                if run.review.entry(a.id).approved { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).font(.caption).padding(2) }
+                            }
+                            .frame(width: 72, height: 72)
+                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                            .overlay(RoundedRectangle(cornerRadius: 5).stroke(a.id == selection ? Color.accentColor : .clear, lineWidth: 3))
+                        }
+                        .buttonStyle(.plain).help(a.label).id(a.id)
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+            }
+            .frame(height: 90)
+            .onChange(of: selection) { _, s in if let s { withAnimation { proxy.scrollTo(s, anchor: .center) } } }
+            .onAppear { if let s = selection { proxy.scrollTo(s, anchor: .center) } }
+        }
+    }
+
+    // MARK: Inspector
+
+    @ViewBuilder private var inspector: some View {
+        if let a = current {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(a.label).font(.title3.bold()).textSelection(.enabled)
+                    if a.label != a.id { Text(a.id).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                    Text(about(a)).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if a.kind == .symbol { symbolDetails(a.id) }
+                if a.kind != .preview {
+                    Toggle("Approved", isOn: Binding(get: { run.review.entry(a.id).approved }, set: { _ in toggleApproved(a.id) }))
+                        .disabled(working != nil).help("A (when not typing)")
+                    Divider()
+                    if run.isBuiltState(a.id) { builtNote(a) } else { changeEditor(a) }
+                }
+                Divider()
+                VStack(alignment: .leading, spacing: 6) {
+                    if a.kind != .preview {
+                        Button { chooseReplacement(a) } label: { Label("Use My Own Picture…", systemImage: "square.and.arrow.down") }
+                            .disabled(!canReplace(a) || working != nil)
+                            .help("Put a picture of your own in its place (or drop one on it). It is fitted to this picture's size; the current one is kept as a version.")
+                    }
+                    Button { NSWorkspace.shared.activateFileViewerSelecting([a.file]) } label: { Label("Show in Finder", systemImage: "folder") }
+                    Button { NSWorkspace.shared.open(a.file) } label: { Label("Open in Preview", systemImage: "eye") }
+                }
+                .buttonStyle(.link)
+                let vs = versions(a)
+                if !vs.isEmpty {
+                    Divider()
+                    HStack {
+                        Text("Earlier versions").font(.subheadline.bold())
+                        Spacer()
+                        Button("Compare") { compare(a) }.controlSize(.small)
+                    }
+                    ForEach(Array(vs.enumerated()), id: \.offset) { _, v in
+                        HStack(alignment: .top, spacing: 8) {
+                            AsyncThumb(url: folder.appendingPathComponent(v.file), side: 120, backing: run.backing.rgb).frame(width: 56, height: 56)
+                                .background(AssetBackdrop(style: backdrop)).clipShape(RoundedRectangle(cornerRadius: 4))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Replaced by: \(v.change)").font(.caption).lineLimit(3)
+                                Text(String(format: "%@ · $%.2f · %@", v.mode, v.cost, v.at.formatted(date: .abbreviated, time: .shortened))).font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Use") { restore(a, v.file) }.controlSize(.small).disabled(working != nil || run.isBuiltState(a.id))
                         }
                     }
                 }
-                .padding(.horizontal, 14).padding(.vertical, 8)
             }
-            .onChange(of: index) { _, _ in if let c = current { withAnimation { proxy.scrollTo(c, anchor: .center) } } }
+        } else {
+            Text("Choose a picture to see it close up, approve it or change it.").foregroundStyle(.secondary)
         }
-        .frame(height: 138)
     }
 
-    private func thumb(_ id: String) -> some View {
-        let e = run.review.entry(id)
-        return Button { if let i = ids.firstIndex(of: id) { index = i } } label: {
-            ZStack(alignment: .topTrailing) {
-                Group {
-                    if let img = ReviewThumbs.shared.image(folder.appendingPathComponent("\(id).png"), version: run.imagesVersion) {
-                        Image(nsImage: img).resizable().scaledToFit()
-                    } else { Color.gray.opacity(0.2) }
+    private func about(_ a: SetAsset) -> String {
+        let size = CGImageSourceCreateWithURL(a.file as CFURL, nil).flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) as? [CFString: Any] }
+            .map { "\($0[kCGImagePropertyPixelWidth] as? Int ?? 0)×\($0[kCGImagePropertyPixelHeight] as? Int ?? 0) px" } ?? ""
+        let what: String
+        switch a.kind {
+        case .symbol: what = ReviewOrder.title(ReviewOrder.family(a.id))
+        case .preview: what = "Contact sheet — made from the pictures; it updates when they change"
+        case .potState, .potDrawing, .potPart: what = "\(run.potKind.noun.capitalized) — \(GDDToAssetsRun.piece(of: a.id) ?? "")"
+        case .interface: what = GDDToAssetsRun.piece(of: a.id) ?? "Game interface"
+        }
+        return [what, size].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    private func builtNote(_ a: SetAsset) -> some View {
+        let pot = String(a.id.prefix(while: { $0 != "-" }))
+        let sources = [("State 0", "\(pot)-State0Idle"), ("Open, empty", "\(pot)-State0Idle_open"), ("Heaped full", "\(pot)-State0Idle_full")]
+            .filter { s in all.contains { $0.id == s.1 } }
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Built, not drawn").font(.subheadline.bold())
+            Text("Like the studio's rigs, this \(run.potKind.noun)'s states are put together from its drawings: the body never changes, the lid lifts and the treasure rises out of it. To change this state, change what it is built from — the states are built again, free.")
+                .font(.callout).fixedSize(horizontal: false, vertical: true)
+            HStack { ForEach(sources, id: \.1) { s in Button(s.0) { selection = s.1 }.controlSize(.small) } }
+        }
+    }
+
+    @ViewBuilder private func changeEditor(_ a: SetAsset) -> some View {
+        let draft = Binding(get: { drafts[a.id] ?? run.review.entry(a.id).pending }, set: { drafts[a.id] = $0 })
+        let empty = draft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        Text("What should change?").font(.subheadline.bold())
+        TextEditor(text: draft)
+            .font(.body).frame(height: 92).focused($editing)
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.35)))
+        if a.kind == .symbol {
+            let mode = Binding(get: { modes[a.id] ?? ReviewMode(rawValue: run.review.entry(a.id).mode) ?? .edit }, set: { modes[a.id] = $0 })
+            Picker("", selection: mode) {
+                Text("Edit this image").tag(ReviewMode.edit)
+                Text("Redraw").tag(ReviewMode.redraw)
+            }
+            .pickerStyle(.segmented).labelsHidden().disabled(ReviewOrder.family(a.id) == "Frames")
+            Text(mode.wrappedValue == .edit || ReviewOrder.family(a.id) == "Frames"
+                 ? "Only what you describe changes; the rest of the image, and its frame, stay as they are."
+                 : "Drawn again from its plan with your change added, the way the set drew it.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Queue") { run.review.queue(a.id, change: draft.wrappedValue, mode: mode.wrappedValue); run.saveReview(folder) }.disabled(empty)
+                Spacer()
+                Button(String(format: "Apply now — ~$%.2f", run.revisionEstimate(a.id))) {
+                    run.review.queue(a.id, change: draft.wrappedValue, mode: mode.wrappedValue); run.saveReview(folder); applySymbols([a.id])
                 }
-                .frame(width: 84, height: 84)
-                .overlay(RoundedRectangle(cornerRadius: 4).stroke(id == current ? Color.accentColor : .clear, lineWidth: 3))
-                if e.approved { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).padding(2) }
-                else if !e.pending.isEmpty { Image(systemName: "pencil.circle.fill").foregroundStyle(.orange).padding(2) }
-                if working == id { ProgressView().controlSize(.small).padding(2) }
+                .disabled(empty || working != nil || queueRunning)
             }
-            .overlay(alignment: .bottom) { Text(id).font(.caption2).padding(.horizontal, 3).background(.thinMaterial) }
+        } else {
+            let cost = run.pieceEstimate(a.id, folder: folder)
+            let then = run.isPotSource(a.id) ? (a.id.hasSuffix("-State0Idle") ? " The open and heaped drawings are made again from it and the states built again." : " The states are built again from it, free.") : ""
+            Text("Edit changes only what you describe.\(then)").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button(String(format: "Edit — ~$%.2f", cost)) { change(a, draft.wrappedValue, redraw: false) }
+                    .disabled(empty || working != nil || !OpenAIImages.available)
+                    .help("GPT Image edits this picture: only what you describe changes")
+                Spacer()
+                Button(String(format: "Draw Again — ~$%.2f", cost)) { change(a, draft.wrappedValue, redraw: true) }
+                    .disabled(empty || working != nil || !OpenAIImages.available || GDDToAssetsRun.piece(of: a.id) == nil || run.reelLayout == nil)
+                    .help("Drawn again the way the set drew it, with your change added to its brief")
+            }
         }
-        .buttonStyle(.plain)
-        .help(e.pending.isEmpty ? id : "\(id): \(e.pending)")
     }
 
-    private var footer: some View {
-        let queued = run.review.queued(in: ids)
-        let cost = queued.reduce(0) { $0 + run.revisionEstimate($1) }
-        let ready = symbols.filter { run.review.entry($0).approved }
-        let split = run.layerizeEstimate(for: Set(ready))
-        return HStack(spacing: 12) {
-            Button(String(format: "Apply %d queued change%@ — ~$%.2f", queued.count, queued.count == 1 ? "" : "s", cost)) { apply(queued, first: nil) }
-                .disabled(queued.isEmpty || working != nil || queueRunning)
-            Text(run.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-            Spacer()
-            let fal = APIKeys.falAvailable
-            Toggle("then split frames with Layerize" + (fal ? (split.symbols > 0 ? String(format: " (~$%.2f)", split.cost) : "") : " — needs a fal.ai key"),
-                   isOn: Binding(get: { layerizeToo && fal }, set: { layerizeToo = $0 }))
-                .disabled(ready.isEmpty || !fal)
-                .help(fal ? "Splits the framed symbols that were painted with their frames." : "Layerize runs on fal.ai. Add a key in AI ▸ API Keys… to use it.")
-            Button("Remove backgrounds of \(ready.count) approved") {
-                run.finishSet(ready + ids.filter { FrameRules.parse($0) != nil }, folder: folder, layerize: layerizeToo && fal)
+    // MARK: Symbols (the review's own detail)
+
+    @ViewBuilder private func symbolDetails(_ id: String) -> some View {
+        let job = run.jobs.first { $0.id == id }
+        if let j = job {
+            if !j.job.isEmpty { labelled("What it does", j.job) }
+            labelled("Planned", j.subject)
+            if let f = FrameRules.assignments(run.jobs.filter { $0.kind == .symbol }, design: run.styledDesign)[j.id] { labelled("Frame", f) }
+        } else if id == FrameStack.panelID {
+            labelled("Panel", "The grey panel every framed pay is set on, tinted for each one. Editing it builds them all again, free.")
+        } else if let owner = FrameStack.gemsOwner(id) {
+            labelled("Gems", "\(owner)'s frame with its gems set in, in \(owner)'s colour. Editing it sets them in again, in the same places, and builds \(owner) again.")
+        } else if let f = FrameRules.parse(id) {
+            labelled("Frame", f.isShared ? "The frame \(f.owner) share." : "\(f.owner) own frame, the \(f.rank == 1 ? "top" : "second") symbol's.")
+            let members = run.frameMembers(id, folder: folder)
+            if !members.isEmpty, run.framing != .layered {
+                Button(String(format: "Repaint its %d symbols — ~$%.2f", members.count, members.reduce(0) { $0 + run.revisionEstimate($1) })) {
+                    for m in members { run.review.queue(m, change: "Painted again into the revised frame", mode: .redraw) }
+                    run.saveReview(folder); applySymbols(members)
+                }
+                .disabled(working != nil || queueRunning)
             }
-            .disabled(ready.isEmpty || run.keying || run.layering)
-            .help("Photoshop cuts each approved symbol and the frames out on their own canvas (free); Layerize, when ticked, then splits each framed symbol into backing, frame and subject on fal.ai")
-            Button("Export for Spine…") { exportForSpine() }
-                .disabled(ready.isEmpty)
-                .help("A layer kit per approved symbol, in the format the Spine generator reads")
-            // The game interface of a reopened set, from the structure saved with it.
-            Menu("Game Interface") {
-                Button("Make What’s Missing") { run.makeReelArea() }
-                Menu("Make Again") { ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } } }
-                Divider()
-                Button("Show the Previews") { run.showPreviews() }
-            }
-            .fixedSize()
-            .disabled(run.reelLayout == nil || !OpenAIImages.available || run.keying)
-            .help(run.reelLayout == nil ? "This set was made before its structure was saved with it: make its interface from the GDD to Assets window."
-                  : "The reel area, jackpot table, pots, wheels and pop-ups of this set's structure (\(run.reelLayout!.summary)). Only what isn't made yet is drawn, about $0.07–0.15 a piece; Make Again keeps the current files in versions/.")
         }
-        .padding(12)
+        if ReviewOrder.family(id) != "Frames", ReviewOrder.family(id) != "Backgrounds",
+           !FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(id)_rmbg.png").path) {
+            Text(run.review.entry(id).versions.isEmpty ? "Not cut out yet." : "Changed since it was cut out: remove its background again.")
+                .font(.caption).foregroundStyle(.orange)
+        }
     }
 
     private func labelled(_ title: String, _ text: String) -> some View {
@@ -28398,56 +29058,160 @@ struct GDDReviewView: View {
         }
     }
 
+    // MARK: Footer
+
+    private var footer: some View {
+        let ids = sections.filter { $0.id.hasPrefix("sym-") }.flatMap(\.assets).map(\.id)
+        let symbols = ids.filter { ReviewOrder.family($0) != "Backgrounds" }
+        let queued = run.review.queued(in: ids)
+        let cost = queued.reduce(0) { $0 + run.revisionEstimate($1) }
+        let ready = symbols.filter { run.review.entry($0).approved }
+        let split = run.layerizeEstimate(for: Set(ready))
+        let fal = APIKeys.falAvailable
+        return HStack(spacing: 12) {
+            Button(String(format: "Apply %d queued change%@ — ~$%.2f", queued.count, queued.count == 1 ? "" : "s", cost)) { applySymbols(queued) }
+                .disabled(queued.isEmpty || working != nil || queueRunning)
+            if run.keying { ProgressView().controlSize(.small) }
+            Text(run.status).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            Spacer()
+            Toggle("then split frames with Layerize" + (fal ? (split.symbols > 0 ? String(format: " (~$%.2f)", split.cost) : "") : " — needs a fal.ai key"),
+                   isOn: Binding(get: { layerizeToo && fal }, set: { layerizeToo = $0 }))
+                .disabled(ready.isEmpty || !fal)
+            Button("Remove backgrounds of \(ready.count) approved") {
+                run.finishSet(ready + ids.filter { FrameRules.parse($0) != nil }, folder: folder, layerize: layerizeToo && fal)
+            }
+            .disabled(ready.isEmpty || run.keying || run.layering)
+            Button("Export for Spine…") {
+                let r = SpineExport.write(run: run, ids: ready.filter { FrameRules.parse($0) == nil }, folder: folder)
+                run.status = r.error ?? "Spine kits for \(r.kits) symbols in \(r.out.lastPathComponent)"
+                if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
+            }
+            .disabled(ready.isEmpty)
+            Menu("Game Interface") {
+                Button("Make What’s Missing") { run.makeReelArea() }
+                Menu("Make Again") { ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } } }
+            }
+            .fixedSize()
+            .disabled(run.reelLayout == nil || !OpenAIImages.available || run.keying)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 9)
+    }
+
+    // MARK: Keys
+
+    /// Arrow keys step, Space opens and closes the lightbox, A approves, ⌘0 / ⌘1 / ⌘= / ⌘− zoom — none while typing.
+    private var keys: some View {
+        Group {
+            Button("") { step(-1) }.keyboardShortcut(editing ? nil : KeyboardShortcut(.leftArrow, modifiers: []))
+            Button("") { step(1) }.keyboardShortcut(editing ? nil : KeyboardShortcut(.rightArrow, modifiers: []))
+            Button("") { lightbox.toggle() }.keyboardShortcut(editing ? nil : KeyboardShortcut(.space, modifiers: []))
+            Button("") { lightbox = false }.keyboardShortcut(editing ? nil : KeyboardShortcut(.escape, modifiers: []))
+            Button("") { if let a = current, a.kind != .preview { toggleApproved(a.id) } }.keyboardShortcut(editing ? nil : KeyboardShortcut("a", modifiers: []))
+            Button("") { zoom.fit() }.keyboardShortcut("0", modifiers: .command)
+            Button("") { zoom.actualSize() }.keyboardShortcut("1", modifiers: .command)
+            Button("") { zoom.zoomBy(1.25) }.keyboardShortcut("=", modifiers: .command)
+            Button("") { zoom.zoomBy(1 / 1.25) }.keyboardShortcut("-", modifiers: .command)
+        }
+        .opacity(0).frame(width: 0, height: 0).allowsHitTesting(false)
+    }
+
     // MARK: Actions
 
+    private func folderPrint() -> Int {
+        let items = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        return items.reduce(items.count) { h, u in
+            h &+ Int(((try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0) * 10)
+        }
+    }
     private func reload() {
-        ids = run.reviewIDs(folder)
-        if let s = startID, let i = ids.firstIndex(of: s) { index = i }
-        if index >= ids.count { index = max(0, ids.count - 1) }
-        loadDraft()
+        if run.review == SetReview() { run.loadReview(folder) }
+        sections = run.catalog(folder)
+        fingerprint = folderPrint()
+        if let s = selection, !all.contains(where: { $0.id == s }) { selection = shown.first?.id }
     }
-    private func loadDraft() {
-        guard let id = current else { return }
-        let e = run.review.entry(id)
-        draft = e.pending
-        mode = ReviewMode(rawValue: e.mode) ?? .edit
+    private func step(_ d: Int) {
+        guard let i = currentIndex else { selection = shown.first?.id; return }
+        selection = shown[max(0, min(shown.count - 1, i + d))].id
     }
-    private func step(_ d: Int) { index = max(0, min(ids.count - 1, index + d)) }
-
-    /// Runs the changes one after another; `first`, when given, is the typed change for the first id.
-    private func apply(_ list: [String], first: String?) {
+    private func toggleApproved(_ id: String) {
+        run.review.setApproved(id, !run.review.entry(id).approved); run.saveReview(folder)
+    }
+    private func versions(_ a: SetAsset) -> [SetReview.Version] { Array(run.review.entry(a.id).versions.reversed()) }
+    private func compare(_ a: SetAsset) {
+        CompareController.show(images: [folder.appendingPathComponent("\(a.id).png")] + versions(a).map { folder.appendingPathComponent($0.file) })
+    }
+    private func canReplace(_ a: SetAsset) -> Bool { a.kind != .preview && !run.isBuiltState(a.id) }
+    private func restore(_ a: SetAsset, _ file: String) {
+        if a.kind == .symbol { run.restore(a.id, version: file, folder: folder) } else { run.restorePicture(a.id, version: file, folder: folder) }
+    }
+    private func change(_ a: SetAsset, _ text: String, redraw: Bool) {
+        working = a.id
+        let done: (String?) -> Void = { _ in working = nil; drafts[a.id] = nil }
+        if redraw { run.redrawPicture(a.id, change: text, folder: folder, done: done) }
+        else { run.editPicture(a.id, change: text, folder: folder, done: done) }
+    }
+    private func chooseReplacement(_ a: SetAsset) {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.png, .jpeg, .tiff, .heic, .webP]
+        p.message = "A picture to use for \(a.label). It is fitted to \(a.label)'s size; the current one is kept as a version."
+        guard p.runModal() == .OK, let u = p.url else { return }
+        replace(a, with: u)
+    }
+    private func replace(_ a: SetAsset, with u: URL) {
+        let error = a.kind == .symbol ? run.replaceSymbol(a.id, with: u, folder: folder) : run.replacePicture(a.id, with: u, folder: folder)
+        if let error { run.status = error }
+        reload()
+    }
+    private func dropped(_ providers: [NSItemProvider], on a: SetAsset) -> Bool {
+        guard canReplace(a), let p = providers.first else { return false }
+        _ = p.loadObject(ofClass: URL.self) { url, _ in
+            guard let url else { return }
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Use \(url.lastPathComponent) for \(a.label)?"
+                alert.informativeText = "It is fitted to \(a.label)'s size. The current picture is kept as a version you can put back."
+                alert.addButton(withTitle: "Use It"); alert.addButton(withTitle: "Cancel")
+                if alert.runModal() == .alertFirstButtonReturn { selection = a.id; replace(a, with: url) }
+            }
+        }
+        return true
+    }
+    /// Runs the symbols' queued changes one after another.
+    private func applySymbols(_ list: [String]) {
         guard !list.isEmpty else { return }
         var todo = list
-        if let first, let id = todo.first { run.review.queue(id, change: first, mode: mode); run.saveReview(folder) }
         queueRunning = true
         func next() {
-            guard !todo.isEmpty else { queueRunning = false; working = nil; loadDraft(); return }
+            guard !todo.isEmpty else { queueRunning = false; working = nil; return }
             let id = todo.removeFirst()
             let e = run.review.entry(id)
             guard !e.pending.isEmpty else { next(); return }
             working = id
-            run.revise(id, change: e.pending, mode: ReviewMode(rawValue: e.mode) ?? .edit, folder: folder) { _ in next() }
+            run.revise(id, change: e.pending, mode: ReviewMode(rawValue: e.mode) ?? .edit, folder: folder) { _ in drafts[id] = nil; next() }
         }
         next()
-    }
-
-    private func exportForSpine() {
-        let ready = symbols.filter { run.review.entry($0).approved && FrameRules.parse($0) == nil }
-        let r = SpineExport.write(run: run, ids: ready, folder: folder)
-        run.status = r.error ?? "Spine kits for \(r.kits) symbols in \(r.out.lastPathComponent)"
-        if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
     }
 }
 
 enum GDDReviewWindow {
     private static var windows: [NSWindow] = []
-    @MainActor static func open(run: GDDToAssetsRun, folder: URL) {
+    /// Posted to turn an open browser to a picture: object is the set folder, userInfo["id"] the picture.
+    static let select = Notification.Name("AssetBrowserSelect")
+    @MainActor static func open(run: GDDToAssetsRun, folder: URL, select id: String? = nil) {
         if run.review == SetReview() { run.loadReview(folder) }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 860),
+        // One browser per set: opening it again brings the open one forward, turned to the picture asked for.
+        if let open = windows.first(where: { $0.representedURL == folder }) {
+            open.makeKeyAndOrderFront(nil)
+            if let id { NotificationCenter.default.post(name: Self.select, object: folder, userInfo: ["id": id]) }
+            return
+        }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1440, height: 900),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.isReleasedWhenClosed = false
-        w.title = "Review & revise — \(folder.lastPathComponent)"
-        w.contentView = NSHostingView(rootView: GDDReviewView(run: run, folder: folder))
+        w.representedURL = folder
+        w.title = "Assets — \(folder.lastPathComponent)"
+        w.setFrameAutosaveName("AssetBrowser")
+        w.contentView = NSHostingView(rootView: AssetBrowserView(run: run, folder: folder, startID: id, startLightbox: id != nil))
         w.center(); w.makeKeyAndOrderFront(nil)
         windows.append(w)
         var token: NSObjectProtocol?
@@ -28792,6 +29556,8 @@ struct GDDToAssetsSheet: View {
     /// The game's structure: typed for a set with no GDD, or a GDD's reading to correct.
     @State private var sheet = GameSheet()
     @State private var correctingStructure = false
+    /// The structure sheet changed and not yet used: reopening it keeps those edits.
+    @State private var structureEdited = false
     @State private var checklistOpen = false
     @State private var manualName = ""
 
@@ -28857,6 +29623,9 @@ struct GDDToAssetsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+          ScrollViewReader { jump in
+            stepBar(jump)
+            Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     step(1, fromDocument ? "Game design document" : "Symbols this game needs") {
@@ -28880,6 +29649,7 @@ struct GDDToAssetsSheet: View {
                 }
                 .padding(20)
             }
+          }
             Divider()
             footer
         }
@@ -28936,6 +29706,36 @@ struct GDDToAssetsSheet: View {
             }
             content().padding(.leading, 26)
         }
+        .id("step\(n)")
+    }
+
+    /// The four steps as tabs along the top — each a click away however long the page — with where the set stands,
+    /// and the asset browser.
+    private func stepBar(_ jump: ScrollViewProxy) -> some View {
+        let made = run.lastFolder.map { f in run.jobs.filter { FileManager.default.fileExists(atPath: f.appendingPathComponent($0.filename).path) }.count } ?? 0
+        let steps: [(Int, String, Bool)] = [(1, fromDocument ? "Document" : "Symbols", run.jobs.isEmpty == false),
+                                            (2, "Theme", run.theme != nil), (3, "Output & interface", run.lastFolder != nil),
+                                            (4, run.jobs.isEmpty ? "Plan" : "Plan · \(made) of \(run.jobs.count) made", made == run.jobs.count && made > 0)]
+        return HStack(spacing: 6) {
+            ForEach(steps, id: \.0) { s in
+                Button { withAnimation { jump.scrollTo("step\(s.0)", anchor: .top) } } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: s.2 ? "checkmark.circle.fill" : "\(s.0).circle").foregroundStyle(s.2 ? Color.green : Color.accentColor)
+                        Text(s.1)
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 5)
+                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .disabled(s.0 == 4 && run.jobs.isEmpty)
+            }
+            Spacer()
+            if let folder = run.lastFolder {
+                Button { GDDReviewWindow.open(run: run, folder: folder) } label: { Label("Assets", systemImage: "square.grid.3x3.square") }
+                    .help("Every picture of the set as a grid or close up — approve, change, replace or restore any of them")
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 8)
     }
 
     // MARK: Step 1 — the GDD
@@ -29563,7 +30363,7 @@ struct GDDToAssetsSheet: View {
             Text(backgroundNote)
                 .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
                 .fixedSize(horizontal: false, vertical: true)
-            if !run.symbols.isEmpty {
+            if !run.symbols.isEmpty || !run.jobs.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 6) {
                         Text("Reels").bold()
@@ -29573,12 +30373,14 @@ struct GDDToAssetsSheet: View {
                             .help("Everything round the symbols, from the GDD: for every grid, the bezel, dividers, reel texture and reel fade as layers; the jackpot table and pots when it has them; its wheels as the studio builds them (rim, hub, pointer, one wedge per prize); and the award pop-ups (panel, value bar, CONTINUE button, a title per award — bonus games, total win, each jackpot, the win ladder). Previews of each. Only what isn't made yet is drawn. GPT Image 2.5, about $0.07–0.15 a piece.")
                         Menu("Make Again") {
                             ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
-                            Divider()
-                            Button("Show the Previews") { run.showPreviews() }
                         }
                         .fixedSize()
                         .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
-                        .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots or their filling and full states, the wheels, or the pop-ups. The current files are kept in the set's versions folder. About $0.07–0.15 a piece; the bezel can take two tries.")
+                        .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots, the wheels, or the pop-ups. The current files are kept in the set's versions folder. About $0.07–0.15 a piece; the bezel can take two tries. To change one picture, open it in the asset browser (View).")
+                        if let folder = run.lastFolder {
+                            Button("View") { GDDReviewWindow.open(run: run, folder: folder) }
+                                .help("The game interface, piece by piece, in the asset browser — each pot's six states side by side")
+                        }
                     }
                     ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
                     assetChecklist
@@ -29587,12 +30389,25 @@ struct GDDToAssetsSheet: View {
                         DisclosureGroup(run.reelLayout == nil ? "Set the game's structure" : "Correct the game's structure", isExpanded: $correctingStructure) {
                             VStack(alignment: .leading, spacing: 6) {
                                 GameSheetEditor(sheet: $sheet, jackpots: run.symbols.filter { $0.role == .jackpot }.count)
-                                Button("Use This Structure") { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect) }
-                                    .help("Replaces what was read from the document: the reels, bonus grid, extras, jackpot table, pots, wheels and awards the game interface is made from.")
+                                HStack {
+                                    Button("Use This Structure") { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect); structureEdited = false }
+                                        .help("Replaces what was read from the document: the reels, bonus grid, extras, jackpot table and names, pots, wheels, awards and tutorial the game interface is made from.")
+                                    if structureEdited { Text("Not used yet").font(.caption).foregroundStyle(.orange) }
+                                }
                             }
                         }
                         .font(.callout)
-                        .onChange(of: correctingStructure) { if correctingStructure { sheet = run.reelLayout.map { GameSheet(layout: $0, bonusSymbols: run.symbols.filter { $0.role == .bonus }.count) } ?? GameSheet() } }
+                        .onChange(of: sheet) { if correctingStructure { structureEdited = true } }
+                        // Seeded from what the run holds — the reading, the jackpots' names, the tutorial — but never over edits not used yet.
+                        .onChange(of: correctingStructure) {
+                            guard correctingStructure, !structureEdited else { return }
+                            var s = run.reelLayout.map { GameSheet(layout: $0, bonusSymbols: run.symbols.filter { $0.role == .bonus }.count) } ?? GameSheet()
+                            s.jackpotNames = run.jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
+                                .map { (GDDAssetPrompts.letteredWord($0) ?? $0.title).capitalized }.joined(separator: ", ")
+                            s.tutorial = run.gddText.lowercased().contains("tutorial")
+                            sheet = s
+                            DispatchQueue.main.async { structureEdited = false }
+                        }
                     }
                 }
             }
@@ -29803,10 +30618,11 @@ struct GDDToAssetsSheet: View {
             if let a = run.anchorJob, let url = run.anchorImageURL {
                 // The picture every other symbol will be shown. Worth a look before paying for them.
                 HStack(alignment: .top, spacing: 10) {
-                    if let img = NSImage(contentsOf: url) {
-                        Image(nsImage: img).resizable().interpolation(.high)
-                            .frame(width: 96, height: 96).cornerRadius(6)
+                    Button { if let f = run.lastFolder { GDDReviewWindow.open(run: run, folder: f, select: a.id) } } label: {
+                        AsyncThumb(url: url, stamp: run.imagesVersion, side: 256, backing: run.backing.rgb)
+                            .frame(width: 96, height: 96).background(Color.black.opacity(0.35)).cornerRadius(6)
                     }
+                    .buttonStyle(.plain).help("See it close up in the asset browser")
                     VStack(alignment: .leading, spacing: 4) {
                         Text("\(a.id) sets the look").font(.caption.bold())
                         Text("Every other symbol is drawn with this image attached. If it isn’t right, redo it before generating the rest.")
@@ -29819,7 +30635,7 @@ struct GDDToAssetsSheet: View {
                         HStack {
                             Button("Redo \(a.id)") { makeAnchor(redo: true) }
                                 .disabled(run.running || run.busy)
-                            Button("Open") { NSWorkspace.shared.open(url) }
+                            Button("Close Up") { if let f = run.lastFolder { GDDReviewWindow.open(run: run, folder: f, select: a.id) } }
                         }.controlSize(.small)
                     }
                 }
@@ -29954,8 +30770,13 @@ struct GDDToAssetsSheet: View {
     @ViewBuilder private func statusDot(_ id: String) -> some View {
         if let e = run.failures[id] {
             Image(systemName: "xmark.circle.fill").foregroundColor(.red).help(e)
-        } else if run.produced.contains(where: { $0.lastPathComponent == "\(id).png" })
-                    || (run.lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(id).png").path) } ?? false) {
+        } else if let folder = run.lastFolder, FileManager.default.fileExists(atPath: folder.appendingPathComponent("\(id).png").path) {
+            Button { GDDReviewWindow.open(run: run, folder: folder, select: id) } label: {
+                AsyncThumb(url: folder.appendingPathComponent("\(id).png"), stamp: run.imagesVersion, side: 96, backing: run.backing.rgb)
+                    .frame(width: 30, height: 30).background(Color.black.opacity(0.35)).clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+            .buttonStyle(.plain).help("Generated — click to see it close up in the asset browser")
+        } else if run.produced.contains(where: { $0.lastPathComponent == "\(id).png" }) {
             Image(systemName: "checkmark.circle.fill").foregroundColor(.green).help("Generated")
         } else {
             Image(systemName: "circle").foregroundColor(.secondary.opacity(0.35)).help("Not generated yet")
@@ -29989,9 +30810,9 @@ struct GDDToAssetsSheet: View {
                 Button("Retry \(run.failures.count) failed") { retryFailed() }
                     .help("Generate only the images that failed, into the same folder")
             }
-            if !run.running, let folder = run.lastFolder, !run.produced.isEmpty {
-                Button("Review & revise…") { GDDReviewWindow.open(run: run, folder: folder) }
-                    .help("Every image large, in order: ask for changes, approve, then cut the backgrounds and split the frames")
+            if let folder = run.lastFolder {
+                Button { GDDReviewWindow.open(run: run, folder: folder) } label: { Label("Assets", systemImage: "square.grid.3x3.square") }
+                    .help("Every picture of the set — symbols, backgrounds, pots, wheels, pop-ups — as a grid or close up: approve, ask for a change, use your own picture, or put an earlier version back")
             }
             Button("Close") { requestClose() }
             Button(generateLabel) { startGenerate() }
@@ -30396,7 +31217,8 @@ struct GDDToAssetsSheet: View {
             guard a.runModal() == .alertFirstButtonReturn else { return }
             run.generate(into: folder, removeBackground: removeBG, separateFrames: separateFrames,
                          only: rest) { urls in
-                if let first = urls.first { NSWorkspace.shared.activateFileViewerSelecting([first]) }
+                // The set opens in the asset browser to look at, approve and change — not in Finder.
+                if !urls.isEmpty { GDDReviewWindow.open(run: run, folder: folder) }
             }
             return
         }
@@ -30417,9 +31239,8 @@ struct GDDToAssetsSheet: View {
         }
         guard let out = makeRunFolder() else { return }
         run.generate(into: out, removeBackground: removeBG, separateFrames: separateFrames) { urls in
-            if let first = urls.first {
-                NSWorkspace.shared.activateFileViewerSelecting([first])
-            }
+            // The set opens in the asset browser to look at, approve and change — not in Finder.
+            if !urls.isEmpty { GDDReviewWindow.open(run: run, folder: out) }
         }
     }
 

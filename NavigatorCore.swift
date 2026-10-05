@@ -16420,6 +16420,14 @@ extension GDDAssetPrompts {
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
+    /// Any picture of the set changed as the art director describes, an edit of it (attached): only that changes.
+    static func pictureEditBrief(change: String, backing: (name: String, rgb: RGB8)?) -> String {
+        [
+            "Edit the attached image, a piece of a video slot game's art. Make exactly this change: \(change)",
+            "Change nothing else: everything not named stays exactly as it is — its shape, size, position, colours, lettering, material and finish.",
+            backing.map { backdropLine($0) } ?? "Fill the whole picture, as it does now.",
+        ].joined(separator: "\n\n")
+    }
     static func potBoostBrief(theme: GameTheme, backing: (name: String, rgb: RGB8), look: String) -> String {
         [
             "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, full. Show the same pot as it looks while the game's Power Bet is on, as the game's design says: “\(look)”",
