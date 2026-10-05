@@ -26452,7 +26452,8 @@ final class GDDToAssetsRun: ObservableObject {
                     if k > 1 && prevDrawn == nil { break }
                     let prevBody = lid != nil || k == 1 ? body0 : prevDrawn!.px
                     guard var tplPx = PotStates.heaped(previous: prevBody, empty: body0, width: 1024, height: potH, state: k, cap: cap,
-                                                       after: lid != nil ? PotStates.rise[k - 1] : nil) else { break }
+                                                       after: lid != nil ? PotStates.rise[k - 1] : nil,
+                                                       mouth: lid.flatMap { PotStates.mouth(ofLid: $0, width: 1024, height: potH) }) else { break }
                     if let lid {
                         guard let placed = PotStates.placeLid(on: tplPx, lid: lid, width: 1024, height: potH, state: k) else { break }
                         tplPx = placed.px

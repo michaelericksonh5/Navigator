@@ -8814,6 +8814,10 @@ public enum PotStates {
     /// The full pot's top stands no higher than the shipped rigs' tallest (29%; research §6): the canvas's extra room
     /// only keeps a drawing that overshoots from being cut off.
     public static let maxRise = 0.30
+    /// Where the treasure spills over the rim, by state: side (−1 left, +1 right) and how far down the pot, in its heights.
+    public static func spill(_ k: Int) -> [(side: Double, depth: Double)] {
+        k == 4 ? [(1, 0.12)] : k >= 5 ? [(-1, 0.22), (1, 0.26)] : []
+    }
     /// The rows a silhouette spans: those with an opaque pixel in at least 1% of the width.
     static func span(_ px: [UInt8], width w: Int, height h: Int) -> (top: Int, bottom: Int)? {
         let rows = (0..<h).filter { y in (0..<w).reduce(0) { $0 + (px[(y * w + $1) * 4 + 3] > 128 ? 1 : 0) } >= max(1, w / 100) }
@@ -8842,16 +8846,30 @@ public enum PotStates {
     /// State k−1 (straight RGBA) with its grey heap added, opaque — the template before it is laid on the backing.
     /// `after`: where the state before stands by the schedule, when each state is drawn from the empty pot rather than from
     /// the state before (GPT lifts what it is given a little each time, and drawn from each other the overshoot compounded).
-    static func heaped(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise, after: Double? = nil) -> [UInt8]? {
+    /// `mouth`: the mouth's columns when known — a lid's own width, as it sits on the mouth (a cup whose handles join its rim
+    /// made the rim's run handle to handle).
+    static func heaped(previous: [UInt8], empty: [UInt8], width w: Int, height h: Int, state k: Int, cap: Double = maxRise, after: Double? = nil,
+                       mouth: (Int, Int)? = nil) -> [UInt8]? {
         guard k > 0, k < rise.count, var st = standing(previous, empty: empty, width: w, height: h, cap: cap) else { return nil }
         if let after { st.rise = after }
         let s0 = st.s0, H0 = Double(s0.bottom - s0.top)
         // The pot's mouth: its first row at least 40% as wide as its widest (past a lid's knob), the heap as wide as
         // that rim and rising from it — not from the shoulders, which put grey beside the neck (2026-10-05).
-        func extent(_ y: Int) -> (Int, Int)? { let xs = (0..<w).filter { empty[(y * w + $0) * 4 + 3] > 128 }; return xs.first.map { ($0, xs.last!) } }
+        // The run of pot continuous through its own centre, row by row: a handle that rises above the rim is a separate
+        // run, and is no part of the mouth (a cup's handle tips set the heap's width, 2026-10-05).
+        guard let fb = box(empty, width: w, height: h) else { return nil }
+        let mid = fb.x + fb.w / 2
+        func extent(_ y: Int) -> (Int, Int)? {
+            guard empty[(y * w + mid) * 4 + 3] > 128 else { return nil }
+            var a = mid, z = mid
+            while a > 0 && empty[(y * w + a - 1) * 4 + 3] > 128 { a -= 1 }
+            while z < w - 1 && empty[(y * w + z + 1) * 4 + 3] > 128 { z += 1 }
+            return (a, z)
+        }
         let widest = (s0.top...s0.bottom).compactMap { extent($0).map { $0.1 - $0.0 } }.max() ?? 0
-        guard let rimY = (s0.top...s0.bottom).first(where: { y in extent(y).map { Double($0.1 - $0.0) >= 0.4 * Double(widest) } ?? false }),
-              let (x0, x1) = extent(rimY), x1 > x0 else { return nil }
+        guard let rimY = (s0.top...s0.bottom).first(where: { y in extent(y).map { Double($0.1 - $0.0) >= 0.4 * Double(widest) } ?? false }) else { return nil }
+        // The mouth's width: the rim's widest row just below its top edge (its back edge, seen first, is the short arc).
+        guard let (x0, x1) = mouth ?? (rimY..<min(h, rimY + Int(0.08 * H0) + 1)).compactMap(extent).max(by: { $0.1 - $0.0 < $1.1 - $1.0 }), x1 > x0 else { return nil }
         let cx = Double(x0 + x1) / 2, hw = Double(x1 - x0) * 0.5
         let crown = max(0, Double(s0.top) - (after != nil ? min(st.room, rise[k]) : crown(k, after: st.rise, room: st.room)) * H0), foot = Double(rimY) + 0.03 * H0
         var out = previous
@@ -8864,6 +8882,18 @@ public enum PotStates {
             let g = UInt8(135 + 45 * (1 - dy))           // lit from above, like every grey template
             out[(y * w + x) * 4] = g; out[(y * w + x) * 4 + 1] = g; out[(y * w + x) * 4 + 2] = g; out[(y * w + x) * 4 + 3] = 255
         } }
+        // The spill (the shipped rigs overflow past the rim at the end): at State4 a tongue of treasure over one side of
+        // the rim, at State5 down both sides over the pot — laid in grey, over the pot itself, so the overflow is set, not hoped for.
+        for (side, depth) in spill(k) {
+            let ex = side < 0 ? Double(x0) : Double(x1), sx = ex + Double(side) * 0.02 * Double(x1 - x0)
+            let ry = depth * H0 / 2, rx = 0.13 * Double(x1 - x0), sy = Double(rimY) + ry * 0.8
+            for y in max(0, Int(sy - ry))..<min(h, Int(sy + ry)) { for x in max(0, Int(sx - rx))..<min(w, Int(sx + rx)) {
+                let dx = (Double(x) - sx) / rx, dy = (Double(y) - sy) / ry
+                guard dx * dx + dy * dy <= 1 else { continue }
+                let g = UInt8(140 + 35 * (1 - max(0, dy)))
+                out[(y * w + x) * 4] = g; out[(y * w + x) * 4 + 1] = g; out[(y * w + x) * 4 + 2] = g; out[(y * w + x) * 4 + 3] = 255
+            } }
+        }
         return out
     }
     /// What keeps a drawn state (laid on State0) from growing as the rig must: its top at least 3% of State0's height above
@@ -8885,6 +8915,8 @@ public enum PotStates {
     /// How far the lid is tipped at each state, in degrees.
     /// Gentle: a lid lifted by the treasure under it stays nearly level (a flat lid spun 30° read as sliding off, 2026-10-05).
     public static let lidTilt: [Double] = [0, 2, 3, 5, 6, 8]
+    /// A lid's columns, as the mouth it sits on.
+    public static func mouth(ofLid lid: [UInt8], width w: Int, height h: Int) -> (Int, Int)? { box(lid, width: w, height: h).map { ($0.x, $0.x + $0.w - 1) } }
     static func box(_ px: [UInt8], width w: Int, height h: Int) -> (x: Int, y: Int, w: Int, h: Int)? {
         var x0 = w, y0 = h, x1 = -1, y1 = -1
         for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 128 { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y) } }
@@ -16134,7 +16166,7 @@ extension GDDAssetPrompts {
             + "Edit the \(k > 1 ? "first" : "") attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k) of 5. Its lid is shown exactly where it rests at this stage, lifted by the treasure beneath it: keep the lid exactly as it is — its shape, size, position, angle, material and ornament.",
             k == 1
                 ? "Paint the first of its treasure — the theme's own coins, gems or gold, in the pot's own colours — glinting in the narrow gap between the lid and the rim, filling that gap solidly, with a soft warm glow spilling from it onto the lid's rim. Nothing of the background shows through between the lid and the pot."
-                : "The flat grey mound is the treasure that has risen under and round the lid: paint it as the pot's own treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure as before — heaped up to the grey's outline and pressing up against the lid's underside, so the lid truly rests on it: a soft contact shadow where the lid sits on the treasure, the treasure's warm glow lighting the lid's underside and rim, the heap filling the pot's mouth solidly. Nothing of the background shows through anywhere inside it.\(k == PotStates.levels ? " Full to overflowing: a few pieces spill over the rim." : "")",
+                : "The flat grey mound is the treasure that has risen under and round the lid: paint it as the pot's own treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure as before — heaped up to the grey's outline and pressing up against the lid's underside, so the lid truly rests on it: a soft contact shadow where the lid sits on the treasure, the treasure's warm glow lighting the lid's underside and rim, the heap filling the pot's mouth solidly. Nothing of the background shows through anywhere inside it.\(k == 4 ? " Where the grey runs over the rim on one side, the treasure spills over it there — coins tumbling a little way down the pot's side." : k >= 5 ? " Full to overflowing: where the grey runs down over the pot on both sides, coins and gems pour over the rim and tumble down its sides." : "")",
             "The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces. The pot itself stays exactly as it is: its shape, size, position, material, colour and ornament. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
             detailRules,
             backdropLine(backing),
@@ -16146,7 +16178,7 @@ extension GDDAssetPrompts {
         return [
             (k == 1
              ? "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, empty. Show it at fill stage 1 of 5: the first of its treasure — the theme's own coins, gems or gold in the pot's own colours — just showing at its mouth, no higher than its rim, and a soft glow beginning within in the pot's own colour — never the background's."
-             : "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == PotStates.levels ? ", full to overflowing: a few pieces spill over the rim" : ""). At a glance it must look clearly fuller and livelier than the stage before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.")
+             : "Edit the attached image: it is the pot that stands above the reels of a video slot game themed “\(theme.name)”, at fill stage \(k - 1) of 5. The flat grey mound on and above its mouth is more of the treasure it collects: paint it as that treasure — the theme's own coins, gems or gold, in the pot's own colours, the same treasure already in it — heaped up to exactly the grey mound's outline: its top where the grey's top is, no higher and no lower. This is fill stage \(k) of 5\(k == 4 ? ", the treasure beginning to spill: where the grey runs over the rim on one side, coins tumble a little way down the pot's side" : k >= 5 ? ", full to overflowing: where the grey runs down over the pot on both sides, coins and gems pour over the rim and tumble down its sides" : ""). At a glance it must look clearly fuller and livelier than the stage before: the treasure higher, any lid further open, and a warmer, stronger glow rising from within in the pot's own colour — never the background's colour.")
             + " The treasure is a few large, chunky coins and gems with smooth faces and only a handful of bright highlights — never a glittering mass of tiny pieces.",
             (lidOff ? "Its lid is off — it is laid back on afterwards: draw no lid, cover or door, and none of one. "
                     : "If the pot has a lid, cover or door, it is \(lid) — never raised up above the treasure, never taken away; a pot with no lid never gains one. ") + "Everything else stays exactly as it is: the pot's shape, size, position, material, colour and ornament, and the treasure already in it. A calm, still pose: no burst, rays, explosion or flying pieces. Keep it all inside the picture. No text, lettering or numbers.",
