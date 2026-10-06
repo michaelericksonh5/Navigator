@@ -9461,8 +9461,9 @@ public enum AssetChecklist {
                             files: ["\(m.name)_interface_reelTexture_rmbg.png", "\(m.name)_interface_reelFade_rmbg.png"], maker: "Reel area", cost: i == 0 ? gpt(2048, 1365) : 0))
         }
         if l.extras.contains(where: { $0.what == "jackpot table" }), !names.isEmpty {
-            out.append(Item(group: "Jackpots", name: "shared_interface_jackpotTable", what: "jackpot table: " + names.joined(separator: ", "),
-                            files: ["shared_interface_jackpotTable.png"], maker: "Jackpot table", cost: gpt(3008, 1008)))
+            let sheet = JackpotMeters(count: names.count)
+            out.append(Item(group: "Jackpots", name: "shared_interface_jackpotTable", what: "the jackpot meters, drawn together, a plaque per tier: " + names.joined(separator: ", "),
+                            files: ["shared_interface_jackpotTable.png"], maker: "Jackpot meters", cost: gpt(sheet.width, sheet.height)))
         }
         if let pots = l.extras.first(where: { $0.what == "pots" }) {
             // As many as the generator draws: the GDD's number, else one per bonus symbol.
@@ -9497,8 +9498,8 @@ public enum AssetChecklist {
                             files: ["\(p.name).png"], maker: "Pop-ups", cost: gpt(p.w, p.h)))
         }
         if l.extras.contains(where: { $0.what == "jackpot table" }), !names.isEmpty {
-            out.append(Item(group: "Jackpots", name: "shared_meter", what: "a meter plaque per tier, cut from the table: " + names.joined(separator: ", "),
-                            files: names.map { "shared_meter_\(PopUps.key($0)).png" }, maker: "Jackpot table", cost: 0))
+            out.append(Item(group: "Jackpots", name: "shared_meter", what: "each tier's meter, cut from the sheet: " + names.joined(separator: ", "),
+                            files: names.map { "shared_meter_\(PopUps.key($0)).png" }, maker: "Jackpot meters", cost: 0))
         }
         out.append(Item(group: "Fonts", name: "transition_font_totalWin", what: "the total-win number font: " + NumberFont.glyphs.joined(separator: " "),
                         files: ["transition_font_totalWin.png"], maker: "Number font", cost: gpt(NumberFont.size.w, NumberFont.size.h)))
@@ -11184,6 +11185,73 @@ public struct JackpotTable: Equatable, Sendable {
             px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = 255
         } }
         return px
+    }
+}
+
+/// The jackpot meters as the studio ships them (2026-10-06: the screenshots of 90 games, the meter art of six): one plaque
+/// per tier and never a shared plate — the framed plaque with its tier's name on a tab across its top edge, in the tier's
+/// colour, and a dark, empty value field below it where the game prints the amount. Drawn together on one sheet so they
+/// match, two to a row with the backing between them, then cut apart (`cut`), so each meter is whole on its own.
+public struct JackpotMeters: Equatable, Sendable {
+    public static let plaqueW = 896, plaqueH = 384, gap = 128
+    public var count: Int, width: Int, height: Int
+    public var plaques: [ReelArea.Rect] = [], tabs: [ReelArea.Rect] = [], fields: [ReelArea.Rect] = []
+    public init(count n: Int) {
+        let n = max(1, n), cols = n == 1 ? 1 : 2, rows = (n + cols - 1) / cols, pw = Self.plaqueW, ph = Self.plaqueH, g = Self.gap
+        func up16(_ v: Int) -> Int { (v + 15) / 16 * 16 }
+        count = n; width = cols * pw + (cols + 1) * g
+        // No longer than 3:1, GPT Image's limit: a single row is given room above and below.
+        height = up16(max(rows * ph + (rows + 1) * g, (width + 2) / 3))
+        let top = (height - (rows * ph + (rows - 1) * g)) / 2
+        for i in 0..<n {
+            let r = i / cols, inRow = min(cols, n - r * cols), c = i % cols
+            let rowW = inRow * pw + (inRow - 1) * g, x = (width - rowW) / 2 + c * (pw + g), y = top + r * (ph + g)
+            plaques.append(ReelArea.Rect(x: x, y: y, w: pw, h: ph))
+            tabs.append(ReelArea.Rect(x: x + pw * 18 / 100, y: y, w: pw * 64 / 100, h: ph * 36 / 100))
+            fields.append(ReelArea.Rect(x: x + pw * 9 / 100, y: y + ph * 47 / 100, w: pw * 82 / 100, h: ph * 41 / 100))
+        }
+    }
+    /// Meter `i` as cut from the sheet: its plaque and half the gap round it, for the ornament that spreads past its edge.
+    public func cut(_ i: Int) -> ReelArea.Rect {
+        let p = plaques[i], m = Self.gap / 2
+        return ReelArea.Rect(x: max(0, p.x - m), y: max(0, p.y - m), w: min(width - max(0, p.x - m), p.w + 2 * m), h: min(height - max(0, p.y - m), p.h + 2 * m))
+    }
+    /// Meter `i`'s value field in its cut picture's pixels.
+    public func field(in i: Int) -> ReelArea.Rect {
+        let c = cut(i), f = fields[i]
+        return ReelArea.Rect(x: f.x - c.x, y: f.y - c.y, w: f.w, h: f.h)
+    }
+    /// The grey plaques on the backing, each apart: its body raised, its tab on top, its value field recessed.
+    func template(backing b: RGB8) -> [UInt8] {
+        var px = [UInt8](repeating: 255, count: width * height * 4)
+        func rounded(_ r: ReelArea.Rect, _ x: Int, _ y: Int, _ rad: Int) -> Int? {
+            guard r.contains(x, y) else { return nil }
+            let cx = min(max(x, r.x + rad), r.x + r.w - 1 - rad), cy = min(max(y, r.y + rad), r.y + r.h - 1 - rad)
+            guard (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rad * rad else { return nil }
+            return min(x - r.x, r.x + r.w - 1 - x, y - r.y, r.y + r.h - 1 - y)
+        }
+        for y in 0..<height { for x in 0..<width {
+            let i = (y * width + x) * 4
+            var v: Int?
+            for k in plaques.indices {
+                let p = plaques[k], body = ReelArea.Rect(x: p.x, y: p.y + p.h / 5, w: p.w, h: p.h - p.h / 5)
+                if let e = rounded(fields[k], x, y, 14) { v = e < 4 ? 30 : 58; break }
+                if let e = rounded(tabs[k], x, y, 40) { v = e < 6 ? 110 : 190; break }
+                if let e = rounded(body, x, y, 36) { v = e < 8 ? 90 : 150; break }
+            }
+            let c = v.map { (UInt8($0), UInt8($0), UInt8($0)) } ?? (b.r, b.g, b.b)
+            px[i] = c.0; px[i + 1] = c.1; px[i + 2] = c.2; px[i + 3] = 255
+        } }
+        return px
+    }
+    /// The tiers' colours across the studio's games: GRAND (or MEGA) red, MAJOR purple, MINOR blue, MINI green.
+    public static func colour(_ name: String, rank: Int) -> String {
+        let n = name.uppercased()
+        if n.contains("GRAND") || n.contains("MEGA") || n.contains("MAXI") { return "red" }
+        if n.contains("MAJOR") { return "purple" }
+        if n.contains("MINOR") { return "blue" }
+        if n.contains("MINI") { return "green" }
+        return ["red", "purple", "blue", "green", "teal", "orange"][min(5, rank)]
     }
 }
 
@@ -17196,6 +17264,21 @@ extension GDDAssetPrompts {
     }
     /// The jackpot table above the reels (JackpotTable): its plaques lettered with the jackpots' names, in the
     /// bezel's material (attached first), each value field left empty for the game's amount.
+    /// The jackpot meters (JackpotMeters): the plain grey plaques of the sheet repainted, each its own meter.
+    static func jackpotMetersBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), names: [String]) -> String {
+        let places = names.count == 1 ? ["the plaque"] : (0..<names.count).map { i -> String in
+            let row = i / 2, rows = (names.count + 1) / 2, last = i == names.count - 1 && names.count % 2 == 1
+            return (rows == 1 ? "" : row == 0 ? "top " : row == rows - 1 ? "bottom " : "row \(row + 1) ") + (last ? "centre" : i % 2 == 0 ? "left" : "right")
+        }
+        let each = zip(places, names.enumerated()).map { "the \($0) plaque: “\($1.element)”, its tab \(JackpotMeters.colour($1.element, rank: $1.offset))" }.joined(separator: "; ")
+        return [
+            "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: it holds \(names.count) plain grey jackpot meters, separate plaques on a plain backing. Repaint each as its own jackpot meter in the reel frame's material and craft: a framed plaque with a raised tab across its top edge, its jackpot's name lettered on the tab, spelled exactly so, the tab enamelled in that jackpot's colour — \(each). The grandest is the richest. Below the tab each plaque's dark recessed value field stays plain and empty: the game prints the amount there. " + letteringRules,
+            "Every plaque stays separate, exactly where and as large as it is, the plain backing showing between them: no plate, frame, chain or ornament joins one to another. Its ornament may spread a little past its own edge. The only lettering is those names: no numbers, prices, logo or symbols.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     static func jackpotTableBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), names: [String]) -> String {
         [
             "Image 1 is the reel frame of a video slot game themed “\(theme.name)”. Edit the last attached image: it is the plain grey jackpot table that sits above those reels — a plate with \(names.count) plaques in a row. Repaint it in the reel frame's own material and craft. Each plaque has its jackpot's name lettered across its top, in this order from left to right: \(names.map { "“\($0)”" }.joined(separator: ", ")) — spelled exactly so, the grandest plaque the richest. Below each name its dark recessed field stays plain and empty: the game prints the amount there. " + letteringRules,
@@ -19333,11 +19416,15 @@ public enum GameForge {
         }
     }
 
-    /// Where the screen's pieces go in one orientation, in design px. `block`: the reels with the jackpot table and
-    /// pots above them, each piece's rectangle in the block's own pixels, laid out together as Navigator's reel
-    /// preview lays them; it is made as large as the box allows above the HUD band and centred in the room left.
-    /// The logo (`logo`: its shape) goes over it, or beside it when the box is wide and the reels leave room.
-    public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, profile p: Profile) -> [String: Box] {
+    /// Where the screen's pieces go in one orientation, in design px. `block`: the reels (or a wheel) with what stands over
+    /// them (pots), each piece's rectangle in the block's own pixels, laid out together as Navigator's previews lay them; it
+    /// is made as large as the box allows above the HUD band and centred in the room left. The logo (`logo`: its shape)
+    /// and the jackpot meters (`meters`: their shapes, top tier first) go as the studio's games put them (2026-10-06, 90
+    /// games): in portrait round the logo over the reels — the top two beside it, the next two below and further out (the
+    /// platform's own games), three as the top tier over the logo and the next two beside it; in a wide box, when the reels
+    /// leave room, the logo at the top of a column to their left and the meters under it, top tier first, each narrower
+    /// (31 of 41 landscape games). Keys: the block's, "logo", "meter1"….
+    public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, meters: [(w: Double, h: Double)] = [], profile p: Profile) -> [String: Box] {
         guard let u = Box.union(block.values), u.w > 0, u.h > 0 else { return [:] }
         let m = 6.0, gap = 6.0, top = -p.height / 2 + m, bottom = p.height / 2 - p.hud - m
         let aspect = logo.map { $0.w / max(1, $0.h) } ?? 1
@@ -19345,24 +19432,72 @@ public enum GameForge {
         func place(_ s: Double, _ left: Double, _ y0: Double) {
             for (k, b) in block { out[k] = Box(x: left + (b.x - u.x) * s, y: y0 + (b.y - u.y) * s, w: b.w * s, h: b.h * s) }
         }
-        if p.isLandscape, logo != nil {
-            let s = min((p.width - 2 * m) / u.w, (bottom - top) / u.h), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
+        func meterBox(_ i: Int, width w: Double, cx: Double, top y: Double) -> Box {
+            let h = w * meters[i].h / max(1, meters[i].w)
+            return Box(x: cx - w / 2, y: y, w: w, h: h)
+        }
+        if p.isLandscape, logo != nil || !meters.isEmpty {
+            // With meters, a column is kept for them, a fifth of the box: the reels never squeeze it out.
+            let keep = meters.isEmpty ? 0 : 0.2 * p.width
+            let s = min((p.width - 2 * m - 2 * keep) / u.w, (bottom - top) / u.h), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
             if column >= 150 {
                 let y0 = top + (bottom - top - bh) / 2
                 place(s, -bw / 2, y0)
-                var lw = min(column, 280), lh = lw / aspect
-                if lh > bh / 3 { lh = bh / 3; lw = lh * aspect }
-                out["logo"] = Box(x: (-p.width / 2 - bw / 2) / 2 - lw / 2, y: y0 + bh * 0.04, w: lw, h: lh)
+                let cx = (-p.width / 2 - bw / 2) / 2
+                var y = y0 + bh * 0.04
+                if logo != nil {
+                    var lw = min(column, 280), lh = lw / aspect
+                    if lh > bh / 3 { lh = bh / 3; lw = lh * aspect }
+                    out["logo"] = Box(x: cx - lw / 2, y: y, w: lw, h: lh)
+                    y += lh + 2 * gap
+                }
+                // The meters in a column, top tier first, each a step narrower; smaller all together if they would run past the room.
+                let steps = [1.0, 0.85, 0.75, 0.62, 0.55, 0.5], w0 = min(column * 0.9, 240)
+                var boxes = meters.indices.map { meterBox($0, width: w0 * steps[min($0, steps.count - 1)], cx: cx, top: 0) }
+                let total = boxes.reduce(0) { $0 + $1.h } + Double(max(0, boxes.count - 1)) * gap
+                let k = total > bottom - y ? (bottom - y) / total : 1
+                for i in boxes.indices {
+                    boxes[i] = meterBox(i, width: boxes[i].w * k, cx: cx, top: y); y += boxes[i].h + gap
+                    out["meter\(i + 1)"] = boxes[i]
+                }
                 return out
             }
         }
-        var lw = logo == nil ? 0 : min(p.width * 0.62, 260), lh = logo == nil ? 0 : lw / aspect
+        // Over the reels: the logo across the top, the meters round it, clear of it — never behind or over it.
+        let n = meters.count, mw = n == 0 ? 0 : min(0.22 * p.width, 110), mh = n == 0 ? 0 : mw * meters[0].h / max(1, meters[0].w)
+        // How far a side's meters reach past the logo: one meter, or the lower one set further out.
+        let reach = n >= 4 ? 1.35 * mw : n >= 1 ? mw : 0
+        var lw = logo == nil ? 0 : min(p.width * 0.62, 260, n > 0 ? p.width - 2 * (4 + gap + reach) : .infinity), lh = logo == nil ? 0 : lw / aspect
         if lh > p.height * 0.15 { lh = p.height * 0.15; lw = lh * aspect }
-        let room = top + (logo == nil ? 0 : lh + gap)
+        let inner = lw / 2 + gap + mw / 2, outer = inner + 0.35 * mw
+        var header: [String: Box] = [:]
+        if logo != nil { header["logo"] = Box(x: -lw / 2, y: n == 3 ? mh + gap : n >= 4 ? max(0, (2 * mh + gap / 2 - lh) / 2) : 0, w: lw, h: lh) }
+        func put(_ i: Int, _ cx: Double, _ y: Double) { header["meter\(i + 1)"] = meterBox(i, width: mw, cx: cx, top: y) }
+        let beside = max(0, (lh - mh) / 2)
+        switch n {
+        case 0: break
+        case 1: put(0, -inner, beside)
+        case 2: put(0, -inner, beside); put(1, inner, beside)
+        case 3:
+            // The top tier over the logo, the next two beside it.
+            put(0, 0, 0); put(1, -inner, mh + gap + beside); put(2, inner, mh + gap + beside)
+        default:
+            let y1 = max(0, (lh - (2 * mh + gap / 2)) / 2)
+            put(0, -inner, y1); put(1, inner, y1)
+            put(2, -outer, y1 + mh + gap / 2); put(3, outer, y1 + mh + gap / 2)
+            // More than four tiers: the rest in a row under them.
+            let rest = Array(4..<n), rowY = (Box.union(header.values).map { $0.y + $0.h } ?? 0) + gap
+            for (k, i) in rest.enumerated() { put(i, (Double(k) - Double(rest.count - 1) / 2) * (mw + gap), rowY) }
+        }
+        let hb = Box.union(header.values)
+        let headerH = hb.map { $0.y + $0.h } ?? 0
+        let room = top + (headerH > 0 ? headerH + gap : 0)
         let s = min((p.width - 2 * m) / u.w, (bottom - room) / u.h), bw = u.w * s, bh = u.h * s
         let y0 = room + (bottom - room - bh) / 2
         place(s, -bw / 2, y0)
-        if logo != nil { out["logo"] = Box(x: -lw / 2, y: top + (y0 - gap - top - lh) / 2, w: lw, h: lh) }
+        // The header sits midway between the top of the box and the reels.
+        let shift = top + max(0, (y0 - gap - top - headerH) / 2)
+        for (k, b) in header { out[k] = Box(x: b.x, y: b.y + shift, w: b.w, h: b.h) }
         return out
     }
 

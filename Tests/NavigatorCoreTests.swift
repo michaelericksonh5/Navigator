@@ -14595,3 +14595,40 @@ final class GameForgeEventTests: XCTestCase {
         XCTAssertEqual(r.texts.first?["parentAsset"] as? String, "bigWin-bar-base")
     }
 }
+
+final class JackpotMeterTests: XCTestCase {
+    func overlap(_ a: ReelArea.Rect, _ b: ReelArea.Rect) -> Bool { a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h }
+    func testTheMetersAreSeparatePlaquesOnOneSheet() {
+        for n in 1...6 {
+            let s = JackpotMeters(count: n)
+            XCTAssertEqual(s.plaques.count, n)
+            XCTAssertLessThanOrEqual(Double(max(s.width, s.height)) / Double(min(s.width, s.height)), 3.0)      // GPT Image's limit
+            XCTAssertEqual(s.width % 16, 0); XCTAssertEqual(s.height % 16, 0)
+            for i in 0..<n {
+                let c = s.cut(i), f = s.field(in: i)
+                XCTAssertTrue(c.x >= 0 && c.y >= 0 && c.x + c.w <= s.width && c.y + c.h <= s.height)
+                XCTAssertTrue(f.x > 0 && f.y > 0 && f.x + f.w < c.w && f.y + f.h < c.h)                      // the field inside its meter
+                for j in 0..<n where j != i { XCTAssertFalse(overlap(c, s.plaques[j])) }                       // a cut never takes a neighbour
+            }
+        }
+        // An odd one out is centred under the others.
+        let three = JackpotMeters(count: 3)
+        XCTAssertEqual(three.plaques[2].x + three.plaques[2].w / 2, three.width / 2)
+    }
+    func testThePortraitMetersSitRoundTheLogoAndTheLandscapeOnesInAColumn() {
+        typealias Box = GameForge.Box
+        func clear(_ a: Box, _ b: Box) -> Bool { !(a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) }
+        let block = ["bezel": Box(x: 0, y: 0, w: 3000, h: 2600), "grid": Box(x: 300, y: 300, w: 2400, h: 2000)]
+        let meters = Array(repeating: (w: 2.0, h: 1.0), count: 4)
+        let p = GameForge.compose(block: block, logo: (w: 2, h: 1), meters: meters, profile: .portrait())
+        let parts = ["logo", "meter1", "meter2", "meter3", "meter4"].map { p[$0]! }
+        for i in parts.indices { for j in parts.indices where j > i { XCTAssertTrue(clear(parts[i], parts[j]), "\(i) and \(j) overlap") } }
+        for b in parts { XCTAssertGreaterThanOrEqual(b.x, -195); XCTAssertLessThanOrEqual(b.x + b.w, 195); XCTAssertLessThan(b.y + b.h, p["bezel"]!.y) }
+        XCTAssertLessThan(p["meter1"]!.cx, 0); XCTAssertGreaterThan(p["meter2"]!.cx, 0)                     // the top two either side
+        XCTAssertLessThan(p["meter3"]!.cx, p["meter1"]!.cx)                                                  // the next two further out
+        let l = GameForge.compose(block: block, logo: (w: 2, h: 1), meters: meters, profile: .landscape())
+        for k in 1...4 { XCTAssertLessThan(l["meter\(k)"]!.x + l["meter\(k)"]!.w, l["bezel"]!.x) }           // a column left of the reels
+        XCTAssertGreaterThan(l["meter1"]!.w, l["meter4"]!.w)                                                 // each a step narrower
+        XCTAssertLessThan(l["meter1"]!.y, l["meter2"]!.y)
+    }
+}

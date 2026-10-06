@@ -22098,6 +22098,8 @@ if let flag = CommandLine.arguments.firstIndex(of: "--interface-templates"), fla
     save(WheelArt.frameTemplate(backing: b), WheelArt.frameSize, WheelArt.frameSize, "wheelFrame")
     save(WheelArt.discTemplate(size: 512, share: 0.7, backing: b), 512, 512, "wheelHub")
     for p in PopUps.plan(ReelLayout(), jackpots: [], bonus: false) { save(PopUps.template(p, backing: b), p.w, p.h, p.name) }
+    let meters = JackpotMeters(count: 4)
+    save(meters.template(backing: b), meters.width, meters.height, "jackpotMeters")
     // The face from flat wedges in two greys, to see the tiling.
     let light = art.cut([UInt8]((0..<(art.wedgeSize.w * art.wedgeSize.h)).flatMap { _ in [200, 200, 200, 255] as [UInt8] }))
     let dark = art.cut([UInt8]((0..<(art.wedgeSize.w * art.wedgeSize.h)).flatMap { _ in [90, 90, 90, 255] as [UInt8] }))
@@ -26574,7 +26576,7 @@ final class GDDToAssetsRun: ObservableObject {
     static let englishPieces: [(name: String, files: (String) -> Bool)] = [
         ("Bezel", { $0.contains("_interface_bezel") || $0.contains("_interface_dividers") }),
         ("Reel texture", { $0.hasPrefix("base_interface_reelTexture") }),
-        ("Jackpot table", { $0.hasPrefix("shared_interface_jackpotTable") || $0.hasPrefix("shared_meter_") }),
+        ("Jackpot meters", { $0.hasPrefix("shared_interface_jackpotTable") || $0.hasPrefix("shared_meter_") }),
         ("Pots", { $0.hasPrefix("shared_avatar_jar") && !$0.contains("-plaque") }),
         ("Pot states", { $0.hasPrefix("shared_avatar_jar") && ($0.contains("-State") && !$0.contains("-State0") || $0.contains("-boosted")) }),
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
@@ -26600,7 +26602,7 @@ final class GDDToAssetsRun: ObservableObject {
         var groups: [String] {
             switch self {
             case .core: ["Bezel", "Reel texture", "Pots"]
-            case .rest: ["Jackpot table", "Pot plaques", "Number fonts", "Symbol win states", "Symbol forms", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
+            case .rest: ["Jackpot meters", "Pot plaques", "Number fonts", "Symbol win states", "Symbol forms", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
             case .localize: ["Localized"]
             }
         }
@@ -27045,14 +27047,15 @@ final class GDDToAssetsRun: ObservableObject {
             }
             write(area.fadeLayer(), area.width, area.height, "\(name)_interface_reelFade_rmbg.png")
         }
-        // 3. The jackpot table, as wide as the base bezel's band, when the GDD has one and the set has jackpots.
+        // 3. The jackpot meters, a plaque per tier drawn together on one sheet (JackpotMeters), when the GDD has jackpots shown
+        // with the reels and the set has jackpots. The sheet keeps the table's file name: sets made before have a table there.
         let jackpots = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
         if layout.extras.contains(where: { $0.what == "jackpot table" }), !jackpots.isEmpty, !has("shared_interface_jackpotTable.png"),
            let ref = try? Data(contentsOf: url("base_interface_bezel.png")) {
-            let table = JackpotTable(count: jackpots.count, width: base.grid.w + 2 * base.band)
+            let table = JackpotMeters(count: jackpots.count)
             let names = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
             if let tpl = png(table.template(backing: b), table.width, table.height),
-               let px = paint("shared_interface_jackpotTable", prompt: GDDAssetPrompts.jackpotTableBrief(theme: theme, design: design, backing: (backing.name, b), names: names),
+               let px = paint("shared_interface_jackpotTable", prompt: GDDAssetPrompts.jackpotMetersBrief(theme: theme, design: design, backing: (backing.name, b), names: names),
                               inputs: [downsamplePNG(ref, longEdge: 2048) ?? ref, tpl], w: table.width, h: table.height, covered: nil,
                               judge: { px in
                                   let k = FrameKit.keyed(px, backing: b, width: table.width, height: table.height)
@@ -27063,16 +27066,19 @@ final class GDDToAssetsRun: ObservableObject {
                 write(FrameKit.keyed(px, backing: b, width: table.width, height: table.height), table.width, table.height, "shared_interface_jackpotTable_rmbg.png")
             }
         }
-        // The jackpot meters as the studio ships them, a plaque per tier (shared_meter_<tier>), cut from the table — and
-        // from each localized table (`-<lang>`). Free.
+        // The jackpot meters as the studio ships them, a plaque per tier (shared_meter_<tier>), cut from the sheet — and from
+        // each localized sheet (`-<lang>`). Free. A set made before has a table there, its plaques cut from its plate.
         func meters(_ suffix: String = "") {
             guard layout.extras.contains(where: { $0.what == "jackpot table" }), !jackpots.isEmpty, let t = load("shared_interface_jackpotTable\(suffix)_rmbg.png") else { return }
-            let table = JackpotTable(count: jackpots.count, width: base.grid.w + 2 * base.band)
+            let sheet = JackpotMeters(count: jackpots.count), table = JackpotTable(count: jackpots.count, width: base.grid.w + 2 * base.band)
             let tierNames = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
-            guard t.w == table.width, t.h == table.height else { return }
-            for (i, p) in table.plaques.enumerated() where i < tierNames.count && !has("shared_meter_\(PopUps.key(tierNames[i]))\(suffix).png") {
-                let m = p.w / 20, x = max(0, p.x - m), y = max(0, p.y - m), w = min(t.w - x, p.w + 2 * m), h = min(t.h - y, p.h + 2 * m)
-                let piece = FrameKit.crop(t.px, width: t.w, x, y, w, h)
+            let cuts: [ReelArea.Rect]
+            if t.w == sheet.width, t.h == sheet.height { cuts = sheet.plaques.indices.map(sheet.cut) }
+            else if t.w == table.width, t.h == table.height {
+                cuts = table.plaques.map { p in let m = p.w / 20, x = max(0, p.x - m), y = max(0, p.y - m); return ReelArea.Rect(x: x, y: y, w: min(t.w - x, p.w + 2 * m), h: min(t.h - y, p.h + 2 * m)) }
+            } else { return }
+            for (i, c) in cuts.enumerated() where i < tierNames.count && !has("shared_meter_\(PopUps.key(tierNames[i]))\(suffix).png") {
+                let piece = FrameKit.crop(t.px, width: t.w, c.x, c.y, c.w, c.h)
                 write(piece.px, piece.w, piece.h, "shared_meter_\(PopUps.key(tierNames[i]))\(suffix).png")
             }
         }
@@ -27852,9 +27858,17 @@ final class GDDToAssetsRun: ObservableObject {
             guard let cg = loadCGImage(folder.appendingPathComponent(n)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
             return FrameKit.Piece(px: px, w: cg.width, h: cg.height)
         }
-        let table = piece("shared_interface_jackpotTable_rmbg.png"), pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { piece("\($0)_rmbg.png") }
+        var table = piece("shared_interface_jackpotTable_rmbg.png"), meters: [FrameKit.Piece] = []
+        let pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { piece("\($0)_rmbg.png") }
+        // Jackpot meters (JackpotMeters) in a row over the reels, each its own plaque; a set drawn before them, its table.
+        let sheet = JackpotMeters(count: jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.count)
+        if let t = table, t.w == sheet.width, t.h == sheet.height {
+            meters = sheet.plaques.indices.map { i in let r = sheet.cut(i); return FrameKit.crop(t.px, width: t.w, r.x, r.y, r.w, r.h) }
+            table = nil
+        }
+        let meterW = meters.isEmpty ? 0 : area.width / (meters.count + 1), meterH = meters.first.map { meterW * $0.h / max(1, $0.w) } ?? 0
         let potW = area.cell * 13 / 10, potH = pots.map { potW * $0.h / max(1, $0.w) }.max() ?? 0
-        let tableH = table.map { $0.h * area.width / max(1, $0.w) } ?? 0
+        let tableH = table.map { $0.h * area.width / max(1, $0.w) } ?? meterH
         let W = area.width, top = tableH + potH, H = area.height + top
         var canvas = [UInt8](repeating: 0, count: W * H * 4)
         for i in stride(from: 3, to: canvas.count, by: 4) { canvas[i] = 255 }
@@ -27880,6 +27894,10 @@ final class GDDToAssetsRun: ObservableObject {
         // The table on the bezel's top band, the pots above it, spread across the reels.
         let tableY = top + area.grid.y - area.band - tableH + tableH / 6
         if let t = table { FrameKit.over(&canvas, width: W, FrameKit.resized(t, W, tableH), at: 0, max(0, tableY)) }
+        for (i, m) in meters.enumerated() {
+            let gap = (W - meters.count * meterW) / (meters.count + 1)
+            FrameKit.over(&canvas, width: W, FrameKit.resized(m, meterW, meterH), at: gap + i * (meterW + gap), max(0, tableY))
+        }
         for (i, p) in pots.enumerated() {
             let ph = potW * p.h / max(1, p.w), q = FrameKit.resized(p, potW, ph), cx = area.grid.x + area.grid.w * (2 * i + 1) / (2 * pots.count)
             FrameKit.over(&canvas, width: W, q, at: cx - potW / 2, max(0, tableY - ph + potW / 8))
@@ -33381,7 +33399,7 @@ enum GameForgeExport {
             /// key, record name, label, group, z — stacked as the game draws them (GameForge.stack).
             var items: [(key: String, name: String, label: String, group: String?, z: Int)] = []
             var groups: [GameForge.Group] = []
-            var area: ReelArea?
+            var area: ReelArea?, cellBacking: Piece?, showsMeters = true
             var wheel: (art: WheelArt, order: [String], wedges: [String: [UInt8]], prefix: String)?
             mutating func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, asset: String) {
                 block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k)
@@ -33391,11 +33409,23 @@ enum GameForgeExport {
 
         // The pieces every screen shares.
         let logo = load("shared_logo_master_rmbg.png").flatMap(cut)
-        let tableFull = load("shared_interface_jackpotTable_rmbg.png"), table = tableFull.flatMap(cut)
+        let tableFull = load("shared_interface_jackpotTable_rmbg.png")
         let pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { load("\($0)_rmbg.png").flatMap(cut) }
         let jackpots = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
         let tierNames = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
         let baseArea = ReelArea(layout), jt = JackpotTable(count: jackpots.count, width: baseArea.grid.w + 2 * baseArea.band)
+        // The jackpot meters, each cut from the sheet they were drawn on (JackpotMeters), with its value field in its own
+        // pixels; a set drawn before them has a table there instead, placed as one piece.
+        let sheet = JackpotMeters(count: jackpots.count)
+        let meterCuts: [(cut: Cut, field: ReelArea.Rect)] = tableFull.map { t in
+            guard t.w == sheet.width, t.h == sheet.height else { return [] }
+            return sheet.plaques.indices.compactMap { i in
+                let r = sheet.cut(i), f = sheet.field(in: i)
+                guard i < jackpots.count, let c = cut(FrameKit.crop(t.px, width: t.w, r.x, r.y, r.w, r.h)) else { return nil }
+                return (c, ReelArea.Rect(x: f.x - c.x, y: f.y - c.y, w: f.w, h: f.h))
+            }
+        } ?? []
+        let table = meterCuts.isEmpty ? tableFull.flatMap(cut) : nil
         /// The jackpot table `W` wide, its top at `y`, in a screen's block.
         func addTable(_ s: inout Screen, _ W: Double, _ y: Double) {
             guard let t = table, let f = tableFull else { return }
@@ -33403,8 +33433,29 @@ enum GameForgeExport {
             s.items.append(("table", "jackpot-table-\(s.scope)", "Jackpot table", "jackpots-\(s.scope)", 152))
             s.groups.append(GameForge.Group(handle: "jackpots-\(s.scope)", label: "Jackpots"))
         }
-        func tableHeight(_ W: Double) -> Double { tableFull.map { Double($0.h) * W / Double($0.w) } ?? 0 }
+        func tableHeight(_ W: Double) -> Double { table == nil ? 0 : tableFull.map { Double($0.h) * W / Double($0.w) } ?? 0 }
         var screens: [Screen] = []
+
+        // The pieces the GDD calls for beyond the standard ones (ConceptPiece), placed by what they are: buttons in a row
+        // under the reels, plaques and counters over them, glass over the hot reel; a cell's backing tiled under every cell
+        // by the game's code (shown so in the PSB); highlights, rings and other per-cell pieces the code places, exported only.
+        let concepts = (layout.concepts ?? []).filter { exists("\($0.name)_rmbg.png") }
+        enum Place { case button, plaque, overHot, cellBacking, code, unplaced }
+        func place(_ c: ConceptPiece) -> Place {
+            let n = c.name.lowercased()
+            if n.contains("cell") { return n.contains("backing") ? .cellBacking : .code }
+            if c.shape == "ring" || n.contains("highlight") || n.contains("ring") { return .code }
+            if n.contains("glass") || n.contains("cover") { return layout.hotReelAbove != nil ? .overHot : .code }
+            if c.shape == "button" || n.hasSuffix("btn") || n.contains("button") { return .button }
+            if ["plaque", "bar", "disc"].contains(c.shape) || n.contains("meter") || n.contains("counter") || n.contains("remaining") { return .plaque }
+            return .unplaced
+        }
+        /// The screen a piece belongs to, by its name's mode ("bonusGames_interface_cellBacking"); the base game's otherwise.
+        func scopeOf(_ c: ConceptPiece) -> String {
+            let m = String(c.name.split(separator: "_").first ?? "")
+            return layout.fileModes.contains { $0.name == m } ? m : "base"
+        }
+        var codePieces: [(c: ConceptPiece, how: String)] = [], conceptStates: [(key: String, scope: String, c: ConceptPiece)] = []
 
         // Each reel mode: the reels with the jackpot table and pots above them, laid out as its reel preview lays them.
         for (scope, grid) in layout.fileModes {
@@ -33425,6 +33476,44 @@ enum GameForgeExport {
                 let k = potW / Double(p.fullW), cx = Double(g.x) + Double(g.w) * Double(2 * i + 1) / Double(2 * pots.count)
                 s.add("pot\(i + 1)", p, cx - potW / 2, tableY - Double(p.fullH) * k + potW / 8, k, asset: "meters/pot-\(i + 1)")
                 s.items.append(("pot\(i + 1)", "pot-\(i + 1)-\(scope)", "Pot \(i + 1)", "pots-\(scope)", 153))
+            }
+            let mine = concepts.filter { scopeOf($0) == scope }
+            let buttons = mine.filter { place($0) == .button }, plaques = mine.filter { place($0) == .plaque }
+            let cell = Double(area.cell)
+            for (i, c) in buttons.enumerated() {
+                guard let cc = load("\(c.name)_rmbg.png").flatMap(cut) else { continue }
+                let w = 1.4 * cell, gap = 0.2 * cell, row = Double(buttons.count) * w + Double(buttons.count - 1) * gap, k = w / Double(cc.fullW)
+                let key = "concept:\(c.name)"
+                s.add(key, cc, (W - row) / 2 + Double(i) * (w + gap), top + Double(area.height) - 0.1 * cell, k, asset: "features/\(c.name.lowercased())")
+                s.items.append((key, c.name, c.what.isEmpty ? c.name : String(c.what.prefix(60)), "buttons-\(scope)", 155))
+                conceptStates.append((key, scope, c))
+            }
+            if !buttons.isEmpty { s.groups.append(GameForge.Group(handle: "buttons-\(scope)", label: "Buttons")) }
+            let above = (s.block.values.map(\.y).min() ?? 0)
+            for (i, c) in plaques.enumerated() {
+                guard let cc = load("\(c.name)_rmbg.png").flatMap(cut) else { continue }
+                let w = min(2.2 * cell, W / Double(max(1, plaques.count))), gap = 0.15 * cell, row = Double(plaques.count) * w + Double(plaques.count - 1) * gap
+                let k = w / Double(cc.fullW), key = "concept:\(c.name)"
+                s.add(key, cc, (W - row) / 2 + Double(i) * (w + gap), above - Double(cc.fullH) * k - 0.05 * cell, k, asset: "features/\(c.name.lowercased())")
+                s.items.append((key, c.name, c.what.isEmpty ? c.name : String(c.what.prefix(60)), "meters-\(scope)", 154))
+                conceptStates.append((key, scope, c))
+            }
+            if !plaques.isEmpty { s.groups.append(GameForge.Group(handle: "meters-\(scope)", label: "Meters and counters")) }
+            // Glass over the hot reel, which sits in the first windows of the base grid.
+            if g == baseArea.grid || scope == "base", layout.hotReelAbove != nil {
+                let hot = area.windows.prefix(grid.reels)
+                for c in mine where place(c) == .overHot {
+                    guard let cc = load("\(c.name)_rmbg.png").flatMap(cut), let first = hot.first, let last = hot.last else { continue }
+                    let hw = Double(last.x + last.w - first.x), k = hw / Double(cc.fullW), h = Double(cc.fullH) * k
+                    let key = "concept:\(c.name)"
+                    s.add(key, cc, Double(first.x), top + Double(first.y) + Double(first.h) / 2 - h / 2, k, asset: "features/\(c.name.lowercased())")
+                    s.items.append((key, c.name, c.what.isEmpty ? c.name : String(c.what.prefix(60)), nil, 151))
+                    conceptStates.append((key, scope, c))
+                }
+            }
+            for c in mine where [.cellBacking, .code, .unplaced].contains(place(c)) {
+                if place(c) == .cellBacking { s.cellBacking = load("\(c.name)_rmbg.png") }
+                codePieces.append((c, place(c) == .unplaced ? "not placed: say where it goes" : "placed by the game's code, at each " + (c.name.lowercased().contains("reel") ? "reel" : "cell")))
             }
             // Stacked as the set's reel preview stacks them, the order the art was drawn for: the reel texture under the
             // symbols, the dividers and bezel over them (covering where the reels are cut off), the jackpot table over the
@@ -33466,6 +33555,7 @@ enum GameForgeExport {
             // The jackpot table over a wheel that pays jackpots.
             let paysJackpots = order.contains { l in tierNames.contains(l) }
             if tableH > 0, paysJackpots { addTable(&s, n, 0) }
+            s.showsMeters = paysJackpots
             s.items += [("face", "\(prefix)Wheel", "Wheel face (game code)", "wheel-\(prefix)", 149),
                         ("frame", "wheel-frame-\(prefix)", "Wheel rim", "wheel-\(prefix)", 150),
                         ("hub", "wheel-hub-\(prefix)", "Wheel hub", "wheel-\(prefix)", 151),
@@ -33475,15 +33565,26 @@ enum GameForgeExport {
             screens.append(s)
         }
 
-        // Every screen composed into both design boxes, the logo over (or beside) it.
+        // Every screen composed into both design boxes: the logo and the jackpot meters round it, or in a column beside it.
         let shape = logo.map { (w: Double($0.piece.w), h: Double($0.piece.h)) }
+        let meterShapes = meterCuts.map { (w: Double($0.cut.piece.w), h: Double($0.cut.piece.h)) }
         for i in screens.indices {
+            let sc = screens[i].scope
             if let logo {
                 screens[i].cuts["logo"] = logo; screens[i].assets["logo"] = "logo/logo"
-                screens[i].items.append(("logo", "logo-\(screens[i].scope)", "Logo", nil, 154))
+                screens[i].items.append(("logo", "logo-\(sc)", "Logo", nil, 154))
             }
-            screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, profile: portrait)
-            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, profile: landscape)
+            let withMeters = !meterShapes.isEmpty && screens[i].showsMeters
+            if withMeters {
+                for (k, mc) in meterCuts.enumerated() {
+                    let tier = PopUps.key(tierNames[k]), key = "meter\(k + 1)"
+                    screens[i].cuts[key] = mc.cut; screens[i].assets[key] = "meters/jackpot-meter-\(tier.lowercased())"
+                    screens[i].items.append((key, "jackpot-meter-\(tier)-\(sc)", "\(tierNames[k]) meter", "jackpots-\(sc)", 152))
+                }
+                screens[i].groups.append(GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpot meters"))
+            }
+            screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], profile: portrait)
+            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], profile: landscape)
         }
 
         // The events — pop-ups, celebrations, banners — each a group the game shows over its screen, centred on its reels
@@ -33549,6 +33650,21 @@ enum GameForgeExport {
             let p = w == c.w ? c : FrameKit.resized(c, w, h)
             write(p, "portrait/en/\(a).png"); exported[a] = p
         }
+        // A placed piece's other states, cut and sized as its first; the pieces the code places, at the size they were drawn.
+        for st in conceptStates {
+            guard let s = screens.first(where: { $0.scope == st.scope }), let c = s.cuts[st.key], let a = s.assets[st.key], let e = exported[a] else { continue }
+            for state in st.c.states {
+                guard let p = load("\(st.c.name)-\(state)_rmbg.png"), p.w == c.fullW, p.h == c.fullH else { continue }
+                let q = FrameKit.crop(p.px, width: p.w, c.x, c.y, c.piece.w, c.piece.h)
+                write(e.w == q.w ? q : FrameKit.resized(q, e.w, e.h), "portrait/en/\(a)-\(state.lowercased()).png")
+            }
+        }
+        for cp in codePieces {
+            for (file, suffix) in [(cp.c.name, "")] + cp.c.states.map { ("\(cp.c.name)-\($0)", "-\($0.lowercased())") } {
+                guard let p = load("\(file)_rmbg.png").flatMap(cut) else { continue }
+                write(p.piece, "portrait/en/features/\(cp.c.name.lowercased())\(suffix).png")
+            }
+        }
         // A wheel's wedges, upright as the game turns them: 3× the largest the face is shown.
         var wedgeFiles: [String: [String]] = [:]
         for s in screens {
@@ -33578,8 +33694,15 @@ enum GameForgeExport {
             for (key, handle) in [("grid", "reelgrid-\(sc)"), ("face", "wheel-\(sc)")] {
                 if let gp = s.p[key], let gl = s.l[key], let i = groups.firstIndex(where: { $0.handle == handle }) { groups[i].landscapeScale = gl.w / gp.w }
             }
-            // The amounts print in each plaque's dark field, in the table's own space.
+            // The amounts print in each meter's dark field, in the meter's own space (its pixels ÷ 3, from its centre).
             var labels: [GameForge.Label] = []
+            for (k, mc) in meterCuts.enumerated() where s.p["meter\(k + 1)"] != nil {
+                guard let a = s.assets["meter\(k + 1)"], let e = exported[a] else { continue }
+                let tier = PopUps.key(tierNames[k]), f = mc.field, kk = Double(e.w) / Double(mc.cut.piece.w)
+                let box = Box(x: (Double(f.x) * kk - Double(e.w) / 2) / 3, y: (Double(f.y) * kk - Double(e.h) / 2) / 3, w: Double(f.w) * kk / 3, h: Double(f.h) * kk / 3)
+                labels.append(GameForge.Label(name: "\(tier)-amount-\(sc)", label: "\(tier) amount", text: "2,000", parent: "jackpot-meter-\(tier)-\(sc)",
+                                              dataKey: "jackpot.\(tier)", box: box, z: 155))
+            }
             if let t = table, let f = tableFull, f.w == jt.width, f.h == jt.height, s.p["table"] != nil, let e = exported["backgrounds/jackpot-table"] {
                 let k = Double(e.w) / Double(t.piece.w)
                 for (i, field) in jt.fields.enumerated() where i < jackpots.count {
@@ -33687,7 +33810,7 @@ enum GameForgeExport {
                 let b = isL ? it.landscape : it.portrait
                 guard let a = it.asset else {
                     if let area = s.area {
-                        return filledReels(area, symbols: symbols, jobs: jobs, width: max(1, Int((b.w * 3).rounded()))).map { [layer("\(it.name) (game code)", $0, b)] } ?? []
+                        return filledReels(area, symbols: symbols, jobs: jobs, width: max(1, Int((b.w * 3).rounded())), backing: s.cellBacking).map { [layer("\(it.name) (game code)", $0, b)] } ?? []
                     }
                     guard let wh = s.wheel else { return [] }
                     let size = max(1, Int((b.w * 3).rounded())), o = prof.pixel(b.x, b.y)
@@ -33750,11 +33873,20 @@ enum GameForgeExport {
                 readme += String(format: "| %@ | `%@Wheel` | %.1f | %@ | %@ |\n", s.scope, s.scope, fp.w * 0.86, wh.order.joined(separator: ", "), (wedgeFiles[s.scope] ?? []).map { "`\($0)`" }.joined(separator: " "))
             }
         }
+        let placedConcepts = conceptStates.map { "`\($0.c.name)`" + ($0.c.states.isEmpty ? "" : " (states: " + $0.c.states.joined(separator: ", ") + ")") }
+        if !placedConcepts.isEmpty || !codePieces.isEmpty {
+            readme += "\n## The game's own pieces\n\nThe pieces this game's document calls for beyond the standard ones, in `textures/portrait/en/features/`.\n\n"
+            if !placedConcepts.isEmpty { readme += "- Placed: " + placedConcepts.joined(separator: ", ") + ". Buttons sit in a row under the reels, plaques and counters over them, glass over the hot reel; each state is its own file (`-<state>`), the size of the first.\n" }
+            for cp in codePieces { readme += "- `\(cp.c.name)`: \(cp.how)" + (cp.c.states.isEmpty ? "" : " (states: " + cp.c.states.joined(separator: ", ") + ")") + ", at the size it was drawn.\n" }
+        }
         readme += "\n## Assumed — change to suit the game\n\n- Portrait design box 390 × \(Int(o.designHeight)), landscape 970 × 844 (Game Forge's LayoutService); the box's centre is the origin, pinned to the top of the screen.\n"
         readme += "- The control bar takes the bottom \(Int(o.hud)) px of the portrait box and \(Int(o.landscapeHUD)) of the landscape one: nothing is placed there.\n"
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
         readme += "- A PSB per screen and orientation, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
         readme += "- The events (pop-ups, celebrations, banners) are groups marked `isEvent` in the screen they show over, centred on its reels, each with a PSB of its own in `events/`. Their amounts have no data key: the game sets them.\n"
+        if table != nil {
+            readme += "\n## The jackpot table\n\nThis set's jackpots were drawn as one table before Navigator drew them as the studio's games show them, a meter per tier. It is placed as one piece; Make Again ▸ Jackpot meters draws the meters, and the next export places them round the logo (portrait) and in a column beside the reels (landscape).\n"
+        }
         if !upscaled.isEmpty { readme += "\n## Shown larger than drawn\n\n" + upscaled.map { "- \($0)\n" }.joined() }
         if !problems.isEmpty { readme += "\n## Not done\n\n" + problems.map { "- \($0)\n" }.joined() }
         try? readme.write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
@@ -33780,7 +33912,7 @@ enum GameForgeExport {
     }
 
     /// The reels filled with the set's symbols as its reel preview fills them (the same draw), `width` px wide.
-    static func filledReels(_ area: ReelArea, symbols: [String: FrameKit.Piece], jobs: [AssetJob], width: Int) -> FrameKit.Piece? {
+    static func filledReels(_ area: ReelArea, symbols: [String: FrameKit.Piece], jobs: [AssetJob], width: Int, backing: FrameKit.Piece? = nil) -> FrameKit.Piece? {
         let pool = jobs.filter { symbols[$0.id] != nil }
         guard !pool.isEmpty else { return nil }
         let weighted = pool.flatMap { j in Array(repeating: j, count: j.role == .lowPay ? 5 : [.highPay, .mediumPay].contains(j.role) ? 3 : 1) }
@@ -33792,8 +33924,14 @@ enum GameForgeExport {
             for r in 0..<rows {
                 let j = weighted[next() % weighted.count], key = "\(j.id)-\(size)"
                 if cache[key] == nil, let p = symbols[j.id] { cache[key] = FrameKit.resized(p, size, size) }
-                guard let p = cache[key] else { continue }
                 let x = Double(w.x - g.x) * k + (Double(w.w) * k - Double(size)) / 2, y = (Double(w.y - g.y) + Double(r) * ch) * k + (ch * k - Double(size)) / 2
+                // A cell's backing under its symbol, filling the cell.
+                if let backing {
+                    let cw = max(1, Int((Double(w.w) * k).rounded())), chh = max(1, Int((ch * k).rounded()))
+                    if cache["backing-\(cw)x\(chh)"] == nil { cache["backing-\(cw)x\(chh)"] = FrameKit.resized(backing, cw, chh) }
+                    FrameKit.over(&canvas, width: width, cache["backing-\(cw)x\(chh)"]!, at: Int((Double(w.x - g.x) * k).rounded()), Int(((Double(w.y - g.y) + Double(r) * ch) * k).rounded()))
+                }
+                guard let p = cache[key] else { continue }
                 FrameKit.over(&canvas, width: width, p, at: Int(x.rounded()), Int(y.rounded()))
             }
         }
