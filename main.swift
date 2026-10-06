@@ -22212,7 +22212,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--typed-snapshot"), flag + 1
     DispatchQueue.main.async { MainActor.assumeIsolated {
         let run = GDDToAssetsRun()
         var sheet = GameSheet()
-        sheet.pots = 3; sheet.potFeatures = "Expand, Multi, Jackpots or Wilds"; sheet.wheel = .jackpot; sheet.bonusWheel = true
+        sheet.pots = 3; sheet.potFeatures = "Expand, Multi, Jackpots or Wilds"; sheet.wheel = .jackpot; sheet.bonusWheel = true; sheet.pick = .jackpot
         run.loadManual(GDDSymbolSetRules.typicalSet, gameName: "Example", sheet: sheet, size: "2K", symbolAspect: "1:1",
                        backgroundAspect: "3:4", backgroundSize: "4K")
         let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 980, height: 1500), styleMask: [.borderless], backing: .buffered, defer: false)
@@ -30461,6 +30461,13 @@ struct GameSheetEditor: View {
                 HStack(spacing: 6) {
                     Picker("", selection: $sheet.wheel) { ForEach(GameSheet.Wheel.allCases, id: \.self) { Text($0.rawValue) } }.labelsHidden().fixedSize()
                     if sheet.wheel != .none { Toggle("A bonus wedge opens a Bonus Wheel", isOn: $sheet.bonusWheel) }
+                }
+            }
+            GridRow {
+                Text("Pick bonus").foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    Picker("", selection: $sheet.pick) { ForEach(GameSheet.Pick.allCases, id: \.self) { Text($0.rawValue) } }.labelsHidden().fixedSize()
+                    if sheet.pick != .none { Stepper("\(sheet.pickOptions) to pick from", value: $sheet.pickOptions, in: 3...30) }
                 }
             }
             GridRow {

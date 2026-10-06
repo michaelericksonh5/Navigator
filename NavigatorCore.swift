@@ -10640,6 +10640,8 @@ public enum ConceptPlan {
 public struct GameSheet: Equatable, Codable, Sendable {
     public enum Bonus: String, Codable, CaseIterable, Sendable { case none = "None", sameReels = "On the base reels", ownGrid = "On a grid of its own" }
     public enum Wheel: String, Codable, CaseIterable, Sendable { case none = "None", jackpot = "Jackpot wheel", credits = "Credit wheel" }
+    /// A pick bonus, by what its picks reveal (ReelLayout.Pick).
+    public enum Pick: String, Codable, CaseIterable, Sendable { case none = "None", jackpot = "Jackpot pick", bonus = "Bonus games pick", credits = "Credit pick" }
     public var rows = 3, reels = 5
     public var hotReel = false
     /// The bonus games: on the base grid, or a grid of their own, each cell its own reel or not, growing taller or not.
@@ -10659,6 +10661,9 @@ public struct GameSheet: Equatable, Codable, Sendable {
     /// A wedge on the wheel that opens a second wheel picking the bonus (Tiki Titans).
     public var bonusWheel = false
     public var oneMoreChance = false
+    public var pick = Pick.none
+    /// How many objects the pick bonus shows.
+    public var pickOptions = 12
     /// Power Bet (31 of 54 GDDs): the sell screen, drawer and toggles. A first-time tutorial: its panel and button.
     public var powerBet = false
     public var tutorial = false
@@ -10682,6 +10687,7 @@ public struct GameSheet: Equatable, Codable, Sendable {
         holdAndSpin = try v(.holdAndSpin, ""); jackpotNames = try v(.jackpotNames, ""); jackpotTable = try v(.jackpotTable, true)
         pots = try v(.pots, 0); potFeatures = try v(.potFeatures, ""); wheel = try v(.wheel, .none); bonusWheel = try v(.bonusWheel, false)
         oneMoreChance = try v(.oneMoreChance, false); powerBet = try v(.powerBet, false); tutorial = try v(.tutorial, false)
+        pick = try v(.pick, .none); pickOptions = try v(.pickOptions, 12)
         potBoost = try v(.potBoost, ""); winTiers = try v(.winTiers, ""); potKind = try v(.potKind, .jar)
     }
     /// The win celebrations as lettered ("BIG WIN!"), nil for the platform's.
@@ -10738,6 +10744,11 @@ public struct GameSheet: Equatable, Codable, Sendable {
             out.extras.append(ReelLayout.Extra(what: "wheel", rows: nil, reels: nil, place: "", count: wheels.count))
         }
         if oneMoreChance { out.awards = ["one more chance"] }
+        if pick != .none {
+            out.picks = [ReelLayout.Pick(name: pick == .jackpot ? "Jackpot Pick Bonus" : "Pick Bonus",
+                                         reveals: [pick == .jackpot ? "JACKPOTS" : pick == .bonus ? "BONUS GAMES" : "CREDITS"],
+                                         options: pickOptions, picks: nil, ends: pick == .jackpot ? "match 3" : nil, objects: nil)]
+        }
         let boost = potBoost.trimmingCharacters(in: .whitespaces)
         if powerBet && pots > 0 && !boost.isEmpty { out.potBoost = Wording.noFree(boost) }
         if pots > 0 { out.potKind = potKind }
@@ -10774,6 +10785,12 @@ public struct GameSheet: Equatable, Codable, Sendable {
             if bonusWheel { d.append("When the Bonus wedge is selected, the Bonus Wheel appears. Each wedge on the Bonus Wheel represents a mode for entering the bonus: the standard bonus, random wilds, or a multiplier bonus.") }
         }
         if oneMoreChance { d.append("One More Chance can trigger on a losing spin.") }
+        if pick != .none {
+            d.append("Pick Bonus")
+            d.append(pick == .jackpot ? "Landing the trigger symbols starts the Jackpot Pick Bonus: the player picks from \(pickOptions) objects until three of one jackpot are matched, and wins that jackpot."
+                     : pick == .bonus ? "Landing the trigger symbols starts the Pick Bonus: the player picks from \(pickOptions) objects, each revealing bonus games."
+                     : "Landing the trigger symbols starts the Pick Bonus: the player picks from \(pickOptions) objects, each revealing a credit prize.")
+        }
         if powerBet { d += ["Power Bet", "This game features a Power Bet, chosen on its sell screen."] }
         let boost = potBoost.trimmingCharacters(in: .whitespaces)
         if powerBet && pots > 0 && !boost.isEmpty { d.append("With the Power Bet on, the pot changes: " + Wording.noFree(boost).trimmingCharacters(in: CharacterSet(charactersIn: ".")) + ".") }
@@ -10812,6 +10829,10 @@ public struct GameSheet: Equatable, Codable, Sendable {
             l.wheels = w
             if let i = l.extras.firstIndex(where: { $0.what == "wheel" }) { l.extras[i].count = w.count }
         } else { l.wheels = fresh.wheels }
+        // A pick bonus of the same kind keeps what was read of it off the GDD, with the sheet's count.
+        if pick == .none { l.picks = nil }
+        else if var p0 = l0.picks?.first, GameSheet(layout: l0).pick == pick { p0.options = pickOptions; l.picks = [p0] }
+        else { l.picks = fresh.picks }
         return l
     }
 
@@ -10835,6 +10856,10 @@ public struct GameSheet: Equatable, Codable, Sendable {
         if let w = l.wheels?.first { wheel = w.wedges.contains("CREDITS") && !w.wedges.contains(where: WheelRules.tiers.map { $0.uppercased() }.contains) ? .credits : .jackpot }
         bonusWheel = l.wheels?.contains { $0.name.hasPrefix("Bonus") } ?? false
         oneMoreChance = l.awards?.contains("one more chance") ?? false
+        if let p = l.picks?.first {
+            pick = p.reveals.contains("JACKPOTS") ? .jackpot : p.reveals.contains("BONUS GAMES") ? .bonus : .credits
+            pickOptions = p.options ?? 12
+        }
         potBoost = l.potBoost ?? ""
         potKind = l.potKind ?? .jar
         winTiers = (l.winTiers ?? []).map { $0.dropLast().capitalized }.joined(separator: ", ")

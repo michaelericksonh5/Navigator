@@ -14689,3 +14689,18 @@ final class PickReadingTests: XCTestCase {
         XCTAssertTrue(PickRules.read("Pick your bet, then spin.").isEmpty)
     }
 }
+
+final class GameSheetPickTests: XCTestCase {
+    func testATypedPickBonusRoundTrips() {
+        var sheet = GameSheet()
+        sheet.pick = .jackpot; sheet.pickOptions = 15; sheet.jackpotNames = "Grand, Major, Minor, Mini"
+        let l = sheet.layout([])
+        XCTAssertEqual(l.picks?.first?.reveals, ["JACKPOTS"]); XCTAssertEqual(l.picks?.first?.options, 15); XCTAssertEqual(l.picks?.first?.ends, "match 3")
+        let back = GameSheet(layout: l)
+        XCTAssertEqual(back.pick, .jackpot); XCTAssertEqual(back.pickOptions, 15)
+        XCTAssertTrue(sheet.document(game: "Lucky Lanterns", symbols: []).contains("Jackpot Pick Bonus"))
+        XCTAssertEqual(PickRules.read(sheet.document(game: "Lucky Lanterns", symbols: [])).first?.reveals.first, "JACKPOTS")   // the document it writes reads back
+        var none = sheet; none.pick = .none
+        XCTAssertNil(none.layout([]).picks)
+    }
+}
