@@ -12435,6 +12435,13 @@ public struct AssetJob: Equatable, Sendable {
     public let aspect: String        // "1:1" symbols; backgrounds follow BackgroundFormatRules
     public let size: String
     public var filename: String { "\(id).png" }
+    /// The form it takes on the reels beyond its role (SymbolForm's raw value; "" a single), and for one drawn from
+    /// another symbol — a double, triple or free-games version — that symbol's code.
+    public var form: String = ""
+    public var base: String = ""
+    /// Drawn from its base symbol once that is approved, in the game interface's second phase — never by Generate.
+    public var drawnFromBase: Bool { !base.isEmpty }
+    public var symbolForm: SymbolForm { SymbolForm(rawValue: form) ?? .single }
 
     public init(id: String, kind: Kind, role: SlotSymbolRole, tier: Int?, title: String,
                 subject: String = "", silhouette: String = "", aspect: String, size: String,
@@ -12474,12 +12481,16 @@ public enum AssetPlanRules {
         func key(_ s: SlotSymbol) -> (Int, Int, String, Int, String) {
             (rank[family(s)] ?? 9, listed[family(s)] ?? 0, family(s), s.tier ?? 0, s.code)
         }
+        let codes = Set(art.map { $0.code.uppercased() })
         return art
             .sorted { key($0) < key($1) }
             .map {
-                AssetJob(id: $0.code, kind: .symbol, role: $0.role, tier: $0.tier,
-                         title: $0.note.isEmpty ? $0.role.label : $0.note,
-                         aspect: aspect, size: size)
+                var j = AssetJob(id: $0.code, kind: .symbol, role: $0.role, tier: $0.tier,
+                                 title: $0.note.isEmpty ? $0.role.label : $0.note,
+                                 aspect: aspect, size: size)
+                let f = SymbolForm.detect(code: $0.code, role: $0.role, note: $0.note, codes: codes)
+                j.form = f.form == .single ? "" : f.form.rawValue; j.base = f.base ?? ""
+                return j
             }
     }
 
@@ -16795,7 +16806,7 @@ extension GDDAssetPrompts {
         let count = jobs.filter { $0.kind == .symbol && $0.role == job.role }.count
         let t = job.tier ?? 1
         let built = design.families[job.role.rawValue].map { ", all built as \($0)" } ?? ""
-        let line: String
+        var line: String
         switch job.role {
         case .highPay:
             line = t == 1
@@ -16839,6 +16850,16 @@ extension GDDAssetPrompts {
             line = "It is a mystery symbol: it lands, then transforms into another symbol, so it reads as sealed and full of anticipation."
         default:
             line = ""
+        }
+        // What its form asks of the drawing (SymbolForm, from the symbol research).
+        switch job.symbolForm {
+        case .valueWild:
+            line = "It is the WILD, which also carries a credit value the game prints on it: the most eye-catching symbol on the reel. The word “WILD” is lettered along its foot as part of the art, spelled exactly so, smaller than a plain wild's, and a calm, plain band crosses its middle where the number is printed — nothing busy behind it. " + letteringRules
+        case .wildMultiplier: line += " The game lays a multiplier badge (×2, ×3) over its lower third, so that part stays calm."
+        case .expandingWild: line += " It also expands to cover its whole reel, so its subject must read as well drawn tall."
+        case .stacked: line += " It lands stacked the height of a reel, so its subject must read as well drawn as one tall piece."
+        case .colossal: line += " It also lands as a 2×2 or 3×3 block, so it holds up shown large: bold shapes, nothing that only works small."
+        default: break
         }
         let does = job.job.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
         let finish = job.finish.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
@@ -17290,6 +17311,34 @@ extension GDDAssetPrompts {
         ].joined(separator: "\n\n")
     }
 
+    /// A symbol drawn from its base (SymbolForm: a double, a triple, a free-games version), an edit of the base's approved art
+    /// (attached): what the research found these look like — the single's subject repeated in its one cell, or the same
+    /// symbol in the bonus round's treatment — with its frame and lettering kept.
+    static func formBrief(_ job: AssetJob, theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
+        let said = job.title.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        let what: String
+        switch job.symbolForm {
+        case .double, .triple:
+            let n = job.symbolForm == .double ? "two" : "three"
+            what = "Edit the attached image: it is a symbol of a video slot game themed “\(theme.name)”. Show \(n) of its subject in this one symbol — the same subject repeated \(job.symbolForm == .double ? "side by side, or back to back" : "side by side, overlapping a little"), each smaller so every one fits whole, in exactly the same art, colours, lighting and finish, the props the single's own. Its frame, plaque, backing and any lettering stay exactly as they are, and so does the picture's size. It counts as \(n) of this symbol on the reels, so all \(n) read at a glance."
+        default:
+            what = "Edit the attached image: it is a symbol of a video slot game themed “\(theme.name)”. Show the same symbol as it appears on the game's free-games reels"
+                + (said.isEmpty || said.lowercased() == job.role.label.lowercased() ? "" : " (the game's document says: “\(said)”)")
+                + ": the same subject, pose and framing, in the bonus round's richer treatment — its setting, wardrobe and colours lifted, as the game's bonus world is. Its frame and any lettering stay exactly as they are, and so does the picture's size."
+        }
+        return [what, "Static art only: no burst, rays or flying sparkles — the game animates those.", backdropLine(backing)].joined(separator: "\n\n")
+    }
+    /// A symbol's reel-tall version (SymbolForm: stacked, expanding wild) on a tall plain canvas (the last image), drawn from
+    /// the symbol (attached first): one piece the height of a reel, never symbols stacked.
+    static func tallBrief(_ job: AssetJob, theme: GameTheme, backing: (name: String, rgb: RGB8), rows: Int) -> String {
+        let word = letteredWord(job)
+        return [
+            "Image 1 is a symbol of a video slot game themed “\(theme.name)”. Edit the last attached image, a tall plain canvas exactly one reel wide and \(rows) symbols tall: draw this same symbol as one continuous tall piece filling the whole canvas — its subject extended to the full height (a standing figure, a long body, a column of its element or treasure), in exactly its art, colours, lighting and finish."
+                + (word.map { " “\($0)” is lettered once, large, across its lower part, as on the symbol, spelled exactly so. " + letteringRules } ?? ""),
+            "One piece, never \(rows) symbols stacked: no lines, seams or frames across it. If the symbol has a frame, one frame around the whole tall piece. Static art only: no burst, rays or flying sparkles.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     /// A special symbol's lit state (Derived), an edit of the symbol (attached): the same symbol, lit as it lands or wins.
     static func winStateBrief(theme: GameTheme, backing: (name: String, rgb: RGB8)) -> String {
         [
@@ -17740,6 +17789,8 @@ public struct SetManifest: Codable, Equatable {
         public var brief: String, briefSubject: String, aspect: String, size: String
         /// The master frame it is painted into (FrameRules), when it has one.
         public var frame: String?
+        /// Its form (SymbolForm) and the symbol it is drawn from; nil in sets saved before.
+        public var form: String?, base: String?
     }
     public struct Cast: Codable, Equatable { public var name: String, kind: String, look: String, inArt: Bool }
 
@@ -17780,7 +17831,8 @@ public struct SetManifest: Codable, Equatable {
             Symbol(id: j.id, kind: j.kind.rawValue, role: j.role.rawValue, tier: j.tier, title: j.title,
                    subject: j.subject, silhouette: j.silhouette, hasFrame: j.hasFrame, hue: j.hue, shape: j.shape,
                    variation: j.variation, finish: j.finish, cast: j.cast, job: j.job, docName: j.docName,
-                   brief: j.brief, briefSubject: j.briefSubject, aspect: j.aspect, size: j.size, frame: frameOf[j.id])
+                   brief: j.brief, briefSubject: j.briefSubject, aspect: j.aspect, size: j.size, frame: frameOf[j.id],
+                   form: j.form.isEmpty ? nil : j.form, base: j.base.isEmpty ? nil : j.base)
         }
     }
 
@@ -17794,6 +17846,7 @@ public struct SetManifest: Codable, Equatable {
                              aspect: s.aspect, size: s.size, hasFrame: s.hasFrame)
             j.hue = s.hue; j.shape = s.shape; j.variation = s.variation; j.finish = s.finish; j.cast = s.cast
             j.job = s.job; j.docName = s.docName; j.brief = s.brief; j.briefSubject = s.briefSubject
+            j.form = s.form ?? ""; j.base = s.base ?? ""
             return j
         }
     }
@@ -17881,6 +17934,107 @@ public enum GDDMirror {
         guard let c = date(copy) else { return true }
         guard let d = date(document) else { return false }
         return c < d
+    }
+}
+
+/// The form a symbol takes on the reels beyond its role — from the symbol research across all 148 GDDs (55 current,
+/// 93 older; 2026-10-06), which found 66 kinds; these are the ones that recur and change what is drawn. What each is
+/// for, what it does, how it looks and how it is shown, and how Navigator makes it: drawn as itself, drawn from its
+/// base symbol once that is approved (a double, a triple, a free-games version), or drawn as itself with a piece added
+/// (a reel-tall version, multiplier badges).
+public enum SymbolForm: String, CaseIterable, Sendable {
+    case single, double, triple, freeGames, valueWild, wildMultiplier, expandingWild, stacked, colossal
+
+    public var label: String {
+        switch self {
+        case .single: "Single"; case .double: "Double"; case .triple: "Triple"; case .freeGames: "Free-games version"
+        case .valueWild: "Value wild"; case .wildMultiplier: "Wild multiplier"; case .expandingWild: "Expanding wild"
+        case .stacked: "Stacked"; case .colossal: "Colossal"
+        }
+    }
+    /// Why games have it, what it does, how it looks, how it is shown — the research, said once.
+    public var whatFor: String {
+        switch self {
+        case .single: "One symbol in one cell."
+        case .double, .triple: "One cell that counts as \(self == .double ? "two" : "three") of a symbol, for bigger ways and line wins (21 of 148 GDDs: DHP, THP, the older D and T, \"Split Symbol of M1\")."
+        case .freeGames: "Its own art on the free-games reels (8 GDDs: FGHP1, FGWD, \"Bonus Symbols\")."
+        case .valueWild: "A wild that also carries a credit value the game prints on it, collected in features (22 GDDs: WDWY, WYSIWYG Wild, Scatter Bucks)."
+        case .wildMultiplier: "A wild that multiplies the wins it completes (11 GDDs: ×2–×5, ×11 in respins)."
+        case .expandingWild: "A wild that grows to cover its whole reel (7 GDDs: EW, FGEW)."
+        case .stacked: "A symbol stacked the height of a reel, filling the screen for big wins (13 GDDs: Super Stacks)."
+        case .colossal: "One symbol landing as a 2×2 or 3×3 block (7 GDDs: Super Symbols)."
+        }
+    }
+    public var look: String {
+        switch self {
+        case .single: ""
+        case .double, .triple: "The single's own subject \(self == .double ? "twice" : "three times") in its one cell, side by side or back to back, each smaller so all fit whole, the props and frame the single's."
+        case .freeGames: "The same subject in the bonus round's setting — its wardrobe, colours or a richer gold treatment, as the GDD says."
+        case .valueWild: "The game's wild, its WILD lettered smaller along its foot, a calm band across its middle for the number."
+        case .wildMultiplier: "The game's wild, with a ×2/×3 badge laid over it."
+        case .expandingWild, .stacked: "The symbol as one continuous tall piece the height of a reel."
+        case .colossal: "The single's own art, shown at block size."
+        }
+    }
+    public var display: String {
+        switch self {
+        case .single: ""
+        case .double, .triple: "One cell; it animates as the single does, every copy acting."
+        case .freeGames: "The base symbol's cell, on the free-games reels."
+        case .valueWild: "One cell; the amount printed on its band."
+        case .wildMultiplier: "One cell; the multiplier a static overlay on it."
+        case .expandingWild: "One cell when it lands, then its reel-tall version as it expands."
+        case .stacked: "Several cells on one reel, as one piece."
+        case .colossal: "2×2 or 3×3 cells."
+        }
+    }
+
+    /// The form a symbol's code and description say it takes, and the symbol it is drawn from. `codes`: the set's codes, so
+    /// a double is only drawn from a base the set has.
+    public static func detect(code: String, role: SlotSymbolRole, note: String, codes: Set<String>) -> (form: SymbolForm, base: String?) {
+        let c = code.uppercased(), n = note.lowercased(), num = String(c.drop { $0.isLetter })
+        func have(_ b: String) -> String? { codes.contains(b) ? b : nil }
+        // Doubles and triples of a pay: DHP1 / DMP1 / THP1 / TMP1, the older D1 / T1 of M1, or "split symbol of M1".
+        for (p, f, stems) in [("DHP", SymbolForm.double, ["HP"]), ("DMP", .double, ["MP"]), ("THP", .triple, ["HP"]), ("TMP", .triple, ["MP"]),
+                              ("D", .double, ["M", "HP"]), ("T", .triple, ["M", "HP"])] where c.hasPrefix(p) && Int(c.dropFirst(p.count)) != nil {
+            if let b = stems.lazy.compactMap({ have($0 + num) }).first { return (f, b) }
+        }
+        if let r = n.range(of: #"(split|double|triple)( symbol)? (of|version of) ([a-z]{1,3}\d{1,2})"#, options: .regularExpression) {
+            let b = n[r].split(separator: " ").last.map { String($0).uppercased() } ?? ""
+            if codes.contains(b) { return (n[r].contains("triple") ? .triple : .double, b) }
+        }
+        // A free-games version of a symbol the set has.
+        if c.hasPrefix("FG"), let b = have(String(c.dropFirst(2))) { return (.freeGames, b) }
+        if role == .wild {
+            if c.hasPrefix("WDWY") || n.range(of: #"wysiwyg|credit value|cash value|bucks|\bvalue\b"#, options: .regularExpression) != nil { return (.valueWild, nil) }
+            if c.hasPrefix("MUWD") || n.range(of: #"multiplier|\b\d{1,2}\s?x\b|\bx\s?\d{1,2}\b"#, options: .regularExpression) != nil { return (.wildMultiplier, nil) }
+            if c.hasPrefix("EW") || c.hasPrefix("FGEW") || n.contains("expand") { return (.expandingWild, nil) }
+        }
+        if n.range(of: #"super ?stack|stacked|full[- ]reel"#, options: .regularExpression) != nil { return (.stacked, nil) }
+        if n.range(of: #"\b[23]\s?x\s?[23]\b|super symbol|colossal"#, options: .regularExpression) != nil { return (.colossal, nil) }
+        return (.single, nil)
+    }
+    /// A wild multiplier's values, from its description: "2x–5x" is 2, 3, 4, 5; "x2, x3" is 2, 3; none said, the
+    /// common 2, 3, 5.
+    public static func multipliers(_ note: String) -> [Int] {
+        let n = note.lowercased()
+        if let r = n.range(of: #"(\d{1,2})\s?x\s?(?:-|–|to)\s?(\d{1,2})\s?x"#, options: .regularExpression) {
+            let nums = n[r].split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+            if nums.count == 2, nums[0] < nums[1], nums[1] - nums[0] <= 10 { return Array(nums[0]...nums[1]) }
+        }
+        let found = n.matches(of: #"\b(\d{1,2})\s?x\b|\bx\s?(\d{1,2})\b"#)
+        let values = Array(Set(found)).filter { $0 >= 2 && $0 <= 20 }.sorted()
+        return values.isEmpty ? [2, 3, 5] : values
+    }
+}
+
+private extension String {
+    /// The numbers a pattern's groups capture, in order.
+    func matches(of pattern: String) -> [Int] {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        return re.matches(in: self, range: NSRange(startIndex..., in: self)).compactMap { m in
+            (1..<m.numberOfRanges).lazy.compactMap { m.range(at: $0).location == NSNotFound ? nil : Range(m.range(at: $0), in: self).flatMap { Int(self[$0]) } }.first
+        }
     }
 }
 
@@ -18815,6 +18969,34 @@ public enum WheelLabel {
         var out = wedge
         FrameKit.over(&out, width: w, FrameKit.Piece(px: text, w: w, h: h), at: 0, 0)
         return art.cut(out)
+    }
+    /// A multiplier badge laid over a wild (SymbolForm.wildMultiplier: "the multiplier a static overlay on it"): the value
+    /// lettered in code as large as the canvas allows, in the game's own lettering tones or polished gold, a dark outline
+    /// and a bright rim — spelled right by construction, free, one per value.
+    static func badge(_ text: String, width w: Int, height h: Int, face tones: [RGB8]? = nil) -> [UInt8] {
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return [UInt8](repeating: 0, count: w * h * 4) }
+        let probe = CTFontCreateWithName(fontName as CFString, 100, nil), pcap = CTFontGetCapHeight(probe)
+        let pad = CGFloat(outline + rim + 0.04) * 2
+        let size = min(CGFloat(w) * 0.92 / (width(text, probe) / 100 + pad * pcap / 100), CGFloat(h) * 0.86 / (pcap / 100 * (1 + pad)))
+        let font = CTFontCreateWithName(fontName as CFString, size, nil), cap = CTFontGetCapHeight(font)
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [kCTFontAttributeName as NSAttributedString.Key: font]))
+        let at = CGPoint(x: (CGFloat(w) - width(text, font)) / 2, y: (CGFloat(h) - cap) / 2)
+        ctx.textMatrix = .identity; ctx.setLineJoin(.round)
+        func draw(_ mode: CGTextDrawingMode) { ctx.textPosition = at; ctx.setTextDrawingMode(mode); CTLineDraw(line, ctx) }
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: -0.06 * cap), blur: 0.12 * cap, color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+        ctx.setStrokeColor(CGColor(red: 1, green: 0.88, blue: 0.55, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline + rim) * cap); draw(.stroke)
+        ctx.restoreGState()
+        ctx.setStrokeColor(CGColor(red: 0.07, green: 0.04, blue: 0.02, alpha: 1)); ctx.setLineWidth(2 * CGFloat(outline) * cap); draw(.stroke)
+        let srgb = CGColorSpace(name: CGColorSpace.sRGB)
+        func cg(_ c: RGB8) -> CGColor { CGColor(red: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1) }
+        let stops = (tones?.count == 3 ? tones! : [RGB8(255, 250, 224), RGB8(255, 214, 92), RGB8(219, 143, 33)]).map(cg)
+        ctx.saveGState(); draw(.clip)
+        ctx.drawLinearGradient(CGGradient(colorsSpace: srgb, colors: stops as CFArray, locations: [0, 0.45, 1])!, start: CGPoint(x: 0, y: at.y + cap), end: CGPoint(x: 0, y: at.y), options: [])
+        ctx.restoreGState()
+        guard let img = ctx.makeImage(), let px = ChromaKeyOutputRules.straightRGBA8(img) else { return [UInt8](repeating: 0, count: w * h * 4) }
+        return px
     }
     /// The wedge's colour (its opaque pixels' median), darkened to about L* 12 for the outline.
     static func darkInk(_ px: [UInt8], width w: Int, height h: Int) -> RGB8 {

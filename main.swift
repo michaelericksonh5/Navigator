@@ -25784,7 +25784,8 @@ final class GDDToAssetsRun: ObservableObject {
     /// in parallel, each seeing the whole set. A call that fails leaves that image on its subject.
     func writeBriefs(completion: (() -> Void)? = nil) {
         guard let theme else { completion?(); return }
-        let targets = jobs.filter { !$0.subject.isEmpty }
+        // A double, triple or free-games version is drawn from its base later, from that base's art, not a brief of its own.
+        let targets = jobs.filter { !$0.subject.isEmpty && !$0.drawnFromBase }
         guard !targets.isEmpty else { completion?(); return }
         busy = true
         let designed = status
@@ -25922,7 +25923,7 @@ final class GDDToAssetsRun: ObservableObject {
 
     /// What a batch will cost. `ids` scopes it to a retry.
     func estimate(for ids: Set<String>?) -> Double {
-        let planned = jobs.filter { !$0.subject.isEmpty && (ids == nil || ids!.contains($0.id)) }
+        let planned = jobs.filter { !$0.subject.isEmpty && !$0.drawnFromBase && (ids == nil || ids!.contains($0.id)) }
         let byID = Dictionary(planned.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         // The low pays' sheet is ONE 4K image, whatever the number of low pays on it.
         return renderSteps(only: Set(byID.keys)).reduce(0) { sum, st in
@@ -26528,6 +26529,8 @@ final class GDDToAssetsRun: ObservableObject {
     /// base's, every mode's texture the base texture, and the pot states their pot.
     /// The planned pieces' names, for Make Again (set as a set is made or reopened).
     nonisolated(unsafe) static var conceptNames: [String] = []
+    /// The set's symbols drawn from their base (SymbolForm), for Make Again (set as a set is made or reopened).
+    nonisolated(unsafe) static var formNames: [String] = []
     /// A file of a studio or planned piece: its picture, cut-out or a state — by its exact name.
     nonisolated static func isConcept(_ n: String) -> Bool {
         conceptNames.contains { n == $0 + ".png" || n == $0 + "_rmbg.png" || n.hasPrefix($0 + "-") }
@@ -26550,6 +26553,9 @@ final class GDDToAssetsRun: ObservableObject {
         ("Pot plaques", { $0.hasPrefix("shared_avatar_jar") && $0.contains("-plaque") }),
         ("Number fonts", { $0.hasPrefix("transition_font_totalWin") || $0.hasPrefix("shared_font_") }),
         ("Symbol win states", { $0.contains("_win.png") || $0.contains("_win_rmbg") }),
+        // Symbols drawn from their base (a double, a free-games version), their reel-tall versions and multiplier badges.
+        ("Symbol forms", { n in formNames.contains { n == $0 + ".png" || n == $0 + "_rmbg.png" } || n.contains("_stack.") || n.contains("_stack_rmbg")
+            || n.range(of: #"_x\d+(_rmbg)?\.png$"#, options: .regularExpression) != nil }),
         ("Landscape backgrounds", { $0.contains("-landscape") }),
         ("Lobby and loading", { n in Composites.all.contains { n.hasPrefix($0.name + ".png") } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
         // The lobby and loading pictures and the sell screen's avatar are made from the logo and key art: redone with them.
@@ -26567,7 +26573,7 @@ final class GDDToAssetsRun: ObservableObject {
         var groups: [String] {
             switch self {
             case .core: ["Bezel", "Reel texture", "Pots"]
-            case .rest: ["Jackpot table", "Pot plaques", "Number fonts", "Symbol win states", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
+            case .rest: ["Jackpot table", "Pot plaques", "Number fonts", "Symbol win states", "Symbol forms", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
             case .localize: ["Localized"]
             }
         }
@@ -26581,7 +26587,7 @@ final class GDDToAssetsRun: ObservableObject {
     func counts() -> ProjectStage.Counts {
         var c = ProjectStage.Counts()
         c.hasGame = !jobs.isEmpty || !symbols.isEmpty; c.hasTheme = theme != nil; c.planned = planned
-        let planned = jobs.filter { !$0.subject.isEmpty }
+        let planned = jobs.filter { !$0.subject.isEmpty && !$0.drawnFromBase }
         c.symbols = planned.count
         guard let folder = lastFolder else { return c }
         let fm = FileManager.default
@@ -26616,7 +26622,9 @@ final class GDDToAssetsRun: ObservableObject {
     /// reel texture pieces, and each pot's states. Everything else is drawn to match them, so it waits for all of them.
     func coreApproval(_ folder: URL) -> (total: Int, left: [String]) {
         let sections = catalog(folder, stamped: false)
-        let core = sections.filter { $0.id.hasPrefix("sym-") || $0.id == "ui-Bezel" || $0.id == "ui-Reel texture" }.flatMap(\.assets).map(\.id)
+        // A symbol drawn from its base (a double, a free-games version) is phase-two art, as the win states are.
+        let derived = Set(jobs.filter(\.drawnFromBase).map(\.id))
+        let core = sections.filter { $0.id.hasPrefix("sym-") || $0.id == "ui-Bezel" || $0.id == "ui-Reel texture" }.flatMap(\.assets).map(\.id).filter { !derived.contains($0) }
             + sections.filter(\.pot).flatMap(\.assets).filter { $0.kind == .potState }.map(\.id)
         return (core.count, core.filter { !review.entry($0).approved })
     }
@@ -26726,6 +26734,21 @@ final class GDDToAssetsRun: ObservableObject {
             for j in Derived.winSymbols(jobs) {
                 let side = ["1K": 1024, "4K": 4096][j.size] ?? 2048
                 items.append(AssetChecklist.Item(group: "Symbol states", name: Derived.winName(j.id), what: "\(j.id) lit, as it lands or wins", files: ["\(Derived.winName(j.id)).png"], maker: "Symbol states", cost: AssetChecklist.gpt(side, side)))
+            }
+            // The symbols' forms (SymbolForm): drawn from their approved base, their reel-tall versions, multiplier badges (free).
+            Self.formNames = jobs.filter(\.drawnFromBase).map(\.id)
+            for j in jobs where j.kind == .symbol {
+                let side = ["1K": 1024, "4K": 4096][j.size] ?? 2048, rows = min(3, reelLayout?.base?.rows ?? 3)
+                if j.drawnFromBase {
+                    items.append(AssetChecklist.Item(group: "Symbol forms", name: j.id, what: "\(j.symbolForm.label.lowercased()) of \(j.base), drawn from it once approved", files: [j.filename], maker: "Symbol forms", cost: AssetChecklist.gpt(side, side)))
+                }
+                if j.symbolForm == .expandingWild || j.symbolForm == .stacked {
+                    items.append(AssetChecklist.Item(group: "Symbol forms", name: "\(j.id)_stack", what: "\(j.id) one reel tall, \(j.symbolForm == .expandingWild ? "as it expands" : "stacked")", files: ["\(j.id)_stack.png"], maker: "Symbol forms", cost: AssetChecklist.gpt(side / 2, side / 2 * rows)))
+                }
+                if j.symbolForm == .wildMultiplier {
+                    let values = SymbolForm.multipliers(j.title)
+                    items.append(AssetChecklist.Item(group: "Symbol forms", name: "\(j.id)_x", what: "\(j.id)'s multiplier badges: " + values.map { "×\($0)" }.joined(separator: " "), files: values.map { "\(j.id)_x\($0).png" }, maker: "Symbol forms", cost: 0))
+                }
             }
             for j in jobs where j.kind == .background {
                 items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
@@ -27434,6 +27457,31 @@ final class GDDToAssetsRun: ObservableObject {
             write(FrameKit.onBacking(laid, b), w.w, w.h, "\(n).png"); write(laid, w.w, w.h, "\(n)_rmbg.png")
             navLog("gdd reel: \(n) cleaned and laid on \(j.id)")
         }
+        // 10b. The symbols' forms (SymbolForm, from the symbol research): a double, triple or free-games version drawn from its
+        // approved base; a stacked symbol's or expanding wild's reel-tall version; a wild multiplier's badges, lettered in code.
+        Self.formNames = jobs.filter(\.drawnFromBase).map(\.id)
+        for j in jobs where j.kind == .symbol && j.drawnFromBase && !has(j.filename) {
+            guard let base = try? Data(contentsOf: url("\(j.base).png")), let cg = loadCGImage(data: base) else {
+                if wanted(j.filename) { problems.append("\(j.id) is drawn from \(j.base), which isn't drawn yet") }
+                continue
+            }
+            if let px = paint(j.id, prompt: GDDAssetPrompts.formBrief(j, theme: theme, backing: (backing.name, b)),
+                              inputs: [downsamplePNG(base, longEdge: 2048) ?? base], w: cg.width, h: cg.height, covered: nil) { both(px, cg.width, cg.height, j.id) }
+        }
+        let rows = min(3, layout.base?.rows ?? 3)
+        for j in jobs where j.kind == .symbol && (j.symbolForm == .expandingWild || j.symbolForm == .stacked) && !has("\(j.id)_stack.png") {
+            guard let sym = try? Data(contentsOf: url(j.filename)), let cg = loadCGImage(data: sym) else { continue }
+            let w = cg.width / 2, h = w * rows
+            guard let canvas = blank(w, h) else { continue }
+            if let px = paint("\(j.id)_stack", prompt: GDDAssetPrompts.tallBrief(j, theme: theme, backing: (backing.name, b), rows: rows),
+                              inputs: [downsamplePNG(sym, longEdge: 1024) ?? sym, canvas], w: w, h: h, covered: nil) { both(px, w, h, "\(j.id)_stack") }
+        }
+        for j in jobs where j.kind == .symbol && j.symbolForm == .wildMultiplier {
+            for v in SymbolForm.multipliers(j.title) where !has("\(j.id)_x\(v).png") && wanted("\(j.id)_x\(v).png") {
+                let badge = WheelLabel.badge("×\(v)", width: 512, height: 288, face: titleTones)
+                write(FrameKit.onBacking(badge, b), 512, 288, "\(j.id)_x\(v).png"); write(badge, 512, 288, "\(j.id)_x\(v)_rmbg.png")
+            }
+        }
         // 11. Every background's landscape twin, the same scene widened (Derived).
         for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {
             guard let bgPNG = try? Data(contentsOf: url("\(j.id).png")) else { continue }
@@ -28028,8 +28076,9 @@ final class GDDToAssetsRun: ObservableObject {
     func generate(into folder: URL, removeBackground: Bool, separateFrames: Bool = false,
                   only: Set<String>? = nil,
                   onFinished: @escaping ([URL]) -> Void) {
+        // Not a symbol drawn from its base (SymbolForm): that is made with the game interface, from the approved base.
         let todo = jobs.filter {
-            !$0.subject.isEmpty && (only == nil || only!.contains($0.id))
+            !$0.subject.isEmpty && !$0.drawnFromBase && (only == nil || only!.contains($0.id))
         }
         guard !todo.isEmpty, let theme else { return }
         running = true; doneCount = 0; produced = []
@@ -28998,7 +29047,9 @@ extension GDDToAssetsRun {
         var stems = Set<String>()
         for n in names where n.hasSuffix(".png") && !n.contains("-blank") {
             let stem = n.hasSuffix("_rmbg.png") ? String(n.dropLast(9)) : String(n.dropLast(4))
-            guard !symbols.contains(stem), !symbols.contains(where: { stem.hasPrefix($0 + "_") && !stem.hasSuffix("_win") }) else { continue }
+            // A symbol's own files fold into it — but not its win state, its reel-tall version or its multiplier badges.
+            let ownPiece = stem.hasSuffix("_win") || stem.hasSuffix("_stack") || stem.range(of: #"_x\d+$"#, options: .regularExpression) != nil
+            guard !symbols.contains(stem), !symbols.contains(where: { stem.hasPrefix($0 + "_") && !ownPiece }) else { continue }
             stems.insert(stem)
         }
         // Each pot: its six states in order, the boosted look, then what they are built from.
@@ -31824,10 +31875,12 @@ struct GDDToAssetsSheet: View {
                         .lineLimit(1).frame(width: 100, alignment: .leading)
                     // The document's name for it once the set is designed; the role and the
                     // document's own note on hover.
-                    Text(job.kind == .background ? "Background" : GDDAssetPrompts.label(job))
+                    Text(job.kind == .background ? "Background" : GDDAssetPrompts.label(job) + (job.symbolForm == .single ? "" : job.drawnFromBase ? " · \(job.symbolForm.label.lowercased()) of \(job.base)" : " · \(job.symbolForm.label.lowercased())"))
                         .font(.caption).foregroundColor(.secondary).lineLimit(2)
                         .frame(width: 130, alignment: .leading)
-                        .help([job.kind == .background ? "" : "Drawn as: \(job.role.label)", job.title == job.role.label ? "" : "Document: \(job.title)", job.job.isEmpty ? "" : "Does: \(job.job)"].filter { !$0.isEmpty }.joined(separator: "\n"))
+                        .help([job.kind == .background ? "" : "Drawn as: \(job.role.label)", job.title == job.role.label ? "" : "Document: \(job.title)", job.job.isEmpty ? "" : "Does: \(job.job)",
+                               job.symbolForm == .single ? "" : "\(job.symbolForm.label): \(job.symbolForm.whatFor) Looks: \(job.symbolForm.look) Shown: \(job.symbolForm.display)"
+                                 + (job.drawnFromBase ? " Drawn from \(job.base) once it is approved, with the game interface." : "")].filter { !$0.isEmpty }.joined(separator: "\n"))
                     TextField("subject", text: field(job.id, \.subject))
                         .font(.caption).textFieldStyle(.roundedBorder)
                         .disabled(run.running || run.busy)
@@ -32000,7 +32053,7 @@ struct GDDToAssetsSheet: View {
             : "Backgrounds would come out about \(p.w)×\(p.h), smaller than the \(t.w)×\(t.h) portrait size. \(BackgroundFormatRules.best().aspect) at \(BackgroundFormatRules.best().size) covers it."
     }
 
-    private var readyJobs: Int { run.jobs.filter { !$0.subject.isEmpty }.count }
+    private var readyJobs: Int { run.jobs.filter { !$0.subject.isEmpty && !$0.drawnFromBase }.count }
     /// What "make it first" draws: the anchor, or the whole sheet it is drawn on.
     private var anchorLabel: String {
         let g = run.anchorGroupIDs.sorted()
@@ -32012,7 +32065,7 @@ struct GDDToAssetsSheet: View {
     private var restIDs: Set<String> {
         let first = run.anchorGroupIDs
         return Set(run.jobs.filter { j in
-            !j.subject.isEmpty && !first.contains(j.id)
+            !j.subject.isEmpty && !j.drawnFromBase && !first.contains(j.id)
                 && !(run.lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent(j.filename).path) } ?? false)
         }.map(\.id))
     }

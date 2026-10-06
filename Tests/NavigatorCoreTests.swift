@@ -14314,3 +14314,49 @@ final class OlderSymbolLayoutTests: XCTestCase {
         XCTAssertTrue(GDDSymbolSetRules.parseHeadings("Intro\nHP1\nSome prose about the game.\nMore prose.").isEmpty)
     }
 }
+
+/// The forms symbols take beyond their roles, as the research across the GDDs found them.
+final class SymbolFormTests: XCTestCase {
+    let codes: Set<String> = ["HP1", "HP2", "MP1", "M1", "WD1", "BO1"]
+    func f(_ code: String, _ role: SlotSymbolRole, _ note: String = "") -> (SymbolForm, String?) {
+        let r = SymbolForm.detect(code: code, role: role, note: note, codes: codes); return (r.form, r.base)
+    }
+    func testDoublesTriplesAndFreeGamesAreDrawnFromTheirBase() {
+        XCTAssertEqual(f("DHP1", .highPay).0, .double); XCTAssertEqual(f("DHP1", .highPay).1, "HP1")
+        XCTAssertEqual(f("THP2", .highPay).0, .triple); XCTAssertEqual(f("THP2", .highPay).1, "HP2")
+        XCTAssertEqual(f("DMP1", .mediumPay).1, "MP1")
+        XCTAssertEqual(f("D1", .highPay).1, "M1")                                       // the older D of M
+        XCTAssertEqual(f("X9", .highPay, "Split Symbol of M1").0, .double)
+        XCTAssertEqual(f("FGHP2", .highPay).0, .freeGames); XCTAssertEqual(f("FGHP2", .highPay).1, "HP2")
+        XCTAssertEqual(f("DHP4", .highPay).0, .single)                                  // no HP4 in the set: drawn as itself
+    }
+    func testWildsAndStacks() {
+        XCTAssertEqual(f("WDWY1", .wild).0, .valueWild)
+        XCTAssertEqual(f("WD2", .wild, "wild with a credit value on it").0, .valueWild)
+        XCTAssertEqual(f("WD1", .wild, "carries a 2x to 5x multiplier").0, .wildMultiplier)
+        XCTAssertEqual(f("EW1", .wild).0, .expandingWild)
+        XCTAssertEqual(f("WD1", .wild, "expands to fill the reel").0, .expandingWild)
+        XCTAssertEqual(f("HP1", .highPay, "lands as Super Stacks").0, .stacked)
+        XCTAssertEqual(f("HP2", .highPay, "can land as a 2x2 super symbol").0, .colossal)
+        XCTAssertEqual(f("HP1", .highPay, "a fox in a waistcoat").0, .single)
+        XCTAssertEqual(SymbolForm.multipliers("multiplies by 2x-5x"), [2, 3, 4, 5])
+        XCTAssertEqual(SymbolForm.multipliers("x2 or x3"), [2, 3])
+        XCTAssertEqual(SymbolForm.multipliers("a wild"), [2, 3, 5])
+    }
+    func testAMultiplierBadgeIsLetteredWithinItsCanvas() {
+        let w = 400, h = 220, px = WheelLabel.badge("×3", width: w, height: h)
+        var minX = w, maxX = 0, minY = h, maxY = 0
+        for y in 0..<h { for x in 0..<w where px[(y * w + x) * 4 + 3] > 20 { minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y) } }
+        XCTAssertGreaterThan(maxX - minX, w / 3)                                         // large
+        XCTAssertGreaterThan(minX, 0); XCTAssertLessThan(maxX, w - 1)                   // whole: clear of every edge
+        XCTAssertGreaterThan(minY, 0); XCTAssertLessThan(maxY, h - 1)
+    }
+    func testJobsCarryTheirFormAndBase() {
+        let s = GDDSymbolSetRules.parseManual("HP1-2, DHP1, WD1, BO1").symbols
+        let jobs = AssetPlanRules.symbolJobs(s)
+        XCTAssertEqual(jobs.first { $0.id == "DHP1" }?.symbolForm, .double)
+        XCTAssertEqual(jobs.first { $0.id == "DHP1" }?.base, "HP1")
+        XCTAssertTrue(jobs.first { $0.id == "DHP1" }?.drawnFromBase ?? false)
+        XCTAssertFalse(jobs.first { $0.id == "HP1" }?.drawnFromBase ?? true)
+    }
+}
