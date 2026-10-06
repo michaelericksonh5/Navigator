@@ -22304,7 +22304,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projects-snapshot"), flag 
     app.run()
 }
 
-// Free, and only on a copy:  Navigator --projects-action <rename|free|archive|trash> <set folder> [new name] [--no]
+// Free, and only on a copy:  Navigator --projects-action <rename|free|archive|restore|trash> <set folder> [new name] [--no]
 // A project action as the Projects home does it, every question answered yes (or no, with --no) — to test on scratch copies.
 if let flag = CommandLine.arguments.firstIndex(of: "--projects-action"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
@@ -22321,6 +22321,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--projects-action"), flag + 
         case "free": model.freeSpace(row)
         case "trash": model.trash(row)
         case "archive": model.archive(row); DispatchQueue.main.asyncAfter(deadline: .now() + 60) { exit(0) }
+        case "restore": model.restoreEarlier(row)
         default: print("FAILED: no action \(action)"); exit(1)
         }
         if action != "archive" { print("DONE"); exit(0) }
@@ -28276,7 +28277,11 @@ extension GDDToAssetsRun {
 
     func writeManifest(to folder: URL) {
         // Never into a folder that is gone (renamed, archived, in the Trash): that would bring a stray copy back.
-        guard let theme, FileManager.default.fileExists(atPath: folder.path) else { return }
+        guard let theme else { return }
+        guard FileManager.default.fileExists(atPath: folder.path) else {
+            noteSaved(CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "its folder has moved or is gone (\(folder.lastPathComponent)) — reopen it from Projects"]))
+            return
+        }
         var m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
                             backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
         m.typed = typed; m.languages = languages
@@ -28374,6 +28379,15 @@ extension GDDToAssetsRun {
             try SetStore.write(d, SetReview.fileName, in: folder, valid: { SetReview.decode($0) != nil })
             noteSaved(nil)
         } catch { noteSaved(error) }
+    }
+    /// Closing a project not saved yet — it has no plan, so no folder — loses what was picked and read: asked first.
+    func mayCloseUnsaved() -> Bool {
+        guard lastFolder == nil, !jobs.isEmpty || theme != nil, !PaidCalls.disabled else { return true }
+        let a = NSAlert()
+        a.messageText = "This project isn't saved yet"
+        a.informativeText = "A project gets its own folder, and is saved as it goes, from the moment its plan is designed. Closing now loses the document read and the choices made."
+        a.addButton(withTitle: "Keep Open"); a.addButton(withTitle: "Close Without Saving")
+        return a.runModal() == .alertSecondButtonReturn
     }
     /// A save's outcome, said on the main thread whichever thread saved.
     func noteSaved(_ error: Error?) {
@@ -32183,7 +32197,7 @@ struct GDDToAssetsSheet: View {
     /// Closing while paid work is in flight used to dismiss the window and leave the
     /// batch running where nobody could see it, stop it, or find out what it spent.
     private func requestClose() {
-        guard run.running || run.keying || run.layering else { onClose(); return }
+        guard run.running || run.keying || run.layering else { if run.mayCloseUnsaved() { onClose() }; return }
         let a = NSAlert()
         a.messageText = run.running ? "Images are still being generated."
                                     : "Background work is still running."
@@ -32296,7 +32310,7 @@ final class CloseGuard: NSObject, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if force { return true }
-        guard run.running else { return true }
+        guard run.running else { return run.mayCloseUnsaved() }
         let a = NSAlert()
         a.messageText = "Images are still being generated."
         a.informativeText = "Closing does not stop the run, and you will not see what it "
@@ -32625,6 +32639,31 @@ enum GDDToAssetsWindow {
         }
     }
 
+    /// The plan, the choices and the approvals as they were at an earlier save (SetStore's dated copies); the pictures stay
+    /// as they are. The save it replaces is kept as a dated copy too, so a restore can itself be undone.
+    func restoreEarlier(_ r: Row) {
+        let saves = SetStore.history(SetManifest.fileName, in: r.folder)
+        guard !saves.isEmpty else { say("No earlier saves of “\(r.title)” yet", "Navigator keeps a copy of a project's plan and approvals every quarter-hour while it changes, in its .navigator folder."); return }
+        let a = NSAlert(); a.messageText = "Restore an earlier save of “\(r.title)”"
+        a.informativeText = "Its plan, choices and approvals go back to how they were at the time chosen. The pictures stay as they are now. The current save is kept, so this can be undone the same way."
+        let pop = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 26), pullsDown: false)
+        saves.forEach { pop.addItem(withTitle: $0.date.formatted(date: .abbreviated, time: .shortened)) }
+        a.accessoryView = pop
+        a.addButton(withTitle: "Restore"); a.addButton(withTitle: "Cancel")
+        guard auto != nil || a.runModal() == .alertFirstButtonReturn else { return }
+        let pick = saves[auto != nil ? 0 : max(0, pop.indexOfSelectedItem)]
+        guard letGo(r, "restore") else { return }
+        do {
+            try SetStore.write(Data(contentsOf: pick.url), SetManifest.fileName, in: r.folder, valid: { SetManifest.decode($0) != nil }, snapshot: true)
+            // The review as it stood then: the first copy taken at or after that time held it; none means it hasn't changed since.
+            if let rv = SetStore.history(SetReview.fileName, in: r.folder).filter({ $0.date >= pick.date }).min(by: { $0.date < $1.date }) {
+                try SetStore.write(Data(contentsOf: rv.url), SetReview.fileName, in: r.folder, valid: { SetReview.decode($0) != nil }, snapshot: true)
+            }
+            say("“\(r.title)” is back to \(pick.date.formatted(date: .abbreviated, time: .shortened))", "Its plan, choices and approvals are as they were then. Continue to open it.")
+        } catch { say("Couldn’t restore “\(r.title)”", error.localizedDescription) }
+        refresh()
+    }
+
     func removeFromList(_ r: Row) { RecentSets.remove(r.folder); refresh() }
     /// A missing project found again: the folder picked must be a set.
     func locate(_ r: Row, at u: URL) {
@@ -32742,6 +32781,7 @@ struct ProjectsView: View {
         Button("Rename…") { model.rename(r) }
         Button("Free Up Space…" + (r.versions > 0 ? " (\(ProjectsModel.bytes(r.versions)))" : "")) { model.freeSpace(r) }
         Button("Archive to .zip…") { model.archive(r) }
+        Button("Restore an Earlier Save…") { model.restoreEarlier(r) }
         Divider()
         if !r.inProjectsFolder { Button("Remove from List") { model.removeFromList(r) } }
         Button("Move to Trash…") { model.trash(r) }

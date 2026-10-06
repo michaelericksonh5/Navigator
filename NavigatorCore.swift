@@ -17819,12 +17819,13 @@ public enum SetStore {
 
     /// Writes `data` as `name` in `folder`, keeping the copy it replaces when that copy is good (`valid`). Throws what
     /// stopped it — the caller says so; nothing is half-written.
-    public static func write(_ data: Data, _ name: String, in folder: URL, valid: (Data) -> Bool, now: Date = Date()) throws {
+    /// `snapshot`: keep a dated copy of what it replaces now, however recent the last (a restore keeps what it undoes).
+    public static func write(_ data: Data, _ name: String, in folder: URL, valid: (Data) -> Bool, now: Date = Date(), snapshot: Bool = false) throws {
         let url = folder.appendingPathComponent(name), fm = FileManager.default
         if let old = try? Data(contentsOf: url), old != data, valid(old) {
             try? fm.createDirectory(at: dir(folder), withIntermediateDirectories: true)
             try? old.write(to: dir(folder).appendingPathComponent(name + ".previous"), options: .atomic)
-            if history(name, in: folder).first.map({ now.timeIntervalSince($0.date) >= every }) ?? true {
+            if snapshot || history(name, in: folder).first.map({ now.timeIntervalSince($0.date) >= every }) ?? true {
                 try? old.write(to: dir(folder).appendingPathComponent("\(name).\(stamp(now))"), options: .atomic)
                 for d in history(name, in: folder).dropFirst(keep) { try? fm.removeItem(at: d.url) }
             }
