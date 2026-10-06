@@ -19190,8 +19190,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     // AI → GDD to Assets… — read a game design document, take a theme from the team
     // hub, and generate the game's whole symbol set and backgrounds.
+    /// AI ▸ GDD to Assets… — the Projects home: carry on with one, or start a new one.
     @objc func gddToAssetsAction(_ sender: Any?) {
-        Task { @MainActor in GDDToAssetsWindow.open() }
+        Task { @MainActor in ProjectsWindow.open() }
     }
     /// AI ▸ Open Set… — a set's .navset file, or its folder, in the editor as it was left.
     @objc func openSetAction(_ sender: Any?) {
@@ -19708,7 +19709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === recentSetsMenu {
             menu.removeAllItems()
-            let list = RecentSets.list()
+            let list = RecentSets.list().prefix(12)
             for s in list {
                 let item = menu.addItem(withTitle: s.game, action: #selector(openRecentSetAction(_:)), keyEquivalent: "")
                 item.target = self; item.representedObject = s.folder; item.toolTip = s.folder.path
@@ -22270,6 +22271,59 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
             }
             print("WROTE: \(out.path)"); exit(0)
         }
+    } }
+    app.run()
+}
+
+// Free:  Navigator --projects-snapshot <projects folder> <out.png> [--recent <folder>,<folder>]
+// The Projects home for a projects folder (and those recent ones), drawn off screen into a PNG — to check the design.
+if let flag = CommandLine.arguments.firstIndex(of: "--projects-snapshot"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let parent = URL(fileURLWithPath: args[flag + 1]), out = URL(fileURLWithPath: args[flag + 2])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        GDDLibrary.outputParent = parent
+        for p in (args.firstIndex(of: "--recent").flatMap { $0 + 1 < args.count ? args[$0 + 1].split(separator: ",").map(String.init) : nil } ?? []).reversed() {
+            RecentSets.add(URL(fileURLWithPath: p))
+        }
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 980, height: 700), styleMask: [.borderless], backing: .buffered, defer: false)
+        w.appearance = NSAppearance(named: .darkAqua)
+        let model = ProjectsModel()
+        w.contentView = NSHostingView(rootView: ProjectsView(model: model))
+        w.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            guard let v = w.contentView else { print("FAILED: no view"); exit(1) }
+            v.layoutSubtreeIfNeeded(); v.display()
+            if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, CGWindowID(w.windowNumber), [.boundsIgnoreFraming, .bestResolution]),
+               let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) { try? png.write(to: out) }
+            for r in model.rows { print("ROW: \(r.title) | \(r.missing ? "MISSING" : r.progress) | \(r.size.map(ProjectsModel.bytes) ?? "-")") }
+            print("WROTE: \(out.path)"); exit(0)
+        }
+    } }
+    app.run()
+}
+
+// Free, and only on a copy:  Navigator --projects-action <rename|free|archive|trash> <set folder> [new name] [--no]
+// A project action as the Projects home does it, every question answered yes (or no, with --no) — to test on scratch copies.
+if let flag = CommandLine.arguments.firstIndex(of: "--projects-action"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments
+    let action = args[flag + 1], folder = URL(fileURLWithPath: args[flag + 2]).standardizedFileURL
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        let model = ProjectsModel()
+        model.auto = (!args.contains("--no"), flag + 3 < args.count && !args[flag + 3].hasPrefix("--") ? args[flag + 3] : "")
+        GDDLibrary.outputParent = folder.deletingLastPathComponent()
+        model.refresh()
+        guard let row = model.rows.first(where: { $0.folder == folder }) else { print("FAILED: not a project: \(folder.path)"); exit(1) }
+        switch action {
+        case "rename": model.rename(row)
+        case "free": model.freeSpace(row)
+        case "trash": model.trash(row)
+        case "archive": model.archive(row); DispatchQueue.main.asyncAfter(deadline: .now() + 60) { exit(0) }
+        default: print("FAILED: no action \(action)"); exit(1)
+        }
+        if action != "archive" { print("DONE"); exit(0) }
     } }
     app.run()
 }
@@ -26424,6 +26478,45 @@ final class GDDToAssetsRun: ObservableObject {
         }
         var title: String { switch self { case .core: "the core pieces"; case .rest: "everything else"; case .localize: "the localized pieces" } }
     }
+    /// The interface pieces of a phase (its reelPieces groups), or all of them.
+    static func inPhase(_ list: [(item: AssetChecklist.Item, made: Bool)], _ groups: Set<String>?) -> [(item: AssetChecklist.Item, made: Bool)] {
+        list.filter { e in e.item.files.contains { f in groups.map { g in reelPieces.contains { g.contains($0.name) && $0.files(f) } } ?? true } }
+    }
+    /// What this set has, counted for where it stands (ProjectStage).
+    func counts() -> ProjectStage.Counts {
+        var c = ProjectStage.Counts()
+        c.hasGame = !jobs.isEmpty || !symbols.isEmpty; c.hasTheme = theme != nil; c.planned = planned
+        let planned = jobs.filter { !$0.subject.isEmpty }
+        c.symbols = planned.count
+        guard let folder = lastFolder else { return c }
+        let fm = FileManager.default
+        c.symbolsDrawn = planned.filter { fm.fileExists(atPath: folder.appendingPathComponent($0.filename).path) }.count
+        let core = coreApproval(folder)
+        c.coreTotal = core.total; c.coreApproved = core.total - core.left.count
+        let list = checklist().filter { $0.item.supported && !["Symbols", "Backgrounds"].contains($0.item.maker) }
+        func phase(_ p: Phase) -> (total: Int, toDraw: Int) { let l = Self.inPhase(list, Set(p.groups)); return (l.count, l.filter { !$0.made }.count) }
+        c.coreToDraw = reelLayout == nil ? 0 : phase(.core).toDraw
+        (c.restTotal, c.restToDraw) = phase(.rest)
+        c.languages = languages.count
+        (c.localizeTotal, c.localizeToDraw) = phase(.localize)
+        return c
+    }
+    /// Where it stands, in a few words: "Core art · 37 of 49 approved".
+    static func progress(_ c: ProjectStage.Counts) -> String {
+        let stage = ProjectStage.current(c)
+        switch stage {
+        case .game, .look: return "Setting up"
+        case .plan: return "Plan · \(c.symbols) symbols to draw"
+        case .core:
+            if c.symbolsDrawn < c.symbols { return "Core art · \(c.symbolsDrawn) of \(c.symbols) symbols drawn" }
+            if c.coreToDraw > 0 { return "Core art · \(c.coreToDraw) reel-area piece\(c.coreToDraw == 1 ? "" : "s") to draw" }
+            return "Core art · \(c.coreApproved) of \(c.coreTotal) approved"
+        case .rest: return "Everything else · \(c.restTotal - c.restToDraw) of \(c.restTotal) made"
+        case .localize: return "Localize · \(c.languages) language\(c.languages == 1 ? "" : "s") · \(c.localizeTotal - c.localizeToDraw) of \(c.localizeTotal)"
+        case .done: return c.languages > 0 ? "Complete · \(c.languages) language\(c.languages == 1 ? "" : "s")" : "Complete"
+        }
+    }
+
     /// The core's pictures and which are not approved yet: every symbol, frame and background in review, the bezel and
     /// reel texture pieces, and each pot's states. Everything else is drawn to match them, so it waits for all of them.
     func coreApproval(_ folder: URL) -> (total: Int, left: [String]) {
@@ -26616,11 +26709,10 @@ final class GDDToAssetsRun: ObservableObject {
             }
         }
         let groups = phase.map { Set($0.groups) }
-        func inPhase(_ file: String) -> Bool { groups.map { g in Self.reelPieces.contains { g.contains($0.name) && $0.files(file) } } ?? true }
         // The cost said before anything is paid for: what isn't made yet, or the piece made again.
         let list = checklist().filter { $0.item.supported && !["Symbols", "Backgrounds"].contains($0.item.maker) }
         let todo = redo.flatMap { r in Self.reelPieces.first { $0.name == r } }
-            .map { p in list.filter { $0.item.files.contains(where: p.files) } } ?? list.filter { !$0.made && $0.item.files.contains(where: inPhase) }
+            .map { p in list.filter { $0.item.files.contains(where: p.files) } } ?? Self.inPhase(list, groups).filter { !$0.made }
         let alert = NSAlert()
         alert.messageText = redo.map { "Make the \($0) again?" } ?? phase.map { "Make \($0.title)?" } ?? "Make the game interface?"
         let total = todo.reduce(0) { $0 + $1.item.cost }
@@ -28183,7 +28275,8 @@ extension GDDToAssetsRun {
     }
 
     func writeManifest(to folder: URL) {
-        guard let theme else { return }
+        // Never into a folder that is gone (renamed, archived, in the Trash): that would bring a stray copy back.
+        guard let theme, FileManager.default.fileExists(atPath: folder.path) else { return }
         var m = SetManifest(game: gameName, gdd: gameName, theme: theme, design: styledDesign, jobs: jobs,
                             backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
         m.typed = typed; m.languages = languages
@@ -29047,11 +29140,29 @@ extension GDDToAssetsRun {
 
 /// The sets opened or saved lately, newest first, for AI ▸ Open Recent Set.
 enum RecentSets {
-    private static let key = "recentSets"
+    private static let key = "recentSets", workedKey = "recentSetsWorked"
+    static var paths: [String] { UserDefaults.standard.stringArray(forKey: key) ?? [] }
+    private static var worked: [String: Double] {
+        get { UserDefaults.standard.dictionary(forKey: workedKey) as? [String: Double] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: workedKey) }
+    }
+    /// A set opened or saved now: first in the list, with when.
     static func add(_ folder: URL) {
-        var list = (UserDefaults.standard.stringArray(forKey: key) ?? []).filter { $0 != folder.path }
+        var list = paths.filter { $0 != folder.path }
         list.insert(folder.path, at: 0)
-        UserDefaults.standard.set(Array(list.prefix(12)), forKey: key)
+        UserDefaults.standard.set(Array(list.prefix(50)), forKey: key)
+        var w = worked; w[folder.path] = Date().timeIntervalSince1970; worked = w.filter { list.prefix(50).contains($0.key) }
+    }
+    /// When it was last opened or saved here.
+    static func lastWorked(_ folder: URL) -> Date? { worked[folder.path].map(Date.init(timeIntervalSince1970:)) }
+    static func remove(_ folder: URL) {
+        UserDefaults.standard.set(paths.filter { $0 != folder.path }, forKey: key)
+        var w = worked; w[folder.path] = nil; worked = w
+    }
+    /// A set found at a new place (renamed, or located): the list keeps its place and its date.
+    static func replace(_ old: URL, with new: URL) {
+        UserDefaults.standard.set(paths.map { $0 == old.path ? new.path : $0 }, forKey: key)
+        var w = worked; w[new.path] = w[old.path]; w[old.path] = nil; worked = w
     }
     /// The ones still there, with their games' names.
     static func list() -> [(folder: URL, game: String)] {
@@ -29843,6 +29954,8 @@ struct AssetBrowserView: View {
 
 enum GDDReviewWindow {
     private static var windows: [NSWindow] = []
+    @MainActor static func isOpen(_ folder: URL) -> Bool { windows.contains { GDDToAssetsWindow.same($0.representedURL, folder) } }
+    @MainActor static func close(_ folder: URL) { windows.filter { GDDToAssetsWindow.same($0.representedURL, folder) }.forEach { $0.close() } }
     /// Posted to turn an open browser to a picture: object is the set folder, userInfo["id"] the picture.
     static let select = Notification.Name("AssetBrowserSelect")
     @MainActor static func open(run: GDDToAssetsRun, folder: URL, select id: String? = nil) {
@@ -30335,7 +30448,7 @@ struct GDDToAssetsSheet: View {
         .onChange(of: run.jobs.map { $0.subject + "|" + $0.silhouette }) { _, _ in save(currentSession) }
         .onChange(of: run.languages) { _, _ in save(currentSession) }
         .onReceive(NotificationCenter.default.publisher(for: APIKeys.changed)) { _ in run.objectWillChange.send() }
-        .onDisappear { saveWork?.perform() }
+        .onDisappear { saveWork?.perform(); saveWork?.cancel() }
         .sheet(item: $picking) { which in
             NavigatorFolderPicker(
                 title: which == .gdds ? "Choose the GDDs folder"
@@ -32032,7 +32145,7 @@ struct GDDToAssetsSheet: View {
 /// `close()` — so the one control every Mac user reaches for by reflex was the one that
 /// silently abandoned a paid batch.
 final class CloseGuard: NSObject, NSWindowDelegate {
-    private let run: GDDToAssetsRun
+    let run: GDDToAssetsRun
     /// Set when the in-window Close button has already asked.
     var force = false
     init(run: GDDToAssetsRun) { self.run = run }
@@ -32122,6 +32235,13 @@ enum OpenSets {
 enum GDDToAssetsWindow {
     private static var windows: [NSWindow] = []
     private static var guards: [CloseGuard] = []
+    static func same(_ a: URL?, _ b: URL) -> Bool { a?.standardizedFileURL.path == b.standardizedFileURL.path }
+    /// Whether a set has an editor open.
+    @MainActor static func isOpen(_ folder: URL) -> Bool { guards.contains { same($0.run.lastFolder, folder) } }
+    /// Its editors closed — saved as they close.
+    @MainActor static func close(_ folder: URL) {
+        for (w, g) in zip(windows, guards) where same(g.run.lastFolder, folder) { g.force = true; w.close() }
+    }
     /// `document`: a GDD right-clicked in Finder — the window opens on its folder with it
     /// picked. The saved GDD folder is left alone; that stays the user's choice.
     /// A saved set (its folder, or its .navset file) in the editor, as it was left — or, when it is open already, that window.
@@ -32166,6 +32286,352 @@ enum GDDToAssetsWindow {
             windows.removeAll { $0 === w }
             guards.removeAll { $0 === guardian }
             if let t = token { NotificationCenter.default.removeObserver(t) }
+        }
+        w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// ===== GDD to Assets: Projects =====
+//
+// Where GDD to Assets opens (2026-10-05): every project — the ones opened lately, wherever they are, and every set in the
+// projects folder — with its picture, where it stands and when it was last worked on; one click to carry on. Finished
+// ones can be archived, slimmed or moved to the Trash from here.
+
+@MainActor final class ProjectsModel: ObservableObject {
+    struct Row: Identifiable {
+        var id: String { folder.path }
+        var folder: URL
+        var missing: Bool
+        var game = "", progress = "", stage = ProjectStage.game
+        var thumb: NSImage?
+        var worked: Date?
+        var size: Int64?, versions: Int64 = 0
+        var inProjectsFolder = false
+        var busy: String?
+        var title: String { folder.lastPathComponent }
+    }
+    @Published var rows: [Row] = []
+    @Published var query = ""
+    @Published var total: Int64 = 0
+    private var generation = 0
+    /// Test runs only (--projects-action): every question answered yes, a rename's new name given, nothing shown.
+    var auto: (yes: Bool, name: String)?
+
+    var shown: [Row] {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        return q.isEmpty ? rows : rows.filter { $0.title.lowercased().contains(q) || $0.game.lowercased().contains(q) }
+    }
+
+    /// The list at once, by when each was last worked on; then each project's details, one at a time, so it never waits.
+    func refresh() {
+        generation += 1
+        let gen = generation, parent = GDDLibrary.outputParent?.standardizedFileURL
+        let fm = FileManager.default
+        rows = ProjectIndex.find(recent: RecentSets.paths, projectsFolder: parent).map { f in
+            var r = Row(folder: f.folder, missing: f.missing)
+            r.inProjectsFolder = parent.map { f.folder.deletingLastPathComponent().standardizedFileURL.path == $0.path } ?? false
+            r.worked = RecentSets.lastWorked(f.folder)
+                ?? (try? fm.attributesOfItem(atPath: f.folder.appendingPathComponent(SetManifest.fileName).path))?[.modificationDate] as? Date
+            return r
+        }.sorted { ($0.missing ? 1 : 0, -($0.worked?.timeIntervalSince1970 ?? 0)) < ($1.missing ? 1 : 0, -($1.worked?.timeIntervalSince1970 ?? 0)) }
+        fill(0, gen)
+    }
+    private func fill(_ i: Int, _ gen: Int) {
+        guard gen == generation else { return }
+        guard i < rows.count else { sizes(gen); return }
+        if !rows[i].missing, let run = OpenSets.open(rows[i].folder) ?? GDDToAssetsRun.reopen(rows[i].folder, fetchTheme: false) {
+            let c = run.counts()
+            rows[i].game = run.gameName
+            rows[i].stage = ProjectStage.current(c)
+            rows[i].progress = GDDToAssetsRun.progress(c)
+            rows[i].thumb = Self.thumbnail(rows[i].folder, hero: run.styledDesign.anchorID)
+        }
+        DispatchQueue.main.async { self.fill(i + 1, gen) }
+    }
+    /// What each takes on disk, and its earlier versions, measured off the main thread.
+    private func sizes(_ gen: Int) {
+        let folders = rows.filter { !$0.missing }.map(\.folder)
+        DispatchQueue.global(qos: .utility).async {
+            let measured = folders.map { ($0, ProjectIndex.size($0), ProjectIndex.size($0.appendingPathComponent("versions"))) }
+            DispatchQueue.main.async {
+                guard gen == self.generation else { return }
+                for (f, size, versions) in measured { if let i = self.rows.firstIndex(where: { $0.folder == f }) { self.rows[i].size = size; self.rows[i].versions = versions } }
+                self.total = measured.reduce(0) { $0 + $1.1 }
+            }
+        }
+    }
+    /// The set's hero (its anchor symbol), its logo, or any picture of it, small.
+    static func thumbnail(_ folder: URL, hero: String) -> NSImage? {
+        let fm = FileManager.default
+        // The cut-out first: the drawing itself sits on the chroma backing.
+        let names = (hero.isEmpty ? [] : ["\(hero)_rmbg.png", "\(hero).png"]) + ["HP1_rmbg.png", "HP1.png", "shared_logo_master_rmbg.png", "shared_logo_master.png"]
+        let pick = names.map { folder.appendingPathComponent($0) }.first { fm.fileExists(atPath: $0.path) }
+            ?? ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []).first { $0.pathExtension == "png" }
+        guard let u = pick, let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 192] as CFDictionary)
+        else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    // MARK: Actions
+
+    func open(_ r: Row) { GDDToAssetsWindow.open(set: r.folder) }
+    func assets(_ r: Row) { if let run = OpenSets.run(for: r.folder) { GDDReviewWindow.open(run: run, folder: r.folder) } }
+    func reveal(_ r: Row) { NSWorkspace.shared.activateFileViewerSelecting([r.folder]) }
+    func isOpen(_ r: Row) -> Bool { GDDToAssetsWindow.isOpen(r.folder) || GDDReviewWindow.isOpen(r.folder) }
+
+    /// A project still drawing is left alone; one open is saved and its windows closed before it moves.
+    private func letGo(_ r: Row, _ doing: String) -> Bool {
+        if let run = OpenSets.open(r.folder), run.running || run.keying || run.busy || run.layering {
+            say("“\(r.title)” is still drawing", "Wait until it finishes, then \(doing) it.")
+            return false
+        }
+        OpenSets.flush(r.folder)
+        GDDToAssetsWindow.close(r.folder); GDDReviewWindow.close(r.folder)
+        return true
+    }
+    private func say(_ title: String, _ text: String) {
+        if auto != nil { print("SAID: \(title) — \(text)"); return }
+        let a = NSAlert(); a.messageText = title; a.informativeText = text; a.addButton(withTitle: "OK"); a.runModal()
+    }
+    private func ask(_ title: String, _ text: String, _ yes: String, style: NSAlert.Style = .warning) -> Bool {
+        if let auto { print("ASKED: \(title) — \(text) → \(auto.yes ? yes : "Cancel")"); return auto.yes }
+        let a = NSAlert(); a.messageText = title; a.informativeText = text; a.alertStyle = style
+        a.addButton(withTitle: yes); a.addButton(withTitle: "Cancel")
+        return a.runModal() == .alertFirstButtonReturn
+    }
+    static func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+
+    func trash(_ r: Row) {
+        let size = " (\(Self.bytes(r.size ?? ProjectIndex.size(r.folder))))"
+        guard ask("Move “\(r.title)” to the Trash?", "The project's folder\(size) — its pictures, plan, review and versions — goes to the Trash. You can put it back from there until the Trash is emptied.", "Move to Trash"),
+              letGo(r, "move") else { return }
+        do {
+            try FileManager.default.trashItem(at: r.folder, resultingItemURL: nil)
+            RecentSets.remove(r.folder)
+        } catch { say("Couldn’t move “\(r.title)” to the Trash", error.localizedDescription) }
+        refresh()
+    }
+
+    func rename(_ r: Row) {
+        let a = NSAlert(); a.messageText = "Rename “\(r.title)”"
+        a.informativeText = "The project's folder is renamed; the game's own name, in its art, stays as it is."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24)); field.stringValue = r.title
+        a.accessoryView = field; a.window.initialFirstResponder = field
+        a.addButton(withTitle: "Rename"); a.addButton(withTitle: "Cancel")
+        guard auto != nil || a.runModal() == .alertFirstButtonReturn else { return }
+        let wanted = (auto?.name ?? field.stringValue).trimmingCharacters(in: .whitespacesAndNewlines)
+        let parent = r.folder.deletingLastPathComponent()
+        guard wanted != r.title else { return }
+        guard let name = ProjectIndex.freeName(wanted, in: parent), name == wanted || !wanted.isEmpty else { say("That name can’t be used", "Give the project a name that isn't empty and doesn't start with a full stop."); return }
+        guard letGo(r, "rename") else { return }
+        let to = parent.appendingPathComponent(name)
+        do {
+            try FileManager.default.moveItem(at: r.folder, to: to)
+            RecentSets.replace(r.folder, with: to)
+            // Its .navset names its folder: written again for the new one.
+            GDDToAssetsRun.reopen(to, fetchTheme: false)?.writeManifest(to: to)
+        } catch { say("Couldn’t rename “\(r.title)”", error.localizedDescription) }
+        refresh()
+    }
+
+    func freeSpace(_ r: Row) {
+        let versions = r.folder.appendingPathComponent("versions")
+        let count = ((try? FileManager.default.contentsOfDirectory(atPath: versions.path)) ?? []).count
+        guard count > 0 else { say("Nothing to free in “\(r.title)”", "It keeps no earlier versions of its pictures."); return }
+        guard ask("Delete the earlier versions in “\(r.title)”?", "\(count) earlier version\(count == 1 ? "" : "s") of its pictures (\(Self.bytes(ProjectIndex.size(versions)))) are deleted for good. The current pictures, the approvals, the plan and the project stay as they are; Restore and Compare no longer have those versions. This can't be undone.", "Delete Versions"),
+              letGo(r, "slim") else { return }
+        do {
+            try FileManager.default.removeItem(at: versions)
+            if let run = GDDToAssetsRun.reopen(r.folder, fetchTheme: false) {
+                for id in run.review.entries.keys { run.review.entries[id]?.versions = [] }
+                run.saveReview(r.folder)
+            }
+        } catch { say("Couldn’t delete the versions", error.localizedDescription) }
+        refresh()
+    }
+
+    func archive(_ r: Row) {
+        let parent = r.folder.deletingLastPathComponent()
+        guard let name = ProjectIndex.freeName(r.title, in: parent, ext: "zip"), letGo(r, "archive") else { return }
+        let zip = parent.appendingPathComponent(name), folder = r.folder, title = r.title
+        if let i = rows.firstIndex(where: { $0.folder == folder }) { rows[i].busy = "Archiving…" }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            p.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", folder.path, zip.path]
+            let ok = (try? p.run()) != nil && { p.waitUntilExit(); return p.terminationStatus == 0 }()
+            DispatchQueue.main.async {
+                if let i = self.rows.firstIndex(where: { $0.folder == folder }) { self.rows[i].busy = nil }
+                guard ok else { self.say("Couldn’t archive “\(title)”", "ditto could not write \(zip.lastPathComponent)."); try? FileManager.default.removeItem(at: zip); return }
+                let size = (try? zip.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map { Self.bytes(Int64($0)) } ?? ""
+                let a = NSAlert(); a.messageText = "“\(title)” is archived"
+                a.informativeText = "\(zip.lastPathComponent) (\(size)) is beside it in \(parent.lastPathComponent). Move the project's folder to the Trash now? You can put it back from there."
+                a.addButton(withTitle: "Keep the Folder"); a.addButton(withTitle: "Move Folder to Trash"); a.addButton(withTitle: "Show Archive")
+                switch self.auto.map({ $0.yes ? NSApplication.ModalResponse.alertSecondButtonReturn : .alertFirstButtonReturn }) ?? a.runModal() {
+                case .alertSecondButtonReturn:
+                    do { try FileManager.default.trashItem(at: folder, resultingItemURL: nil); RecentSets.remove(folder) }
+                    catch { self.say("Couldn’t move the folder to the Trash", error.localizedDescription) }
+                case .alertThirdButtonReturn: NSWorkspace.shared.activateFileViewerSelecting([zip])
+                default: break
+                }
+                self.refresh()
+                if self.auto != nil { print("ARCHIVED: \(zip.path) \(size)"); exit(0) }
+            }
+        }
+    }
+
+    func removeFromList(_ r: Row) { RecentSets.remove(r.folder); refresh() }
+    /// A missing project found again: the folder picked must be a set.
+    func locate(_ r: Row, at u: URL) {
+        guard ProjectIndex.isSet(u) else { say("Not a project", "“\(u.lastPathComponent)” has no \(SetManifest.fileName) — it isn't a GDD to Assets project."); return }
+        RecentSets.replace(r.folder, with: u.standardizedFileURL)
+        GDDToAssetsRun.reopen(u, fetchTheme: false)?.writeManifest(to: u)
+        refresh()
+    }
+}
+
+struct ProjectsView: View {
+    @ObservedObject var model: ProjectsModel
+    @State private var locating: ProjectsModel.Row?
+    @State private var choosingFolder = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text("Projects").font(.title2.bold())
+                Spacer()
+                TextField("Search projects", text: $model.query).textFieldStyle(.roundedBorder).frame(width: 220)
+                Button("Open…") { NSApp.sendAction(#selector(AppDelegate.openSetAction(_:)), to: nil, from: nil) }
+                    .help("A project somewhere else: its folder, or its .navset file")
+                Button { GDDToAssetsWindow.open() } label: { Label("New Project", systemImage: "plus") }
+                    .buttonStyle(.borderedProminent).keyboardShortcut("n", modifiers: .command)
+            }
+            .padding(.horizontal, 18).padding(.vertical, 12)
+            Divider()
+            if model.rows.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "square.stack.3d.up").font(.system(size: 40)).foregroundStyle(.secondary)
+                    Text("No projects yet").font(.headline)
+                    Text("A project is saved in its own folder as soon as its plan is ready, and listed here.").foregroundStyle(.secondary)
+                    Button { GDDToAssetsWindow.open() } label: { Label("New Project", systemImage: "plus") }.buttonStyle(.borderedProminent)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) { ForEach(model.shown) { card($0) } }.padding(14)
+                }
+            }
+            Divider()
+            HStack(spacing: 8) {
+                Text("Projects folder:").foregroundStyle(.secondary)
+                Text(GDDLibrary.outputParent?.path ?? "not chosen").lineLimit(1).truncationMode(.middle)
+                Button("Change…") { choosingFolder = true }.controlSize(.small)
+                Spacer()
+                Text("\(model.rows.filter { !$0.missing }.count) projects" + (model.total > 0 ? " · \(ProjectsModel.bytes(model.total))" : ""))
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption).padding(.horizontal, 18).padding(.vertical, 8)
+        }
+        .frame(minWidth: 760, minHeight: 480)
+        .onAppear { model.refresh() }
+        .sheet(item: $locating) { r in
+            NavigatorFolderPicker(title: "Find “\(r.title)”", start: GDDLibrary.outputParent,
+                                  onChoose: { u in locating = nil; model.locate(r, at: u) }, onCancel: { locating = nil })
+        }
+        .sheet(isPresented: $choosingFolder) {
+            NavigatorFolderPicker(title: "Where projects are kept", start: GDDLibrary.outputParent,
+                                  onChoose: { u in choosingFolder = false; GDDLibrary.outputParent = u; model.refresh() }, onCancel: { choosingFolder = false })
+        }
+    }
+
+    private func card(_ r: ProjectsModel.Row) -> some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.12))
+                if let t = r.thumb { Image(nsImage: t).resizable().scaledToFit().padding(4) }
+                else { Image(systemName: r.missing ? "questionmark.folder" : "photo").foregroundStyle(.secondary) }
+            }
+            .frame(width: 72, height: 72)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(r.title).font(.headline).lineLimit(1)
+                    if model.isOpen(r) { Text("Open").font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 1).background(Capsule().fill(Color.accentColor.opacity(0.25))) }
+                }
+                if r.missing {
+                    Label("Its folder is missing — moved, renamed or in the Trash.", systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+                } else {
+                    if !r.game.isEmpty && r.game != r.title { Text(r.game).foregroundStyle(.secondary).lineLimit(1) }
+                    HStack(spacing: 8) {
+                        Label(r.busy ?? (r.progress.isEmpty ? "…" : r.progress), systemImage: Self.icon(r.stage))
+                            .foregroundStyle(r.stage == .done ? Color.green : Color.primary)
+                        if let w = r.worked { Text("· " + Self.when(w)).foregroundStyle(.secondary) }
+                        if let s = r.size { Text("· " + ProjectsModel.bytes(s)).foregroundStyle(.secondary) }
+                    }
+                    .font(.callout)
+                }
+                if !r.inProjectsFolder { Text(r.folder.deletingLastPathComponent().path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle) }
+            }
+            Spacer()
+            if r.missing {
+                Button("Locate…") { locating = r }
+                Button("Remove from List") { model.removeFromList(r) }
+            } else {
+                Button("Assets") { model.assets(r) }.help("Every picture of the project, to review, approve or change")
+                Button("Continue") { model.open(r) }.buttonStyle(.borderedProminent).help("Open the project where it stands")
+                Menu { menu(r) } label: { Image(systemName: "ellipsis.circle") }.menuStyle(.borderlessButton).fixedSize()
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.06)))
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { if !r.missing { model.open(r) } }
+        .contextMenu { if r.missing { Button("Locate…") { locating = r }; Button("Remove from List") { model.removeFromList(r) } } else { menu(r) } }
+        .disabled(r.busy != nil)
+    }
+
+    @ViewBuilder private func menu(_ r: ProjectsModel.Row) -> some View {
+        Button("Continue") { model.open(r) }
+        Button("Open Assets") { model.assets(r) }
+        Button("Show in Finder") { model.reveal(r) }
+        Divider()
+        Button("Rename…") { model.rename(r) }
+        Button("Free Up Space…" + (r.versions > 0 ? " (\(ProjectsModel.bytes(r.versions)))" : "")) { model.freeSpace(r) }
+        Button("Archive to .zip…") { model.archive(r) }
+        Divider()
+        if !r.inProjectsFolder { Button("Remove from List") { model.removeFromList(r) } }
+        Button("Move to Trash…") { model.trash(r) }
+    }
+
+    static func icon(_ s: ProjectStage) -> String {
+        switch s {
+        case .game, .look: "gearshape"; case .plan: "list.bullet.rectangle"; case .core: "square.grid.3x3"
+        case .rest: "rectangle.stack"; case .localize: "globe"; case .done: "checkmark.seal.fill"
+        }
+    }
+    /// "today, 4:12 PM", "yesterday, 9:03 AM", "Sep 18".
+    static func when(_ d: Date) -> String {
+        let c = Calendar.current
+        if c.isDateInToday(d) { return "today, " + d.formatted(date: .omitted, time: .shortened) }
+        if c.isDateInYesterday(d) { return "yesterday, " + d.formatted(date: .omitted, time: .shortened) }
+        return c.isDate(d, equalTo: Date(), toGranularity: .year) ? d.formatted(.dateTime.month(.abbreviated).day()) : d.formatted(.dateTime.month(.abbreviated).day().year())
+    }
+}
+
+/// The Projects window: one, brought forward when asked for again; its list fresh each time it comes forward.
+@MainActor enum ProjectsWindow {
+    private static var window: NSWindow?
+    private static let model = ProjectsModel()
+    static func open() {
+        if let w = window { model.refresh(); w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 640), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.title = "GDD to Assets"
+        w.setFrameAutosaveName("GDDProjects")
+        w.contentView = NSHostingView(rootView: ProjectsView(model: model))
+        w.center(); window = w
+        NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: w, queue: .main) { _ in
+            MainActor.assumeIsolated { model.refresh() }
         }
         w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
     }

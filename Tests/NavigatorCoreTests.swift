@@ -14132,3 +14132,35 @@ final class SetStoreTests: XCTestCase {
         XCTAssertEqual(SetStore.read("set.json", in: f) { d -> Int? in ((try? JSONSerialization.jsonObject(with: d)) as? [String: Int])?["v"] }?.value, 78)
     }
 }
+
+/// Where a project stands, and where projects are found.
+final class ProjectTests: XCTestCase {
+    func testAProjectIsAtItsFirstStageWithWorkLeft() {
+        var c = ProjectStage.Counts()
+        XCTAssertEqual(ProjectStage.current(c), .game)
+        c.hasGame = true; XCTAssertEqual(ProjectStage.current(c), .look)
+        c.hasTheme = true; c.planned = true; c.symbols = 21; XCTAssertEqual(ProjectStage.current(c), .plan)
+        c.symbolsDrawn = 21; c.coreToDraw = 3; XCTAssertEqual(ProjectStage.current(c), .core)
+        XCTAssertFalse(ProjectStage.open(c).contains(.rest))
+        c.coreToDraw = 0; c.coreTotal = 49; c.coreApproved = 37; XCTAssertEqual(ProjectStage.current(c), .core)
+        c.coreApproved = 49; c.restTotal = 30; c.restToDraw = 30; XCTAssertEqual(ProjectStage.current(c), .rest)
+        XCTAssertTrue(ProjectStage.open(c).contains(.localize))
+        c.restToDraw = 0; XCTAssertEqual(ProjectStage.current(c), .done)          // no languages chosen: complete
+        c.languages = 2; c.localizeToDraw = 14; XCTAssertEqual(ProjectStage.current(c), .localize)
+        c.localizeToDraw = 0; XCTAssertEqual(ProjectStage.current(c), .done)
+    }
+    func testProjectsAreFoundOnceAndMissingOnesSaid() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("projects-\(UUID().uuidString)"), fm = FileManager.default
+        for n in ["A", "B", "not a set"] { try fm.createDirectory(at: root.appendingPathComponent(n), withIntermediateDirectories: true) }
+        try Data("{}".utf8).write(to: root.appendingPathComponent("A/\(SetManifest.fileName)"))
+        try Data("{}".utf8).write(to: root.appendingPathComponent("B/\(SetManifest.fileName)"))
+        let elsewhere = root.appendingPathComponent("gone").path
+        let found = ProjectIndex.find(recent: [root.appendingPathComponent("B").path, elsewhere], projectsFolder: root)
+        XCTAssertEqual(found.map { $0.folder.lastPathComponent }, ["B", "gone", "A"])     // recent first, each once
+        XCTAssertEqual(found.map(\.missing), [false, true, false])
+        XCTAssertEqual(ProjectIndex.freeName("A", in: root), "A 2")
+        XCTAssertEqual(ProjectIndex.freeName("New: Set/1", in: root), "New- Set-1")
+        XCTAssertNil(ProjectIndex.freeName("  ", in: root))
+        XCTAssertGreaterThan(ProjectIndex.size(root), 0)
+    }
+}

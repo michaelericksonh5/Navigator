@@ -17712,6 +17712,92 @@ public struct SetSession: Codable, Equatable, Sendable {
     public func sameEdit(as o: SetSession) -> Bool { var a = self, b = o; a.savedAt = .distantPast; b.savedAt = .distantPast; return a == b }
 }
 
+/// Where a GDD to Assets project stands, in the order the work is done (2026-10-05): the game, its look and output, the
+/// plan, the core art reviewed until approved, everything else drawn to match it, the lettering localized — then done.
+/// One rule for the Projects home, the editor's stage bar and its "Next" line.
+public enum ProjectStage: Int, CaseIterable, Comparable, Sendable {
+    case game, look, plan, core, rest, localize, done
+    public static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+    public var title: String {
+        switch self {
+        case .game: "Game"; case .look: "Look & output"; case .plan: "Plan"; case .core: "Core art"
+        case .rest: "Everything else"; case .localize: "Localize"; case .done: "Complete"
+        }
+    }
+    /// What a project has, counted. `coreToDraw`: core reel-area pieces not drawn yet; `restToDraw`, `localizeToDraw`:
+    /// the pieces of those phases not drawn yet (a flagged word is not one).
+    public struct Counts: Equatable, Sendable {
+        public var hasGame = false, hasTheme = false, planned = false
+        public var symbols = 0, symbolsDrawn = 0, coreToDraw = 0, coreTotal = 0, coreApproved = 0
+        public var restTotal = 0, restToDraw = 0, languages = 0, localizeTotal = 0, localizeToDraw = 0
+        public init() {}
+    }
+    /// The first stage with work left.
+    public static func current(_ c: Counts) -> ProjectStage {
+        if !c.hasGame { return .game }
+        if !c.hasTheme || !c.planned { return .look }
+        if c.symbolsDrawn == 0 { return .plan }
+        if c.symbolsDrawn < c.symbols || c.coreToDraw > 0 || c.coreApproved < c.coreTotal { return .core }
+        if c.restToDraw > 0 { return .rest }
+        if c.languages > 0 && c.localizeToDraw > 0 { return .localize }
+        return .done
+    }
+    /// Its stages that can be worked in yet: everything after the core waits for all of it to be approved.
+    public static func open(_ c: Counts) -> Set<ProjectStage> {
+        var s: Set<ProjectStage> = [.game, .look]
+        if c.planned { s.formUnion([.plan, .core]) }
+        if c.planned && c.symbolsDrawn > 0 && c.coreToDraw == 0 && c.coreApproved == c.coreTotal && c.coreTotal > 0 { s.formUnion([.rest, .localize, .done]) }
+        return s
+    }
+}
+
+/// Where a user's projects are: the ones opened lately (wherever they are) and every set in the projects folder, each
+/// once; a remembered one whose folder is gone, or in the Trash, is said to be missing so it can be found or let go.
+public enum ProjectIndex {
+    public static func isSet(_ folder: URL) -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: folder.appendingPathComponent(SetManifest.fileName).path)
+            || fm.fileExists(atPath: folder.appendingPathComponent(SetStore.folderName + "/" + SetManifest.fileName + ".previous").path)
+    }
+    public static func find(recent: [String], projectsFolder: URL?) -> [(folder: URL, missing: Bool)] {
+        var seen = Set<String>(), out: [(URL, Bool)] = []
+        func add(_ u: URL) {
+            let key = u.standardizedFileURL.path
+            guard seen.insert(key).inserted else { return }
+            out.append((u.standardizedFileURL, key.contains("/.Trash/") || !isSet(u)))
+        }
+        recent.forEach { add(URL(fileURLWithPath: $0)) }
+        if let p = projectsFolder {
+            let kids = (try? FileManager.default.contentsOfDirectory(at: p, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+            kids.filter(isSet).sorted { $0.lastPathComponent < $1.lastPathComponent }.forEach(add)
+        }
+        return out
+    }
+    /// What a folder takes on disk, in bytes.
+    public static func size(_ folder: URL) -> Int64 {
+        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+        guard let e = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: keys) else { return 0 }
+        var total: Int64 = 0
+        for case let u as URL in e {
+            let v = try? u.resourceValues(forKeys: Set(keys))
+            total += Int64(v?.totalFileAllocatedSize ?? v?.fileAllocatedSize ?? 0)
+        }
+        return total
+    }
+    /// A folder name made safe and not taken in `parent`: "Galactic Goddess", "Galactic Goddess 2"…
+    public static func freeName(_ name: String, in parent: URL, ext: String = "") -> String? {
+        let bad = CharacterSet(charactersIn: "/:\\").union(.newlines).union(.controlCharacters)
+        let base = name.components(separatedBy: bad).joined(separator: "-").trimmingCharacters(in: .whitespaces)
+        guard !base.isEmpty, !base.hasPrefix(".") else { return nil }
+        let fm = FileManager.default
+        for n in 1...999 {
+            let candidate = (n == 1 ? base : "\(base) \(n)") + (ext.isEmpty ? "" : "." + ext)
+            if !fm.fileExists(atPath: parent.appendingPathComponent(candidate).path) { return candidate }
+        }
+        return nil
+    }
+}
+
 /// A set's own files written so that a crash, a full disk or a bad write never costs work (2026-10-05): each written whole
 /// or not at all, the last good copy kept beside it, and a dated copy now and then, in the set's hidden `.navigator`
 /// folder. Read back from the newest good copy when the file itself is damaged; a damaged file is set aside, never
