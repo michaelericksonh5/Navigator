@@ -14672,3 +14672,20 @@ final class GameForgeSideColumnTests: XCTestCase {
         XCTAssertGreaterThan(p["btn"]!.y, p["bezel"]!.y + p["bezel"]!.h)                       // under the reels
     }
 }
+
+final class PickReadingTests: XCTestCase {
+    func testAPickBonusIsReadWithWhatItReveals() {
+        let gdd = "Features\nThe Lantern Pick Bonus is triggered by 3 bonus symbols.\nThe player picks from 12 lanterns. Matching 3 jackpots awards that jackpot: Grand, Major, Minor or Mini.\n\nFree Games\n10 free games."
+        let p = PickRules.read(gdd)
+        XCTAssertEqual(p.count, 1)
+        XCTAssertEqual(p.first?.name, "Lantern Pick Bonus")
+        XCTAssertEqual(p.first?.reveals.first, "JACKPOTS")
+        XCTAssertEqual(p.first?.options, 12); XCTAssertEqual(p.first?.ends, "match 3"); XCTAssertEqual(p.first?.objects, "lanterns")
+        // Several mentions are one bonus; a lower-case word before it is not its name.
+        let two = PickRules.read("A jackpot pick bonus. If the pick bonus ends, a whammy was found.\nThe player makes 3 picks.")
+        XCTAssertEqual(two.map(\.name), ["Pick Bonus"])
+        XCTAssertEqual(two.first?.ends, "whammy"); XCTAssertEqual(two.first?.picks, 3)
+        XCTAssertTrue(PickRules.read("This game has no pick bonus and no free games.").isEmpty)
+        XCTAssertTrue(PickRules.read("Pick your bet, then spin.").isEmpty)
+    }
+}

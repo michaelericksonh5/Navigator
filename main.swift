@@ -22017,6 +22017,27 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gameforge"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --gameforge-sheet-snapshot <set folder> <out.png>
+// The Game Forge export's options sheet, drawn off screen: to see it without opening a window.
+if let flag = CommandLine.arguments.firstIndex(of: "--gameforge-sheet-snapshot"), flag + 2 < CommandLine.arguments.count {
+    let args = CommandLine.arguments, folder = URL(fileURLWithPath: args[flag + 1]), out = URL(fileURLWithPath: args[flag + 2])
+    app.setActivationPolicy(.prohibited)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        let game = GDDToAssetsRun.reopen(folder, fetchTheme: false)?.gameName ?? folder.lastPathComponent
+        let w = NSWindow(contentRect: NSRect(x: -20000, y: -20000, width: 520, height: 420), styleMask: [.borderless], backing: .buffered, defer: false)
+        w.appearance = NSAppearance(named: .darkAqua)
+        w.backgroundColor = .windowBackgroundColor
+        let host = NSHostingView(rootView: GameForgeExportSheet(game: game, folder: folder) { _ in }.background(Color(nsColor: .windowBackgroundColor)))
+        w.contentView = host; w.setContentSize(host.fittingSize); w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard let v = w.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { exit(1) }
+            v.cacheDisplay(in: v.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: out); print("WROTE: \(out.path)"); exit(0)
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --legibility <set folder>
 // Every interface piece measured at the size a phone shows it (Legibility): glints, fine detail, edges and, for
 // lettering, whether it reads at an iPhone SE's size — against the limits measured on the studio's shipped art.
@@ -29544,6 +29565,7 @@ struct AssetBrowserView: View {
     @State private var working: String?
     @State private var queueRunning = false
     @State private var layerizeToo = true
+    @State private var gameForgeSheet = false
     @State private var dropping = false
     @State private var fingerprint = 0
     @State private var closeUp: URL?
@@ -29596,6 +29618,7 @@ struct AssetBrowserView: View {
             lightbox = startLightbox
         }
         .onChange(of: run.imagesVersion) { _, _ in reload() }
+        .sheet(isPresented: $gameForgeSheet) { GameForgeExportSheet(game: run.gameName, folder: folder) { exportGameForge($0) } }
         .onReceive(NotificationCenter.default.publisher(for: APIKeys.changed)) { _ in run.objectWillChange.send() }
         .onReceive(tick) { _ in if folderPrint() != fingerprint { reload() } }
         .onReceive(NotificationCenter.default.publisher(for: GDDReviewWindow.select)) { n in
@@ -30056,7 +30079,7 @@ struct AssetBrowserView: View {
                     if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
                 }
                 .disabled(ready.isEmpty)
-                Button("Game Forge Layout and Photoshop Files…") { exportGameForge() }
+                Button("Game Forge Layout and Photoshop Files…") { gameForgeSheet = true }
                     .disabled(run.reelLayout == nil || working != nil)
             }
             .fixedSize()
@@ -30085,12 +30108,12 @@ struct AssetBrowserView: View {
     }
 
     /// The set as Game Forge takes it (GameForgeExport), in the set's gameforge folder, in the background: free.
-    private func exportGameForge() {
+    private func exportGameForge(_ options: GameForgeExport.Options) {
         guard let layout = run.reelLayout else { return }
         let (jobs, game, folder) = (run.jobs, run.gameName, folder)
-        working = "Game Forge"; run.status = "Exporting for Game Forge — the layout, assets and two Photoshop files…"
+        working = "Game Forge"; run.status = "Exporting for Game Forge — every screen's layout, assets and Photoshop files (a minute or two)…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = GameForgeExport.run(folder: folder, layout: layout, jobs: jobs, game: game, options: .init())
+            let r = GameForgeExport.run(folder: folder, layout: layout, jobs: jobs, game: game, options: options)
             DispatchQueue.main.async {
                 working = nil
                 run.status = r.problems.isEmpty ? "Game Forge: layout, assets and Photoshop files in \(r.out.lastPathComponent)"
@@ -33328,6 +33351,53 @@ struct NavigatorFolderPicker: View {
 }
 
 // MARK: - Export for Game Forge
+
+/// What the Game Forge export is set to before it runs: the portrait box's height (722, the safe zone under the host's bars,
+/// as most of the platform's games have it; 844 without), the room the control bar takes in each box, and the game's folder
+/// name as its games/ folder is named. The heights are remembered; the folder is the set's.
+struct GameForgeExportSheet: View {
+    let game: String, folder: URL
+    let export: (GameForgeExport.Options) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("gameForgeDesignHeight") private var designHeight = 722.0
+    @AppStorage("gameForgeHUD") private var hud = 120.0
+    @AppStorage("gameForgeLandscapeHUD") private var landscapeHUD = 100.0
+    @State private var gameFolder = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Export for Game Forge").font(.title3.weight(.semibold))
+            Text("Every screen the game has — its reel modes, wheels, intro and events — as Game Forge's layout files and asset folder, with a layered Photoshop file of each screen and one of them all as artboards, in portrait and landscape. Nothing is drawn: it's free.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Form {
+                Picker("Portrait height", selection: $designHeight) {
+                    Text("722 — the safe zone under the host's bars").tag(722.0)
+                    Text("844 — the full screen").tag(844.0)
+                }
+                LabeledContent("Control bar, portrait") { Stepper("\(Int(hud)) px", value: $hud, in: 0...300, step: 10) }
+                LabeledContent("Control bar, landscape") { Stepper("\(Int(landscapeHUD)) px", value: $landscapeHUD, in: 0...300, step: 10) }
+                TextField("Game folder", text: $gameFolder, prompt: Text(GameForgeExport.folderName(game)))
+                    .help("As the game's folder in Game Forge's games/ is named: <id>_<Name>, e.g. 1234_LuckyLanterns.")
+            }
+            .formStyle(.grouped)
+            Text("Written to \(folder.lastPathComponent)/gameforge/").font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Export") {
+                    var o = GameForgeExport.Options()
+                    o.designHeight = designHeight; o.hud = hud; o.landscapeHUD = landscapeHUD
+                    let f = gameFolder.trimmingCharacters(in: .whitespaces)
+                    o.gameFolder = f.isEmpty ? nil : f
+                    dismiss(); export(o)
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+}
 
 /// A set handed to Game Forge, the studio's slot platform, as its build and layout editor take it: the asset folder
 /// (`assets/<game>/textures/portrait|landscape/en/…`, PNG at 3×), the layout files (GameForge.records) and a layered

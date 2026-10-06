@@ -8200,6 +8200,16 @@ public struct ReelLayout: Equatable, Codable, Sendable {
         public var segments: Int? = nil
     }
     public var wheels: [Wheel]? = nil
+    /// A pick bonus (28 of the 148 GDDs, 2026-10-06): its name as the document says it ("Jackpot Pick Game", "Snake Pick
+    /// Bonus"), what its picks reveal (JACKPOTS, BONUS GAMES, CREDITS, MULTIPLIER), how many objects there are and how
+    /// many the player picks when it says, what ends it ("match 3", "whammy", "lives"), and what is picked ("chests").
+    public struct Pick: Equatable, Codable, Sendable {
+        public var name: String
+        public var reveals: [String]
+        public var options: Int? = nil, picks: Int? = nil
+        public var ends: String? = nil, objects: String? = nil
+    }
+    public var picks: [Pick]? = nil
     /// Award events the document has beyond the usual ones: "one more chance".
     public var awards: [String]? = nil
     /// The pieces Gemini found the game needs that no dedicated generator makes (ConceptPlan): meters,
@@ -8245,7 +8255,10 @@ public struct ReelLayout: Equatable, Codable, Sendable {
             .map { "\($0.key): " + $0.value.map { e in
                 (e.count.map { "\($0) " } ?? "") + e.what + ((e.count ?? 1) > 1 && !e.what.hasSuffix("s") ? "s" : "") + (e.rows.map { " \($0)×\(e.reels ?? 0)" } ?? "")
             }.joined(separator: ", ") }
-        return (parts + places).joined(separator: " · ")
+        let pickParts = (picks ?? []).map { p in
+            "\(p.name): " + ([p.reveals.joined(separator: "/").lowercased()] + [p.picks.map { "pick \($0)" }, p.options.map { "of \($0)" }, p.ends, p.objects].compactMap { $0 }).joined(separator: ", ")
+        }
+        return (parts + places + pickParts).joined(separator: " · ")
     }
 }
 
@@ -8536,6 +8549,8 @@ public enum ReelLayoutRules {
             out.wheels = wheelText.keys.sorted { a, b in a.hasPrefix("Bonus") == b.hasPrefix("Bonus") ? a < b : !a.hasPrefix("Bonus") }
                 .map { WheelRules.wheel(named: $0, text: wheelText[$0]!) }
         }
+        let picks = PickRules.read(gdd)
+        if !picks.isEmpty { out.picks = picks }
         if gdd.lowercased().contains("one more chance") { out.awards = ["one more chance"] }
         if let pots = out.extras.first(where: { $0.what == "pots" }), (pots.count ?? 0) > 1 { out.potFeatures = PotStates.features(gdd, count: pots.count!) }
         if out.extras.contains(where: { $0.what == "pots" }) {
@@ -10831,6 +10846,57 @@ public struct GameSheet: Equatable, Codable, Sendable {
 /// credit amounts to a number font. "Free" is never lettered: production says bonus games.
 extension Array {
     var nilIfEmpty: [Element]? { isEmpty ? nil : self }
+}
+
+/// Reading a GDD's pick bonuses (ReelLayout.Pick). A pick bonus is named where the document says one ("Pick Bonus", "Jackpot
+/// Pick Game", "pick screen", "Pick-a-Prize", "pick 'em") and not denied ("no pick bonus"); what it is comes from the passage
+/// after each mention, up to the next heading-like line.
+public enum PickRules {
+    static let mention = try! NSRegularExpression(pattern: #"((?:\b[A-Z][\w'’]+ ){0,2})\b(?i:pick(?:[- ]a[- ]prize|[- ]?['’]?em|(?: bonus| game| feature| screen)+))\b"#)
+    static let numbers = ["one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                          "twelve": 12, "fifteen": 15, "sixteen": 16, "eighteen": 18, "twenty": 20]
+    static let objects = ["chests", "cards", "coins", "eggs", "gems", "tiles", "doors", "bags", "boxes", "pots", "bottles", "crates", "safes",
+                          "shields", "scrolls", "envelopes", "barrels", "orbs", "lanterns", "stars", "balloons", "presents", "gifts", "jewels"]
+
+    /// Words that open a sentence or describe, never a pick bonus's name.
+    static let notNames: Set<String> = ["the", "a", "an", "this", "that", "each", "and", "or", "with", "of", "in", "to", "from", "for", "if", "when",
+                                         "every", "any", "added", "trigger", "triggers", "version", "basic", "features", "gather", "earned", "cumulative",
+                                         "tiered", "our", "its", "their", "new", "game", "bonus", "s", "user", "selected", "main"]
+
+    /// The document's pick bonus, its mentions taken together (a game has one); [] when it has none.
+    public static func read(_ gdd: String) -> [ReelLayout.Pick] {
+        let ns = gdd as NSString
+        var names: [String: Int] = [:], text = "", screen = false
+        for m in mention.matches(in: gdd, range: NSRange(location: 0, length: ns.length)) {
+            guard let r = Range(m.range, in: gdd), !GDDScenes.isNegated(gdd, at: r) else { continue }
+            if let w = ns.substring(with: m.range(at: 1)).split(separator: " ").last.map(String.init), !notNames.contains(w.lowercased()), w.count > 2 { names[w, default: 0] += 1 }
+            if ns.substring(with: m.range).lowercased().contains("screen") { screen = true }
+            // What is said of it: its own paragraph, to the next blank line.
+            let after = String(gdd[r.upperBound...].prefix(700))
+            text += " " + ns.substring(with: m.range) + " " + (after.components(separatedBy: "\n\n").first ?? after)
+        }
+        guard !text.isEmpty else { return [] }
+        let t = text.lowercased()
+        var reveals: [String] = []
+        if t.range(of: #"\bjackpots?\b|\bgrand\b|\bmajor\b"#, options: .regularExpression) != nil { reveals.append("JACKPOTS") }
+        if t.range(of: #"\bfree (games|spins)\b|\bbonus games\b"#, options: .regularExpression) != nil { reveals.append("BONUS GAMES") }
+        if t.contains("multiplier") { reveals.append("MULTIPLIER") }
+        if t.range(of: #"\bcredits?\b|\bcash\b|\bprizes?\b|\bvalues?\b"#, options: .regularExpression) != nil || reveals.isEmpty { reveals.append("CREDITS") }
+        func count(_ pattern: String) -> Int? {
+            guard let re = try? NSRegularExpression(pattern: pattern), let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)),
+                  let r = Range(m.range(at: 1), in: t) else { return nil }
+            return numbers[String(t[r])] ?? Int(t[r])
+        }
+        let num = #"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|twelve|fifteen|sixteen|eighteen|twenty)"#
+        let picks = count(#"\bpick[- ]\#(num)\b"#) ?? count(#"\bmakes? \#(num) picks?\b"#) ?? count(#"\b\#(num) picks\b"#)
+        let options = count(#"\b\#(num) (?:\w+ ){0,2}(?:pick options|options|objects|items|"# + objects.joined(separator: "|") + #")\b"#)
+        let ends = t.range(of: #"match(es|ing)? (3|three)"#, options: .regularExpression) != nil ? "match 3"
+            : t.range(of: #"whammy|until (a|an|the) (collect|end|stop)"#, options: .regularExpression) != nil ? "whammy"
+            : t.range(of: #"\blives\b"#, options: .regularExpression) != nil ? "lives" : nil
+        let object = objects.first { t.range(of: "\\b\($0)\\b", options: .regularExpression) != nil }
+        let name = names.max { $0.value == $1.value ? $0.key > $1.key : $0.value < $1.value }?.key
+        return [ReelLayout.Pick(name: (name.map { $0 + " " } ?? "") + (screen ? "Pick Screen" : "Pick Bonus"), reveals: reveals, options: options, picks: picks, ends: ends, objects: object)]
+    }
 }
 
 public enum WheelRules {
