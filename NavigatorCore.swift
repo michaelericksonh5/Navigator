@@ -17735,8 +17735,8 @@ public enum ProjectStage: Int, CaseIterable, Comparable, Sendable {
     /// The first stage with work left.
     public static func current(_ c: Counts) -> ProjectStage {
         if !c.hasGame { return .game }
-        if !c.hasTheme || !c.planned { return .look }
-        if c.symbolsDrawn == 0 { return .plan }
+        if !c.hasTheme { return .look }
+        if !c.planned || c.symbolsDrawn == 0 { return .plan }
         if c.symbolsDrawn < c.symbols || c.coreToDraw > 0 || c.coreApproved < c.coreTotal { return .core }
         if c.restToDraw > 0 { return .rest }
         if c.languages > 0 && c.localizeToDraw > 0 { return .localize }
@@ -17745,7 +17745,8 @@ public enum ProjectStage: Int, CaseIterable, Comparable, Sendable {
     /// Its stages that can be worked in yet: everything after the core waits for all of it to be approved.
     public static func open(_ c: Counts) -> Set<ProjectStage> {
         var s: Set<ProjectStage> = [.game, .look]
-        if c.planned { s.formUnion([.plan, .core]) }
+        if c.hasGame { s.insert(.plan) }          // where the set is designed
+        if c.planned { s.insert(.core) }
         if c.planned && c.symbolsDrawn > 0 && c.coreToDraw == 0 && c.coreApproved == c.coreTotal && c.coreTotal > 0 { s.formUnion([.rest, .localize, .done]) }
         return s
     }

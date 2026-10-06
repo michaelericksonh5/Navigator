@@ -14139,6 +14139,8 @@ final class ProjectTests: XCTestCase {
         var c = ProjectStage.Counts()
         XCTAssertEqual(ProjectStage.current(c), .game)
         c.hasGame = true; XCTAssertEqual(ProjectStage.current(c), .look)
+        XCTAssertTrue(ProjectStage.open(c).contains(.plan)); XCTAssertFalse(ProjectStage.open(c).contains(.core))
+        c.hasTheme = true; XCTAssertEqual(ProjectStage.current(c), .plan)          // designed on the Plan page
         c.hasTheme = true; c.planned = true; c.symbols = 21; XCTAssertEqual(ProjectStage.current(c), .plan)
         c.symbolsDrawn = 21; c.coreToDraw = 3; XCTAssertEqual(ProjectStage.current(c), .core)
         XCTAssertFalse(ProjectStage.open(c).contains(.rest))

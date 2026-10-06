@@ -30217,6 +30217,9 @@ struct GameSheetEditor: View {
 }
 
 struct GDDToAssetsSheet: View {
+    /// The stage shown, and what the project has, counted (refreshed a moment after the run changes).
+    @State private var stage: ProjectStage = .game
+    @State private var counts = ProjectStage.Counts()
     // Owned by the window, not the view, so the window's own close button can ask the
     // same question the Close button asks. A paid batch must not be able to slip
     // behind a closed window where nobody can see it, stop it, or learn what it spent.
@@ -30392,33 +30395,46 @@ struct GDDToAssetsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-          ScrollViewReader { jump in
-            stepBar(jump)
+            stageBar
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    step(1, fromDocument ? "Game design document" : "Symbols this game needs") {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Picker("", selection: $fromDocument) {
-                                Text("Read a GDD").tag(true)
-                                Text("No GDD yet — type the set").tag(false)
+                    nextLine
+                    switch stage {
+                    case .game:
+                        step(fromDocument ? "Game design document" : "Symbols this game needs") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Picker("", selection: $fromDocument) {
+                                    Text("Read a GDD").tag(true)
+                                    Text("No GDD yet — type the set").tag(false)
+                                }
+                                .pickerStyle(.segmented).frame(width: 340)
+                                .disabled(run.busy || run.running)
+                                .onAppear { if startTyped { fromDocument = false } }
+                                if fromDocument { gddStep } else { manualStep }
+                                // Shown before a document is picked too: it is the artist's choice,
+                                // not the document's, and loading a document keeps it.
+                                lowPayRow
                             }
-                            .pickerStyle(.segmented).frame(width: 340)
-                            .disabled(run.busy || run.running)
-                            .onAppear { if startTyped { fromDocument = false } }
-                            if fromDocument { gddStep } else { manualStep }
-                            // Shown before a document is picked too: it is the artist's choice,
-                            // not the document's, and loading a document keeps it.
-                            lowPayRow
                         }
+                    case .look:
+                        step("Theme and art direction") { themeStep }
+                        step("Where it goes, and how big") { outputStep }
+                        step("Frames") { frameSection }
+                    case .plan:
+                        step("The asset plan") { if run.jobs.isEmpty { Text("The plan comes from the game's symbols: pick its document, or type them, on the Game page.").foregroundStyle(.secondary) } else { planStep } }
+                    case .core:
+                        step("Core art") { coreStage }
+                    case .rest:
+                        step("Everything else") { restStage }
+                    case .localize, .done:
+                        step("Localize") { localizeStage }
                     }
-                    step(2, "Theme and art direction") { themeStep }
-                    step(3, "Where it goes, and how big") { outputStep }
-                    if !run.jobs.isEmpty { step(4, "The asset plan") { planStep } }
                 }
                 .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-          }
+            .id(stage)
             Divider()
             footer
         }
@@ -30438,7 +30454,15 @@ struct GDDToAssetsSheet: View {
             } else if let f = gddFolder { entries = GDDLibrary.entries(in: f) }
             if let s = restore { putBack(s) }
             loadThemes()
+            // A project opens where its work is; a new one at its start.
+            refreshCounts()
+            if run.lastFolder != nil { let cur = ProjectStage.current(counts); stage = cur == .done ? .localize : cur }
+            // Test runs only (snapshots): NAVIGATOR_STAGE=core opens on that stage.
+            if PaidCalls.disabled, let n = ProcessInfo.processInfo.environment["NAVIGATOR_STAGE"],
+               let st = ProjectStage.allCases.first(where: { "\($0)" == n }) { stage = st }
         }
+        .onReceive(run.objectWillChange.debounce(for: .milliseconds(500), scheduler: RunLoop.main)) { _ in refreshCounts() }
+        .onChange(of: pickedTheme?.name) { refreshCounts() }
         // Saved as it goes, a moment after each change, once the set has its folder: the editor and the plan.
         .onChange(of: currentSession) { _, s in save(s) }
         // The set's folder made as soon as there is a plan — so the plan, paid for, is saved and opens again — or as soon as
@@ -30476,17 +30500,13 @@ struct GDDToAssetsSheet: View {
         }
     }
 
+    /// A section of a stage's page: its heading, then its controls.
     @ViewBuilder
-    private func step<C: View>(_ n: Int, _ title: String, @ViewBuilder _ content: () -> C) -> some View {
+    private func step<C: View>(_ title: String, @ViewBuilder _ content: () -> C) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text("\(n)").font(.caption.bold()).foregroundColor(.white)
-                    .frame(width: 18, height: 18).background(Circle().fill(Color.accentColor))
-                Text(title).font(.headline)
-            }
-            content().padding(.leading, 26)
+            Text(title).font(.headline)
+            content().padding(.leading, 12)
         }
-        .id("step\(n)")
     }
 
     /// The set's folder for a plan that has none, in the chosen place; an empty one moved when the place changes.
@@ -30532,7 +30552,8 @@ struct GDDToAssetsSheet: View {
     /// A saved set's editor put back as it was left — nothing read again, nothing redesigned, nothing paid.
     private func putBack(_ s: SetSession) {
         restoring = true
-        fromDocument = s.fromDocument
+        // A typed set saved before sessions were: its manifest says it was typed.
+        fromDocument = s.fromDocument && !run.typed
         if let f = s.gddFolder {
             gddFolder = URL(fileURLWithPath: f)
             entries = GDDLibrary.entries(in: gddFolder!)
@@ -30555,33 +30576,179 @@ struct GDDToAssetsSheet: View {
         DispatchQueue.main.async { restoring = false }
     }
 
-    /// The four steps as tabs along the top — each a click away however long the page — with where the set stands,
-    /// and the asset browser.
-    private func stepBar(_ jump: ScrollViewProxy) -> some View {
-        let made = run.lastFolder.map { f in run.jobs.filter { FileManager.default.fileExists(atPath: f.appendingPathComponent($0.filename).path) }.count } ?? 0
-        let steps: [(Int, String, Bool)] = [(1, fromDocument ? "Document" : "Symbols", run.jobs.isEmpty == false),
-                                            (2, "Theme", run.theme != nil), (3, "Output & interface", run.lastFolder != nil),
-                                            (4, run.jobs.isEmpty ? "Plan" : "Plan · \(made) of \(run.jobs.count) made", made == run.jobs.count && made > 0)]
+    /// The project's stages along the top, in the order the work is done, each with where it stands: done (✓), the one
+    /// with work left now, or waiting (🔒) — everything after the core waits for all of it to be approved. Projects, and
+    /// whether the project is saved.
+    private var stageBar: some View {
+        let cur = ProjectStage.current(counts), open = ProjectStage.open(counts)
         return HStack(spacing: 6) {
-            ForEach(steps, id: \.0) { s in
-                Button { withAnimation { jump.scrollTo("step\(s.0)", anchor: .top) } } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: s.2 ? "checkmark.circle.fill" : "\(s.0).circle").foregroundStyle(s.2 ? Color.green : Color.accentColor)
-                        Text(s.1)
+            Button { ProjectsWindow.open() } label: { Label("Projects", systemImage: "square.stack") }
+                .help("Every project: carry on with another, start a new one, or tidy up finished ones")
+            Divider().frame(height: 18).padding(.horizontal, 4)
+            ForEach([ProjectStage.game, .look, .plan, .core, .rest, .localize], id: \.self) { s in
+                let done = s < cur || cur == .done, locked = !open.contains(s)
+                Button { stage = s } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: done ? "checkmark.circle.fill" : locked ? "lock.fill" : s == cur ? "circle.inset.filled" : "circle")
+                            .foregroundStyle(done ? Color.green : locked ? Color.secondary : Color.accentColor)
+                        Text(stageLabel(s)).foregroundStyle(locked ? Color.secondary : Color.primary)
                     }
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                    .padding(.horizontal, 9).padding(.vertical, 5)
+                    .background(Capsule().fill(stage == s || (s == .localize && stage == .done) ? Color.accentColor.opacity(0.28) : Color.secondary.opacity(0.12)))
                 }
                 .buttonStyle(.plain)
-                .disabled(s.0 == 4 && run.jobs.isEmpty)
+                .help(locked ? "Waits until every core picture is approved — you can look, not make yet." : s.title)
             }
             Spacer()
-            if let folder = run.lastFolder {
-                Button { GDDReviewWindow.open(run: run, folder: folder) } label: { Label("Assets", systemImage: "square.grid.3x3.square") }
-                    .help("Every picture of the set as a grid or close up — approve, change, replace or restore any of them")
-            }
+            saveBadge
         }
         .padding(.horizontal, 16).padding(.vertical, 8)
+    }
+    private func stageLabel(_ s: ProjectStage) -> String {
+        let c = counts
+        switch s {
+        case .plan: return c.symbols > 0 ? "Plan · \(c.symbols)" : "Plan"
+        case .core: return c.coreTotal > 0 ? "Core art · \(c.coreApproved)/\(c.coreTotal)" : "Core art"
+        case .rest: return c.restTotal > 0 ? "Everything else · \(c.restTotal - c.restToDraw)/\(c.restTotal)" : "Everything else"
+        case .localize: return c.languages > 0 ? "Localize · \(c.languages)" : "Localize"
+        default: return s.title
+        }
+    }
+    /// Saved, when; not saved yet (a project is saved from its plan on); or why the last save failed.
+    @ViewBuilder private var saveBadge: some View {
+        if let e = run.saveError {
+            Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange).lineLimit(1).help(e)
+        } else if run.lastFolder == nil {
+            Label("Saved once its plan is ready", systemImage: "circle.dashed").font(.caption).foregroundStyle(.secondary)
+                .help("A project gets its own folder, and is saved as it goes, as soon as its plan is designed.")
+        } else {
+            Label(run.savedAt.map { "Saved " + $0.formatted(date: .omitted, time: .shortened) } ?? "Saved", systemImage: "checkmark.icloud")
+                .font(.caption).foregroundStyle(.secondary)
+                .help("Saved in \(run.lastFolder?.path ?? "") as it goes, with backups in its .navigator folder.")
+        }
+    }
+    private func refreshCounts() {
+        var c = run.counts()
+        c.hasTheme = c.hasTheme || pickedTheme != nil
+        if c != counts { counts = c }
+    }
+
+    /// What to do next, wherever the project stands, with the button that does it — and a way to its stage.
+    private var nextLine: some View {
+        let cur = ProjectStage.current(counts), next = nextStep
+        return HStack(spacing: 10) {
+            Image(systemName: cur == .done ? "checkmark.seal.fill" : "arrow.right.circle.fill").foregroundStyle(cur == .done ? Color.green : Color.accentColor)
+            Text((cur == .done ? "" : "Next — ") + next.text).fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            if stage != cur && !(cur == .done && stage == .localize) { Button("Go to \(cur == .done ? "Localize" : cur.title)") { stage = cur == .done ? .localize : cur } }
+            if let a = next.action { Button(a.label, action: a.run).buttonStyle(.borderedProminent).disabled(run.busy || run.running || run.keying) }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
+    }
+    private var nextStep: (text: String, action: (label: String, run: () -> Void)?) {
+        let c = counts
+        let assets: (label: String, run: () -> Void)? = run.lastFolder.map { f in ("Open Assets", { GDDReviewWindow.open(run: run, folder: f) }) }
+        switch ProjectStage.current(c) {
+        case .game: return (fromDocument ? "pick the game's design document, or type its symbols." : "type the game's symbols and structure.", nil)
+        case .look: return ("pick a theme, and check where the set goes and how big.", nil)
+        case .plan:
+            if !c.planned { return ("design the set: Gemini plans every symbol from the document and the theme.", ("Design the Set", { run.designSet() })) }
+            return ("check the plan, then generate the symbols.", ("Generate…", { startGenerate() }))
+        case .core:
+            if c.symbolsDrawn < c.symbols { return ("generate the other \(c.symbols - c.symbolsDrawn) symbol\(c.symbols - c.symbolsDrawn == 1 ? "" : "s").", ("Generate…", { startGenerate() })) }
+            if c.coreToDraw > 0 { return ("draw the reel area's core pieces — bezel, reel texture and pots.", ("1 · Core Pieces…", { run.makeReelArea(phase: .core) })) }
+            let left = c.coreTotal - c.coreApproved
+            return ("approve \(left) more core picture\(left == 1 ? "" : "s") in Assets — everything else is drawn to match them.", assets)
+        case .rest: return ("draw everything else to match the approved core: \(c.restToDraw) piece\(c.restToDraw == 1 ? "" : "s").", ("2 · Everything Else…", { run.makeReelArea(phase: .rest) }))
+        case .localize: return ("letter \(c.localizeToDraw) piece\(c.localizeToDraw == 1 ? "" : "s") in \(run.languages.map(Localized.languageName).joined(separator: ", ")).", ("3 · Localize…", { run.makeReelArea(phase: .localize) }))
+        case .done: return (c.languages > 0 ? "Everything is made, approved and localized." : "Everything is made and approved. Choose languages below to localize its lettering, or hand the set on.", assets)
+        }
+    }
+
+    // MARK: Stages 6–8 — the game interface
+
+    private var interfaceReady: Bool { run.lastFolder != nil && OpenAIImages.available && !run.keying && run.reelLayout != nil }
+    /// Said on a stage that waits for the core: how far the core is, and where to approve it.
+    @ViewBuilder private var waitsForCore: some View {
+        if !ProjectStage.open(counts).contains(stage) {
+            HStack(spacing: 8) {
+                Image(systemName: "lock.fill").foregroundStyle(.secondary)
+                Text("Made once every core picture is approved: \(counts.coreApproved) of \(counts.coreTotal) are." + (counts.coreTotal == 0 ? " Draw the core art first." : ""))
+                if let f = run.lastFolder { Button("Open Assets") { GDDReviewWindow.open(run: run, folder: f) } }
+            }
+            .font(.callout).foregroundStyle(.secondary)
+        }
+    }
+    private func countLine(_ title: String, _ done: Int, _ total: Int, _ note: String = "") -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: total > 0 && done == total ? "checkmark.circle.fill" : "circle.dotted").foregroundStyle(total > 0 && done == total ? Color.green : Color.secondary)
+            Text(title).bold()
+            Text(total == 0 ? "none yet" : "\(done) of \(total)" + note).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder private var coreStage: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("The symbols, their frames and backgrounds (Generate, below), and the reel area's bezel, reel texture and pots — reviewed in Assets until every one is approved. Everything else is drawn to match them.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            countLine("Symbols, frames and backgrounds", counts.symbolsDrawn, counts.symbols, " drawn")
+            HStack(spacing: 6) {
+                Text("Reels").bold()
+                Text(run.reelLayout?.summary ?? "not set — the document gives no reel size: set the structure below").foregroundColor(run.reelLayout == nil ? .orange : .secondary)
+            }
+            HStack(spacing: 8) {
+                Button("1 · Core Pieces…") { run.makeReelArea(phase: .core) }
+                    .disabled(!interfaceReady)
+                    .help("For every grid the bezel, dividers, reel texture and reel fade as layers, and the pots in their six states. Only what isn't made yet is drawn; GPT Image 2.5, about $0.07–0.15 a piece.")
+                Menu("Make Again") { ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } } }
+                    .fixedSize().disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
+                    .help("Draw one piece again; the current files are kept in the set's versions folder. To change one picture, open it in Assets.")
+                if let f = run.lastFolder { Button("Open Assets") { GDDReviewWindow.open(run: run, folder: f) } }
+            }
+            countLine("Approved", counts.coreApproved, counts.coreTotal)
+            if !OpenAIImages.available { OpenAIKeyNote() }
+            ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
+            structureEditor
+        }
+    }
+
+    @ViewBuilder private var restStage: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("The jackpot table, pot plaques, wheels, pop-ups and celebrations, number fonts, the specials' win states, landscape backgrounds, the logo and key art, feature cards, Power Bet and tutorial pieces, and the lobby and loading pictures — drawn to match the approved core, each reviewed in Assets.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            waitsForCore
+            HStack(spacing: 8) {
+                Button("2 · Everything Else…") { run.makeReelArea(phase: .rest) }
+                    .disabled(!interfaceReady || !ProjectStage.open(counts).contains(.rest))
+                countLine("Made", counts.restTotal - counts.restToDraw, counts.restTotal)
+            }
+            if !OpenAIImages.available { OpenAIKeyNote() }
+            assetChecklist
+        }
+    }
+
+    @ViewBuilder private var localizeStage: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Every lettered piece in the languages chosen, each word as the localization team's dictionaries give it. A word with no approved translation is flagged and listed for them, never drawn or guessed.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            waitsForCore
+            HStack(spacing: 8) {
+                LanguagePicker(selection: $run.languages)
+                Text(run.languages.isEmpty ? "None chosen — the set is complete without." : run.languages.map(Localized.languageName).joined(separator: ", "))
+                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
+            }
+            HStack(spacing: 8) {
+                Button("3 · Localize…") { run.makeReelArea(phase: .localize) }
+                    .disabled(!interfaceReady || run.languages.isEmpty || !ProjectStage.open(counts).contains(.localize))
+                if !run.languages.isEmpty { countLine("Lettered", counts.localizeTotal - counts.localizeToDraw, counts.localizeTotal) }
+                if let f = run.lastFolder, FileManager.default.fileExists(atPath: f.appendingPathComponent("localization-missing.txt").path) {
+                    Button("Missing Words") { NSWorkspace.shared.open(f.appendingPathComponent("localization-missing.txt")) }
+                        .help("The words with no approved translation, with their languages and pieces — for the localization team.")
+                }
+            }
+            if !OpenAIImages.available { OpenAIKeyNote() }
+        }
     }
 
     // MARK: Step 1 — the GDD
@@ -31159,15 +31326,26 @@ struct GDDToAssetsSheet: View {
 
     @ViewBuilder private var outputStep: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(outParent?.path ?? "No folder chosen")
-                    .lineLimit(1).truncationMode(.middle)
-                    .foregroundColor(outParent == nil ? .secondary : .primary)
-                Button("Choose…") { chooseOutFolder() }
-            }
-            if outParent != nil {
-                Text("Navigator makes a folder in there for this run: “\(runFolderName)”.")
+            if let f = run.lastFolder {
+                // A project has its folder from its plan on: said, not chosen again (rename or move it from Projects).
+                HStack {
+                    Text("Saved in").foregroundColor(.secondary)
+                    Text(f.path).lineLimit(1).truncationMode(.middle)
+                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([f]) }
+                }
+                Text("Saved as it goes, with backups in its .navigator folder. Rename, archive or move it to the Trash from Projects.")
                     .font(.caption).foregroundColor(.secondary)
+            } else {
+                HStack {
+                    Text(outParent?.path ?? "No folder chosen")
+                        .lineLimit(1).truncationMode(.middle)
+                        .foregroundColor(outParent == nil ? .secondary : .primary)
+                    Button("Choose…") { chooseOutFolder() }
+                }
+                if outParent != nil {
+                    Text("The project gets its own folder in there, “\(runFolderName)”, as soon as its plan is ready.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
             }
             HStack(spacing: 22) {
                 Picker("Model", selection: $run.modelFlag) {
@@ -31212,75 +31390,12 @@ struct GDDToAssetsSheet: View {
             Text(backgroundNote)
                 .font(.caption).foregroundColor(backgroundCovers ? .secondary : .orange)
                 .fixedSize(horizontal: false, vertical: true)
-            if !run.symbols.isEmpty || !run.jobs.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text("Reels").bold()
-                        Text(run.reelLayout?.summary ?? "not set — the document gives no reel size").foregroundColor(run.reelLayout == nil ? .orange : .secondary)
-                        let ready = run.lastFolder == nil || !OpenAIImages.available || run.keying || run.reelLayout == nil
-                        Button("1 · Core Pieces…") { run.makeReelArea(phase: .core) }
-                            .disabled(ready)
-                            .help("The core of the reel area, with the symbols and backgrounds Generate makes: for every grid the bezel, dividers, reel texture and reel fade as layers, and the pots in their six states. Review them in Assets until every one is approved. Only what isn't made yet is drawn; GPT Image 2.5, about $0.07–0.15 a piece.")
-                        Button("2 · Everything Else…") { run.makeReelArea(phase: .rest) }
-                            .disabled(ready)
-                            .help("Once every core picture is approved: the jackpot table, pot plaques, wheels, pop-ups and celebrations, number fonts, the specials' win states, landscape backgrounds, the logo, key art, feature cards, Power Bet and tutorial pieces, and the lobby and loading pictures — drawn to match the core.")
-                        Button("3 · Localize…") { run.makeReelArea(phase: .localize) }
-                            .disabled(ready || run.languages.isEmpty)
-                            .help(run.languages.isEmpty ? "Choose the languages first (Languages…, below)." : "Every lettered piece — pop-up titles and buttons, feature cards, Power Bet and tutorial pieces, pot plaques, the jackpot table, wheel wedges and the intro's CONTINUE — in \(run.languages.count) language\(run.languages.count == 1 ? "" : "s"), each word as the localization team's dictionaries give it. A word with no approved translation is flagged and listed, not drawn.")
-                        Menu("Make Again") {
-                            ForEach(GDDToAssetsRun.reelPieces.map(\.name), id: \.self) { n in Button(n) { run.makeReelArea(redo: n) } }
-                        }
-                        .fixedSize()
-                        .disabled(run.lastFolder == nil || !OpenAIImages.available || run.keying)
-                        .help("Draw one piece again — the bezel (every mode's follows the base's), the reel texture, the jackpot table, the pots, the wheels, or the pop-ups. The current files are kept in the set's versions folder. About $0.07–0.15 a piece; the bezel can take two tries. To change one picture, open it in the asset browser (View).")
-                        if let folder = run.lastFolder {
-                            Button("View") { GDDReviewWindow.open(run: run, folder: folder) }
-                                .help("The game interface, piece by piece, in the asset browser — each pot's six states side by side")
-                        }
-                    }
-                    if let folder = run.lastFolder {
-                        let core = run.coreApproval(folder)
-                        Text(core.total == 0 ? "Core: nothing made yet." : core.left.isEmpty ? "Core: all \(core.total) approved — everything else can be made."
-                             : "Core: \(core.total - core.left.count) of \(core.total) approved — everything else waits until all are (approve them in Assets).")
-                            .font(.caption).foregroundColor(core.left.isEmpty && core.total > 0 ? .green : .secondary)
-                            .id(run.review.approvedCount(in: core.left) + run.imagesVersion)
-                    }
-                    if !OpenAIImages.available { OpenAIKeyNote() }
-                    HStack(spacing: 8) {
-                        LanguagePicker(selection: $run.languages)
-                        Text(run.languages.isEmpty ? "Phase 3 letters the game's pieces in the languages chosen here."
-                             : "Localize into " + run.languages.map(Localized.languageName).joined(separator: ", ") + ".")
-                            .font(.caption).foregroundColor(.secondary).lineLimit(2)
-                    }
-                    ForEach(run.reelLayout?.notes ?? [], id: \.self) { Text($0).font(.caption).foregroundColor(.orange) }
-                    assetChecklist
-                    if fromDocument {
-                        // The reading of a GDD, set right by hand — or the structure it never gives.
-                        DisclosureGroup(run.reelLayout == nil ? "Set the game's structure" : "Correct the game's structure", isExpanded: $correctingStructure) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                GameSheetEditor(sheet: $sheet, jackpots: run.symbols.filter { $0.role == .jackpot }.count)
-                                HStack {
-                                    Button("Use This Structure") { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect); structureEdited = false }
-                                        .help("Replaces what was read from the document: the reels, bonus grid, extras, jackpot table and names, pots, wheels, awards and tutorial the game interface is made from.")
-                                    if structureEdited { Text("Not used yet").font(.caption).foregroundStyle(.orange) }
-                                }
-                            }
-                        }
-                        .font(.callout)
-                        .onChange(of: sheet) { if correctingStructure { structureEdited = true } }
-                        // Seeded from what the run holds — the reading, the jackpots' names, the tutorial — but never over edits not used yet.
-                        .onChange(of: correctingStructure) {
-                            guard correctingStructure, !structureEdited else { return }
-                            var s = run.reelLayout.map { GameSheet(layout: $0, bonusSymbols: run.symbols.filter { $0.role == .bonus }.count) } ?? GameSheet()
-                            s.jackpotNames = run.jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
-                                .map { (GDDAssetPrompts.letteredWord($0) ?? $0.title).capitalized }.joined(separator: ", ")
-                            s.tutorial = run.gddText.lowercased().contains("tutorial")
-                            sheet = s
-                            DispatchQueue.main.async { structureEdited = false }
-                        }
-                    }
-                }
-            }
+        }
+    }
+
+    /// How the frames are built and drawn, and what happens after generating.
+    @ViewBuilder private var frameSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Text("Frames built")
@@ -31349,6 +31464,35 @@ struct GDDToAssetsSheet: View {
                         + "(%d in this set), more if a split needs repairing. Card royals have no frame and are skipped.",
                         LayerizePlanRules.estimatePerSymbol, run.layerizeEstimate(for: nil).symbols)
                         : "Layerize runs on fal.ai. Add a key in AI ▸ API Keys… to use it; everything else works without one.")
+            }
+        }
+    }
+
+    /// The game's structure as read from its document, set right by hand — or the structure it never gives.
+    @ViewBuilder private var structureEditor: some View {
+        if fromDocument {
+            // The reading of a GDD, set right by hand — or the structure it never gives.
+            DisclosureGroup(run.reelLayout == nil ? "Set the game's structure" : "Correct the game's structure", isExpanded: $correctingStructure) {
+                VStack(alignment: .leading, spacing: 6) {
+                    GameSheetEditor(sheet: $sheet, jackpots: run.symbols.filter { $0.role == .jackpot }.count)
+                    HStack {
+                        Button("Use This Structure") { run.applySheet(sheet, backgroundSize: backgroundSize, backgroundAspect: backgroundAspect); structureEdited = false }
+                            .help("Replaces what was read from the document: the reels, bonus grid, extras, jackpot table and names, pots, wheels, awards and tutorial the game interface is made from.")
+                        if structureEdited { Text("Not used yet").font(.caption).foregroundStyle(.orange) }
+                    }
+                }
+            }
+            .font(.callout)
+            .onChange(of: sheet) { if correctingStructure { structureEdited = true } }
+            // Seeded from what the run holds — the reading, the jackpots' names, the tutorial — but never over edits not used yet.
+            .onChange(of: correctingStructure) {
+                guard correctingStructure, !structureEdited else { return }
+                var s = run.reelLayout.map { GameSheet(layout: $0, bonusSymbols: run.symbols.filter { $0.role == .bonus }.count) } ?? GameSheet()
+                s.jackpotNames = run.jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
+                    .map { (GDDAssetPrompts.letteredWord($0) ?? $0.title).capitalized }.joined(separator: ", ")
+                s.tutorial = run.gddText.lowercased().contains("tutorial")
+                sheet = s
+                DispatchQueue.main.async { structureEdited = false }
             }
         }
     }
