@@ -18243,6 +18243,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        // The GDDs' plaintext copies, kept current in the background (GDDMirrorUpdater).
+        GDDMirrorUpdater.shared.start()
         // Before anything else that could raise: this is the only hook that sees an
         // exception a framework catches and swallows, which is the shape the drag wedge had.
         ExceptionLog.install()
@@ -22275,6 +22277,26 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
     app.run()
 }
 
+// Free (Docs export):  Navigator --mirror-gdds [<GDDs folder>] [--into <folder>] [--limit N] [--all]
+// One pass of the GDDs' plaintext copies, as the background does it — into a test folder with --into. Run the installed
+// app's binary for its Google session.
+if let flag = CommandLine.arguments.firstIndex(of: "--mirror-gdds") {
+    let args = CommandLine.arguments
+    let gdds = flag + 1 < args.count && !args[flag + 1].hasPrefix("--") ? URL(fileURLWithPath: args[flag + 1]) : GDDLibrary.folder
+    let into = args.firstIndex(of: "--into").flatMap { $0 + 1 < args.count ? URL(fileURLWithPath: args[$0 + 1]) : nil }
+    let limit = args.firstIndex(of: "--limit").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil }
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        let u = GDDMirrorUpdater.shared
+        u.update(all: args.contains("--all"), gdds: gdds, into: into, limit: limit) { written, failures in
+            print("WROTE: \(written)"); failures.forEach { print("FAILED: \($0)") }
+            print("CURRENT: \(u.current) of \(u.total)\(u.status.isEmpty ? "" : " — " + u.status)")
+            exit(0)
+        }
+    } }
+    app.run()
+}
+
 // Free, nothing read:  Navigator --list-gdds <GDDs folder> [--older]
 // The documents GDD to Assets lists for a folder — with the older GDDs in its folders when --older.
 if let flag = CommandLine.arguments.firstIndex(of: "--list-gdds"), flag + 1 < CommandLine.arguments.count {
@@ -24254,9 +24276,9 @@ enum GDDLibrary {
         set { Prefs.d.set(newValue, forKey: "gddIncludeOlder") }
     }
     /// Documents in `folder`, then — when older GDDs are included — those in each folder inside it, by folder.
-    static func entries(in folder: URL) -> [Entry] {
+    static func entries(in folder: URL, older: Bool = includeOlder) -> [Entry] {
         let top = documents(in: folder)
-        guard includeOlder else { return top }
+        guard older else { return top }
         let subfolders = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? [])
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
@@ -24292,9 +24314,33 @@ enum GDDLibrary {
         }
     }
 
-    /// The document's plain text.
+    /// A Drive document's plaintext copy (GDDMirror), beside the GDDs folder — or in `into`, for a test run.
+    static func mirrorCopy(of entry: Entry, gdds: URL, into: URL? = nil) -> URL? {
+        guard let stub = entry.stub, let c = GDDMirror.copy(of: entry.url, gdds: gdds, kind: stub.kind == .document ? nil : stub.kind.label) else { return nil }
+        guard let into else { return c }
+        return URL(fileURLWithPath: into.path + c.path.dropFirst(GDDMirror.root(for: gdds).path.count))
+    }
+    /// A copy written whole, its folder made when it is the first. Throws what stopped it.
+    static func writeMirror(_ text: String, to copy: URL) throws {
+        try FileManager.default.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(text.utf8).write(to: copy, options: .atomic)
+    }
+    /// The document's text: its plaintext copy while that is current — at once, offline — else the document itself,
+    /// whose text then becomes its copy.
     @MainActor
     static func text(of entry: Entry, completion: @escaping (String?, String?) -> Void) {
+        let copy = folder.flatMap { mirrorCopy(of: entry, gdds: $0) }
+        if let copy, !GDDMirror.isStale(copy, of: entry.url), let t = try? String(contentsOf: copy, encoding: .utf8), !t.isEmpty {
+            completion(t, nil); return
+        }
+        liveText(of: entry) { t, err in
+            if let t, !t.isEmpty, let copy { try? writeMirror(t, to: copy) }
+            completion(t, err)
+        }
+    }
+    /// The document's plain text, read from the document itself.
+    @MainActor
+    static func liveText(of entry: Entry, completion: @escaping (String?, String?) -> Void) {
         guard let stub = entry.stub else {
             // Already a real file on disk.
             if let t = localText(of: entry.url) { completion(t, nil) }
@@ -30874,6 +30920,7 @@ struct GDDToAssetsSheet: View {
                     }
                 }
             }
+            if let f = gddFolder { GDDMirrorRow(gdds: f) }
             if let f = gddFolder {
                 Toggle("Include older GDDs", isOn: Binding(get: { includeOlder }, set: { on in
                     includeOlder = on; GDDLibrary.includeOlder = on
@@ -32507,6 +32554,107 @@ enum GDDToAssetsWindow {
             if let t = token { NotificationCenter.default.removeObserver(t) }
         }
         w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+// ===== GDD to Assets: the GDDs' plaintext copies =====
+
+/// Keeps the GDDs' plaintext copies (GDDMirror) current in the background (2026-10-06): at launch and every half hour, each
+/// Google Drive document in the GDDs folder and the folders in it whose copy is missing or older than it is read once more —
+/// one at a time, as Docs rate-limits a burst — and its text written beside the GDDs, where any Navigator reads it at once.
+/// Paused while Google wants a sign-in; a document that cannot be read is tried again a day later.
+@MainActor final class GDDMirrorUpdater: ObservableObject {
+    static let shared = GDDMirrorUpdater()
+    @Published private(set) var running = false
+    @Published private(set) var status = ""
+    @Published private(set) var current = 0
+    @Published private(set) var total = 0
+    private var timer: Timer?
+    private static let failedKey = "gddMirrorFailed"
+    private var failed: [String: Double] {
+        get { Prefs.d.dictionary(forKey: Self.failedKey) as? [String: Double] ?? [:] }
+        set { Prefs.d.set(newValue, forKey: Self.failedKey) }
+    }
+
+    func start() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { self.update() }
+        timer = Timer.scheduledTimer(withTimeInterval: 30 * 60, repeats: true) { _ in MainActor.assumeIsolated { self.update() } }
+    }
+    /// Every Drive document, older ones included, with its copy.
+    func documents(_ gdds: URL, into: URL? = nil) -> [(entry: GDDLibrary.Entry, copy: URL)] {
+        GDDLibrary.entries(in: gdds, older: true).compactMap { e in
+            guard let stub = e.stub, stub.kind.cannotReadReason == nil, let c = GDDLibrary.mirrorCopy(of: e, gdds: gdds, into: into) else { return nil }
+            return (e, c)
+        }
+    }
+    /// How many copies are current.
+    func count(_ gdds: URL? = GDDLibrary.folder) {
+        guard let gdds, !running else { return }
+        let docs = documents(gdds)
+        total = docs.count; current = docs.filter { !GDDMirror.isStale($0.copy, of: $0.entry.url) }.count
+    }
+    /// One pass. `all`: every copy written again. `into`/`limit`: a test run's folder and size.
+    func update(all: Bool = false, gdds: URL? = GDDLibrary.folder, into: URL? = nil, limit: Int? = nil,
+                done: ((_ written: Int, _ failures: [String]) -> Void)? = nil) {
+        guard !running, let gdds, FileManager.default.fileExists(atPath: gdds.path) else { done?(0, []); return }
+        let docs = documents(gdds, into: into), now = Date().timeIntervalSince1970
+        let todo = Array(docs.filter { d in all || (GDDMirror.isStale(d.copy, of: d.entry.url) && now - (failed[d.entry.key] ?? 0) > 86_400) }.prefix(limit ?? .max))
+        total = docs.count; current = docs.count - docs.filter { GDDMirror.isStale($0.copy, of: $0.entry.url) }.count
+        guard !todo.isEmpty else { status = ""; done?(0, []); return }
+        running = true
+        var written = 0, failures: [String] = []
+        func finish(_ said: String) {
+            running = false
+            count(gdds)
+            status = said
+            navLog("gdd plaintext: \(said)")
+            done?(written, failures)
+        }
+        func step(_ i: Int) {
+            guard i < todo.count else {
+                finish(written == todo.count ? "" : "\(written) of \(todo.count) converted; \(failures.count) couldn’t be read")
+                return
+            }
+            let d = todo[i]
+            status = "Converting \(i + 1) of \(todo.count): \(d.entry.name)"
+            GDDLibrary.liveText(of: d.entry) { t, err in
+                if err == GoogleWebSession.signInNeeded { finish("Paused: sign in to Google (AI ▸ Sign in to Google…) to convert \(todo.count - i) more."); return }
+                do {
+                    guard let t, !t.isEmpty else { throw CocoaError(.fileReadUnknown, userInfo: [NSLocalizedDescriptionKey: err ?? "no text came back"]) }
+                    try GDDLibrary.writeMirror(t, to: d.copy)
+                    written += 1; self.failed[d.entry.key] = nil
+                    navLog("gdd plaintext: \(d.entry.name) → \(d.copy.lastPathComponent) (\(t.count) characters)")
+                } catch {
+                    failures.append("\(d.entry.name): \(error.localizedDescription)")
+                    var f = self.failed; f[d.entry.key] = Date().timeIntervalSince1970; self.failed = f
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { step(i + 1) }
+            }
+        }
+        step(0)
+    }
+}
+
+/// The GDDs' plaintext copies, said under the GDDs folder: how many are current, what is converting, and Update Now.
+struct GDDMirrorRow: View {
+    let gdds: URL
+    @ObservedObject var updater = GDDMirrorUpdater.shared
+    var body: some View {
+        HStack(spacing: 8) {
+            if updater.running { ProgressView().controlSize(.small) }
+            Text(updater.running ? updater.status
+                 : updater.total == 0 ? "Plaintext copies: none yet"
+                 : "Plaintext copies: \(updater.current) of \(updater.total) current" + (updater.status.isEmpty ? "" : " — " + updater.status))
+                .font(.caption).foregroundStyle(updater.status.hasPrefix("Paused") ? Color.orange : Color.secondary).lineLimit(1)
+            Button("Update Now") { updater.update() }.controlSize(.small).disabled(updater.running)
+                .help("Convert every GDD that is new or changed since its copy, now. Navigator also does this in the background, at launch and every half hour.")
+            Button("Show Folder") {
+                let r = GDDMirror.root(for: gdds)
+                NSWorkspace.shared.activateFileViewerSelecting([FileManager.default.fileExists(atPath: r.path) ? r : gdds])
+            }.controlSize(.small)
+        }
+        .help("Each Google Doc's text, kept beside the GDDs in “\(GDDMirror.root(for: gdds).lastPathComponent)”, so a GDD reads at once and offline — the live document is read whenever its copy is older than it.")
+        .onAppear { updater.count(gdds) }
     }
 }
 

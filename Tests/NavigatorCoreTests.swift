@@ -14166,3 +14166,31 @@ final class ProjectTests: XCTestCase {
         XCTAssertGreaterThan(ProjectIndex.size(root), 0)
     }
 }
+
+/// The GDDs' plaintext copies: beside the GDDs, folder for folder, current while newer than their document.
+final class GDDMirrorTests: XCTestCase {
+    func testACopyIsBesideTheGDDsFolderForFolder() {
+        let gdds = URL(fileURLWithPath: "/Drive/Studio/GDDs")
+        XCTAssertEqual(GDDMirror.root(for: gdds).path, "/Drive/Studio/GDDs Plaintext")
+        XCTAssertEqual(GDDMirror.copy(of: gdds.appendingPathComponent("9001 Example GDD.gdoc"), gdds: gdds)?.path, "/Drive/Studio/GDDs Plaintext/9001 Example GDD.txt")
+        XCTAssertEqual(GDDMirror.copy(of: gdds.appendingPathComponent("Older GDDs/0001 Sample GDD.gdoc"), gdds: gdds)?.path,
+                       "/Drive/Studio/GDDs Plaintext/Older GDDs/0001 Sample GDD.txt")
+        XCTAssertEqual(GDDMirror.copy(of: gdds.appendingPathComponent("Paytable.gsheet"), gdds: gdds, kind: "Sheet")?.lastPathComponent, "Paytable (Sheet).txt")
+        XCTAssertNil(GDDMirror.copy(of: URL(fileURLWithPath: "/Elsewhere/A GDD.gdoc"), gdds: gdds))
+        XCTAssertNil(GDDMirror.copy(of: URL(fileURLWithPath: "/Drive/Studio/GDDs Plaintext/A GDD.gdoc"), gdds: gdds))   // not "GDDs" by prefix
+    }
+    func testACopyIsCurrentWhileNewerThanItsDocument() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mirror-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let doc = dir.appendingPathComponent("A GDD.gdoc"), copy = dir.appendingPathComponent("A GDD.txt")
+        try Data("{}".utf8).write(to: doc)
+        XCTAssertTrue(GDDMirror.isStale(copy, of: doc))                                   // no copy yet
+        try Data("text".utf8).write(to: copy)
+        let t = Date()
+        try FileManager.default.setAttributes([.modificationDate: t.addingTimeInterval(-3600)], ofItemAtPath: doc.path)
+        try FileManager.default.setAttributes([.modificationDate: t], ofItemAtPath: copy.path)
+        XCTAssertFalse(GDDMirror.isStale(copy, of: doc))
+        try FileManager.default.setAttributes([.modificationDate: t.addingTimeInterval(60)], ofItemAtPath: doc.path)   // edited since
+        XCTAssertTrue(GDDMirror.isStale(copy, of: doc))
+    }
+}

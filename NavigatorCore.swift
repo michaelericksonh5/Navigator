@@ -17712,6 +17712,34 @@ public struct SetSession: Codable, Equatable, Sendable {
     public func sameEdit(as o: SetSession) -> Bool { var a = self, b = o; a.savedAt = .distantPast; b.savedAt = .distantPast; return a == b }
 }
 
+/// The GDDs' plaintext copies (2026-10-06): beside the GDDs folder, "<GDDs> Plaintext", with the same folders inside it,
+/// one `.txt` per Google Drive document holding exactly the text GDD to Assets reads from it — so a document reads at
+/// once, offline, without a Google session. A copy is current while it is newer than its document: Drive for desktop
+/// dates each document's pointer file with the document's last edit (2020 to 2026 across the GDDs folder, 2026-10-06).
+public enum GDDMirror {
+    public static func root(for gdds: URL) -> URL {
+        gdds.deletingLastPathComponent().appendingPathComponent(gdds.lastPathComponent + " Plaintext")
+    }
+    /// The copy of `document`, a Drive document in `gdds` or a folder inside it (`kind`: said in the name of anything but
+    /// a Google Doc, so a Sheet and a Doc of one name stay apart); nil for one outside it.
+    public static func copy(of document: URL, gdds: URL, kind: String? = nil) -> URL? {
+        let base = gdds.standardizedFileURL.path, dir = document.deletingLastPathComponent().standardizedFileURL.path
+        guard dir == base || dir.hasPrefix(base + "/") else { return nil }
+        var u = root(for: gdds)
+        let rel = dir.dropFirst(base.count).split(separator: "/")
+        for part in rel { u = u.appendingPathComponent(String(part)) }
+        return u.appendingPathComponent(document.deletingPathExtension().lastPathComponent + (kind.map { " (\($0))" } ?? "") + ".txt")
+    }
+    /// Missing, or older than its document.
+    public static func isStale(_ copy: URL, of document: URL) -> Bool {
+        // Read fresh each time: a URL keeps the dates it read once, and the editor holds its documents' URLs for long.
+        func date(_ u: URL) -> Date? { (try? FileManager.default.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date }
+        guard let c = date(copy) else { return true }
+        guard let d = date(document) else { return false }
+        return c < d
+    }
+}
+
 /// Where a GDD to Assets project stands, in the order the work is done (2026-10-05): the game, its look and output, the
 /// plan, the core art reviewed until approved, everything else drawn to match it, the lettering localized — then done.
 /// One rule for the Projects home, the editor's stage bar and its "Next" line.
