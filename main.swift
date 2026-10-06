@@ -33371,10 +33371,17 @@ enum GameForgeExport {
             return Piece(px: px, w: cg.width, h: cg.height)
         }
         /// A picture cut to what it shows, and where that sat in it.
-        struct Cut { var piece: Piece, x: Int, y: Int, fullW: Int, fullH: Int }
+        /// `source`: the file it was cut from (its stem), `ox`, `oy` where in that file, `srcW`×`srcH` that file's size — so
+        /// each language's version of it (`<stem>-<lang>`) is cut alike.
+        struct Cut { var piece: Piece, x: Int, y: Int, fullW: Int, fullH: Int, source: String? = nil, ox = 0, oy = 0, srcW = 0, srcH = 0 }
         func cut(_ p: Piece) -> Cut? {
             guard let e = LayerizeAssembly.extent(p.px, width: p.w, height: p.h, alpha: 8) else { return nil }
-            return Cut(piece: FrameKit.crop(p.px, width: p.w, e.x, e.y, e.w, e.h), x: e.x, y: e.y, fullW: p.w, fullH: p.h)
+            return Cut(piece: FrameKit.crop(p.px, width: p.w, e.x, e.y, e.w, e.h), x: e.x, y: e.y, fullW: p.w, fullH: p.h, ox: e.x, oy: e.y, srcW: p.w, srcH: p.h)
+        }
+        /// A set picture (`<stem>_rmbg.png`) cut to what it shows.
+        func cutFile(_ stem: String) -> Cut? {
+            guard var c = load("\(stem)_rmbg.png").flatMap(cut) else { return nil }
+            c.source = stem; return c
         }
         func write(_ p: Piece, _ path: String) {
             let url = textures.appendingPathComponent(path)
@@ -33410,9 +33417,12 @@ enum GameForgeExport {
         }
 
         // The pieces every screen shares.
-        let logo = load("shared_logo_master_rmbg.png").flatMap(cut)
+        let logo = cutFile("shared_logo_master")
         let tableFull = load("shared_interface_jackpotTable_rmbg.png")
-        let pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { load("\($0)_rmbg.png").flatMap(cut) }
+        let potStems = (["shared_avatar_jar"] + (1...6).map { "shared_avatar_jar\($0)" }).filter { exists("\($0)-State0Idle_rmbg.png") }
+        let pots = potStems.compactMap { cutFile("\($0)-State0Idle") }
+        // A pot's plaque, lettered with what it unlocks, under it (as the platform's games put theirs).
+        let plaques = potStems.map { cutFile("\($0)-plaque") }
         let jackpots = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
         let tierNames = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
         let baseArea = ReelArea(layout), jt = JackpotTable(count: jackpots.count, width: baseArea.grid.w + 2 * baseArea.band)
@@ -33423,11 +33433,12 @@ enum GameForgeExport {
             guard t.w == sheet.width, t.h == sheet.height else { return [] }
             return sheet.plaques.indices.compactMap { i in
                 let r = sheet.cut(i), f = sheet.field(in: i)
-                guard i < jackpots.count, let c = cut(FrameKit.crop(t.px, width: t.w, r.x, r.y, r.w, r.h)) else { return nil }
+                guard i < jackpots.count, var c = cut(FrameKit.crop(t.px, width: t.w, r.x, r.y, r.w, r.h)) else { return nil }
+                c.source = "shared_interface_jackpotTable"; c.ox += r.x; c.oy += r.y; c.srcW = t.w; c.srcH = t.h
                 return (c, ReelArea.Rect(x: f.x - c.x, y: f.y - c.y, w: f.w, h: f.h))
             }
         } ?? []
-        let table = meterCuts.isEmpty ? tableFull.flatMap(cut) : nil
+        let table = meterCuts.isEmpty ? cutFile("shared_interface_jackpotTable") : nil
         /// The jackpot table `W` wide, its top at `y`, in a screen's block.
         func addTable(_ s: inout Screen, _ W: Double, _ y: Double) {
             guard let t = table, let f = tableFull else { return }
@@ -33469,21 +33480,27 @@ enum GameForgeExport {
             for (key, file) in [("texture", "reelTexture"), ("dividers", "dividers"), ("bezel", "bezel")] {
                 guard let p = load("\(scope)_interface_\(file)_rmbg.png") else { problems.append("\(scope): no \(file) drawn yet"); continue }
                 guard p.w == area.width, p.h == area.height else { problems.append("\(scope): its \(file) was laid for another grid — Make Again ▸ Bezel"); continue }
-                if let c = cut(p) { s.add(key, c, 0, top, 1, asset: "backgrounds/reel-\(key == "texture" ? "texture" : key)-\(sl)") }
+                if var c = cut(p) { c.source = "\(scope)_interface_\(file)"; s.add(key, c, 0, top, 1, asset: "backgrounds/reel-\(key == "texture" ? "texture" : key)-\(sl)") }
             }
             s.block["grid"] = Box(x: Double(g.x), y: top + Double(g.y), w: Double(g.w), h: Double(g.h))
             let tableY = top + Double(g.y - area.band) - tableH + tableH / 6
             addTable(&s, W, tableY)
             for (i, p) in pots.enumerated() {
                 let k = potW / Double(p.fullW), cx = Double(g.x) + Double(g.w) * Double(2 * i + 1) / Double(2 * pots.count)
-                s.add("pot\(i + 1)", p, cx - potW / 2, tableY - Double(p.fullH) * k + potW / 8, k, asset: "meters/pot-\(i + 1)")
+                let py = tableY - Double(p.fullH) * k + potW / 8
+                s.add("pot\(i + 1)", p, cx - potW / 2, py, k, asset: "meters/pot-\(i + 1)")
                 s.items.append(("pot\(i + 1)", "pot-\(i + 1)-\(scope)", "Pot \(i + 1)", "pots-\(scope)", 153))
+                if i < plaques.count, let pl = plaques[i], let pb = s.block["pot\(i + 1)"] {
+                    let w = potW * 0.95, kk = w / Double(pl.fullW)
+                    s.add("plaque\(i + 1)", pl, cx - w / 2, pb.y + pb.h - Double(pl.y) * kk - 0.25 * Double(pl.piece.h) * kk, kk, asset: "meters/pot-\(i + 1)-plaque")
+                    s.items.append(("plaque\(i + 1)", "pot-\(i + 1)-plaque-\(scope)", "Pot \(i + 1) plaque", "pots-\(scope)", 154))
+                }
             }
             let mine = concepts.filter { scopeOf($0) == scope }
             let buttons = mine.filter { place($0) == .button }, plaques = mine.filter { place($0) == .plaque }
             let cell = Double(area.cell)
             for (i, c) in buttons.enumerated() {
-                guard let cc = load("\(c.name)_rmbg.png").flatMap(cut) else { continue }
+                guard let cc = cutFile("\(c.name)") else { continue }
                 let w = 1.4 * cell, gap = 0.2 * cell, row = Double(buttons.count) * w + Double(buttons.count - 1) * gap, k = w / Double(cc.fullW)
                 let key = "concept:\(c.name)"
                 s.add(key, cc, (W - row) / 2 + Double(i) * (w + gap), top + Double(area.height) - 0.1 * cell, k, asset: "features/\(c.name.lowercased())")
@@ -33494,7 +33511,7 @@ enum GameForgeExport {
             if !buttons.isEmpty { s.groups.append(GameForge.Group(handle: "buttons-\(scope)", label: "Buttons")) }
             let above = (s.block.values.map(\.y).min() ?? 0)
             for (i, c) in plaques.enumerated() {
-                guard let cc = load("\(c.name)_rmbg.png").flatMap(cut) else { continue }
+                guard let cc = cutFile("\(c.name)") else { continue }
                 let w = min(2.2 * cell, W / Double(max(1, plaques.count))), gap = 0.15 * cell, row = Double(plaques.count) * w + Double(plaques.count - 1) * gap
                 let k = w / Double(cc.fullW), key = "concept:\(c.name)"
                 s.add(key, cc, (W - row) / 2 + Double(i) * (w + gap), above - Double(cc.fullH) * k - 0.05 * cell, k, asset: "features/\(c.name.lowercased())")
@@ -33506,7 +33523,7 @@ enum GameForgeExport {
             if g == baseArea.grid || scope == "base", layout.hotReelAbove != nil {
                 let hot = area.windows.prefix(grid.reels)
                 for c in mine where place(c) == .overHot {
-                    guard let cc = load("\(c.name)_rmbg.png").flatMap(cut), let first = hot.first, let last = hot.last else { continue }
+                    guard let cc = cutFile("\(c.name)"), let first = hot.first, let last = hot.last else { continue }
                     let hw = Double(last.x + last.w - first.x), k = hw / Double(cc.fullW), h = Double(cc.fullH) * k
                     let key = "concept:\(c.name)"
                     s.add(key, cc, Double(first.x), top + Double(first.y) + Double(first.h) / 2 - h / 2, k, asset: "features/\(c.name.lowercased())")
@@ -33533,8 +33550,8 @@ enum GameForgeExport {
         // Each wheel the GDD has, as the studio's wheelSpin mode: the face of upright wedges the game turns round its hub,
         // the rim, the hub and the pointer, laid out as the wheel preview lays them; the SPIN banner under it, the jackpot
         // table over it when the game has jackpots.
-        let frame = load("wheelSpin_interface_wheelFrame_rmbg.png").flatMap(cut), hub = load("wheelSpin_interface_wheelHub_rmbg.png").flatMap(cut)
-        let pointer = load("wheelSpin_interface_winIndicator_rmbg.png").flatMap(cut)
+        let frame = cutFile("wheelSpin_interface_wheelFrame"), hub = cutFile("wheelSpin_interface_wheelHub")
+        let pointer = cutFile("wheelSpin_interface_winIndicator")
         for (wi, wheel) in (layout.wheels ?? []).enumerated() {
             let prefix = wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)"
             let order = WheelRules.order(WheelRules.labels(wheel, jackpots: tierNames), segments: wheel.segments), art = WheelArt(segments: order.count)
@@ -33551,7 +33568,7 @@ enum GameForgeExport {
             if let f = frame { s.add("frame", f, 0, wheelTop, n / Double(f.fullW), asset: "wheel/wheel-frame") }
             if let h = hub { let k = 0.23 * n / Double(h.fullW); s.add("hub", h, (n - 0.23 * n) / 2, wheelTop + (n - 0.23 * n) / 2, k, asset: "wheel/wheel-hub") }
             if let p = pointer { let sz = 0.30 * n, k = sz / Double(p.fullW); s.add("pointer", p, (n - sz) / 2, wheelTop + 0.10 * n - 0.95 * sz, k, asset: "wheel/wheel-pointer") }
-            if let b = load("\(prefix)_banner_spin_rmbg.png").flatMap(cut) ?? load("wheelSpin_banner_spin_rmbg.png").flatMap(cut) {
+            if let b = cutFile("\(prefix)_banner_spin") ?? cutFile("wheelSpin_banner_spin") {
                 let bw = 0.6 * n, k = bw / Double(b.fullW)
                 s.add("banner", b, (n - bw) / 2, wheelTop + n + 0.02 * n, k, asset: "wheel/banner-spin")
             }
@@ -33566,6 +33583,41 @@ enum GameForgeExport {
                         ("banner", "banner-spin-\(prefix)", "SPIN banner", nil, 153)]
             s.groups.append(GameForge.Group(handle: "wheel-\(prefix)", label: "Wheel"))
             screens.append(s)
+        }
+
+        // The intro the game opens on, as the studio's are: a card for each feature over the base game's background, the logo
+        // over them and CONTINUE under them.
+        let cards = (try? fm.contentsOfDirectory(atPath: folder.path))?.filter { $0.hasPrefix("shared_intro_featureCard-") && $0.hasSuffix("_rmbg.png") }
+            .map { String($0.dropLast("_rmbg.png".count)) }.filter { !Localized.codes.dropFirst().contains(where: $0.hasSuffix) }.sorted() ?? []
+        if !cards.isEmpty {
+            var s = Screen(scope: "intro", background: ["bg_base"])
+            s.showsMeters = false
+            let cell = 512.0, gap = 64.0, cols = cards.count == 1 ? 1 : 2, rows = (cards.count + cols - 1) / cols
+            for (i, stem) in cards.enumerated() {
+                guard let c = cutFile(stem) else { continue }
+                let r = i / cols, inRow = min(cols, cards.count - r * cols), col = i % cols
+                let rowW = Double(inRow) * cell + Double(inRow - 1) * gap, x = (Double(cols) * cell + Double(cols - 1) * gap - rowW) / 2 + Double(col) * (cell + gap)
+                let key = "card\(i + 1)", name = String(stem.dropFirst("shared_intro_featureCard-".count))
+                s.add(key, c, x, Double(r) * (cell + gap), cell / Double(c.fullW), asset: "intro/feature-card-\(name.lowercased())")
+                s.items.append((key, "intro-card-\(name)", "Feature card: \(name)", "cards-intro", 160))
+            }
+            s.groups.append(GameForge.Group(handle: "cards-intro", label: "Feature cards"))
+            if let b = cutFile("shared_intro_continueBtn") {
+                let w = 1.25 * cell, k = w / Double(b.fullW), W = Double(cols) * cell + Double(cols - 1) * gap
+                let bx = (W - w) / 2, by = Double(rows) * (cell + gap) + gap
+                s.add("continue", b, bx, by, k, asset: "intro/continue-button")
+                s.items.append(("continue", "intro-continue", "CONTINUE button", "continue-intro", 161))
+                // Its word, a picture of its own laid over it as the studio's intros have it (lettered in every language,
+                // English too): registered on the button's canvas, or centred on it.
+                if var word = cutFile("\(Localized.introWord)-en") {
+                    word.source = Localized.introWord
+                    if word.fullW == b.fullW, word.fullH == b.fullH { s.add("continueWord", word, bx, by, k, asset: "intro/continue-word") }
+                    else { let ww = 0.7 * w, kk = ww / Double(word.fullW); s.add("continueWord", word, bx + (w - ww) / 2, by + Double(b.fullH) * k / 2 - Double(word.fullH) * kk / 2, kk, asset: "intro/continue-word") }
+                    s.items.append(("continueWord", "intro-continue-word", "CONTINUE (the word)", "continue-intro", 162))
+                } else { problems.append("intro: its CONTINUE word isn't drawn yet — Localize with English chosen") }
+                s.groups.append(GameForge.Group(handle: "continue-intro", label: "CONTINUE"))
+            }
+            if !s.block.isEmpty { screens.append(s) }
         }
 
         // Every screen composed into both design boxes: the logo and the jackpot meters round it, or in a column beside it.
@@ -33594,13 +33646,13 @@ enum GameForgeExport {
         // (as the platform's celebration tiers are), put together as the set's pop-up sheet puts them: the panel, the
         // title inside it, the value bar for the amount, the CONTINUE button; a celebration has no button, a banner
         // is its title alone.
-        let panel = load("shared_celebration_backing-2_rmbg.png").flatMap(cut), bar = load("shared_celebration_backing-1_rmbg.png").flatMap(cut)
-        let button = load("base_popUp_bonusBtn_rmbg.png").flatMap(cut)
+        let panel = cutFile("shared_celebration_backing-2"), bar = cutFile("shared_celebration_backing-1")
+        let button = cutFile("base_popUp_bonusBtn")
         let titles = PopUps.plan(layout, jackpots: tierNames, bonus: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout))
             .filter { $0.kind == .title && $0.name != "wheelSpin_banner_spin" && exists("\($0.name)_rmbg.png") }
         var eventCount = 0
         for t in titles {
-            guard let title = load("\(t.name)_rmbg.png").flatMap(cut) else { continue }
+            guard let title = cutFile("\(t.name)") else { continue }
             let banner = t.name.hasPrefix("base_banner_"), celebration = t.name.hasPrefix("shared_celebration_message")
             let scope = t.name.hasPrefix("transition_outro") && screens.contains(where: { $0.scope == "bonusGames" }) ? "bonusGames" : "base"
             guard let si = screens.firstIndex(where: { $0.scope == scope }) else { continue }
@@ -33653,6 +33705,16 @@ enum GameForgeExport {
             let p = w == c.w ? c : FrameKit.resized(c, w, h)
             write(p, "portrait/en/\(a).png"); exported[a] = p
         }
+        // Each pot's other states and parts, registered on the same canvas as its first: cut and sized as it is.
+        for (i, stem) in potStems.enumerated() {
+            guard let c = pots.indices.contains(i) ? pots[i] : nil, let e = exported["meters/pot-\(i + 1)"] else { continue }
+            let parts = (1...5).map { ("\(stem)-State\($0)Idle", "state\($0)") } + [("\(stem)-State0Idle_open", "open"), ("\(stem)-lid", "lid")]
+            for (file, name) in parts {
+                guard let p = load("\(file)_rmbg.png"), p.w == c.srcW, p.h == c.srcH else { continue }
+                let q = FrameKit.crop(p.px, width: p.w, c.ox, c.oy, c.piece.w, c.piece.h)
+                write(q.w == e.w ? q : FrameKit.resized(q, e.w, e.h), "portrait/en/meters/pot-\(i + 1)-\(name).png")
+            }
+        }
         // A placed piece's other states, cut and sized as its first; the pieces the code places, at the size they were drawn.
         for st in conceptStates {
             guard let s = screens.first(where: { $0.scope == st.scope }), let c = s.cuts[st.key], let a = s.assets[st.key], let e = exported[a] else { continue }
@@ -33664,12 +33726,12 @@ enum GameForgeExport {
         }
         for cp in codePieces {
             for (file, suffix) in [(cp.c.name, "")] + cp.c.states.map { ("\(cp.c.name)-\($0)", "-\($0.lowercased())") } {
-                guard let p = load("\(file)_rmbg.png").flatMap(cut) else { continue }
+                guard let p = cutFile("\(file)") else { continue }
                 write(p.piece, "portrait/en/features/\(cp.c.name.lowercased())\(suffix).png")
             }
         }
         // A wheel's wedges, upright as the game turns them: 3× the largest the face is shown.
-        var wedgeFiles: [String: [String]] = [:]
+        var wedgeFiles: [String: [String]] = [:], wedgeSizes: [String: (w: Int, h: Int, stem: String)] = [:]
         for s in screens {
             guard let wh = s.wheel else { continue }
             let faceW = max(s.p["face"]?.w ?? 0, s.l["face"]?.w ?? 0) * 3, k = faceW / 2 * 0.86 / Double(wh.art.radius)
@@ -33678,6 +33740,7 @@ enum GameForgeExport {
                 let (ww, hh) = wh.art.wedgeSize, p = Piece(px: px, w: ww, h: hh), w = max(1, min(ww, Int((Double(ww) * k).rounded(.up))))
                 let path = "\(folderName)/wedge-\(PopUps.key(label).lowercased())"
                 write(w == ww ? p : FrameKit.resized(p, w, max(1, w * hh / ww)), "portrait/en/\(path).png")
+                wedgeSizes[path] = (w, max(1, w * hh / ww), "\(wh.prefix)_interface_wedge-\(PopUps.key(label))")
                 wedgeFiles[s.scope, default: []].append(path)
             }
         }
@@ -33748,6 +33811,14 @@ enum GameForgeExport {
                 write(q, "portrait/en/symbols/\(stem).png")
                 if !stem.hasSuffix("-win"), ![.replacement, .blank].contains(j.role) { symbols[j.id] = q }
             }
+            // Its forms (SymbolForm): the reel-tall version, multiplier badges, the locked frame, a train's parts — at the same scale.
+            let side = Double(["1K": 1024, "4K": 4096][j.size] ?? 2048), k = Double(symbolPx) / side
+            let forms = [("_stack", "stack"), ("_locked", "locked")] + (2...20).map { ("_x\($0)", "x\($0)") } + (1...3).map { ("_train\($0)", "train\($0)") }
+            for (suffix, name) in forms {
+                guard let p = load("\(j.id)\(suffix)_rmbg.png") else { continue }
+                let w = max(1, Int((Double(p.w) * k).rounded())), h = max(1, Int((Double(p.h) * k).rounded()))
+                write(k < 1 ? FrameKit.resized(p, w, h) : p, "portrait/en/symbols/symbol-\(j.id.lowercased())-\(name).png")
+            }
         }
 
         // Each symbol as a layered Photoshop file at the size it was drawn: the layers it was split into (frame backing,
@@ -33784,6 +33855,32 @@ enum GameForgeExport {
         }
         let rank = Dictionary(uniqueKeysWithValues: symbolJobs.enumerated().map { ($1.id, $0) })
         layered.sort { rank[$0]! < rank[$1]! }; single.sort { rank[$0]! < rank[$1]! }
+
+        // Each language's lettered pictures, as overrides beside the English (the platform's language folders hold only what
+        // differs from en/): cut and sized exactly as the English one.
+        var languages = Set<String>()
+        func localize(_ stem: String, _ c: Cut?, to path: String, size: (w: Int, h: Int)) {
+            for lang in Localized.codes.dropFirst() {
+                guard let p = load("\(stem)-\(lang)_rmbg.png") else { continue }
+                let q: Piece
+                if let c { guard p.w == c.srcW, p.h == c.srcH else { continue }; q = FrameKit.crop(p.px, width: p.w, c.ox, c.oy, c.piece.w, c.piece.h) } else { q = p }
+                write(q.w == size.w && q.h == size.h ? q : FrameKit.resized(q, size.w, size.h), "portrait/\(lang)/\(path).png"); languages.insert(lang)
+            }
+        }
+        for (a, n) in need { if let src = n.cut.source, let e = exported[a] { localize(src, n.cut, to: a, size: (e.w, e.h)) } }
+        for (path, w) in wedgeSizes { localize(w.stem, nil, to: path, size: (w.w, w.h)) }
+
+        // The pictures the game shows outside its screens, for the lobby and the store: as they were made, outside the build.
+        let lobbyDir = out.appendingPathComponent("lobby")
+        var lobby: [String] = []
+        for (file, name) in [("shared_interface-gameArt.176x176.png", "game-art-176.png"), ("shared_interface-gameArt.600x600.png", "game-art-600.png"),
+                             ("shared_interface-gameIcon1x2.png", "game-icon-1x2.png"), ("shared_interface-icon.png", "icon.png"),
+                             ("shared_interface-sharedIcon.png", "shared-icon.png"), ("shared_character_keyArt_rmbg.png", "key-art.png"),
+                             ("shared_preloader_2048.png", "preloader.png")] where exists(file) {
+            try? fm.createDirectory(at: lobbyDir, withIntermediateDirectories: true)
+            try? fm.removeItem(at: lobbyDir.appendingPathComponent(name))
+            try? fm.copyItem(at: folder.appendingPathComponent(file), to: lobbyDir.appendingPathComponent(name)); lobby.append(name)
+        }
 
         // The layout files.
         let layoutDir = out.appendingPathComponent("layout")
@@ -33921,6 +34018,13 @@ enum GameForgeExport {
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
         readme += "- `\(stem)_all-screens_portrait.psb` and `_landscape.psb` hold every screen of the game, each an artboard of its own (\(screens.map(\.scope).joined(separator: ", "))), and every event in artboards under them — every layer and group, nothing covering anything else. Each screen also has a PSB of its own, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
         readme += "- The events (pop-ups, celebrations, banners) are groups marked `isEvent` in the screen they show over, centred on its reels, each with a PSB of its own in `events/`. Their amounts have no data key: the game sets them.\n"
+        if !languages.isEmpty {
+            readme += "\n## Languages\n\nThe lettered pictures in \(languages.sorted().joined(separator: ", ")) are in `textures/portrait/<language>/`, at the same paths and sizes as the English ones — overrides only, as the platform's language folders are. A language code may need renaming to the one the platform's localization service reports.\n"
+        }
+        if !lobby.isEmpty { readme += "\n## Outside the game\n\n`lobby/` has the lobby and store pictures as they were made: " + lobby.joined(separator: ", ") + ".\n" }
+        if screens.contains(where: { $0.scope == "intro" }) {
+            readme += "\n## The intro\n\nThe screen the game opens on (scope `intro`): a card per feature over the base game's background, the logo over them and CONTINUE under them.\n"
+        }
         if table != nil {
             readme += "\n## The jackpot table\n\nThis set's jackpots were drawn as one table before Navigator drew them as the studio's games show them, a meter per tier. It is placed as one piece; Make Again ▸ Jackpot meters draws the meters, and the next export places them round the logo (portrait) and in a column beside the reels (landscape).\n"
         }
