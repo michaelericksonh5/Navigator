@@ -22275,6 +22275,19 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
     app.run()
 }
 
+// Free, nothing read:  Navigator --list-gdds <GDDs folder> [--older]
+// The documents GDD to Assets lists for a folder — with the older GDDs in its folders when --older.
+if let flag = CommandLine.arguments.firstIndex(of: "--list-gdds"), flag + 1 < CommandLine.arguments.count {
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    GDDLibrary.includeOlder = CommandLine.arguments.contains("--older")
+    let all = GDDLibrary.entries(in: folder)
+    for (parent, list) in Dictionary(grouping: all, by: { $0.url.deletingLastPathComponent().lastPathComponent }).sorted(by: { $0.key < $1.key }) {
+        print("\(parent): \(list.count) — " + list.prefix(3).map(\.name).joined(separator: ", ") + (list.count > 3 ? ", …" : ""))
+    }
+    print("TOTAL: \(all.count)")
+    exit(0)
+}
+
 // Free:  Navigator --projects-snapshot <projects folder> <out.png> [--recent <folder>,<folder>]
 // The Projects home for a projects folder (and those recent ones), drawn off screen into a PNG — to check the design.
 if let flag = CommandLine.arguments.firstIndex(of: "--projects-snapshot"), flag + 2 < CommandLine.arguments.count {
@@ -24234,9 +24247,24 @@ enum GDDLibrary {
         return DriveStub.parse(json: text, fileExtension: url.pathExtension)
     }
 
-    /// Documents in `folder`, newest-looking name order. `.gdoc` stubs and plain text
-    /// files are both listed; anything else is left out rather than half-supported.
+    /// Also list the documents in the folders inside the GDDs folder — the older GDDs ("Confluence GDDs", 2026-10-06),
+    /// one level down only (a game build's folder beside them holds no documents). Off unless asked.
+    static var includeOlder: Bool {
+        get { Prefs.d.bool(forKey: "gddIncludeOlder") }
+        set { Prefs.d.set(newValue, forKey: "gddIncludeOlder") }
+    }
+    /// Documents in `folder`, then — when older GDDs are included — those in each folder inside it, by folder.
     static func entries(in folder: URL) -> [Entry] {
+        let top = documents(in: folder)
+        guard includeOlder else { return top }
+        let subfolders = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        return top + subfolders.flatMap(documents(in:))
+    }
+    /// Documents directly in `folder`, newest-looking name order. `.gdoc` stubs and plain text
+    /// files are both listed; anything else is left out rather than half-supported.
+    static func documents(in folder: URL) -> [Entry] {
         let fm = FileManager.default
         let items = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil,
                                                  options: [.skipsHiddenFiles])) ?? []
@@ -30231,6 +30259,7 @@ struct GameSheetEditor: View {
 }
 
 struct GDDToAssetsSheet: View {
+    @State private var includeOlder = GDDLibrary.includeOlder
     /// The stage shown, and what the project has, counted (refreshed a moment after the run changes).
     @State private var stage: ProjectStage = .game
     @State private var counts = ProjectStage.Counts()
@@ -30293,6 +30322,17 @@ struct GDDToAssetsSheet: View {
     /// Documents a scan found to declare no symbol set. Not hidden until scanned, and
     /// never hidden when the read FAILED — that is our problem, not the document's.
     private var hiddenKeys: Set<String> { GDDScanRules.hiddenKeys(scan) }
+    /// The documents in the GDDs folder itself, then the older ones, by the folder inside it they are in.
+    private var entryGroups: [(folder: String?, entries: [GDDLibrary.Entry])] {
+        let top = gddFolder?.standardizedFileURL.path
+        var groups: [(folder: String?, entries: [GDDLibrary.Entry])] = []
+        for e in visibleEntries {
+            let parent = e.url.deletingLastPathComponent().standardizedFileURL
+            let key: String? = parent.path == top ? nil : parent.lastPathComponent
+            if let i = groups.firstIndex(where: { $0.folder == key }) { groups[i].entries.append(e) } else { groups.append((key, [e])) }
+        }
+        return groups
+    }
     private var visibleEntries: [GDDLibrary.Entry] {
         showEmpty ? entries : entries.filter { !hiddenKeys.contains($0.key) }
     }
@@ -30571,7 +30611,14 @@ struct GDDToAssetsSheet: View {
         if let f = s.gddFolder {
             gddFolder = URL(fileURLWithPath: f)
             entries = GDDLibrary.entries(in: gddFolder!)
-            if let g = s.gddFile, let e = entries.first(where: { $0.url.path == g }) { restoringGDD = g; pickedGDD = e }
+            if let g = s.gddFile {
+                // A project made from an older GDD finds it with older ones left out too.
+                if !entries.contains(where: { $0.url.path == g }), FileManager.default.fileExists(atPath: g) {
+                    let u = URL(fileURLWithPath: g)
+                    entries.append(GDDLibrary.Entry(url: u, stub: DriveStub.Kind(fileExtension: u.pathExtension.lowercased()) != nil ? GDDLibrary.stub(at: u) : nil))
+                }
+                if let e = entries.first(where: { $0.url.path == g }) { restoringGDD = g; pickedGDD = e }
+            }
         }
         if !s.manualSpec.isEmpty { manualSpec = s.manualSpec }
         manualName = run.gameName
@@ -30827,6 +30874,15 @@ struct GDDToAssetsSheet: View {
                     }
                 }
             }
+            if let f = gddFolder {
+                Toggle("Include older GDDs", isOn: Binding(get: { includeOlder }, set: { on in
+                    includeOlder = on; GDDLibrary.includeOlder = on
+                    entries = GDDLibrary.entries(in: f)
+                    if let p = pickedGDD, !entries.contains(p) { entries.append(p) }      // the one picked stays pickable
+                }))
+                .toggleStyle(.checkbox).font(.caption)
+                .help("Also list the documents in the folders inside “\(f.lastPathComponent)” — the older GDDs, such as Confluence GDDs — in a section of their own.")
+            }
             if gddFolder == nil {
                 Text("Point this at your Drive “GDDs” folder. Google Drive already keeps it on this Mac, so Navigator reads the list straight off disk.")
                     .font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -30839,9 +30895,14 @@ struct GDDToAssetsSheet: View {
                     // the folder holds "3140 Milky Way GDD" as both a .docx and a
                     // .gdoc, and the list showed it twice with nothing to tell them
                     // apart, so picking one was a coin toss.
-                    ForEach(visibleEntries) { e in
-                        Text(duplicateNames.contains(e.name) ? e.uniqueName : e.name)
-                            .tag(GDDLibrary.Entry?.some(e))
+                    ForEach(entryGroups, id: \.folder) { g in
+                        if let f = g.folder {
+                            Section("Older GDDs — \(f)") {
+                                ForEach(g.entries) { e in Text(duplicateNames.contains(e.name) ? e.uniqueName : e.name).tag(GDDLibrary.Entry?.some(e)) }
+                            }
+                        } else {
+                            ForEach(g.entries) { e in Text(duplicateNames.contains(e.name) ? e.uniqueName : e.name).tag(GDDLibrary.Entry?.some(e)) }
+                        }
                     }
                 }
                 .frame(maxWidth: 520)
