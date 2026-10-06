@@ -21990,6 +21990,33 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reel-area"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --gameforge <set folder> [--design-height 722|844] [--hud <px>] [--landscape-hud <px>] [--game-folder <1234_GameName>] [--out <folder>]
+// The set handed to Game Forge: its asset folder, its layout files and a layered PSB of the game screen per
+// orientation, all from one set of positions (GameForgeExport). Nothing is drawn.
+if let flag = CommandLine.arguments.firstIndex(of: "--gameforge"), flag + 1 < CommandLine.arguments.count {
+    let args = CommandLine.arguments, folder = URL(fileURLWithPath: args[flag + 1])
+    func value(_ k: String) -> String? { args.firstIndex(of: k).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        guard let run = GDDToAssetsRun.reopen(folder, fetchTheme: false) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
+        guard let layout = run.reelLayout, layout.base != nil else { print("FAILED: this set has no reels saved"); exit(1) }
+        var o = GameForgeExport.Options()
+        if let v = value("--design-height").flatMap(Double.init) { o.designHeight = v }
+        if let v = value("--hud").flatMap(Double.init) { o.hud = v }
+        if let v = value("--landscape-hud").flatMap(Double.init) { o.landscapeHUD = v }
+        o.gameFolder = value("--game-folder")
+        o.out = value("--out").map { URL(fileURLWithPath: $0) }
+        let (jobs, game) = (run.jobs, run.gameName)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let started = Date()
+            let r = GameForgeExport.run(folder: folder, layout: layout, jobs: jobs, game: game, options: o)
+            for l in r.lines { print(l) }
+            for p in r.problems { print("PROBLEM: \(p)") }
+            print(String(format: "WROTE: %@ (%.1f s)", r.out.path, Date().timeIntervalSince(started))); exit(0)
+        }
+    } }
+    app.run()
+}
+
 // Free:  Navigator --legibility <set folder>
 // Every interface piece measured at the size a phone shows it (Legibility): glints, fine detail, edges and, for
 // lettering, whether it reads at an iPhone SE's size — against the limits measured on the studio's shipped art.
@@ -26555,7 +26582,7 @@ final class GDDToAssetsRun: ObservableObject {
         ("Symbol win states", { $0.contains("_win.png") || $0.contains("_win_rmbg") }),
         // Symbols drawn from their base (a double, a free-games version), their reel-tall versions and multiplier badges.
         ("Symbol forms", { n in formNames.contains { n == $0 + ".png" || n == $0 + "_rmbg.png" } || n.contains("_stack.") || n.contains("_stack_rmbg")
-            || n.range(of: #"_x\d+(_rmbg)?\.png$"#, options: .regularExpression) != nil }),
+            || n.range(of: #"_x\d+(_rmbg)?\.png$|_locked(_rmbg)?\.png$|_train\d*(_rmbg)?\.png$"#, options: .regularExpression) != nil }),
         ("Landscape backgrounds", { $0.contains("-landscape") }),
         ("Lobby and loading", { n in Composites.all.contains { n.hasPrefix($0.name + ".png") } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
         // The lobby and loading pictures and the sell screen's avatar are made from the logo and key art: redone with them.
@@ -26748,6 +26775,13 @@ final class GDDToAssetsRun: ObservableObject {
                 if j.symbolForm == .wildMultiplier {
                     let values = SymbolForm.multipliers(j.title)
                     items.append(AssetChecklist.Item(group: "Symbol forms", name: "\(j.id)_x", what: "\(j.id)'s multiplier badges: " + values.map { "×\($0)" }.joined(separator: " "), files: values.map { "\(j.id)_x\($0).png" }, maker: "Symbol forms", cost: 0))
+                }
+                if j.symbolForm == .sticky {
+                    items.append(AssetChecklist.Item(group: "Symbol forms", name: "\(j.id)_locked", what: "the frame locked round \(j.id) while it is held", files: ["\(j.id)_locked.png"], maker: "Symbol forms", cost: 0))
+                }
+                if j.symbolForm == .train {
+                    let n = SymbolForm.trainParts(j.title)
+                    items.append(AssetChecklist.Item(group: "Symbol forms", name: "\(j.id)_train", what: "\(j.id) as one train of \(n) parts, a part per cell", files: ["\(j.id)_train.png"] + (1...n).map { "\(j.id)_train\($0).png" }, maker: "Symbol forms", cost: AssetChecklist.gpt(side / 2 * n, side / 2)))
                 }
             }
             for j in jobs where j.kind == .background {
@@ -27481,6 +27515,21 @@ final class GDDToAssetsRun: ObservableObject {
                 let badge = WheelLabel.badge("×\(v)", width: 512, height: 288, face: titleTones)
                 write(FrameKit.onBacking(badge, b), 512, 288, "\(j.id)_x\(v).png"); write(badge, 512, 288, "\(j.id)_x\(v)_rmbg.png")
             }
+        }
+        // A sticky symbol's locked frame, drawn in code at the symbol's size: free.
+        for j in jobs where j.kind == .symbol && j.symbolForm == .sticky && !has("\(j.id)_locked.png") && wanted("\(j.id)_locked.png") {
+            let n = ["1K": 1024, "4K": 4096][j.size] ?? 2048, frame = SymbolForm.lockedFrame(size: n, tones: titleTones)
+            write(FrameKit.onBacking(frame, b), n, n, "\(j.id)_locked.png"); write(frame, n, n, "\(j.id)_locked_rmbg.png")
+        }
+        // A wild train, drawn once as one wide piece from the wild, then cut at the part lines into a part per cell.
+        for j in jobs where j.kind == .symbol && j.symbolForm == .train && !has("\(j.id)_train.png") {
+            guard let sym = try? Data(contentsOf: url(j.filename)), let cg = loadCGImage(data: sym) else { continue }
+            let parts = SymbolForm.trainParts(j.title), side = cg.width / 2, w = side * parts
+            guard let canvas = blank(w, side) else { continue }
+            guard let px = paint("\(j.id)_train", prompt: GDDAssetPrompts.trainBrief(j, theme: theme, backing: (backing.name, b), parts: parts),
+                                 inputs: [downsamplePNG(sym, longEdge: 1024) ?? sym, canvas], w: w, h: side, covered: nil) else { continue }
+            both(px, w, side, "\(j.id)_train")
+            for k in 0..<parts { both(FrameKit.crop(px, width: w, k * side, 0, side, side).px, side, side, "\(j.id)_train\(k + 1)") }
         }
         // 11. Every background's landscape twin, the same scene widened (Derived).
         for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {
@@ -29982,12 +30031,18 @@ struct AssetBrowserView: View {
                 run.finishSet(ready + ids.filter { FrameRules.parse($0) != nil }, folder: folder, layerize: layerizeToo && fal)
             }
             .disabled(ready.isEmpty || run.keying || run.layering)
-            Button("Export for Spine…") {
-                let r = SpineExport.write(run: run, ids: ready.filter { FrameRules.parse($0) == nil }, folder: folder)
-                run.status = r.error ?? "Spine kits for \(r.kits) symbols in \(r.out.lastPathComponent)"
-                if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
+            Menu("Export") {
+                Button("Spine Kits for \(ready.count) Approved Symbols…") {
+                    let r = SpineExport.write(run: run, ids: ready.filter { FrameRules.parse($0) == nil }, folder: folder)
+                    run.status = r.error ?? "Spine kits for \(r.kits) symbols in \(r.out.lastPathComponent)"
+                    if r.error == nil { NSWorkspace.shared.activateFileViewerSelecting([r.out]) }
+                }
+                .disabled(ready.isEmpty)
+                Button("Game Forge Layout and Photoshop Files…") { exportGameForge() }
+                    .disabled(run.reelLayout == nil || working != nil)
             }
-            .disabled(ready.isEmpty)
+            .fixedSize()
+            .help("Spine: a layer kit per approved symbol. Game Forge: the asset folder, layout files and a layered PSB of the game screen per orientation, free.")
             let core = run.coreApproval(folder)
             Menu("Game Interface") {
                 Button("1 · Core Pieces…") { run.makeReelArea(phase: .core) }
@@ -30009,6 +30064,22 @@ struct AssetBrowserView: View {
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
+    }
+
+    /// The set as Game Forge takes it (GameForgeExport), in the set's gameforge folder, in the background: free.
+    private func exportGameForge() {
+        guard let layout = run.reelLayout else { return }
+        let (jobs, game, folder) = (run.jobs, run.gameName, folder)
+        working = "Game Forge"; run.status = "Exporting for Game Forge — the layout, assets and two Photoshop files…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = GameForgeExport.run(folder: folder, layout: layout, jobs: jobs, game: game, options: .init())
+            DispatchQueue.main.async {
+                working = nil
+                run.status = r.problems.isEmpty ? "Game Forge: layout, assets and Photoshop files in \(r.out.lastPathComponent)"
+                    : "Game Forge: exported, \(r.problems.count) piece\(r.problems.count == 1 ? "" : "s") not drawn yet — see its README"
+                NSWorkspace.shared.activateFileViewerSelecting([r.out])
+            }
+        }
     }
 
     // MARK: Keys
@@ -33235,5 +33306,319 @@ struct NavigatorFolderPicker: View {
         } catch {
             self.error = "Couldn’t create it: \(error.localizedDescription)"
         }
+    }
+}
+
+// MARK: - Export for Game Forge
+
+/// A set handed to Game Forge, the studio's slot platform, as its build and layout editor take it: the asset folder
+/// (`assets/<game>/textures/portrait|landscape/en/…`, PNG at 3×), the layout files (GameForge.records) and a layered
+/// PSB of the game screen per orientation built from the same positions, so the picture and the layout agree. Free:
+/// nothing is drawn — the set's pictures are cut to what they show, sized and placed. The reels, jackpot table and pots
+/// keep the arrangement of the set's reel preview; GameForge.compose fits it to each orientation's design box.
+enum GameForgeExport {
+    struct Options {
+        /// Portrait design height (722: the safe zone under the host's bars, as most of its games have it; 844 without) and the
+        /// bands at the bottom of each box the game's control bar takes.
+        var designHeight = 722.0, hud = 120.0, landscapeHUD = 100.0
+        /// The game's folder name, `<id>_<Name>` as its games/ folder is named; from the game's name when not given.
+        var gameFolder: String?
+        var out: URL?
+    }
+
+    /// "Lucky Lanterns" → LuckyLanterns; "1234 Lucky Lanterns" → 1234_LuckyLanterns, as games/<id>_<Name> is named.
+    static func folderName(_ game: String) -> String {
+        let words = game.split { !$0.isLetter && !$0.isNumber }.map(String.init)
+        func camel(_ w: [String]) -> String { w.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined() }
+        guard let first = words.first else { return "Game" }
+        return first.allSatisfy(\.isNumber) && words.count > 1 ? first + "_" + camel(Array(words.dropFirst())) : camel(words)
+    }
+
+    /// The name the game's code registers a mode's reel grid under, for the layout to group it with its bezel.
+    static func gridName(_ scope: String) -> String { scope == "base" ? "reelGrid" : scope + "ReelGrid" }
+
+    static func run(folder: URL, layout: ReelLayout, jobs: [AssetJob], game: String, options o: Options) -> (out: URL, lines: [String], problems: [String]) {
+        typealias Piece = FrameKit.Piece
+        typealias Box = GameForge.Box
+        let fm = FileManager.default, space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let out = o.out ?? folder.appendingPathComponent("gameforge")
+        let gameDir = o.gameFolder ?? folderName(game)
+        let textures = out.appendingPathComponent("assets/\(gameDir)/textures")
+        var lines: [String] = [], problems: [String] = [], upscaled: [String] = []
+        let portrait = GameForge.Profile.portrait(height: o.designHeight, hud: o.hud), landscape = GameForge.Profile.landscape(hud: o.landscapeHUD)
+
+        func exists(_ n: String) -> Bool { fm.fileExists(atPath: folder.appendingPathComponent(n).path) }
+        func load(_ n: String) -> Piece? {
+            guard let cg = loadCGImage(folder.appendingPathComponent(n)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            return Piece(px: px, w: cg.width, h: cg.height)
+        }
+        /// A picture cut to what it shows, and where that sat in it.
+        struct Cut { var piece: Piece, x: Int, y: Int, fullW: Int, fullH: Int }
+        func cut(_ p: Piece) -> Cut? {
+            guard let e = LayerizeAssembly.extent(p.px, width: p.w, height: p.h, alpha: 8) else { return nil }
+            return Cut(piece: FrameKit.crop(p.px, width: p.w, e.x, e.y, e.w, e.h), x: e.x, y: e.y, fullW: p.w, fullH: p.h)
+        }
+        func write(_ p: Piece, _ path: String) {
+            let url = textures.appendingPathComponent(path)
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let img = ChromaKeyOutputRules.image(straightRGBA8: p.px, width: p.w, height: p.h, space: space), let d = encodePNG(img) { try? d.write(to: url) }
+            else { problems.append("could not write \(path)") }
+        }
+        /// Fills `w`×`h` and is cropped to it about its centre, as the game cover-fits a background.
+        func cover(_ p: Piece, _ w: Int, _ h: Int, _ what: String) -> Piece {
+            let s = max(Double(w) / Double(p.w), Double(h) / Double(p.h))
+            if s > 1.02 { upscaled.append(String(format: "%@ is enlarged %.0f%% to %d×%d", what, (s - 1) * 100, w, h)) }
+            let sw = max(w, Int((Double(p.w) * s).rounded())), sh = max(h, Int((Double(p.h) * s).rounded()))
+            return FrameKit.crop(FrameKit.resized(p, sw, sh).px, width: sw, (sw - w) / 2, (sh - h) / 2, w, h)
+        }
+
+        // The pieces every mode shares, and each mode's reel block laid out as its reel preview is (reelPreview).
+        let logo = load("shared_logo_master_rmbg.png").flatMap(cut)
+        let tableFull = load("shared_interface_jackpotTable_rmbg.png"), table = tableFull.flatMap(cut)
+        let pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { load("\($0)_rmbg.png").flatMap(cut) }
+        struct Laid { var scope: String, area: ReelArea, cuts: [String: Cut], p: [String: Box], l: [String: Box] }
+        var modes: [Laid] = []
+        for (scope, grid) in layout.fileModes {
+            let area = ReelArea(layout, grid: grid), W = Double(area.width), g = area.grid
+            let tableH = tableFull.map { Double($0.h) * W / Double($0.w) } ?? 0, potW = 1.3 * Double(area.cell)
+            let top = tableH + (pots.map { potW * Double($0.fullH) / Double($0.fullW) }.max() ?? 0)
+            var block: [String: Box] = [:], cuts: [String: Cut] = [:]
+            func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double) {
+                block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k); cuts[key] = c
+            }
+            for (key, file) in [("texture", "reelTexture"), ("dividers", "dividers"), ("bezel", "bezel")] {
+                guard let p = load("\(scope)_interface_\(file)_rmbg.png") else { problems.append("\(scope): no \(file) drawn yet"); continue }
+                guard p.w == area.width, p.h == area.height else { problems.append("\(scope): its \(file) was laid for another grid — Make Again ▸ Bezel"); continue }
+                if let c = cut(p) { add(key, c, 0, top, 1) }
+            }
+            block["grid"] = Box(x: Double(g.x), y: top + Double(g.y), w: Double(g.w), h: Double(g.h))
+            let tableY = top + Double(g.y - area.band) - tableH + tableH / 6
+            if let t = table, let f = tableFull { add("table", t, 0, tableY, W / Double(f.w)) }
+            for (i, p) in pots.enumerated() {
+                let k = potW / Double(p.fullW), cx = Double(g.x) + Double(g.w) * Double(2 * i + 1) / Double(2 * pots.count)
+                add("pot\(i + 1)", p, cx - potW / 2, tableY - Double(p.fullH) * k + potW / 8, k)
+            }
+            let shape = logo.map { (w: Double($0.piece.w), h: Double($0.piece.h)) }
+            if let logo { cuts["logo"] = logo }
+            modes.append(Laid(scope: scope, area: area, cuts: cuts, p: GameForge.compose(block: block, logo: shape, profile: portrait),
+                              l: GameForge.compose(block: block, logo: shape, profile: landscape)))
+        }
+
+        // Each file exported once, at 3× the largest it is shown — never past what was drawn (then shown larger, and said).
+        func asset(_ key: String, _ scope: String) -> String {
+            let s = scope.lowercased()
+            switch key {
+            case "texture": return "backgrounds/reel-texture-\(s)"
+            case "dividers": return "backgrounds/reel-dividers-\(s)"
+            case "bezel": return "backgrounds/reel-bezel-\(s)"
+            case "table": return "backgrounds/jackpot-table"
+            case "logo": return "logo/logo"
+            default: return "meters/" + key.replacingOccurrences(of: "pot", with: "pot-")
+            }
+        }
+        var need: [String: (w: Double, cut: Cut)] = [:]
+        for m in modes { for (k, c) in m.cuts { let a = asset(k, m.scope); need[a] = (max(need[a]?.w ?? 0, 3 * max(m.p[k]?.w ?? 0, m.l[k]?.w ?? 0)), c) } }
+        var exported: [String: Piece] = [:]
+        for (a, n) in need.sorted(by: { $0.key < $1.key }) {
+            let c = n.cut.piece, w = max(1, min(c.w, Int((n.w - 0.01).rounded(.up)))), h = max(1, Int((Double(w) * Double(c.h) / Double(c.w)).rounded()))
+            if Double(c.w) < n.w * 0.98 { upscaled.append(String(format: "%@ was drawn %d px wide and is shown up to %.0f (at 3×)", a, c.w, n.w)) }
+            let p = w == c.w ? c : FrameKit.resized(c, w, h)
+            write(p, "portrait/en/\(a).png"); exported[a] = p
+        }
+
+        // The modes' records: pictures, the code-built grid each bezel frames, the jackpots' amounts, backgrounds.
+        let jackpots = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
+        let baseArea = ReelArea(layout), jt = JackpotTable(count: jackpots.count, width: baseArea.grid.w + 2 * baseArea.band)
+        var gf: [GameForge.Mode] = [], backgrounds: [String: (p: Piece, l: Piece)] = [:]
+        for m in modes {
+            let sc = m.scope, s = sc.lowercased()
+            var items: [GameForge.Item] = []
+            func item(_ key: String, _ name: String, _ label: String, _ group: String?, _ z: Int) {
+                guard let p = m.p[key], let l = m.l[key] else { return }
+                let a = key == "grid" ? nil : asset(key, sc)
+                items.append(GameForge.Item(name: name, asset: a, label: label, group: group, z: z, portrait: p, landscape: l, pixels: a.flatMap { exported[$0]?.w } ?? 0))
+            }
+            item("texture", "reel-texture-\(sc)", "Reel texture", "reel-\(sc)", 146)
+            item("dividers", "reel-dividers-\(sc)", "Reel dividers", "reel-\(sc)", 147)
+            item("bezel", "reel-bezel-\(sc)", "Bezel", "reel-\(sc)", 148)
+            item("grid", gridName(sc), "Reel grid (game code)", "reelgrid-\(sc)", 149)
+            item("table", "jackpot-table-\(sc)", "Jackpot table", "jackpots-\(sc)", 150)
+            for i in pots.indices { item("pot\(i + 1)", "pot-\(i + 1)-\(sc)", "Pot \(i + 1)", "pots-\(sc)", 151) }
+            item("logo", "logo-\(sc)", "Logo", nil, 152)
+            let gp = m.p["grid"]!, gl = m.l["grid"]!
+            let groups = [GameForge.Group(handle: "reel-\(sc)", label: "Reel + bezel"),
+                          GameForge.Group(handle: "reelgrid-\(sc)", label: "Reel grid", landscapeScale: gl.w / gp.w),
+                          GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpots"), GameForge.Group(handle: "pots-\(sc)", label: "Pots")]
+            // The amounts print in each plaque's dark field, in the table's own space.
+            var labels: [GameForge.Label] = []
+            if let t = table, let f = tableFull, f.w == jt.width, f.h == jt.height, let e = exported["backgrounds/jackpot-table"] {
+                let k = Double(e.w) / Double(t.piece.w)
+                for (i, field) in jt.fields.enumerated() where i < jackpots.count {
+                    let key = PopUps.key(GDDAssetPrompts.letteredWord(jackpots[i]) ?? jackpots[i].title)
+                    let box = Box(x: (Double(field.x - t.x) * k - Double(e.w) / 2) / 3, y: (Double(field.y - t.y) * k - Double(e.h) / 2) / 3,
+                                  w: Double(field.w) * k / 3, h: Double(field.h) * k / 3)
+                    labels.append(GameForge.Label(name: "\(key)-amount-\(sc)", label: "\(key) amount", text: "2,000", parent: "jackpot-table-\(sc)",
+                                                  dataKey: "jackpot.\(key)", box: box, z: 153))
+                }
+            }
+            var bg: (portrait: String, landscape: String)?
+            if let bp = ["bg_\(s).png", "bg_base.png"].first(where: exists).flatMap(load) {
+                let bl = ["bg_\(s)-landscape.png", "bg_base-landscape.png"].first(where: exists).flatMap(load) ?? bp
+                let pc = portrait.canvas, lc = landscape.canvas
+                let pp = cover(bp, pc.w, pc.h, "the \(sc) portrait background"), lp = cover(bl, lc.w, lc.h, "the \(sc) landscape background")
+                write(pp, "portrait/en/backgrounds/background_\(s)_portrait.png"); write(lp, "landscape/en/backgrounds/background_\(s)_landscape.png")
+                backgrounds[sc] = (pp, lp)
+                bg = ("backgrounds/background_\(s)_portrait", "backgrounds/background_\(s)_landscape")
+            } else { problems.append("\(sc): no background drawn yet") }
+            gf.append(GameForge.Mode(scope: sc, items: items, groups: groups, labels: labels, background: bg))
+        }
+
+        // The symbols, for the game's code to draw on the reels: 3× the largest cell they are shown in.
+        let cell = modes.flatMap { m in [m.p["grid"]!, m.l["grid"]!].map { Double(m.area.cell) * $0.w / Double(m.area.grid.w) } }.max() ?? 92
+        let symbolPx = Int((3 * cell - 0.01).rounded(.up))
+        var symbols: [String: Piece] = [:]
+        for j in jobs where j.kind == .symbol {
+            for (file, stem) in [("\(j.id)_rmbg.png", "symbol-\(j.id.lowercased())"), ("\(j.id)_win_rmbg.png", "symbol-\(j.id.lowercased())-win")] {
+                guard let p = load(file) else { continue }
+                let w = min(p.w, symbolPx), q = w == p.w ? p : FrameKit.resized(p, w, max(1, w * p.h / p.w))
+                write(q, "portrait/en/symbols/\(stem).png")
+                if !stem.hasSuffix("-win"), ![.replacement, .blank].contains(j.role) { symbols[j.id] = q }
+            }
+        }
+
+        // The layout files.
+        let layoutDir = out.appendingPathComponent("layout")
+        try? fm.createDirectory(at: layoutDir, withIntermediateDirectories: true)
+        let r = GameForge.records(gf)
+        for (obj, name) in [(r.placements as Any, "layoutPlacements"), (r.groups, "layoutGroups"), (r.texts, "layoutTexts"), (r.background, "layoutBackground")] {
+            if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
+                try? (d + Data("\n".utf8)).write(to: layoutDir.appendingPathComponent("\(name).json"))
+            }
+        }
+
+        // The PSBs: a group per mode (base shown), its pieces where the layout puts them, the reels filled as the
+        // preview fills them, and the design box with its HUD band as a hidden guide.
+        func psb(_ prof: GameForge.Profile, landscape isL: Bool) -> Data {
+            let (CW, CH) = prof.canvas
+            func layer(_ name: String, _ src: Piece, _ b: Box) -> PhotoshopFile.Node {
+                let o = prof.pixel(b.x, b.y), w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
+                let p = w == src.w && h == src.h ? src : FrameKit.resized(src, w, h)
+                return .layer(name: name, x: Int(o.x.rounded()), y: Int(o.y.rounded()), w: w, h: h, px: p.px)
+            }
+            var top: [PhotoshopFile.Node] = [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)]
+            for (i, m) in modes.enumerated() {
+                let boxes = isL ? m.l : m.p, mode = gf[i], sc = m.scope
+                func picture(_ key: String, _ name: String) -> PhotoshopFile.Node? {
+                    guard let b = boxes[key], let src = exported[asset(key, sc)] else { return nil }
+                    return layer(name, src, b)
+                }
+                var jack: [PhotoshopFile.Node] = []
+                if let tb = boxes["table"], let e = exported["backgrounds/jackpot-table"] {
+                    let k = tb.w / (Double(e.w) / 3)
+                    for l in mode.labels {
+                        let b = Box(x: tb.cx + l.box.x * k, y: tb.cy + l.box.y * k, w: l.box.w * k, h: l.box.h * k)
+                        let w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
+                        jack.append(layer("\(l.name) (text: \(l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), b))
+                    }
+                }
+                jack += [picture("table", "jackpot-table-\(sc)")].compactMap { $0 }
+                var reels: [PhotoshopFile.Node] = []
+                if let gb = boxes["grid"], let s = filledReels(m.area, symbols: symbols, jobs: jobs, width: max(1, Int((gb.w * 3).rounded()))) { reels.append(layer("\(gridName(sc)) (game code)", s, gb)) }
+                var children: [PhotoshopFile.Node] = []
+                if let n = picture("logo", "logo-\(sc)") { children.append(n) }
+                children.append(.group(name: "jackpots-\(sc)", children: jack, visible: true))
+                children.append(.group(name: "pots-\(sc)", children: pots.indices.compactMap { picture("pot\($0 + 1)", "pot-\($0 + 1)-\(sc)") }, visible: true))
+                children.append(.group(name: "reelgrid-\(sc)", children: reels, visible: true))
+                children.append(.group(name: "reel-\(sc)", children: [picture("bezel", "reel-bezel-\(sc)"), picture("dividers", "reel-dividers-\(sc)"), picture("texture", "reel-texture-\(sc)")].compactMap { $0 }, visible: true))
+                if let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
+                top.append(.group(name: sc, children: children, visible: i == 0))
+            }
+            return PhotoshopFile.data(width: CW, height: CH, nodes: top)
+        }
+        let stem = gameDir.replacingOccurrences(of: "/", with: "-")
+        for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
+            try? psb(prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_\(name).psb"))
+        }
+
+        // What a developer needs to wire it in, written beside it.
+        let gp = modes.first.map { (Double($0.area.cell) * $0.p["grid"]!.w / Double($0.area.grid.w), Double($0.area.gap) * $0.p["grid"]!.w / Double($0.area.grid.w)) } ?? (0, 0)
+        var readme = "# \(game) for Game Forge\n\nMade by Navigator from the set \(folder.lastPathComponent), \(ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate])).\n\n"
+        readme += "## Put it in the game\n\n1. Copy `assets/\(gameDir)` into the Game Forge repository's `assets/`. Its name must be the game's `games/<id>_<Name>` folder name exactly — rename it if it is not.\n"
+        readme += "2. Copy `layout/*.json` into the game's layout folder (`gameConfig.configDir`) and add the modes to `package.json` `gameConfig.scopes`: \(modes.map { "`\($0.scope)`" }.joined(separator: ", ")).\n"
+        readme += "3. `pnpm build:assets`, then `pnpm dev`; Ctrl+Shift+E opens the layout editor on it.\n\n"
+        readme += "## The reels are the game's code\n\nThe bezel's openings are drawn for the grid below. Register each mode's grid under its name so the layout groups it with its bezel (group `reelgrid-<mode>`, placed on the bezel's openings), and draw it at these sizes (design px, portrait; the group scales it in landscape):\n\n| Mode | Grid name | Rows × reels | Cell | Gap between reels |\n|---|---|---|---|---|\n"
+        for m in modes {
+            let k = m.p["grid"]!.w / Double(m.area.grid.w), g = layout.fileModes.first { $0.name == m.scope }?.grid
+            readme += String(format: "| %@ | `%@` | %@ | %.1f | %.1f |\n", m.scope, gridName(m.scope), g.map { "\($0.rows) × \($0.reels)" } ?? "?", Double(m.area.cell) * k, Double(m.area.gap) * k)
+        }
+        readme += "\nSymbols are in `textures/portrait/en/symbols/` at \(symbolPx) px (3× the largest cell they are shown in); `-win` is the win state.\n\n"
+        readme += "## Assumed — change to suit the game\n\n- Portrait design box 390 × \(Int(o.designHeight)), landscape 970 × 844 (Game Forge's LayoutService); the box's centre is the origin, pinned to the top of the screen.\n"
+        readme += "- The control bar takes the bottom \(Int(o.hud)) px of the portrait box and \(Int(o.landscapeHUD)) of the landscape one: nothing is placed there.\n"
+        readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
+        readme += "- The PSBs show each mode as a group (base shown, the rest hidden) and the design box with its control-bar band in `guides`, hidden.\n"
+        if !upscaled.isEmpty { readme += "\n## Shown larger than drawn\n\n" + upscaled.map { "- \($0)\n" }.joined() }
+        if !problems.isEmpty { readme += "\n## Not done\n\n" + problems.map { "- \($0)\n" }.joined() }
+        try? readme.write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+
+        lines.append("MODES: " + modes.map(\.scope).joined(separator: ", "))
+        lines.append("PLACEMENTS: \((r.placements["records"] as? [Any])?.count ?? 0) · GROUPS: \(r.groups.count) · TEXTS: \(r.texts.count) · SYMBOLS: \(symbols.count) at \(symbolPx) px")
+        lines.append(String(format: "CELL: %.1f design px portrait, gap %.1f", gp.0, gp.1))
+        lines += upscaled.map { "LARGER THAN DRAWN: \($0)" }
+        return (out, lines, problems)
+    }
+
+    /// The design box outlined and its control-bar band shaded, on the whole canvas.
+    static func guide(_ prof: GameForge.Profile) -> PhotoshopFile.Node {
+        let (W, H) = prof.canvas, x0 = Int(((prof.screenWidth - prof.width) / 2 * 3).rounded()), x1 = x0 + Int(prof.width * 3), y1 = Int(prof.height * 3), hud = Int((prof.height - prof.hud) * 3)
+        var px = [UInt8](repeating: 0, count: W * H * 4)
+        func set(_ x: Int, _ y: Int, _ a: UInt8) { guard x >= 0, y >= 0, x < W, y < H else { return }; let i = (y * W + x) * 4; px[i] = 255; px[i + 1] = 0; px[i + 2] = 255; px[i + 3] = a }
+        for y in hud..<min(H, y1) { for x in x0..<min(W, x1) { set(x, y, 70) } }
+        for t in 0..<6 {
+            for x in x0..<min(W, x1) { set(x, t, 255); set(x, y1 - 1 - t, 255) }
+            for y in 0..<min(H, y1) { set(x0 + t, y, 255); set(x1 - 1 - t, y, 255) }
+        }
+        return .layer(name: "design box and control-bar band", x: 0, y: 0, w: W, h: H, px: px)
+    }
+
+    /// The reels filled with the set's symbols as its reel preview fills them (the same draw), `width` px wide.
+    static func filledReels(_ area: ReelArea, symbols: [String: FrameKit.Piece], jobs: [AssetJob], width: Int) -> FrameKit.Piece? {
+        let pool = jobs.filter { symbols[$0.id] != nil }
+        guard !pool.isEmpty else { return nil }
+        let weighted = pool.flatMap { j in Array(repeating: j, count: j.role == .lowPay ? 5 : [.highPay, .mediumPay].contains(j.role) ? 3 : 1) }
+        let g = area.grid, k = Double(width) / Double(g.w), H = max(1, Int((Double(g.h) * k).rounded()))
+        var canvas = [UInt8](repeating: 0, count: width * H * 4), seed: UInt64 = 7, cache: [String: FrameKit.Piece] = [:]
+        func next() -> Int { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Int(seed >> 33) }
+        for w in area.windows {
+            let rows = max(1, Int((Double(w.h) / Double(area.cell)).rounded())), ch = Double(w.h) / Double(rows), size = max(1, Int((min(Double(area.cell), ch) * k).rounded()))
+            for r in 0..<rows {
+                let j = weighted[next() % weighted.count], key = "\(j.id)-\(size)"
+                if cache[key] == nil, let p = symbols[j.id] { cache[key] = FrameKit.resized(p, size, size) }
+                guard let p = cache[key] else { continue }
+                let x = Double(w.x - g.x) * k + (Double(w.w) * k - Double(size)) / 2, y = (Double(w.y - g.y) + Double(r) * ch) * k + (ch * k - Double(size)) / 2
+                FrameKit.over(&canvas, width: width, p, at: Int(x.rounded()), Int(y.rounded()))
+            }
+        }
+        return FrameKit.Piece(px: canvas, w: width, h: H)
+    }
+
+    /// A placeholder amount, white with a dark outline, centred in `w`×`h` — the PSB's stand-in for the printed text.
+    static func amount(_ text: String, _ w: Int, _ h: Int) -> [UInt8] {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard w > 0, h > 0, let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return [UInt8](repeating: 0, count: max(0, w * h * 4)) }
+        func line(_ size: CGFloat) -> CTLine {
+            CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [kCTFontAttributeName as NSAttributedString.Key: CTFontCreateWithName("Helvetica-Bold" as CFString, size, nil),
+                                                                                           kCTForegroundColorFromContextAttributeName as NSAttributedString.Key: true]))
+        }
+        var size = CGFloat(h) * 0.7, l = line(size), b = CTLineGetBoundsWithOptions(l, .useGlyphPathBounds)
+        if b.width > CGFloat(w) * 0.9 { size *= CGFloat(w) * 0.9 / b.width; l = line(size); b = CTLineGetBoundsWithOptions(l, .useGlyphPathBounds) }
+        let at = CGPoint(x: (CGFloat(w) - b.width) / 2 - b.minX, y: (CGFloat(h) - b.height) / 2 - b.minY)
+        ctx.setLineJoin(.round)
+        for (mode, colour, width) in [(CGTextDrawingMode.stroke, CGColor(red: 0, green: 0, blue: 0, alpha: 1), size * 0.12), (.fill, CGColor(red: 1, green: 1, blue: 1, alpha: 1), 0)] {
+            ctx.setStrokeColor(colour); ctx.setFillColor(colour); ctx.setLineWidth(width); ctx.setTextDrawingMode(mode)
+            ctx.textPosition = at; CTLineDraw(l, ctx)
+        }
+        guard let img = ctx.makeImage(), let px = ChromaKeyOutputRules.straightRGBA8(img) else { return [UInt8](repeating: 0, count: w * h * 4) }
+        return px
     }
 }

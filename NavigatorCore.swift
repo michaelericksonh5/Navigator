@@ -14,6 +14,7 @@ import CoreGraphics
 import ImageIO
 import Vision
 import CoreText
+import Accelerate
 
 import Darwin
 
@@ -11580,7 +11581,45 @@ public enum GDDSymbolSetRules {
                   parseTable(gddText),            // bare codes in a column
                   parseHeadings(gddText)]         // "Copper Kettle (HP1)", "Royals (5)" — older GDDs
         where c.count > best.count { best = c }
-        return best
+        // Only counted ("4 Majors", "5 royals"): believed only when no list says more.
+        return best.isEmpty ? parseCounts(gddText) : best
+    }
+
+    /// Symbols only counted, as some older GDDs' "Basic Game Breakdown" or "Main Game Features" bullets give them
+    /// (2026-10-06, 4 of the 68 documents nothing else read): "4 Majors (HP1, HP2,)", "2 Mids", "5 royals", "4 majors,
+    /// 4 royals", "1 Wild", a bare "Wild" or "Bonus symbol". The counts are the document's; the codes the families'
+    /// (majors HP, mids MP, royals LP), numbered in order. Believed only as a set: high pays and mids or royals counted.
+    static func parseCounts(_ gddText: String) -> [SlotSymbol] {
+        let numbers = ["one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8]
+        let families: [(String, String, SlotSymbolRole)] = [("major", "HP", .highPay), ("high pay", "HP", .highPay), ("premium", "HP", .highPay),
+                                                            ("mid", "MP", .mediumPay), ("minor", "MP", .mediumPay), ("royal", "LP", .lowPay), ("low pay", "LP", .lowPay)]
+        var out: [SlotSymbol] = []
+        func add(_ family: String, _ role: SlotSymbolRole, _ n: Int, _ note: String) {
+            guard n > 0, n <= 12, !out.contains(where: { $0.code.hasPrefix(family) }) else { return }
+            for k in 1...n { out.append(SlotSymbol(code: "\(family)\(k)", index: out.count, role: role, tier: k, note: note)) }
+        }
+        let count = try! NSRegularExpression(pattern: #"(?i)\b(\d{1,2}|one|two|three|four|five|six|seven|eight)\s+(majors?|high pays?|premiums?|mids?|minors?|royals?|low pays?)\b"#)
+        let special = try! NSRegularExpression(pattern: #"(?i)^(?:(\d)\s+)?(wild|scatter|bonus)(?:\s+symbols?)?(?:\s*\(.*\))?$"#)
+        for raw in gddText.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: CharacterSet(charactersIn: "•◦▪●○■*·-–— \t\u{00A0}"))
+            guard !line.isEmpty, line.count <= 60 else { continue }
+            let ns = line as NSString
+            for m in count.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+                let n = numbers[ns.substring(with: m.range(at: 1)).lowercased()] ?? Int(ns.substring(with: m.range(at: 1))) ?? 0
+                let word = ns.substring(with: m.range(at: 2)).lowercased()
+                if let f = families.first(where: { word.hasPrefix($0.0) }) { add(f.1, f.2, n, f.2 == .lowPay ? "a card-rank royal" : "") }
+            }
+            if let m = special.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
+                let n = m.range(at: 1).location == NSNotFound ? 1 : Int(ns.substring(with: m.range(at: 1))) ?? 1
+                switch ns.substring(with: m.range(at: 2)).lowercased() {
+                case "wild": add("WD", .wild, n, "")
+                case "scatter": add("SC", .scatter, n, "")
+                default: add("BO", .bonus, n, "")
+                }
+            }
+        }
+        guard out.count >= 4, out.contains(where: { $0.role == .highPay }), out.contains(where: { [.mediumPay, .lowPay].contains($0.role) }) else { return [] }
+        return out
     }
 
     /// The code families of the older (Confluence-era) GDDs, read only as headings: M the majors (high pays), D a
@@ -14849,6 +14888,17 @@ public enum FrameKit {
     static func crop(_ px: [UInt8], width w: Int, _ x: Int, _ y: Int, _ cw: Int, _ ch: Int, only: ((Int) -> Bool)? = nil) -> Piece {
         var out = [UInt8](repeating: 0, count: cw * ch * 4)
         let rows = px.count / max(1, w * 4)
+        // Without a mask, whole rows at once (memmove): pixel by pixel, unoptimized as the app is built, a full
+        // screen took seconds.
+        if only == nil {
+            let x0 = max(0, x), x1 = min(w, x + cw)
+            guard x1 > x0 else { return Piece(px: out, w: cw, h: ch) }
+            for yy in 0..<ch where y + yy >= 0 && y + yy < rows {
+                let s = ((y + yy) * w + x0) * 4, d = (yy * cw + x0 - x) * 4, n = (x1 - x0) * 4
+                out.replaceSubrange(d..<(d + n), with: px[s..<(s + n)])
+            }
+            return Piece(px: out, w: cw, h: ch)
+        }
         for yy in 0..<ch { for xx in 0..<cw {
             // Past the source's edge reads as transparent: a crop laid for another size must not trap.
             guard x + xx >= 0, x + xx < w, y + yy >= 0, y + yy < rows else { continue }
@@ -16859,6 +16909,8 @@ extension GDDAssetPrompts {
         case .expandingWild: line += " It also expands to cover its whole reel, so its subject must read as well drawn tall."
         case .stacked: line += " It lands stacked the height of a reel, so its subject must read as well drawn as one tall piece."
         case .colossal: line += " It also lands as a 2×2 or 3×3 block, so it holds up shown large: bold shapes, nothing that only works small."
+        case .sticky: line += " It stays locked in place for later spins with a lit frame laid round it, so it reads complete well inside that frame."
+        case .train: line += " It also travels as a train of linked parts over the reels, so it reads as one vehicle or creature seen side on."
         default: break
         }
         let does = job.job.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
@@ -17336,6 +17388,15 @@ extension GDDAssetPrompts {
             "Image 1 is a symbol of a video slot game themed “\(theme.name)”. Edit the last attached image, a tall plain canvas exactly one reel wide and \(rows) symbols tall: draw this same symbol as one continuous tall piece filling the whole canvas — its subject extended to the full height (a standing figure, a long body, a column of its element or treasure), in exactly its art, colours, lighting and finish."
                 + (word.map { " “\($0)” is lettered once, large, across its lower part, as on the symbol, spelled exactly so. " + letteringRules } ?? ""),
             "One piece, never \(rows) symbols stacked: no lines, seams or frames across it. If the symbol has a frame, one frame around the whole tall piece. Static art only: no burst, rays or flying sparkles.",
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
+    /// A wild train (SymbolForm.train) on a wide plain canvas (the last image), drawn from the wild (attached first): one train
+    /// of `parts` linked parts, each exactly a symbol wide, cut apart afterwards at the part lines.
+    static func trainBrief(_ job: AssetJob, theme: GameTheme, backing: (name: String, rgb: RGB8), parts: Int) -> String {
+        [
+            "Image 1 is the wild symbol of a video slot game themed “\(theme.name)”. Edit the last attached image, a wide plain canvas exactly \(parts) symbols wide and one symbol tall: draw this wild as one train of \(parts) linked parts filling the canvas from end to end — the lead part at the left (an engine, or a creature's head) facing left, the others following it — each part exactly one symbol wide, in exactly the wild's art, colours, lighting and finish.",
+            "The parts join exactly where one symbol's width ends and the next begins, each part whole and complete inside its own width, so the train can be cut apart there and each part shown in a cell of its own. Seen side on, level, filling the canvas's height. Static art only: no burst, rays, smoke or flying sparkles.",
             backdropLine(backing),
         ].joined(separator: "\n\n")
     }
@@ -17943,13 +18004,13 @@ public enum GDDMirror {
 /// base symbol once that is approved (a double, a triple, a free-games version), or drawn as itself with a piece added
 /// (a reel-tall version, multiplier badges).
 public enum SymbolForm: String, CaseIterable, Sendable {
-    case single, double, triple, freeGames, valueWild, wildMultiplier, expandingWild, stacked, colossal
+    case single, double, triple, freeGames, valueWild, wildMultiplier, expandingWild, stacked, colossal, sticky, train
 
     public var label: String {
         switch self {
         case .single: "Single"; case .double: "Double"; case .triple: "Triple"; case .freeGames: "Free-games version"
         case .valueWild: "Value wild"; case .wildMultiplier: "Wild multiplier"; case .expandingWild: "Expanding wild"
-        case .stacked: "Stacked"; case .colossal: "Colossal"
+        case .stacked: "Stacked"; case .colossal: "Colossal"; case .sticky: "Sticky"; case .train: "Wild train"
         }
     }
     /// Why games have it, what it does, how it looks, how it is shown — the research, said once.
@@ -17963,6 +18024,8 @@ public enum SymbolForm: String, CaseIterable, Sendable {
         case .expandingWild: "A wild that grows to cover its whole reel (7 GDDs: EW, FGEW)."
         case .stacked: "A symbol stacked the height of a reel, filling the screen for big wins (13 GDDs: Super Stacks)."
         case .colossal: "One symbol landing as a 2×2 or 3×3 block (7 GDDs: Super Symbols)."
+        case .sticky: "It stays where it lands for later spins or the whole bonus: a locked wild, or a multiplier or adder that keeps adding every respin (5 GDDs: locked and sticky wilds, persistent multipliers and adders)."
+        case .train: "A wild made of linked parts that land together and travel over the reels, collecting the special wilds they pass, respinning until none are left (1 GDD)."
         }
     }
     public var look: String {
@@ -17974,6 +18037,8 @@ public enum SymbolForm: String, CaseIterable, Sendable {
         case .wildMultiplier: "The game's wild, with a ×2/×3 badge laid over it."
         case .expandingWild, .stacked: "The symbol as one continuous tall piece the height of a reel."
         case .colossal: "The single's own art, shown at block size."
+        case .sticky: "The symbol itself; while it is held, a lit frame locked round its cell."
+        case .train: "One train — an engine and its cars, or a creature's head, body and tail — drawn as one piece and cut into a part per cell, the parts meeting exactly."
         }
     }
     public var display: String {
@@ -17986,6 +18051,8 @@ public enum SymbolForm: String, CaseIterable, Sendable {
         case .expandingWild: "One cell when it lands, then its reel-tall version as it expands."
         case .stacked: "Several cells on one reel, as one piece."
         case .colossal: "2×2 or 3×3 cells."
+        case .sticky: "One cell; the locked frame over it for as long as it stays (one GDD would build it into the bezel)."
+        case .train: "A part per cell, in a row, moving together over the other symbols."
         }
     }
 
@@ -18009,10 +18076,47 @@ public enum SymbolForm: String, CaseIterable, Sendable {
             if c.hasPrefix("WDWY") || n.range(of: #"wysiwyg|credit value|cash value|bucks|\bvalue\b"#, options: .regularExpression) != nil { return (.valueWild, nil) }
             if c.hasPrefix("MUWD") || n.range(of: #"multiplier|\b\d{1,2}\s?x\b|\bx\s?\d{1,2}\b"#, options: .regularExpression) != nil { return (.wildMultiplier, nil) }
             if c.hasPrefix("EW") || c.hasPrefix("FGEW") || n.contains("expand") { return (.expandingWild, nil) }
+            // The train itself, not the wild that lengthens it ("train extension wild").
+            if n.range(of: #"\bwild train\b|\btrain (symbol|part|car|piece)s?\b"#, options: .regularExpression) != nil, !n.contains("extension") { return (.train, nil) }
         }
+        // Held where it lands: a locked or sticky wild, a persistent multiplier or adder. Not a hold-and-spin coin, which every
+        // one of those games locks and none draws apart.
+        if n.range(of: #"\bsticky\b|\bpersistent\b"#, options: .regularExpression) != nil
+            || (role == .wild && n.range(of: #"\blocked\b|\blocks? in place\b|\bstays? (in place|locked)\b"#, options: .regularExpression) != nil) { return (.sticky, nil) }
         if n.range(of: #"super ?stack|stacked|full[- ]reel"#, options: .regularExpression) != nil { return (.stacked, nil) }
         if n.range(of: #"\b[23]\s?x\s?[23]\b|super symbol|colossal"#, options: .regularExpression) != nil { return (.colossal, nil) }
         return (.single, nil)
+    }
+    /// How many parts a train is, from its description ("two parts", "3-part"); three when not said, and never more: the
+    /// train is drawn as one piece, and GPT Image draws nothing wider than 3:1.
+    public static func trainParts(_ note: String) -> Int {
+        let words = ["two": 2, "three": 3, "four": 4, "five": 5]
+        guard let r = note.lowercased().range(of: #"\b(\d|two|three|four|five)[- ](parts?|pieces?|cars?)\b"#, options: .regularExpression) else { return 3 }
+        let w = note.lowercased()[r].split(whereSeparator: { $0 == " " || $0 == "-" }).first.map(String.init) ?? ""
+        return min(3, max(2, words[w] ?? Int(w) ?? 3))
+    }
+    /// The frame a sticky symbol is locked in while it is held (SymbolForm.sticky), drawn in code — free, the same every
+    /// time: a rounded band just inside the cell in the game's lettering tones (or gold), a dark edge each side and a soft
+    /// glow outside it; clear in the middle, where the symbol shows.
+    static func lockedFrame(size n: Int, tones: [RGB8]? = nil) -> [UInt8] {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard n > 8, let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return [UInt8](repeating: 0, count: max(0, n * n * 4)) }
+        let s = CGFloat(n), band = s * 0.055, inset = s * 0.06, r = s * 0.12
+        let path = CGPath(roundedRect: CGRect(x: inset, y: inset, width: s - 2 * inset, height: s - 2 * inset), cornerWidth: r, cornerHeight: r, transform: nil)
+        func cg(_ c: RGB8) -> CGColor { CGColor(red: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1) }
+        let stops = (tones?.count == 3 ? tones! : [RGB8(255, 250, 224), RGB8(255, 214, 92), RGB8(219, 143, 33)]).map(cg)
+        ctx.setLineJoin(.round)
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: inset * 0.9, color: stops[1].copy(alpha: 0.9))
+        ctx.addPath(path); ctx.setStrokeColor(CGColor(red: 0.08, green: 0.05, blue: 0.02, alpha: 1)); ctx.setLineWidth(band * 1.5); ctx.strokePath()
+        ctx.restoreGState()
+        ctx.saveGState()
+        ctx.addPath(path); ctx.setLineWidth(band); ctx.replacePathWithStrokedPath(); ctx.clip()
+        ctx.drawLinearGradient(CGGradient(colorsSpace: space, colors: stops as CFArray, locations: [0, 0.45, 1])!, start: CGPoint(x: 0, y: s), end: .zero, options: [])
+        ctx.restoreGState()
+        guard let img = ctx.makeImage(), let px = ChromaKeyOutputRules.straightRGBA8(img) else { return [UInt8](repeating: 0, count: n * n * 4) }
+        return px
     }
     /// A wild multiplier's values, from its description: "2x–5x" is 2, 3, 4, 5; "x2, x3" is 2, 3; none said, the
     /// common 2, 3, 5.
@@ -19006,5 +19110,324 @@ public enum WheelLabel {
         func med(_ a: [Int]) -> Double { Double(a.sorted()[a.count / 2]) }
         let (mr, mg, mb) = (med(r), med(g), med(b)), k = 34 / max(mr, mg, mb, 1)
         return RGB8(UInt8(min(255, mr * k)), UInt8(min(255, mg * k)), UInt8(min(255, mb * k)))
+    }
+}
+
+// MARK: - Photoshop documents, written directly
+
+/// A layered Photoshop document written with no Photoshop: straight-RGBA pixel layers in nested groups, each
+/// channel PackBits-compressed as Photoshop writes them, and the flattened picture it shows before reading the
+/// layers. `large` writes the PSB form (version 2: 64-bit section and channel lengths, 32-bit row counts), the one
+/// Photoshop needs past 30,000 px a side; without it, the same document as a PSD.
+public enum PhotoshopFile {
+    public indirect enum Node {
+        /// Straight RGBA `px`, `w`×`h`, its top-left at (`x`, `y`) on the canvas.
+        case layer(name: String, x: Int, y: Int, w: Int, h: Int, px: [UInt8], visible: Bool = true, opacity: UInt8 = 255)
+        case group(name: String, children: [Node], visible: Bool = true)
+    }
+
+    /// The document; `nodes` top first, as the Layers panel lists them.
+    public static func data(width W: Int, height H: Int, nodes: [Node], large: Bool = true) -> Data {
+        func be(_ v: UInt64, _ bytes: Int, _ d: inout Data) { for i in (0..<bytes).reversed() { d.append(UInt8(truncatingIfNeeded: v >> UInt64(8 * i))) } }
+        func len(_ v: Int, _ d: inout Data) { be(UInt64(v), large ? 8 : 4, &d) }
+        func tag(_ key: String, _ body: Data, _ d: inout Data) { d.append(contentsOf: Array(("8BIM" + key).utf8)); be(UInt64(body.count), 4, &d); d.append(body) }
+        // Written bottom first; a group is its closing marker, its layers, then the group itself (lsct 3, …, lsct 1).
+        struct Entry { var name: String, rect: (t: Int, l: Int, b: Int, r: Int), blend: String, opacity: UInt8, hidden: Bool, section: UInt32?, pixels: Int? }
+        var entries: [Entry] = [], sources: [(px: [UInt8], w: Int, h: Int)] = []
+        func walk(_ nodes: [Node]) {
+            for n in nodes.reversed() {
+                switch n {
+                case let .layer(name, x, y, w, h, px, visible, opacity):
+                    entries.append(Entry(name: name, rect: (y, x, y + h, x + w), blend: "norm", opacity: opacity, hidden: !visible, section: nil, pixels: sources.count))
+                    sources.append((px, w, h))
+                case let .group(name, children, visible):
+                    entries.append(Entry(name: "</Layer group>", rect: (0, 0, 0, 0), blend: "norm", opacity: 255, hidden: false, section: 3, pixels: nil))
+                    walk(children)
+                    entries.append(Entry(name: name, rect: (0, 0, 0, 0), blend: "pass", opacity: 255, hidden: !visible, section: 1, pixels: nil))
+                }
+            }
+        }
+        walk(nodes)
+        // Every layer's channels (alpha, red, green, blue), then the flattened picture's three, compressed in parallel.
+        let flat = flattened(width: W, height: H, nodes: nodes)
+        let jobs = sources.indices.flatMap { i in [3, 0, 1, 2].map { (i, $0) } } + (0..<3).map { (-1, $0) }
+        var packedPlanes = [(counts: Data, body: Data)](repeating: (Data(), Data()), count: jobs.count)
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: jobs.count) { k in
+            let (i, c) = jobs[k]
+            let r = i < 0 ? packed(flat, width: W, height: H, offset: c, large: large) : packed(sources[i].px, width: sources[i].w, height: sources[i].h, offset: c, large: large)
+            lock.lock(); packedPlanes[k] = r; lock.unlock()
+        }
+        var records = Data(), channels = Data()
+        let none = [Data](repeating: Data([0, 0]), count: 4)
+        for e in entries {
+            let planes = e.pixels.map { i in (0..<4).map { c -> Data in let p = packedPlanes[i * 4 + c]; return Data([0, 1]) + p.counts + p.body } } ?? none
+            var r = Data()
+            for v in [e.rect.t, e.rect.l, e.rect.b, e.rect.r] { be(UInt64(UInt32(bitPattern: Int32(v))), 4, &r) }
+            be(4, 2, &r)
+            for (id, p) in zip([-1, 0, 1, 2] as [Int16], planes) { be(UInt64(UInt16(bitPattern: id)), 2, &r); len(p.count, &r); channels.append(p) }
+            r.append(contentsOf: Array(("8BIM" + e.blend).utf8))
+            // flags: bit 1 hides the layer; bits 3 and 4 mark a group's layers as carrying no pixels
+            r.append(contentsOf: [e.opacity, 0, (e.section == nil ? 0x08 : 0x18) | (e.hidden ? 0x02 : 0), 0])
+            var extra = Data()
+            be(0, 4, &extra); be(0, 4, &extra)                  // no mask, no blending ranges
+            let ascii = e.name.unicodeScalars.prefix(255).map { $0.isASCII ? UInt8($0.value) : UInt8(ascii: "_") }
+            extra.append(UInt8(ascii.count)); extra.append(contentsOf: ascii)
+            while (extra.count - 8) % 4 != 0 { extra.append(0) }
+            var uni = Data(); be(UInt64(e.name.utf16.count), 4, &uni)
+            for c in e.name.utf16 { be(UInt64(c), 2, &uni) }
+            while uni.count % 4 != 0 { uni.append(0) }
+            tag("luni", uni, &extra)                            // the name as Photoshop shows it, in Unicode
+            if let section = e.section {
+                var s = Data(); be(UInt64(section), 4, &s)
+                if section != 3 { s.append(contentsOf: Array("8BIMpass".utf8)) }
+                tag("lsct", s, &extra)
+            }
+            be(UInt64(extra.count), 4, &r); r.append(extra)
+            records.append(r)
+        }
+        var info = Data(); be(UInt64(UInt16(entries.count)), 2, &info); info.append(records); info.append(channels)
+        while info.count % 4 != 0 { info.append(0) }
+        var layers = Data(); len(info.count, &layers); layers.append(info); be(0, 4, &layers)   // no global mask
+
+        var out = Data("8BPS".utf8); be(large ? 2 : 1, 2, &out); out.append(Data(count: 6))
+        be(3, 2, &out); be(UInt64(H), 4, &out); be(UInt64(W), 4, &out); be(8, 2, &out); be(3, 2, &out)   // RGB, 8 bits
+        be(0, 4, &out); be(0, 4, &out)                          // no colour table, no resources
+        len(layers.count, &out); out.append(layers)
+        be(1, 2, &out)
+        for p in packedPlanes.suffix(3) { out.append(p.counts) }
+        for p in packedPlanes.suffix(3) { out.append(p.body) }
+        return out
+    }
+
+    /// The visible layers over white, as RGBA (opaque).
+    static func flattened(width W: Int, height H: Int, nodes: [Node]) -> [UInt8] {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard W > 0, H > 0, let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4, space: space,
+                                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return [UInt8](repeating: 255, count: max(0, W * H * 4)) }
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1)); ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.interpolationQuality = .none
+        func draw(_ nodes: [Node]) {
+            for n in nodes.reversed() {
+                switch n {
+                case let .layer(_, x, y, w, h, px, visible, opacity):
+                    guard visible, let img = ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space) else { continue }
+                    ctx.setAlpha(CGFloat(opacity) / 255)
+                    ctx.draw(img, in: CGRect(x: x, y: H - y - h, width: w, height: h))
+                case let .group(_, children, visible): if visible { draw(children) }
+                }
+            }
+        }
+        draw(nodes)
+        guard let p = ctx.data else { return [UInt8](repeating: 255, count: W * H * 4) }
+        return Array(UnsafeBufferPointer(start: p.assumingMemoryBound(to: UInt8.self), count: W * H * 4))
+    }
+
+    /// One channel (`offset` into each RGBA pixel) compressed row by row: the rows' lengths, then the rows. The channel
+    /// is split out by vImage: byte by byte, unoptimized as the app is built, a landscape screen took most of a minute.
+    static func packed(_ px: [UInt8], width w: Int, height h: Int, offset: Int, large: Bool) -> (counts: Data, body: Data) {
+        var plane = [UInt8](repeating: 0, count: w * h)
+        px.withUnsafeBytes { src in
+            plane.withUnsafeMutableBytes { dst in
+                var s = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!), height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
+                var d = vImage_Buffer(data: dst.baseAddress!, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
+                _ = vImageExtractChannel_ARGB8888(&s, &d, offset, vImage_Flags(kvImageNoFlags))
+            }
+        }
+        var counts = Data(capacity: h * (large ? 4 : 2)), body = [UInt8]()
+        body.reserveCapacity(w * h / 2)
+        for y in 0..<h {
+            let start = body.count
+            packBits(plane[(y * w)..<(y * w + w)], into: &body)
+            let n = body.count - start
+            for i in (0..<(large ? 4 : 2)).reversed() { counts.append(UInt8(truncatingIfNeeded: n >> (8 * i))) }
+        }
+        return (counts, Data(body))
+    }
+
+    /// PackBits, as Photoshop compresses a row: a run of 2–128 equal bytes as 1 − n then the byte; up to 128
+    /// others as n − 1 then the bytes.
+    static func packBits(_ s: [UInt8], into out: inout [UInt8]) { packBits(s[...], into: &out) }
+    static func packBits(_ s: ArraySlice<UInt8>, into out: inout [UInt8]) {
+        s.withUnsafeBufferPointer { s in
+            let n = s.count
+            var i = 0
+            while i < n {
+                var r = 1
+                while i + r < n && r < 128 && s[i + r] == s[i] { r += 1 }
+                if r > 1 { out.append(UInt8(bitPattern: Int8(1 - r))); out.append(s[i]); i += r; continue }
+                var j = i + 1
+                while j < n && j - i < 128 && !(j + 1 < n && s[j] == s[j + 1]) { j += 1 }
+                out.append(UInt8(j - i - 1)); out.append(contentsOf: s[i..<j]); i = j
+            }
+        }
+    }
+    static func unpackBits(_ d: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = [], i = 0
+        while i < d.count {
+            let h = Int(Int8(bitPattern: d[i])); i += 1
+            if h >= 0 { out.append(contentsOf: d[i..<min(d.count, i + h + 1)]); i += h + 1 }
+            else if h > -128, i < d.count { out.append(contentsOf: repeatElement(d[i], count: 1 - h)); i += 1 }
+        }
+        return out
+    }
+}
+
+// MARK: - Game Forge: the game screen as its layout editor lays it out
+
+/// The game screen as Game Forge lays it out (the studio's slot platform: its layout editor and runtime): where each
+/// piece sits in the game's design space in both orientations, and the records that put it there —
+/// layoutPlacements (schemaVersion 1), layoutGroups, layoutTexts, layoutBackground. Its rules, read from that repo
+/// on 2026-10-06 from its code (there is no written spec):
+/// - Design px, as LayoutService has them: portrait 390 wide and 722 tall (the safe zone under the host's bars;
+///   some games 844), landscape 970×844. The origin is the box's centre, the box pinned to the top of the
+///   screen, +y down. Plain x/y/scale are portrait; a record's `landscape` overrides them.
+/// - Art is authored at 3×: a picture is shown at its pixel size ÷ 3 times its scale. A full portrait screen is
+///   1170×2532 (390×844); a landscape background 4608×2532 (1536×844, wider than the 970 box).
+/// - A placement's x/y is its centre, in its group's space when it has one; a text parented to a placement is in
+///   that picture's own space (its pixels ÷ 3, from its centre).
+public enum GameForge {
+    /// A design box: `width`×`height` design px on a `screenWidth`×`screenHeight` screen, pinned to its top;
+    /// `hud` the band at the bottom of the box the game's control bar takes (the React HUD, not art).
+    public struct Profile: Equatable, Sendable {
+        public var width: Double, height: Double, hud: Double, screenWidth: Double, screenHeight: Double
+        public init(width: Double, height: Double, hud: Double, screenWidth: Double, screenHeight: Double) {
+            self.width = width; self.height = height; self.hud = hud; self.screenWidth = screenWidth; self.screenHeight = screenHeight
+        }
+        public static func portrait(height: Double = 722, hud: Double = 120) -> Profile { Profile(width: 390, height: height, hud: hud, screenWidth: 390, screenHeight: 844) }
+        public static func landscape(hud: Double = 100) -> Profile { Profile(width: 970, height: 844, hud: hud, screenWidth: 1536, screenHeight: 844) }
+        public var isLandscape: Bool { width > height }
+        /// The screen at 3×: 1170×2532 portrait, 4608×2532 landscape.
+        public var canvas: (w: Int, h: Int) { (Int(screenWidth * 3), Int(screenHeight * 3)) }
+        /// A design point's pixel on that canvas.
+        public func pixel(_ x: Double, _ y: Double) -> (x: Double, y: Double) { ((x + screenWidth / 2) * 3, (y + height / 2) * 3) }
+    }
+
+    /// A rectangle: its top-left and size.
+    public struct Box: Equatable, Sendable {
+        public var x, y, w, h: Double
+        public init(x: Double, y: Double, w: Double, h: Double) { self.x = x; self.y = y; self.w = w; self.h = h }
+        public var cx: Double { x + w / 2 }
+        public var cy: Double { y + h / 2 }
+        static func union<S: Sequence>(_ boxes: S) -> Box? where S.Element == Box {
+            var it = boxes.makeIterator()
+            guard var u = it.next() else { return nil }
+            while let b = it.next() {
+                let x0 = min(u.x, b.x), y0 = min(u.y, b.y)
+                u = Box(x: x0, y: y0, w: max(u.x + u.w, b.x + b.w) - x0, h: max(u.y + u.h, b.y + b.h) - y0)
+            }
+            return u
+        }
+    }
+
+    /// Where the screen's pieces go in one orientation, in design px. `block`: the reels with the jackpot table and
+    /// pots above them, each piece's rectangle in the block's own pixels, laid out together as Navigator's reel
+    /// preview lays them; it is made as large as the box allows above the HUD band and centred in the room left.
+    /// The logo (`logo`: its shape) goes over it, or beside it when the box is wide and the reels leave room.
+    public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, profile p: Profile) -> [String: Box] {
+        guard let u = Box.union(block.values), u.w > 0, u.h > 0 else { return [:] }
+        let m = 6.0, gap = 6.0, top = -p.height / 2 + m, bottom = p.height / 2 - p.hud - m
+        let aspect = logo.map { $0.w / max(1, $0.h) } ?? 1
+        var out: [String: Box] = [:]
+        func place(_ s: Double, _ left: Double, _ y0: Double) {
+            for (k, b) in block { out[k] = Box(x: left + (b.x - u.x) * s, y: y0 + (b.y - u.y) * s, w: b.w * s, h: b.h * s) }
+        }
+        if p.isLandscape, logo != nil {
+            let s = min((p.width - 2 * m) / u.w, (bottom - top) / u.h), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
+            if column >= 150 {
+                let y0 = top + (bottom - top - bh) / 2
+                place(s, -bw / 2, y0)
+                var lw = min(column, 280), lh = lw / aspect
+                if lh > bh / 3 { lh = bh / 3; lw = lh * aspect }
+                out["logo"] = Box(x: (-p.width / 2 - bw / 2) / 2 - lw / 2, y: y0 + bh * 0.04, w: lw, h: lh)
+                return out
+            }
+        }
+        var lw = logo == nil ? 0 : min(p.width * 0.62, 260), lh = logo == nil ? 0 : lw / aspect
+        if lh > p.height * 0.15 { lh = p.height * 0.15; lw = lh * aspect }
+        let room = top + (logo == nil ? 0 : lh + gap)
+        let s = min((p.width - 2 * m) / u.w, (bottom - room) / u.h), bw = u.w * s, bh = u.h * s
+        let y0 = room + (bottom - room - bh) / 2
+        place(s, -bw / 2, y0)
+        if logo != nil { out["logo"] = Box(x: -lw / 2, y: top + (y0 - gap - top - lh) / 2, w: lw, h: lh) }
+        return out
+    }
+
+    /// One picture of a mode, placed: `asset` its file ("folder/stem", lowercase, as the build names it), `pixels`
+    /// the width that file is exported at. No `asset`: a piece the game's code builds (the reel grid), grouped with
+    /// the art round it but not a placement.
+    public struct Item: Equatable, Sendable {
+        public var name: String, asset: String?, label: String, group: String?, z: Int
+        public var portrait: Box, landscape: Box, pixels: Int
+        public init(name: String, asset: String?, label: String, group: String?, z: Int, portrait: Box, landscape: Box, pixels: Int) {
+            self.name = name; self.asset = asset; self.label = label; self.group = group; self.z = z
+            self.portrait = portrait; self.landscape = landscape; self.pixels = pixels
+        }
+        /// The scale that shows its file at `box`'s size.
+        public func scale(_ box: Box) -> Double { box.w / (Double(max(1, pixels)) / 3) }
+    }
+    /// Text the game prints on a picture (a jackpot's amount): `box` in that picture's own space — its pixels ÷ 3,
+    /// from its centre — so it moves and scales with it.
+    public struct Label: Equatable, Sendable {
+        public var name: String, label: String, text: String, parent: String, dataKey: String, box: Box, z: Int
+        public init(name: String, label: String, text: String, parent: String, dataKey: String, box: Box, z: Int) {
+            self.name = name; self.label = label; self.text = text; self.parent = parent; self.dataKey = dataKey; self.box = box; self.z = z
+        }
+    }
+    /// A group: its members' names; its origin their centre. `landscapeScale` scales the group in landscape (the
+    /// code-built reel grid, whose cell is the portrait one).
+    public struct Group: Equatable, Sendable {
+        public var handle: String, label: String, landscapeScale: Double
+        public init(handle: String, label: String, landscapeScale: Double = 1) { self.handle = handle; self.label = label; self.landscapeScale = landscapeScale }
+    }
+    /// A mode of the game (a layout scope): its pictures, groups, printed text and backgrounds.
+    public struct Mode: Equatable, Sendable {
+        public var scope: String, items: [Item], groups: [Group], labels: [Label], background: (portrait: String, landscape: String)?
+        public init(scope: String, items: [Item], groups: [Group], labels: [Label], background: (portrait: String, landscape: String)?) {
+            self.scope = scope; self.items = items; self.groups = groups; self.labels = labels; self.background = background
+        }
+        public static func == (a: Mode, b: Mode) -> Bool {
+            a.scope == b.scope && a.items == b.items && a.groups == b.groups && a.labels == b.labels && a.background?.portrait == b.background?.portrait && a.background?.landscape == b.background?.landscape
+        }
+    }
+
+    /// A number as the layout files write it: whole when it is, else to `places` decimals.
+    static func num(_ v: Double, _ places: Int = 1) -> Any {
+        let k = pow(10, Double(places)), r = (v * k).rounded() / k
+        return r == r.rounded() ? Int(r) as Any : NSDecimalNumber(string: String(format: "%.\(places)f", r))
+    }
+
+    /// The layout files' records for `modes`.
+    public static func records(_ modes: [Mode]) -> (placements: [String: Any], groups: [[String: Any]], texts: [[String: Any]], background: [String: Any]) {
+        var placements: [[String: Any]] = [], groups: [[String: Any]] = [], texts: [[String: Any]] = [], background: [String: Any] = [:]
+        for mode in modes {
+            var origin: [String: (p: (Double, Double), l: (Double, Double))] = [:]
+            for g in mode.groups {
+                let members = mode.items.filter { $0.group == g.handle }
+                guard let up = Box.union(members.map(\.portrait)), let ul = Box.union(members.map(\.landscape)) else { continue }
+                origin[g.handle] = ((up.cx, up.cy), (ul.cx, ul.cy))
+                groups.append(["handle": g.handle, "label": g.label, "scope": mode.scope, "members": members.map(\.name),
+                               "x": num(up.cx), "y": num(up.cy), "scale": 1, "z": members.map(\.z).min() ?? 150,
+                               "landscape": ["x": num(ul.cx), "y": num(ul.cy), "scale": num(g.landscapeScale, 4)]])
+            }
+            for i in mode.items {
+                guard let asset = i.asset else { continue }
+                let o = i.group.flatMap { origin[$0] } ?? ((0, 0), (0, 0))
+                var r: [String: Any] = ["name": i.name, "assetPath": "tex/tall/\(asset).webp", "label": i.label,
+                                        "x": num(i.portrait.cx - o.p.0), "y": num(i.portrait.cy - o.p.1), "z": i.z,
+                                        "scale": num(i.scale(i.portrait), 4), "scope": mode.scope,
+                                        "landscape": ["x": num(i.landscape.cx - o.l.0), "y": num(i.landscape.cy - o.l.1), "scale": num(i.scale(i.landscape), 4)]]
+                if let g = i.group { r["groupHandle"] = g }
+                placements.append(r)
+            }
+            for l in mode.labels {
+                texts.append(["name": l.name, "label": l.label, "text": l.text, "x": num(l.box.cx), "y": num(l.box.cy), "z": l.z, "scale": 1,
+                              "boxW": num(l.box.w), "boxH": num(l.box.h), "maxFontSize": Int(l.box.h.rounded()), "minFontSize": 8, "align": "center",
+                              "fontFamily": "fnt/myriad-pro-bold", "parentAsset": l.parent, "scope": mode.scope, "dataKey": l.dataKey,
+                              "fxLayers": ["stroke"], "strokeWidth": 0.25, "color": "#ffffff", "strokeColor": "#000000"])
+            }
+            if let b = mode.background { background[mode.scope] = ["portrait": "tex/tall/\(b.portrait).webp", "landscape": "tex/wide/\(b.landscape).webp"] }
+        }
+        return (["schemaVersion": 1, "records": placements], groups, texts, background)
     }
 }

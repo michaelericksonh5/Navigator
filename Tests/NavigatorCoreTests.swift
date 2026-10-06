@@ -14360,3 +14360,192 @@ final class SymbolFormTests: XCTestCase {
         XCTAssertFalse(jobs.first { $0.id == "HP1" }?.drawnFromBase ?? true)
     }
 }
+
+final class PhotoshopFileTests: XCTestCase {
+    /// What a reader finds in the file: each layer bottom first — its name, box, flags, section type and pixels.
+    struct Read { var version: Int, w: Int, h: Int; var layers: [(name: String, rect: [Int], flags: UInt8, section: UInt32?, rgba: [UInt8])]; var flat: [UInt8] }
+    func read(_ d: Data) -> Read {
+        let b = [UInt8](d); var i = 0
+        func n(_ k: Int) -> Int { var v = 0; for _ in 0..<k { v = v << 8 | Int(b[i]); i += 1 }; return v }
+        XCTAssertEqual(String(bytes: b[0..<4], encoding: .ascii), "8BPS"); i = 4
+        let version = n(2); i += 6
+        let channels = n(2), h = n(4), w = n(4); XCTAssertEqual(channels, 3); XCTAssertEqual(n(2), 8); XCTAssertEqual(n(2), 3)
+        i += n(4); i += n(4)                                         // colour mode data, resources
+        let large = version == 2, sectionEnd = { let l = n(large ? 8 : 4); return i + l }()
+        _ = n(large ? 8 : 4)
+        let count = Int(Int16(truncatingIfNeeded: n(2)))
+        var recs: [(name: String, rect: [Int], lens: [(Int, Int)], flags: UInt8, section: UInt32?)] = []
+        for _ in 0..<count {
+            let rect = (0..<4).map { _ in Int(Int32(truncatingIfNeeded: n(4))) }
+            let lens = (0..<n(2)).map { _ in (Int(Int16(truncatingIfNeeded: n(2))), n(large ? 8 : 4)) }
+            i += 4; i += 4                                           // 8BIM, blend
+            i += 2; let flags = b[i]; i += 2                          // opacity, clipping, flags, filler
+            let extraEnd = { let l = n(4); return i + l }()
+            i += n(4); i += n(4)                                     // mask, blending ranges
+            let nl = Int(b[i]); var name = String(bytes: b[(i + 1)..<(i + 1 + nl)], encoding: .ascii) ?? ""
+            i += (1 + nl + 3) / 4 * 4
+            var section: UInt32?
+            while i < extraEnd {
+                i += 4; let key = String(bytes: b[i..<(i + 4)], encoding: .ascii)!; i += 4
+                let l = n(4), end = i + l
+                if key == "lsct" { section = UInt32(n(4)) }
+                if key == "luni" { let c = n(4); name = String(utf16CodeUnits: (0..<c).map { _ in UInt16(n(2)) }, count: c) }
+                i = end
+            }
+            recs.append((name, rect, lens, flags, section))
+        }
+        var layers: [(name: String, rect: [Int], flags: UInt8, section: UInt32?, rgba: [UInt8])] = []
+        for r in recs {
+            let lw = r.rect[3] - r.rect[1], lh = r.rect[2] - r.rect[0]
+            var rgba = [UInt8](repeating: 0, count: max(0, lw * lh * 4))
+            for (id, l) in r.lens {
+                let end = i + l, comp = n(2)
+                if comp == 1 {
+                    let counts = (0..<lh).map { _ in n(large ? 4 : 2) }
+                    for (y, c) in counts.enumerated() {
+                        let row = PhotoshopFile.unpackBits(Array(b[i..<(i + c)])); i += c
+                        XCTAssertEqual(row.count, lw)
+                        for (x, v) in row.enumerated() { rgba[(y * lw + x) * 4 + (id < 0 ? 3 : Int(id))] = v }
+                    }
+                }
+                i = end
+            }
+            layers.append((r.name, r.rect, r.flags, r.section, rgba))
+        }
+        i = sectionEnd
+        XCTAssertEqual(n(2), 1)
+        let counts = (0..<(3 * h)).map { _ in n(large ? 4 : 2) }
+        var flat = [UInt8](repeating: 0, count: w * h * 3)
+        for (k, c) in counts.enumerated() {
+            let row = PhotoshopFile.unpackBits(Array(b[i..<(i + c)])); i += c
+            for (x, v) in row.enumerated() { flat[((k % h) * w + x) * 3 + k / h] = v }
+        }
+        XCTAssertEqual(i, b.count)
+        return Read(version: version, w: w, h: h, layers: layers, flat: flat)
+    }
+    func solid(_ w: Int, _ h: Int, _ c: [UInt8]) -> [UInt8] { (0..<(w * h)).flatMap { _ in c } }
+
+    func testPackBitsRoundTrips() {
+        for row in [[UInt8](repeating: 0, count: 300), (0..<300).map { UInt8($0 % 251) }, [1, 1, 2, 3, 3, 3, 4] + [UInt8](repeating: 9, count: 200) + [5]] {
+            var out: [UInt8] = []; PhotoshopFile.packBits(row, into: &out)
+            XCTAssertEqual(PhotoshopFile.unpackBits(out), row)
+        }
+        var flat: [UInt8] = []; PhotoshopFile.packBits([UInt8](repeating: 7, count: 256), into: &flat)
+        XCTAssertEqual(flat.count, 4)                                                  // two runs of 128
+    }
+    func testLayersAndGroupsAreWrittenAsPhotoshopReadsThem() {
+        let red = solid(4, 3, [255, 0, 0, 255]), half = solid(2, 2, [0, 0, 255, 128])
+        let nodes: [PhotoshopFile.Node] = [
+            .group(name: "mode", children: [.layer(name: "top", x: 1, y: 1, w: 2, h: 2, px: half),
+                                            .layer(name: "bottom", x: 0, y: 0, w: 4, h: 3, px: red)]),
+            .layer(name: "hidden café", x: 0, y: 0, w: 4, h: 3, px: red, visible: false),
+        ]
+        for large in [true, false] {
+            let r = read(PhotoshopFile.data(width: 6, height: 5, nodes: nodes, large: large))
+            XCTAssertEqual(r.version, large ? 2 : 1); XCTAssertEqual(r.w, 6); XCTAssertEqual(r.h, 5)
+            // bottom first: the hidden layer, then the group's closing marker, its layers bottom first, the group itself
+            XCTAssertEqual(r.layers.map(\.name), ["hidden café", "</Layer group>", "bottom", "top", "mode"])
+            XCTAssertEqual(r.layers.map(\.section), [nil, 3, nil, nil, 1])
+            XCTAssertEqual(r.layers[0].flags & 2, 2); XCTAssertEqual(r.layers[4].flags & 2, 0)
+            XCTAssertEqual(r.layers[3].rect, [1, 1, 3, 3])                                     // top, left, bottom, right
+            XCTAssertEqual(r.layers[2].rgba, red); XCTAssertEqual(r.layers[3].rgba, half)
+            // The flattened picture: blue at half over red where they meet, red elsewhere, white off the layers.
+            func px(_ x: Int, _ y: Int) -> [UInt8] { Array(r.flat[((y * 6 + x) * 3)..<((y * 6 + x) * 3 + 3)]) }
+            XCTAssertEqual(px(0, 0), [255, 0, 0]); XCTAssertEqual(px(5, 4), [255, 255, 255])
+            XCTAssertEqual(Int(px(1, 1)[0]), 127, accuracy: 2); XCTAssertEqual(Int(px(1, 1)[2]), 128, accuracy: 2)
+        }
+    }
+}
+
+final class GameForgeLayoutTests: XCTestCase {
+    typealias Box = GameForge.Box
+    // A reel block as the reel preview lays it: pots over a table over the reels, in its own pixels.
+    let block: [String: Box] = ["pot1": Box(x: 300, y: 0, w: 600, h: 700), "table": Box(x: 0, y: 500, w: 3000, h: 900),
+                                "bezel": Box(x: 0, y: 1200, w: 3000, h: 2600), "grid": Box(x: 300, y: 1500, w: 2400, h: 2000)]
+
+    func testThePortraitScreenFitsTheBoxAboveTheControlBar() {
+        let p = GameForge.Profile.portrait(), b = GameForge.compose(block: block, logo: (w: 2, h: 1), profile: p)
+        let all = Box.union(b.values)!
+        XCTAssertGreaterThanOrEqual(all.x, -195); XCTAssertLessThanOrEqual(all.x + all.w, 195)
+        XCTAssertGreaterThanOrEqual(all.y, -361); XCTAssertLessThanOrEqual(all.y + all.h, 361 - 120)
+        XCTAssertEqual(b["bezel"]!.cx, 0, accuracy: 0.01)                                       // centred
+        XCTAssertLessThan(b["logo"]!.y + b["logo"]!.h, b["pot1"]!.y)                            // the logo over it all
+        // One scale for the whole block: the grid keeps its place inside the bezel.
+        XCTAssertEqual(b["grid"]!.w / b["bezel"]!.w, 2400.0 / 3000, accuracy: 1e-9)
+        XCTAssertEqual((b["grid"]!.x - b["bezel"]!.x) / b["bezel"]!.w, 0.1, accuracy: 1e-9)
+    }
+    func testAWideBoxPutsTheLogoBesideTheReelsWhenTheyLeaveRoom() {
+        let l = GameForge.Profile.landscape(), b = GameForge.compose(block: block, logo: (w: 2, h: 1), profile: l)
+        XCTAssertLessThanOrEqual(b["logo"]!.x + b["logo"]!.w, b["bezel"]!.x)                    // left of the reels
+        XCTAssertGreaterThanOrEqual(b["logo"]!.x, -485)
+        let all = Box.union(b.filter { $0.key != "logo" }.values)!
+        XCTAssertEqual(all.h, 844 - 100 - 12, accuracy: 0.01)                                  // as tall as the room allows
+    }
+    func testCanvasPixelsMatchTheDesignOrigin() {
+        XCTAssertEqual(GameForge.Profile.portrait().canvas.w, 1170); XCTAssertEqual(GameForge.Profile.portrait().canvas.h, 2532)
+        XCTAssertEqual(GameForge.Profile.landscape().canvas.w, 4608)
+        let o = GameForge.Profile.portrait().pixel(0, 0), ol = GameForge.Profile.landscape().pixel(0, 0)
+        XCTAssertEqual(o.x, 585); XCTAssertEqual(o.y, 1083); XCTAssertEqual(ol.x, 2304); XCTAssertEqual(ol.y, 1266)
+    }
+    func testRecordsPlacePicturesInTheirGroupsSpace() {
+        let item = GameForge.Item(name: "bezel-base", asset: "backgrounds/bezel-base", label: "Bezel", group: "reel-base", z: 148,
+                                  portrait: Box(x: -150, y: -50, w: 300, h: 200), landscape: Box(x: -300, y: -100, w: 600, h: 400), pixels: 1800)
+        let grid = GameForge.Item(name: "reelGrid", asset: nil, label: "Grid", group: "reelgrid-base", z: 149,
+                                  portrait: Box(x: -120, y: -30, w: 240, h: 160), landscape: Box(x: -240, y: -60, w: 480, h: 320), pixels: 0)
+        let label = GameForge.Label(name: "grand-amount-base", label: "grand", text: "2,000", parent: "bezel-base", dataKey: "jackpot.grand",
+                                    box: Box(x: -40, y: 10, w: 80, h: 20), z: 153)
+        let r = GameForge.records([GameForge.Mode(scope: "base", items: [item, grid], groups: [GameForge.Group(handle: "reel-base", label: "Reel"),
+                                   GameForge.Group(handle: "reelgrid-base", label: "Grid", landscapeScale: 2)], labels: [label],
+                                   background: ("backgrounds/background_base_portrait", "backgrounds/background_base_landscape"))])
+        XCTAssertEqual(r.placements["schemaVersion"] as? Int, 1)
+        let recs = r.placements["records"] as! [[String: Any]]
+        XCTAssertEqual(recs.count, 1)                                                           // the grid is the game's code
+        let p = recs[0]
+        XCTAssertEqual(p["assetPath"] as? String, "tex/tall/backgrounds/bezel-base.webp")
+        XCTAssertEqual(p["x"] as? Int, 0); XCTAssertEqual(p["y"] as? Int, 0)                    // the group's only member, at its centre
+        XCTAssertEqual((p["scale"] as? NSNumber)?.doubleValue, 0.5)                             // 1800 px is 600 design px, shown at 300
+        XCTAssertEqual(((p["landscape"] as? [String: Any])?["scale"] as? NSNumber)?.doubleValue, 1)
+        let g = r.groups.first { $0["handle"] as? String == "reelgrid-base" }!
+        XCTAssertEqual(g["members"] as? [String], ["reelGrid"]); XCTAssertEqual(g["y"] as? Int, 50)
+        XCTAssertEqual(((g["landscape"] as? [String: Any])?["scale"] as? NSNumber)?.doubleValue, 2)
+        XCTAssertEqual(r.texts.first?["parentAsset"] as? String, "bezel-base"); XCTAssertEqual(r.texts.first?["x"] as? Int, 0)
+        XCTAssertEqual((r.background["base"] as? [String: String])?["landscape"], "tex/wide/backgrounds/background_base_landscape.webp")
+        let json = String(data: try! JSONSerialization.data(withJSONObject: r.placements, options: [.sortedKeys, .withoutEscapingSlashes]), encoding: .utf8)!
+        XCTAssertFalse(json.contains("0000000"))                                              // numbers written plainly
+    }
+}
+
+final class StickyAndTrainTests: XCTestCase {
+    func testSymbolsOnlyCountedAreReadAsTheirFamilies() {
+        let gdd = "Basic Game Breakdown\n\t•\t3x5 matrix\n\t•\t3 Majors (HP1, HP2,)\n\t•\t2 Mids\n\t•\t5 royals\n\t•\tWild\n\t•\tBonus symbol\n\nGame Features\nThe wild is wild."
+        let s = GDDSymbolSetRules.parse(gdd)
+        XCTAssertEqual(s.map(\.code), ["HP1", "HP2", "HP3", "MP1", "MP2", "LP1", "LP2", "LP3", "LP4", "LP5", "WD1", "BO1"])
+        XCTAssertEqual(s.first { $0.code == "LP2" }?.role, .lowPay)
+        // On one line, as a features bullet writes it.
+        XCTAssertEqual(GDDSymbolSetRules.parse("Main Game Features\n\t▪\t4 majors, 4 royals\n").count, 8)
+        // Never believed alone: a count in prose with no set beside it reads as nothing.
+        XCTAssertTrue(GDDSymbolSetRules.parse("The bonus pays when 3 majors land.\n").isEmpty)
+        // A real list wins over counts.
+        XCTAssertEqual(GDDSymbolSetRules.parse("Symbol Set\n0 WD1 // wild\n1-2 HP1-2 // highs\n3-6 LP1-4 // royals\n\nFeatures\nThe game has 4 majors and 5 royals in all.").map(\.code),
+                       ["WD1", "HP1", "HP2", "LP1", "LP2", "LP3", "LP4"])
+    }
+    func testStickyAndTrainFormsAreReadFromWhatTheSymbolDoes() {
+        func form(_ code: String, _ role: SlotSymbolRole, _ note: String) -> SymbolForm { SymbolForm.detect(code: code, role: role, note: note, codes: []).form }
+        XCTAssertEqual(form("WD1", .wild, "A wild that stays locked for the bonus round"), .sticky)
+        XCTAssertEqual(form("MU3", .multiplier, "Persistent multiplier: +1 every respin"), .sticky)
+        XCTAssertEqual(form("WY2", .wysiwyg, "Sticky adder"), .sticky)
+        XCTAssertEqual(form("WY1", .wysiwyg, "Coins lock in place during hold and spin"), .single)   // every coin locks
+        XCTAssertEqual(form("WD2", .wild, "The wild train: its parts move across the reels together"), .train)
+        XCTAssertEqual(form("WD3", .wild, "An extension wild that makes the wild train longer"), .single)
+        XCTAssertEqual(form("WD4", .wild, "Sticky wild with a 2x multiplier"), .wildMultiplier)     // the drawing's need comes first
+        XCTAssertEqual(SymbolForm.trainParts("two parts"), 2); XCTAssertEqual(SymbolForm.trainParts("a 3-part train"), 3)
+        XCTAssertEqual(SymbolForm.trainParts("five cars"), 3); XCTAssertEqual(SymbolForm.trainParts(""), 3)
+    }
+    func testTheLockedFrameIsABandWithTheSymbolClearInside() {
+        let n = 200, px = SymbolForm.lockedFrame(size: n)
+        func a(_ x: Int, _ y: Int) -> UInt8 { px[(y * n + x) * 4 + 3] }
+        XCTAssertEqual(a(n / 2, n / 2), 0)                                   // the middle clear
+        XCTAssertEqual(a(n / 2, 12), 255)                                    // the band across the top, opaque
+        XCTAssertGreaterThan(a(n / 2, 1), 0); XCTAssertLessThan(a(n / 2, 1), 255)   // glowing outside it
+    }
+}
