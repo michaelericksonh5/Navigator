@@ -11238,6 +11238,11 @@ public enum PopUps {
             out.append(title("base_banner_event-\(i == 0 ? "wheel" : "wheel\(i + 1)")Awarded", "\(w.name.uppercased()) AWARDED!"))
         }
         if !(layout.wheels ?? []).isEmpty { out.append(title("wheelSpin_banner_spin", "PRESS TO SPIN", 1536, 512)) }
+        // A pick bonus (PickArt): awarded by name, and its instruction on the panel's top edge, as the studio's say it.
+        if let p = layout.picks?.first {
+            out.append(title("base_popUp_\(key(p.name))Awarded", "\(p.name.uppercased()) AWARDED!"))
+            out.append(title("jackpot_interface_message", p.ends == "match 3" || p.reveals.contains("JACKPOTS") && p.ends == nil ? "MATCH 3 TO WIN" : "PICK TO WIN", 1536, 512))
+        }
         if layout.awards?.contains("one more chance") == true { out.append(title("shared_popUp_oneMoreChance", "ONE MORE CHANCE")) }
         for (i, t) in (layout.winTiers ?? winTiers).enumerated() { out.append(title("shared_celebration_message-\(i + 1)", t)) }
         return out
@@ -11343,6 +11348,54 @@ public struct JackpotMeters: Equatable, Sendable {
         if n.contains("MINOR") { return "blue" }
         if n.contains("MINI") { return "green" }
         return ["red", "purple", "blue", "green", "teal", "orange"][min(5, rank)]
+    }
+}
+
+/// A pick bonus's pieces as the studio's games have them (2026-10-06: the 11 shipped games with pick screens, and the
+/// platform's own): a grid of the game's own themed object the player picks — 3×3 most often, then 4×3 and 6×3 — in a
+/// framed panel over the reels, "MATCH 3 TO WIN" on its top edge and the jackpot meters in a row over it; a picked object
+/// is the same object with its jackpot's name stamped across it and a ring in the tier's colour. The dimming of the ones
+/// left, the glows and every number are the game's code.
+public enum PickArt {
+    /// The grid for `n` objects, columns × rows, as the shipped ones are (9 → 3×3, 12 → 4×3, 18 → 6×3, 20 → 5×4).
+    public static func grid(_ n: Int) -> (cols: Int, rows: Int) {
+        switch n {
+        case ...4: return (max(1, n), 1)
+        case 5...6: return (3, 2)
+        case 7...9: return (3, 3)
+        case 10...12: return (4, 3)
+        case 13...15: return (5, 3)
+        case 16: return (4, 4)
+        case 17...18: return (6, 3)
+        default: return (5, (n + 4) / 5)
+        }
+    }
+    /// The tier's colour as a ring is drawn (JackpotMeters.colour's names).
+    static func rgb(_ colour: String) -> RGB8 {
+        ["red": RGB8(222, 44, 44), "purple": RGB8(156, 64, 214), "blue": RGB8(46, 118, 238), "green": RGB8(44, 182, 84),
+         "teal": RGB8(30, 180, 180), "orange": RGB8(240, 140, 30)][colour] ?? RGB8(240, 200, 60)
+    }
+    /// A picked object, from the closed one (straight RGBA, `n` square): a ring in its tier's colour round it and the tier's
+    /// name lettered across its middle, in code — spelled right by construction, and free.
+    static func revealed(_ closed: [UInt8], size n: Int, tier: String, rank: Int, tones: [RGB8]? = nil) -> [UInt8] {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard n > 8, let ctx = CGContext(data: nil, width: n, height: n, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return closed }
+        if let img = ChromaKeyOutputRules.image(straightRGBA8: closed, width: n, height: n, space: space) { ctx.draw(img, in: CGRect(x: 0, y: 0, width: n, height: n)) }
+        let c = rgb(JackpotMeters.colour(tier, rank: rank)), s = CGFloat(n)
+        let ring = CGColor(red: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
+        // Round the object itself, whatever share of its canvas it fills.
+        let e = LayerizeAssembly.extent(closed, width: n, height: n, alpha: 32) ?? (Int(s * 0.05), Int(s * 0.05), Int(s * 0.9), Int(s * 0.9))
+        let d = min(s * 0.94, CGFloat(max(e.w, e.h)) * 1.06), cx = CGFloat(e.x) + CGFloat(e.w) / 2, cy = s - (CGFloat(e.y) + CGFloat(e.h) / 2)
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: s * 0.05, color: ring)
+        ctx.setStrokeColor(ring); ctx.setLineWidth(s * 0.04)
+        ctx.strokeEllipse(in: CGRect(x: cx - d / 2, y: cy - d / 2, width: d, height: d))
+        ctx.restoreGState()
+        guard let base = ctx.makeImage(), var px = ChromaKeyOutputRules.straightRGBA8(base) else { return closed }
+        let bw = Int(s * 0.92), bh = Int(s * 0.34)
+        FrameKit.over(&px, width: n, FrameKit.Piece(px: WheelLabel.badge(tier, width: bw, height: bh, face: tones), w: bw, h: bh), at: (n - bw) / 2, (n - bh) / 2)
+        return px
     }
 }
 
@@ -17355,6 +17408,20 @@ extension GDDAssetPrompts {
     }
     /// The jackpot table above the reels (JackpotTable): its plaques lettered with the jackpots' names, in the
     /// bezel's material (attached first), each value field left empty for the game's amount.
+    /// The object a pick bonus's player picks (PickArt), drawn on a plain disc (the last image) after the game's jackpot or
+    /// bonus symbol (attached first): the game's own treasure, plain — the game stamps a jackpot's name across it when picked.
+    static func pickObjectBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), object: String?) -> String {
+        let thing = object.map { o in o.hasSuffix("ies") ? String(o.dropLast(3)) + "y" : o.hasSuffix("es") && (o.hasSuffix("sses") || o.hasSuffix("xes") || o.hasSuffix("ches")) ? String(o.dropLast(2)) : o.hasSuffix("s") ? String(o.dropLast()) : o }
+        return [
+            "Image 1 is a symbol of a video slot game themed “\(theme.name)”. Edit the last attached image, a plain grey disc on a plain backing: draw in its place the object the player picks in the game's jackpot pick bonus — "
+                + (thing.map { "a \($0) of this game's world" } ?? "a coin, orb or token of this game's own treasure, chosen to suit its world")
+                + ", filling the disc's place, front-on, in exactly the attached symbol's art, colours, lighting and finish. One object, whole, centred, the same size as the disc.",
+            "It is plain and the same for every pick: no lettering, no numbers, no jackpot names or tier colours — the game stamps the jackpot's name across it when it is picked. A calm middle, so a word laid across it reads. Static art only: no burst, rays or flying sparkles.",
+            "THE LOOK OF THIS SET: \(lookBlock(theme, design, artAttached: false))",
+            detailRules,
+            backdropLine(backing),
+        ].joined(separator: "\n\n")
+    }
     /// The jackpot meters (JackpotMeters): the plain grey plaques of the sheet repainted, each its own meter.
     static func jackpotMetersBrief(theme: GameTheme, design: SetDesign, backing: (name: String, rgb: RGB8), names: [String]) -> String {
         let places = names.count == 1 ? ["the plaque"] : (0..<names.count).map { i -> String in

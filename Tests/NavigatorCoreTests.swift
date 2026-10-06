@@ -14759,3 +14759,21 @@ final class GameForgeImportRuleTests: XCTestCase {
         XCTAssertEqual(GameForge.moved(old, to: rect(old, grow: 1.5), profile: p).w, 150, accuracy: 0.5)      // resized
     }
 }
+
+final class PickArtTests: XCTestCase {
+    func testThePickGridIsShapedAsTheShippedOnesAre() {
+        XCTAssertTrue(PickArt.grid(9) == (3, 3)); XCTAssertTrue(PickArt.grid(12) == (4, 3)); XCTAssertTrue(PickArt.grid(18) == (6, 3)); XCTAssertTrue(PickArt.grid(20) == (5, 4))
+        for n in 1...30 { let g = PickArt.grid(n); XCTAssertGreaterThanOrEqual(g.cols * g.rows, n) }
+    }
+    func testAPickedObjectCarriesItsTiersRingAndName() {
+        let n = 200
+        var closed = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 50..<150 { for x in 50..<150 { let i = (y * n + x) * 4; closed[i] = 200; closed[i + 1] = 160; closed[i + 2] = 40; closed[i + 3] = 255 } }
+        let r = PickArt.revealed(closed, size: n, tier: "GRAND", rank: 0)
+        // The ring hugs the object: red just outside its corners, nothing at the canvas's edge.
+        let i = (100 * n + 100 + Int(Double(100) * 0.53)) * 4
+        XCTAssertGreaterThan(Int(r[i]), Int(r[i + 2]) + 60)
+        XCTAssertEqual(r[(100 * n + 2) * 4 + 3], 0)
+        XCTAssertNotEqual(Array(r[((100 * n) + 100) * 4..<((100 * n) + 100) * 4 + 4]), [200, 160, 40, 255])   // the word across the middle
+    }
+}

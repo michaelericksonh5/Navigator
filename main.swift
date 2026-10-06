@@ -26620,6 +26620,8 @@ final class GDDToAssetsRun: ObservableObject {
         // The lobby and loading pictures and the sell screen's avatar are made from the logo and key art: redone with them.
         ("Studio and GDD pieces", { n in n.hasPrefix("shared_concepts") || isConcept(n) || Composites.all.contains { n == $0.name + ".png" } || n.hasPrefix("shared_sellScreen_tutorialAvatar") }),
         ("Wheels", { $0.hasPrefix("wheelSpin") && !$0.hasPrefix("wheelSpin_banner") }),
+        // A pick bonus (PickArt): its object, each tier's picked object, its instruction and the inside of its panel.
+        ("Pick bonus", { $0.hasPrefix("jackpot_symbol_") || $0.hasPrefix("jackpot_interface_message") || $0.hasPrefix("jackpot_interface_reelTexture") }),
         ("Pop-ups", { n in !isConcept(n) && (n.contains("_popUp_") || n.hasPrefix("shared_popUps") || n.hasPrefix("transition_outro_") || n.hasPrefix("shared_celebration_")
             || n.hasPrefix("base_banner_event-") || n.hasPrefix("wheelSpin_banner")) }),
     ]
@@ -26632,7 +26634,7 @@ final class GDDToAssetsRun: ObservableObject {
         var groups: [String] {
             switch self {
             case .core: ["Bezel", "Reel texture", "Pots"]
-            case .rest: ["Jackpot meters", "Pot plaques", "Number fonts", "Symbol win states", "Symbol forms", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pop-ups"]
+            case .rest: ["Jackpot meters", "Pot plaques", "Number fonts", "Symbol win states", "Symbol forms", "Landscape backgrounds", "Lobby and loading", "Studio and GDD pieces", "Wheels", "Pick bonus", "Pop-ups"]
             case .localize: ["Localized"]
             }
         }
@@ -26815,6 +26817,14 @@ final class GDDToAssetsRun: ObservableObject {
                     let n = SymbolForm.trainParts(j.title)
                     items.append(AssetChecklist.Item(group: "Symbol forms", name: "\(j.id)_train", what: "\(j.id) as one train of \(n) parts, a part per cell", files: ["\(j.id)_train.png"] + (1...n).map { "\(j.id)_train\($0).png" }, maker: "Symbol forms", cost: AssetChecklist.gpt(side / 2 * n, side / 2)))
                 }
+            }
+            // A pick bonus (PickArt): the object the player picks, drawn; each tier's picked object and the panel, in code.
+            if let pick = reelLayout?.picks?.first {
+                items.append(AssetChecklist.Item(group: "Pick bonus", name: "jackpot_symbol_pick", what: "the object the player picks in the \(pick.name), drawn after the game's jackpot symbol", files: ["jackpot_symbol_pick.png"], maker: "Pick bonus", cost: AssetChecklist.gpt(1024, 1024)))
+                if pick.reveals.contains("JACKPOTS"), !jackpotNames.isEmpty {
+                    items.append(AssetChecklist.Item(group: "Pick bonus", name: "jackpot_symbol_tiers", what: "each jackpot's picked object, its name stamped across it: " + jackpotNames.joined(separator: ", "), files: jackpotNames.map { "jackpot_symbol_\(PopUps.key($0)).png" }, maker: "Pick bonus", cost: 0))
+                }
+                items.append(AssetChecklist.Item(group: "Pick bonus", name: "jackpot_interface_bezel", what: "the pick panel: the base bezel round the pick grid, the reel texture inside", files: ["jackpot_interface_bezel_rmbg.png", "jackpot_interface_reelTexture_rmbg.png"], maker: "Pick bonus", cost: 0))
             }
             for j in jobs where j.kind == .background {
                 items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
@@ -27550,6 +27560,36 @@ final class GDDToAssetsRun: ObservableObject {
             for v in SymbolForm.multipliers(j.title) where !has("\(j.id)_x\(v).png") && wanted("\(j.id)_x\(v).png") {
                 let badge = WheelLabel.badge("×\(v)", width: 512, height: 288, face: titleTones)
                 write(FrameKit.onBacking(badge, b), 512, 288, "\(j.id)_x\(v).png"); write(badge, 512, 288, "\(j.id)_x\(v)_rmbg.png")
+            }
+        }
+        // A pick bonus (PickArt): its panel — the base bezel re-laid round the pick grid, free — with the reel texture inside;
+        // the object the player picks, drawn once after the game's jackpot symbol; each tier's picked object made from it in
+        // code, free. Its instruction and its award are titles, drawn with the pop-ups.
+        if let pick = layout.picks?.first {
+            let (cols, rows) = PickArt.grid(pick.options ?? 9), board = ReelArea(rows: rows, reels: cols, independent: true, cell: base.cell)
+            if wanted("jackpot_interface_bezel_rmbg.png"), !has("jackpot_interface_bezel_rmbg.png"), let bz = load("base_interface_bezel_rmbg.png"),
+               let dv = load("base_interface_dividers_rmbg.png"), bz.w == base.width, bz.h == base.height, dv.w == base.width, dv.h == base.height {
+                let (bezel, _) = ReelArea.relay(bezel: bz.px, dividers: dv.px, from: base, to: board)
+                write(FrameKit.onBacking(bezel, b), board.width, board.height, "jackpot_interface_bezel.png")
+                write(bezel, board.width, board.height, "jackpot_interface_bezel_rmbg.png")
+            }
+            if let t = texture, wanted("jackpot_interface_reelTexture_rmbg.png"), !has("jackpot_interface_reelTexture_rmbg.png") {
+                write(board.textureLayer(t.px, width: t.w, height: t.h), board.width, board.height, "jackpot_interface_reelTexture_rmbg.png")
+            }
+            let n = 1024
+            if !has("jackpot_symbol_pick.png"), let refJob = jackpots.first ?? jobs.first(where: { $0.kind == .symbol && $0.role == .bonus }),
+               let ref = try? Data(contentsOf: url(refJob.filename)), let tpl = png(WheelArt.discTemplate(size: n, share: 0.82, backing: b), n, n),
+               let px = paint("jackpot_symbol_pick", prompt: GDDAssetPrompts.pickObjectBrief(theme: theme, design: design, backing: (backing.name, b), object: pick.objects),
+                              inputs: [downsamplePNG(ref, longEdge: 1024) ?? ref, tpl], w: n, h: n, covered: nil) {
+                both(px, n, n, "jackpot_symbol_pick")
+            }
+            if pick.reveals.contains("JACKPOTS"), let closed = load("jackpot_symbol_pick_rmbg.png"), closed.w == closed.h {
+                for (i, j) in jackpots.enumerated() {
+                    let name = GDDAssetPrompts.letteredWord(j) ?? j.title.uppercased(), file = "jackpot_symbol_\(PopUps.key(name))"
+                    guard wanted("\(file).png"), !has("\(file).png") else { continue }
+                    let r = PickArt.revealed(closed.px, size: closed.w, tier: name, rank: i, tones: titleTones)
+                    write(FrameKit.onBacking(r, b), closed.w, closed.h, "\(file).png"); write(r, closed.w, closed.h, "\(file)_rmbg.png")
+                }
             }
         }
         // A sticky symbol's locked frame, drawn in code at the symbol's size: free.
@@ -33558,7 +33598,9 @@ enum GameForgeExport {
             /// Groups that join a column right of the reels in landscape (each pot with its plaque).
             var right: [[String]] = []
             /// The most design px a block pixel may take (`GameForge.compose`).
-            var maxScale = Double.infinity, column = true
+            var maxScale = Double.infinity, column = true, showsLogo = true
+            /// A pick bonus's object, drawn in each cell of `area` (its grid) where a reel screen has its symbols.
+            var pickObject: Piece?
             var wheel: (art: WheelArt, order: [String], wedges: [String: [UInt8]], prefix: String)?
             mutating func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, asset: String) {
                 block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k)
@@ -33736,6 +33778,42 @@ enum GameForgeExport {
             screens.append(s)
         }
 
+        // The pick bonus the GDD has (PickArt), as the studio's are: its panel where the reels are, the objects in a grid inside it
+        // for the game's code to reveal, "MATCH 3 TO WIN" on the panel's top edge and the jackpot meters in a row over it, as
+        // wide as it; no logo.
+        if let pick = layout.picks?.first, let panel = cutFile("jackpot_interface_bezel"), let object = load("jackpot_symbol_pick_rmbg.png") {
+            var s = Screen(scope: "jackpotPick", background: ["bg_jackpot", "bg_pick", "bg_bonus", "bg_base"])
+            s.showsMeters = false; s.showsLogo = false; s.pickObject = object
+            let (cols, rows) = PickArt.grid(pick.options ?? 9), board = ReelArea(rows: rows, reels: cols, independent: true, cell: baseArea.cell)
+            s.area = board
+            let g = board.grid, outer = Double(g.w + 2 * board.band), left = Double(g.x - board.band), bandTop = Double(g.y - board.band)
+            if panel.fullW == board.width, panel.fullH == board.height {
+                s.add("panel", panel, 0, 0, 1, asset: "jackpot/panel")
+                if var inside = cutFile("jackpot_interface_reelTexture"), inside.fullW == board.width { inside.source = nil; s.add("inside", inside, 0, 0, 1, asset: "jackpot/panel-inside") }
+            } else { problems.append("jackpotPick: its panel was laid for another grid — Make Again ▸ Bezel") }
+            s.block["grid"] = Box(x: Double(g.x), y: Double(g.y), w: Double(g.w), h: Double(g.h))
+            if let m = cutFile("jackpot_interface_message") {
+                let w = 0.62 * outer, k = w / Double(m.fullW)
+                s.add("message", m, left + (outer - w) / 2, bandTop + Double(board.band) / 2 - Double(m.fullH) * k / 2, k, asset: "jackpot/message")
+            }
+            // The meters over it, in a row as wide as it.
+            if !meterCuts.isEmpty {
+                let n = Double(meterCuts.count), gap = 0.04 * outer, w = (outer - (n - 1) * gap) / n
+                for (k, mc) in meterCuts.enumerated() {
+                    let kk = w / Double(mc.cut.piece.w), h = Double(mc.cut.piece.h) * kk, key = "meter\(k + 1)", tier = PopUps.key(tierNames[k])
+                    s.add(key, mc.cut, left + Double(k) * (w + gap) - Double(mc.cut.x) * kk, bandTop - 0.06 * outer - h - Double(mc.cut.y) * kk, kk, asset: "meters/jackpot-meter-\(tier.lowercased())")
+                    s.items.append((key, "jackpot-meter-\(tier)-jackpotPick", "\(tierNames[k]) meter", "jackpots-jackpotPick", 152))
+                }
+                s.groups.append(GameForge.Group(handle: "jackpots-jackpotPick", label: "Jackpot meters"))
+            }
+            s.items += [("inside", "panel-inside-jackpotPick", "Inside the pick panel", "panel-jackpotPick", 145),
+                        ("panel", "panel-jackpotPick", "Pick panel", "panel-jackpotPick", 146),
+                        ("grid", "pickGrid", "Pick objects (game code)", "pickgrid-jackpotPick", 149),
+                        ("message", "message-jackpotPick", "MATCH 3 TO WIN", nil, 153)]
+            s.groups += [GameForge.Group(handle: "panel-jackpotPick", label: "Pick panel"), GameForge.Group(handle: "pickgrid-jackpotPick", label: "Pick objects")]
+            screens.append(s)
+        }
+
         // The intro the game opens on, as the studio's are: a card for each feature over the base game's background, the logo
         // over them and CONTINUE under them.
         let cards = (try? fm.contentsOfDirectory(atPath: folder.path))?.filter { $0.hasPrefix("shared_intro_featureCard-") && $0.hasSuffix("_rmbg.png") }
@@ -33776,7 +33854,7 @@ enum GameForgeExport {
         let meterShapes = meterCuts.map { (w: Double($0.cut.piece.w), h: Double($0.cut.piece.h)) }
         for i in screens.indices {
             let sc = screens[i].scope
-            if let logo {
+            if let logo, screens[i].showsLogo {
                 screens[i].cuts["logo"] = logo; screens[i].assets["logo"] = "logo/logo"
                 screens[i].items.append(("logo", "logo-\(sc)", "Logo", nil, 154))
             }
@@ -33789,8 +33867,9 @@ enum GameForgeExport {
                 }
                 screens[i].groups.append(GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpot meters"))
             }
-            screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], maxScale: screens[i].maxScale, profile: portrait)
-            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], side: screens[i].side, right: screens[i].right, maxScale: screens[i].maxScale, column: screens[i].column, profile: landscape)
+            let logoShape = screens[i].showsLogo ? shape : nil
+            screens[i].p = GameForge.compose(block: screens[i].block, logo: logoShape, meters: withMeters ? meterShapes : [], maxScale: screens[i].maxScale, profile: portrait)
+            screens[i].l = GameForge.compose(block: screens[i].block, logo: logoShape, meters: withMeters ? meterShapes : [], side: screens[i].side, right: screens[i].right, maxScale: screens[i].maxScale, column: screens[i].column, profile: landscape)
         }
 
         // The events — pop-ups, celebrations, banners — each a group the game shows over its screen, centred on its reels
@@ -33855,6 +33934,23 @@ enum GameForgeExport {
             if Double(c.w) < n.w * 0.98 { upscaled.append(String(format: "%@ was drawn %d px wide and is shown up to %.0f (at 3×)", a, c.w, n.w)) }
             let p = w == c.w ? c : FrameKit.resized(c, w, h)
             write(p, "portrait/en/\(a).png"); exported[a] = p
+        }
+        // A pick bonus's objects, closed and each tier's picked one, for the game's code to lay in its grid: 3× the largest
+        // they're shown at.
+        var pickFiles: [String] = [], pickInfo: (cols: Int, rows: Int, cell: Double, gap: Double)?
+        if let s = screens.first(where: { $0.pickObject != nil }), let area = s.area, let gp = s.p["grid"] {
+            let k = gp.w / Double(area.grid.w), cols = Set(area.windows.map(\.x)).count
+            pickInfo = (cols, area.windows.count / max(1, cols), Double(area.cell) * k, Double(area.gap) * k)
+            var biggest = Double(area.cell) * k * 0.92
+            if let gl = s.l["grid"] { biggest = max(biggest, Double(area.cell) * gl.w / Double(area.grid.w) * 0.92) }
+            let px = Int((3 * biggest - 0.01).rounded(.up))
+            var files: [(String, String)] = [("jackpot_symbol_pick", "jackpot/pick")]
+            for t in tierNames { let key = PopUps.key(t); files.append(("jackpot_symbol_\(key)", "jackpot/pick-\(key.lowercased())")) }
+            for (file, path) in files {
+                guard let p = load("\(file)_rmbg.png") else { continue }
+                let w = min(p.w, px)
+                write(w == p.w ? p : FrameKit.resized(p, w, max(1, w * p.h / p.w)), "portrait/en/\(path).png"); pickFiles.append(path)
+            }
         }
         // Each pot's other states and parts, registered on the same canvas as its first: cut and sized as it is.
         for (i, stem) in potStems.enumerated() {
@@ -34059,6 +34155,16 @@ enum GameForgeExport {
             func nodes(_ it: GameForge.Item) -> [PhotoshopFile.Node] {
                 let b = isL ? it.landscape : it.portrait
                 guard let a = it.asset else {
+                    if let area = s.area, let object = s.pickObject {
+                        // Each object a layer of its own, in its cell, as the game lays them before any is picked.
+                        let k = b.w / Double(area.grid.w)
+                        let cells = area.windows.enumerated().map { n, w -> PhotoshopFile.Node in
+                            let side = Double(min(w.w, w.h)) * k * 0.92
+                            let cb = Box(x: b.x + (Double(w.x - area.grid.x) * k) + (Double(w.w) * k - side) / 2, y: b.y + Double(w.y - area.grid.y) * k + (Double(w.h) * k - side) / 2, w: side, h: side)
+                            return layer("pick \(n + 1)", object, cb)
+                        }
+                        return [.group(name: "\(it.name) (game code)", children: cells, visible: true)]
+                    }
                     if let area = s.area {
                         return filledReels(area, symbols: symbols, jobs: jobs, width: max(1, Int((b.w * 3).rounded())), backing: s.cellBacking).map { [layer("\(it.name) (game code)", $0, b)] } ?? []
                     }
@@ -34148,6 +34254,10 @@ enum GameForgeExport {
         readme += "\nEach symbol is also a layered Photoshop file in `symbols/`, at the size it was drawn: "
             + (layered.isEmpty ? "" : "\(layered.joined(separator: ", ")) in the layers they were split into (frame backing, light, frame glow, frame, gems, the symbol)")
             + (single.isEmpty ? "" : (layered.isEmpty ? "" : "; ") + "\(single.joined(separator: ", ")) as the one picture each was drawn as") + ".\n"
+        if let pi = pickInfo, let pick = layout.picks?.first {
+            readme += String(format: "\n## The pick bonus is the game's code\n\nThe `jackpotPick` screen is the %@: its panel stands where the reels are, the jackpot meters in a row over it and %@ on its top edge, and no logo, as the studio's pick screens have them. Register its grid as `pickGrid` (group `pickgrid-jackpotPick`): %d × %d objects, each in a cell of %.1f design px with %.1f between, portrait. Lay `jackpot/pick` in every cell; when one is picked, show its jackpot's `jackpot/pick-<tier>`; when the round ends, show the ones left at half brightness. Files: %@.\n",
+                              pick.name, pick.ends == "match 3" || pick.ends == nil ? "MATCH 3 TO WIN" : "its instruction", pi.cols, pi.rows, pi.cell, pi.gap, pickFiles.map { "`\($0)`" }.joined(separator: " "))
+        }
         let wheels = screens.filter { $0.wheel != nil }
         if !wheels.isEmpty {
             readme += "\n## The wheels are the game's code\n\nEach wheel's face is turned by the game: register it under its name (group `wheel-<screen>`, with its rim, hub and pointer) and build it from its upright wedges, each turned about its tip to its place, clockwise from the top. Sizes in design px, portrait:\n\n| Screen | Face name | Diameter | Wedges, clockwise from the top | Wedge files |\n|---|---|---|---|---|\n"
@@ -34239,6 +34349,17 @@ enum GameForgeExport {
                         for w in visible where w.groups.contains("\(it.name) (game code: turns)") {
                             let r = local(w)
                             if let u = rect { rect = (min(u.l, r.l), min(u.t, r.t), max(u.r, r.r), max(u.b, r.b)) } else { rect = r }
+                        }
+                        // A pick grid: its objects, together, moved as one (never rescaled from them).
+                        var objects: (l: Int, t: Int, r: Int, b: Int)?
+                        for o in visible where o.groups.contains("\(it.name) (game code)") {
+                            let r = local(o)
+                            if let u = objects { objects = (min(u.l, r.l), min(u.t, r.t), max(u.r, r.r), max(u.b, r.b)) } else { objects = r }
+                        }
+                        if let u = objects {
+                            let old = isL ? it.landscape : it.portrait, o = prof.pixel(old.x, old.y)
+                            let dx = Double(u.l + u.r) / 2 - (o.x + old.w * 1.5), dy = Double(u.t + u.b) / 2 - (o.y + old.h * 1.5)
+                            rect = (Int((o.x + dx).rounded()), Int((o.y + dy).rounded()), Int((o.x + dx + old.w * 3).rounded()), Int((o.y + dy + old.h * 3).rounded()))
                         }
                         // The wedges reach 0.86 of the face's half-width (WheelArt.face): the face is that much larger.
                         if let u = rect {
