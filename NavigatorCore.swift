@@ -19391,6 +19391,19 @@ public enum GameForge {
         }
     }
 
+    /// A mode's pieces in the order the game stacks them, top first: by z, each group as one unit at its lowest member's
+    /// z (as its record has it), its members top first; a piece in no group on its own. The PSB is built in this order,
+    /// so the picture stacks as the game will.
+    public static func stack(_ mode: Mode) -> [(group: String?, items: [Item])] {
+        var units: [(z: Int, group: String?, items: [Item])] = []
+        for g in mode.groups {
+            let members = mode.items.filter { $0.group == g.handle }
+            if let z = members.map(\.z).min() { units.append((z, g.handle, members.sorted { $0.z > $1.z })) }
+        }
+        for i in mode.items where !mode.groups.contains(where: { $0.handle == i.group }) { units.append((i.z, nil, [i])) }
+        return units.sorted { $0.z > $1.z }.map { ($0.group, $0.items) }
+    }
+
     /// A number as the layout files write it: whole when it is, else to `places` decimals.
     static func num(_ v: Double, _ places: Int = 1) -> Any {
         let k = pow(10, Double(places)), r = (v * k).rounded() / k

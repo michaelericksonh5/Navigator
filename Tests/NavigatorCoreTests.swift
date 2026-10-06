@@ -14549,3 +14549,19 @@ final class StickyAndTrainTests: XCTestCase {
         XCTAssertGreaterThan(a(n / 2, 1), 0); XCTAssertLessThan(a(n / 2, 1), 255)   // glowing outside it
     }
 }
+
+final class GameForgeStackTests: XCTestCase {
+    func testPiecesStackAsTheGameDrawsThemTopFirst() {
+        let b = GameForge.Box(x: 0, y: 0, w: 10, h: 10)
+        func item(_ n: String, _ g: String?, _ z: Int) -> GameForge.Item { GameForge.Item(name: n, asset: g == "grid" ? nil : n, label: n, group: g, z: z, portrait: b, landscape: b, pixels: 30) }
+        let mode = GameForge.Mode(scope: "base", items: [item("texture", "reel", 146), item("grid", "grid", 149), item("dividers", "bezel", 150), item("bezel", "bezel", 151),
+                                                         item("table", "jackpots", 152), item("pot", "pots", 153), item("logo", nil, 154)],
+                                  groups: ["reel", "grid", "bezel", "jackpots", "pots"].map { GameForge.Group(handle: $0, label: $0) }, labels: [], background: nil)
+        let s = GameForge.stack(mode)
+        XCTAssertEqual(s.map { $0.group ?? $0.items[0].name }, ["logo", "pots", "jackpots", "bezel", "grid", "reel"])
+        XCTAssertEqual(s[3].items.map(\.name), ["bezel", "dividers"])                         // over the symbols, the bezel on top
+        // The layout's group records carry the same order.
+        let z = Dictionary(uniqueKeysWithValues: GameForge.records([mode]).groups.map { ($0["handle"] as! String, $0["z"] as! Int) })
+        XCTAssertGreaterThan(z["pots"]!, z["jackpots"]!); XCTAssertGreaterThan(z["bezel"]!, z["grid"]!); XCTAssertGreaterThan(z["grid"]!, z["reel"]!)
+    }
+}

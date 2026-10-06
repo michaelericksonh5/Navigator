@@ -33438,16 +33438,20 @@ enum GameForgeExport {
                 let a = key == "grid" ? nil : asset(key, sc)
                 items.append(GameForge.Item(name: name, asset: a, label: label, group: group, z: z, portrait: p, landscape: l, pixels: a.flatMap { exported[$0]?.w } ?? 0))
             }
+            // Stacked as the set's reel preview stacks them, the order the art was drawn for: the reel texture under the
+            // symbols, the dividers and bezel over them (covering where the reels are cut off), the jackpot table over the
+            // bezel's top band, the pots standing on the table, the logo over all.
             item("texture", "reel-texture-\(sc)", "Reel texture", "reel-\(sc)", 146)
-            item("dividers", "reel-dividers-\(sc)", "Reel dividers", "reel-\(sc)", 147)
-            item("bezel", "reel-bezel-\(sc)", "Bezel", "reel-\(sc)", 148)
             item("grid", gridName(sc), "Reel grid (game code)", "reelgrid-\(sc)", 149)
-            item("table", "jackpot-table-\(sc)", "Jackpot table", "jackpots-\(sc)", 150)
-            for i in pots.indices { item("pot\(i + 1)", "pot-\(i + 1)-\(sc)", "Pot \(i + 1)", "pots-\(sc)", 151) }
-            item("logo", "logo-\(sc)", "Logo", nil, 152)
+            item("dividers", "reel-dividers-\(sc)", "Reel dividers", "bezel-\(sc)", 150)
+            item("bezel", "reel-bezel-\(sc)", "Bezel", "bezel-\(sc)", 151)
+            item("table", "jackpot-table-\(sc)", "Jackpot table", "jackpots-\(sc)", 152)
+            for i in pots.indices { item("pot\(i + 1)", "pot-\(i + 1)-\(sc)", "Pot \(i + 1)", "pots-\(sc)", 153) }
+            item("logo", "logo-\(sc)", "Logo", nil, 154)
             let gp = m.p["grid"]!, gl = m.l["grid"]!
-            let groups = [GameForge.Group(handle: "reel-\(sc)", label: "Reel + bezel"),
+            let groups = [GameForge.Group(handle: "reel-\(sc)", label: "Reel texture"),
                           GameForge.Group(handle: "reelgrid-\(sc)", label: "Reel grid", landscapeScale: gl.w / gp.w),
+                          GameForge.Group(handle: "bezel-\(sc)", label: "Bezel and dividers"),
                           GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpots"), GameForge.Group(handle: "pots-\(sc)", label: "Pots")]
             // The amounts print in each plaque's dark field, in the table's own space.
             var labels: [GameForge.Label] = []
@@ -33458,7 +33462,7 @@ enum GameForgeExport {
                     let box = Box(x: (Double(field.x - t.x) * k - Double(e.w) / 2) / 3, y: (Double(field.y - t.y) * k - Double(e.h) / 2) / 3,
                                   w: Double(field.w) * k / 3, h: Double(field.h) * k / 3)
                     labels.append(GameForge.Label(name: "\(key)-amount-\(sc)", label: "\(key) amount", text: "2,000", parent: "jackpot-table-\(sc)",
-                                                  dataKey: "jackpot.\(key)", box: box, z: 153))
+                                                  dataKey: "jackpot.\(key)", box: box, z: 155))
                 }
             }
             var bg: (portrait: String, landscape: String)?
@@ -33496,48 +33500,48 @@ enum GameForgeExport {
             }
         }
 
-        // The PSBs: a group per mode (base shown), its pieces where the layout puts them, the reels filled as the
+        // The PSBs, one per mode and orientation — every mode has its own opaque background, so modes sharing a file hid
+        // all but one: its pieces where the layout puts them, stacked as the game stacks them, the reels filled as the
         // preview fills them, and the design box with its HUD band as a hidden guide.
-        func psb(_ prof: GameForge.Profile, landscape isL: Bool) -> Data {
+        func psb(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool) -> Data {
             let (CW, CH) = prof.canvas
             func layer(_ name: String, _ src: Piece, _ b: Box) -> PhotoshopFile.Node {
                 let o = prof.pixel(b.x, b.y), w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
                 let p = w == src.w && h == src.h ? src : FrameKit.resized(src, w, h)
                 return .layer(name: name, x: Int(o.x.rounded()), y: Int(o.y.rounded()), w: w, h: h, px: p.px)
             }
-            var top: [PhotoshopFile.Node] = [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)]
-            for (i, m) in modes.enumerated() {
-                let boxes = isL ? m.l : m.p, mode = gf[i], sc = m.scope
-                func picture(_ key: String, _ name: String) -> PhotoshopFile.Node? {
-                    guard let b = boxes[key], let src = exported[asset(key, sc)] else { return nil }
-                    return layer(name, src, b)
-                }
-                var jack: [PhotoshopFile.Node] = []
-                if let tb = boxes["table"], let e = exported["backgrounds/jackpot-table"] {
-                    let k = tb.w / (Double(e.w) / 3)
-                    for l in mode.labels {
-                        let b = Box(x: tb.cx + l.box.x * k, y: tb.cy + l.box.y * k, w: l.box.w * k, h: l.box.h * k)
-                        let w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
-                        jack.append(layer("\(l.name) (text: \(l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), b))
+            let m = modes[i], mode = gf[i], sc = m.scope
+            do {
+                /// A placed piece as its layer, with the text the game prints on it laid over it; the code-built reel grid
+                /// as its reels filled.
+                func nodes(_ it: GameForge.Item) -> [PhotoshopFile.Node] {
+                    let b = isL ? it.landscape : it.portrait
+                    guard let a = it.asset else {
+                        return filledReels(m.area, symbols: symbols, jobs: jobs, width: max(1, Int((b.w * 3).rounded()))).map { [layer("\(it.name) (game code)", $0, b)] } ?? []
                     }
+                    guard let src = exported[a] else { return [] }
+                    let k = b.w / (Double(src.w) / 3)
+                    return mode.labels.filter { $0.parent == it.name }.map { l in
+                        let lb = Box(x: b.cx + l.box.x * k, y: b.cy + l.box.y * k, w: l.box.w * k, h: l.box.h * k)
+                        let w = max(1, Int((lb.w * 3).rounded())), h = max(1, Int((lb.h * 3).rounded()))
+                        return layer("\(l.name) (text: \(l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), lb)
+                    } + [layer(it.name, src, b)]
                 }
-                jack += [picture("table", "jackpot-table-\(sc)")].compactMap { $0 }
-                var reels: [PhotoshopFile.Node] = []
-                if let gb = boxes["grid"], let s = filledReels(m.area, symbols: symbols, jobs: jobs, width: max(1, Int((gb.w * 3).rounded()))) { reels.append(layer("\(gridName(sc)) (game code)", s, gb)) }
+                // In the order the game stacks them (GameForge.stack): the layout's groups as Photoshop groups.
                 var children: [PhotoshopFile.Node] = []
-                if let n = picture("logo", "logo-\(sc)") { children.append(n) }
-                children.append(.group(name: "jackpots-\(sc)", children: jack, visible: true))
-                children.append(.group(name: "pots-\(sc)", children: pots.indices.compactMap { picture("pot\($0 + 1)", "pot-\($0 + 1)-\(sc)") }, visible: true))
-                children.append(.group(name: "reelgrid-\(sc)", children: reels, visible: true))
-                children.append(.group(name: "reel-\(sc)", children: [picture("bezel", "reel-bezel-\(sc)"), picture("dividers", "reel-dividers-\(sc)"), picture("texture", "reel-texture-\(sc)")].compactMap { $0 }, visible: true))
+                for u in GameForge.stack(mode) {
+                    let n = u.items.flatMap(nodes)
+                    if let g = u.group { children.append(.group(name: g, children: n, visible: true)) } else { children += n }
+                }
                 if let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
-                top.append(.group(name: sc, children: children, visible: i == 0))
+                return PhotoshopFile.data(width: CW, height: CH, nodes: [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)] + children)
             }
-            return PhotoshopFile.data(width: CW, height: CH, nodes: top)
         }
         let stem = gameDir.replacingOccurrences(of: "/", with: "-")
-        for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
-            try? psb(prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_\(name).psb"))
+        for i in modes.indices {
+            for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
+                try? psb(i, prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_\(modes[i].scope)_\(name).psb"))
+            }
         }
 
         // What a developer needs to wire it in, written beside it.
@@ -33555,7 +33559,7 @@ enum GameForgeExport {
         readme += "## Assumed — change to suit the game\n\n- Portrait design box 390 × \(Int(o.designHeight)), landscape 970 × 844 (Game Forge's LayoutService); the box's centre is the origin, pinned to the top of the screen.\n"
         readme += "- The control bar takes the bottom \(Int(o.hud)) px of the portrait box and \(Int(o.landscapeHUD)) of the landscape one: nothing is placed there.\n"
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
-        readme += "- The PSBs show each mode as a group (base shown, the rest hidden) and the design box with its control-bar band in `guides`, hidden.\n"
+        readme += "- A PSB per mode and orientation, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
         if !upscaled.isEmpty { readme += "\n## Shown larger than drawn\n\n" + upscaled.map { "- \($0)\n" }.joined() }
         if !problems.isEmpty { readme += "\n## Not done\n\n" + problems.map { "- \($0)\n" }.joined() }
         try? readme.write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
