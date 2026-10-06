@@ -33486,6 +33486,59 @@ enum GameForgeExport {
             screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, profile: landscape)
         }
 
+        // The events — pop-ups, celebrations, banners — each a group the game shows over its screen, centred on its reels
+        // (as the platform's celebration tiers are), put together as the set's pop-up sheet puts them: the panel, the
+        // title inside it, the value bar for the amount, the CONTINUE button; a celebration has no button, a banner
+        // is its title alone.
+        let panel = load("shared_celebration_backing-2_rmbg.png").flatMap(cut), bar = load("shared_celebration_backing-1_rmbg.png").flatMap(cut)
+        let button = load("base_popUp_bonusBtn_rmbg.png").flatMap(cut)
+        let titles = PopUps.plan(layout, jackpots: tierNames, bonus: AssetChecklist.hasBonusGames(jobs: jobs, layout: layout))
+            .filter { $0.kind == .title && $0.name != "wheelSpin_banner_spin" && exists("\($0.name)_rmbg.png") }
+        var eventCount = 0
+        for t in titles {
+            guard let title = load("\(t.name)_rmbg.png").flatMap(cut) else { continue }
+            let banner = t.name.hasPrefix("base_banner_"), celebration = t.name.hasPrefix("shared_celebration_message")
+            let scope = t.name.hasPrefix("transition_outro") && screens.contains(where: { $0.scope == "bonusGames" }) ? "bonusGames" : "base"
+            guard let si = screens.firstIndex(where: { $0.scope == scope }) else { continue }
+            let ev = celebration ? "celebration" + t.name.dropFirst("shared_celebration_message-".count) : String(t.name.split(separator: "_").last ?? "").replacingOccurrences(of: "event-", with: "")
+            // The event in its own pixels, the panel 1100 wide.
+            let pw = 1100.0, ph = pw * 0.75
+            var block: [String: (cut: Cut, box: Box, asset: String, name: String, z: Int)] = [:]
+            func put(_ part: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, _ asset: String, _ z: Int) {
+                block[part] = (c, Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k), asset, "\(ev)-\(part)-\(scope)", z)
+            }
+            if banner {
+                put("title", title, 0, 0, pw / Double(title.fullW), "popups/\(t.name.lowercased())", 241)
+            } else {
+                guard let panel, let bar else { continue }
+                put("panel", panel, 0, 0, pw / Double(panel.fullW), "popups/panel", 221)
+                let k = min(0.7 * pw / Double(title.fullW), 0.34 * ph / Double(title.fullH))
+                put("title", title, (pw - Double(title.fullW) * k) / 2, ph - 0.47 * ph - Double(title.fullH) * k, k, "popups/\(t.name.lowercased())", 241)
+                let bw = 0.8 * pw, bk = bw / Double(bar.fullW)
+                put("bar", bar, (pw - bw) / 2, ph - 0.19 * ph - Double(bar.fullH) * bk, bk, "popups/value-bar", 231)
+                if !celebration, let button {
+                    let w = 0.4 * pw, kk = w / Double(button.fullW)
+                    put("button", button, (pw - w) / 2, ph - 0.04 * ph - Double(button.fullH) * kk, kk, "popups/button-continue", 241)
+                }
+            }
+            guard let u = Box.union(block.values.map(\.box)) else { continue }
+            // Over the reels, as wide as a phone allows in portrait, about half the box in landscape, inside the room above the HUD.
+            func placed(_ prof: GameForge.Profile, _ grid: Box?) -> [String: Box] {
+                let room = prof.height - prof.hud - 12, k = min((prof.isLandscape ? 0.55 : banner ? 0.85 : 0.92) * prof.width / u.w, 0.8 * room / u.h)
+                let cx = grid?.cx ?? 0, cy = grid?.cy ?? (-prof.height / 2 + 6 + room / 2)
+                return block.mapValues { b in Box(x: cx + (b.box.x - u.cx) * k, y: cy + (b.box.y - u.cy) * k, w: b.box.w * k, h: b.box.h * k) }
+            }
+            let bp = placed(portrait, screens[si].p["grid"]), bl = placed(landscape, screens[si].l["grid"])
+            for (part, b) in block {
+                let key = "ev:\(ev):\(part)"
+                screens[si].cuts[key] = b.cut; screens[si].assets[key] = b.asset
+                screens[si].p[key] = bp[part]; screens[si].l[key] = bl[part]
+                screens[si].items.append((key, b.name, "\(ev) \(part)", "\(ev)-\(scope)", b.z))
+            }
+            screens[si].groups.append(GameForge.Group(handle: "\(ev)-\(scope)", label: ev, isEvent: true))
+            eventCount += 1
+        }
+
         // Each file exported once, at 3× the largest it is shown — never past what was drawn (then shown larger, and said).
         var need: [String: (w: Double, cut: Cut)] = [:]
         for s in screens { for (k, c) in s.cuts { guard let a = s.assets[k] else { continue }; need[a] = (max(need[a]?.w ?? 0, 3 * max(s.p[k]?.w ?? 0, s.l[k]?.w ?? 0)), c) } }
@@ -33536,6 +33589,13 @@ enum GameForgeExport {
                     labels.append(GameForge.Label(name: "\(key)-amount-\(sc)", label: "\(key) amount", text: "2,000", parent: "jackpot-table-\(sc)",
                                                   dataKey: "jackpot.\(key)", box: box, z: 155))
                 }
+            }
+            // An event's amount prints across the middle of its value bar; the game sets it, so it has no data key.
+            for it in s.items where it.key.hasPrefix("ev:") && it.key.hasSuffix(":bar") {
+                guard let a = s.assets[it.key], let e = exported[a] else { continue }
+                let w = Double(e.w) / 3, h = Double(e.h) / 3
+                labels.append(GameForge.Label(name: it.name.replacingOccurrences(of: "-bar-", with: "-amount-"), label: "amount", text: "88,888", parent: it.name,
+                                              dataKey: "", box: Box(x: -0.35 * w, y: -0.3 * h, w: 0.7 * w, h: 0.6 * h), z: 245))
             }
             var bg: (portrait: String, landscape: String)?
             if let stem = s.background.first(where: { exists("\($0).png") }), let bp = load("\(stem).png") {
@@ -33613,8 +33673,9 @@ enum GameForgeExport {
         // file hid all but one: its pieces where the layout puts them, stacked as the game stacks them, the reels filled
         // as the preview fills them, a wheel's wedges each a layer of its own, and the design box with its HUD band as a
         // hidden guide.
-        func psb(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool) -> Data {
+        func psb(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool, event: String? = nil) -> Data {
             let (CW, CH) = prof.canvas, s = screens[i], mode = gf[i], sc = s.scope
+            let events = Set(mode.groups.filter(\.isEvent).map(\.handle))
             func layer(_ name: String, _ src: Piece, _ b: Box) -> PhotoshopFile.Node {
                 let o = prof.pixel(b.x, b.y), w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
                 let p = w == src.w && h == src.h ? src : FrameKit.resized(src, w, h)
@@ -33642,21 +33703,27 @@ enum GameForgeExport {
                 return mode.labels.filter { $0.parent == it.name }.map { l in
                     let lb = Box(x: b.cx + l.box.x * k, y: b.cy + l.box.y * k, w: l.box.w * k, h: l.box.h * k)
                     let w = max(1, Int((lb.w * 3).rounded())), h = max(1, Int((lb.h * 3).rounded()))
-                    return layer("\(l.name) (text: \(l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), lb)
+                    return layer("\(l.name) (text\(l.dataKey.isEmpty ? "" : ": " + l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), lb)
                 } + [layer(it.name, src, b)]
             }
             var children: [PhotoshopFile.Node] = []
-            for u in GameForge.stack(mode) {
+            // The screen without its events, or one event alone.
+            for u in GameForge.stack(mode) where event.map({ u.group == $0 }) ?? !(u.group.map(events.contains) ?? false) {
                 let n = u.items.flatMap(nodes)
                 if let g = u.group { children.append(.group(name: g, children: n, visible: true)) } else { children += n }
             }
-            if let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
+            if event == nil, let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
             return PhotoshopFile.data(width: CW, height: CH, nodes: [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)] + children)
         }
         let stem = gameDir.replacingOccurrences(of: "/", with: "-")
+        let eventDir = out.appendingPathComponent("events")
         for i in screens.indices {
             for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
                 try? psb(i, prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_\(screens[i].scope)_\(name).psb"))
+                for g in gf[i].groups where g.isEvent {
+                    try? fm.createDirectory(at: eventDir, withIntermediateDirectories: true)
+                    try? psb(i, prof, landscape: isL, event: g.handle).write(to: eventDir.appendingPathComponent("\(g.handle)_\(name).psb"))
+                }
             }
         }
 
@@ -33687,11 +33754,12 @@ enum GameForgeExport {
         readme += "- The control bar takes the bottom \(Int(o.hud)) px of the portrait box and \(Int(o.landscapeHUD)) of the landscape one: nothing is placed there.\n"
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
         readme += "- A PSB per screen and orientation, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
+        readme += "- The events (pop-ups, celebrations, banners) are groups marked `isEvent` in the screen they show over, centred on its reels, each with a PSB of its own in `events/`. Their amounts have no data key: the game sets them.\n"
         if !upscaled.isEmpty { readme += "\n## Shown larger than drawn\n\n" + upscaled.map { "- \($0)\n" }.joined() }
         if !problems.isEmpty { readme += "\n## Not done\n\n" + problems.map { "- \($0)\n" }.joined() }
         try? readme.write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
 
-        lines.append("SCREENS: " + screens.map(\.scope).joined(separator: ", "))
+        lines.append("SCREENS: " + screens.map(\.scope).joined(separator: ", ") + " · EVENTS: \(eventCount)")
         lines.append("SYMBOL FILES: \(layered.count) layered (\(layered.joined(separator: " "))), \(single.count) single pictures")
         lines.append("PLACEMENTS: \((r.placements["records"] as? [Any])?.count ?? 0) · GROUPS: \(r.groups.count) · TEXTS: \(r.texts.count) · SYMBOLS: \(symbols.count) at \(symbolPx) px")
         lines += upscaled.map { "LARGER THAN DRAWN: \($0)" }

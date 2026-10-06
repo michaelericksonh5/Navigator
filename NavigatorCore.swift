@@ -19391,7 +19391,11 @@ public enum GameForge {
     /// code-built reel grid, whose cell is the portrait one).
     public struct Group: Equatable, Sendable {
         public var handle: String, label: String, landscapeScale: Double
-        public init(handle: String, label: String, landscapeScale: Double = 1) { self.handle = handle; self.label = label; self.landscapeScale = landscapeScale }
+        /// An event (a pop-up, a celebration): hidden until the game shows it.
+        public var isEvent: Bool
+        public init(handle: String, label: String, landscapeScale: Double = 1, isEvent: Bool = false) {
+            self.handle = handle; self.label = label; self.landscapeScale = landscapeScale; self.isEvent = isEvent
+        }
     }
     /// A mode of the game (a layout scope): its pictures, groups, printed text and backgrounds.
     public struct Mode: Equatable, Sendable {
@@ -19432,9 +19436,11 @@ public enum GameForge {
                 let members = mode.items.filter { $0.group == g.handle }
                 guard let up = Box.union(members.map(\.portrait)), let ul = Box.union(members.map(\.landscape)) else { continue }
                 origin[g.handle] = ((up.cx, up.cy), (ul.cx, ul.cy))
-                groups.append(["handle": g.handle, "label": g.label, "scope": mode.scope, "members": members.map(\.name),
-                               "x": num(up.cx), "y": num(up.cy), "scale": 1, "z": members.map(\.z).min() ?? 150,
-                               "landscape": ["x": num(ul.cx), "y": num(ul.cy), "scale": num(g.landscapeScale, 4)]])
+                var r: [String: Any] = ["handle": g.handle, "label": g.label, "scope": mode.scope, "members": members.map(\.name),
+                                        "x": num(up.cx), "y": num(up.cy), "scale": 1, "z": members.map(\.z).min() ?? 150,
+                                        "landscape": ["x": num(ul.cx), "y": num(ul.cy), "scale": num(g.landscapeScale, 4)]]
+                if g.isEvent { r["isEvent"] = true }
+                groups.append(r)
             }
             for i in mode.items {
                 guard let asset = i.asset else { continue }
@@ -19447,10 +19453,13 @@ public enum GameForge {
                 placements.append(r)
             }
             for l in mode.labels {
-                texts.append(["name": l.name, "label": l.label, "text": l.text, "x": num(l.box.cx), "y": num(l.box.cy), "z": l.z, "scale": 1,
-                              "boxW": num(l.box.w), "boxH": num(l.box.h), "maxFontSize": Int(l.box.h.rounded()), "minFontSize": 8, "align": "center",
-                              "fontFamily": "fnt/myriad-pro-bold", "parentAsset": l.parent, "scope": mode.scope, "dataKey": l.dataKey,
-                              "fxLayers": ["stroke"], "strokeWidth": 0.25, "color": "#ffffff", "strokeColor": "#000000"])
+                var t: [String: Any] = ["name": l.name, "label": l.label, "text": l.text, "x": num(l.box.cx), "y": num(l.box.cy), "z": l.z, "scale": 1,
+                                        "boxW": num(l.box.w), "boxH": num(l.box.h), "maxFontSize": Int(l.box.h.rounded()), "minFontSize": 8, "align": "center",
+                                        "fontFamily": "fnt/myriad-pro-bold", "parentAsset": l.parent, "scope": mode.scope,
+                                        "fxLayers": ["stroke"], "strokeWidth": 0.25, "color": "#ffffff", "strokeColor": "#000000"]
+                // An amount the game sets itself (a win) has no data key, as the platform's celebrations have none.
+                if !l.dataKey.isEmpty { t["dataKey"] = l.dataKey }
+                texts.append(t)
             }
             if let b = mode.background { background[mode.scope] = ["portrait": "tex/tall/\(b.portrait).webp", "landscape": "tex/wide/\(b.landscape).webp"] }
         }

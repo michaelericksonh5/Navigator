@@ -14582,3 +14582,16 @@ final class WheelLayerTests: XCTestCase {
         XCTAssertEqual(layers[0][((size * 3 / 4) * size + size / 2) * 4 + 3], 0)
     }
 }
+
+final class GameForgeEventTests: XCTestCase {
+    func testEventsAreMarkedAndTheirAmountsCarryNoDataKey() {
+        let b = GameForge.Box(x: -50, y: -20, w: 100, h: 40)
+        let bar = GameForge.Item(name: "bigWin-bar-base", asset: "popups/value-bar", label: "bar", group: "bigWin-base", z: 231, portrait: b, landscape: b, pixels: 300)
+        let amount = GameForge.Label(name: "bigWin-amount-base", label: "amount", text: "88,888", parent: "bigWin-bar-base", dataKey: "", box: b, z: 245)
+        let r = GameForge.records([GameForge.Mode(scope: "base", items: [bar], groups: [GameForge.Group(handle: "bigWin-base", label: "bigWin", isEvent: true)],
+                                                  labels: [amount], background: nil)])
+        XCTAssertEqual(r.groups.first?["isEvent"] as? Bool, true)
+        XCTAssertNil(r.texts.first?["dataKey"])
+        XCTAssertEqual(r.texts.first?["parentAsset"] as? String, "bigWin-bar-base")
+    }
+}
