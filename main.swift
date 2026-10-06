@@ -33400,6 +33400,8 @@ enum GameForgeExport {
             var items: [(key: String, name: String, label: String, group: String?, z: Int)] = []
             var groups: [GameForge.Group] = []
             var area: ReelArea?, cellBacking: Piece?, showsMeters = true
+            /// Pieces that join the column beside the reels in landscape (the Power Bet buttons).
+            var side: Set<String> = []
             var wheel: (art: WheelArt, order: [String], wedges: [String: [UInt8]], prefix: String)?
             mutating func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, asset: String) {
                 block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k)
@@ -33486,6 +33488,7 @@ enum GameForgeExport {
                 let key = "concept:\(c.name)"
                 s.add(key, cc, (W - row) / 2 + Double(i) * (w + gap), top + Double(area.height) - 0.1 * cell, k, asset: "features/\(c.name.lowercased())")
                 s.items.append((key, c.name, c.what.isEmpty ? c.name : String(c.what.prefix(60)), "buttons-\(scope)", 155))
+                s.side.insert(key)
                 conceptStates.append((key, scope, c))
             }
             if !buttons.isEmpty { s.groups.append(GameForge.Group(handle: "buttons-\(scope)", label: "Buttons")) }
@@ -33584,7 +33587,7 @@ enum GameForgeExport {
                 screens[i].groups.append(GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpot meters"))
             }
             screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], profile: portrait)
-            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], profile: landscape)
+            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], side: screens[i].side, profile: landscape)
         }
 
         // The events — pop-ups, celebrations, banners — each a group the game shows over its screen, centred on its reels
@@ -33796,8 +33799,9 @@ enum GameForgeExport {
         // file hid all but one: its pieces where the layout puts them, stacked as the game stacks them, the reels filled
         // as the preview fills them, a wheel's wedges each a layer of its own, and the design box with its HUD band as a
         // hidden guide.
-        func psb(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool, event: String? = nil) -> Data {
-            let (CW, CH) = prof.canvas, s = screens[i], mode = gf[i], sc = s.scope
+        /// A screen's layers (without its events), or one event's, placed on its orientation's canvas.
+        func screenNodes(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool, event: String? = nil) -> [PhotoshopFile.Node] {
+            let s = screens[i], mode = gf[i], sc = s.scope
             let events = Set(mode.groups.filter(\.isEvent).map(\.handle))
             func layer(_ name: String, _ src: Piece, _ b: Box) -> PhotoshopFile.Node {
                 let o = prof.pixel(b.x, b.y), w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
@@ -33836,9 +33840,42 @@ enum GameForgeExport {
                 if let g = u.group { children.append(.group(name: g, children: n, visible: true)) } else { children += n }
             }
             if event == nil, let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
-            return PhotoshopFile.data(width: CW, height: CH, nodes: [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)] + children)
+            return children
+        }
+        func psb(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool, event: String? = nil) -> Data {
+            let (CW, CH) = prof.canvas
+            return PhotoshopFile.data(width: CW, height: CH, nodes: [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)]
+                                      + screenNodes(i, prof, landscape: isL, event: event))
+        }
+        /// Every screen of the game in one file: each an artboard of its own, side by side, with every layer and group its own
+        /// file has; each event an artboard in the rows under them, cropped to the event. Nothing covers anything else.
+        func allScreens(_ prof: GameForge.Profile, landscape isL: Bool) -> Data {
+            let (CW, CH) = prof.canvas, gap = CW / 8, margin = 60
+            var boards: [PhotoshopFile.Node] = [], x = 0
+            for i in screens.indices {
+                let kids: [PhotoshopFile.Node] = [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)] + screenNodes(i, prof, landscape: isL)
+                boards.append(.group(name: screens[i].scope, children: kids.map { $0.moved(x, 0) }, artboard: (x, 0, CW, CH)))
+                x += CW + gap
+            }
+            let rowW = max(CW, x - gap)
+            var ex = 0, ey = CH + gap, rowH = 0
+            for i in screens.indices {
+                for g in gf[i].groups where g.isEvent {
+                    let kids = screenNodes(i, prof, landscape: isL, event: g.handle)
+                    guard let b = PhotoshopFile.Node.group(name: g.handle, children: kids).bounds else { continue }
+                    let w = b.r - b.l + 2 * margin, h = b.b - b.t + 2 * margin
+                    if ex > 0, ex + w > rowW { ex = 0; ey += rowH + gap; rowH = 0 }
+                    boards.append(.group(name: "\(g.handle) (event)", children: kids.map { $0.moved(ex + margin - b.l, ey + margin - b.t) }, artboard: (ex, ey, w, h)))
+                    ex += w + gap; rowH = max(rowH, h)
+                }
+            }
+            let H = rowH > 0 ? ey + rowH : CH
+            return PhotoshopFile.data(width: rowW, height: H, nodes: boards, composite: false)
         }
         let stem = gameDir.replacingOccurrences(of: "/", with: "-")
+        for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
+            try? allScreens(prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_all-screens_\(name).psb"))
+        }
         let eventDir = out.appendingPathComponent("events")
         for i in screens.indices {
             for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
@@ -33882,7 +33919,7 @@ enum GameForgeExport {
         readme += "\n## Assumed — change to suit the game\n\n- Portrait design box 390 × \(Int(o.designHeight)), landscape 970 × 844 (Game Forge's LayoutService); the box's centre is the origin, pinned to the top of the screen.\n"
         readme += "- The control bar takes the bottom \(Int(o.hud)) px of the portrait box and \(Int(o.landscapeHUD)) of the landscape one: nothing is placed there.\n"
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
-        readme += "- A PSB per screen and orientation, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
+        readme += "- `\(stem)_all-screens_portrait.psb` and `_landscape.psb` hold every screen of the game, each an artboard of its own (\(screens.map(\.scope).joined(separator: ", "))), and every event in artboards under them — every layer and group, nothing covering anything else. Each screen also has a PSB of its own, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
         readme += "- The events (pop-ups, celebrations, banners) are groups marked `isEvent` in the screen they show over, centred on its reels, each with a PSB of its own in `events/`. Their amounts have no data key: the game sets them.\n"
         if table != nil {
             readme += "\n## The jackpot table\n\nThis set's jackpots were drawn as one table before Navigator drew them as the studio's games show them, a meter per tier. It is placed as one piece; Make Again ▸ Jackpot meters draws the meters, and the next export places them round the logo (portrait) and in a column beside the reels (landscape).\n"
@@ -33898,17 +33935,19 @@ enum GameForgeExport {
         return (out, lines, problems)
     }
 
-    /// The design box outlined and its control-bar band shaded, on the whole canvas.
+    /// The design box outlined and its control-bar band shaded: a few small layers, not a canvas of empty pixels.
     static func guide(_ prof: GameForge.Profile) -> PhotoshopFile.Node {
-        let (W, H) = prof.canvas, x0 = Int(((prof.screenWidth - prof.width) / 2 * 3).rounded()), x1 = x0 + Int(prof.width * 3), y1 = Int(prof.height * 3), hud = Int((prof.height - prof.hud) * 3)
-        var px = [UInt8](repeating: 0, count: W * H * 4)
-        func set(_ x: Int, _ y: Int, _ a: UInt8) { guard x >= 0, y >= 0, x < W, y < H else { return }; let i = (y * W + x) * 4; px[i] = 255; px[i + 1] = 0; px[i + 2] = 255; px[i + 3] = a }
-        for y in hud..<min(H, y1) { for x in x0..<min(W, x1) { set(x, y, 70) } }
-        for t in 0..<6 {
-            for x in x0..<min(W, x1) { set(x, t, 255); set(x, y1 - 1 - t, 255) }
-            for y in 0..<min(H, y1) { set(x0 + t, y, 255); set(x1 - 1 - t, y, 255) }
+        let (W, H) = prof.canvas, x0 = Int(((prof.screenWidth - prof.width) / 2 * 3).rounded()), w = Int(prof.width * 3), h = min(H, Int(prof.height * 3))
+        let hud = Int((prof.height - prof.hud) * 3), t = 6
+        func solid(_ name: String, _ x: Int, _ y: Int, _ cw: Int, _ ch: Int, _ a: UInt8) -> PhotoshopFile.Node {
+            let cx = max(0, x), cy = max(0, y), ww = max(1, min(W, x + cw) - cx), hh = max(1, min(H, y + ch) - cy)
+            return .layer(name: name, x: cx, y: cy, w: ww, h: hh, px: [UInt8]((0..<(ww * hh)).flatMap { _ in [255, 0, 255, a] }))
         }
-        return .layer(name: "design box and control-bar band", x: 0, y: 0, w: W, h: H, px: px)
+        return .group(name: "design box and control-bar band", children: [
+            solid("control-bar band", x0, hud, w, h - hud, 70),
+            solid("box top", x0, 0, w, t, 255), solid("box bottom", x0, h - t, w, t, 255),
+            solid("box left", x0, 0, t, h, 255), solid("box right", x0 + w - t, 0, t, h, 255),
+        ])
     }
 
     /// The reels filled with the set's symbols as its reel preview fills them (the same draw), `width` px wide.

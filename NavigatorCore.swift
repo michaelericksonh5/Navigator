@@ -10327,7 +10327,7 @@ public enum Localized {
                                "el", "cs", "bg", "nl", "ko", "ja"]
     /// A language's name, for choosing which to localize into.
     public static func languageName(_ lang: String) -> String {
-        ["en": "English", "fr": "French (Canada)", "es": "Spanish", "pt-br": "Portuguese (Brazil)", "pt": "Portuguese (Portugal)", "de": "German",
+        ["en": "English", "fr": "French (Canada)", "es": "Spanish (Latin America)", "pt-br": "Portuguese (Brazil)", "pt": "Portuguese (Portugal)", "de": "German",
          "it": "Italian", "tr": "Turkish", "ru": "Russian", "zh-cn": "Chinese (Simplified)", "zh-hk": "Chinese (Hong Kong)", "da": "Danish",
          "sv": "Swedish", "sk": "Slovak", "ro": "Romanian", "pl": "Polish", "no": "Norwegian", "fi": "Finnish", "el": "Greek", "cs": "Czech",
          "bg": "Bulgarian", "nl": "Dutch", "ko": "Korean", "ja": "Japanese"][lang] ?? lang
@@ -19219,16 +19219,37 @@ public enum PhotoshopFile {
     public indirect enum Node {
         /// Straight RGBA `px`, `w`×`h`, its top-left at (`x`, `y`) on the canvas.
         case layer(name: String, x: Int, y: Int, w: Int, h: Int, px: [UInt8], visible: Bool = true, opacity: UInt8 = 255)
-        case group(name: String, children: [Node], visible: Bool = true)
+        /// `artboard`: the group is a Photoshop artboard over that rectangle of the canvas — a screen of its own.
+        case group(name: String, children: [Node], visible: Bool = true, artboard: (x: Int, y: Int, w: Int, h: Int)? = nil)
+
+        /// The node moved by (`dx`, `dy`) on the canvas, artboards with it.
+        public func moved(_ dx: Int, _ dy: Int) -> Node {
+            switch self {
+            case let .layer(name, x, y, w, h, px, visible, opacity): return .layer(name: name, x: x + dx, y: y + dy, w: w, h: h, px: px, visible: visible, opacity: opacity)
+            case let .group(name, children, visible, a):
+                return .group(name: name, children: children.map { $0.moved(dx, dy) }, visible: visible, artboard: a.map { ($0.x + dx, $0.y + dy, $0.w, $0.h) })
+            }
+        }
+        /// What the node's pixels cover: left, top, right, bottom; nil for an empty group.
+        public var bounds: (l: Int, t: Int, r: Int, b: Int)? {
+            switch self {
+            case let .layer(_, x, y, w, h, _, _, _): return (x, y, x + w, y + h)
+            case let .group(_, children, _, _):
+                return children.compactMap(\.bounds).reduce(nil) { u, b in u.map { (min($0.l, b.l), min($0.t, b.t), max($0.r, b.r), max($0.b, b.b)) } ?? b }
+            }
+        }
     }
 
-    /// The document; `nodes` top first, as the Layers panel lists them.
-    public static func data(width W: Int, height H: Int, nodes: [Node], large: Bool = true) -> Data {
+    /// The document; `nodes` top first, as the Layers panel lists them. `composite: false` stores a plain white flattened
+    /// picture instead of laying the layers together: Photoshop shows the layers, and a canvas holding many screens would
+    /// take gigabytes to lay together.
+    public static func data(width W: Int, height H: Int, nodes: [Node], large: Bool = true, composite: Bool = true) -> Data {
         func be(_ v: UInt64, _ bytes: Int, _ d: inout Data) { for i in (0..<bytes).reversed() { d.append(UInt8(truncatingIfNeeded: v >> UInt64(8 * i))) } }
         func len(_ v: Int, _ d: inout Data) { be(UInt64(v), large ? 8 : 4, &d) }
         func tag(_ key: String, _ body: Data, _ d: inout Data) { d.append(contentsOf: Array(("8BIM" + key).utf8)); be(UInt64(body.count), 4, &d); d.append(body) }
         // Written bottom first; a group is its closing marker, its layers, then the group itself (lsct 3, …, lsct 1).
-        struct Entry { var name: String, rect: (t: Int, l: Int, b: Int, r: Int), blend: String, opacity: UInt8, hidden: Bool, section: UInt32?, pixels: Int? }
+        struct Entry { var name: String, rect: (t: Int, l: Int, b: Int, r: Int), blend: String, opacity: UInt8, hidden: Bool, section: UInt32?, pixels: Int?
+            var artboard: (x: Int, y: Int, w: Int, h: Int)? = nil }
         var entries: [Entry] = [], sources: [(px: [UInt8], w: Int, h: Int)] = []
         func walk(_ nodes: [Node]) {
             for n in nodes.reversed() {
@@ -19236,32 +19257,34 @@ public enum PhotoshopFile {
                 case let .layer(name, x, y, w, h, px, visible, opacity):
                     entries.append(Entry(name: name, rect: (y, x, y + h, x + w), blend: "norm", opacity: opacity, hidden: !visible, section: nil, pixels: sources.count))
                     sources.append((px, w, h))
-                case let .group(name, children, visible):
+                case let .group(name, children, visible, artboard):
                     entries.append(Entry(name: "</Layer group>", rect: (0, 0, 0, 0), blend: "norm", opacity: 255, hidden: false, section: 3, pixels: nil))
                     walk(children)
-                    entries.append(Entry(name: name, rect: (0, 0, 0, 0), blend: "pass", opacity: 255, hidden: !visible, section: 1, pixels: nil))
+                    entries.append(Entry(name: name, rect: (0, 0, 0, 0), blend: "pass", opacity: 255, hidden: !visible, section: 1, pixels: nil, artboard: artboard))
                 }
             }
         }
         walk(nodes)
         // Every layer's channels (alpha, red, green, blue), then the flattened picture's three, compressed in parallel.
-        let flat = flattened(width: W, height: H, nodes: nodes)
+        let flat = composite ? flattened(width: W, height: H, nodes: nodes) : []
         let jobs = sources.indices.flatMap { i in [3, 0, 1, 2].map { (i, $0) } } + (0..<3).map { (-1, $0) }
         var packedPlanes = [(counts: Data, body: Data)](repeating: (Data(), Data()), count: jobs.count)
         let lock = NSLock()
         DispatchQueue.concurrentPerform(iterations: jobs.count) { k in
             let (i, c) = jobs[k]
-            let r = i < 0 ? packed(flat, width: W, height: H, offset: c, large: large) : packed(sources[i].px, width: sources[i].w, height: sources[i].h, offset: c, large: large)
+            let r = i < 0 ? (composite ? packed(flat, width: W, height: H, offset: c, large: large) : white(width: W, height: H, large: large))
+                : packed(sources[i].px, width: sources[i].w, height: sources[i].h, offset: c, large: large)
             lock.lock(); packedPlanes[k] = r; lock.unlock()
         }
-        var records = Data(), channels = Data()
-        let none = [Data](repeating: Data([0, 0]), count: 4)
+        // The records first (they need only each channel's length), then every channel's data straight into the file: a
+        // document of many screens is hundreds of megabytes, copied once.
+        var records = Data()
+        func planeLength(_ i: Int?, _ c: Int) -> Int { i.map { let p = packedPlanes[$0 * 4 + c]; return 2 + p.counts.count + p.body.count } ?? 2 }
         for e in entries {
-            let planes = e.pixels.map { i in (0..<4).map { c -> Data in let p = packedPlanes[i * 4 + c]; return Data([0, 1]) + p.counts + p.body } } ?? none
             var r = Data()
             for v in [e.rect.t, e.rect.l, e.rect.b, e.rect.r] { be(UInt64(UInt32(bitPattern: Int32(v))), 4, &r) }
             be(4, 2, &r)
-            for (id, p) in zip([-1, 0, 1, 2] as [Int16], planes) { be(UInt64(UInt16(bitPattern: id)), 2, &r); len(p.count, &r); channels.append(p) }
+            for (c, id) in ([-1, 0, 1, 2] as [Int16]).enumerated() { be(UInt64(UInt16(bitPattern: id)), 2, &r); len(planeLength(e.pixels, c), &r) }
             r.append(contentsOf: Array(("8BIM" + e.blend).utf8))
             // flags: bit 1 hides the layer; bits 3 and 4 mark a group's layers as carrying no pixels
             r.append(contentsOf: [e.opacity, 0, (e.section == nil ? 0x08 : 0x18) | (e.hidden ? 0x02 : 0), 0])
@@ -19279,21 +19302,55 @@ public enum PhotoshopFile {
                 if section != 3 { s.append(contentsOf: Array("8BIMpass".utf8)) }
                 tag("lsct", s, &extra)
             }
+            if let a = e.artboard { tag("artb", artboardData(a), &extra) }
             be(UInt64(extra.count), 4, &r); r.append(extra)
             records.append(r)
         }
-        var info = Data(); be(UInt64(UInt16(entries.count)), 2, &info); info.append(records); info.append(channels)
-        while info.count % 4 != 0 { info.append(0) }
-        var layers = Data(); len(info.count, &layers); layers.append(info); be(0, 4, &layers)   // no global mask
+        let channelBytes = entries.reduce(0) { t, e in t + (0..<4).reduce(0) { $0 + planeLength(e.pixels, $1) } }
+        let infoLength = 2 + records.count + channelBytes, infoPadded = (infoLength + 3) / 4 * 4
+        let compositeBytes = 2 + packedPlanes.suffix(3).reduce(0) { $0 + $1.counts.count + $1.body.count }
 
-        var out = Data("8BPS".utf8); be(large ? 2 : 1, 2, &out); out.append(Data(count: 6))
+        var out = Data(capacity: 26 + 8 + 2 * (large ? 8 : 4) + infoPadded + 4 + compositeBytes)
+        out.append(contentsOf: Array("8BPS".utf8)); be(large ? 2 : 1, 2, &out); out.append(Data(count: 6))
         be(3, 2, &out); be(UInt64(H), 4, &out); be(UInt64(W), 4, &out); be(8, 2, &out); be(3, 2, &out)   // RGB, 8 bits
         be(0, 4, &out); be(0, 4, &out)                          // no colour table, no resources
-        len(layers.count, &out); out.append(layers)
+        len((large ? 8 : 4) + infoPadded + 4, &out)             // layer and mask information
+        len(infoPadded, &out)                                   // layer info
+        be(UInt64(UInt16(entries.count)), 2, &out); out.append(records)
+        for e in entries {
+            for c in 0..<4 {
+                if let i = e.pixels { let p = packedPlanes[i * 4 + c]; out.append(contentsOf: [0, 1]); out.append(p.counts); out.append(p.body) }
+                else { out.append(contentsOf: [0, 0]) }
+            }
+        }
+        out.append(Data(count: infoPadded - infoLength))
+        be(0, 4, &out)                                          // no global mask
         be(1, 2, &out)
         for p in packedPlanes.suffix(3) { out.append(p.counts) }
         for p in packedPlanes.suffix(3) { out.append(p.body) }
         return out
+    }
+
+    /// An artboard's settings as Photoshop keeps them (an `artb` descriptor, version 16): its rectangle on the canvas, no
+    /// guides, no preset, a transparent background.
+    static func artboardData(_ a: (x: Int, y: Int, w: Int, h: Int)) -> Data {
+        var d = Data()
+        func u32(_ v: UInt32) { for i in (0..<4).reversed() { d.append(UInt8(truncatingIfNeeded: v >> UInt32(8 * i))) } }
+        func key(_ k: String) { u32(k.utf8.count == 4 ? 0 : UInt32(k.utf8.count)); d.append(contentsOf: Array(k.utf8)) }
+        func text(_ t: String) { u32(UInt32(t.utf16.count + 1)); for c in t.utf16 + [0] { d.append(UInt8(c >> 8)); d.append(UInt8(c & 0xff)) } }
+        func double(_ v: Double) { let b = v.bitPattern; for i in (0..<8).reversed() { d.append(UInt8(truncatingIfNeeded: b >> UInt64(8 * i))) } }
+        func ostype(_ t: String) { d.append(contentsOf: Array(t.utf8)) }
+        u32(16)
+        text(""); key("null"); u32(5)
+        key("artboardRect"); ostype("Objc"); text(""); key("classFloatRect"); u32(4)
+        for (k, v) in [("Top ", a.y), ("Left", a.x), ("Btom", a.y + a.h), ("Rght", a.x + a.w)] { key(k); ostype("doub"); double(Double(v)) }
+        key("guideIndeces"); ostype("VlLs"); u32(0)
+        key("artboardPresetName"); ostype("TEXT"); text("")
+        key("Clr "); ostype("Objc"); text(""); key("RGBC"); u32(3)
+        for k in ["Rd  ", "Grn ", "Bl  "] { key(k); ostype("doub"); double(255) }
+        key("artboardBackgroundType"); ostype("long"); u32(1)
+        while d.count % 4 != 0 { d.append(0) }
+        return d
     }
 
     /// The visible layers over white, as RGBA (opaque).
@@ -19310,7 +19367,7 @@ public enum PhotoshopFile {
                     guard visible, let img = ChromaKeyOutputRules.image(straightRGBA8: px, width: w, height: h, space: space) else { continue }
                     ctx.setAlpha(CGFloat(opacity) / 255)
                     ctx.draw(img, in: CGRect(x: x, y: H - y - h, width: w, height: h))
-                case let .group(_, children, visible): if visible { draw(children) }
+                case let .group(_, children, visible, _): if visible { draw(children) }
                 }
             }
         }
@@ -19339,6 +19396,19 @@ public enum PhotoshopFile {
             for i in (0..<(large ? 4 : 2)).reversed() { counts.append(UInt8(truncatingIfNeeded: n >> (8 * i))) }
         }
         return (counts, Data(body))
+    }
+
+    /// A white channel, packed row by row without ever being laid out: runs of 128.
+    static func white(width w: Int, height h: Int, large: Bool) -> (counts: Data, body: Data) {
+        var row = [UInt8]()
+        var left = w
+        while left > 0 { let n = min(128, left); if n == 1 { row += [0, 255] } else { row += [UInt8(bitPattern: Int8(1 - n)), 255] }; left -= n }
+        var counts = Data(capacity: h * (large ? 4 : 2)), body = Data(capacity: h * row.count)
+        for _ in 0..<h {
+            for i in (0..<(large ? 4 : 2)).reversed() { counts.append(UInt8(truncatingIfNeeded: row.count >> (8 * i))) }
+            body.append(contentsOf: row)
+        }
+        return (counts, body)
     }
 
     /// PackBits, as Photoshop compresses a row: a run of 2–128 equal bytes as 1 − n then the byte; up to 128
@@ -19423,8 +19493,10 @@ public enum GameForge {
     /// games): in portrait round the logo over the reels — the top two beside it, the next two below and further out (the
     /// platform's own games), three as the top tier over the logo and the next two beside it; in a wide box, when the reels
     /// leave room, the logo at the top of a column to their left and the meters under it, top tier first, each narrower
-    /// (31 of 41 landscape games). Keys: the block's, "logo", "meter1"….
-    public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, meters: [(w: Double, h: Double)] = [], profile p: Profile) -> [String: Box] {
+    /// (31 of 41 landscape games). `side`: block pieces that join that column, under the meters (the Power Bet buttons,
+    /// as those games have them), keeping their size beside the reels. Keys: the block's, "logo", "meter1"….
+    public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, meters: [(w: Double, h: Double)] = [], side: Set<String> = [],
+                               profile p: Profile) -> [String: Box] {
         guard let u = Box.union(block.values), u.w > 0, u.h > 0 else { return [:] }
         let m = 6.0, gap = 6.0, top = -p.height / 2 + m, bottom = p.height / 2 - p.hud - m
         let aspect = logo.map { $0.w / max(1, $0.h) } ?? 1
@@ -19436,13 +19508,14 @@ public enum GameForge {
             let h = w * meters[i].h / max(1, meters[i].w)
             return Box(x: cx - w / 2, y: y, w: w, h: h)
         }
-        if p.isLandscape, logo != nil || !meters.isEmpty {
+        let main = block.filter { !side.contains($0.key) }
+        if p.isLandscape, logo != nil || !meters.isEmpty, let u = Box.union(main.values), u.w > 0, u.h > 0 {
             // With meters, a column is kept for them, a fifth of the box: the reels never squeeze it out.
-            let keep = meters.isEmpty ? 0 : 0.2 * p.width
+            let keep = meters.isEmpty && side.isEmpty ? 0 : 0.2 * p.width
             let s = min((p.width - 2 * m - 2 * keep) / u.w, (bottom - top) / u.h), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
             if column >= 150 {
                 let y0 = top + (bottom - top - bh) / 2
-                place(s, -bw / 2, y0)
+                for (k, b) in main { out[k] = Box(x: -bw / 2 + (b.x - u.x) * s, y: y0 + (b.y - u.y) * s, w: b.w * s, h: b.h * s) }
                 let cx = (-p.width / 2 - bw / 2) / 2
                 var y = y0 + bh * 0.04
                 if logo != nil {
@@ -19459,6 +19532,13 @@ public enum GameForge {
                 for i in boxes.indices {
                     boxes[i] = meterBox(i, width: boxes[i].w * k, cx: cx, top: y); y += boxes[i].h + gap
                     out["meter\(i + 1)"] = boxes[i]
+                }
+                // The side pieces under them, as large beside the reels as they are under them, no wider than the column.
+                y += gap
+                for key in side.sorted() {
+                    guard let b = block[key] else { continue }
+                    let w = min(b.w * s, column * 0.9), h = w * b.h / max(1, b.w)
+                    out[key] = Box(x: cx - w / 2, y: y, w: w, h: h); y += h + gap
                 }
                 return out
             }

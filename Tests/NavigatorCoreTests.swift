@@ -14632,3 +14632,43 @@ final class JackpotMeterTests: XCTestCase {
         XCTAssertLessThan(l["meter1"]!.y, l["meter2"]!.y)
     }
 }
+
+final class PhotoshopArtboardTests: XCTestCase {
+    func testAGroupCanBeAnArtboard() throws {
+        let px = [UInt8](repeating: 200, count: 10 * 10 * 4)
+        let nodes: [PhotoshopFile.Node] = [
+            .group(name: "bonus", children: [.layer(name: "b", x: 120, y: 10, w: 10, h: 10, px: px)], artboard: (100, 0, 80, 60)),
+            .group(name: "base", children: [.layer(name: "a", x: 10, y: 10, w: 10, h: 10, px: px)], artboard: (0, 0, 80, 60)).moved(0, 0),
+        ]
+        let d = PhotoshopFile.data(width: 180, height: 60, nodes: nodes, composite: false)
+        XCTAssertNotNil(d.range(of: Data("8BIMartb".utf8)))
+        let a = PhotoshopFile.artboardData((x: 100, y: 0, w: 80, h: 60))
+        XCTAssertEqual(a.prefix(4), Data([0, 0, 0, 16]))                                   // descriptor version 16
+        XCTAssertEqual(a.count % 4, 0)
+        XCTAssertEqual(nodes[0].moved(5, 7).bounds?.l, 125)
+        if let out = ProcessInfo.processInfo.environment["NAVIGATOR_ARTBOARD_SAMPLE"] { try d.write(to: URL(fileURLWithPath: out)) }
+    }
+}
+
+final class PhotoshopWhiteTests: XCTestCase {
+    func testAWhiteChannelPacksAsTheRowsWouldHave() {
+        for w in [1, 2, 127, 128, 129, 300] {
+            let (counts, body) = PhotoshopFile.white(width: w, height: 2, large: false)
+            let n = Int(counts[0]) << 8 | Int(counts[1])
+            XCTAssertEqual(PhotoshopFile.unpackBits(Array(body.prefix(n))), [UInt8](repeating: 255, count: w))
+        }
+    }
+}
+
+final class GameForgeSideColumnTests: XCTestCase {
+    func testPowerBetButtonsJoinTheColumnInLandscapeOnly() {
+        typealias Box = GameForge.Box
+        let block = ["bezel": Box(x: 0, y: 0, w: 3000, h: 2600), "btn": Box(x: 1000, y: 2700, w: 700, h: 350)]
+        let meters = Array(repeating: (w: 2.0, h: 1.0), count: 4)
+        let l = GameForge.compose(block: block, logo: (w: 2, h: 1), meters: meters, side: ["btn"], profile: .landscape())
+        XCTAssertLessThan(l["btn"]!.x + l["btn"]!.w, l["bezel"]!.x)                          // beside the reels
+        XCTAssertGreaterThan(l["btn"]!.y, l["meter4"]!.y + l["meter4"]!.h)                    // under the meters
+        let p = GameForge.compose(block: block, logo: (w: 2, h: 1), meters: meters, side: ["btn"], profile: .portrait())
+        XCTAssertGreaterThan(p["btn"]!.y, p["bezel"]!.y + p["bezel"]!.h)                       // under the reels
+    }
+}
