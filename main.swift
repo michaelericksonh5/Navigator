@@ -26826,8 +26826,11 @@ final class GDDToAssetsRun: ObservableObject {
                 }
                 items.append(AssetChecklist.Item(group: "Pick bonus", name: "jackpot_interface_bezel", what: "the pick panel: the base bezel round the pick grid, the reel texture inside", files: ["jackpot_interface_bezel_rmbg.png", "jackpot_interface_reelTexture_rmbg.png"], maker: "Pick bonus", cost: 0))
             }
+            // Drawn by GPT, then brought to 4K by Nano Banana Pro: one drawn before that costs only the 4K.
             for j in jobs where j.kind == .background {
-                items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
+                let n = Derived.landscapeName(j.id), drawn = lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(n).png").path) } ?? false
+                items.append(AssetChecklist.Item(group: "Landscape", name: n, what: "\(j.title), landscape, at 4K", files: ["\(n).png"], maker: "Landscape",
+                                                 cost: (drawn ? 0 : AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)) + nbEstimatedCost(size: "4K", modelFlag: vertexUpscaleModelFlag)))
             }
             // Phase 3: each lettered piece in the languages chosen — a word with no approved translation flagged, not drawn;
             // the same words as the English copied, free; a wheel's wedge lettered in code, free.
@@ -26845,7 +26848,9 @@ final class GDDToAssetsRun: ObservableObject {
             }
         }
         let fm = FileManager.default
-        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) } } ?? false) }
+        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) }
+            // A landscape background is made once it is at 4K.
+            && (i.group != "Landscape" || i.files.allSatisfy { imagePixelSize(f.appendingPathComponent($0)).map { VertexUpscaleRules.isPointless(longEdge: $0.w) } ?? false }) } ?? false) }
     }
 
     /// Gemini reads the GDD for every other static piece the game needs (ConceptPlan) — meters, collection
@@ -27607,12 +27612,25 @@ final class GDDToAssetsRun: ObservableObject {
             both(px, w, side, "\(j.id)_train")
             for k in 0..<parts { both(FrameKit.crop(px, width: w, k * side, 0, side, side).px, side, side, "\(j.id)_train\(k + 1)") }
         }
-        // 11. Every background's landscape twin, the same scene widened (Derived).
-        for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {
-            guard let bgPNG = try? Data(contentsOf: url("\(j.id).png")) else { continue }
-            let (w, h) = Derived.landscape
-            if let px = paint(Derived.landscapeName(j.id), prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
-                              inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(Derived.landscapeName(j.id)).png") }
+        // 11. Every background's landscape twin, the same scene widened (Derived), then brought to 4K by Nano Banana Pro
+        // (Vertex): GPT draws no more than 3840 a side, and Game Forge shows a landscape background at 4608×2532.
+        for j in jobs where j.kind == .background {
+            let name = Derived.landscapeName(j.id), file = url("\(name).png")
+            if !has("\(name).png"), let bgPNG = try? Data(contentsOf: url("\(j.id).png")) {
+                let (w, h) = Derived.landscape
+                if let px = paint(name, prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
+                                  inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(name).png") }
+            }
+            guard wanted("\(name).png"), let size = imagePixelSize(file), !VertexUpscaleRules.isPointless(longEdge: size.w) else { continue }
+            if let budget, cost + nbEstimatedCost(size: "4K", modelFlag: vertexUpscaleModelFlag) > budget {
+                if !problems.contains(where: { $0.hasPrefix("stopped at the budget") }) { problems.append(String(format: "stopped at the budget of $%.2f: what is not drawn yet is drawn by the next run", budget)) }
+                continue
+            }
+            let r = runRestyle(source: file, prompt: VertexUpscaleRules.prompt(transparent: false), modelFlag: vertexUpscaleModelFlag,
+                               aspect: "auto", size: "4K", modeLabel: "Upscale (Nano Banana Pro) 4K")
+            cost += r.cost ?? 0
+            if let saved = r.saved, (try? fm.replaceItemAt(file, withItemAt: saved)) != nil { log.write("prompts/\(name)-4K.txt", "MODE: \(name) (Nano Banana Pro) 4K\n\n" + VertexUpscaleRules.prompt(transparent: false)) }
+            else { problems.append("\(name) is \(size.w)×\(size.h), not brought to 4K: \(r.error ?? "it could not be saved")") }
         }
         // 12. Phase 3: the lettered pieces in the languages chosen (Localized), every word from the art-words table. A word
         // with no approved translation is flagged and listed for the localization team, never drawn; a piece whose words are
@@ -33553,7 +33571,8 @@ enum GameForgeExport {
 
         func exists(_ n: String) -> Bool { fm.fileExists(atPath: folder.appendingPathComponent(n).path) }
         func load(_ n: String) -> Piece? {
-            guard let cg = loadCGImage(folder.appendingPathComponent(n)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            guard let cg = loadCGImage(folder.appendingPathComponent(n)), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { return nil }
+            FrameKit.clearSpecks(&px, width: cg.width, height: cg.height)   // a set keyed before the keyer took them
             return Piece(px: px, w: cg.width, h: cg.height)
         }
         /// A picture cut to what it shows, and where that sat in it.
@@ -33795,7 +33814,8 @@ enum GameForgeExport {
             s.block["grid"] = Box(x: Double(g.x), y: Double(g.y), w: Double(g.w), h: Double(g.h))
             if let m = cutFile("jackpot_interface_message") {
                 let w = 0.62 * outer, k = w / Double(m.fullW)
-                let y = bandTop + Double(board.band) / 2 - Double(m.fullH) * k / 2
+                // Centred on the panel's top edge, raised as far as it takes to end above the objects.
+                let y = min(bandTop + Double(board.band) / 2 - Double(m.fullH) * k / 2, Double(g.y) - 0.015 * outer - Double(m.y + m.piece.h) * k)
                 s.add("message", m, left + (outer - w) / 2, y, k, asset: "jackpot/message"); top = min(top, y + Double(m.y) * k)
             }
             // The meters over it, in a row as wide as it.
@@ -34084,7 +34104,8 @@ enum GameForgeExport {
             var nodes: [PhotoshopFile.Node] = [], size = (w: 0, h: 0)
             if let d = try? Data(contentsOf: dir.appendingPathComponent("_layers.json")), let split = try? JSONDecoder().decode([Split].self, from: d) {
                 for l in split.sorted(by: { $0.z_index > $1.z_index }) {
-                    guard let cg = loadCGImage(dir.appendingPathComponent(l.file)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+                    guard let cg = loadCGImage(dir.appendingPathComponent(l.file)), var px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+                    FrameKit.clearSpecks(&px, width: cg.width, height: cg.height)
                     size = (cg.width, cg.height)
                     guard let e = LayerizeAssembly.extent(px, width: cg.width, height: cg.height, alpha: 1) else { continue }
                     let c = FrameKit.crop(px, width: cg.width, e.x, e.y, e.w, e.h)

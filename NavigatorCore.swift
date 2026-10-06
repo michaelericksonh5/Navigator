@@ -11385,8 +11385,10 @@ public enum PickArt {
         let c = rgb(JackpotMeters.colour(tier, rank: rank)), s = CGFloat(n)
         let ring = CGColor(red: CGFloat(c.r) / 255, green: CGFloat(c.g) / 255, blue: CGFloat(c.b) / 255, alpha: 1)
         // Round the object itself, whatever share of its canvas it fills.
-        let e = LayerizeAssembly.extent(closed, width: n, height: n, alpha: 32) ?? (Int(s * 0.05), Int(s * 0.05), Int(s * 0.9), Int(s * 0.9))
-        let d = min(s * 0.94, CGFloat(max(e.w, e.h)) * 1.06), cx = CGFloat(e.x) + CGFloat(e.w) / 2, cy = s - (CGFloat(e.y) + CGFloat(e.h) / 2)
+        // Its solid body, so a speck at the canvas's edge cannot stretch it; the ring and its glow kept inside the canvas.
+        let e = Derived.body(closed, width: n, height: n).map { (x: $0.x0, y: $0.y0, w: $0.x1 - $0.x0 + 1, h: $0.y1 - $0.y0 + 1) }
+            ?? (x: Int(s * 0.05), y: Int(s * 0.05), w: Int(s * 0.9), h: Int(s * 0.9))
+        let d = min(s * 0.86, CGFloat(max(e.w, e.h)) * 1.06), cx = CGFloat(e.x) + CGFloat(e.w) / 2, cy = s - (CGFloat(e.y) + CGFloat(e.h) / 2)
         ctx.saveGState()
         ctx.setShadow(offset: .zero, blur: s * 0.05, color: ring)
         ctx.setStrokeColor(ring); ctx.setLineWidth(s * 0.04)
@@ -15031,8 +15033,26 @@ public enum FrameKit {
     /// ring, so the art's own colours inside are never touched.
     static func keyed(_ px: [UInt8], backing b: RGB8, width w: Int, height h: Int, ring: Int = 3) -> [UInt8] {
         var out = keyed(px, backing: b)
+        clearSpecks(&out, width: w, height: h)
         despill(&out, width: w, height: h, backing: b, ring: ring)
         return out
+    }
+    /// The specks GPT Image leaves at a picture's edge taken away (straight RGBA). Its corners come back a little off the
+    /// backing and key to dots (59 of a set's 128 cut-outs, 2026-10-06), and a resize leaves a faint line along an edge.
+    /// A speck is a pixel within 3 of the edge with no more than 9 set pixels in the 9×9 round it; art that reaches the
+    /// edge has far more.
+    static func clearSpecks(_ px: inout [UInt8], width w: Int, height h: Int) {
+        guard px.count == w * h * 4, w > 8, h > 8 else { return }
+        func set(_ x: Int, _ y: Int) -> Bool { px[(y * w + x) * 4 + 3] > 8 }
+        var specks: [Int] = []
+        for y in 0..<h {
+            for x in (y < 3 || y >= h - 3 ? Array(0..<w) : [0, 1, 2, w - 3, w - 2, w - 1]) where set(x, y) {
+                var n = 0
+                for yy in max(0, y - 4)...min(h - 1, y + 4) { for xx in max(0, x - 4)...min(w - 1, x + 4) where set(xx, yy) { n += 1 } }
+                if n <= 9 { specks.append(y * w + x) }
+            }
+        }
+        for i in specks { px[i * 4] = 0; px[i * 4 + 1] = 0; px[i * 4 + 2] = 0; px[i * 4 + 3] = 0 }
     }
     /// The backing's colour taken out of a cut-out's outer `ring` and its soft pixels (straight RGBA): its own
     /// channels (magenta: red and blue) brought down to the others where they run ahead of them.

@@ -14775,5 +14775,18 @@ final class PickArtTests: XCTestCase {
         XCTAssertGreaterThan(Int(r[i]), Int(r[i + 2]) + 60)
         XCTAssertEqual(r[(100 * n + 2) * 4 + 3], 0)
         XCTAssertNotEqual(Array(r[((100 * n) + 100) * 4..<((100 * n) + 100) * 4 + 4]), [200, 160, 40, 255])   // the word across the middle
+        // A speck in a corner, as GPT leaves them, does not stretch the ring to the canvas's edge.
+        closed[3] = 105; closed[(n * n - 1) * 4 + 3] = 61
+        XCTAssertEqual(PickArt.revealed(closed, size: n, tier: "GRAND", rank: 0)[(100 * n + 2) * 4 + 3], 0)
+    }
+    func testSpecksAtAPicturesEdgeAreTakenAwayAndArtThatReachesItKept() {
+        let n = 40
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        func a(_ x: Int, _ y: Int) -> UInt8 { px[(y * n + x) * 4 + 3] }
+        for y in 10..<30 { for x in 0..<10 { px[(y * n + x) * 4 + 3] = 255 } }      // art against the left edge
+        px[((n - 1) * n + n - 1) * 4 + 3] = 157                                     // a corner speck
+        for x in 15..<35 { px[((n - 1) * n + x) * 4 + 3] = 10 }                      // a faint line along the bottom
+        FrameKit.clearSpecks(&px, width: n, height: n)
+        XCTAssertEqual(a(0, 20), 255); XCTAssertEqual(a(0, 10), 255); XCTAssertEqual(a(n - 1, n - 1), 0); XCTAssertEqual(a(25, n - 1), 0)
     }
 }
