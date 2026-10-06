@@ -33510,6 +33510,8 @@ enum GameForgeExport {
             var area: ReelArea?, cellBacking: Piece?, showsMeters = true
             /// Pieces that join the column beside the reels in landscape (the Power Bet buttons).
             var side: Set<String> = []
+            /// Groups that join a column right of the reels in landscape (each pot with its plaque).
+            var right: [[String]] = []
             var wheel: (art: WheelArt, order: [String], wedges: [String: [UInt8]], prefix: String)?
             mutating func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, asset: String) {
                 block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k)
@@ -33590,6 +33592,7 @@ enum GameForgeExport {
                 let k = potW / Double(p.fullW), cx = Double(g.x) + Double(g.w) * Double(2 * i + 1) / Double(2 * pots.count)
                 let py = tableY - Double(p.fullH) * k + potW / 8
                 s.add("pot\(i + 1)", p, cx - potW / 2, py, k, asset: "meters/pot-\(i + 1)")
+                s.right.append(["pot\(i + 1)", "plaque\(i + 1)"])
                 s.items.append(("pot\(i + 1)", "pot-\(i + 1)-\(scope)", "Pot \(i + 1)", "pots-\(scope)", 153))
                 if i < plaques.count, let pl = plaques[i], let pb = s.block["pot\(i + 1)"] {
                     let w = potW * 0.95, kk = w / Double(pl.fullW)
@@ -33740,7 +33743,7 @@ enum GameForgeExport {
                 screens[i].groups.append(GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpot meters"))
             }
             screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], profile: portrait)
-            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], side: screens[i].side, profile: landscape)
+            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], side: screens[i].side, right: screens[i].right, profile: landscape)
         }
 
         // The events — pop-ups, celebrations, banners — each a group the game shows over its screen, centred on its reels

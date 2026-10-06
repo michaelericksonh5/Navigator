@@ -14704,3 +14704,18 @@ final class GameSheetPickTests: XCTestCase {
         XCTAssertNil(none.layout([]).picks)
     }
 }
+
+final class GameForgeRightColumnTests: XCTestCase {
+    func testPotsMoveRightOfTheReelsInLandscapeWithTheirPlaques() {
+        typealias Box = GameForge.Box
+        let block = ["bezel": Box(x: 0, y: 900, w: 3000, h: 2600), "pot1": Box(x: 600, y: 0, w: 600, h: 900), "plaque1": Box(x: 620, y: 820, w: 560, h: 200)]
+        let meters = Array(repeating: (w: 2.0, h: 1.0), count: 4)
+        let l = GameForge.compose(block: block, logo: (w: 2, h: 1), meters: meters, right: [["pot1", "plaque1"]], profile: .landscape())
+        XCTAssertGreaterThan(l["pot1"]!.x, l["bezel"]!.x + l["bezel"]!.w)                         // right of the reels
+        XCTAssertEqual(l["plaque1"]!.y - l["pot1"]!.y, (820 - 0) * l["pot1"]!.w / 600, accuracy: 0.5)  // its plaque with it
+        XCTAssertEqual(l["bezel"]!.cx, 0, accuracy: 0.5)                                           // centred between the columns
+        XCTAssertLessThanOrEqual(l["bezel"]!.w, 970 - 12 - 2 * 0.2 * 970 + 0.5)
+        let p = GameForge.compose(block: block, logo: (w: 2, h: 1), meters: meters, right: [["pot1", "plaque1"]], profile: .portrait())
+        XCTAssertLessThan(p["pot1"]!.y, p["bezel"]!.y)                                             // over the reels in portrait
+    }
+}

@@ -19585,9 +19585,11 @@ public enum GameForge {
     /// platform's own games), three as the top tier over the logo and the next two beside it; in a wide box, when the reels
     /// leave room, the logo at the top of a column to their left and the meters under it, top tier first, each narrower
     /// (31 of 41 landscape games). `side`: block pieces that join that column, under the meters (the Power Bet buttons,
-    /// as those games have them), keeping their size beside the reels. Keys: the block's, "logo", "meter1"….
+    /// as those games have them), keeping their size beside the reels. `right`: groups of block pieces (a pot and its
+    /// plaque) that move to a column right of the reels in landscape, each group kept together, so the reels take the
+    /// box's height. Keys: the block's, "logo", "meter1"….
     public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, meters: [(w: Double, h: Double)] = [], side: Set<String> = [],
-                               profile p: Profile) -> [String: Box] {
+                               right: [[String]] = [], profile p: Profile) -> [String: Box] {
         guard let u = Box.union(block.values), u.w > 0, u.h > 0 else { return [:] }
         let m = 6.0, gap = 6.0, top = -p.height / 2 + m, bottom = p.height / 2 - p.hud - m
         let aspect = logo.map { $0.w / max(1, $0.h) } ?? 1
@@ -19599,10 +19601,11 @@ public enum GameForge {
             let h = w * meters[i].h / max(1, meters[i].w)
             return Box(x: cx - w / 2, y: y, w: w, h: h)
         }
-        let main = block.filter { !side.contains($0.key) }
+        let rightKeys = Set(right.flatMap { $0 })
+        let main = block.filter { !side.contains($0.key) && !rightKeys.contains($0.key) }
         if p.isLandscape, logo != nil || !meters.isEmpty, let u = Box.union(main.values), u.w > 0, u.h > 0 {
             // With meters, a column is kept for them, a fifth of the box: the reels never squeeze it out.
-            let keep = meters.isEmpty && side.isEmpty ? 0 : 0.2 * p.width
+            let keep = meters.isEmpty && side.isEmpty && right.isEmpty ? 0 : 0.2 * p.width
             let s = min((p.width - 2 * m - 2 * keep) / u.w, (bottom - top) / u.h), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
             if column >= 150 {
                 let y0 = top + (bottom - top - bh) / 2
@@ -19630,6 +19633,20 @@ public enum GameForge {
                     guard let b = block[key] else { continue }
                     let w = min(b.w * s, column * 0.9), h = w * b.h / max(1, b.w)
                     out[key] = Box(x: cx - w / 2, y: y, w: w, h: h); y += h + gap
+                }
+                // The right column: each group as it stands in the block, as large as beside the reels, no wider than the
+                // column; together centred on the reels, smaller all together if they would run past them.
+                let units = right.compactMap { keys -> (keys: [String], box: Box)? in Box.union(keys.compactMap { block[$0] }).map { (keys, $0) } }
+                if !units.isEmpty {
+                    let rx = (p.width / 2 + bw / 2) / 2
+                    var k = units.map { min(s, column * 0.9 / $0.box.w) }.min() ?? s
+                    let total = units.reduce(0) { $0 + $1.box.h * k } + Double(units.count - 1) * 2 * gap
+                    if total > bh { k *= bh / total }
+                    var ry = y0 + (bh - (units.reduce(0) { $0 + $1.box.h * k } + Double(units.count - 1) * 2 * gap)) / 2
+                    for unit in units {
+                        for key in unit.keys { if let b = block[key] { out[key] = Box(x: rx + (b.x - unit.box.cx) * k, y: ry + (b.y - unit.box.y) * k, w: b.w * k, h: b.h * k) } }
+                        ry += unit.box.h * k + 2 * gap
+                    }
                 }
                 return out
             }
