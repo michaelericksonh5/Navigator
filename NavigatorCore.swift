@@ -19422,6 +19422,94 @@ public enum PhotoshopFile {
         return out
     }
 
+    /// A layer as a file holds it: its name, its rectangle on the canvas (left, top, right, bottom), the groups it is in
+    /// (outermost first) and whether it is hidden. Groups themselves are not listed.
+    public struct LayerRecord: Equatable, Sendable {
+        public var name: String, rect: (l: Int, t: Int, r: Int, b: Int), groups: [String], hidden: Bool
+        /// The top-left of the artboard it is on; (0, 0) on a document without artboards.
+        public var origin: (x: Int, y: Int) = (0, 0)
+        public static func == (a: LayerRecord, b: LayerRecord) -> Bool {
+            a.name == b.name && a.groups == b.groups && a.hidden == b.hidden && a.rect.l == b.rect.l && a.rect.t == b.rect.t && a.rect.r == b.rect.r && a.rect.b == b.rect.b
+                && a.origin.x == b.origin.x && a.origin.y == b.origin.y
+        }
+    }
+    /// The layers of a PSD or PSB (as Photoshop saves them, or as `data` writes them), read without their pixels: what an
+    /// artist moved, when a file comes back. Nil for a file that is not one, or that stops short.
+    public static func layers(in d: Data) -> (width: Int, height: Int, layers: [LayerRecord])? {
+        let b = [UInt8](d)
+        var i = 0
+        func n(_ k: Int) -> Int? { guard i + k <= b.count else { return nil }; var v = 0; for _ in 0..<k { v = v << 8 | Int(b[i]); i += 1 }; return v }
+        guard b.count > 26, String(bytes: b[0..<4], encoding: .ascii) == "8BPS" else { return nil }
+        i = 4
+        guard let version = n(2), version == 1 || version == 2 else { return nil }
+        let large = version == 2
+        i += 6
+        guard n(2) != nil, let h = n(4), let w = n(4), n(2) != nil, n(2) != nil else { return nil }
+        guard let cm = n(4) else { return nil }; i += cm                       // colour mode data
+        guard let res = n(4) else { return nil }; i += res                     // image resources
+        guard n(large ? 8 : 4) != nil, n(large ? 8 : 4) != nil, let rawCount = n(2) else { return nil }
+        let count = abs(Int(Int16(truncatingIfNeeded: rawCount)))
+        var out: [LayerRecord] = [], stack: [(name: String, origin: (x: Int, y: Int)?)] = []
+        var pending: [(name: String, rect: (Int, Int, Int, Int), hidden: Bool, section: Int, origin: (x: Int, y: Int)?)] = []
+        for _ in 0..<count {
+            guard let t = n(4), let l = n(4), let bt = n(4), let r = n(4), let chans = n(2) else { return nil }
+            for _ in 0..<chans { guard n(2) != nil, n(large ? 8 : 4) != nil else { return nil } }
+            i += 4 + 4 + 2                                                    // 8BIM, blend key, opacity, clipping
+            guard i < b.count else { return nil }
+            let flags = b[i]; i += 2
+            guard let extraLen = n(4) else { return nil }
+            let extraEnd = i + extraLen
+            guard let maskLen = n(4) else { return nil }; i += maskLen
+            guard let rangesLen = n(4) else { return nil }; i += rangesLen
+            guard i < b.count else { return nil }
+            let nl = Int(b[i]); var name = String(bytes: b[(i + 1)..<min(b.count, i + 1 + nl)], encoding: .macOSRoman) ?? ""
+            i += (1 + nl + 3) / 4 * 4
+            var section = 0, origin: (x: Int, y: Int)?
+            while i + 12 <= extraEnd {
+                i += 4
+                let key = String(bytes: b[i..<(i + 4)], encoding: .ascii) ?? ""; i += 4
+                let long = large && ["LMsk", "Lr16", "Lr32", "Layr", "Mt16", "Mt32", "Mtrn", "Alph", "FMsk", "lnk2", "FEid", "FXid", "PxSD", "artd"].contains(key)
+                guard let len = n(long ? 8 : 4) else { return nil }
+                let end = i + len
+                if key == "lsct", let s = n(4) { section = s }
+                // An artboard: its rectangle's Left and Top, each a 4-letter key, "doub", then the double.
+                if key == "artb" {
+                    func value(_ k: String) -> Int? {
+                        let pat = [UInt8]([0, 0, 0, 0] + Array(k.utf8) + Array("doub".utf8))
+                        var j = i
+                        while j + pat.count + 8 <= min(end, b.count) {
+                            if Array(b[j..<(j + pat.count)]) == pat {
+                                var bits: UInt64 = 0; for q in 0..<8 { bits = bits << 8 | UInt64(b[j + pat.count + q]) }
+                                return Int(Double(bitPattern: bits).rounded())
+                            }
+                            j += 1
+                        }
+                        return nil
+                    }
+                    if let x = value("Left"), let y = value("Top ") { origin = (x, y) }
+                }
+                if key == "luni", let c = n(4), i + 2 * c <= b.count {
+                    name = String(utf16CodeUnits: (0..<c).map { k in UInt16(b[i + 2 * k]) << 8 | UInt16(b[i + 2 * k + 1]) }, count: c).trimmingCharacters(in: CharacterSet(charactersIn: "\u{0}"))
+                }
+                i = end
+            }
+            i = extraEnd
+            pending.append((name, (l, Int(Int32(truncatingIfNeeded: t)), Int(Int32(truncatingIfNeeded: r)), Int(Int32(truncatingIfNeeded: bt))), flags & 2 != 0, section, origin))
+        }
+        // Records run bottom first: a group's closing marker (3), its layers, then the group (1 or 2). Read top first, a
+        // group opens at its record and closes at its marker.
+        for e in pending.reversed() {
+            switch e.section {
+            case 1, 2: stack.append((e.name, e.origin))
+            case 3: _ = stack.popLast()
+            default:
+                out.append(LayerRecord(name: e.name, rect: (Int(Int32(truncatingIfNeeded: e.rect.0)), e.rect.1, Int(Int32(truncatingIfNeeded: e.rect.2)), e.rect.3),
+                                       groups: stack.map(\.name), hidden: e.hidden, origin: stack.last(where: { $0.origin != nil })?.origin ?? (0, 0)))
+            }
+        }
+        return (w, h, out)
+    }
+
     /// An artboard's settings as Photoshop keeps them (an `artb` descriptor, version 16): its rectangle on the canvas, no
     /// guides, no preset, a transparent background.
     static func artboardData(_ a: (x: Int, y: Int, w: Int, h: Int)) -> Data {
@@ -19546,7 +19634,7 @@ public enum PhotoshopFile {
 public enum GameForge {
     /// A design box: `width`×`height` design px on a `screenWidth`×`screenHeight` screen, pinned to its top;
     /// `hud` the band at the bottom of the box the game's control bar takes (the React HUD, not art).
-    public struct Profile: Equatable, Sendable {
+    public struct Profile: Equatable, Codable, Sendable {
         public var width: Double, height: Double, hud: Double, screenWidth: Double, screenHeight: Double
         public init(width: Double, height: Double, hud: Double, screenWidth: Double, screenHeight: Double) {
             self.width = width; self.height = height; self.hud = hud; self.screenWidth = screenWidth; self.screenHeight = screenHeight
@@ -19561,7 +19649,7 @@ public enum GameForge {
     }
 
     /// A rectangle: its top-left and size.
-    public struct Box: Equatable, Sendable {
+    public struct Box: Equatable, Codable, Sendable {
         public var x, y, w, h: Double
         public init(x: Double, y: Double, w: Double, h: Double) { self.x = x; self.y = y; self.w = w; self.h = h }
         public var cx: Double { x + w / 2 }
@@ -19694,7 +19782,7 @@ public enum GameForge {
     /// One picture of a mode, placed: `asset` its file ("folder/stem", lowercase, as the build names it), `pixels`
     /// the width that file is exported at. No `asset`: a piece the game's code builds (the reel grid), grouped with
     /// the art round it but not a placement.
-    public struct Item: Equatable, Sendable {
+    public struct Item: Equatable, Codable, Sendable {
         public var name: String, asset: String?, label: String, group: String?, z: Int
         public var portrait: Box, landscape: Box, pixels: Int
         public init(name: String, asset: String?, label: String, group: String?, z: Int, portrait: Box, landscape: Box, pixels: Int) {
@@ -19706,7 +19794,7 @@ public enum GameForge {
     }
     /// Text the game prints on a picture (a jackpot's amount): `box` in that picture's own space — its pixels ÷ 3,
     /// from its centre — so it moves and scales with it.
-    public struct Label: Equatable, Sendable {
+    public struct Label: Equatable, Codable, Sendable {
         public var name: String, label: String, text: String, parent: String, dataKey: String, box: Box, z: Int
         public init(name: String, label: String, text: String, parent: String, dataKey: String, box: Box, z: Int) {
             self.name = name; self.label = label; self.text = text; self.parent = parent; self.dataKey = dataKey; self.box = box; self.z = z
@@ -19714,7 +19802,7 @@ public enum GameForge {
     }
     /// A group: its members' names; its origin their centre. `landscapeScale` scales the group in landscape (the
     /// code-built reel grid, whose cell is the portrait one).
-    public struct Group: Equatable, Sendable {
+    public struct Group: Equatable, Codable, Sendable {
         public var handle: String, label: String, landscapeScale: Double
         /// An event (a pop-up, a celebration): hidden until the game shows it.
         public var isEvent: Bool
@@ -19744,6 +19832,38 @@ public enum GameForge {
         }
         for i in mode.items where !mode.groups.contains(where: { $0.handle == i.group }) { units.append((i.z, nil, [i])) }
         return units.sorted { $0.z > $1.z }.map { ($0.group, $0.items) }
+    }
+
+    /// What an export placed, kept beside its layout files (`navigator-export.json`), so the files can be laid again from
+    /// Photoshop files an artist has moved things in (`moved`).
+    public struct Saved: Codable, Sendable {
+        public struct Screen: Codable, Sendable {
+            public var scope: String, items: [Item], groups: [Group], labels: [Label], backgroundPortrait: String?, backgroundLandscape: String?
+            public init(_ m: Mode) {
+                scope = m.scope; items = m.items; groups = m.groups; labels = m.labels
+                backgroundPortrait = m.background?.portrait; backgroundLandscape = m.background?.landscape
+            }
+            public var mode: Mode {
+                Mode(scope: scope, items: items, groups: groups, labels: labels,
+                     background: backgroundPortrait.flatMap { p in backgroundLandscape.map { (p, $0) } })
+            }
+        }
+        public var portrait: Profile, landscape: Profile, game: String, screens: [Screen]
+        public init(portrait: Profile, landscape: Profile, game: String, modes: [Mode]) {
+            self.portrait = portrait; self.landscape = landscape; self.game = game; screens = modes.map(Screen.init)
+        }
+    }
+
+    /// A piece's place read back from a Photoshop file: the layer's rectangle (canvas pixels, at 3×) as a design-px box.
+    /// A layer whose size is within `tolerance` px of what was written is taken as moved only, its size kept — a layer
+    /// Photoshop has trimmed by a pixel is not rescaled.
+    public static func moved(_ old: Box, to r: (l: Int, t: Int, r: Int, b: Int), profile p: Profile, tolerance: Double = 3) -> Box {
+        let x0 = Double(r.l) / 3 - p.screenWidth / 2, y0 = Double(r.t) / 3 - p.height / 2
+        let w = Double(r.r - r.l) / 3, h = Double(r.b - r.t) / 3
+        if abs(w * 3 - old.w * 3) <= tolerance && abs(h * 3 - old.h * 3) <= tolerance {
+            return Box(x: x0 + w / 2 - old.w / 2, y: y0 + h / 2 - old.h / 2, w: old.w, h: old.h)
+        }
+        return Box(x: x0, y: y0, w: w, h: h)
     }
 
     /// A number as the layout files write it: whole when it is, else to `places` decimals.

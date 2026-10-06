@@ -22017,6 +22017,15 @@ if let flag = CommandLine.arguments.firstIndex(of: "--gameforge"), flag + 1 < Co
     app.run()
 }
 
+// Free:  Navigator --gameforge-import <export folder>
+// The layout files laid again from the export's Photoshop files after pieces were moved in them (GameForgeExport.importLayout).
+if let flag = CommandLine.arguments.firstIndex(of: "--gameforge-import"), flag + 1 < CommandLine.arguments.count {
+    let r = GameForgeExport.importLayout(URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+    for l in r.lines { print(l) }
+    for p in r.problems { print("PROBLEM: \(p)") }
+    exit(r.problems.isEmpty ? 0 : 1)
+}
+
 // Free:  Navigator --gameforge-sheet-snapshot <set folder> <out.png>
 // The Game Forge export's options sheet, drawn off screen: to see it without opening a window.
 if let flag = CommandLine.arguments.firstIndex(of: "--gameforge-sheet-snapshot"), flag + 2 < CommandLine.arguments.count {
@@ -30081,6 +30090,9 @@ struct AssetBrowserView: View {
                 .disabled(ready.isEmpty)
                 Button("Game Forge Layout and Photoshop Files…") { gameForgeSheet = true }
                     .disabled(run.reelLayout == nil || working != nil)
+                Button("Update Game Forge Layout from Photoshop Files") { importGameForge() }
+                    .disabled(working != nil || !FileManager.default.fileExists(atPath: folder.appendingPathComponent("gameforge/layout/navigator-export.json").path))
+                    .help("After moving or resizing pieces in the exported Photoshop files: the layout files are written again to match them")
             }
             .fixedSize()
             .help("Spine: a layer kit per approved symbol. Game Forge: the asset folder, layout files and a layered PSB of the game screen per orientation, free.")
@@ -30105,6 +30117,20 @@ struct AssetBrowserView: View {
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 9)
+    }
+
+    /// The exported layout laid again from its Photoshop files (GameForgeExport.importLayout), in the background.
+    private func importGameForge() {
+        let out = folder.appendingPathComponent("gameforge")
+        working = "Game Forge"; run.status = "Reading the Game Forge Photoshop files…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = GameForgeExport.importLayout(out)
+            DispatchQueue.main.async {
+                working = nil
+                let moved = r.lines.filter { $0.hasPrefix("MOVED") }.count
+                run.status = r.problems.first ?? (moved == 0 ? "Game Forge: nothing was moved in the Photoshop files" : "Game Forge: the layout files follow the Photoshop files — \(moved) piece\(moved == 1 ? "" : "s") moved")
+            }
+        }
     }
 
     /// The set as Game Forge takes it (GameForgeExport), in the set's gameforge folder, in the background: free.
@@ -33032,6 +33058,21 @@ struct GDDMirrorRow: View {
         }
     }
 
+    /// The project's exported layout laid again from its Photoshop files (GameForgeExport.importLayout), in the background.
+    func importGameForge(_ r: Row) {
+        let folder = r.folder, title = r.title
+        if let i = rows.firstIndex(where: { $0.folder == folder }) { rows[i].busy = "Reading the Photoshop files…" }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = GameForgeExport.importLayout(folder.appendingPathComponent("gameforge"))
+            DispatchQueue.main.async {
+                if let i = self.rows.firstIndex(where: { $0.folder == folder }) { self.rows[i].busy = nil }
+                let moved = res.lines.filter { $0.hasPrefix("MOVED") }
+                self.say(moved.isEmpty ? "Nothing was moved in “\(title)”'s Photoshop files" : "“\(title)”'s layout follows its Photoshop files",
+                         (res.problems + moved.prefix(12).map { String($0.dropFirst("MOVED: ".count)) }).joined(separator: "\n") + (moved.count > 12 ? "\n…" : ""))
+            }
+        }
+    }
+
     func archive(_ r: Row) {
         let parent = r.folder.deletingLastPathComponent()
         guard let name = ProjectIndex.freeName(r.title, in: parent, ext: "zip"), letGo(r, "archive") else { return }
@@ -33204,6 +33245,10 @@ struct ProjectsView: View {
         Button("Show in Finder") { model.reveal(r) }
         Button("Export for Game Forge…") { exporting = r }
             .help("Every screen's layout, asset folder and Photoshop files, portrait and landscape — free")
+        if FileManager.default.fileExists(atPath: r.folder.appendingPathComponent("gameforge/layout/navigator-export.json").path) {
+            Button("Update Game Forge Layout from Photoshop Files") { model.importGameForge(r) }
+                .help("After moving or resizing pieces in the exported Photoshop files: the layout files are written again to match them")
+        }
         Divider()
         Button("Rename…") { model.rename(r) }
         Button("Free Up Space…" + (r.versions > 0 ? " (\(ProjectsModel.bytes(r.versions)))" : "")) { model.freeSpace(r) }
@@ -33991,12 +34036,10 @@ enum GameForgeExport {
         // The layout files.
         let layoutDir = out.appendingPathComponent("layout")
         try? fm.createDirectory(at: layoutDir, withIntermediateDirectories: true)
-        let r = GameForge.records(gf)
-        for (obj, name) in [(r.placements as Any, "layoutPlacements"), (r.groups, "layoutGroups"), (r.texts, "layoutTexts"), (r.background, "layoutBackground")] {
-            if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
-                try? (d + Data("\n".utf8)).write(to: layoutDir.appendingPathComponent("\(name).json"))
-            }
-        }
+        let r = writeLayout(gf, to: layoutDir)
+        // What was placed, kept beside the layout files, so they can be laid again from Photoshop files moved by hand.
+        let saved = GameForge.Saved(portrait: portrait, landscape: landscape, game: gameDir, modes: gf)
+        if let d = try? JSONEncoder().encode(saved) { try? d.write(to: layoutDir.appendingPathComponent("navigator-export.json")) }
 
         // The PSBs, one per screen and orientation — every screen has its own opaque background, so screens sharing a
         // file hid all but one: its pieces where the layout puts them, stacked as the game stacks them, the reels filled
@@ -34124,6 +34167,7 @@ enum GameForgeExport {
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
         readme += "- `\(stem)_all-screens_portrait.psb` and `_landscape.psb` hold every screen of the game, each an artboard of its own (\(screens.map(\.scope).joined(separator: ", "))), and every event in artboards under them — every layer and group, nothing covering anything else. Each screen also has a PSB of its own, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
         readme += "- The events (pop-ups, celebrations, banners) are groups marked `isEvent` in the screen they show over, centred on its reels, each with a PSB of its own in `events/`. Their amounts have no data key: the game sets them.\n"
+        readme += "\n## Moving things in Photoshop\n\nMove or resize any piece in these Photoshop files — a screen's, an event's (in `events/`), or a screen's artboard in the all-screens file — save, then choose Assets ▸ Export ▸ Update Game Forge Layout from Photoshop Files (or run `Navigator --gameforge-import <this folder>`). The layout files are written again to match: what's in `layout/navigator-export.json` is what they're laid from. Text printed on a piece moves with it unless its own layer was moved.\n"
         if !languages.isEmpty {
             readme += "\n## Languages\n\nThe lettered pictures in \(languages.sorted().joined(separator: ", ")) are in `textures/portrait/<language>/`, at the same paths and sizes as the English ones — overrides only, as the platform's language folders are. A language code may need renaming to the one the platform's localization service reports.\n"
         }
@@ -34143,6 +34187,102 @@ enum GameForgeExport {
         lines.append("PLACEMENTS: \((r.placements["records"] as? [Any])?.count ?? 0) · GROUPS: \(r.groups.count) · TEXTS: \(r.texts.count) · SYMBOLS: \(symbols.count) at \(symbolPx) px")
         lines += upscaled.map { "LARGER THAN DRAWN: \($0)" }
         return (out, lines, problems)
+    }
+
+    /// The layout files for `modes`, written into `dir`.
+    @discardableResult
+    static func writeLayout(_ modes: [GameForge.Mode], to dir: URL) -> (placements: [String: Any], groups: [[String: Any]], texts: [[String: Any]], background: [String: Any]) {
+        let r = GameForge.records(modes)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (obj, name) in [(r.placements as Any, "layoutPlacements"), (r.groups, "layoutGroups"), (r.texts, "layoutTexts"), (r.background, "layoutBackground")] {
+            if let d = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
+                try? (d + Data("\n".utf8)).write(to: dir.appendingPathComponent("\(name).json"))
+            }
+        }
+        return r
+    }
+
+    /// The layout files laid again from the Photoshop files of an export (`out`) after an artist has moved or resized pieces in
+    /// them — each screen's, each event's or the all-screens file, portrait and landscape. A piece counts as moved when its
+    /// layer is more than half a design pixel from where the export put it; when the same piece was moved in two files, the
+    /// file saved last wins. Text printed on a piece moves with it, or on its own when its layer was moved.
+    static func importLayout(_ out: URL) -> (lines: [String], problems: [String]) {
+        let fm = FileManager.default, layoutDir = out.appendingPathComponent("layout"), file = layoutDir.appendingPathComponent("navigator-export.json")
+        guard let d = try? Data(contentsOf: file), var saved = try? JSONDecoder().decode(GameForge.Saved.self, from: d) else {
+            return ([], ["\(out.lastPathComponent) has no layout/navigator-export.json: export it again first"])
+        }
+        func modified(_ u: URL) -> Date { (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast }
+        var psbs: [URL] = []
+        for dir in [out, out.appendingPathComponent("events")] {
+            let found = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            psbs += found.filter { $0.pathExtension.lowercased() == "psb" }
+        }
+        psbs.sort { modified($0) < modified($1) }
+        var lines: [String] = [], problems: [String] = [], changed = 0
+        func far(_ a: GameForge.Box, _ b: GameForge.Box) -> Bool { abs(a.x - b.x) > 0.5 || abs(a.y - b.y) > 0.5 || abs(a.w - b.w) > 0.5 || abs(a.h - b.h) > 0.5 }
+        for f in psbs {
+            guard let data = try? Data(contentsOf: f, options: .mappedIfSafe), let doc = PhotoshopFile.layers(in: data) else { problems.append("\(f.lastPathComponent): not a Photoshop file Navigator can read"); continue }
+            let isL = f.lastPathComponent.contains("_landscape"), prof = isL ? saved.landscape : saved.portrait, side = isL ? "landscape" : "portrait"
+            // An event's artboard in the all-screens file is cropped to it, so not where it shows: events are read from their own files.
+            let visible = doc.layers.filter { !$0.hidden && !($0.groups.first?.hasSuffix(" (event)") ?? false) }
+            var byName: [String: PhotoshopFile.LayerRecord] = [:]
+            for l in visible where byName[l.name] == nil { byName[l.name] = l }
+            func local(_ l: PhotoshopFile.LayerRecord) -> (l: Int, t: Int, r: Int, b: Int) { (l.rect.l - l.origin.x, l.rect.t - l.origin.y, l.rect.r - l.origin.x, l.rect.b - l.origin.y) }
+            for si in saved.screens.indices {
+                let before = saved.screens[si].items
+                for ii in saved.screens[si].items.indices {
+                    let it = saved.screens[si].items[ii]
+                    var rect: (l: Int, t: Int, r: Int, b: Int)?
+                    if let l = byName[it.name] ?? byName["\(it.name) (game code)"] { rect = local(l) }
+                    else {
+                        // A wheel's face: the wedges in its group, together.
+                        for w in visible where w.groups.contains("\(it.name) (game code: turns)") {
+                            let r = local(w)
+                            if let u = rect { rect = (min(u.l, r.l), min(u.t, r.t), max(u.r, r.r), max(u.b, r.b)) } else { rect = r }
+                        }
+                        // The wedges reach 0.86 of the face's half-width (WheelArt.face): the face is that much larger.
+                        if let u = rect {
+                            let cx = Double(u.l + u.r) / 2, cy = Double(u.t + u.b) / 2, hw = Double(u.r - u.l) / 2 / 0.86, hh = Double(u.b - u.t) / 2 / 0.86
+                            rect = (Int((cx - hw).rounded()), Int((cy - hh).rounded()), Int((cx + hw).rounded()), Int((cy + hh).rounded()))
+                        }
+                    }
+                    guard let rect else { continue }
+                    let old = isL ? it.landscape : it.portrait, new = GameForge.moved(old, to: rect, profile: prof)
+                    guard far(old, new) else { continue }
+                    if isL { saved.screens[si].items[ii].landscape = new } else { saved.screens[si].items[ii].portrait = new }
+                    changed += 1
+                    lines.append(String(format: "MOVED: %@ (%@) by %+.0f, %+.0f design px", it.name, side, new.cx - old.cx, new.cy - old.cy)
+                                 + (abs(new.w / old.w - 1) > 0.01 ? String(format: ", scaled ×%.2f", new.w / old.w) : ""))
+                }
+                // Text moved on its own: its box in its picture's own space, from where its layer now sits on the picture. A text
+                // layer left where the export put it follows its picture, as it does in the game.
+                for li in saved.screens[si].labels.indices {
+                    let lab = saved.screens[si].labels[li]
+                    guard let l = byName["\(lab.name) (text\(lab.dataKey.isEmpty ? "" : ": " + lab.dataKey))"],
+                          let parent = saved.screens[si].items.first(where: { $0.name == lab.parent }), parent.pixels > 0 else { continue }
+                    let pb: GameForge.Box = isL ? parent.landscape : parent.portrait
+                    let k: Double = pb.w / (Double(parent.pixels) / 3)
+                    let r = local(l)
+                    if let p0 = before.first(where: { $0.name == lab.parent }) {
+                        let b0: GameForge.Box = isL ? p0.landscape : p0.portrait, k0 = b0.w / (Double(p0.pixels) / 3)
+                        let x: Double = (b0.cx + lab.box.x * k0 + prof.screenWidth / 2) * 3, y: Double = (b0.cy + lab.box.y * k0 + prof.height / 2) * 3
+                        if abs(Double(r.l) - x) <= 2, abs(Double(r.t) - y) <= 2 { continue }      // untouched: it follows its picture
+                    }
+                    let x0: Double = Double(r.l) / 3 - prof.screenWidth / 2, y0: Double = Double(r.t) / 3 - prof.height / 2
+                    let w: Double = Double(r.r - r.l) / 3, h: Double = Double(r.b - r.t) / 3
+                    let now = GameForge.Box(x: (x0 - pb.cx) / k, y: (y0 - pb.cy) / k, w: w / k, h: h / k)
+                    // A label is one box in both orientations (it scales with its picture): moved in either, it moves.
+                    guard far(lab.box, now) else { continue }
+                    saved.screens[si].labels[li].box = now; changed += 1
+                    lines.append("MOVED: \(lab.name) (\(side)) on \(lab.parent)")
+                }
+            }
+        }
+        guard changed > 0 else { return (["Nothing was moved: the layout files are as they were."], problems) }
+        writeLayout(saved.screens.map(\.mode), to: layoutDir)
+        if let d = try? JSONEncoder().encode(saved) { try? d.write(to: file) }
+        lines.append("WROTE: the layout files, \(changed) change\(changed == 1 ? "" : "s")")
+        return (lines, problems)
     }
 
     /// The design box outlined and its control-bar band shaded: a few small layers, not a canvas of empty pixels.

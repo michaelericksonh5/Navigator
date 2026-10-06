@@ -14719,3 +14719,43 @@ final class GameForgeRightColumnTests: XCTestCase {
         XCTAssertLessThan(p["pot1"]!.y, p["bezel"]!.y)                                             // over the reels in portrait
     }
 }
+
+final class PhotoshopLayerReadingTests: XCTestCase {
+    func testTheLayersComeBackWithTheirGroupsAndPlaces() {
+        let px = [UInt8](repeating: 120, count: 4 * 3 * 4)
+        let nodes: [PhotoshopFile.Node] = [
+            .group(name: "base", children: [.group(name: "jackpots-base", children: [.layer(name: "jackpot-meter-grand-base", x: 5, y: 7, w: 4, h: 3, px: px)]),
+                                            .layer(name: "logo-base", x: -2, y: 1, w: 4, h: 3, px: px, visible: false)], artboard: (0, 0, 40, 30)),
+            .layer(name: "background-base", x: 0, y: 0, w: 4, h: 3, px: px),
+        ]
+        for large in [true, false] {
+            let r = PhotoshopFile.layers(in: PhotoshopFile.data(width: 40, height: 30, nodes: nodes, large: large, composite: false))
+            XCTAssertEqual(r?.width, 40); XCTAssertEqual(r?.height, 30)
+            XCTAssertEqual(r?.layers.map(\.name), ["jackpot-meter-grand-base", "logo-base", "background-base"])        // top first
+            XCTAssertEqual(r?.layers.first?.groups, ["base", "jackpots-base"])
+            XCTAssertEqual(r?.layers[1].rect.l, -2); XCTAssertEqual(r?.layers[1].rect.b, 4); XCTAssertEqual(r?.layers[1].hidden, true)
+            XCTAssertEqual(r?.layers[2].groups, [])
+            XCTAssertEqual(r?.layers.first?.origin.x, 0)
+        }
+        XCTAssertNil(PhotoshopFile.layers(in: Data("not a psd".utf8)))
+        // On an artboard placed elsewhere on the canvas, a layer knows the artboard's corner.
+        let moved = PhotoshopFile.layers(in: PhotoshopFile.data(width: 90, height: 40, nodes: nodes.map { $0.moved(50, 5) }, composite: false))
+        XCTAssertEqual(moved?.layers.first?.origin.x, 50); XCTAssertEqual(moved?.layers.first?.origin.y, 5); XCTAssertEqual(moved?.layers.first?.rect.l, 55)
+    }
+}
+
+final class GameForgeImportRuleTests: XCTestCase {
+    func testALayerMovedOrResizedInPhotoshopGivesItsNewBox() {
+        let p = GameForge.Profile.portrait(), old = GameForge.Box(x: -50, y: -300, w: 100, h: 40)
+        func rect(_ b: GameForge.Box, dx: Double = 0, dy: Double = 0, grow: Double = 1) -> (l: Int, t: Int, r: Int, b: Int) {
+            let o = p.pixel(b.x + dx, b.y + dy)
+            return (Int(o.x.rounded()), Int(o.y.rounded()), Int((o.x + b.w * 3 * grow).rounded()), Int((o.y + b.h * 3 * grow).rounded()))
+        }
+        XCTAssertEqual(GameForge.moved(old, to: rect(old), profile: p), old)                                   // untouched
+        let moved = GameForge.moved(old, to: rect(old, dx: 10, dy: -5), profile: p)
+        XCTAssertEqual(moved.x, -40, accuracy: 0.01); XCTAssertEqual(moved.y, -305, accuracy: 0.01); XCTAssertEqual(moved.w, 100)
+        let trimmed = (l: rect(old).l + 1, t: rect(old).t, r: rect(old).r, b: rect(old).b)                    // Photoshop trims a pixel
+        XCTAssertEqual(GameForge.moved(old, to: trimmed, profile: p).w, 100)
+        XCTAssertEqual(GameForge.moved(old, to: rect(old, grow: 1.5), profile: p).w, 150, accuracy: 0.5)      // resized
+    }
+}
