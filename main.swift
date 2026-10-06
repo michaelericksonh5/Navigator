@@ -33005,6 +33005,26 @@ struct GDDMirrorRow: View {
         refresh()
     }
 
+    /// The project handed to Game Forge (GameForgeExport) with the options chosen in its sheet, in the background; its
+    /// gameforge folder shown when done.
+    func exportGameForge(_ r: Row, _ o: GameForgeExport.Options) {
+        guard let run = GDDToAssetsRun.reopen(r.folder, fetchTheme: false), let layout = run.reelLayout, layout.base != nil else {
+            say("Couldn’t export “\(r.title)”", "It has no reels saved yet: plan it first."); return
+        }
+        let (jobs, game, folder, title) = (run.jobs, run.gameName, r.folder, r.title)
+        if let i = rows.firstIndex(where: { $0.folder == folder }) { rows[i].busy = "Exporting for Game Forge…" }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = GameForgeExport.run(folder: folder, layout: layout, jobs: jobs, game: game, options: o)
+            DispatchQueue.main.async {
+                if let i = self.rows.firstIndex(where: { $0.folder == folder }) { self.rows[i].busy = nil }
+                NSWorkspace.shared.activateFileViewerSelecting([res.out])
+                if !res.problems.isEmpty {
+                    self.say("“\(title)” is exported, with \(res.problems.count) piece\(res.problems.count == 1 ? "" : "s") not drawn yet", res.problems.prefix(6).joined(separator: "\n") + (res.problems.count > 6 ? "\n…" : "") + "\n\nIts README lists them.")
+                }
+            }
+        }
+    }
+
     func archive(_ r: Row) {
         let parent = r.folder.deletingLastPathComponent()
         guard let name = ProjectIndex.freeName(r.title, in: parent, ext: "zip"), letGo(r, "archive") else { return }
@@ -33073,6 +33093,7 @@ struct GDDMirrorRow: View {
 struct ProjectsView: View {
     @ObservedObject var model: ProjectsModel
     @State private var locating: ProjectsModel.Row?
+    @State private var exporting: ProjectsModel.Row?
     @State private var choosingFolder = false
 
     var body: some View {
@@ -33114,6 +33135,7 @@ struct ProjectsView: View {
         }
         .frame(minWidth: 760, minHeight: 480)
         .onAppear { model.refresh() }
+        .sheet(item: $exporting) { r in GameForgeExportSheet(game: r.game.isEmpty ? r.title : r.game, folder: r.folder) { model.exportGameForge(r, $0) } }
         .sheet(item: $locating) { r in
             NavigatorFolderPicker(title: "Find “\(r.title)”", start: GDDLibrary.outputParent,
                                   onChoose: { u in locating = nil; model.locate(r, at: u) }, onCancel: { locating = nil })
@@ -33173,6 +33195,8 @@ struct ProjectsView: View {
         Button("Continue") { model.open(r) }
         Button("Open Assets") { model.assets(r) }
         Button("Show in Finder") { model.reveal(r) }
+        Button("Export for Game Forge…") { exporting = r }
+            .help("Every screen's layout, asset folder and Photoshop files, portrait and landscape — free")
         Divider()
         Button("Rename…") { model.rename(r) }
         Button("Free Up Space…" + (r.versions > 0 ? " (\(ProjectsModel.bytes(r.versions)))" : "")) { model.freeSpace(r) }
