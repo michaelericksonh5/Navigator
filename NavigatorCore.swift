@@ -10947,9 +10947,24 @@ public struct WheelArt: Equatable, Sendable {
     /// The wheel's face, `size` square: each segment's wedge (by `order`, clockwise from the top) turned into
     /// its place, sampled bilinearly. Transparent past the wedges' length.
     public func face(_ wedges: [String: [UInt8]], order: [String], size: Int) -> [UInt8] {
-        let (w, h) = wedgeSize, c = Double(size) / 2, scale = Double(radius) / (c * 0.86)
         var out = [UInt8](repeating: 0, count: size * size * 4)
-        guard !order.isEmpty else { return out }
+        paint(wedges, order: order, size: size) { _, i, r, g, b, a in out[i] = r; out[i + 1] = g; out[i + 2] = b; out[i + 3] = a }
+        return out
+    }
+    /// The face as a layer per wedge position, clockwise from the top: each transparent but for its own wedge, laid
+    /// exactly as `face` lays it — for a layered file, where each wedge is its own layer.
+    public func faceLayers(_ wedges: [String: [UInt8]], order: [String], size: Int) -> [[UInt8]] {
+        var out = [[UInt8]](repeating: [], count: segments)
+        paint(wedges, order: order, size: size) { k, i, r, g, b, a in
+            if out[k].isEmpty { out[k] = [UInt8](repeating: 0, count: size * size * 4) }
+            out[k][i] = r; out[k][i + 1] = g; out[k][i + 2] = b; out[k][i + 3] = a
+        }
+        return out.map { $0.isEmpty ? [UInt8](repeating: 0, count: size * size * 4) : $0 }
+    }
+    /// Each pixel of the face, with the wedge position it belongs to.
+    private func paint(_ wedges: [String: [UInt8]], order: [String], size: Int, _ put: (Int, Int, UInt8, UInt8, UInt8, UInt8) -> Void) {
+        let (w, h) = wedgeSize, c = Double(size) / 2, scale = Double(radius) / (c * 0.86)
+        guard !order.isEmpty else { return }
         // Bilinear on premultiplied colour, so a wedge's keyed-out edge brings none of the backing with it.
         func sample(_ p: [UInt8], _ x: Double, _ y: Double) -> (Double, Double, Double, Double) {
             let x0 = Int(x.rounded(.down)), y0 = Int(y.rounded(.down)), fx = x - Double(x0), fy = y - Double(y0)
@@ -10971,12 +10986,10 @@ public struct WheelArt: Equatable, Sendable {
             guard let p = wedges[order[k % order.count]] else { continue }
             let (r0, g0, b0, a) = sample(p, tip.x + r * sin(phi) - 0.5, tip.y - r * cos(phi) - 0.5)
             guard a > 0.001 else { continue }
-            let i = (y * size + x) * 4
-            out[i] = UInt8(min(255, r0 / a + 0.5)); out[i + 1] = UInt8(min(255, g0 / a + 0.5)); out[i + 2] = UInt8(min(255, b0 / a + 0.5))
-            out[i + 3] = UInt8(min(255, a * 255 + 0.5))
+            put(k, (y * size + x) * 4, UInt8(min(255, r0 / a + 0.5)), UInt8(min(255, g0 / a + 0.5)), UInt8(min(255, b0 / a + 0.5)), UInt8(min(255, a * 255 + 0.5)))
         } }
-        return out
     }
+
 
     /// The frame ring's grey template, `frameSize` square: a bevelled ring from 0.86 to 0.99 of the half-width,
     /// the face inside it left as the backing — the window its check keeps open.

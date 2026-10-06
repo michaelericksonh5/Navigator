@@ -14565,3 +14565,20 @@ final class GameForgeStackTests: XCTestCase {
         XCTAssertGreaterThan(z["pots"]!, z["jackpots"]!); XCTAssertGreaterThan(z["bezel"]!, z["grid"]!); XCTAssertGreaterThan(z["grid"]!, z["reel"]!)
     }
 }
+
+final class WheelLayerTests: XCTestCase {
+    func testTheWedgeLayersMakeUpTheFaceExactly() {
+        let art = WheelArt(segments: 6, radius: 120), (w, h) = art.wedgeSize
+        let a = [UInt8]((0..<(w * h)).flatMap { _ in [200, 40, 40, 255] as [UInt8] }), b = [UInt8]((0..<(w * h)).flatMap { _ in [40, 40, 200, 255] as [UInt8] })
+        let order = ["A", "B", "A", "B", "A", "B"], size = 160
+        let face = art.face(["A": art.cut(a), "B": art.cut(b)], order: order, size: size)
+        let layers = art.faceLayers(["A": art.cut(a), "B": art.cut(b)], order: order, size: size)
+        XCTAssertEqual(layers.count, 6)
+        var merged = [UInt8](repeating: 0, count: size * size * 4)
+        for l in layers { for i in stride(from: 0, to: l.count, by: 4) where l[i + 3] > 0 { for c in 0..<4 { merged[i + c] = l[i + c] } } }
+        XCTAssertEqual(merged, face)
+        // The first layer is the wedge at the top.
+        XCTAssertGreaterThan(layers[0][((size / 4) * size + size / 2) * 4 + 3], 0)
+        XCTAssertEqual(layers[0][((size * 3 / 4) * size + size / 2) * 4 + 3], 0)
+    }
+}

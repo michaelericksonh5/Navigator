@@ -33372,52 +33372,123 @@ enum GameForgeExport {
             return FrameKit.crop(FrameKit.resized(p, sw, sh).px, width: sw, (sw - w) / 2, (sh - h) / 2, w, h)
         }
 
-        // The pieces every mode shares, and each mode's reel block laid out as its reel preview is (reelPreview).
+        /// A screen of the game — a reel mode, or a wheel — as its own layout scope: its pictures laid out together in
+        /// their own pixels (`block`), composed into each orientation's design box (`p`, `l`), then placed.
+        struct Screen {
+            var scope: String, background: [String]
+            var cuts: [String: Cut] = [:], assets: [String: String] = [:], block: [String: Box] = [:]
+            var p: [String: Box] = [:], l: [String: Box] = [:]
+            /// key, record name, label, group, z — stacked as the game draws them (GameForge.stack).
+            var items: [(key: String, name: String, label: String, group: String?, z: Int)] = []
+            var groups: [GameForge.Group] = []
+            var area: ReelArea?
+            var wheel: (art: WheelArt, order: [String], wedges: [String: [UInt8]], prefix: String)?
+            mutating func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, asset: String) {
+                block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k)
+                cuts[key] = c; assets[key] = asset
+            }
+        }
+
+        // The pieces every screen shares.
         let logo = load("shared_logo_master_rmbg.png").flatMap(cut)
         let tableFull = load("shared_interface_jackpotTable_rmbg.png"), table = tableFull.flatMap(cut)
         let pots = (["shared_avatar_jar-State0Idle"] + (1...6).map { "shared_avatar_jar\($0)-State0Idle" }).compactMap { load("\($0)_rmbg.png").flatMap(cut) }
-        struct Laid { var scope: String, area: ReelArea, cuts: [String: Cut], p: [String: Box], l: [String: Box] }
-        var modes: [Laid] = []
+        let jackpots = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
+        let tierNames = jackpots.map { GDDAssetPrompts.letteredWord($0) ?? $0.title.uppercased() }
+        let baseArea = ReelArea(layout), jt = JackpotTable(count: jackpots.count, width: baseArea.grid.w + 2 * baseArea.band)
+        /// The jackpot table `W` wide, its top at `y`, in a screen's block.
+        func addTable(_ s: inout Screen, _ W: Double, _ y: Double) {
+            guard let t = table, let f = tableFull else { return }
+            s.add("table", t, 0, y, W / Double(f.w), asset: "backgrounds/jackpot-table")
+            s.items.append(("table", "jackpot-table-\(s.scope)", "Jackpot table", "jackpots-\(s.scope)", 152))
+            s.groups.append(GameForge.Group(handle: "jackpots-\(s.scope)", label: "Jackpots"))
+        }
+        func tableHeight(_ W: Double) -> Double { tableFull.map { Double($0.h) * W / Double($0.w) } ?? 0 }
+        var screens: [Screen] = []
+
+        // Each reel mode: the reels with the jackpot table and pots above them, laid out as its reel preview lays them.
         for (scope, grid) in layout.fileModes {
-            let area = ReelArea(layout, grid: grid), W = Double(area.width), g = area.grid
-            let tableH = tableFull.map { Double($0.h) * W / Double($0.w) } ?? 0, potW = 1.3 * Double(area.cell)
+            var s = Screen(scope: scope, background: ["bg_\(scope.lowercased())", "bg_base"])
+            let area = ReelArea(layout, grid: grid), W = Double(area.width), g = area.grid, sl = scope.lowercased()
+            s.area = area
+            let tableH = tableHeight(W), potW = 1.3 * Double(area.cell)
             let top = tableH + (pots.map { potW * Double($0.fullH) / Double($0.fullW) }.max() ?? 0)
-            var block: [String: Box] = [:], cuts: [String: Cut] = [:]
-            func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double) {
-                block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k); cuts[key] = c
-            }
             for (key, file) in [("texture", "reelTexture"), ("dividers", "dividers"), ("bezel", "bezel")] {
                 guard let p = load("\(scope)_interface_\(file)_rmbg.png") else { problems.append("\(scope): no \(file) drawn yet"); continue }
                 guard p.w == area.width, p.h == area.height else { problems.append("\(scope): its \(file) was laid for another grid — Make Again ▸ Bezel"); continue }
-                if let c = cut(p) { add(key, c, 0, top, 1) }
+                if let c = cut(p) { s.add(key, c, 0, top, 1, asset: "backgrounds/reel-\(key == "texture" ? "texture" : key)-\(sl)") }
             }
-            block["grid"] = Box(x: Double(g.x), y: top + Double(g.y), w: Double(g.w), h: Double(g.h))
+            s.block["grid"] = Box(x: Double(g.x), y: top + Double(g.y), w: Double(g.w), h: Double(g.h))
             let tableY = top + Double(g.y - area.band) - tableH + tableH / 6
-            if let t = table, let f = tableFull { add("table", t, 0, tableY, W / Double(f.w)) }
+            addTable(&s, W, tableY)
             for (i, p) in pots.enumerated() {
                 let k = potW / Double(p.fullW), cx = Double(g.x) + Double(g.w) * Double(2 * i + 1) / Double(2 * pots.count)
-                add("pot\(i + 1)", p, cx - potW / 2, tableY - Double(p.fullH) * k + potW / 8, k)
+                s.add("pot\(i + 1)", p, cx - potW / 2, tableY - Double(p.fullH) * k + potW / 8, k, asset: "meters/pot-\(i + 1)")
+                s.items.append(("pot\(i + 1)", "pot-\(i + 1)-\(scope)", "Pot \(i + 1)", "pots-\(scope)", 153))
             }
-            let shape = logo.map { (w: Double($0.piece.w), h: Double($0.piece.h)) }
-            if let logo { cuts["logo"] = logo }
-            modes.append(Laid(scope: scope, area: area, cuts: cuts, p: GameForge.compose(block: block, logo: shape, profile: portrait),
-                              l: GameForge.compose(block: block, logo: shape, profile: landscape)))
+            // Stacked as the set's reel preview stacks them, the order the art was drawn for: the reel texture under the
+            // symbols, the dividers and bezel over them (covering where the reels are cut off), the jackpot table over the
+            // bezel's top band, the pots standing on the table, the logo over all.
+            s.items += [("texture", "reel-texture-\(scope)", "Reel texture", "reel-\(scope)", 146),
+                        ("grid", gridName(scope), "Reel grid (game code)", "reelgrid-\(scope)", 149),
+                        ("dividers", "reel-dividers-\(scope)", "Reel dividers", "bezel-\(scope)", 150),
+                        ("bezel", "reel-bezel-\(scope)", "Bezel", "bezel-\(scope)", 151)]
+            s.groups += [GameForge.Group(handle: "reel-\(scope)", label: "Reel texture"), GameForge.Group(handle: "reelgrid-\(scope)", label: "Reel grid"),
+                         GameForge.Group(handle: "bezel-\(scope)", label: "Bezel and dividers"), GameForge.Group(handle: "pots-\(scope)", label: "Pots")]
+            screens.append(s)
+        }
+
+        // Each wheel the GDD has, as the studio's wheelSpin mode: the face of upright wedges the game turns round its hub,
+        // the rim, the hub and the pointer, laid out as the wheel preview lays them; the SPIN banner under it, the jackpot
+        // table over it when the game has jackpots.
+        let frame = load("wheelSpin_interface_wheelFrame_rmbg.png").flatMap(cut), hub = load("wheelSpin_interface_wheelHub_rmbg.png").flatMap(cut)
+        let pointer = load("wheelSpin_interface_winIndicator_rmbg.png").flatMap(cut)
+        for (wi, wheel) in (layout.wheels ?? []).enumerated() {
+            let prefix = wi == 0 ? "wheelSpin" : "wheelSpin\(wi + 1)"
+            let order = WheelRules.order(WheelRules.labels(wheel, jackpots: tierNames), segments: wheel.segments), art = WheelArt(segments: order.count)
+            var wedges: [String: [UInt8]] = [:]
+            for l in Set(order) { if let p = load("\(prefix)_interface_wedge-\(PopUps.key(l))_rmbg.png"), p.w == art.wedgeSize.w, p.h == art.wedgeSize.h { wedges[l] = p.px } }
+            guard !wedges.isEmpty else { problems.append("\(wheel.name): no wedges drawn yet"); continue }
+            // The scene the document names for it ("jackpot wheel" → bg_jackpot), else the base game's.
+            let named = GDDScenes.modes.first { wheel.name.lowercased().contains($0.phrase) }?.id
+            var s = Screen(scope: prefix, background: (named.map { [$0] } ?? []) + ["bg_base"])
+            s.wheel = (art, order, wedges, prefix)
+            let n = Double(WheelArt.frameSize), top = n / 6
+            let tableH = order.contains(where: tierNames.contains) ? tableHeight(n) : 0, wheelTop = tableH + top
+            s.block["face"] = Box(x: 0, y: wheelTop, w: n, h: n)
+            if let f = frame { s.add("frame", f, 0, wheelTop, n / Double(f.fullW), asset: "wheel/wheel-frame") }
+            if let h = hub { let k = 0.23 * n / Double(h.fullW); s.add("hub", h, (n - 0.23 * n) / 2, wheelTop + (n - 0.23 * n) / 2, k, asset: "wheel/wheel-hub") }
+            if let p = pointer { let sz = 0.30 * n, k = sz / Double(p.fullW); s.add("pointer", p, (n - sz) / 2, wheelTop + 0.10 * n - 0.95 * sz, k, asset: "wheel/wheel-pointer") }
+            if let b = load("\(prefix)_banner_spin_rmbg.png").flatMap(cut) ?? load("wheelSpin_banner_spin_rmbg.png").flatMap(cut) {
+                let bw = 0.6 * n, k = bw / Double(b.fullW)
+                s.add("banner", b, (n - bw) / 2, wheelTop + n + 0.02 * n, k, asset: "wheel/banner-spin")
+            }
+            // The jackpot table over a wheel that pays jackpots.
+            let paysJackpots = order.contains { l in tierNames.contains(l) }
+            if tableH > 0, paysJackpots { addTable(&s, n, 0) }
+            s.items += [("face", "\(prefix)Wheel", "Wheel face (game code)", "wheel-\(prefix)", 149),
+                        ("frame", "wheel-frame-\(prefix)", "Wheel rim", "wheel-\(prefix)", 150),
+                        ("hub", "wheel-hub-\(prefix)", "Wheel hub", "wheel-\(prefix)", 151),
+                        ("pointer", "wheel-pointer-\(prefix)", "Pointer", "wheel-\(prefix)", 152),
+                        ("banner", "banner-spin-\(prefix)", "SPIN banner", nil, 153)]
+            s.groups.append(GameForge.Group(handle: "wheel-\(prefix)", label: "Wheel"))
+            screens.append(s)
+        }
+
+        // Every screen composed into both design boxes, the logo over (or beside) it.
+        let shape = logo.map { (w: Double($0.piece.w), h: Double($0.piece.h)) }
+        for i in screens.indices {
+            if let logo {
+                screens[i].cuts["logo"] = logo; screens[i].assets["logo"] = "logo/logo"
+                screens[i].items.append(("logo", "logo-\(screens[i].scope)", "Logo", nil, 154))
+            }
+            screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, profile: portrait)
+            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, profile: landscape)
         }
 
         // Each file exported once, at 3× the largest it is shown — never past what was drawn (then shown larger, and said).
-        func asset(_ key: String, _ scope: String) -> String {
-            let s = scope.lowercased()
-            switch key {
-            case "texture": return "backgrounds/reel-texture-\(s)"
-            case "dividers": return "backgrounds/reel-dividers-\(s)"
-            case "bezel": return "backgrounds/reel-bezel-\(s)"
-            case "table": return "backgrounds/jackpot-table"
-            case "logo": return "logo/logo"
-            default: return "meters/" + key.replacingOccurrences(of: "pot", with: "pot-")
-            }
-        }
         var need: [String: (w: Double, cut: Cut)] = [:]
-        for m in modes { for (k, c) in m.cuts { let a = asset(k, m.scope); need[a] = (max(need[a]?.w ?? 0, 3 * max(m.p[k]?.w ?? 0, m.l[k]?.w ?? 0)), c) } }
+        for s in screens { for (k, c) in s.cuts { guard let a = s.assets[k] else { continue }; need[a] = (max(need[a]?.w ?? 0, 3 * max(s.p[k]?.w ?? 0, s.l[k]?.w ?? 0)), c) } }
         var exported: [String: Piece] = [:]
         for (a, n) in need.sorted(by: { $0.key < $1.key }) {
             let c = n.cut.piece, w = max(1, min(c.w, Int((n.w - 0.01).rounded(.up)))), h = max(1, Int((Double(w) * Double(c.h) / Double(c.w)).rounded()))
@@ -33425,40 +33496,41 @@ enum GameForgeExport {
             let p = w == c.w ? c : FrameKit.resized(c, w, h)
             write(p, "portrait/en/\(a).png"); exported[a] = p
         }
-
-        // The modes' records: pictures, the code-built grid each bezel frames, the jackpots' amounts, backgrounds.
-        let jackpots = jobs.filter { $0.kind == .symbol && $0.role == .jackpot }.sorted { ($0.tier ?? 0) < ($1.tier ?? 0) }
-        let baseArea = ReelArea(layout), jt = JackpotTable(count: jackpots.count, width: baseArea.grid.w + 2 * baseArea.band)
-        var gf: [GameForge.Mode] = [], backgrounds: [String: (p: Piece, l: Piece)] = [:]
-        for m in modes {
-            let sc = m.scope, s = sc.lowercased()
-            var items: [GameForge.Item] = []
-            func item(_ key: String, _ name: String, _ label: String, _ group: String?, _ z: Int) {
-                guard let p = m.p[key], let l = m.l[key] else { return }
-                let a = key == "grid" ? nil : asset(key, sc)
-                items.append(GameForge.Item(name: name, asset: a, label: label, group: group, z: z, portrait: p, landscape: l, pixels: a.flatMap { exported[$0]?.w } ?? 0))
+        // A wheel's wedges, upright as the game turns them: 3× the largest the face is shown.
+        var wedgeFiles: [String: [String]] = [:]
+        for s in screens {
+            guard let wh = s.wheel else { continue }
+            let faceW = max(s.p["face"]?.w ?? 0, s.l["face"]?.w ?? 0) * 3, k = faceW / 2 * 0.86 / Double(wh.art.radius)
+            let folderName = wh.prefix == "wheelSpin" ? "wheel" : "wheel" + wh.prefix.dropFirst("wheelSpin".count)
+            for (label, px) in wh.wedges.sorted(by: { $0.key < $1.key }) {
+                let (ww, hh) = wh.art.wedgeSize, p = Piece(px: px, w: ww, h: hh), w = max(1, min(ww, Int((Double(ww) * k).rounded(.up))))
+                let path = "\(folderName)/wedge-\(PopUps.key(label).lowercased())"
+                write(w == ww ? p : FrameKit.resized(p, w, max(1, w * hh / ww)), "portrait/en/\(path).png")
+                wedgeFiles[s.scope, default: []].append(path)
             }
-            // Stacked as the set's reel preview stacks them, the order the art was drawn for: the reel texture under the
-            // symbols, the dividers and bezel over them (covering where the reels are cut off), the jackpot table over the
-            // bezel's top band, the pots standing on the table, the logo over all.
-            item("texture", "reel-texture-\(sc)", "Reel texture", "reel-\(sc)", 146)
-            item("grid", gridName(sc), "Reel grid (game code)", "reelgrid-\(sc)", 149)
-            item("dividers", "reel-dividers-\(sc)", "Reel dividers", "bezel-\(sc)", 150)
-            item("bezel", "reel-bezel-\(sc)", "Bezel", "bezel-\(sc)", 151)
-            item("table", "jackpot-table-\(sc)", "Jackpot table", "jackpots-\(sc)", 152)
-            for i in pots.indices { item("pot\(i + 1)", "pot-\(i + 1)-\(sc)", "Pot \(i + 1)", "pots-\(sc)", 153) }
-            item("logo", "logo-\(sc)", "Logo", nil, 154)
-            let gp = m.p["grid"]!, gl = m.l["grid"]!
-            let groups = [GameForge.Group(handle: "reel-\(sc)", label: "Reel texture"),
-                          GameForge.Group(handle: "reelgrid-\(sc)", label: "Reel grid", landscapeScale: gl.w / gp.w),
-                          GameForge.Group(handle: "bezel-\(sc)", label: "Bezel and dividers"),
-                          GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpots"), GameForge.Group(handle: "pots-\(sc)", label: "Pots")]
+        }
+
+        // The screens' records: pictures, the code-built pieces they frame, the jackpots' amounts, backgrounds.
+        var gf: [GameForge.Mode] = [], backgrounds: [String: (p: Piece, l: Piece)] = [:]
+        for s in screens {
+            let sc = s.scope, sl = sc.lowercased()
+            var items: [GameForge.Item] = []
+            for it in s.items {
+                guard let p = s.p[it.key], let l = s.l[it.key] else { continue }
+                let a = s.assets[it.key]
+                items.append(GameForge.Item(name: it.name, asset: a, label: it.label, group: it.group, z: it.z, portrait: p, landscape: l, pixels: a.flatMap { exported[$0]?.w } ?? 0))
+            }
+            var groups = s.groups
+            // A code-built piece's group scales it in landscape: its size is the portrait one.
+            for (key, handle) in [("grid", "reelgrid-\(sc)"), ("face", "wheel-\(sc)")] {
+                if let gp = s.p[key], let gl = s.l[key], let i = groups.firstIndex(where: { $0.handle == handle }) { groups[i].landscapeScale = gl.w / gp.w }
+            }
             // The amounts print in each plaque's dark field, in the table's own space.
             var labels: [GameForge.Label] = []
-            if let t = table, let f = tableFull, f.w == jt.width, f.h == jt.height, let e = exported["backgrounds/jackpot-table"] {
+            if let t = table, let f = tableFull, f.w == jt.width, f.h == jt.height, s.p["table"] != nil, let e = exported["backgrounds/jackpot-table"] {
                 let k = Double(e.w) / Double(t.piece.w)
                 for (i, field) in jt.fields.enumerated() where i < jackpots.count {
-                    let key = PopUps.key(GDDAssetPrompts.letteredWord(jackpots[i]) ?? jackpots[i].title)
+                    let key = PopUps.key(tierNames[i])
                     let box = Box(x: (Double(field.x - t.x) * k - Double(e.w) / 2) / 3, y: (Double(field.y - t.y) * k - Double(e.h) / 2) / 3,
                                   w: Double(field.w) * k / 3, h: Double(field.h) * k / 3)
                     labels.append(GameForge.Label(name: "\(key)-amount-\(sc)", label: "\(key) amount", text: "2,000", parent: "jackpot-table-\(sc)",
@@ -33466,19 +33538,21 @@ enum GameForgeExport {
                 }
             }
             var bg: (portrait: String, landscape: String)?
-            if let bp = ["bg_\(s).png", "bg_base.png"].first(where: exists).flatMap(load) {
-                let bl = ["bg_\(s)-landscape.png", "bg_base-landscape.png"].first(where: exists).flatMap(load) ?? bp
+            if let stem = s.background.first(where: { exists("\($0).png") }), let bp = load("\(stem).png") {
+                let bl = load("\(stem)-landscape.png") ?? load("bg_base-landscape.png") ?? bp
                 let pc = portrait.canvas, lc = landscape.canvas
                 let pp = cover(bp, pc.w, pc.h, "the \(sc) portrait background"), lp = cover(bl, lc.w, lc.h, "the \(sc) landscape background")
-                write(pp, "portrait/en/backgrounds/background_\(s)_portrait.png"); write(lp, "landscape/en/backgrounds/background_\(s)_landscape.png")
+                write(pp, "portrait/en/backgrounds/background_\(sl)_portrait.png"); write(lp, "landscape/en/backgrounds/background_\(sl)_landscape.png")
                 backgrounds[sc] = (pp, lp)
-                bg = ("backgrounds/background_\(s)_portrait", "backgrounds/background_\(s)_landscape")
+                bg = ("backgrounds/background_\(sl)_portrait", "backgrounds/background_\(sl)_landscape")
             } else { problems.append("\(sc): no background drawn yet") }
             gf.append(GameForge.Mode(scope: sc, items: items, groups: groups, labels: labels, background: bg))
         }
 
         // The symbols, for the game's code to draw on the reels: 3× the largest cell they are shown in.
-        let cell = modes.flatMap { m in [m.p["grid"]!, m.l["grid"]!].map { Double(m.area.cell) * $0.w / Double(m.area.grid.w) } }.max() ?? 92
+        var cell = 0.0
+        for s in screens { if let a = s.area { for b in [s.p["grid"], s.l["grid"]].compactMap({ $0 }) { cell = max(cell, Double(a.cell) * b.w / Double(a.grid.w)) } } }
+        if cell == 0 { cell = 92 }
         let symbolPx = Int((3 * cell - 0.01).rounded(.up))
         var symbols: [String: Piece] = [:]
         for j in jobs where j.kind == .symbol {
@@ -33490,6 +33564,41 @@ enum GameForgeExport {
             }
         }
 
+        // Each symbol as a layered Photoshop file at the size it was drawn: the layers it was split into (frame backing,
+        // light, frame glow, frame, gems, the symbol), bottom to top as its split says; a symbol drawn as one picture,
+        // that picture. Beside the asset folder, not in it: they are for the art, not the build.
+        let symbolDir = out.appendingPathComponent("symbols")
+        try? fm.createDirectory(at: symbolDir, withIntermediateDirectories: true)
+        var layered: [String] = [], single: [String] = []
+        struct Split: Decodable { var name: String, file: String, z_index: Int }
+        let symbolJobs = jobs.filter { $0.kind == .symbol }, lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: symbolJobs.count) { n in
+            let j = symbolJobs[n]
+            let dir = folder.appendingPathComponent("\(j.id)_rmbg_Layers")
+            var nodes: [PhotoshopFile.Node] = [], size = (w: 0, h: 0)
+            if let d = try? Data(contentsOf: dir.appendingPathComponent("_layers.json")), let split = try? JSONDecoder().decode([Split].self, from: d) {
+                for l in split.sorted(by: { $0.z_index > $1.z_index }) {
+                    guard let cg = loadCGImage(dir.appendingPathComponent(l.file)), let px = ChromaKeyOutputRules.straightRGBA8(cg) else { continue }
+                    size = (cg.width, cg.height)
+                    guard let e = LayerizeAssembly.extent(px, width: cg.width, height: cg.height, alpha: 1) else { continue }
+                    let c = FrameKit.crop(px, width: cg.width, e.x, e.y, e.w, e.h)
+                    nodes.append(.layer(name: l.name, x: e.x, y: e.y, w: c.w, h: c.h, px: c.px))
+                }
+            }
+            if nodes.isEmpty, let p = load("\(j.id)_rmbg.png") {
+                size = (p.w, p.h)
+                if let e = LayerizeAssembly.extent(p.px, width: p.w, height: p.h, alpha: 1) {
+                    let c = FrameKit.crop(p.px, width: p.w, e.x, e.y, e.w, e.h)
+                    nodes.append(.layer(name: j.id, x: e.x, y: e.y, w: c.w, h: c.h, px: c.px))
+                }
+                if !nodes.isEmpty { lock.lock(); single.append(j.id); lock.unlock() }
+            } else if !nodes.isEmpty { lock.lock(); layered.append(j.id); lock.unlock() }
+            guard !nodes.isEmpty else { return }
+            try? PhotoshopFile.data(width: size.w, height: size.h, nodes: nodes).write(to: symbolDir.appendingPathComponent("\(j.id).psb"))
+        }
+        let rank = Dictionary(uniqueKeysWithValues: symbolJobs.enumerated().map { ($1.id, $0) })
+        layered.sort { rank[$0]! < rank[$1]! }; single.sort { rank[$0]! < rank[$1]! }
+
         // The layout files.
         let layoutDir = out.appendingPathComponent("layout")
         try? fm.createDirectory(at: layoutDir, withIntermediateDirectories: true)
@@ -33500,73 +33609,91 @@ enum GameForgeExport {
             }
         }
 
-        // The PSBs, one per mode and orientation — every mode has its own opaque background, so modes sharing a file hid
-        // all but one: its pieces where the layout puts them, stacked as the game stacks them, the reels filled as the
-        // preview fills them, and the design box with its HUD band as a hidden guide.
+        // The PSBs, one per screen and orientation — every screen has its own opaque background, so screens sharing a
+        // file hid all but one: its pieces where the layout puts them, stacked as the game stacks them, the reels filled
+        // as the preview fills them, a wheel's wedges each a layer of its own, and the design box with its HUD band as a
+        // hidden guide.
         func psb(_ i: Int, _ prof: GameForge.Profile, landscape isL: Bool) -> Data {
-            let (CW, CH) = prof.canvas
+            let (CW, CH) = prof.canvas, s = screens[i], mode = gf[i], sc = s.scope
             func layer(_ name: String, _ src: Piece, _ b: Box) -> PhotoshopFile.Node {
                 let o = prof.pixel(b.x, b.y), w = max(1, Int((b.w * 3).rounded())), h = max(1, Int((b.h * 3).rounded()))
                 let p = w == src.w && h == src.h ? src : FrameKit.resized(src, w, h)
                 return .layer(name: name, x: Int(o.x.rounded()), y: Int(o.y.rounded()), w: w, h: h, px: p.px)
             }
-            let m = modes[i], mode = gf[i], sc = m.scope
-            do {
-                /// A placed piece as its layer, with the text the game prints on it laid over it; the code-built reel grid
-                /// as its reels filled.
-                func nodes(_ it: GameForge.Item) -> [PhotoshopFile.Node] {
-                    let b = isL ? it.landscape : it.portrait
-                    guard let a = it.asset else {
-                        return filledReels(m.area, symbols: symbols, jobs: jobs, width: max(1, Int((b.w * 3).rounded()))).map { [layer("\(it.name) (game code)", $0, b)] } ?? []
+            /// A placed piece as its layer, with the text the game prints on it laid over it; a code-built piece as what
+            /// the game shows there: the reels filled, the wheel's wedges each in its place.
+            func nodes(_ it: GameForge.Item) -> [PhotoshopFile.Node] {
+                let b = isL ? it.landscape : it.portrait
+                guard let a = it.asset else {
+                    if let area = s.area {
+                        return filledReels(area, symbols: symbols, jobs: jobs, width: max(1, Int((b.w * 3).rounded()))).map { [layer("\(it.name) (game code)", $0, b)] } ?? []
                     }
-                    guard let src = exported[a] else { return [] }
-                    let k = b.w / (Double(src.w) / 3)
-                    return mode.labels.filter { $0.parent == it.name }.map { l in
-                        let lb = Box(x: b.cx + l.box.x * k, y: b.cy + l.box.y * k, w: l.box.w * k, h: l.box.h * k)
-                        let w = max(1, Int((lb.w * 3).rounded())), h = max(1, Int((lb.h * 3).rounded()))
-                        return layer("\(l.name) (text: \(l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), lb)
-                    } + [layer(it.name, src, b)]
+                    guard let wh = s.wheel else { return [] }
+                    let size = max(1, Int((b.w * 3).rounded())), o = prof.pixel(b.x, b.y)
+                    let parts = wh.art.faceLayers(wh.wedges, order: wh.order, size: size).enumerated().compactMap { k, px -> PhotoshopFile.Node? in
+                        guard let e = LayerizeAssembly.extent(px, width: size, height: size, alpha: 1) else { return nil }
+                        let c = FrameKit.crop(px, width: size, e.x, e.y, e.w, e.h)
+                        return .layer(name: "wedge \(k + 1) · \(wh.order[k % wh.order.count])", x: Int(o.x.rounded()) + e.x, y: Int(o.y.rounded()) + e.y, w: c.w, h: c.h, px: c.px)
+                    }
+                    return [.group(name: "\(it.name) (game code: turns)", children: parts, visible: true)]
                 }
-                // In the order the game stacks them (GameForge.stack): the layout's groups as Photoshop groups.
-                var children: [PhotoshopFile.Node] = []
-                for u in GameForge.stack(mode) {
-                    let n = u.items.flatMap(nodes)
-                    if let g = u.group { children.append(.group(name: g, children: n, visible: true)) } else { children += n }
-                }
-                if let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
-                return PhotoshopFile.data(width: CW, height: CH, nodes: [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)] + children)
+                guard let src = exported[a] else { return [] }
+                let k = b.w / (Double(src.w) / 3)
+                return mode.labels.filter { $0.parent == it.name }.map { l in
+                    let lb = Box(x: b.cx + l.box.x * k, y: b.cy + l.box.y * k, w: l.box.w * k, h: l.box.h * k)
+                    let w = max(1, Int((lb.w * 3).rounded())), h = max(1, Int((lb.h * 3).rounded()))
+                    return layer("\(l.name) (text: \(l.dataKey))", Piece(px: amount(l.text, w, h), w: w, h: h), lb)
+                } + [layer(it.name, src, b)]
             }
+            var children: [PhotoshopFile.Node] = []
+            for u in GameForge.stack(mode) {
+                let n = u.items.flatMap(nodes)
+                if let g = u.group { children.append(.group(name: g, children: n, visible: true)) } else { children += n }
+            }
+            if let bg = backgrounds[sc] { let p = isL ? bg.l : bg.p; children.append(.layer(name: "background-\(sc)", x: 0, y: 0, w: p.w, h: p.h, px: p.px)) }
+            return PhotoshopFile.data(width: CW, height: CH, nodes: [.group(name: "guides (not exported)", children: [guide(prof)], visible: false)] + children)
         }
         let stem = gameDir.replacingOccurrences(of: "/", with: "-")
-        for i in modes.indices {
+        for i in screens.indices {
             for (prof, isL, name) in [(portrait, false, "portrait"), (landscape, true, "landscape")] {
-                try? psb(i, prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_\(modes[i].scope)_\(name).psb"))
+                try? psb(i, prof, landscape: isL).write(to: out.appendingPathComponent("\(stem)_\(screens[i].scope)_\(name).psb"))
             }
         }
 
         // What a developer needs to wire it in, written beside it.
-        let gp = modes.first.map { (Double($0.area.cell) * $0.p["grid"]!.w / Double($0.area.grid.w), Double($0.area.gap) * $0.p["grid"]!.w / Double($0.area.grid.w)) } ?? (0, 0)
         var readme = "# \(game) for Game Forge\n\nMade by Navigator from the set \(folder.lastPathComponent), \(ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate])).\n\n"
         readme += "## Put it in the game\n\n1. Copy `assets/\(gameDir)` into the Game Forge repository's `assets/`. Its name must be the game's `games/<id>_<Name>` folder name exactly — rename it if it is not.\n"
-        readme += "2. Copy `layout/*.json` into the game's layout folder (`gameConfig.configDir`) and add the modes to `package.json` `gameConfig.scopes`: \(modes.map { "`\($0.scope)`" }.joined(separator: ", ")).\n"
+        readme += "2. Copy `layout/*.json` into the game's layout folder (`gameConfig.configDir`) and add the screens to `package.json` `gameConfig.scopes`: \(screens.map { "`\($0.scope)`" }.joined(separator: ", ")).\n"
         readme += "3. `pnpm build:assets`, then `pnpm dev`; Ctrl+Shift+E opens the layout editor on it.\n\n"
         readme += "## The reels are the game's code\n\nThe bezel's openings are drawn for the grid below. Register each mode's grid under its name so the layout groups it with its bezel (group `reelgrid-<mode>`, placed on the bezel's openings), and draw it at these sizes (design px, portrait; the group scales it in landscape):\n\n| Mode | Grid name | Rows × reels | Cell | Gap between reels |\n|---|---|---|---|---|\n"
-        for m in modes {
-            let k = m.p["grid"]!.w / Double(m.area.grid.w), g = layout.fileModes.first { $0.name == m.scope }?.grid
-            readme += String(format: "| %@ | `%@` | %@ | %.1f | %.1f |\n", m.scope, gridName(m.scope), g.map { "\($0.rows) × \($0.reels)" } ?? "?", Double(m.area.cell) * k, Double(m.area.gap) * k)
+        for s in screens {
+            guard let a = s.area, let gp = s.p["grid"] else { continue }
+            let k = gp.w / Double(a.grid.w), g = layout.fileModes.first { $0.name == s.scope }?.grid
+            readme += String(format: "| %@ | `%@` | %@ | %.1f | %.1f |\n", s.scope, gridName(s.scope), g.map { "\($0.rows) × \($0.reels)" } ?? "?", Double(a.cell) * k, Double(a.gap) * k)
         }
-        readme += "\nSymbols are in `textures/portrait/en/symbols/` at \(symbolPx) px (3× the largest cell they are shown in); `-win` is the win state.\n\n"
-        readme += "## Assumed — change to suit the game\n\n- Portrait design box 390 × \(Int(o.designHeight)), landscape 970 × 844 (Game Forge's LayoutService); the box's centre is the origin, pinned to the top of the screen.\n"
+        readme += "\nSymbols are in `textures/portrait/en/symbols/` at \(symbolPx) px (3× the largest cell they are shown in); `-win` is the win state.\n"
+        readme += "\nEach symbol is also a layered Photoshop file in `symbols/`, at the size it was drawn: "
+            + (layered.isEmpty ? "" : "\(layered.joined(separator: ", ")) in the layers they were split into (frame backing, light, frame glow, frame, gems, the symbol)")
+            + (single.isEmpty ? "" : (layered.isEmpty ? "" : "; ") + "\(single.joined(separator: ", ")) as the one picture each was drawn as") + ".\n"
+        let wheels = screens.filter { $0.wheel != nil }
+        if !wheels.isEmpty {
+            readme += "\n## The wheels are the game's code\n\nEach wheel's face is turned by the game: register it under its name (group `wheel-<screen>`, with its rim, hub and pointer) and build it from its upright wedges, each turned about its tip to its place, clockwise from the top. Sizes in design px, portrait:\n\n| Screen | Face name | Diameter | Wedges, clockwise from the top | Wedge files |\n|---|---|---|---|---|\n"
+            for s in wheels {
+                guard let wh = s.wheel, let fp = s.p["face"] else { continue }
+                readme += String(format: "| %@ | `%@Wheel` | %.1f | %@ | %@ |\n", s.scope, s.scope, fp.w * 0.86, wh.order.joined(separator: ", "), (wedgeFiles[s.scope] ?? []).map { "`\($0)`" }.joined(separator: " "))
+            }
+        }
+        readme += "\n## Assumed — change to suit the game\n\n- Portrait design box 390 × \(Int(o.designHeight)), landscape 970 × 844 (Game Forge's LayoutService); the box's centre is the origin, pinned to the top of the screen.\n"
         readme += "- The control bar takes the bottom \(Int(o.hud)) px of the portrait box and \(Int(o.landscapeHUD)) of the landscape one: nothing is placed there.\n"
         readme += "- Jackpot amounts print in `fnt/myriad-pro-bold` (Myriad Pro Bold, in `assets/_Common/fonts`), with the data keys `jackpot.<tier>`.\n"
-        readme += "- A PSB per mode and orientation, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
+        readme += "- A PSB per screen and orientation, its layers stacked and grouped as the layout stacks and groups them; the design box with its control-bar band is in `guides`, hidden.\n"
         if !upscaled.isEmpty { readme += "\n## Shown larger than drawn\n\n" + upscaled.map { "- \($0)\n" }.joined() }
         if !problems.isEmpty { readme += "\n## Not done\n\n" + problems.map { "- \($0)\n" }.joined() }
         try? readme.write(to: out.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
 
-        lines.append("MODES: " + modes.map(\.scope).joined(separator: ", "))
+        lines.append("SCREENS: " + screens.map(\.scope).joined(separator: ", "))
+        lines.append("SYMBOL FILES: \(layered.count) layered (\(layered.joined(separator: " "))), \(single.count) single pictures")
         lines.append("PLACEMENTS: \((r.placements["records"] as? [Any])?.count ?? 0) · GROUPS: \(r.groups.count) · TEXTS: \(r.texts.count) · SYMBOLS: \(symbols.count) at \(symbolPx) px")
-        lines.append(String(format: "CELL: %.1f design px portrait, gap %.1f", gp.0, gp.1))
         lines += upscaled.map { "LARGER THAN DRAWN: \($0)" }
         return (out, lines, problems)
     }
