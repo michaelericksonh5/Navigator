@@ -34004,7 +34004,7 @@ enum GameForgeExport {
             }
             var groups = s.groups
             // A code-built piece's group scales it in landscape: its size is the portrait one.
-            for (key, handle) in [("grid", "reelgrid-\(sc)"), ("face", "wheel-\(sc)")] {
+            for (key, handle) in [("grid", "reelgrid-\(sc)"), ("grid", "pickgrid-\(sc)"), ("face", "wheel-\(sc)")] {
                 if let gp = s.p[key], let gl = s.l[key], let i = groups.firstIndex(where: { $0.handle == handle }) { groups[i].landscapeScale = gl.w / gp.w }
             }
             // The amounts print in each meter's dark field, in the meter's own space (its pixels ÷ 3, from its centre).
