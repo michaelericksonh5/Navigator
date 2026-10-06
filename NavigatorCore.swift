@@ -7700,6 +7700,12 @@ public enum GDDScanRules {
         Set(results.filter(\.declaresNothing).map(\.key))
     }
 
+    /// A new check added to what was known: a document checked again takes its new result, the rest keep theirs — so
+    /// checking the older GDDs, or the folder with them left out, never forgets the others.
+    public static func merged(_ old: [GDDScanResult], _ new: [GDDScanResult]) -> [GDDScanResult] {
+        let fresh = Set(new.map(\.key))
+        return old.filter { !fresh.contains($0.key) } + new
+    }
     public static func encode(_ results: [GDDScanResult]) -> Data? {
         try? JSONEncoder().encode(results)
     }
@@ -17723,7 +17729,10 @@ public enum GDDMirror {
     /// The copy of `document`, a Drive document in `gdds` or a folder inside it (`kind`: said in the name of anything but
     /// a Google Doc, so a Sheet and a Doc of one name stay apart); nil for one outside it.
     public static func copy(of document: URL, gdds: URL, kind: String? = nil) -> URL? {
-        let base = gdds.standardizedFileURL.path, dir = document.deletingLastPathComponent().standardizedFileURL.path
+        // Compared where they really are: the GDDs folder is saved as "~/Google Drive/…", a link to Library/CloudStorage,
+        // while Finder and a folder's own listing give the other spelling (2026-10-06: 93 copies not written for it).
+        let base = gdds.resolvingSymlinksInPath().standardizedFileURL.path
+        let dir = document.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path
         guard dir == base || dir.hasPrefix(base + "/") else { return nil }
         var u = root(for: gdds)
         let rel = dir.dropFirst(base.count).split(separator: "/")

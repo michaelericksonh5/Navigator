@@ -14179,6 +14179,16 @@ final class GDDMirrorTests: XCTestCase {
         XCTAssertNil(GDDMirror.copy(of: URL(fileURLWithPath: "/Elsewhere/A GDD.gdoc"), gdds: gdds))
         XCTAssertNil(GDDMirror.copy(of: URL(fileURLWithPath: "/Drive/Studio/GDDs Plaintext/A GDD.gdoc"), gdds: gdds))   // not "GDDs" by prefix
     }
+    // The GDDs folder saved through a link, its documents listed where they really are: still inside it.
+    func testACopyIsFoundThroughALink() throws {
+        let fm = FileManager.default, root = fm.temporaryDirectory.appendingPathComponent("mirror-link-\(UUID().uuidString)")
+        let real = root.appendingPathComponent("CloudStorage/Studio/GDDs")
+        try fm.createDirectory(at: real.appendingPathComponent("Older GDDs"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: root.appendingPathComponent("Drive"), withDestinationURL: root.appendingPathComponent("CloudStorage"))
+        let saved = root.appendingPathComponent("Drive/Studio/GDDs")
+        let copy = GDDMirror.copy(of: real.appendingPathComponent("Older GDDs/0001 Sample GDD.gdoc"), gdds: saved)
+        XCTAssertEqual(copy?.path, saved.deletingLastPathComponent().appendingPathComponent("GDDs Plaintext/Older GDDs/0001 Sample GDD.txt").path)
+    }
     func testACopyIsCurrentWhileNewerThanItsDocument() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mirror-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -14192,5 +14202,18 @@ final class GDDMirrorTests: XCTestCase {
         XCTAssertFalse(GDDMirror.isStale(copy, of: doc))
         try FileManager.default.setAttributes([.modificationDate: t.addingTimeInterval(60)], ofItemAtPath: doc.path)   // edited since
         XCTAssertTrue(GDDMirror.isStale(copy, of: doc))
+    }
+}
+
+/// Checking some documents keeps what was known about the rest.
+final class GDDScanMergeTests: XCTestCase {
+    func testANewCheckAddsToTheOld() {
+        let t = Date(timeIntervalSince1970: 1_800_000_000)
+        let old = [GDDScanResult(key: "a", name: "A", symbolCount: 12, checkedAt: t, failure: nil), GDDScanResult(key: "b", name: "B", symbolCount: 0, checkedAt: t, failure: nil)]
+        let new = [GDDScanResult(key: "b", name: "B", symbolCount: 9, checkedAt: t, failure: nil), GDDScanResult(key: "c", name: "C", symbolCount: 0, checkedAt: t, failure: nil)]
+        let m = GDDScanRules.merged(old, new)
+        XCTAssertEqual(m.map(\.key).sorted(), ["a", "b", "c"])
+        XCTAssertEqual(m.first { $0.key == "b" }?.symbolCount, 9)
+        XCTAssertEqual(m.first { $0.key == "a" }?.symbolCount, 12)
     }
 }

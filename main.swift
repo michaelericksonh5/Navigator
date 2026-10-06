@@ -22277,6 +22277,26 @@ if let flag = CommandLine.arguments.firstIndex(of: "--review-snapshot"), flag + 
     app.run()
 }
 
+// Free (Docs export):  Navigator --check-gdds <folder>
+// Check documents… for one folder — the GDDs, or a folder inside it such as Confluence GDDs — as the window does it, each
+// document's symbol set counted, and the results added to the window's. Run the installed app's binary for its Google session.
+if let flag = CommandLine.arguments.firstIndex(of: "--check-gdds"), flag + 1 < CommandLine.arguments.count {
+    let folder = URL(fileURLWithPath: CommandLine.arguments[flag + 1])
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.async { MainActor.assumeIsolated {
+        let began = Date()
+        GDDLibrary.scanAll(from: folder) { i, n, name in print("[\(i)/\(n)] \(name)"); fflush(stdout) } done: { results in
+            GDDLibrary.scanResults = GDDScanRules.merged(GDDLibrary.scanResults, results)
+            for r in results.sorted(by: { $0.name.localizedStandardCompare($1.name) == .orderedAscending }) {
+                print("RESULT\t\(r.symbolCount)\t\(r.name)" + (r.failure.map { "\tFAILED: \($0)" } ?? ""))
+            }
+            print("SUMMARY: \(GDDScanRules.summary(results) ?? "nothing checked") — \(Int(Date().timeIntervalSince(began)))s")
+            exit(0)
+        }
+    } }
+    app.run()
+}
+
 // Free (Docs export):  Navigator --mirror-gdds [<GDDs folder>] [--into <folder>] [--limit N] [--all]
 // One pass of the GDDs' plaintext copies, as the background does it — into a test folder with --into. Run the installed
 // app's binary for its Google session.
@@ -32243,8 +32263,10 @@ struct GDDToAssetsSheet: View {
             run.status = "Checking \(i) of \(n) — \(name)"
         } done: { results in
             scanning = false
-            scan = results
-            GDDLibrary.scanResults = results
+            // Added to what was known, so documents not in this check (older ones left out) keep their results.
+            let all = GDDScanRules.merged(GDDLibrary.scanResults, results)
+            scan = all
+            GDDLibrary.scanResults = all
             // If the picked document has just been hidden, stop showing its plan.
             if let p = pickedGDD, GDDScanRules.hiddenKeys(results).contains(p.key), !showEmpty {
                 pickedGDD = nil
