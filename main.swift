@@ -33787,21 +33787,23 @@ enum GameForgeExport {
             let (cols, rows) = PickArt.grid(pick.options ?? 9), board = ReelArea(rows: rows, reels: cols, independent: true, cell: baseArea.cell)
             s.area = board
             let g = board.grid, outer = Double(g.w + 2 * board.band), left = Double(g.x - board.band), bandTop = Double(g.y - board.band)
+            var top = bandTop   // the meters stand clear of everything the panel draws above its band
             if panel.fullW == board.width, panel.fullH == board.height {
-                s.add("panel", panel, 0, 0, 1, asset: "jackpot/panel")
+                s.add("panel", panel, 0, 0, 1, asset: "jackpot/panel"); top = min(top, Double(panel.y))
                 if var inside = cutFile("jackpot_interface_reelTexture"), inside.fullW == board.width { inside.source = nil; s.add("inside", inside, 0, 0, 1, asset: "jackpot/panel-inside") }
             } else { problems.append("jackpotPick: its panel was laid for another grid — Make Again ▸ Bezel") }
             s.block["grid"] = Box(x: Double(g.x), y: Double(g.y), w: Double(g.w), h: Double(g.h))
             if let m = cutFile("jackpot_interface_message") {
                 let w = 0.62 * outer, k = w / Double(m.fullW)
-                s.add("message", m, left + (outer - w) / 2, bandTop + Double(board.band) / 2 - Double(m.fullH) * k / 2, k, asset: "jackpot/message")
+                let y = bandTop + Double(board.band) / 2 - Double(m.fullH) * k / 2
+                s.add("message", m, left + (outer - w) / 2, y, k, asset: "jackpot/message"); top = min(top, y + Double(m.y) * k)
             }
             // The meters over it, in a row as wide as it.
             if !meterCuts.isEmpty {
                 let n = Double(meterCuts.count), gap = 0.04 * outer, w = (outer - (n - 1) * gap) / n
                 for (k, mc) in meterCuts.enumerated() {
                     let kk = w / Double(mc.cut.piece.w), h = Double(mc.cut.piece.h) * kk, key = "meter\(k + 1)", tier = PopUps.key(tierNames[k])
-                    s.add(key, mc.cut, left + Double(k) * (w + gap) - Double(mc.cut.x) * kk, bandTop - 0.06 * outer - h - Double(mc.cut.y) * kk, kk, asset: "meters/jackpot-meter-\(tier.lowercased())")
+                    s.add(key, mc.cut, left + Double(k) * (w + gap) - Double(mc.cut.x) * kk, top - 0.03 * outer - h - Double(mc.cut.y) * kk, kk, asset: "meters/jackpot-meter-\(tier.lowercased())")
                     s.items.append((key, "jackpot-meter-\(tier)-jackpotPick", "\(tierNames[k]) meter", "jackpots-jackpotPick", 152))
                 }
                 s.groups.append(GameForge.Group(handle: "jackpots-jackpotPick", label: "Jackpot meters"))
