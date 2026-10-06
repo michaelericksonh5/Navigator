@@ -17712,6 +17712,65 @@ public struct SetSession: Codable, Equatable, Sendable {
     public func sameEdit(as o: SetSession) -> Bool { var a = self, b = o; a.savedAt = .distantPast; b.savedAt = .distantPast; return a == b }
 }
 
+/// A set's own files written so that a crash, a full disk or a bad write never costs work (2026-10-05): each written whole
+/// or not at all, the last good copy kept beside it, and a dated copy now and then, in the set's hidden `.navigator`
+/// folder. Read back from the newest good copy when the file itself is damaged; a damaged file is set aside, never
+/// written over. (review.json was written in place: a half-written one read as an empty review, and the next save made
+/// that permanent — every approval gone.)
+public enum SetStore {
+    public static let folderName = ".navigator"
+    /// Dated copies kept per file, and how far apart.
+    static let keep = 20, every: TimeInterval = 15 * 60
+
+    static func dir(_ folder: URL) -> URL { folder.appendingPathComponent(folderName) }
+    static func stamp(_ d: Date) -> String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyyMMdd-HHmmss"; return f.string(from: d)
+    }
+    static func date(_ s: Substring) -> Date? {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyyMMdd-HHmmss"; return f.date(from: String(s))
+    }
+
+    /// Writes `data` as `name` in `folder`, keeping the copy it replaces when that copy is good (`valid`). Throws what
+    /// stopped it — the caller says so; nothing is half-written.
+    public static func write(_ data: Data, _ name: String, in folder: URL, valid: (Data) -> Bool, now: Date = Date()) throws {
+        let url = folder.appendingPathComponent(name), fm = FileManager.default
+        if let old = try? Data(contentsOf: url), old != data, valid(old) {
+            try? fm.createDirectory(at: dir(folder), withIntermediateDirectories: true)
+            try? old.write(to: dir(folder).appendingPathComponent(name + ".previous"), options: .atomic)
+            if history(name, in: folder).first.map({ now.timeIntervalSince($0.date) >= every }) ?? true {
+                try? old.write(to: dir(folder).appendingPathComponent("\(name).\(stamp(now))"), options: .atomic)
+                for d in history(name, in: folder).dropFirst(keep) { try? fm.removeItem(at: d.url) }
+            }
+        }
+        try data.write(to: url, options: .atomic)
+    }
+    /// The dated copies of `name`, newest first.
+    public static func history(_ name: String, in folder: URL) -> [(url: URL, date: Date)] {
+        ((try? FileManager.default.contentsOfDirectory(atPath: dir(folder).path)) ?? []).compactMap { n -> (URL, Date)? in
+            guard n.hasPrefix(name + "."), let d = date(n.dropFirst(name.count + 1)) else { return nil }
+            return (dir(folder).appendingPathComponent(n), d)
+        }.sorted { $0.1 > $1.1 }
+    }
+    /// `name` read and decoded; when it is missing or damaged, its newest good copy, with when that copy was made.
+    public static func read<T>(_ name: String, in folder: URL, decode: (Data) -> T?) -> (value: T, recovered: Date?)? {
+        if let d = try? Data(contentsOf: folder.appendingPathComponent(name)), let v = decode(d) { return (v, nil) }
+        let previous = dir(folder).appendingPathComponent(name + ".previous")
+        let when = (try? previous.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+        for c in [(previous, when)] + history(name, in: folder).map({ ($0.url, $0.date) }) {
+            if let d = try? Data(contentsOf: c.0), let v = decode(d) { return (v, c.1) }
+        }
+        return nil
+    }
+    /// A file there that does not decode, moved aside as `<name>.damaged-<stamp>` in the hidden folder, so what is in it
+    /// is kept and a fresh write cannot replace it. False when there was nothing damaged to move.
+    @discardableResult public static func setAside(_ name: String, in folder: URL, valid: (Data) -> Bool, now: Date = Date()) -> Bool {
+        let url = folder.appendingPathComponent(name)
+        guard let d = try? Data(contentsOf: url), !valid(d) else { return false }
+        try? FileManager.default.createDirectory(at: dir(folder), withIntermediateDirectories: true)
+        return (try? FileManager.default.moveItem(at: url, to: dir(folder).appendingPathComponent("\(name).damaged-\(stamp(now))"))) != nil
+    }
+}
+
 /// The file a set opens from: `<Game>.navset` in its folder, double-clicked in Finder or picked in Navigator. It names its
 /// folder, so a copy moved elsewhere still finds the set; a set folder moved with its file in it is found beside it.
 public struct SetLauncher: Codable, Equatable, Sendable {

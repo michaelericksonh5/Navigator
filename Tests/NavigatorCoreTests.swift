@@ -14096,3 +14096,39 @@ final class LocalizationPlanTests: XCTestCase {
         XCTAssertEqual(Localized.missingReport([pieces[1]], languages: ["fr"]), "")
     }
 }
+
+/// A set's files are never lost to a bad write: written whole, the good copy kept, a damaged file read from its backup.
+final class SetStoreTests: XCTestCase {
+    func folder() -> URL {
+        let f = FileManager.default.temporaryDirectory.appendingPathComponent("setstore-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: f, withIntermediateDirectories: true)
+        return f
+    }
+    let ok: (Data) -> Bool = { (try? JSONSerialization.jsonObject(with: $0)) != nil }
+    func testADamagedFileIsReadFromItsLastGoodCopy() throws {
+        let f = folder(), t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        try SetStore.write(Data(#"{"v":1}"#.utf8), "review.json", in: f, valid: ok, now: t0)
+        try SetStore.write(Data(#"{"v":2}"#.utf8), "review.json", in: f, valid: ok, now: t0.addingTimeInterval(60))
+        // Half-written: the file reads as nothing.
+        try Data(#"{"v":"#.utf8).write(to: f.appendingPathComponent("review.json"))
+        let r = SetStore.read("review.json", in: f) { d -> Int? in ((try? JSONSerialization.jsonObject(with: d)) as? [String: Int])?["v"] }
+        XCTAssertEqual(r?.value, 1); XCTAssertNotNil(r?.recovered)
+        // Set aside, never written over; a good file is never moved.
+        XCTAssertTrue(SetStore.setAside("review.json", in: f, valid: ok))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.appendingPathComponent("review.json").path))
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: f.appendingPathComponent(".navigator").path).contains { $0.hasPrefix("review.json.damaged-") })
+        try SetStore.write(Data(#"{"v":3}"#.utf8), "review.json", in: f, valid: ok)
+        XCTAssertFalse(SetStore.setAside("review.json", in: f, valid: ok))
+    }
+    func testDatedCopiesAreSpacedAndCapped() throws {
+        let f = folder(), t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        for i in 0..<30 { try SetStore.write(Data("{\"v\":\(i)}".utf8), "set.json", in: f, valid: ok, now: t0.addingTimeInterval(Double(i) * 600)) }
+        // A copy at most every quarter-hour: 30 saves ten minutes apart make 15, all kept under the cap of 20.
+        XCTAssertEqual(SetStore.history("set.json", in: f).count, 15)
+        for i in 30..<80 { try SetStore.write(Data("{\"v\":\(i)}".utf8), "set.json", in: f, valid: ok, now: t0.addingTimeInterval(Double(i) * 1000)) }
+        XCTAssertEqual(SetStore.history("set.json", in: f).count, 20)
+        // A missing file is read from its last good copy too.
+        try FileManager.default.removeItem(at: f.appendingPathComponent("set.json"))
+        XCTAssertEqual(SetStore.read("set.json", in: f) { d -> Int? in ((try? JSONSerialization.jsonObject(with: d)) as? [String: Int])?["v"] }?.value, 78)
+    }
+}

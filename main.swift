@@ -18875,6 +18875,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // must not read those closes as "the user doesn't want these tabs back".
         terminating = true
         for w in NSApp.windows.compactMap({ $0 as? NavWindow }) { w.model.saveState() }
+        // The GDD to Assets sets open: their last second of edits, which a window's close would have saved.
+        OpenSets.flush()
     }
 
     // Keyboard navigation for the file list/grid. Runs only when our window is key
@@ -19215,7 +19217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             p.canChooseDirectories = true; p.canChooseFiles = false; p.allowsMultipleSelection = false
             p.message = "Choose a set folder made by GDD to Assets"
             guard p.runModal() == .OK, let folder = p.url else { return }
-            guard let run = GDDToAssetsRun.reopen(folder) else {
+            guard let run = OpenSets.run(for: folder) else {
                 reportFileError("Not a GDD to Assets set", "“\(folder.lastPathComponent)” has no \(SetManifest.fileName). Sets made from 2.16.16 on carry one.")
                 return
             }
@@ -24759,6 +24761,10 @@ final class GDDRunLog {
 
 @MainActor
 final class GDDToAssetsRun: ObservableObject {
+    /// When the set was last saved whole, and why the last save failed (nil once one succeeds) — said in the editor.
+    @Published var savedAt: Date?
+    @Published var saveError: String?
+    init() { OpenSets.track(self) }
     @Published var jobs: [AssetJob] = []
     @Published var theme: GameTheme?
     @Published var gameName = ""
@@ -28182,13 +28188,17 @@ extension GDDToAssetsRun {
                             backing: (backing.name, backing.rgb), model: modelFlag, reels: reelLayout)
         m.typed = typed; m.languages = languages
         if var s = editorSession { s.savedAt = Date(); m.session = s }
-        if let d = m.encoded() { try? d.write(to: folder.appendingPathComponent(SetManifest.fileName)) }
+        do {
+            guard let d = m.encoded() else { throw CocoaError(.fileWriteUnknown) }
+            try SetStore.write(d, SetManifest.fileName, in: folder, valid: { SetManifest.decode($0) != nil })
+            noteSaved(nil)
+        } catch { noteSaved(error) }
         // The file it opens from — one per set, named for the game — and the recent sets.
         let launcher = SetLauncher.fileName(game: gameName, folder: folder)
         for n in ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []) where n.hasSuffix("." + SetLauncher.fileExtension) && n != launcher {
             try? FileManager.default.removeItem(at: folder.appendingPathComponent(n))
         }
-        try? SetLauncher(game: gameName, folder: folder.path).encoded()?.write(to: folder.appendingPathComponent(launcher))
+        try? SetLauncher(game: gameName, folder: folder.path).encoded()?.write(to: folder.appendingPathComponent(launcher), options: .atomic)
         RecentSets.add(folder)
         // The document itself (read, or written from a typed sheet): the studio pieces, Find What Else It Needs and
         // a corrected structure all read it again after the set is reopened.
@@ -28198,9 +28208,11 @@ extension GDDToAssetsRun {
     /// A set folder rebuilt into a run from its manifest, with its review, so it can be revised
     /// after the window that made it is gone. The theme's art is fetched again from the hub (free)
     /// for redraws that use it; an edit never needs it.
-    static func reopen(_ folder: URL) -> GDDToAssetsRun? {
-        guard let d = try? Data(contentsOf: folder.appendingPathComponent(SetManifest.fileName)),
-              let m = SetManifest.decode(d) else { return nil }
+    static func reopen(_ folder: URL, fetchTheme: Bool = true) -> GDDToAssetsRun? {
+        // A damaged navigator-set.json opens from its last good copy, set aside rather than written over.
+        guard let read = SetStore.read(SetManifest.fileName, in: folder, decode: SetManifest.decode) else { return nil }
+        let m = read.value
+        if read.recovered != nil { SetStore.setAside(SetManifest.fileName, in: folder, valid: { SetManifest.decode($0) != nil }) }
         let run = GDDToAssetsRun()
         var t = GameTheme(name: m.themeName, category: m.themeCategory, look: m.themeLook)
         t.styleFromArt = m.themeStyle
@@ -28236,6 +28248,11 @@ extension GDDToAssetsRun {
             run.softenPots = s.softenPots
             if s.styleChosen, let picked = SlotArtStyles.byID(s.styleID) { run.theme?.chosenStyle = picked }
         }
+        if let when = read.recovered {
+            run.status = "This set’s file was damaged: it opened from its backup of \(when.formatted(date: .abbreviated, time: .shortened)); the damaged file is kept in its .navigator folder."
+            run.writeManifest(to: folder)
+        }
+        guard fetchTheme else { return run }
         ThemeHubClient.themes { list, _ in
             guard let hub = list?.first(where: { $0.name == m.themeName }) else { return }
             DispatchQueue.main.async {
@@ -28247,11 +28264,28 @@ extension GDDToAssetsRun {
         return run
     }
 
+    /// The set's review; a damaged review.json is read from its last good copy and set aside, never written over.
     func loadReview(_ folder: URL) {
-        review = (try? Data(contentsOf: folder.appendingPathComponent(SetReview.fileName))).flatMap(SetReview.decode) ?? SetReview()
+        let valid: (Data) -> Bool = { SetReview.decode($0) != nil }
+        let r = SetStore.read(SetReview.fileName, in: folder, decode: SetReview.decode)
+        review = r?.value ?? SetReview()
+        if SetStore.setAside(SetReview.fileName, in: folder, valid: valid) {
+            status = r?.recovered.map { "The review file was damaged: its approvals were put back from \($0.formatted(date: .abbreviated, time: .shortened)), and the damaged one kept in the set's .navigator folder." }
+                ?? "The review file was damaged and had no backup: it is kept in the set's .navigator folder, and the review starts afresh."
+            if r != nil { saveReview(folder) }
+        }
     }
     func saveReview(_ folder: URL) {
-        if let d = review.encoded() { try? d.write(to: folder.appendingPathComponent(SetReview.fileName)) }
+        do {
+            guard let d = review.encoded() else { throw CocoaError(.fileWriteUnknown) }
+            try SetStore.write(d, SetReview.fileName, in: folder, valid: { SetReview.decode($0) != nil })
+            noteSaved(nil)
+        } catch { noteSaved(error) }
+    }
+    /// A save's outcome, said on the main thread whichever thread saved.
+    func noteSaved(_ error: Error?) {
+        let say = { self.saveError = error.map { "Couldn’t save: \($0.localizedDescription)" }; if error == nil { self.savedAt = Date() } }
+        if Thread.isMainThread { say() } else { DispatchQueue.main.async(execute: say) }
     }
 
     /// Every image of the set in `folder`, in review order: the master frames, each symbol type
@@ -32064,6 +32098,27 @@ enum ArtPanelProbe {
     nonisolated(unsafe) static var windowThemes = 0
 }
 
+/// One run per set however it is opened — the editor, its Assets, the Projects home — so two windows never hold two copies
+/// of a set's review and save over each other's approvals (Open a Set's Assets… used to make its own).
+enum OpenSets {
+    private final class Weak { weak var run: GDDToAssetsRun?; init(_ r: GDDToAssetsRun) { run = r } }
+    nonisolated(unsafe) private static var all: [Weak] = []
+    static func track(_ run: GDDToAssetsRun) { all.removeAll { $0.run == nil }; all.append(Weak(run)) }
+    /// The run a window already has for `folder`.
+    @MainActor static func open(_ folder: URL) -> GDDToAssetsRun? {
+        let p = folder.standardizedFileURL.path
+        return all.lazy.compactMap(\.run).first { $0.lastFolder?.standardizedFileURL.path == p }
+    }
+    /// That run, or the set read from its folder.
+    @MainActor static func run(for folder: URL) -> GDDToAssetsRun? { open(folder) ?? GDDToAssetsRun.reopen(folder) }
+    /// Every set with a folder saved now: on quit, before a set is moved, renamed or archived.
+    @MainActor static func flush(_ folder: URL? = nil) {
+        for r in all.compactMap(\.run) where r.lastFolder != nil && (folder == nil || r.lastFolder?.standardizedFileURL.path == folder!.standardizedFileURL.path) {
+            if r.theme != nil { r.writeManifest(to: r.lastFolder!) }
+        }
+    }
+}
+
 enum GDDToAssetsWindow {
     private static var windows: [NSWindow] = []
     private static var guards: [CloseGuard] = []
@@ -32072,7 +32127,7 @@ enum GDDToAssetsWindow {
     /// A saved set (its folder, or its .navset file) in the editor, as it was left — or, when it is open already, that window.
     @MainActor static func open(set: URL) {
         let folder = set.pathExtension == SetLauncher.fileExtension ? SetLauncher.setFolder(of: set) : set
-        guard let folder, let run = GDDToAssetsRun.reopen(folder) else {
+        guard let folder, let run = OpenSets.run(for: folder) else {
             reportFileError("Not a set Navigator can open", "“\(set.lastPathComponent)” is not a GDD to Assets set, or its folder has moved.")
             return
         }
