@@ -19587,9 +19587,11 @@ public enum GameForge {
     /// (31 of 41 landscape games). `side`: block pieces that join that column, under the meters (the Power Bet buttons,
     /// as those games have them), keeping their size beside the reels. `right`: groups of block pieces (a pot and its
     /// plaque) that move to a column right of the reels in landscape, each group kept together, so the reels take the
-    /// box's height. Keys: the block's, "logo", "meter1"….
+    /// box's height. `maxScale`: the most design px a block pixel may take (a block in its pictures' own pixels: 1.1 / 3
+    /// shows none much past the size it was drawn). `column: false` keeps the logo over the block in a wide box too (an intro).
+    /// Keys: the block's, "logo", "meter1"….
     public static func compose(block: [String: Box], logo: (w: Double, h: Double)?, meters: [(w: Double, h: Double)] = [], side: Set<String> = [],
-                               right: [[String]] = [], profile p: Profile) -> [String: Box] {
+                               right: [[String]] = [], maxScale: Double = .infinity, column: Bool = true, profile p: Profile) -> [String: Box] {
         guard let u = Box.union(block.values), u.w > 0, u.h > 0 else { return [:] }
         let m = 6.0, gap = 6.0, top = -p.height / 2 + m, bottom = p.height / 2 - p.hud - m
         let aspect = logo.map { $0.w / max(1, $0.h) } ?? 1
@@ -19603,10 +19605,10 @@ public enum GameForge {
         }
         let rightKeys = Set(right.flatMap { $0 })
         let main = block.filter { !side.contains($0.key) && !rightKeys.contains($0.key) }
-        if p.isLandscape, logo != nil || !meters.isEmpty, let u = Box.union(main.values), u.w > 0, u.h > 0 {
+        if column, p.isLandscape, logo != nil || !meters.isEmpty, let u = Box.union(main.values), u.w > 0, u.h > 0 {
             // With meters, a column is kept for them, a fifth of the box: the reels never squeeze it out.
             let keep = meters.isEmpty && side.isEmpty && right.isEmpty ? 0 : 0.2 * p.width
-            let s = min((p.width - 2 * m - 2 * keep) / u.w, (bottom - top) / u.h), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
+            let s = min((p.width - 2 * m - 2 * keep) / u.w, (bottom - top) / u.h, maxScale), bw = u.w * s, bh = u.h * s, column = (p.width - bw) / 2 - 2 * m
             if column >= 150 {
                 let y0 = top + (bottom - top - bh) / 2
                 for (k, b) in main { out[k] = Box(x: -bw / 2 + (b.x - u.x) * s, y: y0 + (b.y - u.y) * s, w: b.w * s, h: b.h * s) }
@@ -19680,7 +19682,7 @@ public enum GameForge {
         let hb = Box.union(header.values)
         let headerH = hb.map { $0.y + $0.h } ?? 0
         let room = top + (headerH > 0 ? headerH + gap : 0)
-        let s = min((p.width - 2 * m) / u.w, (bottom - room) / u.h), bw = u.w * s, bh = u.h * s
+        let s = min((p.width - 2 * m) / u.w, (bottom - room) / u.h, maxScale), bw = u.w * s, bh = u.h * s
         let y0 = room + (bottom - room - bh) / 2
         place(s, -bw / 2, y0)
         // The header sits midway between the top of the box and the reels.

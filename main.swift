@@ -33512,6 +33512,8 @@ enum GameForgeExport {
             var side: Set<String> = []
             /// Groups that join a column right of the reels in landscape (each pot with its plaque).
             var right: [[String]] = []
+            /// The most design px a block pixel may take (`GameForge.compose`).
+            var maxScale = Double.infinity, column = true
             var wheel: (art: WheelArt, order: [String], wedges: [String: [UInt8]], prefix: String)?
             mutating func add(_ key: String, _ c: Cut, _ x: Double, _ y: Double, _ k: Double, asset: String) {
                 block[key] = Box(x: x + Double(c.x) * k, y: y + Double(c.y) * k, w: Double(c.piece.w) * k, h: Double(c.piece.h) * k)
@@ -33695,7 +33697,7 @@ enum GameForgeExport {
             .map { String($0.dropLast("_rmbg.png".count)) }.filter { !Localized.codes.dropFirst().contains(where: $0.hasSuffix) }.sorted() ?? []
         if !cards.isEmpty {
             var s = Screen(scope: "intro", background: ["bg_base"])
-            s.showsMeters = false
+            s.showsMeters = false; s.maxScale = 1.1 / 3; s.column = false   // its cards never shown much past their size; the logo over them
             let cell = 512.0, gap = 64.0, cols = cards.count == 1 ? 1 : 2, rows = (cards.count + cols - 1) / cols
             for (i, stem) in cards.enumerated() {
                 guard let c = cutFile(stem) else { continue }
@@ -33742,8 +33744,8 @@ enum GameForgeExport {
                 }
                 screens[i].groups.append(GameForge.Group(handle: "jackpots-\(sc)", label: "Jackpot meters"))
             }
-            screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], profile: portrait)
-            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], side: screens[i].side, right: screens[i].right, profile: landscape)
+            screens[i].p = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], maxScale: screens[i].maxScale, profile: portrait)
+            screens[i].l = GameForge.compose(block: screens[i].block, logo: shape, meters: withMeters ? meterShapes : [], side: screens[i].side, right: screens[i].right, maxScale: screens[i].maxScale, column: screens[i].column, profile: landscape)
         }
 
         // The events — pop-ups, celebrations, banners — each a group the game shows over its screen, centred on its reels
