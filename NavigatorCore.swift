@@ -11180,10 +11180,14 @@ public enum GDDSymbolSetRules {
         // Longest first: BWY1 is a bonus WYSIWYG, not a blank that happens to start
         // with B, and DHP a doubled high pay rather than an unknown.
         // WDWY1, a wild carrying a value (Toyota's "Wild+Way"), is a wild before it is a WD-something.
-        ("WDWY", .wild), ("BWY", .wysiwyg), ("DHP", .highPay),
+        // From the older GDDs and the symbol research (2026-10-06): THP/TMP a triple and DMP a doubled mid (a split symbol's
+        // two and three-up versions), WJP a wild that awards a jackpot, PS a progressive jackpot, EW an expanding wild, CO a
+        // coin. A free-games version (FGHP1, FGWD1) is its base code's role — see classify.
+        ("WDWY", .wild), ("BWY", .wysiwyg), ("DHP", .highPay), ("DMP", .mediumPay), ("THP", .highPay), ("TMP", .mediumPay), ("WJP", .wild),
         ("WD", .wild), ("HP", .highPay), ("MP", .mediumPay), ("LP", .lowPay),
         ("SC", .scatter), ("BO", .bonus), ("BN", .bonus), ("JP", .jackpot),
         ("WY", .wysiwyg), ("SF", .collector), ("MU", .multiplier), ("BL", .blank),
+        ("PS", .jackpot), ("EW", .wild), ("CO", .collector),
         ("R", .replacement),
     ]
 
@@ -11193,6 +11197,11 @@ public enum GDDSymbolSetRules {
     /// shown as unclassified and fixed by hand.
     public static func classify(_ code: String) -> (role: SlotSymbolRole, tier: Int?) {
         let up = code.uppercased()
+        // A symbol's free-games version, drawn apart for the bonus round: its base symbol's role.
+        if up.hasPrefix("FG"), up.count > 3 {
+            let base = classify(String(up.dropFirst(2)))
+            if base.role != .unknown { return base }
+        }
         for (p, role) in prefixes where up.hasPrefix(p) {
             let rest = String(up.dropFirst(p.count))
             // "HP" + "1" is a tier; "HP" + "s" is the plural group name, not a tier.
@@ -11568,9 +11577,135 @@ public enum GDDSymbolSetRules {
         for c in [parseIndexedList(gddText),      // "0 WD1 // wild"
                   parseDescribedList(gddText),    // "HP1 - main cowboy, gold frame"
                   parseRows(gddText),             // "0\tWD1\t0\t1\t1"
-                  parseTable(gddText)]            // bare codes in a column
+                  parseTable(gddText),            // bare codes in a column
+                  parseHeadings(gddText)]         // "Copper Kettle (HP1)", "Royals (5)" — older GDDs
         where c.count > best.count { best = c }
         return best
+    }
+
+    /// The code families of the older (Confluence-era) GDDs, read only as headings: M the majors (high pays), D a
+    /// major's split double, B a bonus, LO the logo wild.
+    static let olderFamilies: [(String, SlotSymbolRole)] = [("LO", .wild), ("M", .highPay), ("D", .highPay), ("B", .bonus)]
+    /// What a symbol's own name says it is, for one named with no code, or with a code its role can't be read from.
+    static func role(named name: String) -> SlotSymbolRole? {
+        let n = name.lowercased()
+        for (w, r) in [("wild", SlotSymbolRole.wild), ("scatter", .scatter), ("jackpot", .jackpot), ("free game", .bonus), ("free spin", .bonus),
+                       ("bonus", .bonus), ("multiplier", .multiplier), ("mystery", .replacement), ("collect", .collector)] where n.contains(w) { return r }
+        return nil
+    }
+
+    /// Symbols declared as headings — how the older (Confluence-era) GDDs write their asset breakdown (2026-10-06): a
+    /// line naming one symbol, its description in the lines under it. "HP1", "HP1 Symbol", "MP1 Static Symbol:",
+    /// "Copper Kettle (HP1)", "Bonus Symbol (BO1)", "HP1 (River Otter)", "Marsh Heron - HP2 Symbol", "HP3 - Brass Key"; low-pay
+    /// royals counted ("Royals (5)") or listed under a "Royals" heading (A, K, Q, J on lines of their own); a wild or
+    /// scatter named with no code; and the older code families (olderFamilies). A bulleted line is a description, never
+    /// a heading, and a heading is short: prose that mentions "(HP1)" stays prose.
+    static func parseHeadings(_ gddText: String) -> [SlotSymbol] {
+        // Confluence's exports carry non-breaking spaces and line separators inside headings (" \u{2028}HP1").
+        let lines = gddText.replacingOccurrences(of: "\u{2028}", with: "\n").replacingOccurrences(of: "\u{00A0}", with: " ")
+            .components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+        let code = #"(?:FG)?(?:WDWY|BWY|DHP|DMP|THP|TMP|WJP|HP|MP|LP|WD|SC|BO|BN|JP|SF|MU|WY|PS|EW|CO|M|D|B)\d{1,2}|LO|WD|SC|FGWD"#
+        func match(_ line: String, _ pattern: String) -> [String]? {
+            guard let re = try? NSRegularExpression(pattern: "^" + pattern + "$", options: [.caseInsensitive]),
+                  let m = re.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) else { return nil }
+            return (1..<m.numberOfRanges).map { m.range(at: $0).location == NSNotFound ? "" : String(line[Range(m.range(at: $0), in: line)!]) }
+        }
+        func roleOf(_ c: String, name: String) -> (SlotSymbolRole, Int?) {
+            let (r, t) = classify(c)
+            if r != .unknown { return (r == .collector ? r.refined(byNote: name) : r, t) }
+            for (p, role) in olderFamilies where c.hasPrefix(p) { return (role, Int(c.dropFirst(p.count))) }
+            return (role(named: name) ?? .unknown, nil)
+        }
+        let bullets = CharacterSet(charactersIn: "•◦▪●○■*·-–—")
+        let ranks = ["A": "A", "ACE": "A", "K": "K", "KING": "K", "Q": "Q", "QUEEN": "Q", "J": "J", "JACK": "J", "10": "10", "TEN": "10", "9": "9", "NINE": "9"]
+        var out: [SlotSymbol] = [], seen = Set<String>(), notes: [String: [String]] = [:]
+        var current: String?, lowPays = 0, i = 0
+        func add(_ c: String, _ role: SlotSymbolRole, _ tier: Int?, _ name: String) {
+            let c = c.uppercased()
+            guard !seen.contains(c) else { current = nil; return }
+            seen.insert(c); current = c
+            out.append(SlotSymbol(code: c, index: out.count, role: role, tier: tier, note: name))
+        }
+        while i < lines.count {
+            defer { i += 1 }
+            let raw = lines[i]
+            guard !raw.isEmpty else { continue }
+            // A bulleted or numbered line: a heading only when it is nothing but a symbol ("• River Otter (HP1)", "• BO1"),
+            // otherwise a description of the one above, kept short.
+            let bulleted = raw.unicodeScalars.first.map { bullets.contains($0) } ?? false || raw.range(of: #"^\d{1,2}\s"#, options: .regularExpression) != nil
+            // An index in front of the code ("0 – HP1", "9001 — WD1 (Wild)"), a list's own number ("2 HP3"), and the wild
+            // written WDI — but never the 7 of "7 = HP1", a classic machine's symbol.
+            var line = raw.trimmingCharacters(in: bullets.union(.whitespaces))
+                .replacingOccurrences(of: #"^\d{1,4}\s*[-–—]\s+(?=[A-Za-z])"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"\bWDI\b"#, with: "WD1", options: .regularExpression)
+            if bulleted { line = line.replacingOccurrences(of: #"^\d{1,2}\s+(?=[A-Za-z(])"#, with: "", options: .regularExpression) }
+            line = line.replacingOccurrences(of: #"(?i)\s*(static\s+)?symbol:?$|:$"#, with: "", options: .regularExpression)
+            // Royals: counted, or listed under their heading.
+            if !bulleted, line.count <= 70, let m = match(line, #"(?:royals?|low[- ]pay(?:ing)?(?: symbols)?(?: \(royals\))?|card symbols)\s*(?:\((\d)\))?"#) {
+                var listed: [String] = []
+                var j = i + 1
+                while j < lines.count, listed.count < 7 {
+                    let t = lines[j].trimmingCharacters(in: bullets.union(.whitespaces)).uppercased()
+                    if t.isEmpty { j += 1; continue }
+                    guard let r = ranks[t] else { break }
+                    listed.append(r); j += 1
+                }
+                let n = Int(m[0]) ?? listed.count
+                for k in 0..<n {
+                    lowPays += 1
+                    add("LP\(lowPays)", .lowPay, lowPays, k < listed.count ? "the \(listed[k]) card" : "a card-rank royal")
+                }
+                if !listed.isEmpty { i = j - 1 }
+                current = nil
+                continue
+            }
+            // The symbol named on the line, in any of the ways these documents write one; "HP1/DHP1" names two.
+            // Several on one line: "HP1/DHP1", "WD1, BO1", "BO1 & BO2".
+            let codes = "((?:" + code + #")(?:\s*(?:/|,|&|\band\b)\s*(?:"# + code + "))*)"
+            var found: (codes: String, name: String)?
+            if line.count <= 70, let m = match(line, codes) { found = (m[0], "") }
+            else if line.count <= 70, let m = match(line, #"(.{1,48}?)\s*\("# + codes + #"\)"#) { found = (m[1], m[0]) }
+            else if line.count <= 70, let m = match(line, codes + #"\s*\((.{1,48})\)"#) { found = (m[0], m[1]) }
+            else if line.count <= 70, let m = match(line, #"(.{1,40}?)\s*[-–—]\s*"# + codes + #"(?:\s+symbol)?"#) { found = (m[1], m[0]) }
+            else if let m = match(line, codes + #"(?:\s+symbol)?\s*(?:[-–—:]|\s{2,}|\t)\s*(.*)"#),
+                    !bulleted || m[1].split(separator: " ").count <= 8 { found = (m[0], m[1]) }
+            else if !bulleted, line.count <= 50, let m = match(line, codes + #"\s+([A-Za-z][\w'’ .&]{1,40})"#) { found = (m[0], m[1]) }
+            // A classic machine's asset request: "7 = HP1 (link)", "Bar III = MP1".
+            else if let m = match(line, #"(.{1,30}?)\s*=\s*"# + codes + #"(?:\s.*)?"#) { found = (m[1], m[0]) }
+            else if !bulleted, let m = match(line, #"(wild|scatter)"#) { found = (m[0].lowercased() == "wild" ? "WD" : "SC", m[0].capitalized) }
+            if let f = found {
+                // The name: the description's first phrase.
+                let name = f.name.components(separatedBy: CharacterSet(charactersIn: ".;")).first?.trimmingCharacters(in: .whitespaces) ?? ""
+                var any = false
+                for c in f.codes.replacingOccurrences(of: #"(?i)\s*(,|&|\band\b)\s*"#, with: "/", options: .regularExpression)
+                    .split(separator: "/").map({ $0.trimmingCharacters(in: .whitespaces).uppercased() }) where !c.isEmpty {
+                    let (role, tier) = roleOf(c, name: name)
+                    guard role != .unknown else { continue }
+                    add(c, role, tier, String(name.prefix(120))); any = true
+                }
+                if !any { current = nil }
+                continue
+            }
+            if bulleted {
+                // Not about the symbol above when it opens with another one's code ("• WD1 is wild for all symbols").
+                let other = match(String(line.prefix(6)).components(separatedBy: " ").first ?? "", "(?:" + code + ")") != nil
+                if !other, let c = current, (notes[c]?.count ?? 0) < 3 { notes[c, default: []].append(String(line.prefix(160))) }
+                continue
+            }
+            guard line.count <= 70 || current != nil else { current = nil; continue }
+            // A plain line under a heading describes it — a few of them, the boilerplate left out.
+            if let c = current, (notes[c]?.count ?? 0) < 3,
+               !line.lowercased().hasPrefix("board"), !line.lowercased().hasPrefix("storyboard"), !line.lowercased().hasPrefix("animation"),
+               line.lowercased() != "static", line.count > 3 {
+                notes[c, default: []].append(String(line.prefix(160)))
+            }
+        }
+        // Believed only as a set: a high pay and two others at least, so a stray heading is never a symbol set.
+        guard out.count >= 4, out.contains(where: { $0.role == .highPay }) else { return [] }
+        return out.map { s in
+            let said = ([s.note] + (notes[s.code] ?? [])).filter { !$0.isEmpty }.joined(separator: " — ")
+            return SlotSymbol(code: s.code, index: s.index, role: s.role.refined(byNote: said), tier: s.tier, note: said)
+        }
     }
 
     /// The indexed "Symbol Set" block: "0 WD1 // wild", "1-4 HP1-4 // HPs".

@@ -14217,3 +14217,100 @@ final class GDDScanMergeTests: XCTestCase {
         XCTAssertEqual(m.first { $0.key == "a" }?.symbolCount, 12)
     }
 }
+
+/// The older GDDs' asset breakdowns: a heading per symbol, royals counted or listed, older code families.
+final class OlderSymbolLayoutTests: XCTestCase {
+    func testHeadingsWithNamesAndCodes() {
+        let text = """
+        Visual Asset Breakdown
+        Copper Kettle (HP1)
+        \u{2022}\tspout at the top, steam rising
+        Tin Lantern (HP2)
+        \u{2022}\tglass panes, warm glow
+        HP3 - Brass Key
+        Royals (4)
+        Bonus Trigger (BO1)
+        Wild Symbol (WD1)
+        This paragraph mentions (HP1) in passing and is far too long to be a heading of its own, so it stays prose.
+        """
+        let s = GDDSymbolSetRules.parse(text)
+        XCTAssertEqual(s.map(\.code), ["HP1", "HP2", "HP3", "LP1", "LP2", "LP3", "LP4", "BO1", "WD1"])
+        XCTAssertEqual(s.first?.note, "Copper Kettle — spout at the top, steam rising")
+        XCTAssertEqual(s.first { $0.code == "BO1" }?.role, .bonus)
+        XCTAssertEqual(s.first { $0.code == "WD1" }?.role, .wild)
+        XCTAssertEqual(s.filter { $0.role == .lowPay }.count, 4)
+    }
+    func testBareHeadingsRoyalLettersAndOlderFamilies() {
+        let text = """
+        Asset Breakdown
+        HP1
+        Static Symbol:
+        a paper boat
+        HP2
+        Static Symbol:
+        a folded crane
+        Royals
+        A
+        K
+        Q
+        J
+        Wild
+        Static Symbol:
+        the game's logo
+        """
+        let s = GDDSymbolSetRules.parse(text)
+        XCTAssertEqual(s.map(\.code), ["HP1", "HP2", "LP1", "LP2", "LP3", "LP4", "WD"])
+        XCTAssertEqual(s[0].note, "a paper boat")
+        XCTAssertEqual(s[2].note, "the A card"); XCTAssertEqual(s[5].note, "the J card")
+        let older = """
+        ASSETS OVERVIEW
+        M1
+        M2
+        D1
+        LO (Wild)
+        B1
+        """
+        let o = GDDSymbolSetRules.parse(older)
+        XCTAssertEqual(o.map(\.code), ["M1", "M2", "D1", "LO", "B1"])
+        XCTAssertEqual(o.map(\.role), [.highPay, .highPay, .highPay, .wild, .bonus])
+        XCTAssertEqual(o[1].tier, 2)
+    }
+    func testColonsBulletsPairsAndBareNames() {
+        let text = """
+        Symbols
+        \u{2022}\tRiver Otter (HP1)
+        \u{2022}\tHP2 - Marsh Heron
+        HP3: Old Fisherman- weathered face, oilskin coat, pipe in his teeth and a net over one shoulder that trails down
+        HP4/DHP4 reed basket
+        WD1     WILD SYMBOL with a credit value
+        BO1 Golden Trout
+        \u{2022}\tWD1 is wild for every symbol except the bonus.
+        """
+        let s = GDDSymbolSetRules.parse(text)
+        XCTAssertEqual(s.map(\.code), ["HP1", "HP2", "HP3", "HP4", "DHP4", "WD1", "BO1"])
+        XCTAssertEqual(s[2].note.hasPrefix("Old Fisherman- weathered face"), true)
+        XCTAssertEqual(s.first { $0.code == "BO1" }?.note, "Golden Trout")
+    }
+    func testIndexedLinesAssetRequestsAndHiddenCharacters() {
+        let gaffe = "Reel strips\n\t\u{25E6}\t0 – HP1\n\t\u{25E6}\t1 – HP2\n\t\u{25E6}\t2 – LP1\n\t\u{25E6}\t3 – LP2\n"
+        XCTAssertEqual(GDDSymbolSetRules.parse(gaffe).map(\.code), ["HP1", "HP2", "LP1", "LP2"])
+        let classic = "Asset Requests\n\u{2022}\t7 = HP1 (https://example.com/a)\n\u{2022}\tBar III = MP1 (https://example.com/b)\n\u{2022}\tBar II = MP2\n\u{2022}\tBar I = MP3\n\u{2022}\tWDI = WILD\n"
+        let c = GDDSymbolSetRules.parse(classic)
+        XCTAssertEqual(c.map(\.code), ["HP1", "MP1", "MP2", "MP3"])
+        XCTAssertEqual(c.first?.note, "7")
+        let hidden = "Breakdown\n \u{2028}HP1\u{00A0}(Lantern)\nHP2 (Kite)\nWild (WDI)\nRoyals (2)\n"
+        XCTAssertEqual(GDDSymbolSetRules.parse(hidden).map(\.code), ["HP1", "HP2", "WD1", "LP1", "LP2"])
+    }
+    func testFreeGamesVersionsProgressivesAndListedCodes() {
+        XCTAssertEqual(GDDSymbolSetRules.classify("FGHP2").role, .highPay); XCTAssertEqual(GDDSymbolSetRules.classify("FGHP2").tier, 2)
+        XCTAssertEqual(GDDSymbolSetRules.classify("FGWD1").role, .wild)
+        XCTAssertEqual(GDDSymbolSetRules.classify("PS1").role, .jackpot)
+        XCTAssertEqual(GDDSymbolSetRules.classify("THP3").role, .highPay); XCTAssertEqual(GDDSymbolSetRules.classify("DMP1").role, .mediumPay)
+        XCTAssertEqual(GDDSymbolSetRules.classify("FG").role, .unknown)
+        let text = "Game Breakdown\nHP1 (Fox)\nHP2 (Owl)\n\u{2022}\tWD1, BO1\nGrand Progressive (PS1)\n"
+        XCTAssertEqual(GDDSymbolSetRules.parse(text).map(\.code), ["HP1", "HP2", "WD1", "BO1", "PS1"])
+    }
+    func testAStrayHeadingIsNoSet() {
+        XCTAssertTrue(GDDSymbolSetRules.parseHeadings("Intro\nHP1\nSome prose about the game.\nMore prose.").isEmpty)
+    }
+}
