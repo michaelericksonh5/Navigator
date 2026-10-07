@@ -10564,7 +10564,10 @@ public enum Localized {
 /// state (4 of 10 games, signalled by any landing or collecting special) and every background's landscape twin
 /// (10 of 10 older games ship one; GameForge's landscape is 4608x2532, drawn here at its shape within GPT's limits).
 public enum Derived {
-    public static let landscape = (w: 2912, h: 1600)
+    /// GPT Image's largest at Game Forge's landscape shape (8 MP, about 4K UHD), shown enlarged 21%. Asked at 2912×1600
+    /// it was enlarged 58%; brought to 4K by Nano Banana Pro it came back softer than that enlarged (2026-10-06: two
+    /// of four backgrounds lost detail, the stars thinned, every one warmer) — a redraw, not more of the drawing.
+    public static let landscape = (w: 3808, h: 2096)
     /// A cut-out with any glow round it taken off: the cut kept only where Apple's subject lifting (Vision's foreground
     /// mask, run on the drawing on its backing, `source`) finds the symbol. The studio's jackpot coins carry no glow
     /// (2026-10-05). A glow keys nearly opaque and fades into the coin's own rim, so neither alpha nor edges tell them apart;

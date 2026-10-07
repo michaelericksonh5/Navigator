@@ -26826,11 +26826,8 @@ final class GDDToAssetsRun: ObservableObject {
                 }
                 items.append(AssetChecklist.Item(group: "Pick bonus", name: "jackpot_interface_bezel", what: "the pick panel: the base bezel round the pick grid, the reel texture inside", files: ["jackpot_interface_bezel_rmbg.png", "jackpot_interface_reelTexture_rmbg.png"], maker: "Pick bonus", cost: 0))
             }
-            // Drawn by GPT, then brought to 4K by Nano Banana Pro: one drawn before that costs only the 4K.
             for j in jobs where j.kind == .background {
-                let n = Derived.landscapeName(j.id), drawn = lastFolder.map { FileManager.default.fileExists(atPath: $0.appendingPathComponent("\(n).png").path) } ?? false
-                items.append(AssetChecklist.Item(group: "Landscape", name: n, what: "\(j.title), landscape, at 4K", files: ["\(n).png"], maker: "Landscape",
-                                                 cost: (drawn ? 0 : AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)) + nbEstimatedCost(size: "4K", modelFlag: vertexUpscaleModelFlag)))
+                items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
             }
             // Phase 3: each lettered piece in the languages chosen — a word with no approved translation flagged, not drawn;
             // the same words as the English copied, free; a wheel's wedge lettered in code, free.
@@ -26848,9 +26845,7 @@ final class GDDToAssetsRun: ObservableObject {
             }
         }
         let fm = FileManager.default
-        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) }
-            // A landscape background is made once it is at 4K.
-            && (i.group != "Landscape" || i.files.allSatisfy { imagePixelSize(f.appendingPathComponent($0)).map { VertexUpscaleRules.isPointless(longEdge: $0.w) } ?? false }) } ?? false) }
+        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) } } ?? false) }
     }
 
     /// Gemini reads the GDD for every other static piece the game needs (ConceptPlan) — meters, collection
@@ -27612,25 +27607,12 @@ final class GDDToAssetsRun: ObservableObject {
             both(px, w, side, "\(j.id)_train")
             for k in 0..<parts { both(FrameKit.crop(px, width: w, k * side, 0, side, side).px, side, side, "\(j.id)_train\(k + 1)") }
         }
-        // 11. Every background's landscape twin, the same scene widened (Derived), then brought to 4K by Nano Banana Pro
-        // (Vertex): GPT draws no more than 3840 a side, and Game Forge shows a landscape background at 4608×2532.
-        for j in jobs where j.kind == .background {
-            let name = Derived.landscapeName(j.id), file = url("\(name).png")
-            if !has("\(name).png"), let bgPNG = try? Data(contentsOf: url("\(j.id).png")) {
-                let (w, h) = Derived.landscape
-                if let px = paint(name, prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
-                                  inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(name).png") }
-            }
-            guard wanted("\(name).png"), let size = imagePixelSize(file), !VertexUpscaleRules.isPointless(longEdge: size.w) else { continue }
-            if let budget, cost + nbEstimatedCost(size: "4K", modelFlag: vertexUpscaleModelFlag) > budget {
-                if !problems.contains(where: { $0.hasPrefix("stopped at the budget") }) { problems.append(String(format: "stopped at the budget of $%.2f: what is not drawn yet is drawn by the next run", budget)) }
-                continue
-            }
-            let r = runRestyle(source: file, prompt: VertexUpscaleRules.prompt(transparent: false), modelFlag: vertexUpscaleModelFlag,
-                               aspect: "auto", size: "4K", modeLabel: "Upscale (Nano Banana Pro) 4K")
-            cost += r.cost ?? 0
-            if let saved = r.saved, (try? fm.replaceItemAt(file, withItemAt: saved)) != nil { log.write("prompts/\(name)-4K.txt", "MODE: \(name) (Nano Banana Pro) 4K\n\n" + VertexUpscaleRules.prompt(transparent: false)) }
-            else { problems.append("\(name) is \(size.w)×\(size.h), not brought to 4K: \(r.error ?? "it could not be saved")") }
+        // 11. Every background's landscape twin, the same scene widened (Derived).
+        for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {
+            guard let bgPNG = try? Data(contentsOf: url("\(j.id).png")) else { continue }
+            let (w, h) = Derived.landscape
+            if let px = paint(Derived.landscapeName(j.id), prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
+                              inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(Derived.landscapeName(j.id)).png") }
         }
         // 12. Phase 3: the lettered pieces in the languages chosen (Localized), every word from the art-words table. A word
         // with no approved translation is flagged and listed for the localization team, never drawn; a piece whose words are
