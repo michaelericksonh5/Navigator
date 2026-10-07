@@ -9753,12 +9753,15 @@ public enum ArtWords {
     super boost awarded!	pt-br	super-reforço concedido
     continue	pt	continuar
     power bet	pt	Power Bet
+    bonus games awarded!	pt	Jogos Grátis Atribuídos!
     bonus games	pt	jogos grátis
     multiplier	pt	multiplicador
+    credits	pt	Créditos
     wild	pt	wild
     scatter	pt	scatter
     bonus	pt	bónus
     jackpot	pt	jackpot
+    awarded!	pt	atribuídos!
     loot link	pt	Loot Link
     jackpot	pt	jackpot
     continue	de	FORTFAHREN
@@ -10077,8 +10080,9 @@ public enum ArtWords {
     bonus games awarded!	sk	ZÍSKALI STE BEZPLATNÉ HRY!
     bonus games complete	sk	BEZPLATNÉ HRY DOKONČENÉ
     one more chance	sk	POSLEDNÁ ŠANCA
+    jackpots	sk	Jackpots
     bonus games	sk	BONUSOVÉ HRY
-    multiplier	sk	Násobiteľ
+    multiplier	sk	Multiplikátor
     wild	sk	WILD
     scatter	sk	SCATTER
     bonus	sk	Bonus
@@ -10109,7 +10113,7 @@ public enum ArtWords {
     bonus games complete	ro	JOCURI GRATUITE FINALIZATE
     one more chance	ro	ÎNCĂ O ȘANSĂ
     bonus wheel	ro	Bonus Wheel
-    jackpots	ro	Jackpots
+    jackpots	ro	jackpoturi
     bonus games	ro	JOCURI BONUS
     multiplier	ro	Multiplicator
     credits	ro	Credite
@@ -10144,8 +10148,10 @@ public enum ArtWords {
     bonus games awarded!	pl	PRZYZNANO DARMOWE GRY
     bonus games complete	pl	DARMOWE GRY UKOŃCZONE
     one more chance	pl	DODATKOWA SZANSA
+    jackpots	pl	Jackpots
     bonus games	pl	DARMOWE GRY
     multiplier	pl	Mnożnik
+    credits	pl	Kredyty
     wild	pl	WILD
     scatter	pl	SCATTER
     bonus	pl	Bonus
@@ -10175,8 +10181,12 @@ public enum ArtWords {
     bonus games awarded!	no	GRATISSPILL TILDELT!
     bonus games complete	no	GRATISSPILL FULLFØRT
     one more chance	no	ÉN SJANSE TIL
+    jackpots	no	Jackpots
     bonus games	no	BONUSSPILL
     multiplier	no	Multiplikator
+    credits	no	Kreditter
+    wilds	no	Wilds
+    respins	no	Respins
     wild	no	WILD
     scatter	no	SCATTER
     bonus	no	Bonus
@@ -10207,10 +10217,11 @@ public enum ArtWords {
     one more chance	fi	VIELÄ YKSI MAHDOLLISUUS
     bonus games	fi	BONUSPELEJÄ
     multiplier	fi	kerroin
+    credits	fi	krediittiä
     wild	fi	WILD
     scatter	fi	SCATTER
     bonus	fi	bonus
-    jackpot	fi	jättipotti
+    jackpot	fi	JACKPOT
     awarded!	fi	ANNETTU!
     grand	fi	VALTAVA
     mega	fi	MEGA
@@ -10226,7 +10237,7 @@ public enum ArtWords {
     super win!	fi	SUPERVOITTO!
     ultra win!	fi	ULTRAVOITTO!
     loot link	fi	Loot Link
-    jackpot	fi	jättipotti
+    jackpot	fi	JACKPOT
     continue	el	ΣΥΝΕΧΕΙΑ
     play now!	el	ΠΑΙΞΤΕ ΤΩΡΑ!
     power bet	el	Power Bet
@@ -10306,12 +10317,14 @@ public enum ArtWords {
     bonus games awarded!	bg	СПЕЧЕЛЕНИ БЕЗПЛАТНИ ИГРИ!
     bonus games complete	bg	БЕЗПЛАТНИ ИГРИ ЗАВЪРШЕНИ
     one more chance	bg	ОЩЕ ЕДИН ШАНС
+    jackpots	bg	Jackpots
     bonus games	bg	БОНУС ИГРИ
     multiplier	bg	Множител
+    credits	bg	кредити
     wild	bg	WILD
-    scatter	bg	SCATTER
+    scatter	bg	СКАТЕР
     bonus	bg	бонус
-    jackpot	bg	ДЖАКПОТ
+    jackpot	bg	JACKPOT
     awarded!	bg	НАГРАДЕНО!
     grand	bg	ГЛАВЕН
     mega	bg	МЕГА
@@ -10327,7 +10340,7 @@ public enum ArtWords {
     super win!	bg	СУПЕР ПЕЧАЛБА!
     ultra win!	bg	СВРЪХ ПЕЧАЛБА!
     loot link	bg	Loot Link
-    jackpot	bg	ДЖАКПОТ
+    jackpot	bg	JACKPOT
     continue	nl	DOORGAAN
     play now!	nl	SPEEL NU!
     power bet	nl	Power Bet
