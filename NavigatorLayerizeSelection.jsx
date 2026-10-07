@@ -27,22 +27,21 @@
  * roughly 2-3 minutes, so about 2-3 cents. Photoshop is frozen while curl runs — that is unavoidable
  * in ExtendScript, which is single-threaded.
  *
- * KEY: looked for in a FAL_KEY environment variable, then ~/.claude/settings.json -> env.FAL_KEY
- * (present on machines with the H5G plugins), then this script's own prefs file. If none of those
- * has one, it asks and remembers the answer. The key is NEVER written into this file — the script is
+ * KEY: the key entered into this script comes first (its own prefs file). Without one it falls back
+ * to a FAL_KEY environment variable, then ~/.claude/settings.json -> env.FAL_KEY (present on
+ * machines with the H5G plugins). If none of those has one, it asks and remembers the answer. The key is NEVER written into this file — the script is
  * meant to be passed around, and the key must not travel with it.
  *
  * TO SHARE THIS: send the .jsx on its own. The recipient runs it, is asked for a fal.ai key once,
  * and it is saved to their own machine at Folder.userData/Navigator/fal_key.txt.
  *
- * TO REPLACE A SAVED KEY: hold Option while starting the script. A stored key is otherwise never
- * questioned again, so a rotated or mistyped-but-valid-looking one would need the file deleted by
- * hand.
+ * TO REPLACE THE KEY: hold Option (Alt on Windows) while starting the script, or use Connections >
+ * Set key. The key entered there is used ahead of any FAL_KEY or settings.json key.
  *
  * CONNECTIONS: the dialog has a Connections button. It shows where the fal.ai key came from and
  * lets you set or forget one, and it shows whether Vertex is signed in and can start that sign-in.
- * Claude's own settings are tried FIRST for both, so a machine with the H5G plugins needs nothing;
- * these controls exist for machines without them.
+ * For fal, the key entered here wins and Claude's settings.json is the backup, so a machine with the
+ * H5G plugins still needs nothing. For Vertex, Claude's own sign-in is the only source.
  *
  * THE LOG: every run writes a plain-text log to Documents/Navigator Layerize Logs, and its path is
  * in the final message. It records the document's layers, exactly what was sent (including whether
@@ -296,11 +295,14 @@ function curl(args) {
 
 // ---------------------------------------------------------------- the fal.ai key
 //
-// Looked for in three places, in order, so an H5G machine that already has one needs no setup and
-// anyone else is asked once:
-//   1. a FAL_KEY environment variable
-//   2. ~/.claude/settings.json -> env.FAL_KEY   (shared by the H5G plugins; absent without them)
-//   3. this script's own prefs file, written by the setup dialog below
+// Looked for in three places, in order. The key entered into this script always wins; the others
+// are backups, so an H5G machine that already has one needs no setup and anyone else is asked once:
+//   1. this script's own prefs file, written by the setup dialog below
+//   2. a FAL_KEY environment variable
+//   3. ~/.claude/settings.json -> env.FAL_KEY   (shared by the H5G plugins; absent without them)
+//
+// The order matters when a key goes bad: a key typed here must beat a stale one in settings.json,
+// or the person has no way to replace it from Photoshop.
 //
 // The key is NEVER written into this .jsx. The script gets passed around; the key must not travel
 // with it.
@@ -352,7 +354,7 @@ function askForKey() {
     var how = w.add("statictext", undefined,
         "1.  Sign in at  fal.ai/dashboard/keys\n" +
         "2.  Create an API key and copy it\n" +
-        "3.  Paste it below \u2014 it is saved on this Mac only, in\n" +
+        "3.  Paste it below \u2014 it is saved on this computer only, in\n" +
         "     " + Folder.userData.fsName + "/Navigator/fal_key.txt\n\n" +
         "It is never written into this script, so the script is safe to share.",
         { multiline: true });
@@ -362,7 +364,7 @@ function askForKey() {
     field.preferredSize = [430, 24];
     var note = w.add("statictext", undefined,
         "At High 5 a key may already be set up \u2014 Cancel and ask, rather than making a second one.\n" +
-        "To replace this key later, hold Option while starting the script.",
+        "To replace this key later, hold Option (Alt on Windows) while starting the script.",
         { multiline: true });
     note.preferredSize = [430, 30];
     note.graphics.font = ScriptUI.newFont(note.graphics.font.name, "italic", 10);
@@ -391,21 +393,34 @@ function optionKeyHeld() {
     try { return ScriptUI.environment.keyboardState.altKey === true; } catch (e) { return false; }
 }
 
+/// The first key found, and where it came from. The one place that decides the order.
+var SAVED_KEY_SOURCE = "this script's saved key";
+function findFalKey() {
+    var k = readStoredKey();
+    if (k) { return { key: k, source: SAVED_KEY_SOURCE }; }
+    k = $.getenv("FAL_KEY");
+    if (k) { return { key: k, source: "the FAL_KEY environment variable" }; }
+    k = readClaudeSettingsKey();
+    if (k) { return { key: k, source: "Claude's settings.json" }; }
+    return null;
+}
+
+/// Where the key used for this run came from; the rejection message names it.
+var FAL_KEY_SOURCE = null;
+
 /// The key, from whichever source has one. Prompts as a last resort, or on demand.
 function falKey() {
-    // Hold Option while launching the script to replace a saved key.
-    if (optionKeyHeld() && readStoredKey() !== null) {
+    // Hold Option/Alt while launching the script to enter a different key, whatever is set now.
+    if (optionKeyHeld()) {
         var replaced = askForKey();
-        if (replaced !== null) { return replaced; }
+        if (replaced !== null) { FAL_KEY_SOURCE = SAVED_KEY_SOURCE; return replaced; }
         // Cancelled out of the change dialog — carry on with what was already there.
     }
-    var k = $.getenv("FAL_KEY");
-    if (k) { return k; }
-    k = readClaudeSettingsKey();
-    if (k) { return k; }
-    k = readStoredKey();
-    if (k) { return k; }
-    return askForKey();
+    var found = findFalKey();
+    if (found !== null) { FAL_KEY_SOURCE = found.source; return found.key; }
+    var typed = askForKey();
+    FAL_KEY_SOURCE = (typed === null) ? null : SAVED_KEY_SOURCE;
+    return typed;
 }
 
 /// Wipe a stored key that the server rejected, so the next run asks again instead of failing the
@@ -547,8 +562,8 @@ var PLAN_SYSTEM_PROMPT =
 // something is already missing. There was previously no way at all to sign in to Vertex, and the
 // only way to change a fal key was a keyboard trick nobody would find.
 //
-// Claude's own settings are still tried FIRST for both, so a machine with the H5G plugins needs no
-// setup whatsoever. These controls are the fallback for a machine without them.
+// For fal, the key set here comes first and Claude's settings.json is only the backup, so a bad key
+// in settings.json can always be overridden from this dialog.
 
 /// Where node lives.
 ///
@@ -675,10 +690,8 @@ function resolveH5GClient() {
 
 /// Which source the fal key came from, without revealing the key itself.
 function falKeySource() {
-    if ($.getenv("FAL_KEY")) { return "the FAL_KEY environment variable"; }
-    if (readClaudeSettingsKey()) { return "Claude's settings.json"; }
-    if (readStoredKey()) { return "this script's saved key"; }
-    return null;
+    var found = findFalKey();
+    return (found === null) ? null : found.source;
 }
 
 /// Open the Vertex sign-in in a Terminal window, because the flow is a browser round trip that
@@ -1412,10 +1425,18 @@ function layerizeOnce(imageRef, key, promptText, tier) {
         var msg = (d instanceof Array && d.length && d[0].msg) ? d[0].msg : String(d);
         // A rejected key must not be kept, or every future run fails the same way with no way out.
         if (/unauthor|forbidden|invalid.*key|authentication/i.test(msg)) {
-            forgetStoredKey();
+            if (FAL_KEY_SOURCE === SAVED_KEY_SOURCE) {
+                forgetStoredKey();
+                return { layers: null, body: String(resp), fatal: true,
+                         error: msg + "\n\nfal rejected this script's saved key, so it has been " +
+                                "forgotten. Run the script again to enter a different one." };
+            }
+            // Not ours to delete. A key entered here is used ahead of it, so point at that.
             return { layers: null, body: String(resp), fatal: true,
-                     error: msg + "\n\nThat key was rejected, so it has been forgotten. " +
-                            "Run the script again to enter a different one." };
+                     error: msg + "\n\nfal rejected the key from " + (FAL_KEY_SOURCE || "this computer") + ". " +
+                            "Click Connections > Set key (or run the script again holding " +
+                            "Option, or Alt on Windows) and paste a working key. A key entered " +
+                            "there is used ahead of any other key." };
         }
         return { layers: null, body: String(resp), fatal: false, error: explainRefusal(msg) };
     }
@@ -1440,6 +1461,10 @@ function explainRefusal(msg) {
     }
     if (/image_size|resolution|too small|too large/i.test(m)) {
         return m + "\n\nThat is about the size sent. Try selecting a larger or smaller area.";
+    }
+    if (/balance|locked|billing|credit/i.test(m)) {
+        return m + "\n\nThe fal.ai account behind this key has no credit left. Top it up at " +
+               "fal.ai/dashboard/billing, or use the team key (Connections > Set key).";
     }
     if (/safety|nsfw|flagged/i.test(m)) {
         return m + "\n\nfal's safety checker refused this image; retrying will not change it.";
