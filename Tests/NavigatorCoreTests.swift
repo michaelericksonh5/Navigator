@@ -13796,6 +13796,10 @@ final class ReadabilityTests: XCTestCase {
         XCTAssertEqual(ArtWords.word("ONE MORE\nCHANCE", lang: "fr"), "ENCORE UNE CHANCE")      // stored as a shout, lettered without
         XCTAssertEqual(ArtWords.word("GOT IT!", lang: "en"), "GOT IT!")
         XCTAssertNil(ArtWords.word("GOT IT!", lang: "fr"))
+        // English never says "free"; the other languages may, from the dictionaries' "free games" phrases.
+        XCTAssertEqual(ArtWords.word("BONUS GAMES AWARDED!", lang: "de"), "GRATISSPIELE ERHALTEN!")
+        XCTAssertEqual(ArtWords.word("BONUS GAMES AWARDED!", lang: "en"), "BONUS GAMES AWARDED!")
+        XCTAssertEqual(Localized.codes.dropFirst().filter { ArtWords.word("BONUS GAMES COMPLETE", lang: $0) == nil }, ["pt"])   // pt's dictionary has neither wording
         XCTAssertTrue(ArtWords.table.values.allSatisfy { $0.values.allSatisfy { !$0.isEmpty && !$0.contains("\u{200F}") } })
         XCTAssertTrue(Localized.codes.allSatisfy { ArtWords.word("CONTINUE", lang: $0) != nil })
         let cellW = 40, h = 50, n = NumberFont.glyphs.count

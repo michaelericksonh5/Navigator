@@ -12,7 +12,7 @@ import json, os, re, sys, unicodedata
 
 LANGS = ["fr", "es", "pt-br", "pt", "de", "it", "tr", "ru", "zh-cn", "zh-hk", "da", "sv", "sk", "ro", "pl", "no", "fi", "el",
          "cs", "bg", "nl", "ko", "ja"]
-FILE_CODE = {"pt-br": "pt-BR", "zh-cn": "zh-CN", "zh-hk": "zh-HK"}
+FILE_CODE = {"pt-br": "pt-BR", "zh-cn": "zh-CN", "zh-hk": "zh-HK", "es": "es-AR"}   # the studio's shipped Spanish art is Argentine Spanish
 
 # Every word Navigator letters (PopUps, StandardPieces, wheels, pot plaques, the jackpot table, symbol words, feature cards).
 TIERS = ["grand", "mega", "major", "minor", "mini", "micro"]
@@ -33,10 +33,15 @@ def clean(s):
     return re.sub(r"\s+", " ", s).strip()
 
 def lookup(terms, en):
-    if clean(terms.get(en, "")):
-        return clean(terms[en])
-    if not en.endswith("!") and clean(terms.get(en + "!", "")):  # kept as a shout: "one more chance!" for ONE MORE CHANCE
-        return clean(terms[en + "!"]).rstrip("!！ \u00a0") or None
+    # Navigator's English never says "free" (production says "bonus games"); the other languages may, so a
+    # "bonus games" phrase the dictionaries have only in their "free games" wording takes that.
+    for key in [en] + ([en.replace("bonus games", "free games")] if "bonus games" in en else []):
+        if clean(terms.get(key, "")):
+            return clean(terms[key])
+        if not key.endswith("!") and clean(terms.get(key + "!", "")):  # kept as a shout: "one more chance!" for ONE MORE CHANCE
+            return clean(terms[key + "!"]).rstrip("!\uff01 \u00a0") or None
+        if key.endswith("!") and clean(terms.get(key[:-1], "")):  # written without the shout: "free games awarded"
+            return clean(terms[key[:-1]])
     return None
 
 def main(folder):
