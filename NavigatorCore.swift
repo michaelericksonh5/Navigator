@@ -9677,13 +9677,13 @@ public enum ArtWords {
     power bet	es	Power Bet
     on	es	activado
     off	es	desactivado
-    total win	es	ganancia total
+    total win	es	premio total
     bonus games awarded!	es	juegos gratis otorgados
     bonus games complete	es	juegos gratis completados
     one more chance	es	¡una oportunidad más
     bonus wheel	es	Bonus Wheel
     jackpots	es	Jackpots
-    bonus games	es	juegos bonus
+    bonus games	es	Juegos Gratis
     multiplier	es	multiplicador
     credits	es	créditos
     wilds	es	Wilds
@@ -9695,6 +9695,7 @@ public enum ArtWords {
     jackpot	es	jackpot
     awarded!	es	¡otorgados!
     grand	es	máximo
+    mega	es	Mega
     major	es	mayor
     minor	es	menor
     mini	es	mini
@@ -9744,7 +9745,7 @@ public enum ArtWords {
     you've won the mini jackpot	pt-br	você ganhou o mini jackpot
     big win!	pt-br	grande ganho!
     super win!	pt-br	super ganho!
-    mega win!	pt-br	mega ganho!
+    mega win!	pt-br	MEGA PRÊMIO!
     huge win!	pt-br	ganho enorme!
     ultra win!	pt-br	ultra ganho!
     loot link	pt-br	Loot Link
@@ -9757,6 +9758,7 @@ public enum ArtWords {
     bonus games	pt	jogos grátis
     multiplier	pt	multiplicador
     credits	pt	Créditos
+    wilds	pt	Wilds
     wild	pt	wild
     scatter	pt	scatter
     bonus	pt	bónus
@@ -9775,9 +9777,9 @@ public enum ArtWords {
     one more chance	de	NOCH EINE CHANCE
     bonus wheel	de	Bonus Wheel
     jackpots	de	CASHPOTS
-    bonus games	de	BONUSSPIELE
+    bonus games	de	Gratisspiele
     multiplier	de	MULTIPLIKATOR
-    credits	de	Guthabenpunkte
+    credits	de	Credits
     wilds	de	Wilds
     respins	de	Neudrehs
     collect	de	SAMMELN
@@ -9811,10 +9813,10 @@ public enum ArtWords {
     total win	it	vincita totale
     bonus games awarded!	it	giocate gratis assegnate
     bonus games complete	it	giocate gratis completate
-    one more chance	it	un'altra chance
+    one more chance	it	UN'ALTRA POSSIBILITÀ
     bonus wheel	it	Bonus Wheel
     jackpots	it	jackpot
-    bonus games	it	partite bonus
+    bonus games	it	Giocate gratis
     multiplier	it	moltiplicatore
     credits	it	crediti
     wilds	it	wild
@@ -9850,12 +9852,12 @@ public enum ArtWords {
     on	tr	AÇIK
     off	tr	KAPALI
     total win	tr	TOPLAM KAZANÇ
-    bonus games awarded!	tr	ÜCRETSİZ OYUNLAR VERİLDİ!
+    bonus games awarded!	tr	Verilen Ücretsiz Oyunlar!
     bonus games complete	tr	ÜCRETSİZ OYUNLAR TAMAMLANDI
     one more chance	tr	BİR ŞANS DAHA
     bonus wheel	tr	Bonus Wheel
     jackpots	tr	Jackpots
-    bonus games	tr	BONUS OYUN
+    bonus games	tr	Ücretsiz Oyunlar
     multiplier	tr	ÇARPAN
     credits	tr	kredi
     respins	tr	tekrar çevirme
@@ -9893,7 +9895,7 @@ public enum ArtWords {
     one more chance	ru	ЕЩЕ ОДИН ШАНС
     bonus wheel	ru	Bonus Wheel
     jackpots	ru	Jackpots
-    bonus games	ru	БОНУСНЫЕ ИГРЫ
+    bonus games	ru	Бесплатные игры
     multiplier	ru	Множитель
     credits	ru	кредиты
     wilds	ru	WILD
@@ -9934,6 +9936,7 @@ public enum ArtWords {
     bonus games	zh-cn	奖励游戏
     multiplier	zh-cn	奖赏倍数
     credits	zh-cn	金额
+    wilds	zh-cn	Wilds
     respins	zh-cn	重新旋转
     wild	zh-cn	百搭
     scatter	zh-cn	分散
@@ -9971,6 +9974,7 @@ public enum ArtWords {
     bonus games	zh-hk	獎勵遊戲
     multiplier	zh-hk	加倍派彩
     credits	zh-hk	可用金額
+    wilds	zh-hk	Wilds
     respins	zh-hk	重新旋轉
     wild	zh-hk	百搭
     scatter	zh-hk	SCATTER
@@ -10002,7 +10006,7 @@ public enum ArtWords {
     total win	da	SAMLET GEVINST
     bonus games awarded!	da	GRATIS SPIL TILDELT!
     bonus games complete	da	GRATIS SPIL GENNEMFØRT
-    one more chance	da	EN CHANCE TIL
+    one more chance	da	EN CHANCE MERE
     bonus wheel	da	Bonus Wheel
     jackpots	da	Jackpots
     bonus games	da	BONUSSPIL
@@ -10083,6 +10087,9 @@ public enum ArtWords {
     jackpots	sk	Jackpots
     bonus games	sk	BONUSOVÉ HRY
     multiplier	sk	Multiplikátor
+    credits	sk	kredity
+    wilds	sk	Wilds
+    respins	sk	Respins
     wild	sk	WILD
     scatter	sk	SCATTER
     bonus	sk	Bonus
@@ -10117,7 +10124,7 @@ public enum ArtWords {
     bonus games	ro	JOCURI BONUS
     multiplier	ro	Multiplicator
     credits	ro	Credite
-    wild	ro	SIMBOL WILD
+    wild	ro	WILD
     scatter	ro	SCATTER
     bonus	ro	Bonus
     jackpot	ro	Jackpot
@@ -10215,6 +10222,7 @@ public enum ArtWords {
     bonus games awarded!	fi	ILMAISPELEJÄ ANNETTU!
     bonus games complete	fi	ILMAISPELIT PELATTU
     one more chance	fi	VIELÄ YKSI MAHDOLLISUUS
+    jackpots	fi	Jackpots
     bonus games	fi	BONUSPELEJÄ
     multiplier	fi	kerroin
     credits	fi	krediittiä
@@ -10272,7 +10280,7 @@ public enum ArtWords {
     you've won the mini jackpot	el	Κερδίσατε το ΜΙΝΙ JACKPOT
     big win!	el	ΜΕΓΑΛΟ ΚΕΡΔΟΣ!
     super win!	el	ΣΟΥΠΕΡ ΚΕΡΔΟΣ!
-    mega win!	el	ΜΕΓΑ ΚΕΡΔΟΣ!
+    mega win!	el	ΠΟΛΥ ΜΕΓΑΛΟ ΚΕΡΔΟΣ!
     huge win!	el	ΤΕΡΑΣΤΙΟ ΚΕΡΔΟΣ!
     ultra win!	el	ΥΠΕΡ-ΚΕΡΔΟΣ!
     loot link	el	Loot Link
@@ -10283,11 +10291,12 @@ public enum ArtWords {
     on	cs	ZAPNUTO
     off	cs	VYPNUTO
     total win	cs	CELKOVÁ VÝHRA
-    bonus games awarded!	cs	ZÍSKALI JSTE HRY ZDARMA!
+    bonus games awarded!	cs	Uděleny Hry Zdarma!
     bonus games complete	cs	HRY ZDARMA DOKONČENY
     one more chance	cs	JEŠTĚ JEDNA ŠANCE
     bonus games	cs	BONUSOVÉ HRY
     multiplier	cs	Násobitel
+    credits	cs	kredity
     wild	cs	WILD
     scatter	cs	SCATTER
     bonus	cs	Bonus
@@ -10321,8 +10330,9 @@ public enum ArtWords {
     bonus games	bg	БОНУС ИГРИ
     multiplier	bg	Множител
     credits	bg	кредити
+    wilds	bg	Wilds
     wild	bg	WILD
-    scatter	bg	СКАТЕР
+    scatter	bg	SCATTER
     bonus	bg	бонус
     jackpot	bg	JACKPOT
     awarded!	bg	НАГРАДЕНО!
@@ -10425,7 +10435,7 @@ public enum ArtWords {
     total win	ja	合計賞金
     bonus games awarded!	ja	フリーゲーム獲得！
     bonus games complete	ja	フリーゲーム終了
-    one more chance	ja	もう一回チャンス
+    one more chance	ja	ワン・モア・チャンス
     bonus wheel	ja	Bonus Wheel
     jackpots	ja	ジャックポット
     bonus games	ja	ボーナスゲーム
