@@ -551,10 +551,105 @@ var PLAN_SYSTEM_PROMPT =
     "  \"kind\": \"<what this image is, short>\",\n" +
     "  \"options\": [\n" +
     "    {\"label\": \"<3-5 words>\", \"job\": \"structure|extract|animate|parallax|inventory\",\n" +
-    "     \"why\": \"<one short line>\", \"elements\": [\"...\"], \"warning\": \"<optional>\"}\n" +
+    "     \"why\": \"<one short line>\", \"elements\": [{\"name\": \"...\", \"detail\": \"\"}],\n" +
+    "     \"warning\": \"<optional, else empty>\"}\n" +
     "  ]\n" +
     "}\n" +
     "Order options best-first for this image.";
+
+/// The brief for "Spine animation (2.5D)". It follows the decomposition rules of the
+/// spine-2-0-skills flat-image-to-spine workflow: parts are chosen by how they MOVE, and every part
+/// carries a sentence telling layerize where it is, what to leave out and what hidden area to paint
+/// in, because layerize only completes covered areas when it is told to.
+var PLAN_SPINE_PROMPT =
+    "You plan how to split a flat 2D game-art image into layers that a Spine animator will rig\n" +
+    "for 2.5D animation: idle, land and win loops with head turns, blinks, breathing, jaw and\n" +
+    "limb swings, hair, cloth and flame sway, and glow pulses.\n\n" +
+    "HOW THE SPLITTING TOOL WORKS:\n" +
+    "- It returns a BASE image plus AT MOST 16 named parts. Anything not named stays in the\n" +
+    "  base, which is the bottom layer and is always returned.\n" +
+    "- It paints in areas hidden behind a part ONLY when told to. Each part's detail must say\n" +
+    "  what to complete, or the animator gets holes when parts move.\n\n" +
+    "CHOOSE PARTS BY MOTION, NOT BY ANATOMY:\n" +
+    "- A part gets its own layer only when it must move, rotate, deform, hide or change stacking\n" +
+    "  order differently from what it touches. Things that always move together stay together.\n" +
+    "- Cut where the part pivots (neck, jaw hinge, shoulder, elbow, tail root, tassel cord) and\n" +
+    "  ask for a little overlap past the joint so it does not gap when rotated.\n" +
+    "- Left and right are always separate parts. Near and far limbs (in front of the body or\n" +
+    "  behind it) are separate parts, named near/far.\n" +
+    "- Faces: for a head that should turn or emote, separate each eye, the brows, the mouth or\n" +
+    "  jaw, and keep the face itself with those areas painted in as plain surface underneath.\n" +
+    "- Hair, manes, whiskers, beards, capes, ribbons, tassels, tails, fins and flames: separate\n" +
+    "  the pieces that should sway; split a long one into root and tip only if it bends.\n" +
+    "- Glows, rays, auras and loose flames floating beside the subject: their own FX layers, so\n" +
+    "  they can pulse or hide. NOT highlights or glints painted onto a surface: they cannot be\n" +
+    "  lifted off and come back empty; the animator adds shine in Spine instead.\n" +
+    "- A held or attached prop (weapon, coin, gem, pot lid) is separate from what holds it.\n" +
+    "- Rigid decoration that never moves on its own (a gem set in a medallion or armour,\n" +
+    "  patterns, engraving) stays with its surface, even for a gleam: lifting it leaves a hole\n" +
+    "  the tool does not reliably fill. A fixed frame or backing is one layer, or stays in the base.\n" +
+    "- A rigid object (fan, drum, ingot) needs few parts: only what swings, opens or glows.\n" +
+    "- If the image is a scene rather than one subject, plan depth bands and moving props.\n\n" +
+    "PICK ONE LEVEL PER THING: never list a part together with its own sub-parts.\n\n" +
+    "SPEND THE 16 ON MOTION: face features and jaw first, then limbs and props, then secondary\n" +
+    "sway, then FX. NEVER pad: three parts that move beat ten that don't. If the subject needs\n" +
+    "more than 16, give the best 16 and say what was left out in warning.\n\n" +
+    "EACH PART:\n" +
+    "- name: short English, with side and depth explicit (left eye, far arm upper, tail tip).\n" +
+    "- detail: ONE sentence another tool will follow without seeing your reasoning: what it looks\n" +
+    "  like and where it is in the picture, what NOT to include, and which hidden area to paint\n" +
+    "  in. Example: \"the lower jaw with its teeth at the bottom of the open mouth, not the upper\n" +
+    "  teeth or tongue; paint in the inside of the mouth behind it\".\n\n" +
+    "Propose 1-3 options, best first: usually a full rig, plus a lighter rig with fewer parts\n" +
+    "only if that is genuinely useful. For each: label (3-5 words), job (full rig, light rig,\n" +
+    "face only, FX only, parallax), why (one line naming the motions it enables), elements, and\n" +
+    "warning (empty if none). kind is what the image is, in a few words.";
+
+/// Which brief Analyze uses. Remembered between runs, like the element list.
+var PURPOSES = [
+    { label: "General",                prompt: PLAN_SYSTEM_PROMPT, spine: false },
+    { label: "Spine animation (2.5D)", prompt: PLAN_SPINE_PROMPT,  spine: true }
+];
+function purposePrefsFile() {
+    return new File(Folder.userData.fsName + "/NavigatorLayerizePurpose.txt");
+}
+function loadPurpose() {
+    try {
+        var f = purposePrefsFile();
+        if (!f.exists) { return 0; }
+        f.encoding = "UTF-8"; f.open("r"); var t = f.read(); f.close();
+        var i = parseInt(t, 10);
+        return (i >= 0 && i < PURPOSES.length) ? i : 0;
+    } catch (e) { return 0; }
+}
+function rememberPurpose(i) {
+    try { var f = purposePrefsFile(); f.encoding = "UTF-8"; f.open("w"); f.write(String(i)); f.close(); } catch (e) {}
+}
+
+/// Gemini 3.8 Flash with thinking at HIGH: the planner is a reasoning task (what moves, where it
+/// pivots, what is hidden), and HIGH costs cents. The model id and levels are Google's
+/// ("gemini-3.8-flash"; low/medium/high, MEDIUM default, MINIMAL refused); the service forwards
+/// thinking_level as generationConfig.thinkingConfig.thinkingLevel and checks the level per model.
+/// No temperature: Google's 3.8 guide says to remove the sampling parameters.
+var PLAN_MODEL = "gemini-3.8-flash";
+var PLAN_THINKING = "HIGH";
+
+/// Forces the reply into the plan's shape (Vertex Schema, sent as response_schema), so a plan is
+/// never lost to prose or a markdown fence. parsePlan still tolerates both, for safety.
+var PLAN_SCHEMA = {
+    type: "OBJECT",
+    properties: {
+        kind: { type: "STRING" },
+        options: { type: "ARRAY", items: { type: "OBJECT", properties: {
+            label: { type: "STRING" }, job: { type: "STRING" }, why: { type: "STRING" },
+            warning: { type: "STRING" },
+            elements: { type: "ARRAY", items: { type: "OBJECT", properties: {
+                name: { type: "STRING" }, detail: { type: "STRING" } },
+                required: ["name", "detail"] } } },
+            required: ["label", "job", "why", "elements", "warning"] } }
+    },
+    required: ["kind", "options"]
+};
 
 // ---------------------------------------------------------------- Connections
 //
@@ -867,7 +962,7 @@ function friendlyError(msg) {
 /// Parse the model's reply into { kind, options:[{label,job,why,elements,warning}] }.
 /// Tolerates a ```json fence and surrounding prose, because "STRICT JSON only" is an instruction,
 /// not a guarantee.
-function parsePlan(reply) {
+function parsePlan(reply, spine) {
     var s = String(reply);
     var a = s.indexOf("{"), b = s.lastIndexOf("}");
     if (a < 0 || b <= a) { return null; }
@@ -881,10 +976,16 @@ function parsePlan(reply) {
         var els = [];
         var raw = (o && o.elements instanceof Array) ? o.elements : [];
         for (var j = 0; j < raw.length; j++) {
+            var t = "";
             if (typeof raw[j] === "string") {
-                var t = raw[j].replace(/^\s+|\s+$/g, "");
-                if (t.length) { els.push(t); }
+                t = raw[j];
+            } else if (raw[j] && typeof raw[j].name === "string") {
+                t = raw[j].name.replace(/^\s+|\s+$/g, "");
+                var d = (typeof raw[j].detail === "string") ? raw[j].detail.replace(/^\s+|\s+$/g, "") : "";
+                if (spine && t.length && d.length) { t = t + " \u2014 " + d; }
             }
+            t = t.replace(/^\s+|\s+$/g, "");
+            if (t.length) { els.push(t); }
         }
         if (!els.length) { continue; }          // an option that separates nothing is noise
         options.push({ label: str(o, "label"), job: str(o, "job"), why: str(o, "why"),
@@ -905,11 +1006,12 @@ function optionTitle(o) {
 ///
 /// "background" is dropped: it is the base image, which layerize returns anyway, so asking for it
 /// wastes one of the 16 slots. Returns { text, dropped }.
-function instructionFor(names) {
+function instructionFor(names, spine) {
     var usable = [], seen = {};
     for (var i = 0; i < names.length; i++) {
         var n = String(names[i]).replace(/^\s+|\s+$/g, "");
-        var lower = n.toLowerCase();
+        // Dedupe and drop "background" by the NAME, not the whole "name \u2014 detail" line.
+        var lower = n.split(" \u2014 ")[0].toLowerCase();
         if (!n.length || lower === "background") { continue; }
         if (seen[lower]) { continue; }          // appending a second proposal repeats names
         seen[lower] = true;
@@ -918,9 +1020,20 @@ function instructionFor(names) {
     var kept = usable.slice(0, MAX_ELEMENTS);
     var dropped = usable.slice(MAX_ELEMENTS);
     if (!kept.length) { return { text: "", dropped: dropped }; }
+    if (spine) {
+        return { text: SPINE_INSTRUCTION + "\n- " + kept.join("\n- "), dropped: dropped };
+    }
     return { text: "Separate these elements out from the image as individual layers: " +
                    kept.join(", "), dropped: dropped };
 }
+
+/// The lead-in for a Spine split. Layerize paints in hidden areas only when asked, and a rig
+/// with holes behind every moving part is the most common reason a split has to be redone.
+var SPINE_INSTRUCTION =
+    "Separate each of these parts into its own transparent layer for animation rigging. " +
+    "Where another part covers it, paint in the hidden area so every part is complete and " +
+    "nothing shows a hole when parts move, including the surface under each removed part. " +
+    "Keep each part's original outline, colours, detail and position; add nothing new.";
 
 /// Recover element names from an instruction this script produced, so a second proposal can be
 /// appended to a first. Anything typed freehand that isn't in that shape is treated as one item,
@@ -928,6 +1041,15 @@ function instructionFor(names) {
 function elementsInInstruction(text) {
     var t = String(text).replace(/^\s+|\s+$/g, "");
     if (!t.length) { return []; }
+    // Either line break: ScriptUI's multiline field and ExtendScript files on a Mac use \r.
+    if (/[\r\n]- /.test(t)) {
+        var lines = t.split(/\r?\n|\r/), items = [];
+        for (var k = 0; k < lines.length; k++) {
+            var m = lines[k].replace(/^\s+|\s+$/g, "");
+            if (m.indexOf("- ") === 0 && m.length > 2) { items.push(m.substring(2)); }
+        }
+        return items;
+    }
     var marker = "individual layers:";
     var at = t.indexOf(marker);
     if (at >= 0) { t = t.substring(at + marker.length); }
@@ -941,7 +1063,7 @@ function elementsInInstruction(text) {
 }
 
 /// Ask Gemini what is worth separating. Returns { plan, cost, error } — `plan` null on failure.
-function requestPlan(pngFile) {
+function requestPlan(pngFile, purpose) {
     var token = h5gToken();
     if (!token) {
         return { plan: null, cost: 0,
@@ -964,27 +1086,32 @@ function requestPlan(pngFile) {
     payload.encoding = "UTF-8";
     payload.open("w");
     payload.write('{"prompt":' + JSON.stringify("Plan how to split this image into layers.") +
-                  ',"system_prompt":' + JSON.stringify(PLAN_SYSTEM_PROMPT) +
+                  ',"system_prompt":' + JSON.stringify(purpose.prompt) +
+                  ',"model":' + JSON.stringify(PLAN_MODEL) +
+                  ',"thinking_level":' + JSON.stringify(PLAN_THINKING) +
+                  ',"response_schema":' + JSON.stringify(PLAN_SCHEMA) +
                   ',"input_images":[{"mime":"image/png","base64":"');
     payload.write(b64);
     payload.write('"}]}');
     payload.close();
 
-    // 60s and two tries, not 120s and three: the worst case is time spent with Photoshop frozen
-    // and no way to cancel, and a vision call that has not answered in a minute is not going to.
-    log("analyze: asking " + base + "/v1/vision  (" + Math.round(b64.length / 1024) + " KB of base64)");
+    // 120s and two tries: HIGH thinking adds time before the answer starts, and Photoshop is
+    // frozen for the duration with no way to cancel, so not longer than that.
+    log("analyze: asking " + base + "/v1/vision  (" + Math.round(b64.length / 1024) + " KB of base64)" +
+        "  purpose: " + purpose.label + "  model: " + PLAN_MODEL + "  thinking: " + PLAN_THINKING);
     var lastError = "no response";
     for (var attempt = 0; attempt < 2; attempt++) {
-        var resp = curl('-s -S --max-time 60 -X POST -H "Authorization: Bearer ' + token + '" ' +
+        var resp = curl('-s -S --max-time 120 -X POST -H "Authorization: Bearer ' + token + '" ' +
                         '-H "Content-Type: application/json" "' + base + '/v1/vision" ' +
                         '-d @"' + payload.fsName + '"');
         if (resp) {
             var j = null;
             try { j = JSON.parse(resp); } catch (e) { j = null; }
             if (j && typeof j.text === "string") {
-                var plan = parsePlan(j.text);
+                var plan = parsePlan(j.text, purpose.spine);
                 if (plan !== null) {
-                    log("analyze ok: " + plan.options.length + " option(s), cost $" + (j.cost_usd || 0));
+                    log("analyze ok: " + plan.options.length + " option(s), cost $" + (j.cost_usd || 0) +
+                        ", model " + (j.model || "?") + ", thought tokens " + (j.thought_tokens || 0));
                     return { plan: plan, cost: (j.cost_usd || 0), error: null };
                 }
                 // Logged verbatim: this is what a refusal looks like, and on a blank or near-blank
@@ -1056,6 +1183,20 @@ function askElements(thumbFile) {
         { multiline: true });
     hint.preferredSize = [460, 58];
 
+    // --- Purpose: which brief Analyze uses ----------------------------------------------------
+    var prow = w.add("group");
+    prow.add("statictext", undefined, "Analyze for:");
+    var purposePick = prow.add("dropdownlist", undefined, []);
+    for (var pi = 0; pi < PURPOSES.length; pi++) { purposePick.add("item", PURPOSES[pi].label); }
+    purposePick.selection = loadPurpose();
+    purposePick.helpTip = "Spine animation plans parts by how they move and asks for hidden areas to be painted in";
+    purposePick.onChange = function () {
+        if (purposePick.selection !== null) { rememberPurpose(purposePick.selection.index); }
+    };
+    function currentPurpose() {
+        return PURPOSES[purposePick.selection === null ? 0 : purposePick.selection.index];
+    }
+
     // --- Analyze row: look at the image and propose plans ---------------------------------------
     var arow = w.add("group");
     arow.alignment = "fill";
@@ -1074,7 +1215,7 @@ function askElements(thumbFile) {
     status.graphics.font = ScriptUI.newFont(status.graphics.font.name, "italic", 10);
 
     var field = w.add("edittext", undefined, loadRememberedElements(), { multiline: true });
-    field.preferredSize = [460, 80];
+    field.preferredSize = [460, 140];   // a Spine plan is one part per line
 
     var foot = w.add("statictext", undefined,
         "\u201c" + BASE_PROMPT + "\u201d is always sent, so names come back in English.");
@@ -1132,7 +1273,7 @@ function askElements(thumbFile) {
         if (plan === null || index < 0 || index >= plan.options.length) { return; }
         var o = plan.options[index];
         var names = append ? elementsInInstruction(field.text).concat(o.elements) : o.elements;
-        var built = instructionFor(names);
+        var built = instructionFor(names, plan.spine === true);
         field.text = built.text;
         var note = o.why;
         if (o.warning.length) { note = note.length ? note + " \u2014 " + o.warning : o.warning; }
@@ -1147,7 +1288,7 @@ function askElements(thumbFile) {
         analyze.enabled = false;
         // Says it will freeze, because it will: the curl below blocks Photoshop's only thread and
         // no repaint can happen until it returns. Silence here reads as a hung script.
-        status.text = "Looking at the image\u2026 Photoshop will be unresponsive for up to a minute.";
+        status.text = "Looking at the image\u2026 Photoshop will be unresponsive for up to two minutes.";
         // Photoshop is single-threaded, so the window cannot repaint while curl runs. Force the one
         // update that matters before blocking, or the button just appears to do nothing for 10s.
         status.update();
@@ -1157,9 +1298,11 @@ function askElements(thumbFile) {
         // button next to "Looking at the image..." forever, with no error anywhere. That exact
         // dead end was reported, and a stuck button is indistinguishable from a hung network call.
         try {
-            var r = requestPlan(thumbFile);
+            var purpose = currentPurpose();
+            var r = requestPlan(thumbFile, purpose);
             if (r.plan === null) { status.text = "Analyze failed: " + r.error; return; }
             plan = r.plan;
+            plan.spine = purpose.spine;     // so a later purpose change can't reformat this plan
             picker.removeAll();
             for (var i = 0; i < plan.options.length; i++) { picker.add("item", optionTitle(plan.options[i])); }
             picker.enabled = true;
