@@ -26827,7 +26827,10 @@ final class GDDToAssetsRun: ObservableObject {
                 items.append(AssetChecklist.Item(group: "Pick bonus", name: "jackpot_interface_bezel", what: "the pick panel: the base bezel round the pick grid, the reel texture inside", files: ["jackpot_interface_bezel_rmbg.png", "jackpot_interface_reelTexture_rmbg.png"], maker: "Pick bonus", cost: 0))
             }
             for j in jobs where j.kind == .background {
-                items.append(AssetChecklist.Item(group: "Landscape", name: Derived.landscapeName(j.id), what: "\(j.title), landscape", files: ["\(Derived.landscapeName(j.id)).png"], maker: "Landscape", cost: AssetChecklist.gpt(Derived.landscape.w, Derived.landscape.h)))
+                let n = Derived.landscapeName(j.id), (w, h) = Derived.landscape
+                let small = lastFolder.flatMap { imagePixelSize($0.appendingPathComponent("\(n).png")) }.flatMap { $0.w < w ? $0 : nil }
+                items.append(AssetChecklist.Item(group: "Landscape", name: n, what: "\(j.title), landscape" + (small.map { ": drawn at \($0.w)×\($0.h), to be drawn again at \(w)×\(h)" } ?? ""),
+                                                 files: ["\(n).png"], maker: "Landscape", cost: AssetChecklist.gpt(w, h)))
             }
             // Phase 3: each lettered piece in the languages chosen — a word with no approved translation flagged, not drawn;
             // the same words as the English copied, free; a wheel's wedge lettered in code, free.
@@ -26845,7 +26848,9 @@ final class GDDToAssetsRun: ObservableObject {
             }
         }
         let fm = FileManager.default
-        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) } } ?? false) }
+        return items.map { i in (i, lastFolder.map { f in !i.files.isEmpty && i.files.allSatisfy { fm.fileExists(atPath: f.appendingPathComponent($0).path) }
+            // A landscape background drawn smaller, before the size grew, is made again (generateReelArea).
+            && (i.group != "Landscape" || i.files.allSatisfy { imagePixelSize(f.appendingPathComponent($0)).map { $0.w >= Derived.landscape.w } ?? false }) } ?? false) }
     }
 
     /// Gemini reads the GDD for every other static piece the game needs (ConceptPlan) — meters, collection
@@ -27607,12 +27612,21 @@ final class GDDToAssetsRun: ObservableObject {
             both(px, w, side, "\(j.id)_train")
             for k in 0..<parts { both(FrameKit.crop(px, width: w, k * side, 0, side, side).px, side, side, "\(j.id)_train\(k + 1)") }
         }
-        // 11. Every background's landscape twin, the same scene widened (Derived).
-        for j in jobs where j.kind == .background && !has("\(Derived.landscapeName(j.id)).png") {
-            guard let bgPNG = try? Data(contentsOf: url("\(j.id).png")) else { continue }
-            let (w, h) = Derived.landscape
-            if let px = paint(Derived.landscapeName(j.id), prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
-                              inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) { write(px, w, h, "\(Derived.landscapeName(j.id)).png") }
+        // 11. Every background's landscape twin, the same scene widened (Derived). One drawn smaller, before the size grew
+        // (2.25.0), is drawn again at it: the new one drawn first, so a failed drawing never leaves the set without one; the
+        // old one kept as a version (review.json), and the new one to be approved.
+        for j in jobs where j.kind == .background {
+            let name = Derived.landscapeName(j.id), (w, h) = Derived.landscape, old = imagePixelSize(url("\(name).png")), before = cost
+            guard old.map({ $0.w < w }) ?? true, let bgPNG = try? Data(contentsOf: url("\(j.id).png")),
+                  let px = paint(name, prompt: GDDAssetPrompts.landscapeBrief(theme: theme),
+                                 inputs: [downsamplePNG(bgPNG, longEdge: 2048) ?? bgPNG], w: w, h: h, covered: nil) else { continue }
+            if let old {
+                DispatchQueue.main.sync {
+                    self.keepPicture(name, change: "Drawn again at \(w)×\(h); it was drawn at \(old.w)×\(old.h)", mode: .redraw, cost: cost - before, folder: folder)
+                    self.review.setApproved(name, false); self.saveReview(folder)
+                }
+            }
+            write(px, w, h, "\(name).png")
         }
         // 12. Phase 3: the lettered pieces in the languages chosen (Localized), every word from the art-words table. A word
         // with no approved translation is flagged and listed for the localization team, never drawn; a piece whose words are
