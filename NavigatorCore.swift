@@ -9647,7 +9647,7 @@ public enum ArtWords {
     credits	fr	crédits
     wilds	fr	wilds
     respins	fr	relances
-    collect	fr	amasser
+    collect	fr	collecter
     wild	fr	wild
     scatter	fr	scatter
     bonus	fr	bonus
@@ -9680,7 +9680,7 @@ public enum ArtWords {
     total win	es	premio total
     bonus games awarded!	es	juegos gratis otorgados
     bonus games complete	es	juegos gratis completados
-    one more chance	es	¡una oportunidad más
+    one more chance	es	una oportunidad más
     bonus wheel	es	Bonus Wheel
     jackpots	es	Jackpots
     bonus games	es	Juegos Gratis
@@ -9821,7 +9821,7 @@ public enum ArtWords {
     credits	it	crediti
     wilds	it	wild
     respins	it	giri extra
-    collect	it	incassa
+    collect	it	raccogli
     wild	it	wild
     scatter	it	scatter
     bonus	it	bonus

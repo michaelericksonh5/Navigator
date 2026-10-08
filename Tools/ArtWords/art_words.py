@@ -38,8 +38,8 @@ def lookup(terms, en):
     for key in [en] + ([en.replace("bonus games", "free games")] if "bonus games" in en else []):
         if clean(terms.get(key, "")):
             return clean(terms[key])
-        if not key.endswith("!") and clean(terms.get(key + "!", "")):  # kept as a shout: "one more chance!" for ONE MORE CHANCE
-            return clean(terms[key + "!"]).rstrip("!\uff01 \u00a0") or None
+        if not key.endswith("!") and clean(terms.get(key + "!", "")):  # kept as a shout: "one more chance!" for ONE MORE CHANCE,
+            return clean(terms[key + "!"]).rstrip("!\uff01 \u00a0").lstrip("\u00a1 ") or None   # Spanish's opening ¡ with its !
         if key.endswith("!") and clean(terms.get(key[:-1], "")):  # written without the shout: "free games awarded"
             return clean(terms[key[:-1]])
     return None
