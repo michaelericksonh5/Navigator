@@ -12,7 +12,7 @@ import json, os, re, sys, unicodedata
 
 LANGS = ["fr", "es", "pt-br", "pt", "de", "it", "tr", "ru", "zh-cn", "zh-hk", "da", "sv", "sk", "ro", "pl", "no", "fi", "el",
          "cs", "bg", "nl", "ko", "ja"]
-FILE_CODE = {"pt-br": "pt-BR", "zh-cn": "zh-CN", "zh-hk": "zh-HK", "es": "es-AR"}   # the studio's shipped Spanish art is Argentine Spanish
+FILE_CODE = {"pt-br": "pt-BR", "zh-cn": "zh-CN", "zh-hk": "zh-HK"}   # es: the studio's one Spanish (its shipped Argentine Spanish)
 
 # Every word Navigator letters (PopUps, StandardPieces, wheels, pot plaques, the jackpot table, symbol words, feature cards).
 TIERS = ["grand", "mega", "major", "minor", "mini", "micro"]
@@ -45,10 +45,14 @@ def lookup(terms, en):
     return None
 
 def main(folder):
+    # Every language's dictionary, or nothing written: one missing would empty its language from the table.
+    paths = {lang: os.path.join(folder, f"en_to_{FILE_CODE.get(lang, lang)}_dictionary.json") for lang in LANGS}
+    gone = [p for p in paths.values() if not os.path.exists(p)]
+    if gone:
+        sys.exit("No dictionary at:\n  " + "\n  ".join(gone) + "\nNothing was written.")
     rows, missing = [], {}
     for lang in LANGS:
-        path = os.path.join(folder, f"en_to_{FILE_CODE.get(lang, lang)}_dictionary.json")
-        terms = json.load(open(path, encoding="utf-8")).get("dictionary", {}) if os.path.exists(path) else {}
+        terms = json.load(open(paths[lang], encoding="utf-8")).get("dictionary", {})
         terms = {clean(k).lower(): v for k, v in terms.items() if isinstance(v, str)}
         for en in ENGLISH:
             word = lookup(terms, en)
