@@ -796,7 +796,7 @@ enum APIKeys {
 /// token: $5 / 1M text in, $8 / 1M image in, $30 / 1M image out (OpenAI pricing, 2026-10-02), so each
 /// call's cost is worked out from the usage it returns. Blocks; call off the main thread.
 enum OpenAIImages {
-    static let model = "gpt-image-2.5-sunburst"
+    static let model = AIUpscaleModel.gpt25.rawValue
     /// A 2048 high-quality edit before its usage is known: measured $0.121–0.134 a call over 14 calls,
     /// one in four drawn twice (2026-10-03).
     static let estimate = 0.16
@@ -807,7 +807,7 @@ enum OpenAIImages {
     /// With no images, a new image from the prompt (images/generations); with some, an edit of the last,
     /// the others its references (images/edits).
     /// `size` wide, `height` tall (square when nil): each a multiple of 16, as GPT Image takes them.
-    static func edit(prompt: String, images: [Data], size: Int = 2048, height: Int? = nil, quality: String = "high") -> (png: Data?, cost: Double, error: String?) {
+    static func edit(prompt: String, images: [Data], size: Int = 2048, height: Int? = nil, quality: String = "high", background: String = "opaque") -> (png: Data?, cost: Double, error: String?) {
         let dims = "\(size)x\(height ?? size)"
         let found = APIKeys.lookup("OpenAI")
         guard let key = found.key else {
@@ -821,7 +821,7 @@ enum OpenAIImages {
         if images.isEmpty {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: ["model": model, "prompt": prompt, "size": dims, "quality": quality,
-                                                                         "background": "opaque", "output_format": "png", "n": 1])
+                                                                         "background": background, "output_format": "png", "n": 1])
             return send(req, dims: dims, quality: quality)
         }
         let boundary = "navigator-\(UUID().uuidString)"
@@ -831,7 +831,7 @@ enum OpenAIImages {
             body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
         }
         for (k, v) in [("model", model), ("prompt", prompt), ("size", dims), ("quality", quality),
-                       ("background", "opaque"), ("output_format", "png"), ("n", "1")] { field(k, v) }
+                       ("background", background), ("output_format", "png"), ("n", "1")] { field(k, v) }
         for (i, img) in images.enumerated() {
             body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"image\(i).png\"\r\nContent-Type: image/png\r\n\r\n".data(using: .utf8)!)
             body.append(img); body.append("\r\n".data(using: .utf8)!)
@@ -2112,6 +2112,7 @@ enum AfterEffectsIcon {
 enum ServiceIcon {
     static let vertex: NSImage? = load("vertex", fallback: "sparkles")
     static let fal: NSImage? = load("fal", fallback: "bolt.fill")
+    static let openai: NSImage? = load("openai", fallback: "sparkles")
 
     private static func load(_ name: String, fallback symbol: String) -> NSImage? {
         let img = Bundle.main.url(forResource: name, withExtension: "png")
@@ -2129,13 +2130,15 @@ enum ServiceIcon {
     }.labelStyle(.titleAndIcon)
 }
 
-// "Upscale (AI)" submenu — Nano Banana Pro on Vertex first, then the fal.ai and local presets.
+// "Upscale (AI)" submenu — Pro and GPT, then the fal.ai and local presets.
 // (Imagen's upscaler is gone from Vertex: 404 in every region. Nano Banana Pro replaces it.)
 @ViewBuilder func upscaleMenu(label: String = "Upscale (AI)",
                               fal: @escaping (UpscaleOption) -> Void,
-                              vertex: @escaping () -> Void) -> some View {
+                              ai: @escaping (AIUpscaleModel) -> Void) -> some View {
     Menu {
-        Button { vertex() } label: { serviceLabel("Upscale → 4K — Nano Banana Pro", ServiceIcon.vertex) }
+        ForEach(AIUpscaleModel.allCases, id: \.self) { model in
+            Button { ai(model) } label: { serviceLabel(model.menuTitle, model == .pro ? ServiceIcon.vertex : ServiceIcon.openai) }
+        }
         Divider()
         ForEach(upscaleOptions) { o in
             Button { fal(o) } label: { serviceLabel(o.label, o.isLocal ? nil : ServiceIcon.fal) }
@@ -2299,7 +2302,7 @@ func fillBackgroundForImage(_ src: URL, color: NSColor?, suffix: String, ratio: 
 
 /// Pads to an exact canvas with the adaptive backing colour, in memory — the auto-prep path
 /// for restyle/edit calls, which must not litter the user's folder with intermediates.
-func paddedToCanvas(_ url: URL, canvas: (w: Int, h: Int)) -> Data? {
+func paddedToCanvas(_ url: URL, canvas: (w: Int, h: Int), transparent: Bool = false) -> Data? {
     guard let cg = loadCGImage(url), canvas.w >= cg.width, canvas.h >= cg.height else { return nil }
     let c: RGB8
     switch KeyColorRules.choose(subject: subjectColours(cg), flatField: flatFieldColour(cg)) {
@@ -2309,8 +2312,10 @@ func paddedToCanvas(_ url: URL, canvas: (w: Int, h: Int)) -> Data? {
     guard let ctx = CGContext(data: nil, width: canvas.w, height: canvas.h, bitsPerComponent: 8,
                               bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
                               bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-    ctx.setFillColor(nsColor(c).cgColor)
-    ctx.fill(CGRect(x: 0, y: 0, width: canvas.w, height: canvas.h))
+    if !transparent {
+        ctx.setFillColor(nsColor(c).cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: canvas.w, height: canvas.h))
+    }
     let o = AspectPrepRules.subjectOrigin(width: cg.width, height: cg.height, canvas: canvas)
     ctx.draw(cg, in: CGRect(x: o.x, y: o.y, width: cg.width, height: cg.height))
     return ctx.makeImage().flatMap(encodePNG)
@@ -2351,7 +2356,7 @@ struct UpscaleOption: Identifiable {
     var isLocal: Bool { endpoint.isEmpty }
 }
 
-/// The fal.ai and local upscalers, after Nano Banana Pro (upscaleImagesViaVertex), which leads
+/// The fal.ai and local upscalers, after Nano Banana Pro (upscaleImagesAI), which leads
 /// every Upscale menu. Crystal, AuraSR and Photoshop's Firefly were taken out at the owner's
 /// request (2026-10-01). Finder's menu addresses this list by INDEX — keep FinderExt in step.
 let upscaleOptions: [UpscaleOption] = [
@@ -4126,7 +4131,7 @@ func batchImageURLs(in folder: URL, skipSuffix: String = "_rmbg") -> [URL] {
             continue
         }
         guard isImageFile(url) else { continue }
-        if url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix(skipSuffix) { continue }
+        if PathRules.isOwnOutput(url, suffix: skipSuffix) { continue }
         out.append(url)
     }
     return out.sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
@@ -4305,31 +4310,48 @@ func batchUpscaleFolderViaFal(_ folder: URL, option: UpscaleOption, onDone: (() 
 // plain resize 0.983 / 0.992, but blurrier), 40–55% more detail than the resize, every feature in
 // place, a slight warm shift (+3–4 on red and blue). A regeneration, not super-resolution — fine
 // detail can move a little — which is why the confirmation says so.
-let vertexUpscaleModelFlag = "nb-pro"
 
-/// Each image redrawn at 4K by Nano Banana Pro, saved as "<name>_upscaled.png" beside it. A
-/// transparent PNG is sent on green and its ORIGINAL matte is put back afterwards, as the Imagen
-/// upscaler did — keying the green out again leaves a fringe on soft edges.
-func upscaleImagesViaVertex(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
-    let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_upscaled") }
+// Main-thread ownership spans the confirmation and request, preventing duplicate paid clicks.
+private var activeAIUpscales = AIUpscaleActivity()
+
+/// Each image is redrawn at higher resolution and saved beside its source.
+/// Pro restores the source matte; GPT preserves its native transparent output.
+func upscaleImagesAI(_ srcs: [URL], model: AIUpscaleModel = .pro, onDone: (([URL]) -> Void)? = nil) {
+    let imgs = activeAIUpscales.claim(srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_upscaled") }, model: model)
     guard !imgs.isEmpty else { NSSound.beep(); return }
-    guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
-    let perImage = nbEstimatedCost(size: "4K", modelFlag: vertexUpscaleModelFlag)
+    var submitted = false
+    defer { if !submitted { activeAIUpscales.release(imgs, model: model) } }
+    if model == .pro {
+        guard vertexSignedIn() else { DispatchQueue.main.async { promptVertexSignin() }; return }
+    } else if !OpenAIImages.available {
+        reportFileError("OpenAI key required", "Add your OpenAI key in AI ▸ API Keys… to use GPT Image 2.5 Upscale.")
+        return
+    }
+    let perImage = model == .pro ? nbEstimatedCost(size: "4K", modelFlag: model.rawValue) : 0.50
     let a = NSAlert()
-    a.messageText = "Upscale \(imgs.count) image\(imgs.count == 1 ? "" : "s") to 4K with Nano Banana Pro?"
+    a.messageText = "Upscale \(imgs.count) image\(imgs.count == 1 ? "" : "s") with \(model.name)?"
     a.informativeText = (imgs.count == 1
         ? String(format: "Estimated cost: ~$%.2f.", perImage)
         : String(format: "Estimated cost: ~$%.2f (about $%.2f each).", Double(imgs.count) * perImage, perImage))
-        + "\n\nNano Banana Pro redraws the image at 4K, told to keep everything exactly as it is. It is sharper than a resize and keeps every feature in place, but it is a redraw: very fine detail can shift slightly."
+        + (model == .gpt25 ? " Maximum quality; up to 3840 pixels on the long edge, depending on aspect ratio." : "")
+        + "\n\n\(model.name) redraws the image at higher resolution, told to keep everything exactly as it is. It is a generative redraw: lettering, framing and fine detail can change. Compare the result with the original before using it."
     a.addButton(withTitle: "Upscale"); a.addButton(withTitle: "Cancel")
     guard a.runModal() == .alertFirstButtonReturn else { return }
 
-    DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling (Nano Banana Pro)", total: imgs.count) }
+    submitted = true
+    DispatchQueue.main.async { BGJobProgress.shared.start("Upscaling (\(model.name))", total: imgs.count) }
     DispatchQueue.global(qos: .userInitiated).async {
         var outs: [URL] = [], errors: [String] = [], spent = 0.0
         for src in imgs {
             defer { DispatchQueue.main.async { BGJobProgress.shared.advance() } }
             guard let size = imagePixelSize(src) else { errors.append("\(src.lastPathComponent): can’t read the image"); continue }
+            if model == .gpt25 {
+                let r = runGPTUpscale(src)
+                spent += r.cost
+                if let saved = r.saved { outs.append(saved) }
+                else { errors.append("\(src.lastPathComponent): \(r.error ?? "no image came back")") }
+                continue
+            }
             if VertexUpscaleRules.isPointless(longEdge: max(size.w, size.h)) {
                 errors.append("\(src.lastPathComponent): already \(size.w)×\(size.h) — about as large as 4K, so it was skipped")
                 continue
@@ -4347,12 +4369,12 @@ func upscaleImagesViaVertex(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
             // Restyle's request path: pads an odd shape to the nearest ratio the model takes and
             // crops the padding back off, so nothing is stretched or cut.
             let r = runRestyle(source: input, prompt: VertexUpscaleRules.prompt(transparent: transparent),
-                               modelFlag: vertexUpscaleModelFlag, aspect: "auto", size: "4K", nameAfter: src,
-                               sendSourceImage: true, modeLabel: "Upscale (Nano Banana Pro) 4K")
+                               modelFlag: model.rawValue, aspect: "auto", size: "4K", nameAfter: src,
+                               sendSourceImage: true, modeLabel: "Upscale (\(model.name)) 4K")
             spent += r.cost ?? 0
             guard let saved = r.saved else { errors.append("\(src.lastPathComponent): \(r.error ?? "no image came back")"); continue }
             let dst = PathRules.uniqueDest(src.deletingLastPathComponent(),
-                                           src.deletingPathExtension().lastPathComponent + "_upscaled.png") {
+                                           src.deletingPathExtension().lastPathComponent + model.outputSuffix + ".png") {
                 FileManager.default.fileExists(atPath: $0)
             }
             do {
@@ -4364,27 +4386,59 @@ func upscaleImagesViaVertex(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
                     try FileManager.default.moveItem(at: saved, to: dst)
                 }
                 outs.append(dst)
-                navLog("vertex upscale: \(src.lastPathComponent) \(size.w)×\(size.h) → \(dst.lastPathComponent)\(transparent ? " (matte rebuilt)" : "")")
+                navLog("vertex upscale [\(model.rawValue)] cost $\(String(format: "%.6f", r.cost ?? 0)): \(src.lastPathComponent) \(size.w)×\(size.h) → \(dst.lastPathComponent)\(transparent ? " (matte rebuilt)" : "")")
             } catch {
                 errors.append("\(src.lastPathComponent): generated, but couldn’t be saved as \(dst.lastPathComponent) — it is “\(saved.lastPathComponent)”")
             }
         }
         let total = spent
         DispatchQueue.main.async {
+            activeAIUpscales.release(imgs, model: model)
             BGJobProgress.shared.finish(String(format: "Upscaled %d of %d · $%.2f", outs.count, imgs.count, total))
-            if !errors.isEmpty { showBGSummary(app: "Upscale (Nano Banana Pro)", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
+            if !errors.isEmpty { showBGSummary(app: "Upscale (\(model.name))", done: outs.count, total: imgs.count, errors: errors, verb: "upscaled") }
             if !outs.isEmpty { onDone?(outs) }
         }
     }
 }
 
-func batchUpscaleFolderViaVertex(_ folder: URL, onDone: (() -> Void)? = nil) {
+/// One edit with native alpha, then a crop of only the padding added before the call.
+func runGPTUpscale(_ src: URL) -> (saved: URL?, cost: Double, error: String?) {
+    guard let size = imagePixelSize(src), let plan = GPTUpscaleRules.plan(width: size.w, height: size.h) else {
+        return (nil, 0, "Already at or above GPT's output resolution for this aspect ratio; skipped.")
+    }
+    let transparent = imageHasTransparency(src)
+    guard let input = paddedToCanvas(src, canvas: plan.canvas, transparent: transparent) else {
+        return (nil, 0, "Couldn’t prepare the image.")
+    }
+    let prompt = GPTUpscaleRules.prompt(transparent: transparent)
+    let r = OpenAIImages.edit(prompt: prompt, images: [input], size: plan.output.w, height: plan.output.h,
+                              quality: "max", background: transparent ? "transparent" : "opaque")
+    guard let raw = r.png else { return (nil, r.cost, r.error ?? "No image came back.") }
+    let dst: URL
+    // Exclusively save the paid result first; concurrent completions must never replace one another.
+    do {
+        dst = try GPTUpscaleRules.saveUnique(raw, beside: src)
+    } catch { return (nil, r.cost, "Couldn’t save the generated image: \(error.localizedDescription)") }
+    guard let cg = loadCGImage(data: raw), cg.width == plan.output.w, cg.height == plan.output.h else {
+        return (nil, r.cost, "Unexpected output size; uncropped result saved as \(dst.lastPathComponent).")
+    }
+    let b = AspectPrepRules.cropBack(canvas: plan.canvas, subject: (size.w, size.h), result: (cg.width, cg.height))
+    guard let crop = cg.cropping(to: CGRect(x: b.x, y: b.y, width: b.w, height: b.h)), let png = encodePNG(crop) else {
+        return (nil, r.cost, "Couldn’t crop padding; uncropped result saved as \(dst.lastPathComponent).")
+    }
+    do { try png.write(to: dst, options: .atomic) }
+    catch { return (nil, r.cost, "Couldn’t save cropped result; uncropped image is at \(dst.path).") }
+    navLog("gpt upscale cost $\(String(format: "%.6f", r.cost)): \(src.lastPathComponent) \(size.w)×\(size.h) → \(b.w)×\(b.h) \(dst.lastPathComponent)")
+    return (dst, r.cost, nil)
+}
+
+func batchUpscaleFolderAI(_ folder: URL, model: AIUpscaleModel = .pro, onDone: (() -> Void)? = nil) {
     let imgs = batchImageURLs(in: folder, skipSuffix: "_upscaled")
     guard !imgs.isEmpty else {
         DispatchQueue.main.async { reportFileError("No images to upscale", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_upscaled” files).") }
         onDone?(); return
     }
-    upscaleImagesViaVertex(imgs) { _ in onDone?() }
+    upscaleImagesAI(imgs, model: model) { _ in onDone?() }
 }
 
 // Remove BG for ONE file, retrying a failure before giving up.
@@ -11934,11 +11988,11 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
             if browser.items.contains(where: { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }) {
                 prepForAIMenu { c, ratio in browser.fillBackground(ids, c, ratio: ratio) }
                 upscaleMenu(fal: { opt in browser.upscale(ids, opt) },
-                            vertex: {
+                            ai: { model in
                                 let targets = browser.items.filter {
                                     ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url)
                                 }.map(\.url)
-                                upscaleImagesViaVertex(targets) { outs in browser.refreshAndReveal(outs) }
+                                upscaleImagesAI(targets, model: model) { outs in browser.refreshAndReveal(outs) }
                             })
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
                     browser.refreshAndReveal([out])
@@ -11952,9 +12006,9 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                       browser.items.first(where: { ids.contains($0.id) })?.isDirectory == true {
                 upscaleMenu(label: "Batch Upscale (AI)",
                             fal: { opt in browser.batchUpscale(ids, opt) },
-                            vertex: {
+                            ai: { model in
                                 for f in browser.items.filter({ ids.contains($0.id) && $0.isDirectory }) {
-                                    batchUpscaleFolderViaVertex(f.url) { browser.refresh() }
+                                    batchUpscaleFolderAI(f.url, model: model) { browser.refresh() }
                                 }
                             })
             }
@@ -15343,8 +15397,8 @@ struct ImageViewerView: View {
                 }
                 upscaleMenu(fal: { opt in
                     upscaleImagesViaFal([u], option: opt) { outs in if let o = outs.first { revealNewImage(o) } }
-                }, vertex: {
-                    upscaleImagesViaVertex([u]) { outs in if let o = outs.first { revealNewImage(o) } }
+                }, ai: { model in
+                    upscaleImagesAI([u], model: model) { outs in if let o = outs.first { revealNewImage(o) } }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
                 // Layerize belongs here for the same reason Restyle does: this viewer is where you
@@ -18518,9 +18572,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "chromakey-solid":
             folders.forEach { batchChromaKeyFolder($0, profile: .solidSymbol) }
             if !images.isEmpty { chromaKeyForImages(images, profile: .solidSymbol) }
-        case "upscale-vertex":
-            folders.forEach { batchUpscaleFolderViaVertex($0) }
-            if !images.isEmpty { upscaleImagesViaVertex(images) }
+        case "upscale-vertex", "upscale-gpt25":
+            let model: AIUpscaleModel = url.host == "upscale-gpt25" ? .gpt25 : .pro
+            folders.forEach { batchUpscaleFolderAI($0, model: model) }
+            if !images.isEmpty { upscaleImagesAI(images, model: model) }
         // Upscalers are addressed by INDEX into `upscaleOptions` rather than by a name
         // string, so Finder's menu and Navigator's own can never drift apart: both are
         // built from the same list. "upscale-lowq" is kept as an alias because older
@@ -20055,8 +20110,8 @@ enum H5GService {
         }
         guard let url = URL(string: base + "/v1/images") else { return (nil, nil, "bad service URL") }
         if modelID == GeneratedSizeRules.nanoBanana21,
-           !capabilities().contains("image.model.gemini_nano_banana_2_1") {
-            return (nil, nil, "The AI service needs the Nano Banana 2.1 update. Ask the maintainer to deploy it.")
+           !GeneratedSizeRules.supportsNanoBanana21HighThinking(capabilities()) {
+            return (nil, nil, "The AI service needs Nano Banana 2.1 with high thinking support. Ask the maintainer to deploy it.")
         }
         var body: [String: Any] = ["prompt": prompt, "model": modelID]
         if !inputPNGs.isEmpty {
@@ -20076,7 +20131,7 @@ enum H5GService {
         if let size, !size.isEmpty, GeneratedSizeRules.sizes(model: modelID).contains(size) { body["image_size"] = size }
         // Nano Banana 2 thinks at "minimal" unless asked; "high" is its other level (Gemini image
         // docs, checked 30 Sep 2026). Sent only once the service lists image.thinking_level:
-        // it does not yet, and an unknown field on a paid call is not worth the risk.
+        // older services must not silently discard the requested thinking level.
         // Nano Banana 2.1 defaults to MEDIUM; H5G runs it at HIGH for art quality.
         if modelID == "gemini-3.1-flash-image" || modelID == "gemini-3.1-flash-lite-image" || modelID == "gemini-3-pro-image" || modelID == GeneratedSizeRules.nanoBanana21,
            capabilities().contains("image.thinking_level") { body["thinking_level"] = "high" }
@@ -29495,17 +29550,6 @@ enum RecentSets {
             guard let d = try? Data(contentsOf: f.appendingPathComponent(SetManifest.fileName)), let m = SetManifest.decode(d) else { return nil }
             return (f, m.gdd.isEmpty ? f.lastPathComponent : m.gdd)
         }
-    }
-}
-
-/// GPT Image's sizes: within 8.29 MP and 3840 a side, a megapixel at least, multiples of 16, no more than 3:1.
-enum GPTSize {
-    static func fit(_ w: Int, _ h: Int) -> (w: Int, h: Int) {
-        let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
-        var rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
-        if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
-        if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
-        return (rw, rh)
     }
 }
 

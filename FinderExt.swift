@@ -131,6 +131,7 @@ final class NavigatorFinderSync: FIFinderSync {
                 // cannot drift: reorder that list and Finder follows. Titles are duplicated
                 // here because the extension is a separate target and can't import them.
                 add(m, "→ 4K — Nano Banana Pro", "upscale-vertex", Self.vertexIcon)
+                add(m, "→ up to 4K — GPT Image 2.5", "upscale-gpt25", Self.icon(systemSymbol: "sparkles"))
                 m.addItem(.separator())
                 add(m, "Topaz ×4", "upscale-0", Self.falIcon)
                 add(m, "Local resample ×4 (free)", "upscale-1", Self.icon(systemSymbol: "desktopcomputer"))

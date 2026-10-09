@@ -222,6 +222,9 @@ final class OwnOutputTests: XCTestCase {
         XCTAssertFalse(PathRules.isOwnOutput(u("/a/pic_rmbg.png"), suffix: "_upscaled"))
         // "_rmbg" in the middle is not an output name.
         XCTAssertFalse(PathRules.isOwnOutput(u("/a/pic_rmbg_final.png"), suffix: "_rmbg"))
+        XCTAssertFalse(PathRules.isOwnOutput(u("/a/pic_upscaled final.png"), suffix: "_upscaled"))
+        XCTAssertFalse(PathRules.isOwnOutput(u("/a/pic_upscaled 1.png"), suffix: "_upscaled"))
+        XCTAssertTrue(PathRules.isOwnOutput(u("/a/pic_upscaled 2.png"), suffix: "_upscaled"))
     }
 }
 
@@ -1709,12 +1712,87 @@ final class ThumbnailKeyRulesTests: XCTestCase {
 // MARK: - Upscale (Nano Banana Pro)
 
 final class VertexUpscaleRulesTests: XCTestCase {
+    func testBothModelsKeepDistinctOutputsAndBatchSkipsBoth() {
+        XCTAssertEqual(AIUpscaleModel.allCases.map(\.rawValue), ["nb-pro", "gpt-image-2.5-sunburst"])
+        XCTAssertEqual(AIUpscaleModel.pro.outputSuffix, "_upscaled")
+        XCTAssertNotEqual(AIUpscaleModel.pro.outputSuffix, AIUpscaleModel.gpt25.outputSuffix)
+        for model in AIUpscaleModel.allCases {
+            for number in ["", " 2"] {
+                let output = URL(fileURLWithPath: "/tmp/art" + model.outputSuffix + number + ".png")
+                XCTAssertTrue(PathRules.isOwnOutput(output, suffix: "_upscaled"))
+            }
+        }
+    }
+    func testNB21RequiresBothModelAndHighThinkingSupport() {
+        let model = "image.model.gemini_nano_banana_2_1", thinking = "image.thinking_level"
+        XCTAssertFalse(GeneratedSizeRules.supportsNanoBanana21HighThinking([]))
+        XCTAssertFalse(GeneratedSizeRules.supportsNanoBanana21HighThinking([model]))
+        XCTAssertFalse(GeneratedSizeRules.supportsNanoBanana21HighThinking([thinking]))
+        XCTAssertTrue(GeneratedSizeRules.supportsNanoBanana21HighThinking([model, thinking]))
+    }
+
     func testThePromptAsksForAnExactCopyAndNamesTheBackground() {
         let t = VertexUpscaleRules.prompt(transparent: true), o = VertexUpscaleRules.prompt(transparent: false)
         XCTAssertTrue(t.contains("Reproduce it exactly"))
         XCTAssertTrue(t.contains("Do not add, remove, move, restyle or reinterpret anything"))
         XCTAssertTrue(t.hasSuffix("Keep the flat background colour exactly as it is."))
         XCTAssertTrue(o.hasSuffix("Keep the background exactly as it is."))
+    }
+    func testRepeatedUpscaleClicksAreClaimedOnceUntilCompletion() {
+        var active = AIUpscaleActivity()
+        let url = URL(fileURLWithPath: "/tmp/button.png")
+        XCTAssertEqual(active.claim([url, url], model: .gpt25), [url])
+        XCTAssertTrue(active.claim([url], model: .gpt25).isEmpty)
+        XCTAssertEqual(active.claim([url], model: .pro), [url])
+        active.release([url], model: .gpt25)
+        XCTAssertEqual(active.claim([url], model: .gpt25), [url])
+    }
+    func testConcurrentGPTSavesCannotOverwriteEachOtherOrEarlierResults() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let source = folder.appendingPathComponent("button.png")
+        try Data("source".utf8).write(to: source)
+        _ = try GPTUpscaleRules.saveUnique(Data("earlier".utf8), beside: source)
+        DispatchQueue.concurrentPerform(iterations: 8) { i in
+            do { _ = try GPTUpscaleRules.saveUnique(Data("result \(i)".utf8), beside: source) }
+            catch { XCTFail("Concurrent save failed: \(error)") }
+        }
+        let outputs = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent != source.lastPathComponent }
+        XCTAssertEqual(outputs.count, 9)
+        let saved = try Set(outputs.map { String(decoding: try Data(contentsOf: $0), as: UTF8.self) })
+        XCTAssertEqual(saved, Set(["earlier"] + (0..<8).map { "result \($0)" }))
+        XCTAssertEqual(try Data(contentsOf: source), Data("source".utf8))
+    }
+    func testGPTPreservesTransparentCanvasAndLettering() {
+        let p = GPTUpscaleRules.prompt(transparent: true)
+        XCTAssertTrue(p.contains("Keep the background transparent."))
+        XCTAssertTrue(p.contains("including accents, font, spacing and placement"))
+        XCTAssertTrue(p.contains("do not zoom or reframe"))
+        XCTAssertFalse(p.contains("flat background colour"))
+    }
+    func testGPTButtonPreparationMatchesLiveTest() throws {
+        let p = try XCTUnwrap(GPTUpscaleRules.plan(width: 714, height: 166))
+        XCTAssertEqual(p.canvas.w, 714); XCTAssertEqual(p.canvas.h, 238)
+        XCTAssertEqual(p.output.w, 3840); XCTAssertEqual(p.output.h, 1280)
+        let b = AspectPrepRules.cropBack(canvas: p.canvas, subject: (714, 166), result: p.output)
+        XCTAssertEqual(b.x, 0); XCTAssertEqual(b.y, 194)
+        XCTAssertEqual(b.w, 3840); XCTAssertEqual(b.h, 893)
+    }
+    func testGPTPortraitSquareAndExtremeRatiosStayLegal() throws {
+        for (w, h) in [(166, 714), (1024, 1024), (601, 999), (1200, 10), (10, 1200), (17, 19)] {
+            let p = try XCTUnwrap(GPTUpscaleRules.plan(width: w, height: h))
+            XCTAssertGreaterThanOrEqual(p.canvas.w, w); XCTAssertGreaterThanOrEqual(p.canvas.h, h)
+            XCTAssertEqual(p.output.w % 16, 0); XCTAssertEqual(p.output.h % 16, 0)
+            XCTAssertLessThanOrEqual(max(p.output.w, p.output.h), 3840)
+            XCTAssertLessThanOrEqual(p.output.w * p.output.h, 8_294_400)
+            XCTAssertLessThanOrEqual(p.output.w, p.output.h * 3)
+            XCTAssertLessThanOrEqual(p.output.h, p.output.w * 3)
+        }
+        XCTAssertNil(GPTUpscaleRules.plan(width: 3000, height: 3000))
+        XCTAssertNil(GPTUpscaleRules.plan(width: 4000, height: 1000))
+        XCTAssertNil(GPTUpscaleRules.plan(width: 0, height: 1000))
     }
     func testAnImageAlreadyNear4KIsSkipped() {
         XCTAssertFalse(VertexUpscaleRules.isPointless(longEdge: 2048))

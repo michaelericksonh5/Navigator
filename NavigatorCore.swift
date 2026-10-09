@@ -529,7 +529,11 @@ enum PathRules {
     /// True for an output this app produced, so batch runs skip their own results
     /// and re-running is safe. `suffix` is "_rmbg" or "_upscaled".
     static func isOwnOutput(_ url: URL, suffix: String) -> Bool {
-        url.deletingPathExtension().lastPathComponent.lowercased().hasSuffix(suffix)
+        let name = url.deletingPathExtension().lastPathComponent.lowercased()
+        if name.hasSuffix(suffix.lowercased()) { return true }
+        guard let space = name.lastIndex(of: " "),
+              let number = Int(name[name.index(after: space)...]), number >= 2 else { return false }
+        return name[..<space].hasSuffix(suffix.lowercased())
     }
 
     /// The new element order after a sidebar drag-reorder, as indices into the
@@ -4742,17 +4746,25 @@ enum ExportRules {
 
 // MARK: - Upscale (Nano Banana Pro) → 4K
 
-/// The words and the one limit behind the Nano Banana Pro upscaler (upscaleImagesViaVertex).
-/// The prompt is the one measured on 2026-10-01: two symbols shrunk 2K→1K and brought back to 4K
-/// kept every feature in place (structure 0.970 / 0.959 against the originals).
+/// Separate output names keep both models' results, and folder runs skip either.
+enum AIUpscaleModel: String, CaseIterable {
+    case pro = "nb-pro"
+    case gpt25 = "gpt-image-2.5-sunburst"
+
+    var name: String { self == .pro ? "Nano Banana Pro" : "GPT Image 2.5" }
+    var menuTitle: String { self == .pro ? "Upscale → 4K — Nano Banana Pro" : "Upscale → up to 4K — GPT Image 2.5" }
+    var outputSuffix: String { self == .pro ? "_upscaled" : "_gpt25_upscaled" }
+}
+
 enum VertexUpscaleRules {
     static func prompt(transparent: Bool) -> String {
-        "Upscale this image to a high resolution. Reproduce it exactly: the same composition, pose, "
+        let copy = "Upscale this image to a high resolution. Reproduce it exactly: the same composition, pose, "
         + "faces, colours, shapes, outlines, lettering and every detail, in the same place. Only make it "
         + "sharper, with finer, cleaner detail at the higher resolution. Do not add, remove, move, restyle "
         + "or reinterpret anything. "
         // A transparent source is sent on a flat key colour, and its own matte is put back afterwards.
         + (transparent ? "Keep the flat background colour exactly as it is." : "Keep the background exactly as it is.")
+        return copy
     }
     /// Already about as large as 4K: a redraw would only buy a copy.
     static func isPointless(longEdge: Int) -> Bool { longEdge >= 3600 }
@@ -12794,6 +12806,11 @@ enum GeneratedSizeRules {
 
     static let nanoBanana21 = "gemini-nano-banana-2.1"
 
+    static func supportsNanoBanana21HighThinking(_ capabilities: Set<String>) -> Bool {
+        capabilities.contains("image.model.gemini_nano_banana_2_1")
+            && capabilities.contains("image.thinking_level")
+    }
+
     /// Reopened sets use the current replacement for their old NB2 default.
     /// Historical output metadata remains unchanged; this only selects the next generation.
     static func resumedModelFlag(_ flag: String) -> String {
@@ -20180,5 +20197,67 @@ public enum GameForge {
             if let b = mode.background { background[mode.scope] = ["portrait": "tex/tall/\(b.portrait).webp", "landscape": "tex/wide/\(b.landscape).webp"] }
         }
         return (["schemaVersion": 1, "records": placements], groups, texts, background)
+    }
+}
+
+/// GPT Image's sizes: within 8.29 MP and 3840 a side, a megapixel at least, multiples of 16, no more than 3:1.
+enum GPTSize {
+    static func fit(_ w: Int, _ h: Int) -> (w: Int, h: Int) {
+        let f = min(max(1, (1_048_576.0 / Double(w * h)).squareRoot()), (8_000_000.0 / Double(w * h)).squareRoot(), 3840.0 / Double(max(w, h)))
+        var rw = Int((Double(w) * f / 16).rounded(.down)) * 16, rh = Int((Double(h) * f / 16).rounded(.down)) * 16
+        if rw * 3 < rh { rw = (rh + 47) / 48 * 16 }
+        if rh * 3 < rw { rh = (rw + 47) / 48 * 16 }
+        return (rw, rh)
+    }
+}
+
+
+/// Match GPT's legal output ratio before sending; crop padding without resampling afterwards.
+enum GPTUpscaleRules {
+    static func saveUnique(_ data: Data, beside source: URL) throws -> URL {
+        while true {
+            let dst = PathRules.uniqueDest(source.deletingLastPathComponent(),
+                                          source.deletingPathExtension().lastPathComponent + AIUpscaleModel.gpt25.outputSuffix + ".png") {
+                FileManager.default.fileExists(atPath: $0)
+            }
+            do {
+                try data.write(to: dst, options: .withoutOverwriting)
+                return dst
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileWriteFileExistsError {
+                continue
+            }
+        }
+    }
+
+    static func plan(width: Int, height: Int) -> (canvas: (w: Int, h: Int), output: (w: Int, h: Int))? {
+        guard width > 0, height > 0 else { return nil }
+        let ratio = min(3.0, max(1.0 / 3.0, Double(width) / Double(height)))
+        let output = GPTSize.fit(ratio >= 1 ? 3840 : Int((3840 * ratio).rounded()),
+                                 ratio >= 1 ? Int((3840 / ratio).rounded()) : 3840)
+        let canvas = AspectPrepRules.canvas(width: width, height: height,
+                                            ratio: Double(output.w) / Double(output.h))
+        let crop = AspectPrepRules.cropBack(canvas: canvas, subject: (width, height), result: output)
+        guard crop.w > width, crop.h > height else { return nil }
+        return (canvas, output)
+    }
+
+    static func prompt(transparent: Bool) -> String {
+        VertexUpscaleRules.prompt(transparent: false)
+            .replacingOccurrences(of: "Keep the background exactly as it is.",
+                                  with: transparent ? "Keep the background transparent." : "Keep the background exactly as it is.")
+        + " The attached image is the image to upscale. Preserve its full canvas, including the empty margins; "
+        + "do not zoom or reframe. Copy all text verbatim, including accents, font, spacing and placement. "
+        + "Preserve every border, corner ornament, highlight and shadow."
+    }
+}
+
+/// Owned by the UI thread; different models may run together, repeated clicks may not.
+struct AIUpscaleActivity {
+    private var pending: Set<String> = []
+    mutating func claim(_ urls: [URL], model: AIUpscaleModel) -> [URL] {
+        urls.filter { pending.insert(model.rawValue + ":" + $0.standardizedFileURL.path).inserted }
+    }
+    mutating func release(_ urls: [URL], model: AIUpscaleModel) {
+        for url in urls { pending.remove(model.rawValue + ":" + url.standardizedFileURL.path) }
     }
 }
