@@ -11653,6 +11653,25 @@ final class SetDesignTests: XCTestCase {
 
     // Only the sizes each image model takes are asked for (Vertex model cards; service 1.2.0
     // refuses any other).
+    // H5G quality floor: Nano Banana 2.1 is never sent below 2K, whatever the caller asked.
+    func testNanoBanana21RestoresSupportedSizes() {
+        XCTAssertEqual(RestyleRules.normalizedSize("1K", forModelFlag: "nb2.1"), "2K")
+        XCTAssertEqual(RestyleRules.normalizedSize("", forModelFlag: "nb2.1"), "2K")
+        XCTAssertEqual(RestyleRules.normalizedSize("4K", forModelFlag: "nb2.1"), "4K")
+        XCTAssertEqual(RestyleRules.normalizedSize("1K", forModelFlag: "nb2"), "1K")
+        XCTAssertEqual(GeneratedSizeRules.sizes(model: GeneratedSizeRules.nanoBanana21), ["2K", "4K"])
+    }
+
+    func testNanoBanana21NeverBelow2K() {
+        let m = GeneratedSizeRules.nanoBanana21
+        XCTAssertEqual(GeneratedSizeRules.requested(model: m, size: nil), "2K")
+        XCTAssertEqual(GeneratedSizeRules.requested(model: m, size: "1K"), "2K")
+        XCTAssertEqual(GeneratedSizeRules.requested(model: m, size: "4K"), "4K")
+        XCTAssertEqual(GeneratedSizeRules.requested(model: "gemini-3.1-flash-image", size: "1K"), "1K")
+        XCTAssertEqual(RestyleRules.sizes(forModelFlag: "nb2.1"), ["2K", "4K"])
+        XCTAssertTrue(RestyleRules.sizes(forModelFlag: "nb2.1").contains(RestyleRules.defaultSize))
+    }
+
     func testEachImageModelIsAskedOnlyForItsSizes() {
         XCTAssertEqual(GeneratedSizeRules.sizes(model: "gemini-2.5-flash-image"), [])
         XCTAssertEqual(GeneratedSizeRules.sizes(model: "gemini-3.1-flash-lite-image"), ["1K"])
@@ -14792,5 +14811,19 @@ final class PickArtTests: XCTestCase {
         for x in 15..<35 { px[((n - 1) * n + x) * 4 + 3] = 10 }                      // a faint line along the bottom
         FrameKit.clearSpecks(&px, width: n, height: n)
         XCTAssertEqual(a(0, 20), 255); XCTAssertEqual(a(0, 10), 255); XCTAssertEqual(a(n - 1, n - 1), 0); XCTAssertEqual(a(25, n - 1), 0)
+    }
+}
+
+final class NB21ResumeMigrationTests: XCTestCase {
+    func testOldNB2SetsUseNewModelForFutureGenerations() {
+        for flag in ["nb2", "gemini-3.1-flash-image", "gemini-3.1-flash-image-preview"] {
+            let model = GeneratedSizeRules.resumedModelFlag(flag)
+            XCTAssertEqual(model, "nb2.1")
+            XCTAssertEqual(RestyleRules.normalizedSize("1K", forModelFlag: model), "2K")
+            XCTAssertEqual(RestyleRules.normalizedSize("4K", forModelFlag: model), "4K")
+        }
+        for flag in ["nb2.1", "nb-pro", "nb-lite", "nb1"] {
+            XCTAssertEqual(GeneratedSizeRules.resumedModelFlag(flag), flag)
+        }
     }
 }

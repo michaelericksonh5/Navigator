@@ -4214,7 +4214,7 @@ func fxAlphaUpscale(_ srcs: [URL], size: String, onDone: (([URL]) -> Void)? = ni
             // 3. Regenerate at the requested size.
             let prompt = RestyleRules.prompt(mode: .editWithStyleText, contents: identity,
                                              styleText: fxAlphaUpscaleStyleText)
-            let r = runRestyle(source: padded, prompt: prompt, modelFlag: "nb2", aspect: "auto",
+            let r = runRestyle(source: padded, prompt: prompt, modelFlag: "nb2.1", aspect: "auto",
                                size: size, nameAfter: src, identity: identity,
                                sendSourceImage: true, modeLabel: "FX Alpha Upscale \(size)")
             guard let restyled = r.saved else {
@@ -20054,6 +20054,10 @@ enum H5GService {
             return (nil, nil, "Not signed in to Vertex. Use AI → Sign in to Google first.")
         }
         guard let url = URL(string: base + "/v1/images") else { return (nil, nil, "bad service URL") }
+        if modelID == GeneratedSizeRules.nanoBanana21,
+           !capabilities().contains("image.model.gemini_nano_banana_2_1") {
+            return (nil, nil, "The AI service needs the Nano Banana 2.1 update. Ask the maintainer to deploy it.")
+        }
         var body: [String: Any] = ["prompt": prompt, "model": modelID]
         if !inputPNGs.isEmpty {
             // "base64", not "data" — the service checks im?.base64 (matches client.mjs's
@@ -20068,11 +20072,13 @@ enum H5GService {
         if let aspect, !aspect.isEmpty { body["aspect_ratio"] = aspect }
         // Only a size the model takes: the service refuses any other (1.2.0), and these
         // models return their one size whatever is asked.
+        let size = GeneratedSizeRules.requested(model: modelID, size: size)
         if let size, !size.isEmpty, GeneratedSizeRules.sizes(model: modelID).contains(size) { body["image_size"] = size }
         // Nano Banana 2 thinks at "minimal" unless asked; "high" is its other level (Gemini image
         // docs, checked 30 Sep 2026). Sent only once the service lists image.thinking_level:
         // it does not yet, and an unknown field on a paid call is not worth the risk.
-        if modelID.contains("flash-image") || modelID.contains("flash-lite-image"),
+        // Nano Banana 2.1 defaults to MEDIUM; H5G runs it at HIGH for art quality.
+        if modelID == "gemini-3.1-flash-image" || modelID == "gemini-3.1-flash-lite-image" || modelID == "gemini-3-pro-image" || modelID == GeneratedSizeRules.nanoBanana21,
            capabilities().contains("image.thinking_level") { body["thinking_level"] = "high" }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
@@ -20361,8 +20367,10 @@ func hasTransparency(_ url: URL) -> Bool {
 struct NanoBananaModel: Identifiable, Hashable {
     let flag: String, id: String, name: String, note: String
     static let all = [
+        NanoBananaModel(flag: "nb2.1", id: GeneratedSizeRules.nanoBanana21, name: "Nano Banana 2.1",
+                        note: "Default. Newest; high thinking, 2K or 4K."),
         NanoBananaModel(flag: "nb2", id: "gemini-3.1-flash-image", name: "Nano Banana 2",
-                        note: "Default."),
+                        note: "The previous default."),
         NanoBananaModel(flag: "nb-lite", id: "gemini-3.1-flash-lite-image", name: "Nano Banana 2 Lite",
                         note: "Faster and cheaper than NB2."),
         NanoBananaModel(flag: "nb-pro", id: "gemini-3-pro-image", name: "Nano Banana Pro",
@@ -20551,7 +20559,7 @@ struct RestyleSheet: View {
     @State private var styleText = ""
     @State private var styleBusy = false
     @State private var extra = ""
-    @State private var modelFlag = "nb2"
+    @State private var modelFlag = "nb2.1"
     @State private var size = RestyleRules.defaultSize
     @State private var aspect = "auto"
     @State private var padOn = true
@@ -21708,7 +21716,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reletter-compare"), flag +
                     try? prompt.write(to: out.appendingPathComponent("\(p.stem)-\(lang)-prompt.txt"), atomically: true, encoding: .utf8)
                     let reference = downsamplePNG(englishData, longEdge: 2048) ?? englishData
                     var cells: [(model: String, px: FrameKit.Piece?, note: String)] = []
-                    for model in ["gpt", "nb2"] {
+                    for model in ["gpt", "nb2.1"] {
                         let estimate = model == "gpt" ? AssetChecklist.gpt(p.w, p.h) : 0.101
                         guard spent + estimate <= budget else { print("BUDGET: \(p.stem) \(lang) \(model) not drawn"); cells.append((model, nil, "not drawn: budget")); continue }
                         var drawn: FrameKit.Piece?, cost = 0.0, error: String?
@@ -21721,7 +21729,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--reletter-compare"), flag +
                             let pad = padded(p.w, p.h), ox = (pad.w - p.w) / 2, oy = (pad.h - p.h) / 2
                             var target = flat(pad.w, pad.h)
                             if !alone { FrameKit.over(&target, width: pad.w, FrameKit.resized(english, p.w, p.h), at: ox, oy) }
-                            let r = H5GService.image(prompt: prompt, modelID: "gemini-3.1-flash-image", inputPNGs: (alone ? [reference] : []) + [png(target, pad.w, pad.h)].compactMap { $0 },
+                            let r = H5GService.image(prompt: prompt, modelID: GeneratedSizeRules.nanoBanana21, inputPNGs: (alone ? [reference] : []) + [png(target, pad.w, pad.h)].compactMap { $0 },
                                                      aspect: pad.aspect, size: "2K")
                             cost = r.cost ?? (r.png == nil ? 0 : estimate); error = r.error
                             drawn = r.png.flatMap(pixels).map { FrameKit.crop(FrameKit.resized($0, pad.w, pad.h).px, width: pad.w, ox, oy, p.w, p.h) }
@@ -22892,7 +22900,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--style-test") {
                        silhouette: "giant bust", aspect: "1:1", size: "1K")
     job.hasFrame = true
     let backing = SlotBackingRules.candidates[2]
-    let model = NanoBananaModel.byFlag("nb2").id
+    let model = NanoBananaModel.byFlag("nb2.1").id
 
     // --short uses the ~200-word brief; --reps N repeats each style for a real sample.
     let useShort = args.contains("--short")
@@ -24518,6 +24526,10 @@ func pngPixelSize(_ data: Data) -> (w: Int, h: Int)? {
 }
 
 func nbEstimatedCost(size: String, modelFlag: String) -> Double {
+    if modelFlag == "nb2.1" {
+        // Google's published per-image price; HIGH thinking adds a little at the text rate.
+        return size == "4K" ? 0.1134 : 0.0504
+    }
     if modelFlag == "nb-pro" {
         switch size {
         case "4K": return 0.240
@@ -25162,9 +25174,8 @@ final class GDDToAssetsRun: ObservableObject {
         get { keyingCount > 0 }
         set { keyingCount = max(0, keyingCount + (newValue ? 1 : -1)) }
     }
-    /// Nano Banana 2 by default. Pro is offered because NB2 does not reliably honour
-    /// a 2K request and Pro did in testing.
-    @Published var modelFlag = "nb2"
+    /// Nano Banana 2.1 by default (high thinking, 2K floor). NB2 and Pro stay selectable.
+    @Published var modelFlag = "nb2.1"
 
     /// Bumped whenever the inputs change. A planning answer that arrives after the
     /// user has switched document or theme belongs to a game that is no longer on
@@ -28623,7 +28634,10 @@ extension GDDToAssetsRun {
         run.frameArtist = FrameArtist(picked)
         run.panelColour = PanelColour(picked)
         run.backing = (name: m.backingName, rgb: m.backingRGB)
-        run.modelFlag = m.model
+        run.modelFlag = GeneratedSizeRules.resumedModelFlag(m.model)
+        for index in run.jobs.indices {
+            run.jobs[index].size = RestyleRules.normalizedSize(run.jobs[index].size, forModelFlag: run.modelFlag)
+        }
         run.reelLayout = m.reels
         run.typed = m.typed ?? false; run.languages = m.languages ?? (m.localize == true ? Array(Localized.codes.dropFirst()) : [])
         run.gddText = (try? String(contentsOf: folder.appendingPathComponent(SetManifest.documentName), encoding: .utf8)) ?? ""
@@ -30939,10 +30953,10 @@ struct GDDToAssetsSheet: View {
         if !s.manualSpec.isEmpty { manualSpec = s.manualSpec }
         manualName = run.gameName
         if let sh = s.sheet { sheet = sh }
-        if !s.size.isEmpty { size = s.size }
+        if !s.size.isEmpty { size = RestyleRules.normalizedSize(s.size, forModelFlag: run.modelFlag) }
         if !s.symbolAspect.isEmpty { symbolAspect = s.symbolAspect }
         if !s.backgroundAspect.isEmpty { backgroundAspect = s.backgroundAspect }
-        if !s.backgroundSize.isEmpty { backgroundSize = s.backgroundSize }
+        if !s.backgroundSize.isEmpty { backgroundSize = RestyleRules.normalizedSize(s.backgroundSize, forModelFlag: run.modelFlag) }
         removeBG = s.removeBackground; separateFrames = s.separateFrames
         // Where it goes: where it was saved going, else beside the set itself.
         outParent = s.outputParent.map { URL(fileURLWithPath: $0) } ?? run.lastFolder?.deletingLastPathComponent()
@@ -31741,7 +31755,7 @@ struct GDDToAssetsSheet: View {
             }
             HStack(spacing: 22) {
                 Picker("Model", selection: $run.modelFlag) {
-                    ForEach(NanoBananaModel.all.filter { $0.flag == "nb2" || $0.flag == "nb-pro" },
+                    ForEach(NanoBananaModel.all.filter { ["nb2.1", "nb2", "nb-pro"].contains($0.flag) },
                             id: \.flag) { Text($0.name).tag($0.flag) }
                 }.frame(width: 220)
                 // Each group reads as one thing: what it is, then its resolution and shape.
@@ -31750,7 +31764,7 @@ struct GDDToAssetsSheet: View {
                 HStack(spacing: 6) {
                     Text("Symbols")
                     Picker("Symbol resolution", selection: $size) {
-                        ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
+                        ForEach(RestyleRules.sizes(forModelFlag: run.modelFlag), id: \.self) { Text($0) }
                     }.labelsHidden().frame(width: 72).help("Symbol resolution")
                     Picker("Symbol aspect ratio", selection: $symbolAspect) {
                         ForEach(AssetPlanRules.symbolAspects, id: \.self) { Text($0) }
@@ -31759,7 +31773,7 @@ struct GDDToAssetsSheet: View {
                 HStack(spacing: 6) {
                     Text("Backgrounds")
                     Picker("Background resolution", selection: $backgroundSize) {
-                        ForEach(AssetPlanRules.sizes, id: \.self) { Text($0) }
+                        ForEach(RestyleRules.sizes(forModelFlag: run.modelFlag), id: \.self) { Text($0) }
                     }.labelsHidden().frame(width: 72).help("Background resolution")
                     Picker("Background aspect ratio", selection: $backgroundAspect) {
                         ForEach(AssetPlanRules.backgroundAspects, id: \.self) { Text($0) }
@@ -31771,6 +31785,10 @@ struct GDDToAssetsSheet: View {
             .onChange(of: symbolAspect) { if !restoring { reflow() } }
             .onChange(of: backgroundAspect) { if !restoring { reflow() } }
             .onChange(of: backgroundSize) { if !restoring { reflow() } }
+            .onChange(of: run.modelFlag) {
+                size = RestyleRules.normalizedSize(size, forModelFlag: run.modelFlag)
+                backgroundSize = RestyleRules.normalizedSize(backgroundSize, forModelFlag: run.modelFlag)
+            }
             if run.modelFlag == "nb2" && size == "2K" {
                 // Beside the setting it is about, not below the post-processing options.
                 Label("2K often comes back at half size. Navigator retries at 4K and scales "

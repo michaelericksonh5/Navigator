@@ -807,7 +807,12 @@ enum RestyleRules {
     /// client rather than a measurement — that was wrong to assert, and it hid sizes
     /// the newer models do render. Anything a model refuses comes back as a plain API
     /// error, which is better than a picker that quietly withholds an option.
-    static func sizes(forModelFlag flag: String) -> [String] { ["1K", "2K", "4K"] }
+    /// Nano Banana 2.1 is the exception: H5G's quality floor is 2K, so 1K is not offered.
+    static func sizes(forModelFlag flag: String) -> [String] { flag == "nb2.1" ? ["2K", "4K"] : ["1K", "2K", "4K"] }
+
+    static func normalizedSize(_ size: String, forModelFlag flag: String) -> String {
+        flag == "nb2.1" && !["2K", "4K"].contains(size) ? "2K" : size
+    }
 
     // MARK: - Vision prompts (describe an image in text, via /v1/vision)
 
@@ -12782,8 +12787,24 @@ enum GeneratedSizeRules {
         switch model {
         case "gemini-2.5-flash-image": return []
         case "gemini-3.1-flash-lite-image": return ["1K"]
+        case nanoBanana21: return ["2K", "4K"]   // the card lists 1K too; 2K is H5G's quality floor
         default: return ["1K", "2K", "4K"]
         }
+    }
+
+    static let nanoBanana21 = "gemini-nano-banana-2.1"
+
+    /// Reopened sets use the current replacement for their old NB2 default.
+    /// Historical output metadata remains unchanged; this only selects the next generation.
+    static func resumedModelFlag(_ flag: String) -> String {
+        ["nb2", "gemini-3.1-flash-image", "gemini-3.1-flash-image-preview"].contains(flag) ? "nb2.1" : flag
+    }
+
+    /// The size actually sent. Nano Banana 2.1 is never asked for less than 2K — H5G's quality
+    /// floor — so a 1K (or unset) request from any caller goes out as 2K.
+    static func requested(model: String, size: String?) -> String? {
+        guard model == nanoBanana21 else { return size }
+        return size == "4K" ? "4K" : "2K"
     }
 
     /// The long edge each size name is asking for.
@@ -12862,7 +12883,7 @@ public struct AssetJob: Equatable, Sendable {
     /// The brief, while it still describes the subject on the row.
     public var currentBrief: String? { brief.isEmpty || briefSubject != subject ? nil : brief }
     public let aspect: String        // "1:1" symbols; backgrounds follow BackgroundFormatRules
-    public let size: String
+    public var size: String
     public var filename: String { "\(id).png" }
     /// The form it takes on the reels beyond its role (SymbolForm's raw value; "" a single), and for one drawn from
     /// another symbol — a double, triple or free-games version — that symbol's code.
