@@ -14905,3 +14905,42 @@ final class NB21ResumeMigrationTests: XCTestCase {
         }
     }
 }
+
+final class NativeBGRemovalTests: XCTestCase {
+    /// A green disc with an anti-aliased rim and a 20% magenta spill on it, on a magenta backing.
+    func disc(size: Int = 96) -> [UInt8] {
+        var px = [UInt8](repeating: 255, count: size * size * 4)
+        let key: [Double] = [255, 0, 255], art: [Double] = [50, 170, 60], c = Double(size) / 2
+        for y in 0..<size {
+            for x in 0..<size {
+                let d = ((Double(x) - c) * (Double(x) - c) + (Double(y) - c) * (Double(y) - c)).squareRoot()
+                let cover = min(1, max(0, 30.5 - d))
+                let spill = d > 27 ? 0.2 : 0
+                for k in 0..<3 {
+                    let tinted = art[k] * (1 - spill) + key[k] * spill
+                    px[(y * size + x) * 4 + k] = UInt8((tinted * cover + key[k] * (1 - cover)).rounded())
+                }
+            }
+        }
+        return px
+    }
+
+    func testKeysTheBackingAndKeepsTheArt() throws {
+        let n = 96
+        let out = try XCTUnwrap(NativeBGRemoval.matte(rgba: disc(size: n), width: n, height: n, subject: nil))
+        XCTAssertEqual(out[(2 * n + 2) * 4 + 3], 0, "backing removed")
+        XCTAssertEqual(out[(48 * n + 48) * 4 + 3], 255, "art opaque")
+        // The spilled rim gets the art's colour back (left as it was it would be 66 levels off).
+        for i in 0..<(n * n) where out[i * 4 + 3] > 40 {
+            let off = (pow(Double(out[i * 4]) - 50, 2) + pow(Double(out[i * 4 + 1]) - 170, 2) + pow(Double(out[i * 4 + 2]) - 60, 2)).squareRoot()
+            XCTAssertLessThan(off, 40, "pixel \(i) keeps key colour")
+        }
+    }
+
+    func testRefusesAnImageNotOnAFlatKeyColour() {
+        var rng = SystemRandomNumberGenerator()
+        let n = 64
+        let noise = (0..<(n * n * 4)).map { $0 % 4 == 3 ? UInt8(255) : UInt8.random(in: 0...255, using: &rng) }
+        XCTAssertNil(NativeBGRemoval.matte(rgba: noise, width: n, height: n, subject: nil))
+    }
+}

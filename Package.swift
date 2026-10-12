@@ -21,7 +21,7 @@ let package = Package(
             path: ".",
             exclude: ["main.swift", "FinderExt.swift", "rebuild.sh", "runtests.sh",
                       "Tests", "Navigator.zip", "README.md"],
-            sources: ["NavigatorCore.swift"]
+            sources: ["NavigatorCore.swift", "NativeBGRemoval.swift"]
         ),
         .testTarget(
             name: "NavigatorCoreTests",

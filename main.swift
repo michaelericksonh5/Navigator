@@ -4992,6 +4992,73 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
     }
 }
 
+// Native BG Removal (NativeBGRemoval.swift): no Adobe app, about a second an image. For art generated on a flat key
+// colour; writes "<base>_rmbg.png" next to each source, originals untouched. Runs as the optimized helper bundled in
+// the app, because this unoptimized build takes a minute an image (see NativeBGRemoval.swift).
+func nativeBGRemoval(_ src: URL) throws -> URL {
+    func failure(_ message: String) -> NSError {
+        NSError(domain: "NativeBGRemoval", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+    guard let tool = Bundle.main.url(forAuxiliaryExecutable: "NavigatorNativeBG") else {
+        throw failure("This Navigator was built without its NavigatorNativeBG helper; build it with rebuild.sh or quickbuild.sh.")
+    }
+    let r = try ExternalProcess.run(tool.path, arguments: [src.path], timeout: 300).completed()
+    guard r.status == 0 else { throw failure(r.err.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    return URL(fileURLWithPath: r.out.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+// Every exit calls back, including the failures — see chromaKeyForImages. `quiet` logs failures instead of showing
+// them, for a caller that handles them itself.
+func nativeBGRemovalForImages(_ srcs: [URL], quiet: Bool = false, onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) }
+    guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
+    DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds", total: imgs.count) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = []
+        var errors: [String] = []
+        for src in imgs {
+            do { outs.append(try nativeBGRemoval(src)) }
+            catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
+            DispatchQueue.main.async { BGJobProgress.shared.advance() }
+        }
+        DispatchQueue.main.async {
+            BGJobProgress.shared.finish("Removed \(outs.count) of \(imgs.count) background\(imgs.count == 1 ? "" : "s")")
+            if quiet { errors.forEach { navLog("native bg: \($0)") } }
+            else if !errors.isEmpty { showBGSummary(app: "Native BG Removal", done: outs.count, total: imgs.count, errors: errors) }
+            onDone?(outs)
+        }
+    }
+}
+
+func nativeBGRemovalForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
+    nativeBGRemovalForImages([src]) { outs in
+        if let out = outs.first { onDone?(out) }
+    }
+}
+
+/// GDD to Assets' cut-outs, each on its own canvas so the set registers. Its symbols are drawn on a flat backing,
+/// which is Native BG Removal's job; one it refuses (a symbol that came back on a painted scene) goes to Photoshop
+/// when Photoshop is installed.
+func cutOutSymbols(_ urls: [URL], onDone: @escaping ([URL]) -> Void) {
+    let photoshop = PhotoshopIcon.image != nil
+    nativeBGRemovalForImages(urls, quiet: photoshop) { outs in
+        let made = Set(outs.map(\.standardizedFileURL.path))
+        let refused = urls.filter { !made.contains(rmbgOutputURL($0).standardizedFileURL.path) }
+        guard photoshop, !refused.isEmpty else { onDone(outs); return }
+        navLog("gdd cut: Native BG Removal refused \(refused.count) — Photoshop cuts those")
+        removeBackgroundForImages(refused, keepCanvas: true) { more in onDone(outs + more) }
+    }
+}
+
+func batchNativeBGRemovalFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
+    let imgs = batchImageURLs(in: folder)
+    guard !imgs.isEmpty else {
+        DispatchQueue.main.async { reportFileError("No images to process", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_rmbg” files).") }
+        onDone?(); return
+    }
+    nativeBGRemovalForImages(imgs) { _ in onDone?() }
+}
+
 func confirmEmptyTrash(_ browser: Browser) {
     let a = NSAlert(); a.alertStyle = .warning
     a.messageText = "Empty the Trash?"
@@ -8201,6 +8268,17 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && $0.url.pathExtension.lowercased() == "png" }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
         chromaKeyForImages(urls, profile: profile) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+
+    // Native BG Removal on the selected image(s), or every image in one selected folder.
+    func nativeBGRemoval(_ ids: Set<String>) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        nativeBGRemovalForImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+    func batchNativeBGRemoval(_ ids: Set<String>) {
+        guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
+        batchNativeBGRemovalFolder(it.url) { [weak self] in self?.refresh() }
     }
 
     // Batch Chroma Key BG writes each <name>_rmbg.png next to its source.
@@ -11961,6 +12039,19 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                     } label: { Label("Batch Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
             }
+            do {
+                // No Adobe app needed, so never gated on one.
+                let sel = browser.items.filter { ids.contains($0.id) }
+                let imgCount = sel.filter { !$0.isDirectory && isImageFile($0.url) }.count
+                let dirs = sel.filter { $0.isDirectory }
+                if imgCount >= 1 {
+                    Button { browser.nativeBGRemoval(ids) } label: {
+                        Label(imgCount == 1 ? "Native BG Removal" : "Native BG Removal (\(imgCount) images)", systemImage: "scissors")
+                    }
+                } else if dirs.count == 1, sel.count == 1 {
+                    Button { browser.batchNativeBGRemoval(ids) } label: { Label("Batch Native BG Removal", systemImage: "scissors") }
+                }
+            }
             // FX Alpha Upscale — regenerate + key, one action. A submenu only because
             // 2K and 4K are different prices; there is nothing else to configure.
             do {
@@ -15417,6 +15508,7 @@ struct ImageViewerView: View {
                 if u.pathExtension.lowercased() == "png" {
                     Button { chromaKeyForImage(u) { out in revealNewImage(out) } } label: { Label("Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
+                Button { nativeBGRemovalForImage(u) { out in revealNewImage(out) } } label: { Label("Native BG Removal", systemImage: "scissors") }
             }
             if currentURL != nil {
                 Divider()
@@ -18572,6 +18664,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "chromakey-solid":
             folders.forEach { batchChromaKeyFolder($0, profile: .solidSymbol) }
             if !images.isEmpty { chromaKeyForImages(images, profile: .solidSymbol) }
+        case "nativebg":
+            folders.forEach { batchNativeBGRemovalFolder($0) }
+            if !images.isEmpty { nativeBGRemovalForImages(images) }
         case "upscale-vertex", "upscale-gpt25":
             let model: AIUpscaleModel = url.host == "upscale-gpt25" ? .gpt25 : .pro
             folders.forEach { batchUpscaleFolderAI($0, model: model) }
@@ -18631,6 +18726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         .init(title: "Remove BG",              action: "removebg",     requires: "com.adobe.Photoshop",    acceptsFolders: true),
         // Native extraction is available even without After Effects installed.
         .init(title: "Chroma Key BG",          action: "chromakey",    requires: nil, acceptsFolders: true),
+        .init(title: "Native BG Removal",      action: "nativebg",     requires: nil, acceptsFolders: true),
         .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: true),
     ]
     // Older names to clean up so we don't leave stale duplicates behind (includes
@@ -21476,6 +21572,25 @@ if CommandLine.arguments.contains("--service-info") {
     app.run()
 }
 
+// Native BG Removal, headless:  Navigator --native-bg <image or folder>...
+// Writes each "<name>_rmbg.png" next to its source, exactly as the menu item does.
+if let flag = CommandLine.arguments.firstIndex(of: "--native-bg") {
+    var srcs: [URL] = []
+    for p in CommandLine.arguments[(flag + 1)...] {
+        let u = URL(fileURLWithPath: p)
+        srcs += (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true ? batchImageURLs(in: u) : [u]
+    }
+    var failed = 0
+    for src in srcs {
+        let t0 = Date()
+        do {
+            let out = try nativeBGRemoval(src)
+            print(String(format: "%@  %.2fs", out.path, Date().timeIntervalSince(t0)))
+        } catch { failed += 1; print("\(src.lastPathComponent): \(error.localizedDescription)") }
+    }
+    exit(failed == 0 ? 0 : 1)
+}
+
 // Timing:  Navigator --timing [<theme>]
 if CommandLine.arguments.contains("--timing") {
     let args = CommandLine.arguments
@@ -21865,7 +21980,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--generate-set"), flag + 2 <
     DispatchQueue.main.async { MainActor.assumeIsolated {
         guard let run = GDDToAssetsRun.reopen(folder) else { print("FAILED: no \(SetManifest.fileName)"); exit(1) }
         print(String(format: "GENERATING: %@ (%@) — estimate $%.2f", ids.sorted().joined(separator: ","), run.framing.rawValue, run.estimate(for: ids)))
-        // --cut: Photoshop takes each symbol off its backing, and each is sized for the reels by its kind.
+        // --cut: each symbol taken off its backing (cutOutSymbols), and each sized for the reels by its kind.
         run.generate(into: folder, removeBackground: args.contains("--cut"), separateFrames: false, only: ids) { made in
             print("MADE: \(made.map(\.lastPathComponent))")
             // A layered set is built after the batch; wait for it. Exits only after saying so: a
@@ -22247,7 +22362,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--restore"), flag + 3 < Comm
 }
 
 // Free without --layerize, PAID with it:  Navigator --finish <set folder> <id,id,…> [--layerize]
-// The review window's last step: Remove BG (Photoshop) on those symbols and the frames, then the
+// The review window's last step: the backgrounds off those symbols and the frames (cutOutSymbols), then the
 // planned split when asked. Waits for both.
 if let flag = CommandLine.arguments.firstIndex(of: "--finish"), flag + 2 < CommandLine.arguments.count {
     let args = CommandLine.arguments
@@ -28448,14 +28563,16 @@ final class GDDToAssetsRun: ObservableObject {
                 // one's files while they are being keyed.
                 self.running = false
                 onFinished(out)
-                // Photoshop, NOT the After Effects chroma key.
+                // Native BG Removal (cutOutSymbols), NOT the After Effects chroma key.
                 //
                 // Keylight is a CHROMA key: it decides transparency from how close a
                 // pixel is to the screen colour, and then despills — pulls that colour
                 // back out of everything it kept. On a magenta field that means removing
                 // red and blue from the whole symbol, which is why a gold-and-crimson
-                // giant came back uniformly green. Photoshop's background removal picks
-                // the SUBJECT instead, and never touches the colours inside it.
+                // giant came back uniformly green. Native BG Removal never touches the
+                // colours inside the art (only its rim is unmixed from the backing), and
+                // drops the glows the generator paints into the backing by Apple's subject
+                // mask, as Photoshop's subject-picking cut did.
                 //
                 // Backgrounds are excluded by construction — symbolPNGs is filtered to
                 // kind == .symbol. A background IS the background; there is nothing to
@@ -28476,8 +28593,8 @@ final class GDDToAssetsRun: ObservableObject {
         }
     }
 
-    /// After a batch, or on its own for symbols already drawn: Remove BG in Photoshop on the
-    /// symbols and frames, then each framed symbol split by a Layerize call planned for it.
+    /// After a batch, or on its own for symbols already drawn: the backgrounds off the symbols and
+    /// frames (cutOutSymbols), then each framed symbol split by a Layerize call planned for it.
     /// Each cut-out sized for the reels by its kind (ReelSizing): low pays smaller than the high pays,
     /// specials as large — the same however big each was drawn. In place, on its own canvas.
     func sizeForReels(_ cutouts: [URL]) {
@@ -28518,14 +28635,14 @@ final class GDDToAssetsRun: ObservableObject {
     func cutAndSplit(_ symbolPNGs: [URL], removeBackground: Bool, separateFrames: Bool) {
         if removeBackground && !symbolPNGs.isEmpty {
             self.keying = true
-            self.status += "  Removing symbol backgrounds in Photoshop — carrying on in the background."
-            // Photoshop keeps each symbol on its own canvas, so the set registers. Putting a
-            // trimmed cut-out back by finding the subject in the source was off by up to
-            // 35px: the source's faint glow counts as subject, Photoshop's cut does not.
-            removeBackgroundForImages(symbolPNGs, keepCanvas: true) { done in
+            self.status += "  Removing symbol backgrounds — carrying on in the background."
+            // Each symbol stays on its own canvas, so the set registers. Putting a trimmed
+            // cut-out back by finding the subject in the source was off by up to 35px: the
+            // source's faint glow counts as subject, the cut does not.
+            cutOutSymbols(symbolPNGs) { done in
                 self.keying = false
                 self.status = done.isEmpty
-                    ? "Background removal didn’t produce anything — check Photoshop."
+                    ? "Background removal didn’t produce anything — see Navigator's log."
                     : "Backgrounds removed from \(done.count) of \(symbolPNGs.count) symbols."
                 self.trimGlows(done)
                 self.sizeForReels(done)
@@ -28909,7 +29026,7 @@ extension GDDToAssetsRun {
         }
     }
 
-    /// Builds the layered pays of `ids` (nil: every one) from their pieces. Photoshop first cuts
+    /// Builds the layered pays of `ids` (nil: every one) from their pieces. cutOutSymbols first cuts
     /// any frame or symbol drawn since it was last cut; then each is stacked (`stack`). Free.
     func stackFramed(_ folder: URL, only ids: [String]? = nil, done: (() -> Void)? = nil) {
         let design = styledDesign
@@ -28964,8 +29081,8 @@ extension GDDToAssetsRun {
             }
         }
         if uncut.isEmpty { build() } else {
-            status = "Cutting out \(uncut.count) piece\(uncut.count == 1 ? "" : "s") in Photoshop, then building the framed symbols…"
-            removeBackgroundForImages(uncut, keepCanvas: true) { _ in build() }
+            status = "Cutting out \(uncut.count) piece\(uncut.count == 1 ? "" : "s"), then building the framed symbols…"
+            cutOutSymbols(uncut) { _ in build() }
         }
     }
 
@@ -30463,7 +30580,7 @@ enum SpineExport {
             let W = first.width, H = first.height
             let split = layers.count > 1
             if !split, run.jobs.first(where: { $0.id == id })?.hasFrame == true { unsplit.append(id) }
-            let prov = "Navigator GDD to Assets: \(split ? "Seedream 5.0 Pro Layerize (fal.ai), planned per symbol by Gemini, assembled by role" : "Photoshop Remove Background cut-out, one layer")"
+            let prov = "Navigator GDD to Assets: \(split ? "Seedream 5.0 Pro Layerize (fal.ai), planned per symbol by Gemini, assembled by role" : "background removed (Native BG Removal, or Photoshop where it refused), one layer")"
                 + "; source \(id).png on the \(run.backing.name) backing"
             let w = SpineKitRules.workingSize(width: W, height: H)
             guard kit(id, layers: layers, docW: w.w, docH: w.h, into: out.appendingPathComponent("\(id)/working"), provenance: prov),
@@ -31905,7 +32022,7 @@ struct GDDToAssetsSheet: View {
             .disabled(run.busy || run.running)
             VStack(alignment: .leading, spacing: 6) {
                 Text("After generating").font(.subheadline).bold().padding(.top, 4)
-                Toggle("Remove symbol backgrounds with Photoshop", isOn: $removeBG)
+                Toggle("Remove symbol backgrounds", isOn: $removeBG)
                 Toggle("Soften pot sparkle in code", isOn: $run.softenPots)
                     .help("Eases each pot drawing's glitter and finest texture to the shipped phone-size limits as it arrives, only as far as it needs. It makes the art a little soft close up, so it is off unless you want it. Navigator --soften-pots does the same to a set drawn already.")
                 // Layerize is fal.ai's: without a key it is not offered, so nothing can start and then fail on it.

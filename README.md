@@ -104,10 +104,12 @@ All of it sits in the right-click menu, runs in the background with a progress i
 
 **Remove BG** · **Chroma Key BG** · **Quick Export as PNG** — Photoshop and After Effects driven directly, single file or whole folder.
 
+**Native BG Removal** — for art generated on a flat key colour, with no Adobe app: a known-backing matte for the edges, plus Apple's on-device subject mask to drop the glows and haze AI generators paint into the key colour. About a second an image. Measured against both on 30 shipped symbols and 19 real AI outputs: cleaner edges than After Effects Keylight, and 25 key-coloured pixels left in total where Photoshop left 44,109.
+
 **Generative Upscale (Firefly)** — Photoshop's own upscaler, scripted. Adobe's Firefly model only, and Navigator refuses to save the result if Photoshop hands back a different one.
 
 ### Integration
-**Navigator's own submenu in Finder's right-click menu** — Open in Navigator, Open Location in Navigator, and the AI toolkit: Remove BG, Prep for AI, Upscale, Restyle, Layerize, Quick Export as PNG. It's a Finder extension, so **it works whether or not Navigator is running** — clicking an item launches it on demand. Enable it in the setup window. **Finder Quick Actions** can be installed too (AI ▸ Install Finder Quick Actions).
+**Navigator's own submenu in Finder's right-click menu** — Open in Navigator, Open Location in Navigator, and the AI toolkit: Remove BG, Native BG Removal, Prep for AI, Upscale, Restyle, Layerize, Quick Export as PNG. It's a Finder extension, so **it works whether or not Navigator is running** — clicking an item launches it on demand. Enable it in the setup window. **Finder Quick Actions** can be installed too (AI ▸ Install Finder Quick Actions).
 
 **Open/Save dialog path bridge** — the feature Photoshop and Chrome are missing. Copy any folder path in Navigator, then in *any* app's Open or Save dialog press **⌃⌥⌘G** to copy the path (then ⇧⌘G and ⌘V yourself), or **⌃⌥⇧⌘G** to do all of it in one keystroke. Google Drive paths pasted from a coworker are remapped to your own Drive account. The chord is configurable (G / P / K). The one-key version needs Accessibility; the copy version doesn't.
 

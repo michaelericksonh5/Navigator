@@ -19,3 +19,4 @@ ext.entitlements
 # binary belongs — tracking it put 514 MB of dead weight into this history (90% of
 # the repo) before it was purged. Never commit it again.
 Navigator.zip
+NavigatorNativeBG.bin

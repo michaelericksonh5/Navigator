@@ -104,6 +104,8 @@ final class NavigatorFinderSync: FIFinderSync {
                     add(m, "Solid subject — opaque interior", "chromakey-solid", Self.icon(systemSymbol: "square.fill"))
                 })
             }
+            // No Adobe app needed, so never gated on one.
+            add(sub, "Native BG Removal", "nativebg", Self.icon(systemSymbol: "scissors"))
             if hasAE, hasImage {
                 // Paid per image; Navigator shows the price and asks before spending.
                 sub.addItem(submenu("FX Alpha Upscale", Self.aeIcon) { m in

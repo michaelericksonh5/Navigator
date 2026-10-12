@@ -9,6 +9,14 @@ TARGET=arm64-apple-macos14.4  "$DIR/compile.sh" "$DIR/Navigator-arm64"
 TARGET=x86_64-apple-macos14.4 "$DIR/compile.sh" "$DIR/Navigator-x86_64"
 lipo -create "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64" -output "$DIR/Navigator.bin"
 rm -f "$DIR/Navigator-arm64" "$DIR/Navigator-x86_64"
+# Native BG Removal runs as its own OPTIMIZED helper: the app above is built without optimization, where the
+# remover takes a minute an image instead of a second (see NativeBGRemoval.swift).
+for arch in arm64 x86_64; do
+  /usr/bin/swiftc -swift-version 5 -O -parse-as-library -D NATIVE_BG_TOOL -target ${arch}-apple-macos14.4 \
+    "$DIR/NativeBGRemoval.swift" -o "$DIR/nativebg-$arch"
+done
+lipo -create "$DIR/nativebg-arm64" "$DIR/nativebg-x86_64" -output "$DIR/NavigatorNativeBG.bin"
+rm -f "$DIR/nativebg-arm64" "$DIR/nativebg-x86_64"
 
 # (Re)generate the icon: prefer AppIcon.png (sips), then the SVG, then the Swift generator
 if [ -f "$DIR/AppIcon.png" ]; then
@@ -37,6 +45,7 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$DIR/Navigator.bin" "$APP/Contents/MacOS/Navigator"
+cp "$DIR/NavigatorNativeBG.bin" "$APP/Contents/MacOS/NavigatorNativeBG"
 [ -f "$DIR/Navigator.icns" ] && cp "$DIR/Navigator.icns" "$APP/Contents/Resources/Navigator.icns"
 # Bundle the Photoshop Remove-BG scripts so they ship inside the app — no one
 # needs a copy saved anywhere; Navigator points Photoshop at these.
@@ -61,8 +70,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.merickson.navigator</string>
 <key>CFBundleExecutable</key><string>Navigator</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.29.4</string>
-<key>CFBundleVersion</key><string>211</string>
+<key>CFBundleShortVersionString</key><string>2.29.5</string>
+<key>CFBundleVersion</key><string>212</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>Navigator</string>
@@ -194,12 +203,14 @@ if security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
   [ -d "$APP/Contents/PlugIns/NavigatorFinder.appex" ] && \
     codesign --force -s "$SIGN_ID" --entitlements "$DIR/ext.entitlements" \
       "$APP/Contents/PlugIns/NavigatorFinder.appex"
+  codesign --force -s "$SIGN_ID" "$APP/Contents/MacOS/NavigatorNativeBG"   # nested code is sealed first, like the appex
   codesign --force -s "$SIGN_ID" "$APP"   # no --deep: it would re-sign the appex and strip its entitlements
   echo "Signed with '$SIGN_ID' (stable identity)."
 else
   [ -d "$APP/Contents/PlugIns/NavigatorFinder.appex" ] && \
     codesign --force -s - --entitlements "$DIR/ext.entitlements" \
       "$APP/Contents/PlugIns/NavigatorFinder.appex"
+  codesign --force -s - "$APP/Contents/MacOS/NavigatorNativeBG"
   codesign --force -s - "$APP"   # no --deep (see above)
   echo "Signed ad-hoc (no '$SIGN_ID' identity found)."
 fi
