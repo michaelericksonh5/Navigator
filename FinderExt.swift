@@ -107,7 +107,7 @@ final class NavigatorFinderSync: FIFinderSync {
             // No Adobe app needed, so never gated on one. The same two jobs as Chroma Key BG.
             sub.addItem(submenu("Native BG Removal", Self.icon(systemSymbol: "scissors")) { m in
                 add(m, "Solid subject — opaque interior", "nativebg", Self.icon(systemSymbol: "square.fill"))
-                add(m, "Soft FX — keep transparency", "nativebg-soft", Self.icon(systemSymbol: "sparkles"))
+                add(m, "Soft FX / UnMult — keep transparency", "nativebg-soft", Self.icon(systemSymbol: "sparkles"))
             })
             if hasImage {
                 // Paid per image; Navigator shows the price and asks before spending. Keyed natively, so no Adobe app.

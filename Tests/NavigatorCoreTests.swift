@@ -14968,6 +14968,77 @@ final class NativeBGRemovalTests: XCTestCase {
         }
     }
 
+    // UnMult on a lifted, noisy AI black (8/255 +- 3): no haze over the frame, and the glow keeps its falloff.
+    // After Effects' Unmult at Black Level 0 leaves the whole lifted backing at alpha ~0.03-0.05.
+    func testUnMultClearsALiftedNoisyBlackAndKeepsTheGlow() {
+        let n = 128, c = Double(n) / 2
+        var rng = SystemRandomNumberGenerator()
+        var px = [UInt8](repeating: 255, count: n * n * 4), alpha = [Double](repeating: 0, count: n * n)
+        for y in 0..<n {
+            for x in 0..<n {
+                let r = ((Double(x) - c) * (Double(x) - c) + (Double(y) - c) * (Double(y) - c)).squareRoot()
+                let a = 0.9 * max(0, 1 - r / 40), i = y * n + x
+                alpha[i] = a
+                let noise = Double.random(in: -3...3, using: &rng)       // the same in every channel, as luma noise is
+                for (k, v) in [255.0, 150, 30].enumerated() {
+                    px[i * 4 + k] = UInt8(max(0, min(255, (v * a + (8 + noise) * (1 - a)).rounded())))
+                }
+            }
+        }
+        let out = NativeBGRemoval.softFX(rgba: px, width: n, height: n)
+        var haze = 0
+        for i in 0..<(n * n) where alpha[i] == 0 && out[i * 4 + 3] > 5 { haze += 1 }
+        XCTAssertLessThan(haze, n * n / 100, "lifted black left visible")
+        for i in stride(from: 0, to: n * n, by: 11) where alpha[i] > 0.2 {
+            XCTAssertEqual(Double(out[i * 4 + 3]) / 255, alpha[i], accuracy: 0.06, "glow alpha at \(i)")
+        }
+    }
+
+    // A bubble burst's last frame: a small faint ring with a faint blue halo and pure black inside it. 2.29.6 could not
+    // reach the inside from the border, extrapolated the backing there from the halo (about 2-5/255), read the true black
+    // as darker than that, and made it opaque black (alpha up to 71/255 here). Pure black must stay clear.
+    func testPureBlackInsideAFaintRingStaysClear() {
+        let n = 512, c = Double(n) / 2
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        var seed: UInt64 = 1
+        for y in 0..<n {
+            for x in 0..<n {
+                let r = ((Double(x) - c) * (Double(x) - c) + (Double(y) - c) * (Double(y) - c)).squareRoot()
+                let line = exp(-pow((r - 34) / 2, 2)) * 0.3, halo = exp(-pow((r - 34) / 16, 2)) * 6
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                let noise = Double((seed >> 33) % 4)                    // 0-3/255, as the AI's black has
+                let i = (y * n + x) * 4
+                for (k, (v, tint)) in [(120.0, 0.4), (200, 0.65), (255, 1.0)].enumerated() {
+                    px[i + k] = UInt8(min(255, (v * line + halo * tint + noise).rounded()))
+                }
+            }
+        }
+        let out = NativeBGRemoval.softFX(rgba: px, width: n, height: n)
+        for y in (n / 2 - 16)..<(n / 2 + 16) {
+            for x in (n / 2 - 16)..<(n / 2 + 16) {
+                let i = (y * n + x) * 4
+                XCTAssertLessThan(out[i + 3], 20, "ring centre at \(x),\(y) is not clear")
+            }
+        }
+    }
+
+    // FX running off every edge (a sprite sheet, a full-frame burst): no backing border to find, still keyed.
+    func testUnMultKeysFXThatFillTheFrame() throws {
+        let n = 96, g = glow([255, 150, 30], on: [0, 0, 0], size: n)
+        let crop = 24, m = n - 2 * crop
+        var px = [UInt8](repeating: 0, count: m * m * 4), alpha = [Double](repeating: 0, count: m * m)
+        for y in 0..<m { for x in 0..<m {
+            let src = ((y + crop) * n + x + crop) * 4
+            for k in 0..<4 { px[(y * m + x) * 4 + k] = g.px[src + k] }
+            alpha[y * m + x] = g.alpha[(y + crop) * n + x + crop]
+        } }
+        XCTAssertNil(NativeBGRemoval.softMatte(rgba: px, width: m, height: m), "no flat border here")
+        let out = NativeBGRemoval.softFX(rgba: px, width: m, height: m)
+        for i in stride(from: 0, to: m * m, by: 5) {
+            XCTAssertEqual(Double(out[i * 4 + 3]) / 255, alpha[i], accuracy: 0.03, "alpha at \(i)")
+        }
+    }
+
     func testRefusesAnImageNotOnAFlatKeyColour() {
         var rng = SystemRandomNumberGenerator()
         let n = 64

@@ -56,7 +56,7 @@ enum NativeBGRemoval {
         guard [0, w - 1, (h - 1) * w, h * w - 1].allSatisfy({ rgba[$0 * 4 + 3] == 255 }) else {
             throw failure("\(source.lastPathComponent) already has a transparent background")
         }
-        guard let out = soft ? softMatte(rgba: rgba, width: w, height: h) : matte(rgba: rgba, width: w, height: h, subject: subjectMask(image)) else {
+        guard let out = soft ? softFX(rgba: rgba, width: w, height: h) : matte(rgba: rgba, width: w, height: h, subject: subjectMask(image)) else {
             throw failure("\(source.lastPathComponent) is not on a flat key colour. Native BG Removal is for art generated on a key colour; Remove BG (Photoshop) handles other images.")
         }
         let data = NSMutableData()
@@ -292,7 +292,9 @@ enum NativeBGRemoval {
         // pass 1: the backing as the border's own noise sees it (a faint glow is the asset, so a tight floor of 3/255)
         let d0 = par(g, Float(0)) { simd_length(c[$0] - B0) }
         let border = (0..<g.n).filter { band[$0] && d0[$0] < 0.25 }.map { d0[$0] }
-        let t = border.isEmpty ? 3 / 255 : min(0.22, max(3 / 255, percentile(border, 99) * 1.6))
+        // a border too varied to be a flat backing (FX running off the frame) is not one: UnMult takes those
+        guard !border.isEmpty, percentile(border, 99) * 1.6 < 0.22 else { return nil }
+        let t = min(0.22, max(3 / 255, percentile(border, 99) * 1.6))
         var field = flood(par(g, false) { ring[$0] && d0[$0] < t }, within: d0.map { $0 < t }, g)
         guard (0..<g.n).filter({ ring[$0] }).filter({ field[$0] }).count * 2 >= 2 * (w + h) - 4 else { return nil }
         var B = localMean(c, field, g, s, inside: false, fallback: B0)
@@ -304,12 +306,16 @@ enum NativeBGRemoval {
         if !edge.isEmpty {
             for k in 0..<3 { sigma[k] = max(percentile(edge.map { abs(c[$0][k] - B[$0][k]) }, 99) / 2.6, 0.5 / 255) }
         }
-        let thr = max(4 * simd_length(sigma), 3 / 255)
-        let near = par(g, false) { simd_length(c[$0] - B[$0]) < thr }
+        let thr = simd_max(3 * sigma, SIMD3(repeating: 1.5 / 255))
+        let near = par(g, false) { i in let d = simd_abs(c[i] - B[i]); return d.x < thr.x && d.y < thr.y && d.z < thr.z }
         let f2 = flood(par(g, false) { ring[$0] && near[$0] }, within: near, g)
         if (0..<g.n).filter({ ring[$0] && f2[$0] }).count * 2 >= 2 * (w + h) - 4 {
             field = f2
-            B = localMean(c, field, g, s, inside: false, fallback: B0)
+            // winsorised: a faint glow just inside the field must not lift the backing map. A lifted map made pure
+            // black read as 'darker than the backing', i.e. opaque black (a bubble burst's last ring came out black).
+            let B1 = B
+            let clipped = par(g, SIMD3<Float>.zero) { simd_clamp(c[$0], B1[$0] - 2 * sigma, B1[$0] + 2 * sigma) }
+            B = localMean(clipped, field, g, s, inside: false, fallback: B0)
             edge = edgeOf(field)
         }
         // alpha: colour to alpha, noise-aware; then values within the backing's own noise gated smoothly to 0
@@ -323,6 +329,162 @@ enum NativeBGRemoval {
             out[i * 4 + 3] = UInt8(min(255, a[i] * 255 + 0.5))
         }
         return out
+    }
+
+    /// Soft FX: UnMult on a black or white backing, or when no flat backing border is showing (FX running off the frame,
+    /// sprite sheets); softMatte's colour-to-alpha on a coloured backing.
+    static func softFX(rgba: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        var corners: [SIMD3<Float>] = []
+        for (x0, y0) in [(0, 0), (max(0, w - 8), 0), (0, max(0, h - 8)), (max(0, w - 8), max(0, h - 8))] {
+            var s = SIMD3<Float>(repeating: 0), k: Float = 0
+            for y in y0..<min(h, y0 + 8) { for x in x0..<min(w, x0 + 8) {
+                let i = (y * w + x) * 4; s += SIMD3(Float(rgba[i]), Float(rgba[i + 1]), Float(rgba[i + 2])) / 255; k += 1 } }
+            corners.append(s / max(k, 1))
+        }
+        var B0 = SIMD3<Float>(repeating: 0)
+        for k in 0..<3 { let v = corners.map { $0[k] }.sorted(); B0[k] = (v[1] + v[2]) / 2 }
+        let neutral = B0.max() - B0.min() < 0.06
+        if neutral && (B0.max() < 0.15 || B0.min() > 0.85) { return unmult(rgba: rgba, width: w, height: h) }
+        return softMatte(rgba: rgba, width: w, height: h) ?? unmult(rgba: rgba, width: w, height: h)
+    }
+
+    /// UnMult, measured instead of tuned. After Effects' Unmult (and Red Giant's before it) makes alpha the brightest
+    /// channel and divides it back out, with a manual Black Level threshold per pixel: AI 'black' is lifted and noisy, so
+    /// at 0 it leaves a haze over the frame (31-51% of it, measured) and any level high enough to clear the haze clips the
+    /// faint glow by as much. Here:
+    /// - the black level is the backing's own colour (the densest dark colour; 0 when the darkest colour is clearly FX),
+    ///   and a plane through the backing pixels follows a vignette;
+    /// - light FX on black only ever ADD light, so everything darker than the backing is pure noise: its spread, on a
+    ///   1.5 px average of the brightness above the backing, is the noise floor, wherever the FX are;
+    /// - faint regions above 3 noise-sigma are kept when connected to a region above 6 sigma, so a glow's tail survives
+    ///   and isolated noise does not; colour of faint glow is smoothed from its neighbours.
+    /// Against After Effects' Black Level at its best setting per image (picked with the truth in hand): lifted black
+    /// error 1.5 vs 2.3/255 and haze 0.4% vs 15%; webp AI output 2.0 vs 2.0, haze 0.2% vs 1.2%. White backing: the
+    /// same on the inverted image (dark FX on white).
+    static func unmult(rgba: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        let g = Grid(w: w, h: h)
+        let c0 = par(g, SIMD3<Float>.zero) { SIMD3<Float>(Float(rgba[$0 * 4]), Float(rgba[$0 * 4 + 1]), Float(rgba[$0 * 4 + 2])) / 255 }
+        var whiteEdge = 0, edgeCount = 0
+        for i in 0..<g.n {
+            let y = i / w, x = i % w
+            guard y < 3 || y >= h - 3 || x < 3 || x >= w - 3 else { continue }
+            edgeCount += 1
+            if c0[i].min() > 0.75 && c0[i].max() - c0[i].min() < 0.08 { whiteEdge += 1 }
+        }
+        let white = whiteEdge * 2 > edgeCount
+        let c = white ? c0.map { SIMD3<Float>(repeating: 1) - $0 } : c0
+        // black level and noise
+        let m = c.map { $0.max() }
+        let p20 = percentile(m, 20)
+        let dark = m.map { $0 <= p20 }
+        let darkM = (0..<g.n).filter { dark[$0] }.map { m[$0] }
+        let top = max(darkM.max() ?? 0, 1e-3)
+        var hist = [Int](repeating: 0, count: 256)
+        for v in darkM { hist[min(255, Int(v / top * 256))] += 1 }
+        let bin = hist.indices.max { hist[$0] < hist[$1] } ?? 0
+        let peak = (Float(bin) + 0.5) / 256 * top
+        var sigma = SIMD3<Float>(repeating: 1 / 255)
+        let sel = (0..<g.n).filter { dark[$0] && abs(m[$0] - peak) < 0.05 }
+        if !sel.isEmpty {
+            for k in 0..<3 {
+                var res = [Float](repeating: 0, count: sel.count)
+                var v = [Float](repeating: 0, count: 9)
+                for (j, i) in sel.enumerated() {          // pixel-to-pixel scatter: distance from its 3x3 median
+                    let y = i / w, x = i % w
+                    var n = 0
+                    for dy in -1...1 { for dx in -1...1 {
+                        v[n] = c[min(h - 1, max(0, y + dy)) * w + min(w - 1, max(0, x + dx))][k]; n += 1 } }
+                    v.sort()
+                    res[j] = abs(c[i][k] - v[4])
+                }
+                res.sort()
+                sigma[k] = max(1.4826 * res[res.count / 2] * 1.25, 0.5 / 255)
+            }
+        }
+        // the darkest fifth only FINDS the backing; its level is the median of ALL pixels near it (the darkest fifth of a
+        // noisy black sits a noise-width low, and then the whole backing reads as faintly lit)
+        var L = SIMD3<Float>(repeating: 0)
+        for centre in [peak, Float.nan] {
+            let at = centre.isNaN ? L.max() : centre
+            let nearPeak = (0..<g.n).filter { abs(m[$0] - at) < 3 * sigma.max() + 1 / 255 }
+            if !nearPeak.isEmpty { for k in 0..<3 { let v = nearPeak.map { c[$0][k] }.sorted(); L[k] = v[v.count / 2] } }
+        }
+        if L.max() - L.min() > 6 / 255 && L.max() > 12 / 255 { L = .zero }     // the darkest colour is FX, not backing
+        L = simd_min(simd_min(L, SIMD3(repeating: L.min() + 3 / 255)), SIMD3(repeating: 24 / 255))
+        var B = [SIMD3<Float>](repeating: L, count: g.n)
+        var region = [Bool](repeating: false, count: g.n)
+        let floor: Float = 0.3 / 255
+        for pass in 0..<3 {
+            let u = blur(par(g, Float(0)) { i in let d = c[i] - B[i]; return (d.x + d.y + d.z) / 3 }, g, 1.5)
+            var neg = u.filter { $0 < 0 }.map { -$0 }
+            var su = max(0.12 * (sigma.x + sigma.y + sigma.z) / 3, floor)
+            if neg.count > 100 { neg.sort(); su = max(1.4826 * neg[neg.count / 2], floor) }
+            let (lab, n) = components(u.map { $0 > 3 * su }, g, eight: true)
+            var strong = [Bool](repeating: false, count: n + 1)
+            for i in 0..<g.n where u[i] > 6 * su { strong[Int(lab[i])] = true }
+            strong[0] = false
+            region = dilate(lab.map { strong[Int($0)] }, 2, g)
+            if pass < 2 {
+                let away = dilate(region, 6, g)
+                let bg = (0..<g.n).filter { u[$0] < 3 * su && !away[$0] }
+                if bg.count > 1000 {
+                    let cap = SIMD3<Float>(repeating: L.min() + 0.06)
+                    let plane = fitPlane(c, bg, g)
+                    B = par(g, SIMD3<Float>.zero) { i in simd_min(simd_clamp(plane(i), .zero, .one), cap) }
+                }
+            }
+        }
+        let a = par(g, Float(0)) { region[$0] ? colourToAlpha(c[$0], B[$0], sigma) : 0 }
+        var F = par(g, SIMD3<Float>.zero) { clamp01((c[$0] - (1 - a[$0]) * B[$0]) / max(a[$0], 1e-4)) }
+        // faint glow: colour from its neighbourhood, weighted by alpha (dividing a 2/255 pixel by its alpha is noise)
+        let den = blur(a, g, 2)
+        let num = (0..<3).map { k in blur(par(g, Float(0)) { F[$0][k] * a[$0] }, g, 2) }
+        F = par(g, SIMD3<Float>.zero) { i in
+            guard den[i] > 1e-6 else { return F[i] }
+            let wgt = min(1, a[i] / 0.25)
+            return wgt * F[i] + (1 - wgt) * SIMD3(num[0][i], num[1][i], num[2][i]) / den[i]
+        }
+        var out = [UInt8](repeating: 0, count: g.n * 4)
+        for i in 0..<g.n where a[i] > 0 {
+            let f = (white ? SIMD3<Float>(repeating: 1) - F[i] : F[i])
+            let p = clamp01(f) * 255 + 0.5
+            out[i * 4] = UInt8(p.x); out[i * 4 + 1] = UInt8(p.y); out[i * 4 + 2] = UInt8(p.z)
+            out[i * 4 + 3] = UInt8(min(255, a[i] * 255 + 0.5))
+        }
+        return out
+    }
+
+    /// Least-squares plane per channel through the listed pixels: follows a vignette or gradient, and under a big glow
+    /// extrapolates linearly (a quadratic overshoots there).
+    private static func fitPlane(_ c: [SIMD3<Float>], _ pixels: [Int], _ g: Grid) -> (Int) -> SIMD3<Float> {
+        let step = max(1, pixels.count / 100_000)
+        var s = [Double](repeating: 0, count: 9)                 // sums: 1, y, x, yy, xx, xy
+        var r = [[Double]](repeating: [0, 0, 0], count: 3)       // per channel: c, c*y, c*x
+        for j in stride(from: 0, to: pixels.count, by: step) {
+            let i = pixels[j], y = Double(i / g.w) / Double(g.h) - 0.5, x = Double(i % g.w) / Double(g.w) - 0.5
+            s[0] += 1; s[1] += y; s[2] += x; s[3] += y * y; s[4] += x * x; s[5] += x * y
+            for k in 0..<3 { let v = Double(c[i][k]); r[k][0] += v; r[k][1] += v * y; r[k][2] += v * x }
+        }
+        // normal equations [n Sy Sx; Sy Syy Sxy; Sx Sxy Sxx] p = r, solved by Cramer's rule
+        let A = [[s[0], s[1], s[2]], [s[1], s[3], s[5]], [s[2], s[5], s[4]]]
+        func det(_ m: [[Double]]) -> Double {
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+        }
+        let D = det(A)
+        var coef = [[Double]](repeating: [0, 0, 0], count: 3)
+        for k in 0..<3 {
+            guard abs(D) > 1e-12 else { coef[k] = [r[k][0] / max(s[0], 1), 0, 0]; continue }
+            for col in 0..<3 {
+                var M = A
+                for row in 0..<3 { M[row][col] = r[k][row] }
+                coef[k][col] = det(M) / D
+            }
+        }
+        let c0 = SIMD3<Float>(Float(coef[0][0]), Float(coef[1][0]), Float(coef[2][0]))
+        let cy = SIMD3<Float>(Float(coef[0][1]), Float(coef[1][1]), Float(coef[2][1]))
+        let cx = SIMD3<Float>(Float(coef[0][2]), Float(coef[1][2]), Float(coef[2][2]))
+        return { i in c0 + cy * (Float(i / g.w) / Float(g.h) - 0.5) + cx * (Float(i % g.w) / Float(g.w) - 0.5) }
     }
 
     /// Smallest a with (C - (1-a)B)/a inside [0,1], noise-aware. A channel moving toward a near limit (down from a dark
@@ -631,7 +793,7 @@ enum NativeBGRemoval {
     }
 
     /// 4-connected components: labels 1...count (0 = not in mask).
-    private static func components(_ mask: [Bool], _ g: Grid) -> ([Int32], Int) {
+    private static func components(_ mask: [Bool], _ g: Grid, eight: Bool = false) -> ([Int32], Int) {
         var label = [Int32](repeating: 0, count: g.n), count: Int32 = 0, stack: [Int] = []
         for s in 0..<g.n where mask[s] && label[s] == 0 {
             count += 1; label[s] = count; stack.append(s)
@@ -640,6 +802,10 @@ enum NativeBGRemoval {
                 let y = i / g.w, x = i - y * g.w
                 if x > 0 { visit(i - 1) }; if x < g.w - 1 { visit(i + 1) }
                 if y > 0 { visit(i - g.w) }; if y < g.h - 1 { visit(i + g.w) }
+                if eight {
+                    if y > 0 && x > 0 { visit(i - g.w - 1) }; if y > 0 && x < g.w - 1 { visit(i - g.w + 1) }
+                    if y < g.h - 1 && x > 0 { visit(i + g.w - 1) }; if y < g.h - 1 && x < g.w - 1 { visit(i + g.w + 1) }
+                }
             }
         }
         return (label, Int(count))

@@ -12043,18 +12043,18 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 let sel = browser.items.filter { ids.contains($0.id) }
                 let imgCount = sel.filter { !$0.isDirectory && isImageFile($0.url) }.count
                 let dirs = sel.filter { $0.isDirectory }
-                // The same two jobs as Chroma Key BG: a solid symbol, or soft FX on any backing (black too).
+                // The same two jobs as Chroma Key BG: a solid symbol, or soft FX on any backing (black too: UnMult).
                 if imgCount >= 1 {
                     Menu {
                         Button { browser.nativeBGRemoval(ids) } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
-                        Button { browser.nativeBGRemoval(ids, soft: true) } label: { Label("Soft FX — keep transparency", systemImage: "sparkles") }
+                        Button { browser.nativeBGRemoval(ids, soft: true) } label: { Label("Soft FX / UnMult — keep transparency", systemImage: "sparkles") }
                     } label: {
                         Label(imgCount == 1 ? "Native BG Removal" : "Native BG Removal (\(imgCount) images)", systemImage: "scissors")
                     }
                 } else if dirs.count == 1, sel.count == 1 {
                     Menu {
                         Button { browser.batchNativeBGRemoval(ids) } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
-                        Button { browser.batchNativeBGRemoval(ids, soft: true) } label: { Label("Soft FX — keep transparency", systemImage: "sparkles") }
+                        Button { browser.batchNativeBGRemoval(ids, soft: true) } label: { Label("Soft FX / UnMult — keep transparency", systemImage: "sparkles") }
                     } label: { Label("Batch Native BG Removal", systemImage: "scissors") }
                 }
             }
@@ -15516,7 +15516,7 @@ struct ImageViewerView: View {
                 }
                 Menu {
                     Button { nativeBGRemovalForImage(u) { out in revealNewImage(out) } } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
-                    Button { nativeBGRemovalForImage(u, soft: true) { out in revealNewImage(out) } } label: { Label("Soft FX — keep transparency", systemImage: "sparkles") }
+                    Button { nativeBGRemovalForImage(u, soft: true) { out in revealNewImage(out) } } label: { Label("Soft FX / UnMult — keep transparency", systemImage: "sparkles") }
                 } label: { Label("Native BG Removal", systemImage: "scissors") }
             }
             if currentURL != nil {
