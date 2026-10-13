@@ -14937,10 +14937,42 @@ final class NativeBGRemovalTests: XCTestCase {
         }
     }
 
+    /// A `colour` glow (alpha from 0.9 at the centre to 0) on `backing`.
+    func glow(_ colour: [Double], on backing: [Double], size n: Int = 96) -> (px: [UInt8], alpha: [Double]) {
+        let c = Double(n) / 2
+        var px = [UInt8](repeating: 255, count: n * n * 4), alpha = [Double](repeating: 0, count: n * n)
+        for y in 0..<n {
+            for x in 0..<n {
+                let r = ((Double(x) - c) * (Double(x) - c) + (Double(y) - c) * (Double(y) - c)).squareRoot()
+                let a = 0.9 * max(0, 1 - r / 34)
+                alpha[y * n + x] = a
+                for k in 0..<3 { px[(y * n + x) * 4 + k] = UInt8((colour[k] * a + backing[k] * (1 - a)).rounded()) }
+            }
+        }
+        return (px, alpha)
+    }
+
+    // Keylight cannot key black at all (no dominant channel); Soft FX must, and keep the glow's own falloff.
+    // Each glow differs from its backing in every full channel: an orange glow on magenta shares magenta's red,
+    // and then a stronger orange and a fainter yellower glow give the same pixels (physics, not the keyer).
+    func testSoftFXKeysAGlowOnBlackMagentaAndGreen() throws {
+        let cases: [(glow: [Double], backing: [Double])] = [([255, 150, 30], [0, 0, 0]), ([60, 255, 80], [255, 0, 255]), ([255, 150, 30], [0, 177, 64])]
+        for (colour, backing) in cases {
+            let n = 96, g = glow(colour, on: backing, size: n)
+            let out = try XCTUnwrap(NativeBGRemoval.softMatte(rgba: g.px, width: n, height: n))
+            XCTAssertEqual(out[(2 * n + 2) * 4 + 3], 0, "backing \(backing) left visible")
+            for i in stride(from: 0, to: n * n, by: 7) {
+                XCTAssertEqual(Double(out[i * 4 + 3]) / 255, g.alpha[i], accuracy: 0.04, "alpha at \(i) on \(backing)")
+                if g.alpha[i] > 0.3 { XCTAssertEqual(Double(out[i * 4 + 1]), colour[1], accuracy: 12, "glow colour at \(i) on \(backing)") }
+            }
+        }
+    }
+
     func testRefusesAnImageNotOnAFlatKeyColour() {
         var rng = SystemRandomNumberGenerator()
         let n = 64
         let noise = (0..<(n * n * 4)).map { $0 % 4 == 3 ? UInt8(255) : UInt8.random(in: 0...255, using: &rng) }
         XCTAssertNil(NativeBGRemoval.matte(rgba: noise, width: n, height: n, subject: nil))
+        XCTAssertNil(NativeBGRemoval.softMatte(rgba: noise, width: n, height: n))
     }
 }

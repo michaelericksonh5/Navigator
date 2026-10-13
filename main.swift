@@ -4178,7 +4178,9 @@ func batchChromaKeyFolder(_ folder: URL, profile: ChromaKeyOutputRules.KeylightP
 // Every step already existed and is reused rather than re-implemented: the adaptive backing
 // (KeyColorRules picks a colour far from everything in the art, so the key cannot eat the
 // subject — it chooses blue for a yellow sparkle), the identity "Detect" that describes what
-// must be preserved, Nano Banana 2, and the After Effects chroma key.
+// must be preserved, Nano Banana 2, and Native BG Removal's soft-FX keyer. That keyer replaced After Effects here:
+// Keylight cannot key a black backing at all (it measures distance from the screen's dominant channel, and black
+// has none), and a regenerated sparkle often comes back on black.
 let fxAlphaUpscaleStyleText = "create a new version of this without any pixelation"
 
 /// Per-image price, matching RestyleSheet's own cost hint.
@@ -4190,11 +4192,6 @@ func fxAlphaUpscaleCost(size: String) -> Double { size == "4K" ? 0.15 : 0.10 }
 func fxAlphaUpscale(_ srcs: [URL], size: String, onDone: (([URL]) -> Void)? = nil) {
     let pngs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: "_fxupres") }
     guard !pngs.isEmpty else { NSSound.beep(); return }
-    guard AfterEffectsApp.bundleID != nil else {
-        reportFileError("FX Alpha Upscale needs After Effects",
-                        "The backing colour is removed with After Effects. Install it, then try again.")
-        return
-    }
     guard confirmUpscale(count: pngs.count, label: "FX Alpha Upscale \(size)",
                          perImage: fxAlphaUpscaleCost(size: size)) else { return }
 
@@ -4230,15 +4227,7 @@ func fxAlphaUpscale(_ srcs: [URL], size: String, onDone: (([URL]) -> Void)? = ni
             spent += r.cost ?? 0
             // 4. Key the backing out, synchronously, so the batch stays in step.
             do {
-                guard let bundleID = AfterEffectsApp.bundleID, let appURL = AfterEffectsApp.url,
-                      let scriptURL = Bundle.main.url(forResource: "NavigatorChromaKeyStill", withExtension: "jsx") else {
-                    throw NSError(domain: "FXAlphaUpscale", code: 1,
-                                  userInfo: [NSLocalizedDescriptionKey: "After Effects or the keying script is missing"])
-                }
-                launchHidden(bundleID: bundleID, appURL: appURL)
-                let keyed = try ChromaKeyOutputRules.exportPNG(
-                    source: restyled, scriptURL: scriptURL, bundleID: bundleID,
-                    onLaunch: { keepHidden(while: $0, bundleID: bundleID, revealAfter: adobeRevealAfter) })
+                let keyed = try nativeBGRemoval(restyled, soft: true)
                 // 5. One deliverable, named for the source. The generated-on-backing file and
                 // the keyer's own output are working files and do not belong in the folder.
                 let final = PathRules.uniqueDest(src.deletingLastPathComponent(), "\(base)_fxupres.png") {
@@ -4258,7 +4247,6 @@ func fxAlphaUpscale(_ srcs: [URL], size: String, onDone: (([URL]) -> Void)? = ni
         }
         let total = spent
         DispatchQueue.main.async {
-            hideApp(bundleID: AfterEffectsApp.bundleID ?? "com.adobe.AfterEffects")
             BGJobProgress.shared.finish(String(format: "FX Alpha Upscale: %d of %d · $%.2f",
                                                outs.count, pngs.count, total))
             if !errors.isEmpty {
@@ -4724,6 +4712,16 @@ func chromaKeyForImages(_ srcs: [URL],
         var errors: [String] = []
         for src in pngs {
             do {
+                // Keylight keys by distance from the screen colour's dominant channel; black, white and greys have none,
+                // so on those it leaves the backing opaque and speckled (a sparkle on black came back that way). Those
+                // go to Native BG Removal, which keys any backing, in the same profile.
+                if let img = try? ChromaKeyOutputRules.load(src), let b = try? ChromaKeyOutputRules.backingColour(img),
+                   Int(max(b.r, b.g, b.b)) - Int(min(b.r, b.g, b.b)) < ChromaKeyOutputRules.keylightMinChroma {
+                    navLog("chroma key: \(src.lastPathComponent) is on rgb(\(b.r),\(b.g),\(b.b)), which Keylight cannot key — Native BG Removal instead")
+                    outs.append(try nativeBGRemoval(src, soft: profile == .softFX))
+                    DispatchQueue.main.async { BGJobProgress.shared.advance() }
+                    continue
+                }
                 launchHidden(bundleID: bundleID, appURL: appURL)
                 let out = try ChromaKeyOutputRules.exportPNG(source: src, scriptURL: scriptURL, bundleID: bundleID,
                     profile: profile,
@@ -4995,21 +4993,22 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
 // Native BG Removal (NativeBGRemoval.swift): no Adobe app, about a second an image. For art generated on a flat key
 // colour; writes "<base>_rmbg.png" next to each source, originals untouched. Runs as the optimized helper bundled in
 // the app, because this unoptimized build takes a minute an image (see NativeBGRemoval.swift).
-func nativeBGRemoval(_ src: URL) throws -> URL {
+/// `soft`: Soft FX (glows, sparkles, rays) on ANY backing, black included — every transitional alpha kept.
+func nativeBGRemoval(_ src: URL, soft: Bool = false) throws -> URL {
     func failure(_ message: String) -> NSError {
         NSError(domain: "NativeBGRemoval", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
     guard let tool = Bundle.main.url(forAuxiliaryExecutable: "NavigatorNativeBG") else {
         throw failure("This Navigator was built without its NavigatorNativeBG helper; build it with rebuild.sh or quickbuild.sh.")
     }
-    let r = try ExternalProcess.run(tool.path, arguments: [src.path], timeout: 300).completed()
+    let r = try ExternalProcess.run(tool.path, arguments: (soft ? ["--soft"] : []) + [src.path], timeout: 300).completed()
     guard r.status == 0 else { throw failure(r.err.trimmingCharacters(in: .whitespacesAndNewlines)) }
     return URL(fileURLWithPath: r.out.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
 // Every exit calls back, including the failures — see chromaKeyForImages. `quiet` logs failures instead of showing
 // them, for a caller that handles them itself.
-func nativeBGRemovalForImages(_ srcs: [URL], quiet: Bool = false, onDone: (([URL]) -> Void)? = nil) {
+func nativeBGRemovalForImages(_ srcs: [URL], soft: Bool = false, quiet: Bool = false, onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
     DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds", total: imgs.count) }
@@ -5017,7 +5016,7 @@ func nativeBGRemovalForImages(_ srcs: [URL], quiet: Bool = false, onDone: (([URL
         var outs: [URL] = []
         var errors: [String] = []
         for src in imgs {
-            do { outs.append(try nativeBGRemoval(src)) }
+            do { outs.append(try nativeBGRemoval(src, soft: soft)) }
             catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
@@ -5030,8 +5029,8 @@ func nativeBGRemovalForImages(_ srcs: [URL], quiet: Bool = false, onDone: (([URL
     }
 }
 
-func nativeBGRemovalForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
-    nativeBGRemovalForImages([src]) { outs in
+func nativeBGRemovalForImage(_ src: URL, soft: Bool = false, onDone: ((URL) -> Void)? = nil) {
+    nativeBGRemovalForImages([src], soft: soft) { outs in
         if let out = outs.first { onDone?(out) }
     }
 }
@@ -5050,13 +5049,13 @@ func cutOutSymbols(_ urls: [URL], onDone: @escaping ([URL]) -> Void) {
     }
 }
 
-func batchNativeBGRemovalFolder(_ folder: URL, onDone: (() -> Void)? = nil) {
+func batchNativeBGRemovalFolder(_ folder: URL, soft: Bool = false, onDone: (() -> Void)? = nil) {
     let imgs = batchImageURLs(in: folder)
     guard !imgs.isEmpty else {
         DispatchQueue.main.async { reportFileError("No images to process", "No images found in “\(folder.lastPathComponent)” (skipping “EN” folders and existing “_rmbg” files).") }
         onDone?(); return
     }
-    nativeBGRemovalForImages(imgs) { _ in onDone?() }
+    nativeBGRemovalForImages(imgs, soft: soft) { _ in onDone?() }
 }
 
 func confirmEmptyTrash(_ browser: Browser) {
@@ -8271,14 +8270,14 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
     }
 
     // Native BG Removal on the selected image(s), or every image in one selected folder.
-    func nativeBGRemoval(_ ids: Set<String>) {
+    func nativeBGRemoval(_ ids: Set<String>, soft: Bool = false) {
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
-        nativeBGRemovalForImages(urls) { [weak self] outs in self?.refreshAndReveal(outs) }
+        nativeBGRemovalForImages(urls, soft: soft) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
-    func batchNativeBGRemoval(_ ids: Set<String>) {
+    func batchNativeBGRemoval(_ ids: Set<String>, soft: Bool = false) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
-        batchNativeBGRemovalFolder(it.url) { [weak self] in self?.refresh() }
+        batchNativeBGRemovalFolder(it.url, soft: soft) { [weak self] in self?.refresh() }
     }
 
     // Batch Chroma Key BG writes each <name>_rmbg.png next to its source.
@@ -12044,12 +12043,19 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 let sel = browser.items.filter { ids.contains($0.id) }
                 let imgCount = sel.filter { !$0.isDirectory && isImageFile($0.url) }.count
                 let dirs = sel.filter { $0.isDirectory }
+                // The same two jobs as Chroma Key BG: a solid symbol, or soft FX on any backing (black too).
                 if imgCount >= 1 {
-                    Button { browser.nativeBGRemoval(ids) } label: {
+                    Menu {
+                        Button { browser.nativeBGRemoval(ids) } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
+                        Button { browser.nativeBGRemoval(ids, soft: true) } label: { Label("Soft FX — keep transparency", systemImage: "sparkles") }
+                    } label: {
                         Label(imgCount == 1 ? "Native BG Removal" : "Native BG Removal (\(imgCount) images)", systemImage: "scissors")
                     }
                 } else if dirs.count == 1, sel.count == 1 {
-                    Button { browser.batchNativeBGRemoval(ids) } label: { Label("Batch Native BG Removal", systemImage: "scissors") }
+                    Menu {
+                        Button { browser.batchNativeBGRemoval(ids) } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
+                        Button { browser.batchNativeBGRemoval(ids, soft: true) } label: { Label("Soft FX — keep transparency", systemImage: "sparkles") }
+                    } label: { Label("Batch Native BG Removal", systemImage: "scissors") }
                 }
             }
             // FX Alpha Upscale — regenerate + key, one action. A submenu only because
@@ -15508,7 +15514,10 @@ struct ImageViewerView: View {
                 if u.pathExtension.lowercased() == "png" {
                     Button { chromaKeyForImage(u) { out in revealNewImage(out) } } label: { Label("Chroma Key BG", systemImage: "eyedropper.halffull") }
                 }
-                Button { nativeBGRemovalForImage(u) { out in revealNewImage(out) } } label: { Label("Native BG Removal", systemImage: "scissors") }
+                Menu {
+                    Button { nativeBGRemovalForImage(u) { out in revealNewImage(out) } } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
+                    Button { nativeBGRemovalForImage(u, soft: true) { out in revealNewImage(out) } } label: { Label("Soft FX — keep transparency", systemImage: "sparkles") }
+                } label: { Label("Native BG Removal", systemImage: "scissors") }
             }
             if currentURL != nil {
                 Divider()
@@ -17893,7 +17902,7 @@ struct SetupItem: Identifiable {
         }
         if AfterEffectsApp.bundleID == nil {
             rows.append(SetupItem(id: "app-ae", section: .apps, title: "Adobe After Effects",
-                      short: "Needed for Chroma Key BG and FX Alpha Upscale, which key out the backing colour with Keylight.",
+                      short: "Needed for Chroma Key BG, which keys out the backing colour with Keylight. Native BG Removal needs nothing.",
                       why: "Keylight ships with After Effects — nothing extra to install. Get it from Creative Cloud with your studio Adobe account, then reopen this window.",
                       probe: { _ in .off }, probeMayPrompt: false, canAsk: false,
                       settingsLabel: "Get After Effects…", labels: notInstalled,
@@ -17933,7 +17942,7 @@ struct SetupItem: Identifiable {
         }
         if let ae = AfterEffectsApp.bundleID {
             rows.append(SetupItem(id: "automation-ae", section: .apps, title: "Control After Effects",
-                      short: "For Chroma Key BG and FX Alpha Upscale, which key out the backing in After Effects.",
+                      short: "For Chroma Key BG, which keys out the backing in After Effects.",
                       why: "Navigator keeps After Effects hidden while it works. macOS only lists Navigator under Automation once it has asked, so use the button.",
                       probe: { _ in PermissionProbe.appAutomation(bundleID: ae) },
                       probeMayPrompt: true, canAsk: true, listedOnlyAfterRequest: true,
@@ -18664,9 +18673,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case "chromakey-solid":
             folders.forEach { batchChromaKeyFolder($0, profile: .solidSymbol) }
             if !images.isEmpty { chromaKeyForImages(images, profile: .solidSymbol) }
-        case "nativebg":
-            folders.forEach { batchNativeBGRemovalFolder($0) }
-            if !images.isEmpty { nativeBGRemovalForImages(images) }
+        case "nativebg", "nativebg-soft":
+            let soft = url.host == "nativebg-soft"
+            folders.forEach { batchNativeBGRemovalFolder($0, soft: soft) }
+            if !images.isEmpty { nativeBGRemovalForImages(images, soft: soft) }
         case "upscale-vertex", "upscale-gpt25":
             let model: AIUpscaleModel = url.host == "upscale-gpt25" ? .gpt25 : .pro
             folders.forEach { batchUpscaleFolderAI($0, model: model) }
@@ -18727,6 +18737,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         // Native extraction is available even without After Effects installed.
         .init(title: "Chroma Key BG",          action: "chromakey",    requires: nil, acceptsFolders: true),
         .init(title: "Native BG Removal",      action: "nativebg",     requires: nil, acceptsFolders: true),
+        .init(title: "Native BG Removal Soft FX", action: "nativebg-soft", requires: nil, acceptsFolders: true),
         .init(title: "Upscale Low Quality ×4", action: "upscale-lowq",    requires: nil,                   acceptsFolders: true),
     ]
     // Older names to clean up so we don't leave stale duplicates behind (includes
@@ -21572,11 +21583,12 @@ if CommandLine.arguments.contains("--service-info") {
     app.run()
 }
 
-// Native BG Removal, headless:  Navigator --native-bg <image or folder>...
+// Native BG Removal, headless:  Navigator --native-bg [--soft] <image or folder>...
 // Writes each "<name>_rmbg.png" next to its source, exactly as the menu item does.
 if let flag = CommandLine.arguments.firstIndex(of: "--native-bg") {
     var srcs: [URL] = []
-    for p in CommandLine.arguments[(flag + 1)...] {
+    let soft = CommandLine.arguments.contains("--soft")
+    for p in CommandLine.arguments[(flag + 1)...] where p != "--soft" {
         let u = URL(fileURLWithPath: p)
         srcs += (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true ? batchImageURLs(in: u) : [u]
     }
@@ -21584,7 +21596,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--native-bg") {
     for src in srcs {
         let t0 = Date()
         do {
-            let out = try nativeBGRemoval(src)
+            let out = try nativeBGRemoval(src, soft: soft)
             print(String(format: "%@  %.2fs", out.path, Date().timeIntervalSince(t0)))
         } catch { failed += 1; print("\(src.lastPathComponent): \(error.localizedDescription)") }
     }

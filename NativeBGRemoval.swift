@@ -34,7 +34,8 @@ enum NativeBGRemoval {
 
     /// Remove the backing of `source` and write "<name>_rmbg.png" beside it, like Remove BG and Chroma Key.
     /// Validated before the write, so a failure leaves an earlier output alone.
-    static func export(source: URL) throws -> URL {
+    /// `soft`: Soft FX (glows, sparkles, rays) keep every transitional alpha (softMatte); otherwise a solid symbol (matte).
+    static func export(source: URL, soft: Bool = false) throws -> URL {
         func failure(_ message: String) -> NSError {
             NSError(domain: "NativeBGRemoval", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
         }
@@ -55,7 +56,7 @@ enum NativeBGRemoval {
         guard [0, w - 1, (h - 1) * w, h * w - 1].allSatisfy({ rgba[$0 * 4 + 3] == 255 }) else {
             throw failure("\(source.lastPathComponent) already has a transparent background")
         }
-        guard let out = matte(rgba: rgba, width: w, height: h, subject: subjectMask(image)) else {
+        guard let out = soft ? softMatte(rgba: rgba, width: w, height: h) : matte(rgba: rgba, width: w, height: h, subject: subjectMask(image)) else {
             throw failure("\(source.lastPathComponent) is not on a flat key colour. Native BG Removal is for art generated on a key colour; Remove BG (Photoshop) handles other images.")
         }
         let data = NSMutableData()
@@ -178,6 +179,16 @@ enum NativeBGRemoval {
                 if a[i] < 0.3 { a[i] = 0 } else if nearestClean[i] >= 0 { col[i] = col[Int(nearestClean[i])] }
             }
         }
+        // ---- a colourless backing (black, white, grey) has art of its own colour: black outlines on black, white
+        // highlights on white, which no colour test can tell from it. There, what Vision is confident is subject stays
+        // (measured on 30 shipped symbols: symbols with holes 27 -> 8 on black, 29 -> 14 on white, none gaining backing).
+        let b = keyB[0], chroma = max(b.x, b.y, b.z) - min(b.x, b.y, b.z)
+        if chroma < 80 / 255, let V = subject {
+            for i in 0..<g.n {
+                let keep = min(1, max(0, (V[i] - 0.75) / 0.2))
+                if keep > a[i] { a[i] = keep; col[i] = c[i] }
+            }
+        }
         removeSpecks(&a, g)
 
         var out = [UInt8](repeating: 0, count: g.n * 4)
@@ -251,6 +262,82 @@ enum NativeBGRemoval {
         col = par(g, SIMD3<Float>.zero) { interior[$0] ? c[$0] : c[Int(nearestInterior[$0])] }
         removeSpecks(&a, g)
         return (a, col, B)
+    }
+
+    // MARK: soft FX
+
+    /// Soft FX on ANY backing colour (black included, which a chroma keyer cannot key: Keylight measures distance from
+    /// the screen's dominant channel, and black has none). Every pixel is C = a*F + (1-a)*B, and for light (glows,
+    /// sparkles, rays) the right reading is the most transparent one that is still a valid colour: the smallest a with
+    /// F = (C - (1-a)*B)/a inside [0,1]. On black that is the compositors' Unmult (a = brightest channel); on magenta,
+    /// green or grey it is the same idea against that colour. On the measured FX set (glows, rings, sparkles, bubbles,
+    /// fire, a real ring) the error over white, grey and blue was under 1.5/255 clean on black, green, blue and grey,
+    /// 3-10/255 with real-world backing noise. Two limits are physics, not the keyer: white light on a white backing
+    /// leaves no trace, and an FX colour sharing a full channel with the backing (gold on magenta: red) is ambiguous.
+    /// Straight RGBA8 in and out; nil when the image is not on a flat backing.
+    static func softMatte(rgba: [UInt8], width w: Int, height h: Int) -> [UInt8]? {
+        let g = Grid(w: w, h: h)
+        let c = par(g, SIMD3<Float>.zero) { SIMD3<Float>(Float(rgba[$0 * 4]), Float(rgba[$0 * 4 + 1]), Float(rgba[$0 * 4 + 2])) / 255 }
+        func cornerMean(_ x0: Int, _ y0: Int) -> SIMD3<Float> {
+            var s = SIMD3<Float>(repeating: 0), k: Float = 0
+            for y in y0..<min(h, y0 + 8) { for x in x0..<min(w, x0 + 8) { s += c[y * w + x]; k += 1 } }
+            return s / max(k, 1)
+        }
+        let corners = [cornerMean(0, 0), cornerMean(max(0, w - 8), 0), cornerMean(0, max(0, h - 8)), cornerMean(max(0, w - 8), max(0, h - 8))]
+        var B0 = SIMD3<Float>(repeating: 0)
+        for k in 0..<3 { let v = corners.map { $0[k] }.sorted(); B0[k] = (v[1] + v[2]) / 2 }
+        let band = par(g, false) { i in let y = i / w, x = i % w; return y < 6 || y >= h - 6 || x < 6 || x >= w - 6 }
+        let ring = par(g, false) { i in let y = i / w, x = i % w; return y == 0 || y == h - 1 || x == 0 || x == w - 1 }
+        let side = Float(min(w, h)), s = max(4, side / 64)
+        // pass 1: the backing as the border's own noise sees it (a faint glow is the asset, so a tight floor of 3/255)
+        let d0 = par(g, Float(0)) { simd_length(c[$0] - B0) }
+        let border = (0..<g.n).filter { band[$0] && d0[$0] < 0.25 }.map { d0[$0] }
+        let t = border.isEmpty ? 3 / 255 : min(0.22, max(3 / 255, percentile(border, 99) * 1.6))
+        var field = flood(par(g, false) { ring[$0] && d0[$0] < t }, within: d0.map { $0 < t }, g)
+        guard (0..<g.n).filter({ ring[$0] }).filter({ field[$0] }).count * 2 >= 2 * (w + h) - 4 else { return nil }
+        var B = localMean(c, field, g, s, inside: false, fallback: B0)
+        // pass 2: within 4 sigma of that map, so a faint glow near the edge is never taken for backing. Sigma is p99/2.6,
+        // not a median: a backing at 0 or 255 clips half its noise away, and a median then reads a third of it.
+        var sigma = SIMD3<Float>(repeating: 1 / 255)
+        let edgeOf = { (f: [Bool]) in (0..<g.n).filter { band[$0] && f[$0] } }
+        var edge = edgeOf(field)
+        if !edge.isEmpty {
+            for k in 0..<3 { sigma[k] = max(percentile(edge.map { abs(c[$0][k] - B[$0][k]) }, 99) / 2.6, 0.5 / 255) }
+        }
+        let thr = max(4 * simd_length(sigma), 3 / 255)
+        let near = par(g, false) { simd_length(c[$0] - B[$0]) < thr }
+        let f2 = flood(par(g, false) { ring[$0] && near[$0] }, within: near, g)
+        if (0..<g.n).filter({ ring[$0] && f2[$0] }).count * 2 >= 2 * (w + h) - 4 {
+            field = f2
+            B = localMean(c, field, g, s, inside: false, fallback: B0)
+            edge = edgeOf(field)
+        }
+        // alpha: colour to alpha, noise-aware; then values within the backing's own noise gated smoothly to 0
+        var a = par(g, Float(0)) { colourToAlpha(c[$0], B[$0], sigma) }
+        let gate = edge.isEmpty ? 1 / 255 : max(percentile(edge.map { a[$0] }, 99), 1 / 255)
+        a = par(g, Float(0)) { field[$0] ? 0 : a[$0] * min(1, max(0, (a[$0] - gate) / gate)) }
+        var out = [UInt8](repeating: 0, count: g.n * 4)
+        for i in 0..<g.n where a[i] > 0 {
+            let F = clamp01((c[i] - (1 - a[i]) * B[i]) / max(a[i], 1e-4)) * 255 + 0.5
+            out[i * 4] = UInt8(F.x); out[i * 4 + 1] = UInt8(F.y); out[i * 4 + 2] = UInt8(F.z)
+            out[i * 4 + 3] = UInt8(min(255, a[i] * 255 + 0.5))
+        }
+        return out
+    }
+
+    /// Smallest a with (C - (1-a)B)/a inside [0,1], noise-aware. A channel moving toward a near limit (down from a dark
+    /// backing channel, up from a bright one) has little room, so its noise would read as nearly opaque: it must clear
+    /// 2.5 sigma first (fully at no room, not at all from a room of 0.25). Toward the far side it counts as it is.
+    static func colourToAlpha(_ c: SIMD3<Float>, _ B: SIMD3<Float>, _ sigma: SIMD3<Float>) -> Float {
+        let room: Float = 8 / 255, tight: Float = 0.25
+        var a: Float = 0
+        for k in 0..<3 {
+            let upRoom = 1 - B[k], downRoom = B[k]
+            let upTol = 2.5 * sigma[k] * min(1, max(0, (tight - upRoom) / tight))
+            let downTol = 2.5 * sigma[k] * min(1, max(0, (tight - downRoom) / tight))
+            a = max(a, max(c[k] - B[k] - upTol, 0) / max(upRoom, room), max(B[k] - c[k] - downTol, 0) / max(downRoom, room))
+        }
+        return a
     }
 
     // MARK: colour helpers
@@ -577,13 +664,14 @@ enum NativeBGRemoval {
 }
 
 #if NATIVE_BG_TOOL
-/// The helper: `NavigatorNativeBG <image>...` prints each output path; a failure goes to stderr and exits 1.
+/// The helper: `NavigatorNativeBG [--soft] <image>...` prints each output path; a failure goes to stderr and exits 1.
 @main
 struct NativeBGRemovalTool {
     static func main() {
         var failed = false
-        for path in CommandLine.arguments.dropFirst() {
-            do { print(try NativeBGRemoval.export(source: URL(fileURLWithPath: path)).path) }
+        let args = CommandLine.arguments.dropFirst(), soft = args.contains("--soft")
+        for path in args where path != "--soft" {
+            do { print(try NativeBGRemoval.export(source: URL(fileURLWithPath: path), soft: soft).path) }
             catch { failed = true; FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8)) }
         }
         exit(failed ? 1 : 0)

@@ -106,6 +106,8 @@ All of it sits in the right-click menu, runs in the background with a progress i
 
 **Native BG Removal** — for art generated on a flat key colour, with no Adobe app: a known-backing matte for the edges, plus Apple's on-device subject mask to drop the glows and haze AI generators paint into the key colour. About a second an image. Measured against both on 30 shipped symbols and 19 real AI outputs: cleaner edges than After Effects Keylight, and 25 key-coloured pixels left in total where Photoshop left 44,109.
 
+**Native BG Removal ▸ Soft FX** — glows, sparkles, rays and bubbles keep every transitional alpha, on any backing colour, black included. After Effects' Keylight can't key black at all: it measures distance from the screen colour's dominant channel, and black has none. FX Alpha Upscale keys with it, so it no longer needs After Effects. Chroma Key BG sends black, white and grey backings to it too.
+
 **Generative Upscale (Firefly)** — Photoshop's own upscaler, scripted. Adobe's Firefly model only, and Navigator refuses to save the result if Photoshop hands back a different one.
 
 ### Integration

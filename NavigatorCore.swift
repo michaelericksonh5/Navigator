@@ -7030,6 +7030,10 @@ enum ChromaKeyOutputRules {
         var clipWhite: Double { self == .softFX ? 100 : 80 }
     }
 
+    /// Below this chroma (max - min channel, 0-255) a backing has no dominant channel for Keylight to key against:
+    /// black, white and greys come back opaque and speckled. Navigator sends those to Native BG Removal instead.
+    static let keylightMinChroma = 80
+
     /// Tell the keying script which colour to key, so it never samples one itself.
     ///
     /// As HEX, deliberately. In custom mode the script re-derives the colour from
