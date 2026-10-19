@@ -9710,7 +9710,7 @@ public enum ArtWords {
     wilds	es	Wilds
     respins	es	nuevos giros
     collect	es	recoger
-    wild	es	WILD
+    wild	es	Wild
     scatter	es	scatter
     bonus	es	bonus
     jackpot	es	jackpot
@@ -9725,10 +9725,10 @@ public enum ArtWords {
     you've won the minor jackpot	es	ganaste el jackpot menor
     you've won the mini jackpot	es	ganaste el jackpot mini
     big win!	es	¡premio grande!
-    super win!	es	¡superpremio!
+    super win!	es	¡super premio!
     mega win!	es	¡megapremio!
     huge win!	es	¡premio enorme!
-    ultra win!	es	¡ultrapremio!
+    ultra win!	es	¡ultra premio!
     loot link	es	Loot Link
     super boost	es	superpotenciador
     jackpot	es	jackpot
@@ -9797,23 +9797,23 @@ public enum ArtWords {
     bonus games complete	de	GRATISSPIELE ABGESCHLOSSEN
     one more chance	de	NOCH EINE CHANCE
     bonus wheel	de	Bonus Wheel
-    jackpots	de	CASHPOTS
+    jackpots	de	Cashpots
     bonus games	de	Gratisspiele
-    multiplier	de	MULTIPLIKATOR
+    multiplier	de	Multiplikator
     credits	de	Credits
     wilds	de	Wilds
     respins	de	Neudrehs
     collect	de	SAMMELN
-    wild	de	WILD
-    scatter	de	SCATTER
+    wild	de	Wild
+    scatter	de	Scatter
     bonus	de	Bonus
-    jackpot	de	CASHPOT
+    jackpot	de	Cashpot
     awarded!	de	ERHALTEN!
-    grand	de	GROSSER
-    mega	de	MEGA
-    major	de	GRÖSSERER
-    minor	de	KLEINER
-    mini	de	MINI
+    grand	de	Grosser
+    mega	de	Mega
+    major	de	Grösserer
+    minor	de	Kleiner
+    mini	de	Mini
     you've won the grand jackpot	de	Sie haben den GROSSEN CASHPOT gewonnen
     you've won the mega jackpot	de	Sie haben den MEGA-CASHPOT gewonnen
     you've won the major jackpot	de	Sie haben den GRÖSSEREN CASHPOT gewonnen
@@ -9825,7 +9825,7 @@ public enum ArtWords {
     huge win!	de	RIESIGER GEWINN!
     ultra win!	de	ULTRAGEWINN!
     loot link	de	Loot Link
-    jackpot	de	CASHPOT
+    jackpot	de	Cashpot
     continue	it	continua
     play now!	it	gioca ora!
     power bet	it	Power Bet
@@ -9834,7 +9834,7 @@ public enum ArtWords {
     total win	it	vincita totale
     bonus games awarded!	it	giocate gratis assegnate
     bonus games complete	it	giocate gratis completate
-    one more chance	it	UN'ALTRA POSSIBILITÀ
+    one more chance	it	NUOVA CHANCE
     bonus wheel	it	Bonus Wheel
     jackpots	it	jackpot
     bonus games	it	Giocate gratis
@@ -9879,20 +9879,20 @@ public enum ArtWords {
     bonus wheel	tr	Bonus Wheel
     jackpots	tr	Jackpots
     bonus games	tr	Ücretsiz Oyunlar
-    multiplier	tr	ÇARPAN
+    multiplier	tr	çarpan
     credits	tr	kredi
     respins	tr	tekrar çevirme
     collect	tr	toplayın
-    wild	tr	WILD
-    scatter	tr	SCATTER
+    wild	tr	Wild
+    scatter	tr	Scatter
     bonus	tr	Bonus
     jackpot	tr	Jackpot
     awarded!	tr	VERİLDİ!
-    grand	tr	DEV
-    mega	tr	MEGA
-    major	tr	BÜYÜK
-    minor	tr	KÜÇÜK
-    mini	tr	MİNİ
+    grand	tr	Dev
+    mega	tr	Mega
+    major	tr	Büyük
+    minor	tr	Küçük
+    mini	tr	Mini
     you've won the grand jackpot	tr	DEV JACKPOT kazandın
     you've won the mega jackpot	tr	MEGA JACKPOT kazandın
     you've won the major jackpot	tr	BÜYÜK JACKPOT kazandın
@@ -9919,18 +9919,18 @@ public enum ArtWords {
     bonus games	ru	Бесплатные игры
     multiplier	ru	Множитель
     credits	ru	кредиты
-    wilds	ru	WILD
+    wilds	ru	Wild
     respins	ru	повторные вращения
-    wild	ru	WILD
-    scatter	ru	SCATTER
+    wild	ru	Wild
+    scatter	ru	Scatter
     bonus	ru	Бонус
-    jackpot	ru	JACKPOT
+    jackpot	ru	Jackpot
     awarded!	ru	ПОЛУЧЕНЫ!
-    grand	ru	ОГРОМНЫЙ
-    mega	ru	МЕГА
-    major	ru	БОЛЬШОЙ
-    minor	ru	МАЛЫЙ
-    mini	ru	МИНИ
+    grand	ru	Огромный
+    mega	ru	Мега
+    major	ru	Большой
+    minor	ru	Малый
+    mini	ru	Мини
     you've won the grand jackpot	ru	Вы выиграли ОГРОМНЫЙ JACKPOT
     you've won the mega jackpot	ru	Вы выиграли МЕГА JACKPOT
     you've won the major jackpot	ru	Вы выиграли БОЛЬШОЙ JACKPOT
@@ -9942,7 +9942,7 @@ public enum ArtWords {
     huge win!	ru	ОГРОМНЫЙ ВЫИГРЫШ!
     ultra win!	ru	УЛЬТРАВЫИГРЫШ!
     loot link	ru	Loot Link
-    jackpot	ru	JACKPOT
+    jackpot	ru	Jackpot
     continue	zh-cn	继续
     play now!	zh-cn	开始游戏！
     power bet	zh-cn	Power Bet
@@ -9955,7 +9955,7 @@ public enum ArtWords {
     bonus wheel	zh-cn	Bonus Wheel
     jackpots	zh-cn	头奖
     bonus games	zh-cn	奖励游戏
-    multiplier	zh-cn	奖赏倍数
+    multiplier	zh-cn	倍数
     credits	zh-cn	金额
     wilds	zh-cn	Wilds
     respins	zh-cn	重新旋转
@@ -9993,8 +9993,8 @@ public enum ArtWords {
     bonus wheel	zh-hk	Bonus Wheel
     jackpots	zh-hk	頭獎
     bonus games	zh-hk	獎勵遊戲
-    multiplier	zh-hk	加倍派彩
-    credits	zh-hk	可用金額
+    multiplier	zh-hk	倍數
+    credits	zh-hk	積分
     wilds	zh-hk	Wilds
     respins	zh-hk	重新旋轉
     wild	zh-hk	百搭
@@ -10037,15 +10037,15 @@ public enum ArtWords {
     respins	da	Respins
     collect	da	SAML
     wild	da	WILD
-    scatter	da	SCATTER
+    scatter	da	Scatter
     bonus	da	bonus
     jackpot	da	Jackpot
     awarded!	da	TILDELT!
-    grand	da	STØRST
-    mega	da	MEGA
-    major	da	STOR
-    minor	da	LILLE
-    mini	da	MINI
+    grand	da	Størst
+    mega	da	Mega
+    major	da	Stor
+    minor	da	Lille
+    mini	da	Mini
     you've won the grand jackpot	da	Du har vundet den STØRSTE JACKPOT
     you've won the mega jackpot	da	Du har vundet MEGAJACKPOTTEN
     you've won the major jackpot	da	Du har vundet den STORE JACKPOT
@@ -10055,7 +10055,7 @@ public enum ArtWords {
     super win!	da	SUPERGEVINST!
     mega win!	da	MEGAGEVINST!
     huge win!	da	KÆMPEGEVINST!
-    ultra win!	da	ULTRA GEVINST!
+    ultra win!	da	ULTRAGEVINST!
     loot link	da	Loot Link
     jackpot	da	Jackpot
     continue	sv	FORTSÄTT
@@ -10075,16 +10075,16 @@ public enum ArtWords {
     wilds	sv	Wilds
     respins	sv	omsnurr
     collect	sv	samla
-    wild	sv	WILD
-    scatter	sv	SCATTER
+    wild	sv	Wild
+    scatter	sv	Scatter
     bonus	sv	bonus
     jackpot	sv	jackpot
     awarded!	sv	TILLDELATS!
-    grand	sv	STÖRSTA
-    mega	sv	MEGA
-    major	sv	STORA
-    minor	sv	LITEN
-    mini	sv	MINI
+    grand	sv	Största
+    mega	sv	Mega
+    major	sv	Stora
+    minor	sv	Liten
+    mini	sv	Mini
     you've won the grand jackpot	sv	DU HAR VUNNIT DEN STÖRSTA JACKPOTTEN
     you've won the mega jackpot	sv	DU HAR VUNNIT MEGA-JACKPOTTEN
     you've won the major jackpot	sv	DU HAR VUNNIT DEN STORA JACKPOTTEN
@@ -10104,17 +10104,17 @@ public enum ArtWords {
     total win	sk	CELKOVÁ VÝHRA
     bonus games awarded!	sk	ZÍSKALI STE BEZPLATNÉ HRY!
     bonus games complete	sk	BEZPLATNÉ HRY DOKONČENÉ
-    one more chance	sk	POSLEDNÁ ŠANCA
+    one more chance	sk	EŠTE JEDNA ŠANCA
     jackpots	sk	Jackpots
     bonus games	sk	BONUSOVÉ HRY
     multiplier	sk	Násobič
     credits	sk	kredity
     wilds	sk	Wilds
     respins	sk	Respins
-    wild	sk	WILD
-    scatter	sk	SCATTER
+    wild	sk	wild
+    scatter	sk	Scatter
     bonus	sk	Bonus
-    jackpot	sk	JACKPOT
+    jackpot	sk	Jackpot
     awarded!	sk	SÚ UDELENÉ!
     grand	sk	VEĽKOLEPÝ
     mega	sk	MEGA
@@ -10130,7 +10130,7 @@ public enum ArtWords {
     super win!	sk	SUPER VÝHRA!
     ultra win!	sk	ULTRA VÝHRA!
     loot link	sk	Loot Link
-    jackpot	sk	JACKPOT
+    jackpot	sk	Jackpot
     continue	ro	CONTINUARE
     play now!	ro	JUCAȚI ACUM!
     power bet	ro	Power Bet
@@ -10145,16 +10145,16 @@ public enum ArtWords {
     bonus games	ro	JOCURI BONUS
     multiplier	ro	Multiplicator
     credits	ro	Credite
-    wild	ro	WILD
-    scatter	ro	SCATTER
+    wild	ro	Wild
+    scatter	ro	scatter
     bonus	ro	Bonus
     jackpot	ro	Jackpot
     awarded!	ro	ACORDATE!
-    grand	ro	GRANDIOS
-    mega	ro	MEGA
-    major	ro	MARE
-    minor	ro	MIC
-    mini	ro	MINI
+    grand	ro	grandios
+    mega	ro	Mega
+    major	ro	mare
+    minor	ro	mic
+    mini	ro	Mini
     you've won the grand jackpot	ro	Ați câștigat JACKPOTUL GRANDIOS
     you've won the mega jackpot	ro	Ați câștigat JACKPOTUL MEGA
     you've won the major jackpot	ro	Ați câștigat JACKPOTUL MARE
@@ -10180,15 +10180,15 @@ public enum ArtWords {
     bonus games	pl	DARMOWE GRY
     multiplier	pl	Mnożnik
     credits	pl	Kredyty
-    wild	pl	WILD
-    scatter	pl	SCATTER
+    wild	pl	Wild
+    scatter	pl	Scatter
     bonus	pl	Bonus
-    jackpot	pl	JACKPOT
+    jackpot	pl	Jackpot
     awarded!	pl	PRZYZNANO!
-    grand	pl	GRAND
+    grand	pl	Grand
     mega	pl	MEGA
-    major	pl	MAJOR
-    minor	pl	MINOR
+    major	pl	Major
+    minor	pl	Minor
     mini	pl	MINI
     you've won the grand jackpot	pl	Wygrywasz GRAND JACKPOT
     you've won the mega jackpot	pl	Wygrywasz MEGA JACKPOT
@@ -10199,7 +10199,7 @@ public enum ArtWords {
     super win!	pl	SUPERWYGRANA!
     ultra win!	pl	ULTRAWYGRANA!
     loot link	pl	Loot Link
-    jackpot	pl	JACKPOT
+    jackpot	pl	Jackpot
     continue	no	FORTSETT
     play now!	no	SPILL NÅ!
     power bet	no	Power Bet
@@ -10208,7 +10208,7 @@ public enum ArtWords {
     total win	no	TOTAL GEVINST
     bonus games awarded!	no	GRATISSPILL TILDELT!
     bonus games complete	no	GRATISSPILL FULLFØRT
-    one more chance	no	ÉN SJANSE TIL
+    one more chance	no	EN EKSTRA SJANSE
     jackpots	no	Jackpoter
     bonus games	no	BONUSSPILL
     multiplier	no	Multiplikator
@@ -10216,14 +10216,14 @@ public enum ArtWords {
     wilds	no	Wilds
     respins	no	Respins
     wild	no	WILD
-    scatter	no	SCATTER
+    scatter	no	Scatter
     bonus	no	Bonus
     jackpot	no	Jackpot
     awarded!	no	TILDELT!
-    grand	no	GRAND
+    grand	no	Grand
     mega	no	MEGA
-    major	no	MAJOR
-    minor	no	MINOR
+    major	no	Major
+    minor	no	Minor
     mini	no	MINI
     you've won the grand jackpot	no	Du har vunnet GRAND-JACKPOTEN
     you've won the mega jackpot	no	Du har vunnet MEGA-JACKPOTEN
@@ -10247,8 +10247,8 @@ public enum ArtWords {
     bonus games	fi	BONUSPELEJÄ
     multiplier	fi	kerroin
     credits	fi	krediittiä
-    wild	fi	WILD
-    scatter	fi	SCATTER
+    wild	fi	wild
+    scatter	fi	Scatter
     bonus	fi	bonus
     jackpot	fi	JACKPOT
     awarded!	fi	ANNETTU!
@@ -10284,16 +10284,16 @@ public enum ArtWords {
     wilds	el	Wilds
     respins	el	επαναπεριστροφές
     collect	el	Συλλέξτε
-    wild	el	WILD
-    scatter	el	SCATTER
+    wild	el	Wild
+    scatter	el	scatter
     bonus	el	μπόνους
-    jackpot	el	JACKPOT
+    jackpot	el	Jackpot
     awarded!	el	ΑΠΟΝΕΜΗΘΗΚΑΝ!
-    grand	el	ΜΕΓΑΛΕΙΩΔΕΣ
-    mega	el	ΜΕΓΑ
-    major	el	ΜΕΓΑΛΟ
-    minor	el	ΜΙΚΡΟ
-    mini	el	ΜΙΝΙ
+    grand	el	Μεγαλειώδες
+    mega	el	Μέγα
+    major	el	Μεγάλο
+    minor	el	Μικρό
+    mini	el	Μίνι
     you've won the grand jackpot	el	Κερδίσατε το ΜΕΓΑΛΕΙΩΔΕΣ JACKPOT
     you've won the mega jackpot	el	Κερδίσατε το ΜΕΓΑ JACKPOT
     you've won the major jackpot	el	Κερδίσατε το ΜΕΓΑΛΟ JACKPOT
@@ -10305,7 +10305,7 @@ public enum ArtWords {
     huge win!	el	ΤΕΡΑΣΤΙΟ ΚΕΡΔΟΣ!
     ultra win!	el	ΥΠΕΡ-ΚΕΡΔΟΣ!
     loot link	el	Loot Link
-    jackpot	el	JACKPOT
+    jackpot	el	Jackpot
     continue	cs	POKRAČOVAT
     play now!	cs	ZAHRAJTE SI TEĎ!
     power bet	cs	Power Bet
@@ -10318,8 +10318,8 @@ public enum ArtWords {
     bonus games	cs	BONUSOVÉ HRY
     multiplier	cs	Násobitel
     credits	cs	kredity
-    wild	cs	WILD
-    scatter	cs	SCATTER
+    wild	cs	Wild
+    scatter	cs	Scatter
     bonus	cs	Bonus
     jackpot	cs	JACKPOT
     awarded!	cs	ZÍSKALI JSTE!
@@ -10352,10 +10352,10 @@ public enum ArtWords {
     multiplier	bg	Множител
     credits	bg	кредити
     wilds	bg	Wilds
-    wild	bg	WILD
-    scatter	bg	SCATTER
+    wild	bg	wild
+    scatter	bg	Scatter
     bonus	bg	бонус
-    jackpot	bg	JACKPOT
+    jackpot	bg	Jackpot
     awarded!	bg	НАГРАДЕНО!
     grand	bg	ГЛАВЕН
     mega	bg	МЕГА
@@ -10371,7 +10371,7 @@ public enum ArtWords {
     super win!	bg	СУПЕР ПЕЧАЛБА!
     ultra win!	bg	СВРЪХ ПЕЧАЛБА!
     loot link	bg	Loot Link
-    jackpot	bg	JACKPOT
+    jackpot	bg	Jackpot
     continue	nl	DOORGAAN
     play now!	nl	SPEEL NU!
     power bet	nl	Power Bet
@@ -10388,16 +10388,16 @@ public enum ArtWords {
     credits	nl	Credits
     wilds	nl	Wilds
     respins	nl	Respins
-    wild	nl	WILD
-    scatter	nl	SCATTER
+    wild	nl	wild
+    scatter	nl	Scatter
     bonus	nl	Bonus
-    jackpot	nl	JACKPOT
+    jackpot	nl	jackpot
     awarded!	nl	TOEGEKEND!
-    grand	nl	ENORM
-    mega	nl	MEGA
-    major	nl	GROOT
-    minor	nl	KLEIN
-    mini	nl	MINI
+    grand	nl	enorm
+    mega	nl	mega
+    major	nl	groot
+    minor	nl	klein
+    mini	nl	mini
     you've won the grand jackpot	nl	Je hebt de ENORME JACKPOT gewonnen
     you've won the mega jackpot	nl	Je hebt de MEGA JACKPOT gewonnen
     you've won the major jackpot	nl	Je hebt de GROTE JACKPOT gewonnen
@@ -10409,7 +10409,7 @@ public enum ArtWords {
     huge win!	nl	ENORME WINST!
     ultra win!	nl	ULTRAWINST!
     loot link	nl	Loot Link
-    jackpot	nl	JACKPOT
+    jackpot	nl	jackpot
     continue	ko	계속하기
     play now!	ko	지금 플레이하세요!
     power bet	ko	Power Bet
