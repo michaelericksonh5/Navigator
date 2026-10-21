@@ -3728,6 +3728,29 @@ enum TeamDefaults {
     ]
 }
 
+/// Google's cwebp, for Export as WebP (macOS can't write WebP). Looked for where Homebrew puts it
+/// and in the user's own bin folders — without admin rights there is no Homebrew, and ~/bin is
+/// where it goes — or wherever the user pointed Navigator at it.
+enum WebPEncoder {
+    private static let key = "cwebpPath"
+    static var path: String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let saved = Prefs.d.string(forKey: key).map { [$0] } ?? []
+        return (saved + ["/opt/homebrew/bin/cwebp", "/usr/local/bin/cwebp", home + "/bin/cwebp", home + "/.local/bin/cwebp"])
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+    /// Let the user pick the cwebp file. True when an executable one was chosen.
+    @MainActor static func choose() -> Bool {
+        let p = NSOpenPanel()
+        p.message = "Choose Google’s cwebp program"
+        p.canChooseDirectories = false; p.allowsMultipleSelection = false
+        p.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("bin")
+        guard p.runModal() == .OK, let u = p.url, FileManager.default.isExecutableFile(atPath: u.path) else { return false }
+        Prefs.d.set(u.path, forKey: key)
+        return true
+    }
+}
+
 enum VertexSetup {
     private static let urlKey = "h5gServiceURL"
 
@@ -15314,9 +15337,8 @@ struct ImageViewerView: View {
         defer { try? FileManager.default.removeItem(at: tmp) }
 
         if format == .webp {
-            guard let cwebp = ["/opt/homebrew/bin/cwebp", "/usr/local/bin/cwebp"]
-                    .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-                return "WebP needs Google's encoder, which isn't installed. Install it with:\n\n    brew install webp"
+            guard let cwebp = WebPEncoder.path else {
+                return "WebP needs Google's cwebp, which Navigator can't find. Put it in ~/bin, install it with “brew install webp”, or choose it in Setup ▸ WebP encoder."
             }
             // -q 90 matches the other lossy formats; lossless alpha preserves cutouts.
             do {
@@ -16532,22 +16554,38 @@ enum Updater {
         }
     }
 
+    /// Where the update goes: over this copy when its folder can be written; otherwise — a standard
+    /// account, with Navigator put in /Applications by an admin — into the user's own ~/Applications,
+    /// which needs no admin rights.
+    static var installDestination: (path: String, moved: Bool) {
+        let here = Bundle.main.bundleURL
+        if here.pathExtension == "app", access(here.deletingLastPathComponent().path, W_OK) == 0 { return (here.path, false) }
+        let mine = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications")
+        try? FileManager.default.createDirectory(at: mine, withIntermediateDirectories: true)
+        return (mine.appendingPathComponent("Navigator.app").path, true)
+    }
+
     private static func download(_ zip: URL) {
-        guard access("/Applications", W_OK) == 0 else {
-            alert("Can't update automatically", "Navigator can't write to /Applications. Download the update manually from the Releases page.", link: releasesPage)
+        let dest = installDestination
+        guard access((dest.path as NSString).deletingLastPathComponent, W_OK) == 0 else {
+            alert("Can't update automatically", "Navigator can't write to \((dest.path as NSString).deletingLastPathComponent). Download the update manually from the Releases page.", link: releasesPage)
             return
+        }
+        if dest.moved {
+            alert("Updating into your own Applications folder",
+                  "Your account can't change \(Bundle.main.bundleURL.deletingLastPathComponent().path), so the new Navigator goes into Applications in your home folder (\(dest.path)) — no admin rights needed. Open Navigator from there from now on, and drag it to the Dock in place of the old one. The old copy can be deleted by whoever installed it.")
         }
         NSApp.dockTile.badgeLabel = "↓"   // brief hint while the (small) zip downloads
         URLSession.shared.downloadTask(with: zip) { tmp, _, err in
             DispatchQueue.main.async {
                 NSApp.dockTile.badgeLabel = nil
                 guard let tmp, err == nil else { alert("Download failed", err?.localizedDescription ?? "Please try again."); return }
-                install(zipAt: tmp)
+                install(zipAt: tmp, to: dest.path)
             }
         }.resume()
     }
 
-    private static func install(zipAt zip: URL) {
+    private static func install(zipAt zip: URL, to dest: String) {
         let fm = FileManager.default
         let work = fm.temporaryDirectory.appendingPathComponent("NavigatorUpdate-\(UUID().uuidString)")
         try? fm.createDirectory(at: work, withIntermediateDirectories: true)
@@ -16559,7 +16597,6 @@ enum Updater {
                   .first(where: { $0.pathExtension == "app" }) else {
             alert("Update failed", "The downloaded update couldn't be expanded."); return
         }
-        let dest = "/Applications/Navigator.app"
         // A helper that waits for us to quit, swaps the bundle, and relaunches —
         // you can't overwrite a running app bundle from within itself. Discard output
         // before we quit so the closed capture pipes cannot give the helper SIGPIPE.
@@ -18063,14 +18100,12 @@ struct SetupItem: Identifiable {
             // encoder. Everything else Navigator exports uses macOS's own ImageIO.
             SetupItem(id: "app-webp", section: .optional, title: "WebP encoder",
                       short: "Only for Export as WebP. Every other format is built into macOS.",
-                      why: "Google’s cwebp, installed with Homebrew. In Terminal:\n\n    brew install webp\n\nNo Homebrew? Install it first from brew.sh (one command, it explains itself). The button copies the command.",
-                      probe: { _ in
-                          ["/opt/homebrew/bin/cwebp", "/usr/local/bin/cwebp"]
-                              .contains { FileManager.default.isExecutableFile(atPath: $0) } ? .granted : .off
-                      },
+                      why: "Google’s cwebp. Navigator finds it where Homebrew installs it (brew install webp) and in ~/bin or ~/.local/bin. No admin rights, so no Homebrew? Download cwebp from Google’s WebP page, put it in ~/bin, or press the button to choose it wherever it is.",
+                      probe: { _ in WebPEncoder.path != nil ? .granted : .off },
                       probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "Copy Install Command",
+                      settingsLabel: "Choose or Install…",
                       run: { report in
+                          if MainActor.assumeIsolated({ WebPEncoder.choose() }) { report("Using \(WebPEncoder.path ?? "cwebp")."); return }
                           NSPasteboard.general.clearContents()
                           NSPasteboard.general.setString("brew install webp", forType: .string)
                           let hasBrew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
@@ -19884,7 +19919,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 NSWorkspace.shared.open(url)
             }
         case .alertSecondButtonReturn:
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: "/Applications/Navigator.app")])
+            NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
         default:
             break
         }
