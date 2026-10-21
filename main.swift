@@ -3711,6 +3711,15 @@ func vertexSignedIn() -> Bool {
 /// The service address is NOT in this repository, which is public. It is taken from the env var the
 /// plugin honours, or scraped from an installed plugin, or - for a machine with neither - typed once
 /// and remembered here.
+/// The team's own addresses, built in (2.29.8) so a new user only signs in with Google. None is a
+/// secret: the meter and the hub let in signed-in @high5games.com accounts only, and the GDDs
+/// folder is just where the picker opens. A saved value or the env var still wins.
+enum TeamDefaults {
+    static let serviceURL = "https://ai-gen-meter-237763884955.us-central1.run.app"
+    static let themeHubURL = "https://h5g-theme-hub-283306230442.us-central1.run.app"
+    static let gddDrivePath = "Shared drives/Public/Departments/Game Innovation/GDDs"
+}
+
 enum VertexSetup {
     private static let urlKey = "h5gServiceURL"
 
@@ -20177,16 +20186,7 @@ enum H5GService {
         // was missing: the address was saved and then never read, so on a Mac WITHOUT the
         // Claude plugin Vertex could not be set up at all, and sign-in asked for it forever.
         if let v = VertexSetup.storedServiceURL { return v }
-        // Last resort: the address baked into an installed h5g-ai-connect plugin.
-        guard let client = resolveH5GClient(),
-              let src = try? String(contentsOfFile: client, encoding: .utf8) else { return nil }
-        // SERVICE_URL = "https://…"  — first quoted https URL after the name.
-        guard let r = src.range(of: "SERVICE_URL"),
-              let q = src.range(of: "https://[^\"']+", options: .regularExpression,
-                                range: r.upperBound..<src.endIndex) else { return nil }
-        var u = String(src[q])
-        if u.hasSuffix("/") { u = String(u.dropLast()) }
-        return u
+        return TeamDefaults.serviceURL
     }
 
     /// What the service says it supports (GET /v1/me, free), read once per launch.
@@ -23510,7 +23510,7 @@ final class GoogleWebSession: NSObject, WKNavigationDelegate, WKDownloadDelegate
     nonisolated static var themeHubURL: String? {
         get {
             if let e = ProcessInfo.processInfo.environment["H5G_THEME_HUB_URL"], !e.isEmpty { return e }
-            guard let v = Prefs.d.string(forKey: "h5gThemeHubURL"), !v.isEmpty else { return nil }
+            guard let v = Prefs.d.string(forKey: "h5gThemeHubURL"), !v.isEmpty else { return TeamDefaults.themeHubURL }
             return v
         }
         set { Prefs.d.set(newValue ?? "", forKey: "h5gThemeHubURL") }
@@ -24525,8 +24525,11 @@ enum GDDLibrary {
     /// only the starting point the picker opens on.
     static var folder: URL? {
         get {
-            guard let p = Prefs.d.string(forKey: "gddFolder"), !p.isEmpty else { return nil }
-            return URL(fileURLWithPath: p)
+            if let p = Prefs.d.string(forKey: "gddFolder"), !p.isEmpty { return URL(fileURLWithPath: p) }
+            // The team's GDDs folder on this Mac's Drive mount, when Drive for desktop has it.
+            guard let root = googleDriveAccountRoot() else { return nil }
+            let u = URL(fileURLWithPath: root).appendingPathComponent(TeamDefaults.gddDrivePath)
+            return FileManager.default.fileExists(atPath: u.path) ? u : nil
         }
         set { Prefs.d.set(newValue?.path ?? "", forKey: "gddFolder") }
     }
