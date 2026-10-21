@@ -1883,10 +1883,15 @@ func googleDrivePortablePath(_ url: URL) -> String? {
 // Where Drive for desktop mounts THIS Mac's account. The one thing about a Drive
 // path that no pure rule can work out, and the anchor every resolved form lands on.
 func googleDriveAccountRoot() -> String? {
+    let roots = googleDriveAccountRoots()
+    // With a personal and a work account both signed in, the one with shared drives is the work one.
+    return roots.first { FileManager.default.fileExists(atPath: $0 + "/Shared drives") } ?? roots.first
+}
+/// Every Drive for desktop account mounted on this Mac.
+func googleDriveAccountRoots() -> [String] {
     let cs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/CloudStorage")
-    guard let accounts = try? FileManager.default.contentsOfDirectory(atPath: cs.path),
-          let local = accounts.first(where: { $0.hasPrefix("GoogleDrive-") }) else { return nil }
-    return cs.appendingPathComponent(local).path
+    let accounts = (try? FileManager.default.contentsOfDirectory(atPath: cs.path)) ?? []
+    return accounts.filter { $0.hasPrefix("GoogleDrive-") }.sorted().map { cs.appendingPathComponent($0).path }
 }
 
 /// The reverse of `googleDriveURL`: a drive.google.com link → where that item actually
@@ -24568,13 +24573,29 @@ enum GDDLibrary {
     /// only the starting point the picker opens on.
     static var folder: URL? {
         get {
-            if let p = Prefs.d.string(forKey: "gddFolder"), !p.isEmpty { return URL(fileURLWithPath: p) }
-            // The team's GDDs folder on this Mac's Drive mount, when Drive for desktop has it.
-            guard let root = googleDriveAccountRoot() else { return nil }
-            let u = URL(fileURLWithPath: root).appendingPathComponent(TeamDefaults.gddDrivePath)
-            return FileManager.default.fileExists(atPath: u.path) ? u : nil
+            // A saved choice is kept only while it is a real folder: a picked app bundle (Google Drive.app)
+            // or a folder that has gone used to stick forever and hide the team folder.
+            if let p = Prefs.d.string(forKey: "gddFolder"), !p.isEmpty, isUsableFolder(URL(fileURLWithPath: p)) {
+                return URL(fileURLWithPath: p)
+            }
+            return teamFolder
         }
         set { Prefs.d.set(newValue?.path ?? "", forKey: "gddFolder") }
+    }
+
+    /// The team's GDDs folder on this user's Google Drive, wherever Drive for desktop mounted it: every
+    /// signed-in account, then the older /Volumes/GoogleDrive and ~/Google Drive mounts.
+    static var teamFolder: URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let bases = googleDriveAccountRoots() + ["/Volumes/GoogleDrive", home + "/Google Drive"]
+        return bases.map { URL(fileURLWithPath: $0).appendingPathComponent(TeamDefaults.gddDrivePath) }
+            .first(where: isUsableFolder)
+    }
+
+    /// A directory that is not a package (an .app is a directory to the file system, not a folder to a user).
+    static func isUsableFolder(_ u: URL) -> Bool {
+        let v = try? u.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        return v?.isDirectory == true && v?.isPackage != true
     }
 
     /// Read a Drive stub off disk. See DriveStub for what these are and why the export
@@ -31081,7 +31102,7 @@ struct GDDToAssetsSheet: View {
                 title: which == .gdds ? "Choose the GDDs folder"
                      : which == .manifests ? "Choose the folder of production asset lists"
                      : "Choose where the art goes",
-                start: which == .gdds ? (gddFolder ?? GDDLibrary.folder)
+                start: which == .gdds ? (gddFolder.flatMap { GDDLibrary.isUsableFolder($0) ? $0 : nil } ?? GDDLibrary.folder)
                      : which == .manifests ? GDDLibrary.manifestFolder
                      : (outParent ?? GDDLibrary.outputParent),
                 onChoose: { u in
@@ -31157,7 +31178,7 @@ struct GDDToAssetsSheet: View {
         restoring = true
         // A typed set saved before sessions were: its manifest says it was typed.
         fromDocument = s.fromDocument && !run.typed
-        if let f = s.gddFolder {
+        if let f = s.gddFolder.map({ URL(fileURLWithPath: $0) }).flatMap({ GDDLibrary.isUsableFolder($0) ? $0 : GDDLibrary.folder })?.path {
             gddFolder = URL(fileURLWithPath: f)
             entries = GDDLibrary.entries(in: gddFolder!)
             if let g = s.gddFile {
@@ -33628,6 +33649,27 @@ struct NavigatorFolderPicker: View {
             HStack(spacing: 0) {
                 // The user's own sidebar, not a generic one.
                 List {
+                    // Drive for desktop lives under ~/Library, which this list never shows.
+                    let drives = googleDriveAccountRoots()
+                    if !drives.isEmpty || GDDLibrary.teamFolder != nil {
+                        Section("Google Drive") {
+                            if let team = GDDLibrary.teamFolder {
+                                Button { here = team; selected = nil; reload() } label: { Label("Team GDDs", systemImage: "doc.text.magnifyingglass") }
+                                    .buttonStyle(.plain)
+                            }
+                            ForEach(drives, id: \.self) { d in
+                                let shared = URL(fileURLWithPath: d).appendingPathComponent("Shared drives")
+                                Button {
+                                    here = FileManager.default.fileExists(atPath: shared.path) ? shared : URL(fileURLWithPath: d)
+                                    selected = nil; reload()
+                                } label: {
+                                    Label(drives.count > 1 ? String(URL(fileURLWithPath: d).lastPathComponent.dropFirst("GoogleDrive-".count)) : "Shared drives",
+                                          systemImage: "externaldrive.connected.to.line.below")
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
                     Section("Favourites") {
                         ForEach(favorites.items) { f in
                             Button {
@@ -33687,9 +33729,7 @@ struct NavigatorFolderPicker: View {
             let items = try FileManager.default.contentsOfDirectory(
                 at: here, includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles])
-            folders = items.filter {
-                (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            folders = items.filter(GDDLibrary.isUsableFolder).sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         } catch {
             folders = []
             self.error = "Can’t read this folder: \(error.localizedDescription)"
