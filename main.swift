@@ -3718,6 +3718,14 @@ enum TeamDefaults {
     static let serviceURL = "https://ai-gen-meter-237763884955.us-central1.run.app"
     static let themeHubURL = "https://h5g-theme-hub-283306230442.us-central1.run.app"
     static let gddDrivePath = "Shared drives/Public/Departments/Game Innovation/GDDs"
+    /// The office shares, as sidebar drives (2.29.9). They answer only on the VPN, and the first
+    /// click mounts with the user's own login.
+    static let drives: [Favorite] = [
+        Favorite(label: "G Drive", path: "/Volumes/Games", mountURL: "smb://CORP-DC01.High5.local/Games"),
+        Favorite(label: "ArtSource", path: "/Volumes/Games/artSource", mountURL: "smb://CORP-DC01.High5.local/Games"),
+        Favorite(label: "T Drive", path: "/Volumes/Games/Tools", mountURL: "smb://CORP-DC01.High5.local/Games"),
+        Favorite(label: "X Drive", path: "/Volumes/data/Dept", mountURL: "smb://corp-pure02/data"),
+    ]
 }
 
 enum VertexSetup {
@@ -5259,6 +5267,14 @@ final class FavoritesStore: ObservableObject {
         } else {
             items = defaultLocations().map { Favorite(label: $0.name, path: $0.url.path, mountURL: nil) }
             persist()
+        }
+        // The team drives, added once per Mac: one already there (by share and folder) is kept, and a
+        // drive the user later removes stays removed.
+        if !UserDefaults.standard.bool(forKey: "teamDrivesAdded") {
+            let have = Set(items.map { "\($0.mountURL?.lowercased() ?? "")|\($0.path.lowercased())" })
+            let missing = TeamDefaults.drives.filter { !have.contains("\($0.mountURL!.lowercased())|\($0.path.lowercased())") }
+            if !missing.isEmpty { items += missing; persist() }
+            UserDefaults.standard.set(true, forKey: "teamDrivesAdded")
         }
     }
     func contains(_ url: URL) -> Bool { items.contains { $0.path == lexicalPath(url.path) } }
