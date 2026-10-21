@@ -3751,6 +3751,21 @@ enum WebPEncoder {
     }
 }
 
+/// macOS's file-viewer preference — the app that other apps' Show in Finder / Reveal opens. A user
+/// preference in the global domain, the same one `defaults write -g NSFileViewer` writes.
+enum FileViewerSetting {
+    private static let key = "NSFileViewer" as CFString
+    static var isNavigator: Bool {
+        (CFPreferencesCopyValue(key, kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost) as? String)
+            == Bundle.main.bundleIdentifier
+    }
+    static func set(_ on: Bool) {
+        CFPreferencesSetValue(key, on ? Bundle.main.bundleIdentifier as CFString? : nil,
+                              kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+    }
+}
+
 enum VertexSetup {
     private static let urlKey = "h5gServiceURL"
 
@@ -18089,12 +18104,12 @@ struct SetupItem: Identifiable {
                       probeMayPrompt: false, canAsk: false, optional: true,
                       settingsLabel: "Make Default",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultImageViewerAction(_:)), to: nil, from: nil) }),
-            SetupItem(id: "defaultfolders", section: .optional, title: "Open folders with Navigator",
-                      short: "Adds Navigator to Open With for folders. macOS never lets any app replace Finder for folders, so this stays Off.",
-                      why: "What the button sets up: Navigator is registered as a folder app, so you can right-click a folder ▸ Open With ▸ Navigator, or Open With ▸ Other… and tick “Always Open With” to make one folder always open here. From Terminal, open -b com.merickson.navigator <folder>. Keeping Navigator in the Dock covers the rest.",
-                      probe: { _ in PermissionProbe.isDefaultApp(for: .folder) },
+            SetupItem(id: "defaultfolders", section: .optional, title: "Show in Finder opens Navigator",
+                      short: "Other apps’ Show in Finder / Show in Folder open here instead (Chrome downloads, Slack, Save dialogs).",
+                      why: "This sets macOS’s file-viewer preference (NSFileViewer), the one Path Finder and ForkLift use. Finder itself is untouched: double-clicking a folder on the Desktop or in Finder still opens Finder — macOS refuses to let any app take folders from Finder (it answers error -50, measured on macOS 26). You can still right-click a folder ▸ Open With ▸ Navigator.\n\nPress the button again to turn it off.",
+                      probe: { _ in FileViewerSetting.isNavigator ? .granted : .off },
                       probeMayPrompt: false, canAsk: false, optional: true,
-                      settingsLabel: "Register & Explain",
+                      settingsLabel: "Turn On or Off",
                       openSettings: { NSApp.sendAction(#selector(AppDelegate.setDefaultBrowserAction(_:)), to: nil, from: nil) }),
             // macOS decodes WebP but cannot write it, so Export as WebP borrows Google's
             // encoder. Everything else Navigator exports uses macOS's own ImageIO.
@@ -19864,38 +19879,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     @objc func setDefaultBrowserAction(_ sender: Any?) {
-        let appURL = Bundle.main.bundleURL
-        Task { @MainActor in
-            // Attempt the real takeover (works only if the OS permits it for folders).
-            try? await NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: .folder)
-            let def = NSWorkspace.shared.urlForApplication(toOpen: UTType.folder)
-            let isDefault = def?.standardizedFileURL.path == appURL.standardizedFileURL.path
-            let a = NSAlert()
-            if isDefault {
-                a.messageText = "Navigator is now your default folder handler"
-                a.informativeText = "Folders opened through the system will now open in Navigator."
-                a.addButton(withTitle: "OK")
-                a.runModal()
-            } else {
-                a.messageText = "macOS reserves folders for Finder"
-                a.informativeText = """
-                macOS doesn't let any third-party app fully replace Finder as the system-wide handler for folders — Apple locks that to Finder.
-
-                What does work — Navigator is registered as a folder app, so you can:
-                •  Right-click a folder in Finder → Open With → Navigator
-                •  Open With → Other…, pick Navigator, and tick “Always Open With” to make that folder always open in Navigator
-                •  From Terminal:  open -b com.merickson.navigator <folder>
-                •  Keep Navigator in your Dock as your everyday browser
-
-                Folders opened this way open as tabs in Navigator.
-                """
-                a.addButton(withTitle: "Reveal Navigator in Finder")
-                a.addButton(withTitle: "OK")
-                if a.runModal() == .alertFirstButtonReturn {
-                    NSWorkspace.shared.activateFileViewerSelecting([appURL])
-                }
-            }
-        }
+        // The part macOS allows: reveal requests from other apps (NSFileViewer).
+        let on = !FileViewerSetting.isNavigator
+        FileViewerSetting.set(on)
+        let a = NSAlert()
+        a.messageText = on ? "Show in Finder now opens Navigator" : "Show in Finder opens Finder again"
+        a.informativeText = on
+            ? "Other apps’ Show in Finder, Show in Folder and Reveal now open the folder in Navigator with the file selected. Apps already open pick it up when they next start. Finder itself still opens folders you double-click in it — macOS doesn’t let any app replace that."
+            : "Navigator is no longer the file viewer for other apps."
+        a.addButton(withTitle: "OK"); a.runModal()
     }
     @objc func openFullDiskAccessAction(_ sender: Any?) {
         let a = NSAlert()
