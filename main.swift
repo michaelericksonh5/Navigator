@@ -2167,6 +2167,16 @@ enum ServiceIcon {
         }
     }
 }
+/// "Remove Heavy Outlines (AI)" — beside Restyle in the same menus. Skips its own outputs.
+@ViewBuilder func removeOutlinesMenuItem(_ urls: [URL], onDone: @escaping ([URL]) -> Void) -> some View {
+    let imgs = urls.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: OutlineRemovalRules.suffix) }
+    if !imgs.isEmpty {
+        Button { removeOutlinesAI(imgs, onDone: onDone) } label: {
+            serviceLabel(imgs.count == 1 ? "Remove Heavy Outlines (AI)" : "Remove Heavy Outlines (AI) (\(imgs.count) images)",
+                         ServiceIcon.openai)
+        }
+    }
+}
 
 @ViewBuilder func fillColorButtons(ratio: Double?, _ action: @escaping (AIPrepColor, Double?) -> Void) -> some View {
     ForEach(aiPrepColors) { c in
@@ -4477,6 +4487,89 @@ func runGPTUpscale(_ src: URL) -> (saved: URL?, cost: Double, error: String?) {
     do { try png.write(to: dst, options: .atomic) }
     catch { return (nil, r.cost, "Couldn’t save cropped result; uncropped image is at \(dst.path).") }
     navLog("gpt upscale cost $\(String(format: "%.6f", r.cost)): \(src.lastPathComponent) \(size.w)×\(size.h) → \(b.w)×\(b.h) \(dst.lastPathComponent)")
+    return (dst, r.cost, nil)
+}
+
+// MARK: - Remove Heavy Outlines (GPT Image 2.5)
+
+// Main-thread owned, like activeAIUpscales: a second click on the same image mid-run is ignored, not paid twice.
+private var activeOutlineRemovals: Set<String> = []
+
+/// Each image is redrawn without its thick dark contour stroke and saved beside its source as
+/// `<name>_no_outline.png`, at the source's own size and with its transparency kept.
+func removeOutlinesAI(_ srcs: [URL], onDone: (([URL]) -> Void)? = nil) {
+    let imgs = srcs.filter { isImageFile($0) && !PathRules.isOwnOutput($0, suffix: OutlineRemovalRules.suffix) }
+        .filter { activeOutlineRemovals.insert($0.standardizedFileURL.path).inserted }
+    guard !imgs.isEmpty else { NSSound.beep(); return }
+    let release = { imgs.forEach { activeOutlineRemovals.remove($0.standardizedFileURL.path) } }
+    var submitted = false
+    defer { if !submitted { release() } }
+    guard OpenAIImages.available else {
+        reportFileError("OpenAI key required", "Add your OpenAI key in AI ▸ API Keys… to use Remove Heavy Outlines.")
+        return
+    }
+    let perImage = OpenAIImages.estimate
+    let a = NSAlert()
+    a.messageText = "Remove heavy outlines from \(imgs.count) image\(imgs.count == 1 ? "" : "s") with GPT Image 2.5?"
+    a.informativeText = (imgs.count == 1
+        ? String(format: "Estimated cost: ~$%.2f.", perImage)
+        : String(format: "Estimated cost: ~$%.2f (about $%.2f each).", Double(imgs.count) * perImage, perImage))
+        + "\n\nGPT Image 2.5 repaints the thick dark outline as painted edge lighting and keeps everything else. "
+        + "It is a generative redraw: fine detail can shift. Each result is saved beside its source as <name>\(OutlineRemovalRules.suffix).png."
+    a.addButton(withTitle: "Remove Outlines"); a.addButton(withTitle: "Cancel")
+    guard a.runModal() == .alertFirstButtonReturn else { return }
+
+    submitted = true
+    DispatchQueue.main.async { BGJobProgress.shared.start("Removing outlines (GPT Image 2.5)", total: imgs.count) }
+    DispatchQueue.global(qos: .userInitiated).async {
+        var outs: [URL] = [], errors: [String] = [], spent = 0.0
+        for src in imgs {
+            defer { DispatchQueue.main.async { BGJobProgress.shared.advance() } }
+            let r = runOutlineRemoval(src)
+            spent += r.cost
+            if let saved = r.saved { outs.append(saved) }
+            else { errors.append("\(src.lastPathComponent): \(r.error ?? "no image came back")") }
+        }
+        let total = spent
+        DispatchQueue.main.async {
+            release()
+            BGJobProgress.shared.finish(String(format: "Removed outlines from %d of %d · $%.2f", outs.count, imgs.count, total))
+            if !errors.isEmpty { showBGSummary(app: "Remove Heavy Outlines", done: outs.count, total: imgs.count, errors: errors, verb: "processed") }
+            if !outs.isEmpty { onDone?(outs) }
+        }
+    }
+}
+
+/// runGPTUpscale's path at 2048: pad to a legal ratio, one edit with native alpha, crop the padding back
+/// off, then resample to the source's exact size so the result drops in where the original was.
+func runOutlineRemoval(_ src: URL) -> (saved: URL?, cost: Double, error: String?) {
+    guard let size = imagePixelSize(src), let plan = OutlineRemovalRules.plan(width: size.w, height: size.h) else {
+        return (nil, 0, "Can’t read the image.")
+    }
+    let transparent = imageHasTransparency(src)
+    guard let input = paddedToCanvas(src, canvas: plan.canvas, transparent: transparent) else {
+        return (nil, 0, "Couldn’t prepare the image.")
+    }
+    let r = OpenAIImages.edit(prompt: OutlineRemovalRules.prompt(transparent: transparent), images: [input],
+                              size: plan.output.w, height: plan.output.h,
+                              quality: "high", background: transparent ? "transparent" : "opaque")
+    guard let raw = r.png else { return (nil, r.cost, r.error ?? "No image came back.") }
+    let dst: URL
+    // Exclusively save the paid result first; concurrent completions must never replace one another.
+    do {
+        dst = try GPTUpscaleRules.saveUnique(raw, beside: src, suffix: OutlineRemovalRules.suffix)
+    } catch { return (nil, r.cost, "Couldn’t save the generated image: \(error.localizedDescription)") }
+    guard let cg = loadCGImage(data: raw), cg.width == plan.output.w, cg.height == plan.output.h else {
+        return (nil, r.cost, "Unexpected output size; uncropped result saved as \(dst.lastPathComponent).")
+    }
+    let b = AspectPrepRules.cropBack(canvas: plan.canvas, subject: (size.w, size.h), result: (cg.width, cg.height))
+    guard let crop = cg.cropping(to: CGRect(x: b.x, y: b.y, width: b.w, height: b.h)),
+          let sized = resampleCG(crop, to: size), let png = encodePNG(sized) else {
+        return (nil, r.cost, "Couldn’t crop padding; uncropped result saved as \(dst.lastPathComponent).")
+    }
+    do { try png.write(to: dst, options: .atomic) }
+    catch { return (nil, r.cost, "Couldn’t save cropped result; uncropped image is at \(dst.path).") }
+    navLog("outline removal cost $\(String(format: "%.6f", r.cost)): \(src.lastPathComponent) \(size.w)×\(size.h) → \(dst.lastPathComponent)")
     return (dst, r.cost, nil)
 }
 
@@ -12162,6 +12255,9 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                 restyleMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { out in
                     browser.refreshAndReveal([out])
                 }
+                removeOutlinesMenuItem(browser.items.filter { ids.contains($0.id) && !$0.isDirectory }.map(\.url)) { outs in
+                    browser.refreshAndReveal(outs)
+                }
                 let layerCount = browser.items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.count
                 Button { browser.layerize(ids) } label: {
                     serviceLabel(layerCount == 1 ? "Layerize (AI)…" : "Layerize (AI)… (\(layerCount) images)",
@@ -15565,6 +15661,7 @@ struct ImageViewerView: View {
                     upscaleImagesAI([u], model: model) { outs in if let o = outs.first { revealNewImage(o) } }
                 })
                 restyleMenuItem([u]) { out in revealNewImage(out) }
+                removeOutlinesMenuItem([u]) { outs in if let o = outs.first { revealNewImage(o) } }
                 // Layerize belongs here for the same reason Restyle does: this viewer is where you
                 // actually look at an image and decide what to do with it, and it was the one AI
                 // surface that could only be reached by going back to the file list. Same call the
@@ -18796,6 +18893,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
                 FileManager.default.fileExists(atPath: $0.appendingPathComponent("_layers.json").path)
             }
             if !dirs.isEmpty { assembleLayerFolders(dirs) }
+        case "outline-gpt25":
+            // Shows the price and asks before spending, like the upscalers.
+            if !images.isEmpty { removeOutlinesAI(images) }
         case "restyle":
             // Opens Navigator's Restyle window on the selection — it needs prompt/model UI,
             // so there is nothing to fire and forget.

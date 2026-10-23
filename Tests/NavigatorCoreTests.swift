@@ -1794,6 +1794,32 @@ final class VertexUpscaleRulesTests: XCTestCase {
         XCTAssertNil(GPTUpscaleRules.plan(width: 4000, height: 1000))
         XCTAssertNil(GPTUpscaleRules.plan(width: 0, height: 1000))
     }
+    func testOutlineRemovalSendsALegal2048CanvasForAnySize() throws {
+        for (w, h) in [(2000, 1708), (1500, 1500), (4000, 4000), (166, 714), (1200, 10), (17, 19)] {
+            let p = try XCTUnwrap(OutlineRemovalRules.plan(width: w, height: h))
+            XCTAssertGreaterThanOrEqual(p.canvas.w, w); XCTAssertGreaterThanOrEqual(p.canvas.h, h)
+            XCTAssertEqual(p.output.w % 16, 0); XCTAssertEqual(p.output.h % 16, 0)
+            XCTAssertLessThanOrEqual(max(p.output.w, p.output.h), 2048)
+            XCTAssertLessThanOrEqual(p.output.w, p.output.h * 3)
+            XCTAssertLessThanOrEqual(p.output.h, p.output.w * 3)
+        }
+        XCTAssertNil(OutlineRemovalRules.plan(width: 0, height: 10))
+    }
+    func testOutlineRemovalNamesItsOutputAndSkipsItOnRerun() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let source = folder.appendingPathComponent("reel.png")
+        let first = try GPTUpscaleRules.saveUnique(Data("a".utf8), beside: source, suffix: OutlineRemovalRules.suffix)
+        let second = try GPTUpscaleRules.saveUnique(Data("b".utf8), beside: source, suffix: OutlineRemovalRules.suffix)
+        XCTAssertEqual(first.lastPathComponent, "reel_no_outline.png")
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(PathRules.isOwnOutput(first, suffix: OutlineRemovalRules.suffix))
+        XCTAssertTrue(PathRules.isOwnOutput(second, suffix: OutlineRemovalRules.suffix))
+        XCTAssertFalse(PathRules.isOwnOutput(source, suffix: OutlineRemovalRules.suffix))
+        XCTAssertTrue(OutlineRemovalRules.prompt(transparent: true).contains("Keep the background transparent."))
+        XCTAssertTrue(OutlineRemovalRules.prompt(transparent: false).contains("do not zoom or reframe"))
+    }
     func testAnImageAlreadyNear4KIsSkipped() {
         XCTAssertFalse(VertexUpscaleRules.isPointless(longEdge: 2048))
         XCTAssertTrue(VertexUpscaleRules.isPointless(longEdge: 4096))

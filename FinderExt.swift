@@ -141,6 +141,10 @@ final class NavigatorFinderSync: FIFinderSync {
                 add(m, "Topaz ×4", "upscale-0", Self.falIcon)
                 add(m, "Local resample ×4 (free)", "upscale-1", Self.icon(systemSymbol: "desktopcomputer"))
             })
+            if hasImage {
+                // Navigator shows the price and asks before spending.
+                add(sub, "Remove Heavy Outlines (AI)", "outline-gpt25", Self.icon(systemSymbol: "pencil.slash"))
+            }
 
             // These open a Navigator window rather than running silently, so they read
             // as "…" commands exactly as they do in Navigator's own menu.

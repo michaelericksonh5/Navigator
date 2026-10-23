@@ -100,6 +100,8 @@ All of it sits in the right-click menu, runs in the background with a progress i
 
 **Restyle (AI)** — restyle one image or a batch against a reference, via Nano Banana 2 / Pro on Vertex. Out-of-ratio inputs are padded to the nearest supported aspect and cropped back afterwards, because sending them raw makes the model silently delete content.
 
+**Remove Heavy Outlines (AI)** — GPT Image 2.5 repaints the thick dark cartoon contour stroke as painted edge lighting and keeps everything else, so outlined art matches painterly art with no strokes. Uses your OpenAI key; shows the price (~$0.10–0.16 each) and asks first. Sent at 2048 on a supported ratio, cropped back and resampled to the source's exact size, transparency kept. Saves `<name>_no_outline.png` beside the source without overwriting. Available for images, the image viewer, and Finder.
+
 **Prep for AI** — fits an image to the nearest ratio the image models accept and fills the padding with an **adaptive backing colour** chosen from the image itself: it extends an existing flat chroma field, or picks the colour furthest from everything in the art. A fixed palette can collide with the subject — a tortoise containing pure white keyed away part of the tortoise.
 
 **Remove BG** · **Chroma Key BG** · **Quick Export as PNG** — Photoshop and After Effects driven directly, single file or whole folder.
@@ -116,7 +118,7 @@ Against After Effects' Unmult at its best possible Black Level per image, on lif
 **Generative Upscale (Firefly)** — Photoshop's own upscaler, scripted. Adobe's Firefly model only, and Navigator refuses to save the result if Photoshop hands back a different one.
 
 ### Integration
-**Navigator's own submenu in Finder's right-click menu** — Open in Navigator, Open Location in Navigator, and the AI toolkit: Remove BG, Native BG Removal, Prep for AI, Upscale, Restyle, Layerize, Quick Export as PNG. It's a Finder extension, so **it works whether or not Navigator is running** — clicking an item launches it on demand. Enable it in the setup window. **Finder Quick Actions** can be installed too (AI ▸ Install Finder Quick Actions).
+**Navigator's own submenu in Finder's right-click menu** — Open in Navigator, Open Location in Navigator, and the AI toolkit: Remove BG, Native BG Removal, Prep for AI, Upscale, Remove Heavy Outlines, Restyle, Layerize, Quick Export as PNG. It's a Finder extension, so **it works whether or not Navigator is running** — clicking an item launches it on demand. Enable it in the setup window. **Finder Quick Actions** can be installed too (AI ▸ Install Finder Quick Actions).
 
 **Open/Save dialog path bridge** — the feature Photoshop and Chrome are missing. Copy any folder path in Navigator, then in *any* app's Open or Save dialog press **⌃⌥⌘G** to copy the path (then ⇧⌘G and ⌘V yourself), or **⌃⌥⇧⌘G** to do all of it in one keystroke. Google Drive paths pasted from a coworker are remapped to your own Drive account. The chord is configurable (G / P / K). The one-key version needs Accessibility; the copy version doesn't.
 

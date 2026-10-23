@@ -20218,10 +20218,10 @@ enum GPTSize {
 
 /// Match GPT's legal output ratio before sending; crop padding without resampling afterwards.
 enum GPTUpscaleRules {
-    static func saveUnique(_ data: Data, beside source: URL) throws -> URL {
+    static func saveUnique(_ data: Data, beside source: URL, suffix: String = AIUpscaleModel.gpt25.outputSuffix) throws -> URL {
         while true {
             let dst = PathRules.uniqueDest(source.deletingLastPathComponent(),
-                                          source.deletingPathExtension().lastPathComponent + AIUpscaleModel.gpt25.outputSuffix + ".png") {
+                                          source.deletingPathExtension().lastPathComponent + suffix + ".png") {
                 FileManager.default.fileExists(atPath: $0)
             }
             do {
@@ -20252,6 +20252,34 @@ enum GPTUpscaleRules {
         + " The attached image is the image to upscale. Preserve its full canvas, including the empty margins; "
         + "do not zoom or reframe. Copy all text verbatim, including accents, font, spacing and placement. "
         + "Preserve every border, corner ornament, highlight and shadow."
+    }
+}
+
+/// Remove Heavy Outlines: one GPT Image 2.5 edit that keeps the art and repaints only the thick dark
+/// cartoon contour stroke as painted edge lighting. Prompt-only — no style reference needed (tested
+/// against chest/fish references on a reel, buoys and a net, 2026-10-23: same result, closer colour).
+/// Sent at a 2048 long edge on a GPT-legal canvas; the padding is cropped back off afterwards.
+enum OutlineRemovalRules {
+    static let suffix = "_no_outline"
+
+    static func plan(width: Int, height: Int) -> (canvas: (w: Int, h: Int), output: (w: Int, h: Int))? {
+        guard width > 0, height > 0 else { return nil }
+        let ratio = min(3.0, max(1.0 / 3.0, Double(width) / Double(height)))
+        let output = GPTSize.fit(ratio >= 1 ? 2048 : Int((2048 * ratio).rounded()),
+                                 ratio >= 1 ? Int((2048 / ratio).rounded()) : 2048)
+        let canvas = AspectPrepRules.canvas(width: width, height: height,
+                                            ratio: Double(output.w) / Double(output.h))
+        return (canvas, output)
+    }
+
+    static func prompt(transparent: Bool) -> String {
+        "Remove the heavy, thick dark brown/black cartoon outline stroke that runs around the outer silhouette "
+        + "and along the inner edges of the object. Edges should instead be defined by painterly lighting, shading, "
+        + "rim light and colour contrast, like modern painterly slot-game art, which has no large outline strokes anywhere. "
+        + "Keep everything else identical: the same object, design, pose, angle, proportions, colours, materials, wear "
+        + "and every small detail, in the same place. Do not add or remove any parts, and do not add a shadow or glow. "
+        + "Preserve the full canvas, including the empty margins; do not zoom or reframe. Copy any text verbatim. "
+        + (transparent ? "Keep the background transparent." : "Keep the background exactly as it is.")
     }
 }
 
