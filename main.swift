@@ -5147,21 +5147,23 @@ func chromaKeyForImage(_ src: URL, onDone: ((URL) -> Void)? = nil) {
 // colour; writes "<base>_rmbg.png" next to each source, originals untouched. Runs as the optimized helper bundled in
 // the app, because this unoptimized build takes a minute an image (see NativeBGRemoval.swift).
 /// `soft`: Soft FX (glows, sparkles, rays) on ANY backing, black included — every transitional alpha kept.
-func nativeBGRemoval(_ src: URL, soft: Bool = false) throws -> URL {
+/// `original`: the picture with see-through parts `src` was redrawn from — solid keying, Soft FX where it was see-through.
+func nativeBGRemoval(_ src: URL, soft: Bool = false, original: URL? = nil) throws -> URL {
     func failure(_ message: String) -> NSError {
         NSError(domain: "NativeBGRemoval", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
     guard let tool = Bundle.main.url(forAuxiliaryExecutable: "NavigatorNativeBG") else {
         throw failure("This Navigator was built without its NavigatorNativeBG helper; build it with rebuild.sh or quickbuild.sh.")
     }
-    let r = try ExternalProcess.run(tool.path, arguments: (soft ? ["--soft"] : []) + [src.path], timeout: 300).completed()
+    let r = try ExternalProcess.run(tool.path, arguments: (soft ? ["--soft"] : []) + (original.map { ["--match", $0.path] } ?? []) + [src.path],
+                                    timeout: 300).completed()
     guard r.status == 0 else { throw failure(r.err.trimmingCharacters(in: .whitespacesAndNewlines)) }
     return URL(fileURLWithPath: r.out.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
 // Every exit calls back, including the failures — see chromaKeyForImages. `quiet` logs failures instead of showing
 // them, for a caller that handles them itself.
-func nativeBGRemovalForImages(_ srcs: [URL], soft: Bool = false, quiet: Bool = false, onDone: (([URL]) -> Void)? = nil) {
+func nativeBGRemovalForImages(_ srcs: [URL], soft: Bool = false, original: URL? = nil, quiet: Bool = false, onDone: (([URL]) -> Void)? = nil) {
     let imgs = srcs.filter { isImageFile($0) }
     guard !imgs.isEmpty else { NSSound.beep(); onDone?([]); return }
     DispatchQueue.main.async { BGJobProgress.shared.start("Removing backgrounds", total: imgs.count) }
@@ -5169,7 +5171,7 @@ func nativeBGRemovalForImages(_ srcs: [URL], soft: Bool = false, quiet: Bool = f
         var outs: [URL] = []
         var errors: [String] = []
         for src in imgs {
-            do { outs.append(try nativeBGRemoval(src, soft: soft)) }
+            do { outs.append(try nativeBGRemoval(src, soft: soft, original: original)) }
             catch { errors.append("\(src.lastPathComponent): \(error.localizedDescription)") }
             DispatchQueue.main.async { BGJobProgress.shared.advance() }
         }
@@ -8435,6 +8437,19 @@ struct ShareIndexFile: Codable { let v: Int; let savedAt: Double; let dirMtime: 
         let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
         guard !urls.isEmpty else { NSSound.beep(); return }
         nativeBGRemovalForImages(urls, soft: soft) { [weak self] outs in self?.refreshAndReveal(outs) }
+    }
+    /// Pictures an AI model redrew from one original with see-through parts (a panel in each language): that original is
+    /// chosen once, and each picture's see-through parts are keyed soft, the rest solid.
+    func nativeBGRemovalMatched(_ ids: Set<String>) {
+        let urls = items.filter { ids.contains($0.id) && !$0.isDirectory && isImageFile($0.url) }.map { $0.url }
+        guard !urls.isEmpty else { NSSound.beep(); return }
+        let panel = NSOpenPanel()
+        panel.message = "Choose the original \(urls.count == 1 ? "this picture was" : "these pictures were") made from — the one with see-through parts."
+        panel.prompt = "Remove Backgrounds"
+        panel.allowedContentTypes = [.png]
+        panel.directoryURL = urls[0].deletingLastPathComponent()
+        guard panel.runModal() == .OK, let original = panel.url else { return }
+        nativeBGRemovalForImages(urls, original: original) { [weak self] outs in self?.refreshAndReveal(outs) }
     }
     func batchNativeBGRemoval(_ ids: Set<String>, soft: Bool = false) {
         guard let id = ids.first, let it = items.first(where: { $0.id == id }), it.isDirectory else { NSSound.beep(); return }
@@ -12209,6 +12224,7 @@ func fileContextMenu(model: AppModel, browser: Browser, ids: Set<FileItem.ID>) -
                     Menu {
                         Button { browser.nativeBGRemoval(ids) } label: { Label("Solid subject — opaque interior", systemImage: "square.fill") }
                         Button { browser.nativeBGRemoval(ids, soft: true) } label: { Label("Soft FX / UnMult — keep transparency", systemImage: "sparkles") }
+                        Button { browser.nativeBGRemovalMatched(ids) } label: { Label("Solid + see-through parts — matched to the original…", systemImage: "square.on.square.dashed") }
                     } label: {
                         Label(imgCount == 1 ? "Native BG Removal" : "Native BG Removal (\(imgCount) images)", systemImage: "scissors")
                     }
@@ -21731,12 +21747,13 @@ if CommandLine.arguments.contains("--service-info") {
     app.run()
 }
 
-// Native BG Removal, headless:  Navigator --native-bg [--soft] <image or folder>...
+// Native BG Removal, headless:  Navigator --native-bg [--soft | --match <original>] <image or folder>...
 // Writes each "<name>_rmbg.png" next to its source, exactly as the menu item does.
 if let flag = CommandLine.arguments.firstIndex(of: "--native-bg") {
     var srcs: [URL] = []
     let soft = CommandLine.arguments.contains("--soft")
-    for p in CommandLine.arguments[(flag + 1)...] where p != "--soft" {
+    let match = CommandLine.arguments.firstIndex(of: "--match").map { $0 + 1 }.flatMap { $0 < CommandLine.arguments.count ? $0 : nil }
+    for (i, p) in CommandLine.arguments.enumerated().dropFirst(flag + 1) where p != "--soft" && p != "--match" && i != match {
         let u = URL(fileURLWithPath: p)
         srcs += (try? u.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true ? batchImageURLs(in: u) : [u]
     }
@@ -21744,7 +21761,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--native-bg") {
     for src in srcs {
         let t0 = Date()
         do {
-            let out = try nativeBGRemoval(src, soft: soft)
+            let out = try nativeBGRemoval(src, soft: soft, original: match.map { URL(fileURLWithPath: CommandLine.arguments[$0]) })
             print(String(format: "%@  %.2fs", out.path, Date().timeIntervalSince(t0)))
         } catch { failed += 1; print("\(src.lastPathComponent): \(error.localizedDescription)") }
     }

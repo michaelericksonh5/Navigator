@@ -14963,6 +14963,79 @@ final class NativeBGRemovalTests: XCTestCase {
         }
     }
 
+    // A localized panel: Nano Banana redraws a gold panel whose 6 px border is half see-through, on a magenta backing.
+    // The solid keyer keeps that border opaque and part magenta; matched to the original it is see-through and green.
+    func testMatchedKeepsASeeThroughBorderItsOwnColourAndTransparency() throws {
+        let ow = 80, oh = 64, n = 160, f = 2                   // the original is centred, pad x1.0, in a 1:1 picture at 2x
+        let gold: [Double] = [230, 180, 40], border: [Double] = [130, 235, 20], key: [Double] = [255, 0, 255]
+        var original = [UInt8](repeating: 0, count: ow * oh * 4)
+        for y in 0..<oh { for x in 0..<ow {
+            let edge = min(x, y, ow - 1 - x, oh - 1 - y) < 6, i = (y * ow + x) * 4
+            for k in 0..<3 { original[i + k] = UInt8(edge ? border[k] : gold[k]) }
+            original[i + 3] = edge ? 128 : 255
+        } }
+        let box = (x0: 0, y0: (n - oh * f) / 2, x1: n, y1: (n + oh * f) / 2)
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let i = (y * n + x) * 4
+            for k in 0..<3 { px[i + k] = UInt8(key[k]) }
+            guard y >= box.y0, y < box.y1 else { continue }
+            let o = ((y - box.y0) / f * ow + x / f) * 4, a = Double(original[o + 3]) / 255
+            for k in 0..<3 { px[i + k] = UInt8((Double(original[o + k]) * a + key[k] * (1 - a)).rounded()) }
+        } }
+        var fitted = [UInt8](repeating: 0, count: n * oh * f * 4)
+        for i in 0..<(n * oh * f) { let o = ((i / n) / f * ow + (i % n) / f) * 4; for k in 0..<4 { fitted[i * 4 + k] = original[o + k] } }
+        let solid = try XCTUnwrap(NativeBGRemoval.matte(rgba: px, width: n, height: n, subject: nil))
+        let out = NativeBGRemoval.matched(rgba: px, width: n, height: n, solid: solid, original: fitted, box: box)
+        let i = ((box.y0 + 6) * n + n / 2) * 4                 // in the bottom of the top border, away from its corners
+        XCTAssertEqual(Double(out[i + 3]) / 255, 0.5, accuracy: 0.1, "border see-through")
+        XCTAssertGreaterThan(out[i + 1], out[i], "border green, not magenta")
+        XCTAssertLessThan(out[i + 2], 90, "border keeps no magenta")
+        XCTAssertEqual(out[((n / 2) * n + n / 2) * 4 + 3], 255, "gold opaque")
+    }
+
+    // Fill Background pads x1.2, auto-prep x1.0: the colours pick which; a different picture's original is refused.
+    func testExportFindsWhereTheOriginalSitsAndRefusesAnotherPicture() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("nativebg-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        func png(_ px: [UInt8], _ w: Int, _ h: Int, _ name: String) throws -> URL {
+            let url = dir.appendingPathComponent(name)
+            let cg = try XCTUnwrap(CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                           space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                                           provider: CGDataProvider(data: Data(px) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent))
+            let encoder = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil))
+            CGImageDestinationAddImage(encoder, cg, nil); XCTAssertTrue(CGImageDestinationFinalize(encoder))
+            return url
+        }
+        // A gold panel with a half see-through green border, 100 x 60, on magenta padded x1.2 into 1:1 at 2x: box (20, 60, 220, 180).
+        let ow = 100, oh = 60, n = 240, key: [Int] = [255, 0, 255]
+        var original = [UInt8](repeating: 0, count: ow * oh * 4)
+        for y in 0..<oh { for x in 0..<ow {
+            let edge = min(x, y, ow - 1 - x, oh - 1 - y) < 4, i = (y * ow + x) * 4
+            let c = edge ? [130, 235, 20] : [230, 180, 40]
+            for k in 0..<3 { original[i + k] = UInt8(c[k]) }
+            original[i + 3] = edge ? 128 : 255
+        } }
+        var px = [UInt8](repeating: 255, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n {
+            let i = (y * n + x) * 4
+            for k in 0..<3 { px[i + k] = UInt8(key[k]) }
+            guard (20..<220).contains(x), (60..<180).contains(y) else { continue }
+            let o = ((y - 60) / 2 * ow + (x - 20) / 2) * 4, a = Int(original[o + 3])
+            for k in 0..<3 { px[i + k] = UInt8((Int(original[o + k]) * a + key[k] * (255 - a)) / 255) }
+        } }
+        let out = try NativeBGRemoval.export(source: try png(px, n, n, "panel-de.png"), original: try png(original, ow, oh, "panel.png"))
+        let cg = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) })
+        let data = try XCTUnwrap(cg.dataProvider?.data as Data?), i = (64 * n + 120) * 4   // the top border's lower half
+        XCTAssertEqual(Double(data[i + 3]) / 255, 0.5, accuracy: 0.1, "border see-through")
+        XCTAssertGreaterThan(data[i + 1], data[i], "border green, not magenta")
+        // A different picture, the same size: not laid on this backing anywhere, so no guess.
+        var other = original
+        for i in stride(from: 0, to: other.count, by: 4) { other[i] = 20; other[i + 1] = 40; other[i + 2] = 200; other[i + 3] = 255 }
+        XCTAssertThrowsError(try NativeBGRemoval.export(source: dir.appendingPathComponent("panel-de.png"), original: try png(other, ow, oh, "other.png")))
+    }
+
     /// A `colour` glow (alpha from 0.9 at the centre to 0) on `backing`.
     func glow(_ colour: [Double], on backing: [Double], size n: Int = 96) -> (px: [UInt8], alpha: [Double]) {
         let c = Double(n) / 2

@@ -35,7 +35,8 @@ enum NativeBGRemoval {
     /// Remove the backing of `source` and write "<name>_rmbg.png" beside it, like Remove BG and Chroma Key.
     /// Validated before the write, so a failure leaves an earlier output alone.
     /// `soft`: Soft FX (glows, sparkles, rays) keep every transitional alpha (softMatte); otherwise a solid symbol (matte).
-    static func export(source: URL, soft: Bool = false) throws -> URL {
+    /// `original`: the picture with see-through parts this one was redrawn from (`matched`); `soft` is then ignored.
+    static func export(source: URL, soft: Bool = false, original: URL? = nil) throws -> URL {
         func failure(_ message: String) -> NSError {
             NSError(domain: "NativeBGRemoval", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
         }
@@ -43,21 +44,30 @@ enum NativeBGRemoval {
               let image = CGImageSourceCreateImageAtIndex(reader, 0, nil) else { throw failure("Could not read \(source.lastPathComponent)") }
         let w = image.width, h = image.height
         let space = image.colorSpace?.model == .rgb ? image.colorSpace! : CGColorSpace(name: CGColorSpace.sRGB)!
-        var rgba = [UInt8](repeating: 0, count: w * h * 4)
-        let drawn = rgba.withUnsafeMutableBytes { raw -> Bool in
-            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                                      space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
-            ctx.setBlendMode(.copy)
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-            return true
-        }
-        guard drawn else { throw failure("Could not decode \(source.lastPathComponent)") }
+        guard let rgba = pixels(image, width: w, height: h, space: space) else { throw failure("Could not decode \(source.lastPathComponent)") }
         // A cut-out has no backing left: its transparent black corners would be keyed as the backing.
         guard [0, w - 1, (h - 1) * w, h * w - 1].allSatisfy({ rgba[$0 * 4 + 3] == 255 }) else {
             throw failure("\(source.lastPathComponent) already has a transparent background")
         }
-        guard let out = soft ? softFX(rgba: rgba, width: w, height: h) : matte(rgba: rgba, width: w, height: h, subject: subjectMask(image)) else {
+        guard var out = soft && original == nil ? softFX(rgba: rgba, width: w, height: h) : matte(rgba: rgba, width: w, height: h, subject: subjectMask(image)) else {
             throw failure("\(source.lastPathComponent) is not on a flat key colour. Native BG Removal is for art generated on a key colour; Remove BG (Photoshop) handles other images.")
+        }
+        if let original {
+            guard let r = CGImageSourceCreateWithURL(original as CFURL, nil), let o = CGImageSourceCreateImageAtIndex(r, 0, nil) else {
+                throw failure("Could not read \(original.lastPathComponent)")
+            }
+            // The right placement measured 8-11 on real redraws, the other 85-95, and a different picture's original 55.
+            let tries = placements(original: (o.width, o.height), picture: (w, h)).compactMap { b in
+                pixels(o, width: b.x1 - b.x0, height: b.y1 - b.y0, space: space).map { (box: b, fitted: $0, miss: miss(rgba: rgba, width: w, height: h, fitted: $0, box: b)) }
+            }
+            guard let best = tries.min(by: { $0.miss < $1.miss }), best.miss <= 24 else {
+                throw failure("\(source.lastPathComponent) does not look like \(original.lastPathComponent) laid on its backing: choose the picture it was made from, or use Solid subject or Soft FX.")
+            }
+            var fitted = best.fitted
+            for i in stride(from: 0, to: fitted.count, by: 4) where fitted[i + 3] > 0 {     // straight colour, as the rule reads it
+                for k in 0..<3 { fitted[i + k] = UInt8(min(255, Int(fitted[i + k]) * 255 / Int(fitted[i + 3]))) }
+            }
+            out = matched(rgba: rgba, width: w, height: h, solid: out, original: fitted, box: best.box)
         }
         let data = NSMutableData()
         guard let provider = CGDataProvider(data: Data(out) as CFData),
@@ -70,6 +80,74 @@ enum NativeBGRemoval {
         let url = source.deletingLastPathComponent().appendingPathComponent(source.deletingPathExtension().lastPathComponent + "_rmbg.png")
         try (data as Data).write(to: url, options: .atomic)
         return url
+    }
+
+    /// `image` drawn at `width` x `height`, premultiplied RGBA8 (straight for an opaque image).
+    private static func pixels(_ image: CGImage, width w: Int, height h: Int, space: CGColorSpace) -> [UInt8]? {
+        guard w > 0, h > 0 else { return nil }
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn = rgba.withUnsafeMutableBytes { raw -> Bool in
+            guard let ctx = CGContext(data: raw.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.setBlendMode(.copy)
+            ctx.interpolationQuality = .high
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        return drawn ? rgba : nil
+    }
+
+    typealias Box = (x0: Int, y0: Int, x1: Int, y1: Int)
+
+    /// Solid keying for the art, Soft FX where the original was partly see-through: for a picture an AI model redrew
+    /// from an original with see-through parts (a localized panel, a glow round lettering). The solid keyer keeps the
+    /// backing in a soft edge (a green line round a gold panel's see-through border); Soft FX alone turns art in the
+    /// backing's colours see-through. Measured 2026-10-26 in the H5G Localization Tool (7.21.19, the same keyers in
+    /// Python): 99th-percentile error 0.8-0.9 against 3-6 on exact tests, and 22 of 24 real redraws better, none worse.
+    /// Soft FX goes where the original is partly see-through (alpha 5-250), in a patch at least 3 px thick, in a colour
+    /// at least 192 from the backing in some channel (a green glow on green stays solid), grown by 1 px.
+    /// `solid` is `matte`'s result; `original` straight RGBA8 at the size of `box`, where it sits on this picture.
+    static func matched(rgba: [UInt8], width w: Int, height h: Int, solid: [UInt8], original: [UInt8], box: Box) -> [UInt8] {
+        let g = Grid(w: w, h: h), B = cornerBacking(rgba: rgba, width: w, height: h) * 255, bw = box.x1 - box.x0
+        var zone = [Bool](repeating: false, count: g.n)
+        for y in max(0, box.y0)..<min(h, box.y1) { for x in max(0, box.x0)..<min(w, box.x1) {
+            let o = ((y - box.y0) * bw + x - box.x0) * 4
+            guard original[o + 3] > 5, original[o + 3] < 250 else { continue }
+            zone[y * w + x] = simd_abs(SIMD3(Float(original[o]), Float(original[o + 1]), Float(original[o + 2])) - B).max() >= 192
+        } }
+        zone = square(square(square(zone, g, grow: false), g, grow: true), g, grow: true)
+        guard zone.contains(true) else { return solid }
+        var out = solid
+        let soft = softFX(rgba: rgba, width: w, height: h)
+        for i in 0..<g.n where zone[i] { for k in 0..<4 { out[i * 4 + k] = soft[i * 4 + k] } }
+        return out
+    }
+
+    /// Where an original of `o` pixels may sit on a picture of `p` pixels redrawn from it: centred in the smallest box of
+    /// the picture's ratio that holds it, padded x1.0 (Restyle's auto-prep and crop-back, the Localization Tool) or x1.2
+    /// (Fill Background, FX Alpha Upscale).
+    static func placements(original o: (w: Int, h: Int), picture p: (w: Int, h: Int)) -> [Box] {
+        let rt = Double(p.w) / Double(p.h)
+        let tight = Double(o.w) / Double(o.h) > rt ? (Double(o.w), Double(o.w) / rt) : (Double(o.h) * rt, Double(o.h))
+        return [1.0, 1.2].map { pad in
+            let cw = tight.0 * pad, ch = tight.1 * pad, fx = Double(p.w) / cw, fy = Double(p.h) / ch
+            let r = [(cw - Double(o.w)) / 2 * fx, (ch - Double(o.h)) / 2 * fy, (cw + Double(o.w)) / 2 * fx, (ch + Double(o.h)) / 2 * fy].map { Int($0.rounded()) }
+            return (max(0, r[0]), max(0, r[1]), min(p.w, r[2]), min(p.h, r[3]))
+        }
+    }
+
+    /// How far the picture is from the original laid on the backing at `box`: the mean over the box of the largest
+    /// channel difference, 0-255. The model redraws only the lettering, so the right place is close everywhere else.
+    /// `fitted` is the original drawn premultiplied at the box's size.
+    static func miss(rgba: [UInt8], width w: Int, height h: Int, fitted: [UInt8], box: Box) -> Double {
+        let B = cornerBacking(rgba: rgba, width: w, height: h) * 255, bw = box.x1 - box.x0
+        var sum = 0.0
+        for y in box.y0..<box.y1 { for x in box.x0..<box.x1 {
+            let f = ((y - box.y0) * bw + x - box.x0) * 4, i = (y * w + x) * 4, a = Float(fitted[f + 3]) / 255
+            let laid = SIMD3(Float(fitted[f]), Float(fitted[f + 1]), Float(fitted[f + 2])) + B * (1 - a)
+            sum += Double(simd_abs(laid - SIMD3(Float(rgba[i]), Float(rgba[i + 1]), Float(rgba[i + 2]))).max())
+        } }
+        return sum / Double(max(1, bw * (box.y1 - box.y0)))
     }
 
     /// Apple Vision's subject mask at the image's own size, 0...1; nil when Vision finds no subject.
@@ -334,6 +412,14 @@ enum NativeBGRemoval {
     /// Soft FX: UnMult on a black or white backing, or when no flat backing border is showing (FX running off the frame,
     /// sprite sheets); softMatte's colour-to-alpha on a coloured backing.
     static func softFX(rgba: [UInt8], width w: Int, height h: Int) -> [UInt8] {
+        let B0 = cornerBacking(rgba: rgba, width: w, height: h)
+        let neutral = B0.max() - B0.min() < 0.06
+        if neutral && (B0.max() < 0.15 || B0.min() > 0.85) { return unmult(rgba: rgba, width: w, height: h) }
+        return softMatte(rgba: rgba, width: w, height: h) ?? unmult(rgba: rgba, width: w, height: h)
+    }
+
+    /// The backing's colour, 0...1: per channel, the middle two of the four 8 px corners' means.
+    static func cornerBacking(rgba: [UInt8], width w: Int, height h: Int) -> SIMD3<Float> {
         var corners: [SIMD3<Float>] = []
         for (x0, y0) in [(0, 0), (max(0, w - 8), 0), (0, max(0, h - 8)), (max(0, w - 8), max(0, h - 8))] {
             var s = SIMD3<Float>(repeating: 0), k: Float = 0
@@ -343,9 +429,7 @@ enum NativeBGRemoval {
         }
         var B0 = SIMD3<Float>(repeating: 0)
         for k in 0..<3 { let v = corners.map { $0[k] }.sorted(); B0[k] = (v[1] + v[2]) / 2 }
-        let neutral = B0.max() - B0.min() < 0.06
-        if neutral && (B0.max() < 0.15 || B0.min() > 0.85) { return unmult(rgba: rgba, width: w, height: h) }
-        return softMatte(rgba: rgba, width: w, height: h) ?? unmult(rgba: rgba, width: w, height: h)
+        return B0
     }
 
     /// UnMult, measured instead of tuned. After Effects' Unmult (and Red Giant's before it) makes alpha the brightest
@@ -712,6 +796,15 @@ enum NativeBGRemoval {
         cityBlock(m, g, outsideIsSet: false).map { $0 <= Int32(k) }
     }
 
+    /// A 3 x 3 square grown (dilation) or shrunk (erosion; the outside counts as set, as OpenCV's).
+    private static func square(_ m: [Bool], _ g: Grid, grow: Bool) -> [Bool] {
+        par(g, false) { i in
+            let x = i % g.w, y = i / g.w
+            for yy in max(0, y - 1)...min(g.h - 1, y + 1) { for xx in max(0, x - 1)...min(g.w - 1, x + 1) where m[yy * g.w + xx] == grow { return grow } }
+            return !grow
+        }
+    }
+
     /// binary_erosion with border_value 0: the image's outside counts as not-set.
     private static func erode(_ m: [Bool], _ k: Int, _ g: Grid) -> [Bool] {
         cityBlock(m.map { !$0 }, g, outsideIsSet: true).map { $0 > Int32(k) }
@@ -830,14 +923,18 @@ enum NativeBGRemoval {
 }
 
 #if NATIVE_BG_TOOL
-/// The helper: `NavigatorNativeBG [--soft] <image>...` prints each output path; a failure goes to stderr and exits 1.
+/// The helper: `NavigatorNativeBG [--soft | --match <original>] <image>...` prints each output path; a failure goes to
+/// stderr and exits 1.
 @main
 struct NativeBGRemovalTool {
     static func main() {
         var failed = false
-        let args = CommandLine.arguments.dropFirst(), soft = args.contains("--soft")
+        var args = Array(CommandLine.arguments.dropFirst())
+        let soft = args.contains("--soft")
+        var original: URL?
+        if let m = args.firstIndex(of: "--match"), m + 1 < args.count { original = URL(fileURLWithPath: args[m + 1]); args.removeSubrange(m...(m + 1)) }
         for path in args where path != "--soft" {
-            do { print(try NativeBGRemoval.export(source: URL(fileURLWithPath: path), soft: soft).path) }
+            do { print(try NativeBGRemoval.export(source: URL(fileURLWithPath: path), soft: soft, original: original).path) }
             catch { failed = true; FileHandle.standardError.write(Data("\(error.localizedDescription)\n".utf8)) }
         }
         exit(failed ? 1 : 0)

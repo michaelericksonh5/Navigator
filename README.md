@@ -115,6 +115,8 @@ All of it sits in the right-click menu, runs in the background with a progress i
 
 Against After Effects' Unmult at its best possible Black Level per image, on lifted black: error 1.5 vs 2.3/255, haze 0.2% vs 15% of the frame. FX Alpha Upscale keys with it, so it no longer needs After Effects. Chroma Key BG sends black, white and grey backings to it too.
 
+**Native BG Removal ▸ Solid + see-through parts — matched to the original…** — for pictures an AI model redrew from an original with see-through parts: a localized panel with a half-clear border, lettering with a glow. Select the redrawn pictures (one per language, say), choose the original once, and each is keyed solid where the original is solid and Soft FX where the original was see-through, so a see-through edge keeps its own colour instead of a line of the backing colour. Navigator finds where the original sits on each picture (padded ×1.0 or ×1.2, as Restyle and Fill Background send it) by comparing colours, and refuses a picture that doesn't match. The same keying the H5G Localization Tool uses since 7.21.19.
+
 **Generative Upscale (Firefly)** — Photoshop's own upscaler, scripted. Adobe's Firefly model only, and Navigator refuses to save the result if Photoshop hands back a different one.
 
 ### Integration
